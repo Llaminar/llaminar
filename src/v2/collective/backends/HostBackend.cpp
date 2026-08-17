@@ -10,6 +10,8 @@
  */
 
 #include "HostBackend.h"
+#include "../../tensors/FP16Utils.h"
+#include "../../utils/BFloat16.h"
 #include "../../utils/Logger.h"
 #include "../../backends/GPUDeviceContextPool.h"
 #include <cstring>
@@ -1025,50 +1027,13 @@ namespace llaminar2
             const uint16_t *src_h = static_cast<const uint16_t *>(src);
             uint16_t *dst_h = static_cast<uint16_t *>(dst);
 
-            // Helper lambdas for FP16 conversion (IEEE 754 half-precision)
-            auto fp16_to_fp32 = [](uint16_t h) -> float
-            {
-                uint32_t sign = (h >> 15) & 0x1;
-                uint32_t exp = (h >> 10) & 0x1F;
-                uint32_t mant = h & 0x3FF;
-
-                if (exp == 0)
-                {
-                    if (mant == 0)
-                        return sign ? -0.0f : 0.0f;
-                    // Denormalized
-                    while (!(mant & 0x400))
-                    {
-                        mant <<= 1;
-                        exp--;
-                    }
-                    exp++;
-                    mant &= ~0x400;
-                }
-                else if (exp == 31)
-                {
-                    uint32_t result = (sign << 31) | 0x7F800000 | (mant << 13);
-                    return *reinterpret_cast<float *>(&result);
-                }
-
-                uint32_t result = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-                return *reinterpret_cast<float *>(&result);
-            };
-
-            auto fp32_to_fp16 = [](float f) -> uint16_t
-            {
-                uint32_t x = *reinterpret_cast<uint32_t *>(&f);
-                uint32_t sign = (x >> 31) & 0x1;
-                int32_t exp = ((x >> 23) & 0xFF) - 127 + 15;
-                uint32_t mant = (x >> 13) & 0x3FF;
-
-                if (exp <= 0)
-                    return static_cast<uint16_t>(sign << 15);
-                if (exp >= 31)
-                    return static_cast<uint16_t>((sign << 15) | 0x7C00);
-
-                return static_cast<uint16_t>((sign << 15) | (exp << 10) | mant);
-            };
+            /*
+             * Use the same IEEE conversion functions as tensor materialization
+             * and snapshot comparison.  The retired local converter truncated
+             * normal values and flushed every half subnormal, so mixed-vendor
+             * collectives could disagree with homogeneous GPU reduction before
+             * the parity comparator ever saw the result.
+             */
 
             switch (op)
             {
@@ -1113,17 +1078,18 @@ namespace llaminar2
             const uint16_t *src_bf = static_cast<const uint16_t *>(src);
             uint16_t *dst_bf = static_cast<uint16_t *>(dst);
 
-            // BF16 is just the upper 16 bits of FP32
+            // Keep conversion identical to BF16Tensor: lossless expansion and
+            // round-to-nearest-even contraction after each fixed-order step.
             auto bf16_to_fp32 = [](uint16_t bf) -> float
             {
-                uint32_t x = static_cast<uint32_t>(bf) << 16;
-                return *reinterpret_cast<float *>(&x);
+                bfloat16 value;
+                value.data = bf;
+                return value.to_float();
             };
 
             auto fp32_to_bf16 = [](float f) -> uint16_t
             {
-                uint32_t x = *reinterpret_cast<uint32_t *>(&f);
-                return static_cast<uint16_t>(x >> 16);
+                return bfloat16::from_float(f).data;
             };
 
             switch (op)

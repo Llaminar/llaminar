@@ -158,12 +158,25 @@ namespace llaminar2
                 std::sort(si.physical_cores.begin(), si.physical_cores.end());
                 std::sort(si.ht_threads.begin(), si.ht_threads.end());
 
-                // Per-NUMA memory
+                /*
+                 * Capture total and currently free bytes from one kernel
+                 * query.  The free value is the NUMA-local admission
+                 * authority used by ExpertOverlay; it naturally reflects
+                 * tmpfs/ramdisk pages and allocations made before discovery.
+                 */
                 if (numa_available() >= 0 && si.numa_node >= 0)
                 {
-                    long long sz = numa_node_size64(si.numa_node, nullptr);
+                    long long free_bytes = 0;
+                    long long sz = numa_node_size64(
+                        si.numa_node, &free_bytes);
                     if (sz > 0)
                         si.memory_bytes = static_cast<size_t>(sz);
+                    if (free_bytes > 0)
+                    {
+                        si.available_memory_bytes = std::min(
+                            static_cast<size_t>(free_bytes),
+                            si.memory_bytes);
+                    }
                 }
 
                 sockets.push_back(std::move(si));

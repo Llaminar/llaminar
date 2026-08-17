@@ -245,6 +245,85 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             cpu_refinement,
         )
 
+    def test_cpu_shape_planning_resolves_dimensions_without_subprocesses(
+        self,
+    ) -> None:
+        """Large decode inventories must not fork once per matrix cell."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+        dimension_helper = wrapper.split(
+            "cpu_shape_dimensions() {", 1
+        )[1].split("run_cuda_measurement_lanes() {", 1)[0]
+
+        self.assertIn('local -n n_result_ref="${n_output_name}"', dimension_helper)
+        self.assertIn('local -n k_result_ref="${k_output_name}"', dimension_helper)
+        self.assertNotRegex(wrapper, r"\$\(\s*cpu_shape_(?:n|k)\b")
+        self.assertNotIn("cpu_shape_n() {", wrapper)
+        self.assertNotIn("cpu_shape_k() {", wrapper)
+        self.assertEqual(
+            wrapper.count('cpu_shape_dimensions "${shape}" n k'),
+            3,
+        )
+        self.assertIn(
+            'cpu_shape_dimensions "${weighted_shape}" weighted_n weighted_k',
+            wrapper,
+        )
+
+    def test_cpu_decode_evidence_does_not_regenerate_full_source_weights(
+        self,
+    ) -> None:
+        """Timing and paired seals must measure prepared kernels, not PRNG setup."""
+
+        source = (
+            REPO_ROOT
+            / "tests/v2/performance/kernels/cpu/native_vnni"
+            / "Perf__CPUNativeVNNI_GEMV.cpp"
+        ).read_text(encoding="utf-8")
+        m1_paired = source.split(
+            "void runCPUM1PairedConfirmation(", 1
+        )[1].split("void runCPUGroupedPairedConfirmation(", 1)[0]
+        grouped_paired = source.split(
+            "void runCPUGroupedPairedConfirmation(", 1
+        )[1].split("TrainerCsv_StrongDecode_AllFormats", 1)[0]
+
+        for evidence_path in (m1_paired, grouped_paired):
+            self.assertIn(
+                "createDispatchEvidenceWeightFixture(",
+                evidence_path,
+            )
+            self.assertNotIn("createWeightsForFormat(", evidence_path)
+
+        self.assertGreaterEqual(
+            source.count("createDispatchEvidenceWeightFixture("),
+            5,
+        )
+        self.assertIn(
+            "DispatchEvidencePreparedWeights_MatchProductionLayout_AllFormats",
+            source,
+        )
+
+    def test_cpu_decode_checkpoint_has_an_independent_evidence_contract(
+        self,
+    ) -> None:
+        """M=1 resume must reject shards from a changed harness or inventory."""
+
+        wrapper = SCRIPT.read_text(encoding="utf-8")
+        decode = wrapper.split("refresh_cpu_decode() {", 1)[1].split(
+            "refresh_cpu() {", 1
+        )[0]
+
+        self.assertIn("cpu-native-vnni-decode-collection-v1", decode)
+        self.assertIn("cpu_decode_collection_contract.sha256", decode)
+        self.assertIn('"build_id=${cpu_build_id}"', decode)
+        self.assertIn(
+            '"serial_policy_hash=${cpu_serial_policy_hash}"',
+            decode,
+        )
+        self.assertIn('"shapes=${measurement_shapes}"', decode)
+        self.assertIn('"formats=${cpu_formats}"', decode)
+        self.assertIn('"threads=${cpu_threads}"', decode)
+        self.assertIn("CPU decode shards exist without an authenticated", decode)
+
     def test_both_backends_emit_m_aware_sweep_contract(self) -> None:
         result = self.run_script("--backend", "both", "--profile", "quick")
 
@@ -1852,7 +1931,28 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--max-leaves 1", result.stdout)
         self.assertIn("--max-regret 0.05", result.stdout)
-        self.assertEqual(result.stdout.count("--generic-max-leaves 1"), 2)
+        verifier_commands = tuple(
+            line
+            for line in result.stdout.splitlines()
+            if "analyze_cpu_native_vnni_verifier_trainer.py" in line
+            and "--adapt-only" not in line
+        )
+        self.assertTrue(verifier_commands)
+        self.assertTrue(all(
+            "--generic-max-leaves 1" in command
+            for command in verifier_commands
+        ))
+        paired_commands = tuple(
+            line
+            for line in result.stdout.splitlines()
+            if "native_vnni_dispatch.paired_requests" in line
+            and "cpu_verifier_rows" in line
+        )
+        self.assertTrue(paired_commands)
+        self.assertTrue(all(
+            "--max-leaves 1" in command
+            for command in paired_commands
+        ))
 
         invalid = self.run_script(
             "--backend",
@@ -1865,6 +1965,38 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertNotEqual(invalid.returncode, 0)
         self.assertIn(
             "--cpu-grouped-max-leaves must be in [1, 32]",
+            invalid.stderr,
+        )
+
+    def test_cpu_decode_leaf_budget_is_transaction_wide(self) -> None:
+        """M=1 refinement, freeze, planning, and certification share capacity."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "all",
+            "--install",
+            "--stop-after-cpu-decode",
+            "--cpu-decode-max-leaves",
+            "32",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--max-leaves 32", result.stdout)
+        self.assertEqual(result.stdout.count("--generic-max-leaves 32"), 3)
+
+        invalid = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "all",
+            "--cpu-decode-max-leaves",
+            "33",
+        )
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn(
+            "--cpu-decode-max-leaves must be in [1, 32]",
             invalid.stderr,
         )
 
@@ -2175,6 +2307,34 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertIn("cmp --silent", stdout)
         self.assertIn("Authenticated installed CPU decode prerequisite", stdout)
 
+    def test_cpu_grouped_format_shards_publish_distinct_output_paths(self) -> None:
+        """One grouped format shard must never overwrite another format."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "all",
+            "--cpu-formats",
+            "Q4_K,Q6_K",
+            "--cpu-format-shards",
+            "--install",
+            "--resume-after-cpu-decode",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stdout = result.stdout.replace("\\,", ",")
+        q4_paths = set(re.findall(
+            r"cpu_verifier_rows\.Q4_K\.[^ ]+?\.csv", stdout
+        ))
+        q6_paths = set(re.findall(
+            r"cpu_verifier_rows\.Q6_K\.[^ ]+?\.csv", stdout
+        ))
+        self.assertTrue(q4_paths)
+        self.assertTrue(q6_paths)
+        self.assertTrue(q4_paths.isdisjoint(q6_paths))
+        self.assertNotIn("cpu_verifier_rows.all-formats.", stdout)
+
     def test_cpu_grouped_resume_requires_installed_production_contract(self) -> None:
         """The grouped continuation cannot bless an uninstalled M=1 table."""
 
@@ -2212,7 +2372,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         )
         self.assertEqual(
             result.stdout.count("TrainerCsv_StrongDecode_AllFormats"),
-            2,
+            1,
         )
         self.assertNotIn("analyze_cpu_native_vnni_decode_trainer.py", result.stdout)
         self.assertNotIn("LLAMINAR_CPU_NVNNI_VERIFIER_M=", result.stdout)
@@ -2426,8 +2586,8 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertEqual(len(csv_paths), 2)
         self.assertEqual(len(set(csv_paths)), 2)
 
-    def test_cpu_measurement_lanes_default_to_detected_sockets(self) -> None:
-        """Turnkey CPU collection must not silently leave sockets idle."""
+    def test_cpu_measurement_lanes_default_to_one_isolated_lane(self) -> None:
+        """Turnkey CPU timing must not admit an unrecorded socket co-runner."""
 
         result = self.run_script(
             "--backend",
@@ -2441,27 +2601,37 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        socket_rows = subprocess.run(
-            ["lscpu", "-p=socket"],
-            text=True,
-            stdout=subprocess.PIPE,
-            check=True,
-        ).stdout.splitlines()
-        socket_count = len({
-            row for row in socket_rows if row and not row.startswith("#")
-        })
         first = next(
             line.replace("\\,", ",")
             for line in result.stdout.splitlines()
             if "mpirun --bind-to socket --map-by socket" in line
             and "LLAMINAR_CPU_NVNNI_VERIFIER_STRONG_CSV=" in line
         )
-        self.assertEqual(first.count(" -np 1 env "), socket_count)
+        self.assertEqual(first.count(" -np 1 env "), 1)
         csv_paths = re.findall(
             r"LLAMINAR_CPU_NVNNI_VERIFIER_STRONG_CSV=([^ ]+)", first
         )
-        self.assertEqual(len(csv_paths), socket_count)
-        self.assertEqual(len(set(csv_paths)), socket_count)
+        self.assertEqual(len(csv_paths), 1)
+
+    def test_cpu_production_collection_rejects_concurrent_timing_lanes(self) -> None:
+        """Installable CPU evidence cannot depend on an unrelated peer shape."""
+
+        result = self.run_script(
+            "--backend",
+            "cpu",
+            "--profile",
+            "all",
+            "--install",
+            "--cpu-measurement-lanes",
+            "2",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "production CPU M=1/grouped timing requires "
+            "--cpu-measurement-lanes 1",
+            result.stderr,
+        )
 
     def test_cpu_bounded_collection_checkpoints_atomic_format_shards(self) -> None:
         """A bounded invocation leaves resumable finals, never partial CSVs."""
@@ -3597,7 +3767,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertRegex(
             source,
             r"selectVerifierRowsPolicy\(\s*"
-            r"packed,\s*M,\s*N,\s*K,\s*effective_isa,\s*num_threads,\s*"
+            r"packed,\s*M,\s*policy_n,\s*K,\s*effective_isa,\s*num_threads,\s*"
             r"cfg\.k_tiles\)",
         )
         self.assertIn("struct VerifierRowsPolicyCacheEntry", source)
@@ -3621,7 +3791,16 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             r"throw std::runtime_error\(\s*std::string\("
             r'"No certified CPU NativeVNNI verifier-row policy',
         )
-        self.assertIn("use_avx512 && M >= 3 && use_wide_rows", source)
+        self.assertRegex(
+            source,
+            r"if \(policy == VerifierRowsPolicy::WideRows\)\s*"
+            r"return use_avx512 && M >= 3;",
+        )
+        self.assertIn(
+            "schedule.route ==\n            "
+            "VerifierRowsExecutionRoute::GroupedFullKWideRows",
+            source,
+        )
         self.assertIn("const int row_tile_count = (M + 3) / 4", source)
         self.assertNotIn("policy_tile_rows", source)
         self.assertNotIn("M > 4 && resolve_generated_policy", source)
@@ -3710,7 +3889,10 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         self.assertNotIn("selectPrefillPolicy(", source)
         self.assertNotIn("No certified CPU NativeVNNI prefill policy", source)
         self.assertIn("switch (schedule_override)", source)
-        self.assertIn("serial_cfg.k_tiles > 1", source)
+        self.assertIn(
+            "nativeVNNIUsesKPartitions(serial_cfg.k_tiles)",
+            source,
+        )
         self.assertIn("VerifierRowsPolicy::Pairwise", source)
 
         self.assertNotIn("CUDANativeVNNIPrefillDispatchGenerated.inc", cuda_source)

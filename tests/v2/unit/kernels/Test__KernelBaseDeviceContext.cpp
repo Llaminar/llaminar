@@ -33,8 +33,13 @@ using namespace llaminar2;
 class MockGPUContext : public IWorkerGPUContext
 {
 public:
-    explicit MockGPUContext(int device_ordinal, bool initialized = true)
-        : device_ordinal_(device_ordinal), initialized_(initialized)
+    explicit MockGPUContext(
+        int device_ordinal,
+        bool initialized = true,
+        bool owns_current_thread = true)
+        : device_ordinal_(device_ordinal),
+          initialized_(initialized),
+          owns_current_thread_(owns_current_thread)
     {
     }
 
@@ -43,14 +48,19 @@ public:
     std::string deviceName() const override { return "MockGPU-" + std::to_string(device_ordinal_); }
     bool isInitialized() const override { return initialized_; }
 
-    // Work Submission (no-op for mock)
-    void submitAndWait(std::function<void()> work) override { work(); }
+    // Work Submission
+    bool ownsCurrentThread() const noexcept override
+    {
+        return owns_current_thread_;
+    }
+
     std::future<void> submitAsync(std::function<void()> work) override
     {
-        work();
-        std::promise<void> p;
-        p.set_value();
-        return p.get_future();
+        ++queued_submission_count_;
+        std::packaged_task<void()> task(std::move(work));
+        auto future = task.get_future();
+        task();
+        return future;
     }
 
     // Stream Access - return mock pointers
@@ -95,10 +105,13 @@ public:
     void setMockBlasHandle(void *handle) { mock_blas_handle_ = handle; }
     void setMockBlasLtHandle(void *handle) { mock_blas_lt_handle_ = handle; }
     void setInitialized(bool init) { initialized_ = init; }
+    int queuedSubmissionCount() const { return queued_submission_count_; }
 
 private:
     int device_ordinal_;
     bool initialized_;
+    bool owns_current_thread_ = true;
+    int queued_submission_count_ = 0;
     void *mock_stream_ = reinterpret_cast<void *>(0xDEADBEEF);
     void *mock_auxiliary_stream_ = reinterpret_cast<void *>(0xDEADCAFE);
     void *mock_event_ = reinterpret_cast<void *>(0xCAFEBABE);
@@ -106,6 +119,32 @@ private:
     void *mock_blas_lt_handle_ = reinterpret_cast<void *>(0x87654321);
     void *mock_comm_ = nullptr;
 };
+
+TEST(Test__WorkerGPUContextSubmission, NestedSynchronousWorkExecutesInline)
+{
+    MockGPUContext context(/*device_ordinal=*/0,
+                           /*initialized=*/true,
+                           /*owns_current_thread=*/true);
+    bool ran = false;
+
+    context.submitAndWait([&ran]() { ran = true; });
+
+    EXPECT_TRUE(ran);
+    EXPECT_EQ(context.queuedSubmissionCount(), 0);
+}
+
+TEST(Test__WorkerGPUContextSubmission, ForeignSynchronousWorkUsesQueueAndPropagatesFailure)
+{
+    MockGPUContext context(/*device_ordinal=*/0,
+                           /*initialized=*/true,
+                           /*owns_current_thread=*/false);
+
+    EXPECT_THROW(
+        context.submitAndWait(
+            []() { throw std::runtime_error("worker setup failed"); }),
+        std::runtime_error);
+    EXPECT_EQ(context.queuedSubmissionCount(), 1);
+}
 
 // ============================================================================
 // Test Derived Classes (Concrete implementations of base classes)

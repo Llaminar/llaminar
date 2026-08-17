@@ -186,7 +186,7 @@ class MoERebalancePolicyCorpusComparatorTest(unittest.TestCase):
                 "llep_native_rows": "900",
                 "llep_spilled_rows": "100",
                 "llep_spilled_row_ratio": "0.1",
-                "llep_spilled_rows_per_transfer": "20",
+                "llep_spilled_rows_per_critical_path_payload_slot": "20",
                 "llep_standard_ep_selected": "0",
                 "llep_skipped_balanced": "0",
                 "llep_skipped_insufficient_spread_improvement": "1",
@@ -298,7 +298,10 @@ class MoERebalancePolicyCorpusComparatorTest(unittest.TestCase):
         self.assertEqual(rows[0]["llep_weight_transfers"], "5")
         self.assertEqual(rows[0]["llep_spilled_rows"], "100")
         self.assertEqual(rows[0]["llep_spilled_row_ratio"], "0.1")
-        self.assertEqual(rows[0]["llep_spilled_rows_per_transfer"], "20")
+        self.assertEqual(
+            rows[0]["llep_spilled_rows_per_critical_path_payload_slot"],
+            "20",
+        )
         self.assertEqual(rows[0]["llep_spans_per_weight_transfer"], "10")
         self.assertEqual(rows[0]["llep_spilled_rows_per_span"], "2")
         self.assertEqual(rows[0]["llep_spilled_rows_per_planned_arrival"], "3.125")

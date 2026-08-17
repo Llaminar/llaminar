@@ -60,7 +60,6 @@ namespace llaminar2::test
                                                }));
             ON_CALL(*this, setDecodeStepTokenBudget(testing::_)).WillByDefault(testing::Return());
             ON_CALL(*this, maybeApplyMoERebalance()).WillByDefault(testing::Return(true));
-            ON_CALL(*this, usesDeviceSideMoERebalanceController()).WillByDefault(testing::Return(false));
             ON_CALL(*this, prefixStateProbe()).WillByDefault(testing::Return(PrefixRuntimeStateSnapshot{}));
         }
 
@@ -85,7 +84,6 @@ namespace llaminar2::test
                     (override));
         MOCK_METHOD(void, setDecodeStepTokenBudget, (int max_tokens), (override));
         MOCK_METHOD(bool, maybeApplyMoERebalance, (), (override));
-        MOCK_METHOD(bool, usesDeviceSideMoERebalanceController, (), (const, override));
 
         // Configuration
         MOCK_METHOD(const RankExecutionPlan &, executionPlan, (), (const, override));
@@ -202,6 +200,14 @@ namespace llaminar2::test
                     (const std::string &config_path), (override));
         MOCK_METHOD(std::unique_ptr<IOrchestrationRunner>, createFromOrchestrationConfig,
                     (OrchestrationConfig config), (override));
+        MOCK_METHOD(std::unique_ptr<IOrchestrationRunner>, createFromOrchestrationConfig,
+                    (OrchestrationConfig config,
+                     std::shared_ptr<ModelContext> model_context),
+                    (override));
+        MOCK_METHOD(std::unique_ptr<IOrchestrationRunner>, createFromOrchestrationConfig,
+                    (OrchestrationConfig config,
+                     ModelContextReuseContract reuse_contract),
+                    (override));
         MOCK_METHOD(std::unique_ptr<IOrchestrationRunner>, createSimple,
                     (const std::string &model_path, const std::string &device_spec), (override));
     };

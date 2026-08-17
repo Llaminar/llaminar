@@ -74,10 +74,11 @@ namespace llaminar2
          * @param device_id GPU device ID (0-based)
          * @return true on success, false on error
          *
-         * **Semantics**:
-         * - CUDA: cudaMemcpyAsync on stream, then cudaStreamSynchronize
-         * - ROCm: hipMemcpyAsync on stream, then hipStreamSynchronize
-         * - CPU: memcpy(dst, src, bytes)
+         * This is a low-level compatibility boundary for raw buffers. GPU
+         * implementations enqueue the copy, record one exact completion event,
+         * and wait only that event before returning host-owned bytes. Tensor
+         * callers must use TransferEngine so coherence and source lifetimes are
+         * published instead of hidden behind this blocking boundary.
          *
          * @param stream Exact producer stream for GPU backends. GPU
          *               implementations reject nullptr. CPU callers pass
@@ -90,7 +91,7 @@ namespace llaminar2
          *
          * Caller guarantees:
          * - src is a valid device pointer on device_id
-         * - GPU work writing to src has already completed (stream synced)
+         * - GPU work writing to src is ordered before the exact supplied stream
          * - dst is a valid host pointer with sufficient space
          *
          * Default implementation delegates to deviceToHost().
@@ -110,10 +111,10 @@ namespace llaminar2
          * @param device_id GPU device ID (0-based)
          * @return true on success, false on error
          *
-         * **Semantics**:
-         * - CUDA: cudaMemcpyAsync on stream, then cudaStreamSynchronize
-         * - ROCm: hipMemcpyAsync on stream, then hipStreamSynchronize
-         * - CPU: memcpy(dst, src, bytes)
+         * This is a low-level compatibility boundary for raw buffers. GPU
+         * implementations enqueue the copy and wait one exact completion event;
+         * they never synchronize the complete stream. Tensor callers must use
+         * TransferEngine, which retains the completion event asynchronously.
          *
          * @param stream Exact consumer stream for GPU backends. GPU
          *               implementations reject nullptr. CPU callers pass
@@ -268,6 +269,31 @@ namespace llaminar2
          * waits for a specific point in the stream, not all device operations.
          */
         virtual bool waitForEvent(void *event, int device_id) = 0;
+
+        /**
+         * @brief Query an event without blocking the calling host thread.
+         *
+         * This is the observation primitive for bounded lifecycle protocols
+         * that must wait for an exact producer-stream point without calling a
+         * stream- or device-wide synchronization API.  A successful query may
+         * report either ready or not-ready; backend/runtime errors are reported
+         * by returning false.  Implementations must never turn a not-ready
+         * result into a blocking event wait.
+         *
+         * @param event Opaque event handle returned by createEvent().
+         * @param device_id Device ordinal that owns @p event.
+         * @param ready Non-null destination; set true only after the recorded
+         *              stream work has completed.
+         * @return true when the query itself succeeded, including not-ready.
+         */
+        virtual bool queryEvent(void *event, int device_id, bool *ready)
+        {
+            (void)event;
+            (void)device_id;
+            if (ready)
+                *ready = false;
+            return false;
+        }
 
         /**
          * @brief Measure elapsed milliseconds between two recorded timing events.
@@ -573,6 +599,63 @@ namespace llaminar2
          */
         virtual bool pinHostMemory(void *ptr, size_t bytes) { return true; }
         virtual bool unpinHostMemory(void *ptr) { return true; }
+
+        /**
+         * @brief Register caller-owned pages for direct access by every local device.
+         *
+         * This is distinct from ordinary DMA pinning: the registration must be
+         * portable across contexts owned by this backend and must expose a
+         * device-visible alias through @ref externalMappedHostDevicePointer.
+         * The call is setup-only and must not allocate or copy payload bytes.
+         *
+         * @param ptr Stable page-aligned or runtime-acceptable host address.
+         * @param bytes Positive immutable region size.
+         * @param registration_device_id One valid local device used to establish
+         *        the backend registration context; it does not limit later aliases.
+         * @return True only when the complete region was registered as mapped/portable.
+         */
+        virtual bool registerExternalMappedHostMemory(
+            void *ptr,
+            size_t bytes,
+            int registration_device_id)
+        {
+            (void)ptr;
+            (void)bytes;
+            (void)registration_device_id;
+            return false;
+        }
+
+        /**
+         * @brief Resolve one exact device alias for a mapped external host region.
+         * @param host_ptr Address previously registered by this backend.
+         * @param device_id Local device whose address space will consume the alias.
+         * @param[out] device_ptr Non-null device-visible address on success.
+         */
+        virtual bool externalMappedHostDevicePointer(
+            void *host_ptr,
+            int device_id,
+            void **device_ptr)
+        {
+            (void)host_ptr;
+            (void)device_id;
+            if (device_ptr)
+                *device_ptr = nullptr;
+            return false;
+        }
+
+        /**
+         * @brief Unregister mapped external pages after every device stream drained.
+         * @param ptr Exact registered host address.
+         * @param registration_device_id Context ordinal used at registration.
+         */
+        virtual bool unregisterExternalMappedHostMemory(
+            void *ptr,
+            int registration_device_id)
+        {
+            (void)ptr;
+            (void)registration_device_id;
+            return false;
+        }
 
         /**
          * @brief GPU-side argmax over FP32 data
@@ -2342,6 +2425,168 @@ namespace llaminar2
         }
 
         /**
+         * @brief Publish one serial decode commit into the device MoE clock.
+         *
+         * Ordinary one-token decode has no compact MTP metadata from which to
+         * derive a commit count. This allocation-free, graph-capturable
+         * operation therefore advances the persistent clock by exactly one
+         * serial-visible round when the edge was not already published by MTP.
+         * An existing valid @p decode_boundary_advanced_device marker makes the
+         * operation idempotent, allowing the same conditional transaction to
+         * follow both serial and grouped-MTP commits without double counting.
+         *
+         * Reaching zero publishes `maintenance_due=1` and leaves the advanced
+         * marker set. The conditional maintenance child consumes both values.
+         * A following acknowledgement fragment retires a non-due marker only
+         * after the conditional child had an opportunity to consume it. This is
+         * the ordinary-decode counterpart of
+         * @ref enqueueAdvanceSpeculativeCommitBoundary and shares its persistent
+         * controller fields with MTP.
+         *
+         * Implementations enqueue exactly one kernel on @p stream. They may not
+         * inspect the fields on the host, synchronize, allocate, or substitute
+         * an eager implementation.
+         *
+         * @param decode_rounds_committed_device Mutable total committed rounds.
+         * @param decode_rounds_until_maintenance_device Mutable remaining cadence.
+         * @param maintenance_due_device Mutable zero/one/poison due word.
+         * @param decode_boundary_advanced_device Mutable once-only edge marker.
+         * @param device_id Backend-local GPU ordinal.
+         * @param stream Exact non-null producer stream.
+         * @return true only when the publication kernel was enqueued.
+         */
+        virtual bool enqueuePublishSerialDecodeCommitBoundary(
+            void *decode_rounds_committed_device,
+            void *decode_rounds_until_maintenance_device,
+            void *maintenance_due_device,
+            void *decode_boundary_advanced_device,
+            int device_id,
+            void *stream)
+        {
+            (void)decode_rounds_committed_device;
+            (void)decode_rounds_until_maintenance_device;
+            (void)maintenance_due_device;
+            (void)decode_boundary_advanced_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Retire a published decode edge after conditional maintenance.
+         *
+         * This is the mandatory final fragment of a cadence-gated transaction.
+         * If maintenance was not due, it clears the once-only advanced marker
+         * so the next serial boundary may advance. If maintenance was due but
+         * did not run, the due/advanced pair remains intact and the clock cannot
+         * cross that edge. A successful maintenance child has already reset the
+         * cadence and marker, making this operation an idempotent no-op.
+         *
+         * Implementations enqueue one graph-capturable kernel on the exact
+         * non-null stream and perform no allocation, transfer, or synchronization.
+         *
+         * @return true only when the acknowledgement kernel was enqueued.
+         */
+        virtual bool enqueueAcknowledgeDecodeCommitBoundary(
+            void *decode_rounds_until_maintenance_device,
+            void *maintenance_due_device,
+            void *decode_boundary_advanced_device,
+            int device_id,
+            void *stream)
+        {
+            (void)decode_rounds_until_maintenance_device;
+            (void)maintenance_due_device;
+            (void)decode_boundary_advanced_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Bind a persistent HIP MoE scheduler ticket to one request.
+         *
+         * Request reset calls this allocation-free kernel after resetting the
+         * device controller and before publishing reset completion.  The
+         * immutable lifecycle fields are therefore ordered with the same arena
+         * generation and cannot be inherited by a later request.  CUDA
+         * implements the symmetric primitive even though its native
+         * conditional graph does not read the ticket on the host.
+         *
+         * @param session_epoch Exact non-zero request/session generation.
+         * @param workspace_generation Exact non-zero persistent arena generation.
+         * @param participant_id Local participant index in the MoE domain.
+         * @param participant_count Number of mirrored domain participants.
+         * @param ticket_device Persistent ticket destination.
+         * @param device_id Backend-local GPU ordinal.
+         * @param stream Exact non-null request-reset stream.
+         * @return true only when initialization was enqueued.
+         */
+        virtual bool enqueueInitializeDeviceMoERebalanceDispatchTicket(
+            uint64_t session_epoch,
+            uint64_t workspace_generation,
+            uint32_t participant_id,
+            uint32_t participant_count,
+            void *ticket_device,
+            int device_id,
+            void *stream)
+        {
+            (void)session_epoch;
+            (void)workspace_generation;
+            (void)participant_id;
+            (void)participant_count;
+            (void)ticket_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Publish one authenticated device-owned MoE dispatch decision.
+         *
+         * This graph-capturable one-thread kernel runs immediately after the
+         * serial/MTP boundary publisher on the exact maintenance stream.  It
+         * copies only cadence and health scalars into the request-initialized
+         * ticket.  It never copies histograms, plans, routing state, or expert
+         * payloads and never performs a transfer or synchronization itself.
+         *
+         * @param controller_magic_device Device controller magic word.
+         * @param controller_version_device Device controller ABI version.
+         * @param controller_error_device First fatal controller error word.
+         * @param decode_rounds_committed_device Total committed decode rounds.
+         * @param decode_rounds_until_maintenance_device Remaining cadence.
+         * @param maintenance_due_device Zero/one due predicate.
+         * @param decode_boundary_advanced_device Once-only boundary marker.
+         * @param ticket_device Persistent initialized ticket destination.
+         * @param device_id Backend-local GPU ordinal.
+         * @param stream Exact non-null publisher stream.
+         * @return true only when publication was enqueued.
+         */
+        virtual bool enqueuePublishDeviceMoERebalanceDispatchTicket(
+            const void *controller_magic_device,
+            const void *controller_version_device,
+            const void *controller_error_device,
+            const void *decode_rounds_committed_device,
+            const void *decode_rounds_until_maintenance_device,
+            const void *maintenance_due_device,
+            const void *decode_boundary_advanced_device,
+            void *ticket_device,
+            int device_id,
+            void *stream)
+        {
+            (void)controller_magic_device;
+            (void)controller_version_device;
+            (void)controller_error_device;
+            (void)decode_rounds_committed_device;
+            (void)decode_rounds_until_maintenance_device;
+            (void)maintenance_due_device;
+            (void)decode_boundary_advanced_device;
+            (void)ticket_device;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Initialize persistent response and control rows for GPU generation.
          *
          * Request admission supplies the immutable response budget once.  Every
@@ -3212,16 +3457,190 @@ namespace llaminar2
             return true;
         }
 
+        /**
+         * @brief Report whether exact-stream 32-bit timeline signals are supported.
+         *
+         * A timeline signal is a device-owned 32-bit word that one explicit GPU
+         * stream can wait on while another explicit stream publishes a monotonically
+         * increasing value.  Unlike an event, the wait may be enqueued before the
+         * corresponding publication exists.  This property is required by
+         * background producer/consumer protocols whose host scheduler must return
+         * before a worker has prepared the completion operation.
+         *
+         * Implementations must return false unless all four operations are usable
+         * for @p device_id: allocation, destruction, stream wait, and stream
+         * publication.  Callers must not substitute a host wait when this capability
+         * is absent.
+         *
+         * @param device_id Backend-local GPU ordinal.
+         * @return true only when the complete timeline-signal contract is available.
+         */
+        virtual bool supportsStreamTimelineSignal32(int device_id) const
+        {
+            (void)device_id;
+            return false;
+        }
+
+        /**
+         * @brief Allocate one device-owned 32-bit timeline signal.
+         *
+         * The returned storage is intentionally uninitialized.  Its owner must
+         * publish an initial value on an exact stream and prove that publication
+         * complete before exposing the signal to consumers.
+         *
+         * @param device_id Backend-local GPU ordinal.
+         * @return Opaque device address, or nullptr on failure/unsupported hardware.
+         */
+        virtual void *allocateStreamTimelineSignal32(int device_id)
+        {
+            (void)device_id;
+            return nullptr;
+        }
+
+        /**
+         * @brief Destroy a timeline signal after every referencing stream has drained.
+         * @param signal Signal returned by allocateStreamTimelineSignal32(); nullptr is ignored.
+         * @param device_id Backend-local GPU ordinal that owns @p signal.
+         */
+        virtual void freeStreamTimelineSignal32(void *signal, int device_id)
+        {
+            (void)signal;
+            (void)device_id;
+        }
+
+        /**
+         * @brief Make an exact stream wait for a future or already-published value.
+         *
+         * Work submitted after this call may execute only after the unsigned signal
+         * value is greater than or equal to @p value.  Values must increase
+         * monotonically for the signal lifetime; callers own overflow prevention.
+         * This method must enqueue only and must never synchronize the host.
+         *
+         * @param stream Exact non-null consumer stream.
+         * @param signal Device signal owned by @p device_id.
+         * @param value Monotonic completion generation to await.
+         * @param device_id Backend-local GPU ordinal.
+         * @return true when the wait was enqueued.
+         */
+        virtual bool streamWaitTimelineSignal32(
+            void *stream,
+            void *signal,
+            uint32_t value,
+            int device_id)
+        {
+            (void)stream;
+            (void)signal;
+            (void)value;
+            (void)device_id;
+            return false;
+        }
+
+        /**
+         * @brief Publish a monotonically increasing value from an exact stream.
+         *
+         * The device writes @p value only after all earlier work on @p stream has
+         * completed.  The call enqueues the publication and returns without host
+         * synchronization.
+         *
+         * @param stream Exact non-null producer stream.
+         * @param signal Device signal owned by @p device_id.
+         * @param value Monotonic completion generation to publish.
+         * @param device_id Backend-local GPU ordinal.
+         * @return true when the publication was enqueued.
+         */
+        virtual bool streamPublishTimelineSignal32(
+            void *stream,
+            void *signal,
+            uint32_t value,
+            int device_id)
+        {
+            (void)stream;
+            (void)signal;
+            (void)value;
+            (void)device_id;
+            return false;
+        }
+
+        /**
+         * @brief Report whether exact-stream 64-bit timeline waits/writes exist.
+         *
+         * The address may be backend-owned signal memory or a device alias of
+         * portable mapped host pages. Callers must prove the latter separately
+         * by registering the region and executing a real producer/consumer
+         * integration test; capability advertisement alone is not evidence.
+         */
+        virtual bool supportsStreamTimelineSignal64(int device_id) const
+        {
+            (void)device_id;
+            return false;
+        }
+
+        /** @brief Allocate one backend-owned 64-bit timeline word for device-local use. */
+        virtual void *allocateStreamTimelineSignal64(int device_id)
+        {
+            (void)device_id;
+            return nullptr;
+        }
+
+        /** @brief Free one backend-owned 64-bit timeline after all streams drain. */
+        virtual void freeStreamTimelineSignal64(void *signal, int device_id)
+        {
+            (void)signal;
+            (void)device_id;
+        }
+
+        /**
+         * @brief Enqueue an unsigned-GEQ wait on an exact non-null stream.
+         * @param stream Exact consumer stream; default/null streams are invalid.
+         * @param signal GPU-accessible aligned 64-bit word.
+         * @param value Monotonically increasing value to await.
+         * @param device_id Exact local device ordinal interpreting @p signal.
+         */
+        virtual bool streamWaitTimelineSignal64(
+            void *stream,
+            void *signal,
+            uint64_t value,
+            int device_id)
+        {
+            (void)stream;
+            (void)signal;
+            (void)value;
+            (void)device_id;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue one fenced 64-bit publication on an exact stream.
+         *
+         * Every earlier payload write/copy on @p stream must become visible
+         * before a peer released by this publication can consume it. The method
+         * enqueues only and never synchronizes the host.
+         */
+        virtual bool streamPublishTimelineSignal64(
+            void *stream,
+            void *signal,
+            uint64_t value,
+            int device_id)
+        {
+            (void)stream;
+            (void)signal;
+            (void)value;
+            (void)device_id;
+            return false;
+        }
+
         // ====================================================================
-        // Async Host-to-Device Transfer (no implicit sync)
+        // Infrastructure copy submission (no implicit host synchronization)
         // ====================================================================
 
         /**
          * @brief Submit async H2D copy on a specific stream WITHOUT synchronizing
          *
-         * Unlike hostToDevice() which syncs after the memcpy, this submits the
-         * copy and returns immediately. Caller is responsible for synchronization
-         * (typically via recordEvent + streamWaitEvent or synchronizeStream).
+         * TransferEngine uses this backend primitive and immediately publishes
+         * an exact completion event into tensor coherence. Captured transfer
+         * nodes and explicitly reviewed loader/collective infrastructure may
+         * also use it when a graph or batch-level event owns completion. Ordinary
+         * production callers must not bypass TransferEngine.
          *
          * @param dst Device destination pointer (must be pre-allocated)
          * @param src Host source pointer (should be pinned for true async DMA)
@@ -3238,7 +3657,7 @@ namespace llaminar2
         virtual bool hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
                                           int device_id, void *stream)
         {
-            // Default: fall back to synchronous hostToDevice
+            // CPU/test backends may complete inline; GPU backends override.
             return hostToDevice(dst, src, bytes, device_id, stream);
         }
 
@@ -3246,11 +3665,11 @@ namespace llaminar2
          * @brief Submit async D2H copy on a specific stream WITHOUT synchronizing
          *
          * This is the device-to-host companion to hostToDeviceOnStream().  It is
-         * intended for small compact summaries where several D2H copies should
-         * be queued on one explicit producer stream and followed by exactly one
-         * synchronizeStream() at the ownership handoff.  GPU implementations
-         * must reject nullptr streams; CPU implementations may treat the stream
-         * as an ignored synchronous marker.
+         * TransferEngine normally follows this enqueue with one exact event and
+         * waits that event only at a real host-observation boundary. Captured
+         * publication nodes may leave completion to their owning graph event.
+         * GPU implementations reject nullptr streams; CPU implementations may
+         * treat the stream as an ignored synchronous marker.
          *
          * @param dst Host destination pointer (should be pinned for true async DMA)
          * @param src Device source pointer

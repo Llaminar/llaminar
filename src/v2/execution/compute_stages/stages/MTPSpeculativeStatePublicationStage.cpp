@@ -5,9 +5,9 @@
 
 #include "MTPSpeculativeStatePublicationStage.h"
 
-#include "MoEExpertComputeStage.h"
 #include "../../../backends/IBackend.h"
 #include "../../../execution/mtp/MTPSpecStatePublisher.h"
+#include "../../../execution/moe/IMoEGroupedVerifierHistogramPublisher.h"
 #include "../../../kernels/IKVCache.h"
 #include "../../../memory/BufferId.h"
 #include "../../../utils/Logger.h"
@@ -102,11 +102,11 @@ namespace llaminar2
             return false;
         }
         if (!std::all_of(
-                params_.moe_stages.begin(),
-                params_.moe_stages.end(),
-                [](const MoEExpertComputeStage *stage)
+                params_.moe_histogram_publishers.begin(),
+                params_.moe_histogram_publishers.end(),
+                [](const IMoEGroupedVerifierHistogramPublisher *publisher)
                 {
-                    return stage != nullptr;
+                    return publisher != nullptr;
                 }) ||
             !std::all_of(
                 params_.verifier_state_stages.begin(),
@@ -125,10 +125,11 @@ namespace llaminar2
     bool MTPSpeculativeStatePublicationStage::publishMoEHistograms(
         void *stream) const
     {
-        for (MoEExpertComputeStage *stage : params_.moe_stages)
+        for (IMoEGroupedVerifierHistogramPublisher *publisher :
+             params_.moe_histogram_publishers)
         {
-            if (!stage->requiresCommittedGroupedVerifierHistogramPublication() ||
-                !stage->enqueueCommittedGroupedVerifierHistograms(
+            if (!publisher->requiresCommittedGroupedVerifierHistogramPublication() ||
+                !publisher->enqueueCommittedGroupedVerifierHistograms(
                     params_.accepted_state_counts_device,
                     params_.publication_ok_flags_device,
                     params_.request_count,
@@ -136,7 +137,9 @@ namespace llaminar2
                     stream))
             {
                 LOG_ERROR("[MTPSpeculativeStatePublicationStage] Failed to enqueue committed MoE verifier history for "
-                          << stage->name());
+                          << publisher->groupedVerifierHistogramPublisherName()
+                          << " layer="
+                          << publisher->groupedVerifierHistogramLayerIndex());
                 return false;
             }
         }
@@ -405,7 +408,8 @@ namespace llaminar2
               std::to_string(params_.verifier_rows_per_request)},
              {"shifted_depths",
               std::to_string(params_.shifted_kv_caches.size())},
-             {"moe_stages", std::to_string(params_.moe_stages.size())},
+             {"moe_histogram_publishers",
+              std::to_string(params_.moe_histogram_publishers.size())},
              {"controller_owned",
               params_.generation_controller_owned ? "true" : "false"}});
         return true;
@@ -539,7 +543,8 @@ namespace llaminar2
                    other.verifier_rows_per_request &&
                self.max_state_commit_rows ==
                    other.max_state_commit_rows &&
-               self.moe_stages == other.moe_stages &&
+               self.moe_histogram_publishers ==
+                   other.moe_histogram_publishers &&
                self.main_kv_bindings == other.main_kv_bindings &&
                self.publish_shifted_kv == other.publish_shifted_kv &&
                self.shifted_kv_caches == other.shifted_kv_caches &&

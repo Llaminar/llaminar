@@ -11,9 +11,15 @@
 #include "planning/WorkspaceMemoryEstimator.h"
 
 #include "execution/moe/MoEWorkspaceRequirements.h"
+#include "interfaces/IWorkspaceConsumer.h"
+#include "kernels/common/FloatingPointGemmWorkspaceABI.h"
+#include "kernels/cuda/attention/CUDAFlashAttentionLaunchPolicy.h"
+#include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
+#include "planning/WeightMemoryEstimator.h"
 
 #include <algorithm>
 #include <limits>
+#include <string>
 #include <stdexcept>
 #include <string_view>
 
@@ -153,6 +159,284 @@ size_t checkedAdd(size_t left, size_t right, std::string_view contribution)
     return left + right;
 }
 
+/** @brief Multiply workspace cardinalities without permitting wraparound. */
+size_t checkedMultiply(size_t left, size_t right, std::string_view contribution)
+{
+    if (left != 0 && right > std::numeric_limits<size_t>::max() / left)
+    {
+        throw std::runtime_error(
+            "Workspace byte overflow while multiplying " +
+            std::string(contribution));
+    }
+    return left * right;
+}
+
+/** @brief Apply the allocator's 256-byte persistent-buffer alignment. */
+size_t alignedWorkspaceBytes(size_t bytes)
+{
+    constexpr size_t alignment = 256;
+    if (bytes > std::numeric_limits<size_t>::max() - (alignment - 1))
+    {
+        throw std::runtime_error(
+            "Workspace byte overflow while applying buffer alignment");
+    }
+    return (bytes + alignment - 1) & ~(alignment - 1);
+}
+
+/** @brief Whether a source tensor selects the floating GEMM implementation. */
+bool isFloatingWeight(const TensorSizeInfo& tensor)
+{
+    return tensor.quant_type == "F32" || tensor.quant_type == "F16" ||
+           tensor.quant_type == "FP16" || tensor.quant_type == "BF16";
+}
+
+/** @brief Whether a GGUF parent tensor stacks every routed expert. */
+bool isRoutedExpertWeight(std::string_view name)
+{
+    return name.ends_with(".ffn_gate_exps.weight") ||
+           name.ends_with(".ffn_up_exps.weight") ||
+           name.ends_with(".ffn_down_exps.weight");
+}
+
+/**
+ * @brief Find the widest local floating projection in an assigned layer range.
+ *
+ * GGUF routed-expert parents add an expert axis outside K, so remove that axis
+ * before interpreting output columns. Tensor-parallel output shards divide N;
+ * reduction shards keep the complete N and only divide K. ExpertOverlay owner
+ * slices retain whole experts and therefore never divide their projection N.
+ */
+size_t maximumFloatingProjectionColumns(
+    const ModelMemoryProfile& profile,
+    const WorkspaceMemoryGeometry& geometry,
+    bool routed_only)
+{
+    size_t maximum = 0;
+    for (const auto& tensor : profile.tensors)
+    {
+        const bool routed = isRoutedExpertWeight(tensor.name);
+        if (tensor.layer_index < geometry.first_layer ||
+            tensor.layer_index > geometry.last_layer ||
+            (routed_only && !routed) || !isFloatingWeight(tensor) ||
+            tensor.K == 0 || tensor.elements < tensor.K)
+        {
+            continue;
+        }
+
+        size_t columns = tensor.elements / tensor.K;
+        if (routed)
+        {
+            if (profile.expert_count <= 0 ||
+                columns % static_cast<size_t>(profile.expert_count) != 0)
+            {
+                throw std::runtime_error(
+                    "Floating routed-expert workspace cannot recover one "
+                    "expert projection width from " + tensor.name);
+            }
+            columns /= static_cast<size_t>(profile.expert_count);
+        }
+
+        const bool whole_overlay_expert =
+            routed && geometry.apportioned_routed_experts;
+        if (!whole_overlay_expert && geometry.total_shards > 1 &&
+            WeightMemoryEstimator::tensorParallelShardAxis(tensor.name) ==
+                TensorParallelWeightShardAxis::OutputColumns)
+        {
+            const size_t shards =
+                static_cast<size_t>(geometry.total_shards);
+            columns = (columns + shards - 1) / shards;
+        }
+        maximum = std::max(maximum, columns);
+    }
+    return maximum;
+}
+
+/**
+ * @brief Exact CUDA floating-GEMM pointer and mapped-output workspace.
+ *
+ * The redirect is an eight-projection graph ABI, not a heuristic reserve. It
+ * must use the same cardinality constant as CUDAFloatingPointGemmKernel.
+ */
+size_t cudaFloatingPointWorkspaceBytes(
+    const ModelMemoryProfile& profile,
+    const WorkspaceMemoryGeometry& geometry,
+    size_t execution_rows,
+    bool routed_only)
+{
+    if (!geometry.device.is_cuda())
+        return 0;
+
+    const size_t columns = maximumFloatingProjectionColumns(
+        profile, geometry, routed_only);
+    if (columns == 0)
+        return 0;
+
+    const size_t projection_capacity =
+        floating_gemm_abi::kMaxBatchedProjections;
+    const size_t pointer_array_bytes = alignedWorkspaceBytes(
+        checkedMultiply(
+            projection_capacity,
+            sizeof(float*),
+            "CUDA floating GEMM pointer-array capacity"));
+    size_t redirect_bytes = checkedMultiply(
+        projection_capacity,
+        execution_rows,
+        "CUDA floating GEMM redirect projection rows");
+    redirect_bytes = checkedMultiply(
+        redirect_bytes,
+        columns,
+        "CUDA floating GEMM redirect columns");
+    redirect_bytes = checkedMultiply(
+        redirect_bytes,
+        sizeof(float),
+        "CUDA floating GEMM redirect element bytes");
+
+    size_t total = alignedWorkspaceBytes(redirect_bytes);
+    total = checkedAdd(total, pointer_array_bytes, "CUDA floating A pointers");
+    total = checkedAdd(total, pointer_array_bytes, "CUDA floating B pointers");
+    total = checkedAdd(total, pointer_array_bytes, "CUDA floating C pointers");
+    return total;
+}
+
+/** @brief Whether this participant materializes at least one full-attention layer. */
+bool hasFullAttentionLayer(
+    const ModelMemoryProfile& profile,
+    int first_layer,
+    int last_layer)
+{
+    const bool explicit_full_attention = std::any_of(
+        profile.tensors.begin(),
+        profile.tensors.end(),
+        [&](const TensorSizeInfo& tensor)
+        {
+            return tensor.layer_index >= first_layer &&
+                   tensor.layer_index <= last_layer &&
+                   tensor.name.ends_with(".attn_q.weight");
+        });
+    if (explicit_full_attention)
+        return true;
+
+    if (profile.full_attention_interval > 0)
+    {
+        for (int layer = std::max(0, first_layer);
+             layer <= last_layer;
+             ++layer)
+        {
+            if ((layer + 1) % profile.full_attention_interval == 0)
+                return true;
+        }
+        return false;
+    }
+
+    /* A non-hybrid attention model uses full attention in every layer. */
+    const bool model_is_hybrid = hasHybridRecurrentLayer(
+        profile,
+        0,
+        std::max(0, profile.n_layers - 1));
+    return !model_is_hybrid && profile.n_heads > 0 && profile.head_dim > 0;
+}
+
+/**
+ * @brief Exact context-summary arena selected by backend capture policy.
+ *
+ * CUDA declares the current resident prefill graph. ROCm additionally declares
+ * its non-monotonic geometry-selected family envelope, exactly as
+ * AttentionComputeStage does before publishing the stable arena address.
+ */
+size_t exactAttentionWorkspaceBytes(
+    const ModelMemoryProfile& profile,
+    const WorkspaceMemoryGeometry& geometry)
+{
+    if (!geometry.device.is_gpu() ||
+        !hasFullAttentionLayer(
+            profile, geometry.first_layer, geometry.last_layer))
+    {
+        return 0;
+    }
+    if (geometry.device_compute_units <= 0 || geometry.batch_size <= 0 ||
+        geometry.resident_graph_rows <= 0 ||
+        geometry.max_context_rows <= 0 || profile.n_heads <= 0 ||
+        profile.head_dim <= 0 || geometry.total_shards <= 0 ||
+        profile.n_heads % geometry.total_shards != 0)
+    {
+        throw std::runtime_error(
+            "Attention workspace planning requires positive, evenly sharded "
+            "graph/device geometry including physical SM/CU count");
+    }
+
+    const int local_query_heads =
+        profile.n_heads / geometry.total_shards;
+    size_t partial_output = 0;
+    size_t partial_m = 0;
+    size_t partial_l = 0;
+
+    if (geometry.device.is_cuda())
+    {
+        const auto plan = cuda::fa2_policy::selectFA2PrefillParallelPlan({
+            .batch_size = geometry.batch_size,
+            .query_rows = geometry.resident_graph_rows,
+            .local_query_heads = local_query_heads,
+            .head_dim = profile.head_dim,
+            .kv_capacity = geometry.max_context_rows,
+            .sm_count = geometry.device_compute_units,
+            .requested_axis =
+                attention::AttentionPrefillParallelAxis::GeometrySelected,
+        });
+        if (!plan.valid)
+        {
+            throw std::runtime_error(
+                "CUDA attention workspace policy rejected admitted graph geometry");
+        }
+        partial_output = plan.partial_output_bytes;
+        partial_m = plan.partial_m_bytes;
+        partial_l = plan.partial_l_bytes;
+    }
+    else if (geometry.device.is_rocm())
+    {
+        const rocm::fa2_policy::ROCmFA2PrefillParallelGeometry current{
+            .batch_size = geometry.batch_size,
+            .query_rows = geometry.resident_graph_rows,
+            .local_query_heads = local_query_heads,
+            .head_dim = profile.head_dim,
+            .kv_capacity = geometry.max_context_rows,
+            .compute_unit_count = geometry.device_compute_units,
+            .lds_capacity_bytes =
+                rocm::fa2_policy::kROCmFA2LDSCapacityBytes,
+            .requested_axis =
+                attention::AttentionPrefillParallelAxis::GeometrySelected,
+        };
+        const auto plan =
+            rocm::fa2_policy::selectROCmFA2PrefillParallelPlan(current);
+        if (!plan.valid)
+        {
+            throw std::runtime_error(
+                "ROCm attention workspace policy rejected admitted graph geometry");
+        }
+        partial_output = plan.partial_output_bytes;
+        partial_m = plan.partial_m_bytes;
+        partial_l = plan.partial_l_bytes;
+
+        auto family_geometry = current;
+        family_geometry.query_rows = geometry.max_context_rows;
+        const auto family = rocm::fa2_policy::
+            selectROCmFA2GeometrySelectedWorkspaceEnvelope(family_geometry);
+        if (family.valid && family.usesContextParallelism())
+        {
+            partial_output = std::max(
+                partial_output, family.partial_output_bytes);
+            partial_m = std::max(partial_m, family.partial_m_bytes);
+            partial_l = std::max(partial_l, family.partial_l_bytes);
+        }
+    }
+
+    size_t total = alignedWorkspaceBytes(partial_output);
+    total = checkedAdd(
+        total, alignedWorkspaceBytes(partial_m), "attention partial M");
+    total = checkedAdd(
+        total, alignedWorkspaceBytes(partial_l), "attention partial L");
+    return total;
+}
+
 } // namespace
 
 size_t WorkspaceMemoryEstimator::estimate(
@@ -220,21 +504,15 @@ size_t WorkspaceMemoryEstimator::estimate(
 
 size_t WorkspaceMemoryEstimator::estimate(
     const ModelMemoryProfile& profile,
-    int batch_size,
-    int resident_graph_rows,
-    int local_d_ff,
-    int first_layer,
-    int last_layer,
-    int total_shards,
-    DeviceId device)
+    const WorkspaceMemoryGeometry& geometry)
 {
     size_t bytes = estimate(
-        batch_size,
-        resident_graph_rows,
+        geometry.batch_size,
+        geometry.resident_graph_rows,
         profile.d_model,
-        local_d_ff,
+        geometry.local_d_ff,
         profile.vocab_size,
-        device);
+        geometry.device);
     if (bytes == 0)
         return 0;
 
@@ -242,20 +520,44 @@ size_t WorkspaceMemoryEstimator::estimate(
         bytes,
         exactMoEWorkspaceBytes(
             profile,
-            batch_size,
-            resident_graph_rows,
-            device),
+            geometry.batch_size,
+            geometry.resident_graph_rows,
+            geometry.device),
         "MoE graph-family requirements");
 
-    if (!hasHybridRecurrentLayer(profile, first_layer, last_layer))
+    bytes = checkedAdd(
+        bytes,
+        exactAttentionWorkspaceBytes(profile, geometry),
+        "attention context-summary requirements");
+
+    const size_t execution_rows = checkedMultiply(
+        static_cast<size_t>(std::max(1, geometry.batch_size)),
+        static_cast<size_t>(std::max(1, geometry.resident_graph_rows)),
+        "floating projection execution rows");
+    bytes = checkedAdd(
+        bytes,
+        cudaFloatingPointWorkspaceBytes(
+            profile, geometry, execution_rows, /*routed_only=*/false),
+        "CUDA floating projection requirements");
+
+    if (!hasHybridRecurrentLayer(
+            profile, geometry.first_layer, geometry.last_layer))
         return bytes;
 
     const size_t gdn_qkv = shardColumns(
-        projectionOutputRows(profile, ".attn_qkv.weight", first_layer, last_layer),
-        total_shards);
+        projectionOutputRows(
+            profile,
+            ".attn_qkv.weight",
+            geometry.first_layer,
+            geometry.last_layer),
+        geometry.total_shards);
     const size_t gdn_gate = shardColumns(
-        projectionOutputRows(profile, ".attn_gate.weight", first_layer, last_layer),
-        total_shards);
+        projectionOutputRows(
+            profile,
+            ".attn_gate.weight",
+            geometry.first_layer,
+            geometry.last_layer),
+        geometry.total_shards);
     if (gdn_qkv == 0 && gdn_gate == 0)
         return bytes;
 
@@ -266,11 +568,103 @@ size_t WorkspaceMemoryEstimator::estimate(
     const size_t hybrid_row_bytes =
         (gdn_qkv + 3 * gdn_gate) * sizeof(float);
     const size_t hybrid_bytes =
-        static_cast<size_t>(std::max(1, batch_size)) *
-        static_cast<size_t>(std::max(1, resident_graph_rows)) *
-        hybrid_row_bytes;
+        checkedMultiply(execution_rows, hybrid_row_bytes,
+                        "hybrid recurrent row scratch");
     bytes = checkedAdd(bytes, hybrid_bytes, "hybrid recurrent scratch");
 
+    return bytes;
+}
+
+size_t WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
+    const ModelMemoryProfile& profile,
+    const WorkspaceMemoryGeometry& geometry)
+{
+    if (geometry.device.is_cpu())
+        return 0;
+    if (!geometry.device.is_gpu())
+    {
+        throw std::runtime_error(
+            "Routed-expert participant workspace requires a valid CPU or GPU device");
+    }
+    if (profile.expert_count <= 0 ||
+        profile.expert_used_count <= 0 ||
+        profile.expert_feed_forward_length <= 0 ||
+        profile.d_model <= 0)
+    {
+        throw std::runtime_error(
+            "Routed-expert participant workspace requires complete MoE geometry");
+    }
+
+    const size_t batches =
+        static_cast<size_t>(std::max(1, geometry.batch_size));
+    const size_t rows =
+        static_cast<size_t>(std::max(1, geometry.resident_graph_rows));
+    const size_t top_k = static_cast<size_t>(profile.expert_used_count);
+    if (rows > static_cast<size_t>(std::numeric_limits<int>::max()) /
+                   batches ||
+        rows * batches >
+            static_cast<size_t>(std::numeric_limits<int>::max()) / top_k)
+    {
+        throw std::runtime_error(
+            "Routed-expert participant compact-row envelope exceeds integer geometry");
+    }
+
+    const int direct_rows = static_cast<int>(rows * batches);
+    const int compact_rows = static_cast<int>(rows * batches * top_k);
+
+    /*
+     * A node-local mapped follower retains MoEExpertComputeStage directly and
+     * therefore declares `(direct_rows, model_top_k)`. CPU and other explicit
+     * heterogeneous boundaries use MoELocalExpertStage, which declares one
+     * compact row per route as `(compact_rows, 1)`. The ROCm requirement is not
+     * algebraically interchangeable: router scratch scales with token rows,
+     * while grouped execution scratch also depends on top-k. Merge by stable
+     * workspace name exactly as the runtime serial-family allocator does.
+     */
+    WorkspaceRequirements direct_requirements;
+    WorkspaceRequirements compact_requirements;
+    if (geometry.device.is_cuda())
+    {
+        direct_requirements = MoEWorkspaceBuffers::cudaMoE(
+            direct_rows,
+            profile.d_model,
+            profile.expert_feed_forward_length,
+            profile.expert_count,
+            profile.expert_used_count);
+        compact_requirements = MoEWorkspaceBuffers::cudaMoE(
+            compact_rows,
+            profile.d_model,
+            profile.expert_feed_forward_length,
+            profile.expert_count,
+            /*top_k=*/1);
+    }
+    else
+    {
+        direct_requirements = MoEWorkspaceBuffers::rocmMoE(
+            direct_rows,
+            profile.d_model,
+            profile.expert_feed_forward_length,
+            profile.expert_count,
+            profile.expert_used_count);
+        compact_requirements = MoEWorkspaceBuffers::rocmMoE(
+            compact_rows,
+            profile.d_model,
+            profile.expert_feed_forward_length,
+            profile.expert_count,
+            /*top_k=*/1);
+    }
+    direct_requirements.merge(compact_requirements);
+    size_t bytes = direct_requirements.total_bytes_with_alignment();
+    WorkspaceMemoryGeometry expert_geometry = geometry;
+    expert_geometry.apportioned_routed_experts = true;
+    bytes = checkedAdd(
+        bytes,
+        cudaFloatingPointWorkspaceBytes(
+            profile,
+            expert_geometry,
+            static_cast<size_t>(compact_rows),
+            /*routed_only=*/true),
+        "CUDA local floating-expert requirements");
     return bytes;
 }
 

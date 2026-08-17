@@ -146,6 +146,12 @@ namespace llaminar2
 
     void NvidiaDeviceContext::workerLoop()
     {
+        /*
+         * Establish worker ownership before initialization can invoke a nested
+         * resource adapter. Other threads cannot observe the constructed
+         * context until initialized_ publishes this immutable identity.
+         */
+        worker_thread_id_ = std::this_thread::get_id();
         LOG_TRACE("[NvidiaDeviceContext] Worker thread starting for device " << device_ordinal_);
 
         // Initialize CUDA context on this thread
@@ -359,10 +365,9 @@ namespace llaminar2
     // Work Submission (Thread-Safe)
     // ============================================================================
 
-    void NvidiaDeviceContext::submitAndWait(std::function<void()> work)
+    bool NvidiaDeviceContext::ownsCurrentThread() const noexcept
     {
-        auto future = submitAsync(std::move(work));
-        future.wait();
+        return worker_thread_id_ == std::this_thread::get_id();
     }
 
     std::future<void> NvidiaDeviceContext::submitAsync(std::function<void()> work)

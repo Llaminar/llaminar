@@ -28,8 +28,11 @@ from native_vnni_dispatch.cpu_grouped_decode_sealed_plan import (  # noqa: E402
     write_cpu_grouped_sealed_plan,
 )
 from native_vnni_dispatch.paired_confirmation import (  # noqa: E402
+    CPU_ISOLATED_PAIRED_PROTOCOL_VERSION,
+    CPU_PROCESS_ISOLATED_TIMING_SCOPE,
     PAIRED_PROTOCOL_VERSION,
     REQUIRED_COLUMNS,
+    REQUIRED_COLUMNS_V4,
 )
 from native_vnni_dispatch.cpu_sealed_paired import (  # noqa: E402
     resolve_sealed_paired_evidence_paths,
@@ -263,8 +266,19 @@ class CPUGroupedSealedPlanTest(unittest.TestCase):
         self.manifest = _Manifest()
 
     @staticmethod
-    def _write_paired_evidence(path: Path, plan) -> None:
-        """Write strict byte-exact paired rows for every planned edge."""
+    def _write_paired_evidence(
+        path: Path,
+        plan,
+        *,
+        process_isolated: bool = True,
+    ) -> None:
+        """Write strict byte-exact paired rows for every planned edge.
+
+        CPU evidence capable of promoting a policy must identify a one-rank,
+        process-isolated timing environment.  The optional legacy form exists
+        solely to prove that final certification rejects historical co-run
+        evidence whose execution context cannot be authenticated.
+        """
 
         rows = []
         pair_count = 30
@@ -283,8 +297,12 @@ class CPUGroupedSealedPlanTest(unittest.TestCase):
                         else request.exact_candidate_id
                     )
                     latency = 12.0 if role == "selected" else 10.0
-                    rows.append({
-                        "protocol_version": PAIRED_PROTOCOL_VERSION,
+                    row = {
+                        "protocol_version": (
+                            CPU_ISOLATED_PAIRED_PROTOCOL_VERSION
+                            if process_isolated
+                            else PAIRED_PROTOCOL_VERSION
+                        ),
                         "request_id": request.request_id,
                         "backend": "cpu",
                         "architecture_class": request.architecture_class,
@@ -329,9 +347,22 @@ class CPUGroupedSealedPlanTest(unittest.TestCase):
                         "serial_m1_candidate_id": "cpu.serial.production",
                         "numerical_correctness": "1",
                         "correctness_pass": "1",
-                    })
+                    }
+                    if process_isolated:
+                        row.update({
+                            "timing_scope": CPU_PROCESS_ISOLATED_TIMING_SCOPE,
+                            "mpi_world_size": "1",
+                        })
+                    rows.append(row)
         with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=sorted(REQUIRED_COLUMNS))
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=sorted(
+                    REQUIRED_COLUMNS_V4
+                    if process_isolated
+                    else REQUIRED_COLUMNS
+                ),
+            )
             writer.writeheader()
             writer.writerows(rows)
 
@@ -421,6 +452,30 @@ class CPUGroupedSealedPlanTest(unittest.TestCase):
             for cell in single_cells
         ))
 
+    def test_seal_rejects_legacy_cpu_corun_timing_evidence(self) -> None:
+        """Unknown CPU co-run context may inform fitting but cannot certify."""
+
+        plan = self._plan()
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence_path = Path(temporary) / "paired.csv"
+            self._write_paired_evidence(
+                evidence_path,
+                plan,
+                process_isolated=False,
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "unauthenticated co-run environment",
+            ):
+                certify_cpu_grouped_sealed_pairs(
+                    self.rules,
+                    FROZEN_DIGEST,
+                    plan,
+                    (evidence_path,),
+                    bootstrap_replicates=1_000,
+                    workers=1,
+                )
+
     def test_burned_seal_becomes_generic_costs_and_not_a_reusable_reserve(
         self,
     ) -> None:
@@ -479,6 +534,25 @@ class CPUGroupedSealedPlanTest(unittest.TestCase):
                 SEALED_BUILD_ID,
                 burned_dimensions,
             )
+
+    def test_legacy_corun_seal_remains_development_only_evidence(self) -> None:
+        """A burned v3 seal may refine a fit but can never certify one."""
+
+        plan = self._plan()
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence_path = Path(temporary) / "paired.csv"
+            self._write_paired_evidence(
+                evidence_path,
+                plan,
+                process_isolated=False,
+            )
+            costs = cpu_grouped_burned_seal_costs(
+                self.development,
+                plan,
+                (evidence_path,),
+            )
+
+        self.assertEqual(set(costs), {rule.domain for rule in self.rules})
 
     def test_burned_seal_informs_an_additively_extended_corpus(self) -> None:
         """Historical paired costs survive later generic geometry additions."""

@@ -6,10 +6,11 @@
  * route groups and descriptor tables already resident on the GPU; no launch
  * reads route counts on the host and no stream synchronization is required.
  *
- * Small verifier buckets (M <= 8) use direct route-owned projections because
- * their latency is dominated by launch and directory overhead. Longer prefill
- * uses a compact device-built tile directory and a generated policy trained
- * across every execution codebook, reciprocal aspect ratio, and M anchor:
+ * Small verifier buckets and exact trained sparse-overlay shapes use direct
+ * route-owned projections because their latency is dominated by launch and
+ * directory overhead. Longer prefill uses a compact device-built tile
+ * directory and a generated policy trained across every execution codebook,
+ * reciprocal aspect ratio, and M anchor:
  *
  *   1. Reuse router-owned Q8 rows, or quantize each original hidden row once.
  *   2. Build a packed expert/tile directory entirely on the device.
@@ -38,12 +39,14 @@
 #include <cstdio>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../tensors/NativeVnniFormatInfo.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../common/NativeVNNIGroupedDecodePolicy.h"
 #include "../ops/ROCmSwiGLUDecodeEquivalentMath.h"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
 #include "ROCmMoEGroupedPrefillDispatchGenerated.inc"
 #include "ROCmMoEProductionPrefillOverlayGenerated.inc"
+#include "ROCmMoEGroupedPrefillRoutePolicy.h"
 
 // Local copy of DeviceNativeVNNIMatrixDesc to avoid pulling in x86-only headers
 // Must stay in sync with src/v2/tensors/TensorKernels.h
@@ -57,8 +60,19 @@ struct DeviceNativeVNNIMatrixDesc
     int k;
     uint32_t blocks_per_row;
     uint8_t codebook_id;
-    uint8_t reserved[3];
+    uint8_t allocation_payload_bytes_per_block;
+    uint8_t allocation_has_mins;
+    uint8_t allocation_has_emins;
+    uint8_t source_codebook_id;
+    uint8_t source_is_superblock;
+    uint8_t source_identity_present;
+    uint8_t reserved;
+    uint32_t reserved_tail;
 };
+
+static_assert(
+    sizeof(DeviceNativeVNNIMatrixDesc) == 56,
+    "ROCm grouped-prefill descriptor must match the shared device ABI");
 
 __device__ __forceinline__ void moe_prefill_fail_fast_invalid_grouped_index()
 {
@@ -83,6 +97,8 @@ enum NativeVNNIFormatPrefill : uint8_t {
     NVNNI_PF_IQ1_S   = 16,
     NVNNI_PF_IQ1_M   = 17,
     NVNNI_PF_Q8_0    = 19,
+    NVNNI_PF_EXPANDED_INT8_MIN =
+        llaminar2::kNativeVnniExpandedInt8MinCodebook,
 };
 
 /**
@@ -104,6 +120,25 @@ struct MoEPrefillSerialM1KPartitionPolicy
     {
         return codebook_id < 32 ? static_cast<int>(by_codebook[codebook_id]) : 0;
     }
+
+    /**
+     * @brief Select the source-format reduction tree for one execution matrix.
+     *
+     * Promoted CPU-native weights use an expanded device decoder but must keep
+     * the compact source format's serial-M1 partition boundaries. Canonical
+     * device formats without explicit provenance retain their execution id.
+     */
+    __host__ __device__ int forDescriptor(
+        const DeviceNativeVNNIMatrixDesc& desc) const
+    {
+        uint8_t policy_codebook = desc.source_identity_present
+                                      ? desc.source_codebook_id
+                                      : desc.codebook_id;
+        // Q8_1 and Q8_K prepare to the same signed-INT8 arithmetic as Q8_0.
+        if (policy_codebook == 20 || policy_codebook == 21)
+            policy_codebook = 19;
+        return forCodebook(policy_codebook);
+    }
 };
 
 extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
@@ -116,7 +151,9 @@ extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
 // Compile-time format properties for prefill (mirrors NVNNITraits in GEMV)
 template <NativeVNNIFormatPrefill FMT>
 struct PrefillNVNNITraits {
-    static constexpr bool is_asymmetric = (FMT == NVNNI_PF_Q4_1 || FMT == NVNNI_PF_Q5_1 || FMT == NVNNI_PF_IQ1_S);
+    static constexpr bool is_asymmetric =
+        FMT == NVNNI_PF_Q4_1 || FMT == NVNNI_PF_Q5_1 ||
+        FMT == NVNNI_PF_IQ1_S || FMT == NVNNI_PF_EXPANDED_INT8_MIN;
     static constexpr bool is_iq3_grid = (FMT == NVNNI_PF_IQ3_S || FMT == NVNNI_PF_IQ3_XXS);
     static constexpr bool is_iq2_grid = (FMT == NVNNI_PF_IQ2_S || FMT == NVNNI_PF_IQ2_XS || FMT == NVNNI_PF_IQ2_XXS);
     static constexpr bool is_iq1_grid = (FMT == NVNNI_PF_IQ1_S || FMT == NVNNI_PF_IQ1_M);
@@ -133,7 +170,8 @@ struct PrefillNVNNITraits {
     static constexpr bool is_6bit = (FMT == NVNNI_PF_Q6_K);
     static constexpr bool is_3bit = (FMT == NVNNI_PF_Q3_K);
     static constexpr bool is_2bit = (FMT == NVNNI_PF_Q2_K);
-    static constexpr bool is_8bit = (FMT == NVNNI_PF_Q8_0);
+    static constexpr bool is_8bit =
+        FMT == NVNNI_PF_Q8_0 || FMT == NVNNI_PF_EXPANDED_INT8_MIN;
     static constexpr bool uses_lut = (FMT == NVNNI_PF_IQ4_NL);
     static constexpr int payload_bytes =
         is_8bit ? 32 :
@@ -1422,7 +1460,7 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     int input_is_original_rows,
     int N,
     int K,
-    int k_partitions,
+    MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
     int num_experts,
     const uint32_t* __restrict__ adaptive_tile_count)
 {
@@ -1434,7 +1472,7 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     const int n = static_cast<int>(blockIdx.x) * TILE_N + threadIdx.x;
     const int directory_index = static_cast<int>(blockIdx.y);
     const int projection_role = static_cast<int>(blockIdx.z);
-    if (directory_index >= max_directory_tiles || n >= N || projection_role > 1)
+    if (directory_index >= max_directory_tiles || projection_role > 1)
         return;
     if (adaptive_tile_count &&
         directory_index >= static_cast<int>(*adaptive_tile_count))
@@ -1471,6 +1509,8 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
         return;
 
+    const int k_partitions = k_partition_policy.forDescriptor(desc);
+
     float* projection_out = projection_role == 0 ? gate_out : up_out;
     const int blocks_per_row = K / 32;
     if (k_partitions <= 0 ||
@@ -1482,6 +1522,14 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
         return;
     }
     const uint8_t* payload_base = desc.payload;
+    /*
+     * A trained TILE_N may be wider than N or leave a partial final column
+     * tile. Those lanes must still cross every LDS barrier because activation
+     * staging is distributed across the complete workgroup. They simply do no
+     * descriptor or output memory work. Returning them above would make the
+     * workgroup barrier protocol divergent and corrupt later row tiles.
+     */
+    const bool owns_column = n < N;
 
     __shared__ __align__(16) int32_t staged_A[TILE_M * 8];
     __shared__ float staged_scales[TILE_M];
@@ -1497,13 +1545,18 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
         const int end = min(begin + blocks_per_partition, blocks_per_row);
         for (int b = begin; b < end; ++b)
         {
-            const size_t linear =
-                static_cast<size_t>(b) * static_cast<size_t>(N) +
-                static_cast<size_t>(n);
+            size_t linear = 0u;
             constexpr int payload_bytes = PrefillNVNNITraits<FMT>::payload_bytes;
-            const uint8_t* payload = payload_base + linear * payload_bytes;
-            int32_t packed_groups[8];
-            moe_prefill_decode_groups<FMT>(payload, packed_groups);
+            const uint8_t* payload = nullptr;
+            int32_t packed_groups[8] = {};
+            if (owns_column)
+            {
+                linear =
+                    static_cast<size_t>(b) * static_cast<size_t>(N) +
+                    static_cast<size_t>(n);
+                payload = payload_base + linear * payload_bytes;
+                moe_prefill_decode_groups<FMT>(payload, packed_groups);
+            }
 
             const int staged_words = rows_in_tile * 8;
             for (int word = threadIdx.x; word < staged_words; word += blockDim.x)
@@ -1555,20 +1608,23 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
             }
             __syncthreads();
 
-#pragma unroll
-            for (int local_row = 0; local_row < TILE_M; ++local_row)
+            if (owns_column)
             {
-                if (local_row >= rows_in_tile)
-                    break;
-                partials[local_row] =
-                    moe_prefill_accumulate_decoded_block<FMT>(
-                        desc,
-                        linear,
-                        payload,
-                        packed_groups,
-                        staged_A + local_row * 8,
-                        staged_scales[local_row],
-                        partials[local_row]);
+#pragma unroll
+                for (int local_row = 0; local_row < TILE_M; ++local_row)
+                {
+                    if (local_row >= rows_in_tile)
+                        break;
+                    partials[local_row] =
+                        moe_prefill_accumulate_decoded_block<FMT>(
+                            desc,
+                            linear,
+                            payload,
+                            packed_groups,
+                            staged_A + local_row * 8,
+                            staged_scales[local_row],
+                            partials[local_row]);
+                }
             }
             __syncthreads();
         }
@@ -1585,15 +1641,18 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
         }
     }
 
-#pragma unroll
-    for (int local_row = 0; local_row < TILE_M; ++local_row)
+    if (owns_column)
     {
-        if (local_row >= rows_in_tile)
-            break;
-        const int grouped_slot = first_grouped_slot + local_row;
-        projection_out[
-            static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
-            static_cast<size_t>(n)] = totals[local_row];
+#pragma unroll
+        for (int local_row = 0; local_row < TILE_M; ++local_row)
+        {
+            if (local_row >= rows_in_tile)
+                break;
+            const int grouped_slot = first_grouped_slot + local_row;
+            projection_out[
+                static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
+                static_cast<size_t>(n)] = totals[local_row];
+        }
     }
 }
 
@@ -1635,7 +1694,7 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
     int input_is_original_rows,
     int N,
     int K,
-    int k_partitions,
+    MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
     int num_experts)
 {
     static_assert(TILE_N == 64 || TILE_N == 128 || TILE_N == 256,
@@ -1700,6 +1759,8 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
         projection_role == 0 ? gate_descs[expert_id] : up_descs[expert_id];
     if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
         return;
+
+    const int k_partitions = k_partition_policy.forDescriptor(desc);
 
     const int blocks_per_row = K / 32;
     int input_row = grouped_slot;
@@ -1811,7 +1872,7 @@ void moe_grouped_gate_up_decode_equivalent_prefill_kernel(
  * @param input_is_original_rows Whether activation rows are token-owned.
  * @param N Projection output width.
  * @param K Projection reduction width.
- * @param k_partitions Exact effective serial-M1 partition count.
+ * @param k_partition_policy Source-codebook-indexed serial-M1 partition policy.
  * @param num_experts Number of descriptors in each table.
  */
 template <
@@ -1834,7 +1895,7 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
     int input_is_original_rows,
     int N,
     int K,
-    int k_partitions,
+    MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
     int num_experts)
 {
     constexpr bool kStageIQ2SGrid = FMT == NVNNI_PF_IQ2_S;
@@ -1868,7 +1929,7 @@ void launch_moe_grouped_gate_up_route_owned_geometry(
         input_is_original_rows,
         N,
         K,
-        k_partitions,
+        k_partition_policy,
         num_experts);
 }
 
@@ -1899,7 +1960,7 @@ void launch_moe_grouped_gate_up_route_owned(
     int input_is_original_rows,
     int N,
     int K,
-    int k_partitions,
+    MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
     int num_experts)
 {
     if constexpr (FMT == NVNNI_PF_IQ2_S)
@@ -1910,7 +1971,7 @@ void launch_moe_grouped_gate_up_route_owned(
                 stream, A_int8, scales_A_blockwise, original_to_grouped,
                 original_expert_ids, gate_descs, up_descs, gate_out, up_out,
                 total_slots, seq_len, top_k, input_is_original_rows,
-                N, K, k_partitions, num_experts);
+                N, K, k_partition_policy, num_experts);
         }
         else
         {
@@ -1918,7 +1979,7 @@ void launch_moe_grouped_gate_up_route_owned(
                 stream, A_int8, scales_A_blockwise, original_to_grouped,
                 original_expert_ids, gate_descs, up_descs, gate_out, up_out,
                 total_slots, seq_len, top_k, input_is_original_rows,
-                N, K, k_partitions, num_experts);
+                N, K, k_partition_policy, num_experts);
         }
     }
     else if constexpr (FMT == NVNNI_PF_Q6_K)
@@ -1927,7 +1988,7 @@ void launch_moe_grouped_gate_up_route_owned(
             stream, A_int8, scales_A_blockwise, original_to_grouped,
             original_expert_ids, gate_descs, up_descs, gate_out, up_out,
             total_slots, seq_len, top_k, input_is_original_rows,
-            N, K, k_partitions, num_experts);
+            N, K, k_partition_policy, num_experts);
     }
     else
     {
@@ -1935,7 +1996,7 @@ void launch_moe_grouped_gate_up_route_owned(
             stream, A_int8, scales_A_blockwise, original_to_grouped,
             original_expert_ids, gate_descs, up_descs, gate_out, up_out,
             total_slots, seq_len, top_k, input_is_original_rows,
-            N, K, k_partitions, num_experts);
+            N, K, k_partition_policy, num_experts);
     }
 }
 
@@ -2019,7 +2080,7 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
     int max_directory_tiles,
     int N,
     int K,
-    int k_partitions,
+    MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
     int num_experts,
     const uint32_t* __restrict__ adaptive_tile_count)
 {
@@ -2030,7 +2091,7 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
                   "grouped-prefill down supports column tiles 64/128/256");
     const int n = static_cast<int>(blockIdx.x) * TILE_N + threadIdx.x;
     const int directory_index = static_cast<int>(blockIdx.y);
-    if (directory_index >= max_directory_tiles || n >= N)
+    if (directory_index >= max_directory_tiles)
         return;
     if (adaptive_tile_count &&
         directory_index >= static_cast<int>(*adaptive_tile_count))
@@ -2066,6 +2127,8 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
     if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
         return;
 
+    const int k_partitions = k_partition_policy.forDescriptor(desc);
+
     const int blocks_per_row = K / 32;
     if (k_partitions <= 0 ||
         k_partitions > blocks_per_row ||
@@ -2076,6 +2139,12 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
         return;
     }
     const uint8_t* payload_base = desc.payload;
+    /*
+     * Inactive lanes in a partial column tile are still participants in the
+     * LDS producer/consumer protocol. Keep them alive through every barrier,
+     * while guarding descriptor reads and final stores with this ownership bit.
+     */
+    const bool owns_column = n < N;
     __shared__ __align__(16) int32_t staged_A[TILE_M * 8];
     __shared__ float staged_scales[TILE_M];
     float totals[TILE_M] = {};
@@ -2090,13 +2159,18 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
         const int end = min(begin + blocks_per_partition, blocks_per_row);
         for (int b = begin; b < end; ++b)
         {
-            const size_t linear =
-                static_cast<size_t>(b) * static_cast<size_t>(N) +
-                static_cast<size_t>(n);
+            size_t linear = 0u;
             constexpr int payload_bytes = PrefillNVNNITraits<FMT>::payload_bytes;
-            const uint8_t* payload = payload_base + linear * payload_bytes;
-            int32_t packed_groups[8];
-            moe_prefill_decode_groups<FMT>(payload, packed_groups);
+            const uint8_t* payload = nullptr;
+            int32_t packed_groups[8] = {};
+            if (owns_column)
+            {
+                linear =
+                    static_cast<size_t>(b) * static_cast<size_t>(N) +
+                    static_cast<size_t>(n);
+                payload = payload_base + linear * payload_bytes;
+                moe_prefill_decode_groups<FMT>(payload, packed_groups);
+            }
 
             const int staged_words = rows_in_tile * 8;
             for (int word = threadIdx.x; word < staged_words; word += blockDim.x)
@@ -2120,20 +2194,23 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
             }
             __syncthreads();
 
-#pragma unroll
-            for (int local_row = 0; local_row < TILE_M; ++local_row)
+            if (owns_column)
             {
-                if (local_row >= rows_in_tile)
-                    break;
-                partials[local_row] =
-                    moe_prefill_accumulate_decoded_block<FMT>(
-                        desc,
-                        linear,
-                        payload,
-                        packed_groups,
-                        staged_A + local_row * 8,
-                        staged_scales[local_row],
-                        partials[local_row]);
+#pragma unroll
+                for (int local_row = 0; local_row < TILE_M; ++local_row)
+                {
+                    if (local_row >= rows_in_tile)
+                        break;
+                    partials[local_row] =
+                        moe_prefill_accumulate_decoded_block<FMT>(
+                            desc,
+                            linear,
+                            payload,
+                            packed_groups,
+                            staged_A + local_row * 8,
+                            staged_scales[local_row],
+                            partials[local_row]);
+                }
             }
             __syncthreads();
         }
@@ -2150,15 +2227,18 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
         }
     }
 
-#pragma unroll
-    for (int local_row = 0; local_row < TILE_M; ++local_row)
+    if (owns_column)
     {
-        if (local_row >= rows_in_tile)
-            break;
-        const int grouped_slot = first_grouped_slot + local_row;
-        down_partials[
-            static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
-            static_cast<size_t>(n)] = totals[local_row];
+#pragma unroll
+        for (int local_row = 0; local_row < TILE_M; ++local_row)
+        {
+            if (local_row >= rows_in_tile)
+                break;
+            const int grouped_slot = first_grouped_slot + local_row;
+            down_partials[
+                static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) +
+                static_cast<size_t>(n)] = totals[local_row];
+        }
     }
 }
 
@@ -2280,6 +2360,9 @@ __device__ __forceinline__ float moe_prefill_dot_desc_serial_m1_dispatch(
     case NVNNI_PF_Q8_0:
         return moe_prefill_dot_desc_serial_m1<NVNNI_PF_Q8_0>(
             desc, n, slot_A, slot_scales, N, k_partitions);
+    case NVNNI_PF_EXPANDED_INT8_MIN:
+        return moe_prefill_dot_desc_serial_m1<NVNNI_PF_EXPANDED_INT8_MIN>(
+            desc, n, slot_A, slot_scales, N, k_partitions);
     default:
         moe_prefill_fail_fast_invalid_grouped_index();
         return 0.0f;
@@ -2317,7 +2400,7 @@ __device__ __forceinline__ float moe_prefill_down_dot(
             slot_A,
             slot_scales,
             N,
-            k_partition_policy.forCodebook(desc.codebook_id));
+            k_partition_policy.forDescriptor(desc));
     }
     else
     {
@@ -2340,8 +2423,7 @@ __device__ __forceinline__ float moe_prefill_down_dot(
             slot_A,
             slot_scales,
             N,
-            k_partition_policy.forCodebook(
-                static_cast<uint8_t>(kFormat)));
+            k_partition_policy.forDescriptor(desc));
     }
 }
 
@@ -2699,8 +2781,16 @@ namespace
         llaminar2::rocm::generated::ROCmMoEGroupedPrefillConfig generated{};
         const uint8_t role_id =
             role == MoEPrefillProjectionRole::GateUp ? 0u : 1u;
+        // Expanded asymmetric INT8 has codebook-19 payload traffic and the
+        // same launch geometry. It deliberately inherits the sealed codebook-
+        // 19 policy until a dedicated synthetic-format corpus is certified;
+        // execution and telemetry retain codebook 23.
+        const uint8_t policy_codebook =
+            format == NVNNI_PF_EXPANDED_INT8_MIN
+                ? static_cast<uint8_t>(NVNNI_PF_Q8_0)
+                : static_cast<uint8_t>(format);
         if (!llaminar2::rocm::generated::selectROCmMoEGroupedPrefillGenerated(
-                static_cast<uint8_t>(format), role_id, m, n, k, generated))
+                policy_codebook, role_id, m, n, k, generated))
         {
             return config;
         }
@@ -2751,9 +2841,15 @@ namespace
 
         llaminar2::rocm::generated::ROCmMoEProductionPrefillOverlayConfig
             exact{};
+        const auto policy_codebook = [](int codebook)
+        {
+            return codebook == NVNNI_PF_EXPANDED_INT8_MIN
+                       ? static_cast<uint8_t>(NVNNI_PF_Q8_0)
+                       : static_cast<uint8_t>(codebook);
+        };
         if (!llaminar2::rocm::generated::selectROCmMoEProductionPrefillOverlay(
-                static_cast<uint8_t>(gateup_codebook),
-                static_cast<uint8_t>(down_codebook),
+                policy_codebook(gateup_codebook),
+                policy_codebook(down_codebook),
                 hidden_size,
                 expert_width,
                 expert_count,
@@ -3207,6 +3303,8 @@ bool rocmMoE_grouped_prefill_query_kernel_resources(
     case NVNNI_PF_IQ1_S: QUERY_TILE_M(NVNNI_PF_IQ1_S);
     case NVNNI_PF_IQ1_M: QUERY_TILE_M(NVNNI_PF_IQ1_M);
     case NVNNI_PF_Q8_0: QUERY_TILE_M(NVNNI_PF_Q8_0);
+    case NVNNI_PF_EXPANDED_INT8_MIN:
+        QUERY_TILE_M(NVNNI_PF_EXPANDED_INT8_MIN);
     default: break;
     }
 
@@ -3254,6 +3352,10 @@ bool rocmMoE_grouped_prefill_pipeline(
     // in each descriptor table. Mixed-codebook expert tables remain supported.
     uint32_t gateup_codebook_mask,
     uint32_t down_codebook_mask,
+    // Policy masks retain the original source codebooks after representation
+    // normalization (for example compact Q5_1 promoted to expanded INT8+min).
+    uint32_t gateup_policy_codebook_mask,
+    uint32_t down_policy_codebook_mask,
     int device_id,
     void* stream)
 {
@@ -3261,7 +3363,9 @@ bool rocmMoE_grouped_prefill_pipeline(
         d_model <= 0 || intermediate <= 0 ||
         total_slots <= 0 || top_k <= 0 || (total_slots % top_k) != 0 ||
         (d_model % 32) != 0 || (intermediate % 32) != 0 ||
-        gateup_codebook_mask == 0 || down_codebook_mask == 0 || !stream)
+        gateup_codebook_mask == 0 || down_codebook_mask == 0 ||
+        gateup_policy_codebook_mask == 0 ||
+        down_policy_codebook_mask == 0 || !stream)
         return false;
     if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_down_desc_table ||
         !d_group_counts || !d_group_offsets || !d_group_token_indices ||
@@ -3274,10 +3378,28 @@ bool rocmMoE_grouped_prefill_pipeline(
     const int seq_len = total_slots / top_k;
     const bool canonical_publication =
         d_canonical_route_contributions != nullptr;
-    const bool use_expert_row_tiles = seq_len > 8;
     const bool has_uniform_codebook_pair =
         moe_prefill_single_codebook(gateup_codebook_mask) >= 0 &&
         moe_prefill_single_codebook(down_codebook_mask) >= 0;
+    const int gateup_codebook =
+        moe_prefill_single_codebook(gateup_codebook_mask);
+    const int down_codebook =
+        moe_prefill_single_codebook(down_codebook_mask);
+    const auto route_decision =
+        llaminar2::rocm::selectROCmMoEGroupedPrefillRouteStrategy({
+            .gateup_codebook = static_cast<uint8_t>(gateup_codebook),
+            .down_codebook = static_cast<uint8_t>(down_codebook),
+            .hidden_size = d_model,
+            .expert_width = intermediate,
+            .expert_count = num_experts,
+            .top_k = top_k,
+            .rows = seq_len,
+        });
+    if (!route_decision.valid())
+        return false;
+    const bool use_expert_row_tiles =
+        route_decision.strategy ==
+        llaminar2::rocm::ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled;
     const MoEPrefillPairConfig pair_config =
         use_expert_row_tiles && has_uniform_codebook_pair
             ? moe_prefill_select_pair_config(
@@ -3301,12 +3423,12 @@ bool rocmMoE_grouped_prefill_pipeline(
     MoEPrefillSerialM1KPartitionPolicy gateup_k_partition_policy{};
     MoEPrefillSerialM1KPartitionPolicy down_k_partition_policy{};
     if (!moe_prefill_resolve_serial_m1_k_partitions(
-            gateup_codebook_mask,
+            gateup_policy_codebook_mask,
             intermediate,
             d_model,
             gateup_k_partition_policy) ||
         !moe_prefill_resolve_serial_m1_k_partitions(
-            down_codebook_mask,
+            down_policy_codebook_mask,
             d_model,
             intermediate,
             down_k_partition_policy))
@@ -3505,8 +3627,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     d_original_to_grouped, d_original_expert_ids, gate_descs, up_descs, \
                     d_scratch_gate, d_scratch_up, total_slots, seq_len, top_k, \
                     1, intermediate, d_model, \
-                    gateup_k_partition_policy.forCodebook( \
-                        static_cast<uint8_t>(FMT)), num_experts); \
+                    gateup_k_partition_policy, num_experts); \
             } while (0)
         #define LAUNCH_GATEUP_ADAPTIVE(FMT, TN) \
             do { \
@@ -3530,8 +3651,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     gate_descs, up_descs, d_scratch_gate, d_scratch_up, \
                     adaptive_directory.tile12_capacity, seq_len, top_k, grouped_indices_are_route_slots, \
                     1, intermediate, d_model, \
-                    gateup_k_partition_policy.forCodebook( \
-                        static_cast<uint8_t>(FMT)), num_experts, \
+                    gateup_k_partition_policy, num_experts, \
                     adaptive_directory.header + \
                         kMoEPrefillAdaptiveTile12CountWord); \
                 hipLaunchKernelGGL( \
@@ -3544,8 +3664,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     gate_descs, up_descs, d_scratch_gate, d_scratch_up, \
                     adaptive_directory.tile16_capacity, seq_len, top_k, grouped_indices_are_route_slots, \
                     1, intermediate, d_model, \
-                    gateup_k_partition_policy.forCodebook( \
-                        static_cast<uint8_t>(FMT)), num_experts, \
+                    gateup_k_partition_policy, num_experts, \
                     adaptive_directory.header + \
                         kMoEPrefillAdaptiveTile16CountWord); \
             } while (0)
@@ -3566,8 +3685,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     gate_descs, up_descs, d_scratch_gate, d_scratch_up, \
                     candidate_directory_capacity, seq_len, top_k, grouped_indices_are_route_slots, \
                     1, intermediate, d_model, \
-                    gateup_k_partition_policy.forCodebook( \
-                        static_cast<uint8_t>(FMT)), num_experts, nullptr); \
+                    gateup_k_partition_policy, num_experts, nullptr); \
             } while (0)
 
         #define DISPATCH_GATEUP_TILE_N(FMT, TM, CONFIG) \
@@ -3635,6 +3753,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ1_S);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_IQ1_M);
         LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_Q8_0);
+        LAUNCH_GATEUP_IF_PRESENT(NVNNI_PF_EXPANDED_INT8_MIN);
         if (!launched_gateup)
         {
                 fprintf(stderr, "[rocmMoE_grouped_prefill_pipeline] unsupported gate/up codebook mask=0x%x\n",
@@ -3727,6 +3846,7 @@ bool rocmMoE_grouped_prefill_pipeline(
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ1_S);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_IQ1_M);
             LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_Q8_0);
+            LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT(NVNNI_PF_EXPANDED_INT8_MIN);
             default:
                 if (down_codebook_mask == 0 ||
                     (down_codebook_mask & (down_codebook_mask - 1u)) == 0)
@@ -3760,8 +3880,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         d_group_counts, d_group_offsets, \
                             reinterpret_cast<const uint32_t*>(d_group_work_directory), \
                             d_scratch_gate, candidate_directory_capacity, d_model, intermediate, \
-                            down_k_partition_policy.forCodebook( \
-                            static_cast<uint8_t>(FMT)), num_experts, nullptr); \
+                            down_k_partition_policy, num_experts, nullptr); \
                 } while (0)
             #define LAUNCH_DOWN_ADAPTIVE(FMT, TN) \
                 do { \
@@ -3782,8 +3901,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         d_group_counts, d_group_offsets, \
                         adaptive_directory.tile12, \
                         d_scratch_gate, adaptive_directory.tile12_capacity, d_model, intermediate, \
-                        down_k_partition_policy.forCodebook( \
-                            static_cast<uint8_t>(FMT)), num_experts, \
+                        down_k_partition_policy, num_experts, \
                         adaptive_directory.header + \
                             kMoEPrefillAdaptiveTile12CountWord); \
                     hipLaunchKernelGGL( \
@@ -3793,8 +3911,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         d_group_counts, d_group_offsets, \
                         adaptive_directory.tile16, \
                         d_scratch_gate, adaptive_directory.tile16_capacity, d_model, intermediate, \
-                        down_k_partition_policy.forCodebook( \
-                            static_cast<uint8_t>(FMT)), num_experts, \
+                        down_k_partition_policy, num_experts, \
                         adaptive_directory.header + \
                             kMoEPrefillAdaptiveTile16CountWord); \
                 } while (0)
@@ -3858,6 +3975,7 @@ bool rocmMoE_grouped_prefill_pipeline(
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_S);
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_IQ1_M);
             LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_Q8_0);
+            LAUNCH_DOWN_IF_PRESENT(NVNNI_PF_EXPANDED_INT8_MIN);
             #undef LAUNCH_DOWN_IF_PRESENT
             #undef DISPATCH_DOWN_CONFIG
             #undef DISPATCH_DOWN_TILE_N

@@ -19,6 +19,9 @@
 #pragma once
 
 #include "../execution/config/RoutedExpertPolicy.h"
+#include "../execution/moe/MoEOverlayActivationPacketABI.h"
+#include "../execution/moe/MoEOverlayNodeLocalRouteExchangeABI.h"
+#include "../execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "../execution/moe/DeviceMoERebalanceController.h"
 #include "../tensors/TensorKernels.h"
 
@@ -385,6 +388,13 @@ namespace llaminar2
          *        count for a fixed-width graph. Rows at or above this value
          *        must publish `expert=-1, weight=0` and cannot reach expert
          *        state. The pointer is replay data, not graph identity.
+         * @param deferred_selected_route_ledger Optional per-layer runtime
+         *        whose immutable-address verifier ledger receives selected
+         *        expert IDs in the same top-k kernel. Participant IDs are
+         *        written as `-1`; this contract is reserved for a manual
+         *        heterogeneous overlay boundary where execution ownership is
+         *        resolved outside this device graph. Passing a non-null ledger
+         *        requires capacity for `seq_len * top_k` route slots.
          *
          * The default deliberately returns false; verifier correctness should fail
          * loudly on a backend that has not implemented the rowwise contract.
@@ -394,7 +404,8 @@ namespace llaminar2
             int seq_len, int d_model, int num_experts, int top_k,
             bool normalize_weights,
             ITensor *output_indices, ITensor *output_weights,
-            const int *device_effective_seq_len = nullptr)
+            const int *device_effective_seq_len = nullptr,
+            DeviceMoELayerRuntime *deferred_selected_route_ledger = nullptr)
         {
             (void)hidden;
             (void)gate_weights;
@@ -406,6 +417,7 @@ namespace llaminar2
             (void)output_indices;
             (void)output_weights;
             (void)device_effective_seq_len;
+            (void)deferred_selected_route_ledger;
             return false;
         }
 
@@ -737,6 +749,53 @@ namespace llaminar2
         }
 
         /**
+         * @brief Publish a persistent contiguous-floating down table.
+         *
+         * Blank entries represent experts not resident on this participant.
+         * Every non-blank entry uses @p weight_format and exact row-major
+         * geometry. The returned id occupies the same typed table namespace as
+         * NativeVNNI tables so captured callers cannot accidentally combine
+         * descriptor families.
+         */
+        virtual int uploadGroupedExpertFloatingDownDescriptorTable(
+            const DeviceMoEFloatingMatrixDesc *down_descs,
+            DeviceMoEWeightFormat weight_format,
+            int num_experts,
+            int d_model,
+            int intermediate)
+        {
+            (void)down_descs;
+            (void)weight_format;
+            (void)num_experts;
+            (void)d_model;
+            (void)intermediate;
+            return -1;
+        }
+
+        /**
+         * @brief Publish persistent contiguous-floating gate/up tables.
+         *
+         * Gate and up entries must be blank together or form a complete pair
+         * with the same @p weight_format and projection geometry.
+         */
+        virtual int uploadGroupedExpertFloatingGateUpDescriptorTables(
+            const DeviceMoEFloatingMatrixDesc *gate_descs,
+            const DeviceMoEFloatingMatrixDesc *up_descs,
+            DeviceMoEWeightFormat weight_format,
+            int num_experts,
+            int d_model,
+            int intermediate)
+        {
+            (void)gate_descs;
+            (void)up_descs;
+            (void)weight_format;
+            (void)num_experts;
+            (void)d_model;
+            (void)intermediate;
+            return -1;
+        }
+
+        /**
          * @brief Refresh an existing persistent down descriptor table in place.
          *
          * Graph-captured grouped decode records the device pointer for the table,
@@ -777,6 +836,51 @@ namespace llaminar2
             (void)descriptor_table_id;
             (void)gate_descs;
             (void)up_descs;
+            (void)num_experts;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
+        /**
+         * @brief Refresh a floating down table without changing its address.
+         *
+         * Runtime movement may replace payload pointers, but captured table
+         * identity, precision, and geometry remain immutable.
+         */
+        virtual bool updateGroupedExpertFloatingDownDescriptorTable(
+            int descriptor_table_id,
+            const DeviceMoEFloatingMatrixDesc *down_descs,
+            DeviceMoEWeightFormat weight_format,
+            int num_experts,
+            int d_model,
+            int intermediate)
+        {
+            (void)descriptor_table_id;
+            (void)down_descs;
+            (void)weight_format;
+            (void)num_experts;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
+        /**
+         * @brief Refresh paired floating gate/up tables in their stable slots.
+         */
+        virtual bool updateGroupedExpertFloatingGateUpDescriptorTables(
+            int descriptor_table_id,
+            const DeviceMoEFloatingMatrixDesc *gate_descs,
+            const DeviceMoEFloatingMatrixDesc *up_descs,
+            DeviceMoEWeightFormat weight_format,
+            int num_experts,
+            int d_model,
+            int intermediate)
+        {
+            (void)descriptor_table_id;
+            (void)gate_descs;
+            (void)up_descs;
+            (void)weight_format;
             (void)num_experts;
             (void)d_model;
             (void)intermediate;
@@ -1236,6 +1340,435 @@ namespace llaminar2
             int participant_count,
             const int *device_effective_seq_len = nullptr);
 
+        // =================================================================
+        // Captured ExpertOverlay sparse activation transactions
+        // =================================================================
+
+        /**
+         * @brief Compact one target participant's routes into shared pages.
+         *
+         * GPU implementations enqueue metadata and payload kernels on the
+         * exact @p launch stream. The caller subsequently publishes the lane's
+         * dispatch timeline through TransferEngine on that same stream. No
+         * method may synchronize or inspect live counts on the host.
+         */
+        virtual bool packMoEOverlayActivationDispatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationDispatchPackLaunch &packet)
+        {
+            (void)launch;
+            (void)packet;
+            return false;
+        }
+
+        /**
+         * @brief Validate and expand a dispatch after its exact timeline wait.
+         *
+         * Unused fixed-capacity rows and route slots are cleared on device.
+         * Semantic failures leave the live-row scalar zero so stale packet
+         * bytes can never reach participant-local expert compute.
+         */
+        virtual bool consumeMoEOverlayActivationDispatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationDispatchConsumeLaunch &packet)
+        {
+            (void)launch;
+            (void)packet;
+            return false;
+        }
+
+        /**
+         * @brief Compact follower-local expert output into shared return pages.
+         *
+         * The caller publishes the matching return timeline through
+         * TransferEngine after this enqueue on the same exact stream.
+         */
+        virtual bool packMoEOverlayActivationReturn(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationReturnPackLaunch &packet)
+        {
+            (void)launch;
+            (void)packet;
+            return false;
+        }
+
+        /**
+         * @brief Validate and accumulate one participant return in fixed order.
+         *
+         * Graph construction invokes this once per participant in canonical
+         * planner order on one stream. One thread owns each output element and
+         * no atomics are used, retaining deterministic FP32 addition order.
+         */
+        virtual bool consumeMoEOverlayActivationReturn(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationReturnConsumeLaunch &packet)
+        {
+            (void)launch;
+            (void)packet;
+            return false;
+        }
+
+        /**
+         * @brief Pack one direct-mapped row and publish it in one graph node.
+         *
+         * The fixed one-row geometry lets one cooperative block preserve the
+         * ordinary packet arithmetic while issuing the final system-release
+         * timeline store itself. This method is not a fallback for wider
+         * geometry; unsupported or incomplete launches must fail.
+         */
+        virtual bool packSingleRowMoEOverlayActivationDispatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowDispatchPackLaunch &packet)
+        {
+            (void)launch;
+            (void)packet;
+            return false;
+        }
+
+        /**
+         * @brief Acquire, validate, and expand one direct-mapped row atomically.
+         *
+         * A single cooperative block waits on the exact mapped lease, validates
+         * the authenticated descriptor, and materializes hidden/routes without
+         * a scheduler-visible gap or host-owned state.
+         */
+        virtual bool consumeSingleRowMoEOverlayActivationDispatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowDispatchConsumeLaunch &packet)
+        {
+            (void)launch;
+            (void)packet;
+            return false;
+        }
+
+        /**
+         * @brief Pack and system-release one direct-mapped return row.
+         *
+         * The release store occurs only after every cooperative thread has
+         * written its assigned columns, making the one kernel the complete
+         * follower publication edge.
+         */
+        virtual bool packSingleRowMoEOverlayActivationReturn(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowReturnPackLaunch &packet)
+        {
+            (void)launch;
+            (void)packet;
+            return false;
+        }
+
+        /**
+         * @brief Acquire and fold one direct-mapped return row in one graph node.
+         *
+         * Parent graph order still supplies canonical participant ordering, so
+         * fusing the wait and fold does not alter FP32 addition order.
+         */
+        virtual bool consumeSingleRowMoEOverlayActivationReturn(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowReturnConsumeLaunch &packet)
+        {
+            (void)launch;
+            (void)packet;
+            return false;
+        }
+
+        /**
+         * @brief Publish all independent one-row continuation lanes in one launch.
+         *
+         * The persistent descriptor array is topology-sized during setup. GPU
+         * implementations assign one block to each lane; there is no host loop,
+         * participant-count specialization, or cross-lane arithmetic.
+         */
+        virtual bool packSingleRowMoEOverlayActivationDispatchBatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowDispatchBatchLaunch &packet)
+        {
+            (void)launch;
+            (void)packet;
+            return false;
+        }
+
+        /**
+         * @brief Acquire remote rows concurrently and fold them deterministically.
+         *
+         * Implementations enqueue a topology-parallel gather followed by one
+         * planner-ordered FP32 fold on the same exact stream. Both operations
+         * are graph-capturable and allocation-free.
+         */
+        virtual bool consumeSingleRowMoEOverlayActivationReturnBatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowReturnBatchLaunch &packet)
+        {
+            (void)launch;
+            (void)packet;
+            return false;
+        }
+
+        /**
+         * @brief Validate multi-row lanes in parallel and fold them once.
+         *
+         * The persistent descriptor array is planner ordered. Implementations
+         * must retain that exact order in FP32 while assigning validation and
+         * row-index construction independently across lanes.
+         */
+        virtual bool consumeMultiRowMoEOverlayActivationReturnBatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationMultiRowReturnBatchLaunch &packet)
+        {
+            (void)launch;
+            (void)packet;
+            return false;
+        }
+
+        /**
+         * @brief Publish this participant's assigned canonical routes locally.
+         *
+         * The producer copies only route slots selected by the authoritative
+         * device runtime table into its mapped node-local lane and advances the
+         * lane epoch on @p launch.stream. Implementations must not synchronize
+         * the stream or materialize route ownership on the host.
+         */
+        virtual bool publishNodeLocalCanonicalRoutes(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalRoutePublishLaunch &publication)
+        {
+            (void)launch;
+            (void)publication;
+            return false;
+        }
+
+        /**
+         * @brief Acquire all local peer-route epochs on the exact root stream.
+         *
+         * This operation deliberately ends before bulk payload consumption so
+         * TransferEngine can insert captured H2D DMA nodes on the same stream.
+         */
+        virtual bool acquireNodeLocalCanonicalRoutes(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalRouteConsumeLaunch &consumption)
+        {
+            (void)launch;
+            (void)consumption;
+            return false;
+        }
+
+        /**
+         * @brief Stage only peer-owned mapped rows into root-device scratch.
+         *
+         * Implementations enqueue a fixed-shape sparse copy kernel after the
+         * epoch acquire and before validation/fold. No host-visible route count
+         * or variable graph node is permitted.
+         */
+        virtual bool stageNodeLocalCanonicalRoutes(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalRouteConsumeLaunch &consumption)
+        {
+            (void)launch;
+            (void)consumption;
+            return false;
+        }
+
+        /**
+         * @brief Validate staged peer routes, fold in order, and acknowledge.
+         *
+         * The continuation root consumes peer rows from stable root-device
+         * scratch, validates every mapped slot tag, and writes the dense routed
+         * output using the fixed FP32 route order. Participants outside this
+         * node-local fabric contribute zero and are folded by their explicit
+         * heterogeneous return stages later in the captured graph.
+         */
+        virtual bool foldNodeLocalCanonicalRoutes(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalRouteConsumeLaunch &consumption)
+        {
+            (void)launch;
+            (void)consumption;
+            return false;
+        }
+
+        // =================================================================
+        // Captured ExpertOverlay epoch admission and maintenance
+        // =================================================================
+
+        /**
+         * @brief Acquire the currently published immutable placement bank.
+         *
+         * GPU implementations enqueue one bounded, graph-capturable kernel on
+         * @p launch.stream.  The kernel installs a reader before publishing the
+         * request-lifetime @p ticket.  CPU executes the identical lifecycle
+         * directly against its authoritative host control block.
+         *
+         * @param launch Exact stage-owned stream/workspace binding.
+         * @param control Authoritative backend-resident epoch control block.
+         * @param ticket Persistent request ticket, overwritten on success.
+         * @param status Persistent semantic completion record.
+         * @return True when the operation executed or was enqueued; inspect
+         *         @p status through an ordered consumer for semantic success.
+         */
+        virtual bool acquireMoEOverlayEpoch(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            DeviceMoEOverlayEpochTicket *ticket,
+            DeviceMoEOverlayEpochStatus *status)
+        {
+            (void)launch;
+            (void)control;
+            (void)ticket;
+            (void)status;
+            return false;
+        }
+
+        /**
+         * @brief Release the reader held by one request-lifetime placement ticket.
+         *
+         * A successful release clears @p ticket so replay can acquire a fresh
+         * epoch without a host reset.  A stale, malformed, or already released
+         * ticket is a semantic failure recorded in @p status.
+         */
+        virtual bool releaseMoEOverlayEpoch(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            DeviceMoEOverlayEpochTicket *ticket,
+            DeviceMoEOverlayEpochStatus *status)
+        {
+            (void)launch;
+            (void)control;
+            (void)ticket;
+            (void)status;
+            return false;
+        }
+
+        /**
+         * @brief Reserve the reusable non-published bank for a newer epoch.
+         *
+         * @p candidate_epoch points to backend-owned live state so a captured
+         * maintenance graph can process successive epochs without recapture.
+         */
+        virtual bool reserveMoEOverlayEpochCandidate(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status)
+        {
+            (void)launch;
+            (void)control;
+            (void)candidate_epoch;
+            (void)status;
+            return false;
+        }
+
+        /**
+         * @brief Normalize and atomically publish a completed durable rebalance.
+         *
+         * The prior reserve status selects the one writable peer bank. A
+         * successful apply may have changed only a subset of layers, so this
+         * operation clones every untouched published layer into that peer,
+         * stamps one common epoch, and switches ticket admission only after the
+         * complete family is visible. A no-work apply aborts the candidate; a
+         * busy/failed reservation is a device-side no-op. On successful
+         * publication @p candidate_epoch advances in place for graph replay.
+         *
+         * @param launch Exact maintenance stream/workspace binding.
+         * @param runtime_layers Canonical main-model placement table.
+         * @param layer_count Complete durable model-layer count.
+         * @param expert_count Logical experts per layer.
+         * @param control Authoritative epoch publication control.
+         * @param candidate_epoch Persistent next-epoch scalar.
+         * @param reservation_and_publication_status Reserve input and terminal output.
+         * @param apply_status Device-owned result of the immediately preceding apply.
+         * @return True when the operation executed or was enqueued.
+         */
+        virtual bool finalizeMoEOverlayRebalancePublication(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoELayerRuntime *runtime_layers,
+            std::uint32_t layer_count,
+            std::uint32_t expert_count,
+            DeviceMoEOverlayEpochControl *control,
+            std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *reservation_and_publication_status,
+            const DeviceMoERebalanceApplyStatus *apply_status)
+        {
+            (void)launch;
+            (void)runtime_layers;
+            (void)layer_count;
+            (void)expert_count;
+            (void)control;
+            (void)candidate_epoch;
+            (void)reservation_and_publication_status;
+            (void)apply_status;
+            return false;
+        }
+
+        /**
+         * @brief Mark a reserved epoch ready after every transfer event is joined.
+         */
+        virtual bool markMoEOverlayEpochCandidateReady(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status)
+        {
+            (void)launch;
+            (void)control;
+            (void)candidate_epoch;
+            (void)status;
+            return false;
+        }
+
+        /**
+         * @brief Atomically publish a ready epoch and begin retiring its predecessor.
+         *
+         * This is the sole device ticket-admission linearization point.  The
+         * host residency authority must already accept the candidate epoch
+         * before a GPU maintenance stream invokes this operation.
+         */
+        virtual bool publishMoEOverlayEpochCandidate(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status)
+        {
+            (void)launch;
+            (void)control;
+            (void)candidate_epoch;
+            (void)status;
+            return false;
+        }
+
+        /** @brief Abort one unpublished Candidate or Ready epoch. */
+        virtual bool abortMoEOverlayEpochCandidate(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status)
+        {
+            (void)launch;
+            (void)control;
+            (void)candidate_epoch;
+            (void)status;
+            return false;
+        }
+
+        /**
+         * @brief Reclaim a retiring bank only after its device grace period.
+         *
+         * A Busy status is expected while either an admission is in flight or
+         * an old request still holds the named epoch.  Callers poll with events;
+         * inference never waits for this maintenance operation.
+         */
+        virtual bool retireMoEOverlayEpoch(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *retiring_epoch,
+            DeviceMoEOverlayEpochStatus *status)
+        {
+            (void)launch;
+            (void)control;
+            (void)retiring_epoch;
+            (void)status;
+            return false;
+        }
+
         /**
          * @brief Graph-capturable device-side MoE rebalance publish/apply.
          *
@@ -1395,7 +1928,8 @@ namespace llaminar2
             DeviceMoERebalanceWaveState *local_wave_states = nullptr,
             DeviceMoELayerRuntime *runtime_layers = nullptr,
             const DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr,
-            uint32_t local_transfer_slot_count = 0)
+            uint32_t local_transfer_slot_count = 0,
+            DeviceMoETransferSlotClaimIndex *transfer_slot_claim_index = nullptr)
         {
             (void)launch;
             (void)gathered_plan_entries;
@@ -1412,6 +1946,7 @@ namespace llaminar2
             (void)runtime_layers;
             (void)local_transfer_slots;
             (void)local_transfer_slot_count;
+            (void)transfer_slot_claim_index;
             return false;
         }
 
@@ -1440,6 +1975,7 @@ namespace llaminar2
             DeviceMoELayerRuntime *runtime_layers,
             const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
             uint32_t local_transfer_slot_count,
+            DeviceMoETransferSlotClaimIndex *transfer_slot_claim_index,
             uint32_t command_buffer_count = 1)
         {
             (void)launch;
@@ -1455,9 +1991,52 @@ namespace llaminar2
             (void)runtime_layers;
             (void)local_transfer_slots;
             (void)local_transfer_slot_count;
+            (void)transfer_slot_claim_index;
             (void)command_buffer_count;
             return false;
         }
+
+        /**
+         * @brief Materialize a mirrored current-batch LLEP domain request set.
+         *
+         * Homogeneous LocalTP prefill participants consume byte-identical
+         * router choices and mirrored runtime ownership, so the deterministic
+         * current-batch planner publishes the same logical transfer list on
+         * every participant. This graph-capturable operation expands that
+         * shared list into the participant-major layout normally produced by
+         * metadata allgathers. The following domain projection still leases
+         * destination-local physical slots and the payload collective still
+         * transports packed bytes; only redundant plan/header collectives are
+         * removed.
+         *
+         * Prefix-runtime rehydration must not use this operation because its
+         * restored transfer requests are participant-owned rather than a
+         * deterministic result of replicated current-batch routing.
+         *
+         * @param launch Explicit graph-owned launch stream and workspace.
+         * @param runtime_layer Current layer runtime containing the shared
+         *        planner transfer publication in `reserved_ptrs[2]`.
+         * @param mirrored_plan_entries Participant-major logical requests with
+         *        `participant_count * plan_capacity` writable entries.
+         * @param mirrored_command_headers One writable header per participant.
+         * @param plan_capacity Capacity of each participant request slice.
+         * @param status Device-owned transaction status publication.
+         * @param config Immutable participant topology and planner policy.
+         * @param payload_slot_capacity Fixed compact slots available per
+         *        source/destination lane.
+         * @param layer_idx Logical routed-expert layer being materialized.
+         * @return `true` when the backend enqueued the exact operation.
+         */
+        virtual bool materializePrefillLeastLoadedMirroredDomainCommands(
+            const MoEKernelLaunchContext &launch,
+            const DeviceMoELayerRuntime *runtime_layer,
+            DeviceMoERebalancePlanEntry *mirrored_plan_entries,
+            DeviceMoERebalanceCommandBufferHeader *mirrored_command_headers,
+            uint32_t plan_capacity,
+            DeviceMoERebalanceStatus *status,
+            const DeviceMoERebalanceConfig &config,
+            uint32_t payload_slot_capacity,
+            uint32_t layer_idx);
 
         /**
          * @brief Materialize current-batch LLEP weight-transfer requirements
@@ -1467,8 +2046,11 @@ namespace llaminar2
          * expert-weight transfers into DeviceMoELayerRuntime::reserved_ptrs[2].
          * This graph-capturable bridge converts those records into
          * ExpertPayloadArrival commands so the existing compact payload
-         * movement path can stage/import them. Commands produced here are
-         * logical, including prefix-runtime rehydration:
+         * movement path can stage/import them. Each participant emits only
+         * commands whose destination equals `config.participant_id`; the
+         * subsequent domain projection reconstructs the common source-packing
+         * plan after these destination-local request lists are gathered.
+         * Commands produced here are logical, including prefix-runtime rehydration:
          * `destination_slot` remains invalid until
          * projectPrefillLeastLoadedDomainCommands() leases physical storage on
          * the destination participant from its complete transfer directory.
@@ -1716,7 +2298,8 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *controller_state,
             DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
             int target_layer = -1,
-            uint32_t command_buffer_count = 1)
+            uint32_t command_buffer_count = 1,
+            const DeviceMoEOverlayEpochStatus *overlay_reservation_status = nullptr)
         {
             (void)launch;
             (void)runtime_layers;
@@ -1731,6 +2314,7 @@ namespace llaminar2
             (void)command_header;
             (void)target_layer;
             (void)command_buffer_count;
+            (void)overlay_reservation_status;
             return false;
         }
 

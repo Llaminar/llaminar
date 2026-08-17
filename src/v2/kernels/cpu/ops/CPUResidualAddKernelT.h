@@ -18,6 +18,8 @@
 #include "../../../utils/PerfStatsCollector.h"
 #include "../CPUKernelBase.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <string>
 
 namespace llaminar2
@@ -25,6 +27,58 @@ namespace llaminar2
 
     namespace residual_add_detail
     {
+        /**
+         * @brief Largest flat span that is cheaper on the caller's SIMD lane.
+         *
+         * Entering even a bounded OpenMP team costs more than adding the
+         * 8--64 KiB activation spans common to M=1..4 verifier calls.  The
+         * arithmetic is element-independent, so a caller-thread SIMD loop is
+         * both byte-equivalent and the economical grouped implementation for
+         * these geometries.  An existing outer team is never collapsed: its
+         * already-live workers continue through the ordinary workshare path.
+         */
+        inline constexpr size_t kCallerThreadElementLimit = 16u * 1024u;
+
+        /**
+         * @brief Return whether a standalone invocation should remain serial.
+         *
+         * A kernel entered by an existing OpenMP team must be reached by every
+         * worker, because its `omp for` is a collective worksharing construct.
+         * Consequently only a standalone caller may select the SIMD branch.
+         */
+        inline bool useCallerThreadSIMD(size_t num_elements)
+        {
+            return !omp_in_parallel() &&
+                   num_elements <= kCallerThreadElementLimit;
+        }
+
+        /**
+         * @brief Return the exact standalone team size for one flat span.
+         *
+         * A non-serial call always uses the configured process-wide team.
+         * Sub-maximal teams are deliberately forbidden in the inference path:
+         * libgomp may retire the omitted workers, forcing the next NativeVNNI
+         * projection to recreate them at millisecond-scale cost.
+         */
+        inline int standaloneTeamSize(size_t num_elements)
+        {
+            return useCallerThreadSIMD(num_elements)
+                       ? 1
+                       : omp_get_max_threads();
+        }
+
+        /**
+         * @brief Describe the launch policy selected for grouped telemetry.
+         */
+        inline const char *invocationPolicy(size_t num_elements)
+        {
+            if (omp_in_parallel())
+                return "existing_team_flat_workshare";
+            if (num_elements <= kCallerThreadElementLimit)
+                return "caller_thread_simd";
+            return "full_flat_workshare";
+        }
+
         /**
          * @brief Derive the active verifier-row count from a flat element span.
          *
@@ -63,6 +117,12 @@ namespace llaminar2
             if (rows < 2)
                 return;
 
+            // Do not materialize strings or a tag map in ordinary inference.
+            // PerfStats filters are collection gates, so the producer must
+            // reject a disabled domain before constructing its payload.
+            if (!PerfStatsCollector::isDomainEnabled("kernel"))
+                return;
+
             PerfStatsCollector::addCounter(
                 "kernel",
                 "cpu_residual_add_grouped_verifier_rows_calls",
@@ -73,7 +133,9 @@ namespace llaminar2
                  {"verifier_rows", std::to_string(rows)},
                  {"cols", std::to_string(input->cols())},
                  {"active_elements", std::to_string(num_elements)},
-                 {"invocation_policy", "single_flat_workshare"}});
+                 {"invocation_policy", invocationPolicy(num_elements)},
+                 {"standalone_team_threads",
+                  std::to_string(standaloneTeamSize(num_elements))}});
         }
     } // namespace residual_add_detail
 
@@ -104,6 +166,14 @@ namespace llaminar2
         {
             (void)mpi_ctx;
             (void)device_idx;
+
+            if (residual_add_detail::useCallerThreadSIMD(num_elements))
+            {
+#pragma omp simd
+                for (size_t i = 0; i < num_elements; ++i)
+                    output[i] = input[i] + residual[i];
+                return true;
+            }
 
             auto do_work = [&]()
             {
@@ -186,6 +256,18 @@ namespace llaminar2
         {
             (void)mpi_ctx;
             (void)device_idx;
+
+            if (residual_add_detail::useCallerThreadSIMD(num_elements))
+            {
+#pragma omp simd
+                for (size_t i = 0; i < num_elements; ++i)
+                {
+                    const float in_f = simd::bf16_to_fp32(input[i]);
+                    const float res_f = simd::bf16_to_fp32(residual[i]);
+                    output[i] = simd::fp32_to_bf16(in_f + res_f);
+                }
+                return true;
+            }
 
             auto do_work = [&]()
             {
@@ -270,6 +352,18 @@ namespace llaminar2
         {
             (void)mpi_ctx;
             (void)device_idx;
+
+            if (residual_add_detail::useCallerThreadSIMD(num_elements))
+            {
+#pragma omp simd
+                for (size_t i = 0; i < num_elements; ++i)
+                {
+                    const float in_f = simd::fp16_to_fp32(input[i]);
+                    const float res_f = simd::fp16_to_fp32(residual[i]);
+                    output[i] = simd::fp32_to_fp16(in_f + res_f);
+                }
+                return true;
+            }
 
             auto do_work = [&]()
             {

@@ -35,7 +35,7 @@ namespace llaminar2
         int n_kv_heads, int head_dim,
         const TurboQuantContext *tq_ctx,
         int device_id,
-        TurboQuantKVMode mode = TurboQuantKVMode::TQ8_K_TQ4_V);
+        TurboQuantKVMode mode = TurboQuantKVMode::AQ8_K_TQ4_V);
 
     /**
      * @brief Create a LocalTP shard of the ROCm asymmetric TQ cache.
@@ -49,6 +49,6 @@ namespace llaminar2
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim, const TurboQuantContext *tq_ctx,
         int device_id,
-        TurboQuantKVMode mode = TurboQuantKVMode::TQ8_K_TQ4_V);
+        TurboQuantKVMode mode = TurboQuantKVMode::AQ8_K_TQ4_V);
 
 } // namespace llaminar2

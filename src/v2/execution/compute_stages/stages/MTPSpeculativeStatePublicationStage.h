@@ -30,7 +30,7 @@ namespace llaminar2
 {
     class IBackend;
     class IKVCache;
-    class MoEExpertComputeStage;
+    class IMoEGroupedVerifierHistogramPublisher;
 
     /**
      * @brief Publish compact verifier acceptance into every mutable model state.
@@ -114,7 +114,8 @@ namespace llaminar2
             int verifier_rows_per_request = 0;
             int max_state_commit_rows = 0;
 
-            std::vector<MoEExpertComputeStage *> moe_stages;
+            std::vector<IMoEGroupedVerifierHistogramPublisher *>
+                moe_histogram_publishers;
             std::vector<MainKVBinding> main_kv_bindings;
 
             bool publish_shifted_kv = false;

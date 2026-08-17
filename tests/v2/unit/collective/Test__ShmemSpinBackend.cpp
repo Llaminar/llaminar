@@ -4,21 +4,27 @@
  *
  * Single-process tests (MPI_PROCS 1):
  *   - Arena layout / alignment assertions
- *   - Fast-path detection
+ *   - Native shared-memory route detection
  *   - AVX-512 reduce correctness
  *
  * Two-process tests (MPI_PROCS 2):
  *   - Basic allreduce correctness
  *   - Repeated allreduce (epoch counter correctness)
- *   - Boundary count (MAX_COUNT)
+ *   - Chunk-boundary and multi-chunk payloads
  *   - Small count (1 element)
- *   - Fallback delegation (allgather)
+ *   - Native rooted packed-record gather and all-dtype broadcast
+ *   - Epoch composition across allreduce, gather, and broadcast
+ *   - Delegation of remaining collective semantics to the general backend
  *   - Stress test (1000 consecutive allreduces)
+ *   - Full Qwen3.6-35B prefill-sequence latency distribution
  */
 
 #include <gtest/gtest.h>
 #include <mpi.h>
+#include <algorithm>
+#include <array>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
@@ -31,6 +37,7 @@
 #include "collective/backends/ShmemSpinBackend.h"
 #include "collective/backends/UPIBackend.h"
 #include "collective/DeviceGroup.h"
+#include "collective/GlobalTPContext.h"
 
 using namespace llaminar2;
 
@@ -79,44 +86,111 @@ TEST(Test__ShmemSpinBackend, ArenaLayoutAlignment)
     {
         size_t expected_size = 64 // header
                                + static_cast<size_t>(n) * 64 // epoch slots
-                               + static_cast<size_t>(n) * 8192 * sizeof(float); // buffers
+                               + static_cast<size_t>(n) *
+                                     ShmemSpinArena::CHUNK_CAPACITY * sizeof(float); // buffers
         EXPECT_EQ(ShmemSpinArena::compute_size(n), expected_size)
             << "Mismatched arena size for " << n << " ranks";
     }
 }
 
-TEST(Test__ShmemSpinBackend, ArenaMaxCount)
+TEST(Test__ShmemSpinBackend, ArenaChunkCapacity)
 {
-    EXPECT_EQ(ShmemSpinArena::MAX_COUNT, 8192u);
-    // Each rank buffer: 8192 * 4 = 32KB
-    EXPECT_EQ(ShmemSpinArena::MAX_COUNT * sizeof(float), 32768u);
+    EXPECT_EQ(ShmemSpinArena::CHUNK_CAPACITY, 1u << 20);
+    EXPECT_EQ(
+        ShmemSpinArena::CHUNK_CAPACITY * sizeof(float),
+        4u * 1024u * 1024u);
 }
 
-TEST(Test__ShmemSpinBackend, FastPathDetection)
+TEST(Test__ShmemSpinBackend, RootedPublicationTransportPolicyHasExactBoundaries)
+{
+    using Operation = CPURootedPublicationOperation;
+    using Transport = CPURootedPublicationTransport;
+    using Policy = CPURootedPublicationTransportPolicy;
+
+    EXPECT_EQ(
+        Policy::select(
+            Operation::PackedRecordGather,
+            Policy::kPackedGatherSharedMemoryMaxBytes),
+        Transport::SharedMemoryLatency);
+    EXPECT_EQ(
+        Policy::select(
+            Operation::PackedRecordGather,
+            Policy::kPackedGatherSharedMemoryMaxBytes + 1u),
+        Transport::MPIBandwidth);
+    EXPECT_EQ(
+        Policy::select(
+            Operation::CompactOutputBroadcast,
+            Policy::kBroadcastSharedMemoryMaxBytes),
+        Transport::SharedMemoryLatency);
+    EXPECT_EQ(
+        Policy::select(
+            Operation::CompactOutputBroadcast,
+            Policy::kBroadcastSharedMemoryMaxBytes + 1u),
+        Transport::MPIBandwidth);
+
+    constexpr size_t qwen36_d_model = 2048u;
+    constexpr size_t qwen36_top_k = 8u;
+    constexpr size_t serial_decode_gather_bytes =
+        qwen36_top_k * (qwen36_d_model + 1u) * sizeof(float);
+    constexpr size_t two_row_gather_bytes =
+        2u * serial_decode_gather_bytes;
+    EXPECT_EQ(
+        Policy::select(
+            Operation::PackedRecordGather,
+            serial_decode_gather_bytes),
+        Transport::SharedMemoryLatency);
+    EXPECT_EQ(
+        Policy::select(
+            Operation::PackedRecordGather,
+            two_row_gather_bytes),
+        Transport::MPIBandwidth);
+
+    constexpr size_t four_row_broadcast_bytes =
+        4u * qwen36_d_model * sizeof(float);
+    constexpr size_t five_row_broadcast_bytes =
+        5u * qwen36_d_model * sizeof(float);
+    EXPECT_EQ(
+        Policy::select(
+            Operation::CompactOutputBroadcast,
+            four_row_broadcast_bytes),
+        Transport::SharedMemoryLatency);
+    EXPECT_EQ(
+        Policy::select(
+            Operation::CompactOutputBroadcast,
+            five_row_broadcast_bytes),
+        Transport::MPIBandwidth);
+}
+
+TEST(Test__ShmemSpinBackend, SharedMemoryPathDetectionIsSizeTotal)
 {
     // Create a backend with a null fallback (won't call MPI in this test)
     // We need MPI_COMM_WORLD for the fallback but we won't actually use it
     auto upi = std::make_unique<UPICollectiveBackend>(MPI_COMM_WORLD, nullptr);
     ShmemSpinBackend backend(999, mpiRank(), std::move(upi));
 
-    // Fast path: FLOAT32 + SUM + count ≤ MAX
-    EXPECT_TRUE(backend.isFastPath(2048, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
-    EXPECT_TRUE(backend.isFastPath(1, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
-    EXPECT_TRUE(backend.isFastPath(ShmemSpinArena::MAX_COUNT, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_TRUE(backend.usesSharedMemoryAllreduce(
+        1, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_TRUE(backend.usesSharedMemoryAllreduce(
+        ShmemSpinArena::CHUNK_CAPACITY,
+        CollectiveDataType::FLOAT32,
+        CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_TRUE(backend.usesSharedMemoryAllreduce(
+        ShmemSpinArena::CHUNK_CAPACITY * 17u + 3u,
+        CollectiveDataType::FLOAT32,
+        CollectiveOp::ALLREDUCE_SUM));
 
-    // Not fast path: count too large
-    EXPECT_FALSE(backend.isFastPath(ShmemSpinArena::MAX_COUNT + 1, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_FALSE(backend.usesSharedMemoryAllreduce(
+        2048, CollectiveDataType::INT32, CollectiveOp::ALLREDUCE_SUM));
 
-    // Not fast path: wrong dtype
-    EXPECT_FALSE(backend.isFastPath(2048, CollectiveDataType::INT32, CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_TRUE(backend.usesSharedMemoryAllreduce(
+        2048, CollectiveDataType::FLOAT16, CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_TRUE(backend.usesSharedMemoryAllreduce(
+        2048, CollectiveDataType::BFLOAT16, CollectiveOp::ALLREDUCE_SUM));
 
-    // Fast path: FP16 and BF16 are also supported
-    EXPECT_TRUE(backend.isFastPath(2048, CollectiveDataType::FLOAT16, CollectiveOp::ALLREDUCE_SUM));
-    EXPECT_TRUE(backend.isFastPath(2048, CollectiveDataType::BFLOAT16, CollectiveOp::ALLREDUCE_SUM));
-
-    // Not fast path: wrong op
-    EXPECT_FALSE(backend.isFastPath(2048, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_MAX));
-    EXPECT_FALSE(backend.isFastPath(2048, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_MIN));
+    EXPECT_FALSE(backend.usesSharedMemoryAllreduce(
+        2048, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_MAX));
+    EXPECT_FALSE(backend.usesSharedMemoryAllreduce(
+        2048, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_MIN));
 }
 
 // ============================================================================
@@ -639,8 +713,8 @@ TEST(Test__ShmemSpinBackend, ReduceBF16NegativeAndSpecialValues)
 
 TEST(Test__ShmemSpinBackend, ReduceFP16MaxCountBoundary)
 {
-    // Test at MAX_COUNT — verifies vectorized tail handling at exact buffer limit
-    const size_t count = ShmemSpinArena::MAX_COUNT;
+    // Exercise the vectorized reduction at the exact protocol chunk boundary.
+    const size_t count = ShmemSpinArena::CHUNK_CAPACITY;
     std::vector<float> fa(count), fb(count);
     for (size_t i = 0; i < count; ++i)
     {
@@ -654,12 +728,12 @@ TEST(Test__ShmemSpinBackend, ReduceFP16MaxCountBoundary)
     std::vector<uint16_t> scalar_out(count), avx512_out(count);
     ShmemSpinBackend::reduce_fp16_scalar(scalar_out.data(), a.data(), b.data(), count);
     ShmemSpinBackend::reduce_fp16_avx512(avx512_out.data(), a.data(), b.data(), count);
-    expectExactMatchU16(scalar_out.data(), avx512_out.data(), count, "FP16 MAX_COUNT boundary");
+    expectExactMatchU16(scalar_out.data(), avx512_out.data(), count, "FP16 chunk boundary");
 }
 
 TEST(Test__ShmemSpinBackend, ReduceBF16MaxCountBoundary)
 {
-    const size_t count = ShmemSpinArena::MAX_COUNT;
+    const size_t count = ShmemSpinArena::CHUNK_CAPACITY;
     std::vector<float> fa(count), fb(count);
     for (size_t i = 0; i < count; ++i)
     {
@@ -673,31 +747,36 @@ TEST(Test__ShmemSpinBackend, ReduceBF16MaxCountBoundary)
     std::vector<uint16_t> scalar_out(count), avx512_out(count);
     ShmemSpinBackend::reduce_bf16_scalar(scalar_out.data(), a.data(), b.data(), count);
     ShmemSpinBackend::reduce_bf16_avx512(avx512_out.data(), a.data(), b.data(), count);
-    expectExactMatchBF16(scalar_out.data(), avx512_out.data(), count, "BF16 MAX_COUNT boundary");
+    expectExactMatchBF16(scalar_out.data(), avx512_out.data(), count, "BF16 chunk boundary");
 }
 
 // ============================================================================
-// Fast-path detection for FP16 / BF16
+// Native shared-memory path detection for FP16 / BF16
 // ============================================================================
 
-TEST(Test__ShmemSpinBackend, FastPathDetectionFP16BF16)
+TEST(Test__ShmemSpinBackend, SharedMemoryPathDetectionFP16BF16IsSizeTotal)
 {
     auto upi = std::make_unique<UPICollectiveBackend>(MPI_COMM_WORLD, nullptr);
     ShmemSpinBackend backend(994, mpiRank(), std::move(upi));
 
-    // FP16 fast path
-    EXPECT_TRUE(backend.isFastPath(2048, CollectiveDataType::FLOAT16, CollectiveOp::ALLREDUCE_SUM));
-    EXPECT_TRUE(backend.isFastPath(ShmemSpinArena::MAX_COUNT, CollectiveDataType::FLOAT16, CollectiveOp::ALLREDUCE_SUM));
-    EXPECT_FALSE(backend.isFastPath(ShmemSpinArena::MAX_COUNT + 1, CollectiveDataType::FLOAT16, CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_TRUE(backend.usesSharedMemoryAllreduce(
+        2048, CollectiveDataType::FLOAT16, CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_TRUE(backend.usesSharedMemoryAllreduce(
+        ShmemSpinArena::CHUNK_CAPACITY + 1,
+        CollectiveDataType::FLOAT16,
+        CollectiveOp::ALLREDUCE_SUM));
 
-    // BF16 fast path
-    EXPECT_TRUE(backend.isFastPath(2048, CollectiveDataType::BFLOAT16, CollectiveOp::ALLREDUCE_SUM));
-    EXPECT_TRUE(backend.isFastPath(ShmemSpinArena::MAX_COUNT, CollectiveDataType::BFLOAT16, CollectiveOp::ALLREDUCE_SUM));
-    EXPECT_FALSE(backend.isFastPath(ShmemSpinArena::MAX_COUNT + 1, CollectiveDataType::BFLOAT16, CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_TRUE(backend.usesSharedMemoryAllreduce(
+        2048, CollectiveDataType::BFLOAT16, CollectiveOp::ALLREDUCE_SUM));
+    EXPECT_TRUE(backend.usesSharedMemoryAllreduce(
+        ShmemSpinArena::CHUNK_CAPACITY + 1,
+        CollectiveDataType::BFLOAT16,
+        CollectiveOp::ALLREDUCE_SUM));
 
-    // Still not fast path for wrong op
-    EXPECT_FALSE(backend.isFastPath(2048, CollectiveDataType::FLOAT16, CollectiveOp::ALLREDUCE_MAX));
-    EXPECT_FALSE(backend.isFastPath(2048, CollectiveDataType::BFLOAT16, CollectiveOp::ALLREDUCE_MAX));
+    EXPECT_FALSE(backend.usesSharedMemoryAllreduce(
+        2048, CollectiveDataType::FLOAT16, CollectiveOp::ALLREDUCE_MAX));
+    EXPECT_FALSE(backend.usesSharedMemoryAllreduce(
+        2048, CollectiveDataType::BFLOAT16, CollectiveOp::ALLREDUCE_MAX));
 }
 
 TEST(Test__ShmemSpinBackend, SupportsOnlyCPU)
@@ -945,14 +1024,231 @@ TEST_F(ShmemSpinMPITest, RepeatedAllreduce)
         }
     }
 
-    // Epoch should match iteration count (2 increments per allreduce: write + read-completion)
+    // Each allreduce publishes both ready-to-read and read-complete epochs.
     EXPECT_EQ(backend_->currentEpoch(), 200u);
+}
+
+/**
+ * @test NativeBroadcastIsByteExactForEveryTypeAndMultipleChunks
+ *
+ * Broadcast does not perform arithmetic, so its contract is byte identity for
+ * every collective element representation. Small cases cover all dtypes and
+ * rotate the root; the FP32 case exceeds one arena slot to prove bounded
+ * chunking and source-buffer reuse.
+ */
+TEST_F(
+    ShmemSpinMPITest,
+    NativeBroadcastIsByteExactForEveryTypeAndMultipleChunks)
+{
+    struct BroadcastCase
+    {
+        CollectiveDataType dtype;
+        size_t element_size;
+    };
+    const std::array<BroadcastCase, 5> cases = {{
+        {CollectiveDataType::FLOAT32, 4u},
+        {CollectiveDataType::FLOAT16, 2u},
+        {CollectiveDataType::BFLOAT16, 2u},
+        {CollectiveDataType::INT32, 4u},
+        {CollectiveDataType::INT8, 1u},
+    }};
+
+    for (size_t case_index = 0u; case_index < cases.size(); ++case_index)
+    {
+        const int root = static_cast<int>(case_index %
+                                          static_cast<size_t>(size_));
+        constexpr size_t count = 257u;
+        const size_t byte_count = count * cases[case_index].element_size;
+        std::vector<uint8_t> payload(byte_count, 0u);
+        std::vector<uint8_t> expected(byte_count);
+        for (size_t byte = 0u; byte < byte_count; ++byte)
+        {
+            expected[byte] = static_cast<uint8_t>(
+                (byte * 29u + case_index * 17u + 3u) & 0xffu);
+        }
+        if (rank_ == root)
+            payload = expected;
+
+        ASSERT_TRUE(backend_->broadcast(
+            payload.data(),
+            count,
+            cases[case_index].dtype,
+            root));
+        EXPECT_EQ(payload, expected)
+            << "native broadcast changed bytes for dtype case " << case_index;
+    }
+
+    if (size_ != 2)
+        return;
+
+    const size_t large_count = ShmemSpinArena::CHUNK_CAPACITY + 257u;
+    std::vector<float> large_payload(large_count, -1.0f);
+    if (rank_ == 0)
+    {
+        for (size_t element = 0u; element < large_count; ++element)
+            large_payload[element] = static_cast<float>(element % 8191u);
+    }
+    ASSERT_TRUE(backend_->broadcast(
+        large_payload.data(),
+        large_count,
+        CollectiveDataType::FLOAT32,
+        0));
+    EXPECT_FLOAT_EQ(large_payload.front(), 0.0f);
+    EXPECT_FLOAT_EQ(
+        large_payload[ShmemSpinArena::CHUNK_CAPACITY - 1u],
+        static_cast<float>(
+            (ShmemSpinArena::CHUNK_CAPACITY - 1u) % 8191u));
+    EXPECT_FLOAT_EQ(
+        large_payload[ShmemSpinArena::CHUNK_CAPACITY],
+        static_cast<float>(ShmemSpinArena::CHUNK_CAPACITY % 8191u));
+    EXPECT_FLOAT_EQ(
+        large_payload.back(),
+        static_cast<float>((large_count - 1u) % 8191u));
+}
+
+/**
+ * @test NativePackedGatherIsSizeTotalAndComposesWithOtherProtocols
+ *
+ * A production packed route block can exceed the four-megabyte participant
+ * slot. This test transfers one multi-chunk block per rank, verifies root-first
+ * participant layout, then alternates allreduce, empty/non-empty gather, and
+ * broadcast without barriers. It catches epoch divergence between protocol
+ * implementations and stale payload reuse at operation boundaries.
+ */
+TEST_F(
+    ShmemSpinMPITest,
+    NativePackedGatherIsSizeTotalAndComposesWithOtherProtocols)
+{
+    if (size_ != 2)
+        GTEST_SKIP() << "Multi-chunk rooted publication economy targets two sockets";
+
+    constexpr size_t record_width = 17u;
+    const size_t base_records =
+        ShmemSpinArena::CHUNK_CAPACITY / record_width + 3u;
+    const size_t local_records = base_records + static_cast<size_t>(rank_);
+    const size_t root_capacity = 2u * base_records + 1u;
+    std::vector<float> local(local_records * record_width);
+    for (size_t element = 0u; element < local.size(); ++element)
+    {
+        local[element] = static_cast<float>(
+            static_cast<size_t>(rank_) * 4u *
+                ShmemSpinArena::CHUNK_CAPACITY +
+            element);
+    }
+    std::vector<float> gathered;
+    if (rank_ == 0)
+        gathered.assign(root_capacity * record_width, -1.0f);
+
+    size_t gathered_records = 0u;
+    ASSERT_TRUE(backend_->gatherVariableFloatRecordsToRoot(
+        local.data(),
+        local_records,
+        rank_ == 0 ? gathered.data() : nullptr,
+        root_capacity,
+        record_width,
+        0,
+        gathered_records));
+    if (rank_ == 0)
+    {
+        ASSERT_EQ(gathered_records, root_capacity);
+        EXPECT_TRUE(std::equal(
+            local.begin(),
+            local.end(),
+            gathered.begin()));
+        const size_t peer_offset = local.size();
+        EXPECT_FLOAT_EQ(
+            gathered[peer_offset],
+            static_cast<float>(4u * ShmemSpinArena::CHUNK_CAPACITY));
+        EXPECT_FLOAT_EQ(
+            gathered[peer_offset +
+                     ShmemSpinArena::CHUNK_CAPACITY - 1u],
+            static_cast<float>(
+                5u * ShmemSpinArena::CHUNK_CAPACITY - 1u));
+        EXPECT_FLOAT_EQ(
+            gathered.back(),
+            static_cast<float>(
+                4u * ShmemSpinArena::CHUNK_CAPACITY +
+                (base_records + 1u) * record_width - 1u));
+    }
+
+    constexpr size_t small_record_width = 3u;
+    for (int iteration = 0; iteration < 100; ++iteration)
+    {
+        std::array<float, 13> reduced{};
+        reduced.fill(static_cast<float>(rank_ + 1));
+        ASSERT_TRUE(backend_->allreduce(
+            reduced.data(),
+            reduced.size(),
+            CollectiveDataType::FLOAT32,
+            CollectiveOp::ALLREDUCE_SUM));
+        EXPECT_FLOAT_EQ(reduced.front(), rank_sum_);
+        EXPECT_FLOAT_EQ(reduced.back(), rank_sum_);
+
+        /*
+         * Exercise every two-rank count combination, including repeated
+         * all-empty transactions. The asymmetric periods force a participant
+         * to move quickly into the next transaction while its peer may still
+         * be reading the reusable count slot, which directly regresses the
+         * metadata-lifetime race found in the GlobalTP production wrapper.
+         */
+        const bool contributes = rank_ == 0
+                                     ? iteration % 3 != 0
+                                     : iteration % 2 != 0;
+        const size_t record_count = contributes ? 1u : 0u;
+        const std::array<float, small_record_width> record = {
+            static_cast<float>(1000 * iteration + 100 * rank_ + 1),
+            static_cast<float>(1000 * iteration + 100 * rank_ + 2),
+            static_cast<float>(1000 * iteration + 100 * rank_ + 3),
+        };
+        std::array<float, 2u * small_record_width> root_records{};
+        root_records.fill(-9.0f);
+        gathered_records = 0u;
+        ASSERT_TRUE(backend_->gatherVariableFloatRecordsToRoot(
+            contributes ? record.data() : nullptr,
+            record_count,
+            rank_ == 0 ? root_records.data() : nullptr,
+            2u,
+            small_record_width,
+            0,
+            gathered_records));
+        if (rank_ == 0)
+        {
+            const size_t expected_records =
+                static_cast<size_t>(iteration % 3 != 0) +
+                static_cast<size_t>(iteration % 2 != 0);
+            EXPECT_EQ(gathered_records, expected_records);
+        }
+
+        std::array<uint32_t, 19> broadcast_payload{};
+        if (rank_ == 1)
+        {
+            for (size_t element = 0u;
+                 element < broadcast_payload.size();
+                 ++element)
+            {
+                broadcast_payload[element] =
+                    static_cast<uint32_t>(iteration * 100 + element);
+            }
+        }
+        ASSERT_TRUE(backend_->broadcast(
+            broadcast_payload.data(),
+            broadcast_payload.size(),
+            CollectiveDataType::INT32,
+            1));
+        EXPECT_EQ(
+            broadcast_payload.front(),
+            static_cast<uint32_t>(iteration * 100));
+        EXPECT_EQ(
+            broadcast_payload.back(),
+            static_cast<uint32_t>(
+                iteration * 100 + broadcast_payload.size() - 1u));
+    }
 }
 
 TEST_F(ShmemSpinMPITest, MaxCountBoundary)
 {
-    // Test at exactly MAX_COUNT
-    const size_t count = ShmemSpinArena::MAX_COUNT;
+    // Test at exactly one complete chunk.
+    const size_t count = ShmemSpinArena::CHUNK_CAPACITY;
     std::vector<float> data(count, static_cast<float>(rank_ + 1));
 
     ASSERT_TRUE(backend_->allreduce(data.data(), count,
@@ -993,10 +1289,9 @@ TEST_F(ShmemSpinMPITest, OddCount)
     }
 }
 
-TEST_F(ShmemSpinMPITest, OverflowFallsBackToMPI)
+TEST_F(ShmemSpinMPITest, MultiChunkAllreduceRemainsOnSharedMemoryPath)
 {
-    // Count > MAX_COUNT should fall back to MPI (still correct)
-    const size_t count = ShmemSpinArena::MAX_COUNT + 100;
+    const size_t count = ShmemSpinArena::CHUNK_CAPACITY + 100;
     std::vector<float> data(count, static_cast<float>(rank_ + 1));
 
     ASSERT_TRUE(backend_->allreduce(data.data(), count,
@@ -1007,6 +1302,132 @@ TEST_F(ShmemSpinMPITest, OverflowFallsBackToMPI)
     {
         EXPECT_FLOAT_EQ(data[i], rank_sum_) << "Mismatch at index " << i;
     }
+}
+
+/**
+ * @brief Guard the complete Qwen3.6-35B prefill collective sequence against
+ *        latency tails and MPI delegation.
+ *
+ * The production graph performs 121 SUM reductions of 434-by-2048 FP32
+ * activations. A size threshold once routed all of them through MPI, consuming
+ * roughly half a second per prefill. A median-only microbenchmark can still
+ * miss the multi-millisecond tails that dominate a 121-call inference graph,
+ * so this regression records one uninterrupted production-sized sequence and
+ * evaluates p50, p95, p99, maximum, and aggregate latency.
+ *
+ * Each backend operation is itself the rank rendezvous. Per-sample MPI barriers
+ * or timing reductions would perturb the protocol being measured, so rank-local
+ * samples are combined with one vector MPI reduction only after the sequence
+ * completes. Buffer initialization and the one initial alignment barrier remain
+ * outside every timed interval.
+ */
+TEST_F(ShmemSpinMPITest, Qwen36PrefillSequenceHasBoundedTailAndBeatsMPI)
+{
+    if (size_ != 2)
+        GTEST_SKIP() << "Dual-socket economy contract requires exactly two ranks";
+
+    constexpr size_t count = 434u * 2048u;
+    constexpr int repetitions = 121;
+    std::vector<float> data(count);
+
+    const auto measure_slowest_rank_us = [&](bool native_shared_memory) {
+        std::vector<double> local_samples(static_cast<size_t>(repetitions));
+        std::vector<double> slowest_rank_samples(static_cast<size_t>(repetitions));
+        MPI_Barrier(MPI_COMM_WORLD);
+
+        for (int repetition = 0; repetition < repetitions; ++repetition)
+        {
+            std::fill(data.begin(), data.end(), static_cast<float>(rank_ + 1));
+
+            const auto start = std::chrono::steady_clock::now();
+            if (native_shared_memory)
+            {
+                EXPECT_TRUE(backend_->allreduce(
+                    data.data(),
+                    count,
+                    CollectiveDataType::FLOAT32,
+                    CollectiveOp::ALLREDUCE_SUM));
+            }
+            else
+            {
+                EXPECT_EQ(
+                    MPI_Allreduce(
+                        MPI_IN_PLACE,
+                        data.data(),
+                        static_cast<int>(count),
+                        MPI_FLOAT,
+                        MPI_SUM,
+                        MPI_COMM_WORLD),
+                    MPI_SUCCESS);
+            }
+            const auto stop = std::chrono::steady_clock::now();
+            local_samples[static_cast<size_t>(repetition)] =
+                std::chrono::duration<double, std::micro>(stop - start).count();
+
+            EXPECT_FLOAT_EQ(data.front(), rank_sum_);
+            EXPECT_FLOAT_EQ(data[count / 2], rank_sum_);
+            EXPECT_FLOAT_EQ(data.back(), rank_sum_);
+        }
+
+        EXPECT_EQ(
+            MPI_Allreduce(
+                local_samples.data(),
+                slowest_rank_samples.data(),
+                repetitions,
+                MPI_DOUBLE,
+                MPI_MAX,
+                MPI_COMM_WORLD),
+            MPI_SUCCESS);
+        std::sort(slowest_rank_samples.begin(), slowest_rank_samples.end());
+        return slowest_rank_samples;
+    };
+
+    // Prime both implementations before collecting their medians.
+    std::fill(data.begin(), data.end(), static_cast<float>(rank_ + 1));
+    ASSERT_TRUE(backend_->allreduce(
+        data.data(), count, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM));
+    std::fill(data.begin(), data.end(), static_cast<float>(rank_ + 1));
+    ASSERT_EQ(
+        MPI_Allreduce(
+            MPI_IN_PLACE,
+            data.data(),
+            static_cast<int>(count),
+            MPI_FLOAT,
+            MPI_SUM,
+            MPI_COMM_WORLD),
+        MPI_SUCCESS);
+
+    const std::vector<double> native_us = measure_slowest_rank_us(true);
+    const std::vector<double> blocking_mpi_us = measure_slowest_rank_us(false);
+    const auto percentile = [](const std::vector<double> &samples, size_t numerator) {
+        const size_t rank =
+            (numerator * samples.size() + 99u) / 100u;
+        return samples[std::max<size_t>(1u, rank) - 1u];
+    };
+    const double native_p50_us = percentile(native_us, 50u);
+    const double native_p95_us = percentile(native_us, 95u);
+    const double native_p99_us = percentile(native_us, 99u);
+    const double native_max_us = native_us.back();
+    const double native_total_us =
+        std::accumulate(native_us.begin(), native_us.end(), 0.0);
+    const double blocking_mpi_p50_us = percentile(blocking_mpi_us, 50u);
+    const double blocking_mpi_p95_us = percentile(blocking_mpi_us, 95u);
+    if (rank_ == 0)
+    {
+        std::cout << "Qwen3.6-35B prefill allreduce sequence: shared_p50="
+                  << native_p50_us << " us shared_p95=" << native_p95_us
+                  << " us shared_p99=" << native_p99_us
+                  << " us shared_max=" << native_max_us
+                  << " us shared_total=" << native_total_us
+                  << " us blocking_mpi_p50=" << blocking_mpi_p50_us
+                  << " us blocking_mpi_p95=" << blocking_mpi_p95_us << '\n';
+    }
+
+    EXPECT_LT(native_p50_us, blocking_mpi_p50_us)
+        << "The ordinary production-sized shared-memory reduction must beat MPI";
+    EXPECT_LT(native_p95_us, blocking_mpi_p95_us)
+        << "The shared-memory p95 must remain economical across the complete "
+           "121-call production sequence; a good median cannot hide tail stalls";
 }
 
 TEST_F(ShmemSpinMPITest, NonSumFallsBackToMPI)
@@ -1384,8 +1805,8 @@ TEST_F(ShmemSpinMPITest, AllreduceBF16SingleElement)
 
 TEST_F(ShmemSpinMPITest, AllreduceFP16MaxCount)
 {
-    // Boundary: exactly MAX_COUNT elements — verifies no buffer overflow
-    const size_t count = ShmemSpinArena::MAX_COUNT;
+    // Boundary: exactly one chunk verifies no buffer overrun.
+    const size_t count = ShmemSpinArena::CHUNK_CAPACITY;
     uint16_t val = static_cast<uint16_t>(
         _cvtss_sh(static_cast<float>(rank_ + 1),
                   _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
@@ -1404,7 +1825,7 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16MaxCount)
 
 TEST_F(ShmemSpinMPITest, AllreduceBF16MaxCount)
 {
-    const size_t count = ShmemSpinArena::MAX_COUNT;
+    const size_t count = ShmemSpinArena::CHUNK_CAPACITY;
     float rank_val = static_cast<float>(rank_ + 1);
     uint32_t bits;
     std::memcpy(&bits, &rank_val, sizeof(float));

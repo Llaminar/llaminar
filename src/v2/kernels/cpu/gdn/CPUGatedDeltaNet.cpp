@@ -9,8 +9,9 @@
  *    Per-head: S = exp(g)*S, kv = S*k, delta = (v - kv)*beta, S += outer(k, delta), o = S*q
  *
  * 2. Chunk-forward (prefill, seq_len>1):
- *    Sequential per-timestep recurrence (functionally identical to chunk-parallel).
- *    The true chunk-parallel optimization is deferred to Phase F.
+ *    Strictly ordered recurrence parallelized across independent heads. The
+ *    useful team is capped by the local head count because splitting one head's
+ *    value columns duplicates Q/K traffic and is slower on measured hardware.
  *
  * The kernel owns ALL preprocessing:
  * - L2 normalization of Q and K (when use_qk_l2norm is true)
@@ -30,6 +31,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 
@@ -43,6 +45,28 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Test two byte ranges for overlap and fail closed on address overflow.
+     */
+    static bool byteRangesOverlap(
+        const void *left,
+        size_t left_bytes,
+        const void *right,
+        size_t right_bytes)
+    {
+        const uintptr_t left_begin = reinterpret_cast<uintptr_t>(left);
+        const uintptr_t right_begin = reinterpret_cast<uintptr_t>(right);
+        if (left_bytes > std::numeric_limits<uintptr_t>::max() - left_begin ||
+            right_bytes > std::numeric_limits<uintptr_t>::max() - right_begin)
+        {
+            return true;
+        }
+
+        const uintptr_t left_end = left_begin + left_bytes;
+        const uintptr_t right_end = right_begin + right_bytes;
+        return left_begin < right_end && right_begin < left_end;
+    }
+
     bool CPUGatedDeltaNet::resetGPUState(void *stream)
     {
         (void)stream;
@@ -865,12 +889,12 @@ namespace llaminar2
     //      where S resides (L1 if S fits, L2 otherwise), based on runtime
     //      cache detection via CPUFeatures.h.
     //
-    // Why NO d_v tiling: S[d_k, d_v] with d_k=d_v=128 is 64 KB — too large
-    // for 32 KB L1D, but fits easily in 1 MB L2.  Tiling d_v forces Q/K
-    // data to be re-read once per tile, which at 296 KB per head × n_tiles
-    // overflows L2 and destroys performance (~30 % regression measured).
-    // Without tiling, Q/K is read once and the sequential row-access pattern
-    // through S is handled efficiently by the hardware prefetcher.
+    // Why NO d_v tiling: each output column is mathematically independent, but
+    // splitting a head duplicates its Q/K stream and makes multiple cores walk
+    // adjacent state rows. Measured Qwen 3.6 d_k=d_v=128 latency regresses as
+    // soon as a second worker shares one head. Whole-head ownership therefore
+    // remains both byte-exact and economical; the launch team is capped to the
+    // useful local head count instead of manufacturing dominated work.
     // =========================================================================
 
 // Prefetch to L1 or L2 depending on runtime bool (GCC 14 requires
@@ -884,6 +908,190 @@ namespace llaminar2
         else                                                 \
             _mm_prefetch((const char *)(addr), _MM_HINT_T1); \
     } while (0)
+#endif
+
+#if defined(__AVX512F__)
+    /**
+     * @brief Advance one complete d_v=128 GDN head with ZMM-resident vectors.
+     *
+     * @param q_scratch Canonically normalized/scaled Q rows.
+     * @param k_scratch Canonically normalized K rows.
+     * @param values Original V rows.
+     * @param gate_scratch Per-row decay factors.
+     * @param beta_scratch Per-row sigmoid(beta) factors.
+     * @param output Complete output tensor.
+     * @param state Initial recurrence state, or mutable state without snapshots.
+     * @param seq_len Number of rows advanced in strict ascending order.
+     * @param n_heads Number of local value heads.
+     * @param d_k Key width and state-row count.
+     * @param head Local head owned by this task.
+     * @param value_row_stride Distance between source V rows in FP32 elements.
+     * @param prefetch_rows Number of future state rows to prefetch.
+     * @param prefetch_to_l1 Whether state geometry fits the detected L1 policy.
+     * @param state_snapshots Optional full-head snapshot storage.
+     * @param snapshot_stride_floats Distance between snapshot rows.
+     *
+     * The eight value vectors remain in ZMM registers through both reductions,
+     * while every lane preserves the serial-decode `j=0..d_k-1` accumulation
+     * order. When snapshots are requested, row zero is written directly from
+     * @p state into snapshot zero and every later row advances its predecessor
+     * into the next snapshot. This makes snapshots the recurrence destination,
+     * eliminating state clones and post-row copies without changing arithmetic.
+     */
+    static void gdnChunkForwardAVX512DV128(
+        const float *q_scratch,
+        const float *k_scratch,
+        const float *values,
+        const float *gate_scratch,
+        const float *beta_scratch,
+        float *output,
+        float *state,
+        int seq_len,
+        int n_heads,
+        int d_k,
+        int head,
+        int value_row_stride,
+        int prefetch_rows,
+        bool prefetch_to_l1,
+        float *state_snapshots,
+        int snapshot_stride_floats)
+    {
+        constexpr int VectorCount = 8;
+        constexpr int kVectorWidth = 16;
+        constexpr int kValueWidth = 128;
+        const int qk_stride = n_heads * d_k;
+        const int output_stride = n_heads * kValueWidth;
+        const size_t head_state_floats =
+            static_cast<size_t>(d_k) * kValueWidth;
+        float *input_head_state =
+            state + static_cast<size_t>(head) * head_state_floats;
+
+        for (int token = 0; token < seq_len; ++token)
+        {
+            const float *q = q_scratch +
+                             static_cast<size_t>(token) * qk_stride +
+                             static_cast<size_t>(head) * d_k;
+            const float *k = k_scratch +
+                             static_cast<size_t>(token) * qk_stride +
+                             static_cast<size_t>(head) * d_k;
+            const float *v = values +
+                             static_cast<size_t>(token) * value_row_stride +
+                             static_cast<size_t>(head) * kValueWidth;
+            float *o = output +
+                       static_cast<size_t>(token) * output_stride +
+                       static_cast<size_t>(head) * kValueWidth;
+            const float *source_head_state = input_head_state;
+            float *destination_head_state = input_head_state;
+            if (state_snapshots)
+            {
+                if (token > 0)
+                {
+                    source_head_state =
+                        state_snapshots +
+                        static_cast<size_t>(token - 1) * snapshot_stride_floats +
+                        static_cast<size_t>(head) * head_state_floats;
+                }
+                destination_head_state =
+                    state_snapshots +
+                    static_cast<size_t>(token) * snapshot_stride_floats +
+                    static_cast<size_t>(head) * head_state_floats;
+            }
+
+            __m512 kv[VectorCount];
+#pragma GCC unroll 8
+            for (int vector = 0; vector < VectorCount; ++vector)
+                kv[vector] = _mm512_setzero_ps();
+
+            const __m512 decay = _mm512_set1_ps(
+                gate_scratch[static_cast<size_t>(token) * n_heads + head]);
+            for (int row = 0; row < d_k; ++row)
+            {
+                if (row + prefetch_rows < d_k)
+                {
+                    GDN_PREFETCH_S(
+                        source_head_state +
+                            static_cast<size_t>(row + prefetch_rows) * kValueWidth,
+                        prefetch_to_l1);
+                }
+
+                const __m512 key = _mm512_set1_ps(k[row]);
+                const float *source_state_row =
+                    source_head_state + static_cast<size_t>(row) * kValueWidth;
+                float *destination_state_row =
+                    destination_head_state +
+                    static_cast<size_t>(row) * kValueWidth;
+#pragma GCC unroll 8
+                for (int vector = 0; vector < VectorCount; ++vector)
+                {
+                    const float *source_segment =
+                        source_state_row + vector * kVectorWidth;
+                    float *destination_segment =
+                        destination_state_row + vector * kVectorWidth;
+                    const __m512 decayed = _mm512_mul_ps(
+                        _mm512_loadu_ps(source_segment), decay);
+                    _mm512_storeu_ps(destination_segment, decayed);
+                    kv[vector] = _mm512_fmadd_ps(decayed, key, kv[vector]);
+                }
+            }
+
+            const __m512 beta = _mm512_set1_ps(
+                beta_scratch[static_cast<size_t>(token) * n_heads + head]);
+#pragma GCC unroll 8
+            for (int vector = 0; vector < VectorCount; ++vector)
+            {
+                kv[vector] = _mm512_mul_ps(
+                    _mm512_sub_ps(
+                        _mm512_loadu_ps(v + vector * kVectorWidth),
+                        kv[vector]),
+                    beta);
+            }
+
+            __m512 accumulated_output[VectorCount];
+#pragma GCC unroll 8
+            for (int vector = 0; vector < VectorCount; ++vector)
+                accumulated_output[vector] = _mm512_setzero_ps();
+
+            for (int row = 0; row < d_k; ++row)
+            {
+                if (row + prefetch_rows < d_k)
+                {
+                    GDN_PREFETCH_S(
+                        destination_head_state +
+                            static_cast<size_t>(row + prefetch_rows) * kValueWidth,
+                        prefetch_to_l1);
+                }
+
+                const __m512 key = _mm512_set1_ps(k[row]);
+                const __m512 query = _mm512_set1_ps(q[row]);
+                float *state_row =
+                    destination_head_state +
+                    static_cast<size_t>(row) * kValueWidth;
+#pragma GCC unroll 8
+                for (int vector = 0; vector < VectorCount; ++vector)
+                {
+                    float *segment = state_row + vector * kVectorWidth;
+                    const __m512 updated = _mm512_fmadd_ps(
+                        key,
+                        kv[vector],
+                        _mm512_loadu_ps(segment));
+                    _mm512_storeu_ps(segment, updated);
+                    accumulated_output[vector] = _mm512_fmadd_ps(
+                        updated,
+                        query,
+                        accumulated_output[vector]);
+                }
+            }
+
+#pragma GCC unroll 8
+            for (int vector = 0; vector < VectorCount; ++vector)
+            {
+                _mm512_storeu_ps(
+                    o + vector * kVectorWidth,
+                    accumulated_output[vector]);
+            }
+
+        }
+    }
 #endif
 
     bool CPUGatedDeltaNet::chunk_forward(
@@ -905,23 +1113,89 @@ namespace llaminar2
             state_snapshots = verifier_state_capture_;
             snapshot_stride_floats = verifier_state_capture_size_;
             max_snapshot_rows = verifier_state_capture_rows_;
-            state = prepareSpeculativeState(state, state_floats);
-            if (!state)
-                return false;
         }
-        if (state_snapshots && seq_len > 1)
-        {
-            return chunkForwardVerifierDecodeEquivalent(
-                Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
-                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-                state_snapshots, snapshot_stride_floats, max_snapshot_rows);
-        }
+        const ChunkInputView input{
+            .q = Q,
+            .k = K,
+            .v = V,
+            .q_row_stride = n_heads * d_k,
+            .k_row_stride = n_heads * d_k,
+            .v_row_stride = n_heads * d_v,
+            .n_k_heads = n_heads,
+            .global_v_head_offset = 0,
+            .layout_name = "separate_qkv"};
         return chunkForwardImpl(
-            Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
+            input, alpha, beta_raw, A_log, dt_bias, output, state,
             seq_len, n_heads, d_k, d_v, chunk_size, use_qk_l2norm,
             state_snapshots,
             snapshot_stride_floats,
-            max_snapshot_rows);
+            max_snapshot_rows,
+            state_snapshots
+                ? InputStateDisposition::PreserveInitialState
+                : InputStateDisposition::PublishTerminalState);
+    }
+
+    bool CPUGatedDeltaNet::chunkForwardMergedQKV(
+        const float *merged_qkv, int qkv_stride,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_k_heads, int n_heads, int d_k, int d_v,
+        int global_v_head_offset, int chunk_size,
+        bool use_qk_l2norm)
+    {
+        if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
+            n_heads <= 0 || d_k <= 0 || d_v <= 0)
+        {
+            return false;
+        }
+
+        const int q_src_dim = n_k_heads * d_k;
+        const int k_src_dim = n_k_heads * d_k;
+        const int v_dim = n_heads * d_v;
+        if (qkv_stride < q_src_dim + k_src_dim + v_dim)
+            return false;
+
+        const int state_floats = n_heads * d_k * d_v;
+        float *state_snapshots = nullptr;
+        int snapshot_stride_floats = 0;
+        int max_snapshot_rows = 0;
+        if (verifier_state_capture_ &&
+            verifier_state_capture_rows_ > 0 &&
+            verifier_state_capture_size_ >= state_floats)
+        {
+            state_snapshots = verifier_state_capture_;
+            snapshot_stride_floats = verifier_state_capture_size_;
+            max_snapshot_rows = verifier_state_capture_rows_;
+        }
+
+        if (state_snapshots)
+        {
+            return chunkForwardMergedQKVWithStateSnapshots(
+                merged_qkv, qkv_stride,
+                alpha, beta_raw, A_log, dt_bias,
+                output, state,
+                seq_len, n_k_heads, n_heads, d_k, d_v,
+                global_v_head_offset, chunk_size, use_qk_l2norm,
+                state_snapshots, snapshot_stride_floats,
+                max_snapshot_rows);
+        }
+
+        const ChunkInputView input{
+            .q = merged_qkv,
+            .k = merged_qkv + q_src_dim,
+            .v = merged_qkv + q_src_dim + k_src_dim,
+            .q_row_stride = qkv_stride,
+            .k_row_stride = qkv_stride,
+            .v_row_stride = qkv_stride,
+            .n_k_heads = n_k_heads,
+            .global_v_head_offset = global_v_head_offset,
+            .layout_name = "merged_qkv"};
+        return chunkForwardImpl(
+            input, alpha, beta_raw, A_log, dt_bias, output, state,
+            seq_len, n_heads, d_k, d_v, chunk_size, use_qk_l2norm,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+            InputStateDisposition::PublishTerminalState);
     }
 
     bool CPUGatedDeltaNet::chunkForwardWithStateSnapshots(
@@ -934,17 +1208,21 @@ namespace llaminar2
         float *state_snapshots, int snapshot_stride_floats,
         int max_snapshot_rows)
     {
-        if (state_snapshots && seq_len > 1)
-        {
-            return chunkForwardVerifierDecodeEquivalent(
-                Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
-                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-                state_snapshots, snapshot_stride_floats, max_snapshot_rows);
-        }
+        const ChunkInputView input{
+            .q = Q,
+            .k = K,
+            .v = V,
+            .q_row_stride = n_heads * d_k,
+            .k_row_stride = n_heads * d_k,
+            .v_row_stride = n_heads * d_v,
+            .n_k_heads = n_heads,
+            .global_v_head_offset = 0,
+            .layout_name = "separate_qkv"};
         return chunkForwardImpl(
-            Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
+            input, alpha, beta_raw, A_log, dt_bias, output, state,
             seq_len, n_heads, d_k, d_v, chunk_size, use_qk_l2norm,
-            state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+            InputStateDisposition::PublishTerminalState);
     }
 
     bool CPUGatedDeltaNet::restoreStateFromSnapshot(
@@ -963,135 +1241,6 @@ namespace llaminar2
         return true;
     }
 
-    template <typename RowAccessor>
-    bool CPUGatedDeltaNet::chunkForwardVerifierDecodeEquivalentRows(
-        RowAccessor &&row_accessor,
-        const float *alpha, const float *beta_raw,
-        const float *A_log, const float *dt_bias,
-        float *output, float *state,
-        int seq_len, int n_heads, int d_k, int d_v,
-        bool use_qk_l2norm,
-        float *state_snapshots, int snapshot_stride_floats,
-        int max_snapshot_rows)
-    {
-        const int state_floats = n_heads * d_k * d_v;
-        if (!alpha || !beta_raw || !A_log || !dt_bias ||
-            !output || !state || !state_snapshots ||
-            seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
-            snapshot_stride_floats < state_floats ||
-            max_snapshot_rows < seq_len)
-        {
-            return false;
-        }
-
-        PerfStatsCollector::addCounter(
-            "kernel",
-            "cpu_gdn_grouped_verifier_recurrence_calls",
-            1.0,
-            "verifier",
-            "cpu",
-            {{"verifier_rows", std::to_string(seq_len)},
-             {"n_heads", std::to_string(n_heads)},
-             {"d_k", std::to_string(d_k)},
-             {"d_v", std::to_string(d_v)},
-             {"snapshot_rows", std::to_string(seq_len)},
-             {"execution_policy", "head_grouped_recurrence"}});
-
-        const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
-        constexpr float l2_eps = 1e-6f;
-        const int v_stride = n_heads * d_v;
-
-        /**
-         * The verifier rows must be decode-equivalent, but they must not be a
-         * hidden sequence of full one-token decode launches.  GDN's recurrence
-         * dependency is per head, so the grouped verifier kernel owns a head's
-         * state for all rows, advances that head in serial decode order, and
-         * publishes the head slice of every post-row snapshot.  This preserves
-         * the exact recurrent_step() operation order for each head while using
-         * one OpenMP worksharing region for the whole runtime-M verifier chunk.
-         */
-        auto grouped_decode_equivalent = [&]()
-        {
-#pragma omp for schedule(static)
-            for (int h = 0; h < n_heads; ++h)
-            {
-                alignas(64) float q_local[512];
-                alignas(64) float k_local[512];
-
-                const size_t head_state_floats = static_cast<size_t>(d_k) * d_v;
-                float *S = state + static_cast<size_t>(h) * head_state_floats;
-
-                for (int t = 0; t < seq_len; ++t)
-                {
-                    const float *q_t = nullptr;
-                    const float *k_t = nullptr;
-                    const float *v_t = nullptr;
-                    row_accessor(t, h, q_t, k_t, v_t);
-                    const float *alpha_t = alpha + static_cast<size_t>(t) * n_heads;
-                    const float *beta_t = beta_raw + static_cast<size_t>(t) * n_heads;
-                    float *output_t = output + static_cast<size_t>(t) * v_stride + h * d_v;
-
-                    if (use_qk_l2norm)
-                    {
-                        gdn_preprocess_qk_l2norm(q_t, k_t, q_local, k_local, d_k, scale_val, l2_eps);
-                    }
-                    else
-                    {
-                        gdn_preprocess_qk_scale(q_t, k_t, q_local, k_local, d_k, scale_val);
-                    }
-
-                    const float x = alpha_t[h] + dt_bias[h];
-                    const float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
-                    const float decay = std::exp(A_log[h] * sp);
-                    const float beta_h = 1.0f / (1.0f + std::exp(-beta_t[h]));
-
-                    gdn_delta_recurrence(S, q_local, k_local, v_t, output_t, decay, beta_h, d_k, d_v);
-
-                    if (t < max_snapshot_rows)
-                    {
-                        float *snapshot_head =
-                            state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats +
-                            static_cast<size_t>(h) * head_state_floats;
-                        std::memcpy(snapshot_head, S, head_state_floats * sizeof(float));
-                    }
-                }
-            }
-        };
-        OMP_WORKSHARE_REGION(grouped_decode_equivalent);
-
-        return true;
-    }
-
-    bool CPUGatedDeltaNet::chunkForwardVerifierDecodeEquivalent(
-        const float *Q, const float *K, const float *V,
-        const float *alpha, const float *beta_raw,
-        const float *A_log, const float *dt_bias,
-        float *output, float *state,
-        int seq_len, int n_heads, int d_k, int d_v,
-        bool use_qk_l2norm,
-        float *state_snapshots, int snapshot_stride_floats,
-        int max_snapshot_rows)
-    {
-        if (!Q || !K || !V)
-            return false;
-
-        const int qk_stride = n_heads * d_k;
-        const int v_stride = n_heads * d_v;
-        auto contiguous_rows =
-            [=](int t, int h, const float *&q_t, const float *&k_t, const float *&v_t)
-        {
-            q_t = Q + static_cast<size_t>(t) * qk_stride + h * d_k;
-            k_t = K + static_cast<size_t>(t) * qk_stride + h * d_k;
-            v_t = V + static_cast<size_t>(t) * v_stride + h * d_v;
-        };
-
-        return chunkForwardVerifierDecodeEquivalentRows(
-            contiguous_rows,
-            alpha, beta_raw, A_log, dt_bias, output, state,
-            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-            state_snapshots, snapshot_stride_floats, max_snapshot_rows);
-    }
-
     bool CPUGatedDeltaNet::chunkForwardMergedQKVWithStateSnapshots(
         const float *merged_qkv, int qkv_stride,
         const float *alpha, const float *beta_raw,
@@ -1102,7 +1251,6 @@ namespace llaminar2
         float *state_snapshots, int snapshot_stride_floats,
         int max_snapshot_rows)
     {
-        (void)chunk_size;
         if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
             n_heads <= 0 || d_k <= 0 || d_v <= 0)
         {
@@ -1112,33 +1260,29 @@ namespace llaminar2
         const int q_src_dim = n_k_heads * d_k;
         const int k_src_dim = n_k_heads * d_k;
         const int v_dim = n_heads * d_v;
-        const int state_floats = n_heads * d_k * d_v;
         if (qkv_stride < q_src_dim + k_src_dim + v_dim)
             return false;
 
-        float *state_for_compute = prepareSpeculativeState(state, state_floats);
-        if (!state_for_compute)
-            return false;
-
-        auto merged_rows =
-            [=](int t, int h, const float *&q_t, const float *&k_t, const float *&v_t)
-        {
-            int qk_head = (h + global_v_head_offset) % n_k_heads;
-            if (qk_head < 0)
-                qk_head += n_k_heads;
-
-            const float *row =
-                merged_qkv + static_cast<size_t>(t) * qkv_stride;
-            q_t = row + static_cast<size_t>(qk_head) * d_k;
-            k_t = row + q_src_dim + static_cast<size_t>(qk_head) * d_k;
-            v_t = row + q_src_dim + k_src_dim + static_cast<size_t>(h) * d_v;
-        };
-
-        return chunkForwardVerifierDecodeEquivalentRows(
-            merged_rows,
-            alpha, beta_raw, A_log, dt_bias, output, state_for_compute,
-            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-            state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+        /*
+         * Snapshot publication is an output contract, not a distinct recurrence
+         * algorithm.  Use the same source view and kernel as ordinary M=1 decode
+         * so grouped verifier rows cannot drift into a second arithmetic path.
+         */
+        const ChunkInputView input{
+            .q = merged_qkv,
+            .k = merged_qkv + q_src_dim,
+            .v = merged_qkv + q_src_dim + k_src_dim,
+            .q_row_stride = qkv_stride,
+            .k_row_stride = qkv_stride,
+            .v_row_stride = qkv_stride,
+            .n_k_heads = n_k_heads,
+            .global_v_head_offset = global_v_head_offset,
+            .layout_name = "merged_qkv"};
+        return chunkForwardImpl(
+            input, alpha, beta_raw, A_log, dt_bias, output, state,
+            seq_len, n_heads, d_k, d_v, chunk_size, use_qk_l2norm,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows,
+            InputStateDisposition::PreserveInitialState);
     }
 
     template <typename RowAccessor>
@@ -1412,21 +1556,72 @@ namespace llaminar2
     }
 
     bool CPUGatedDeltaNet::chunkForwardImpl(
-        const float *Q, const float *K, const float *V,
+        const ChunkInputView &input,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
         float *output, float *state,
         int seq_len, int n_heads, int d_k, int d_v,
         int /*chunk_size*/, bool use_qk_l2norm,
         float *state_snapshots, int snapshot_stride_floats,
-        int max_snapshot_rows)
+        int max_snapshot_rows,
+        InputStateDisposition input_state_disposition)
     {
-        const int state_floats = n_heads * d_k * d_v;
-        const bool capture_state_snapshots = state_snapshots != nullptr;
-        if (capture_state_snapshots &&
-            (snapshot_stride_floats < state_floats || max_snapshot_rows <= 0))
+        if (!input.q || !input.k || !input.v || !input.layout_name ||
+            input.q_row_stride <= 0 || input.k_row_stride <= 0 ||
+            input.v_row_stride <= 0 || input.n_k_heads <= 0 ||
+            !alpha || !beta_raw || !A_log || !dt_bias || !output || !state ||
+            seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+            d_k > 512 || d_v > 512)
         {
             return false;
+        }
+
+        const size_t state_floats_wide =
+            static_cast<size_t>(n_heads) * d_k * d_v;
+        if (state_floats_wide >
+            static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+        const int state_floats = static_cast<int>(state_floats_wide);
+        const bool capture_state_snapshots = state_snapshots != nullptr;
+        if (capture_state_snapshots &&
+            (snapshot_stride_floats < state_floats ||
+             max_snapshot_rows < seq_len))
+        {
+            return false;
+        }
+        if (!capture_state_snapshots &&
+            input_state_disposition == InputStateDisposition::PreserveInitialState)
+        {
+            return false;
+        }
+        if (capture_state_snapshots)
+        {
+            const size_t preceding_snapshot_rows =
+                static_cast<size_t>(seq_len - 1);
+            const size_t snapshot_stride =
+                static_cast<size_t>(snapshot_stride_floats);
+            if (preceding_snapshot_rows >
+                (std::numeric_limits<size_t>::max() - state_floats_wide) /
+                    snapshot_stride)
+            {
+                return false;
+            }
+            const size_t snapshot_span_floats =
+                preceding_snapshot_rows * snapshot_stride + state_floats_wide;
+            if (state_floats_wide >
+                    std::numeric_limits<size_t>::max() / sizeof(float) ||
+                snapshot_span_floats >
+                    std::numeric_limits<size_t>::max() / sizeof(float) ||
+                byteRangesOverlap(
+                    state,
+                    state_floats_wide * sizeof(float),
+                    state_snapshots,
+                    snapshot_span_floats * sizeof(float)))
+            {
+                return false;
+            }
         }
 
         ensureScratch(seq_len, n_heads, d_k, d_v);
@@ -1448,6 +1643,53 @@ namespace llaminar2
         // Prefetch 2 rows ahead gives the hw ~16 cache-line fetches of runway.
         const int pf_rows_ahead = std::max(1, std::min(4,
                                                        static_cast<int>(ci.l2_size / (4u * S_head_bytes))));
+        const int active_or_requested_workers = omp_in_parallel()
+                                                    ? omp_get_num_threads()
+                                                    : omp_get_max_threads();
+        const int useful_worker_count = std::max(
+            1,
+            std::min(active_or_requested_workers, n_heads));
+
+        if (capture_state_snapshots)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_gdn_grouped_verifier_recurrence_calls",
+                1.0,
+                "verifier",
+                "cpu",
+                {{"verifier_rows", std::to_string(seq_len)},
+                 {"n_heads", std::to_string(n_heads)},
+                 {"d_k", std::to_string(d_k)},
+                 {"d_v", std::to_string(d_v)},
+                 {"snapshot_rows", std::to_string(seq_len)},
+                 {"input_layout", input.layout_name},
+                 {"parallel_axis", "head"},
+                 {"active_or_requested_workers", std::to_string(active_or_requested_workers)},
+                 {"useful_worker_count", std::to_string(useful_worker_count)},
+                 {"execution_policy", "head_grouped_recurrence"},
+                 {"kernel_variant", "canonical_chunk_forward"},
+                 {"snapshot_materialization", "direct_row_destination"},
+                 {"arithmetic_order", "serial_decode_per_head"}});
+        }
+        else
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_gdn_prefill_recurrence_calls",
+                1.0,
+                seq_len == 1 ? "decode" : "prefill",
+                "cpu",
+                {{"rows", std::to_string(seq_len)},
+                 {"n_heads", std::to_string(n_heads)},
+                 {"d_k", std::to_string(d_k)},
+                 {"d_v", std::to_string(d_v)},
+                 {"input_layout", input.layout_name},
+                 {"parallel_axis", "head"},
+                 {"active_or_requested_workers", std::to_string(active_or_requested_workers)},
+                 {"useful_worker_count", std::to_string(useful_worker_count)},
+                 {"arithmetic_order", "serial_decode_per_head"}});
+        }
 
         auto do_work = [&]()
         {
@@ -1461,8 +1703,16 @@ namespace llaminar2
                     const int out_off = t * v_stride + h * d_v;
                     float *q_dst = q_scratch_.data() + qk_off;
                     float *k_dst = k_scratch_.data() + qk_off;
-                    const float *q_src = Q + qk_off;
-                    const float *k_src = K + qk_off;
+                    int source_head =
+                        (h + input.global_v_head_offset) % input.n_k_heads;
+                    if (source_head < 0)
+                        source_head += input.n_k_heads;
+                    const float *q_src =
+                        input.q + static_cast<size_t>(t) * input.q_row_stride +
+                        static_cast<size_t>(source_head) * d_k;
+                    const float *k_src =
+                        input.k + static_cast<size_t>(t) * input.k_row_stride +
+                        static_cast<size_t>(source_head) * d_k;
 
                     if (use_qk_l2norm)
                     {
@@ -1492,260 +1742,193 @@ namespace llaminar2
             }
             // implicit barrier between omp-for regions
 
-            // ── Phase 2: Fused recurrence (across heads) ─────────────────
-            // No d_v tiling — process all d_v columns at once so Q/K data
-            // is only read once per head.  S[d_k, d_v] lives in L2; the
-            // sequential row-stride access pattern is hw-prefetcher friendly.
-            //
-            // For d_v=128, the inner vi loop is fully unrolled with kv_mem,
-            // delta, and output kept in ZMM registers.  The generic loop
-            // loads/stores these from stack every j-iteration, causing ~47%
-            // L1 miss rate (perf measured).  Register-resident eliminates
-            // those accesses entirely.
+            // Phase 2: fused recurrence across independent heads. Token order
+            // remains serial inside each head. Whole-head ownership avoids the
+            // measured Q/K duplication and adjacent-state contention of value
+            // column splitting.
 #pragma omp for schedule(static)
-            for (int h = 0; h < n_heads; ++h)
+            for (int head = 0; head < n_heads; ++head)
             {
-                const size_t head_state_floats = static_cast<size_t>(d_k) * d_v;
-                float *S = state + static_cast<size_t>(h) * head_state_floats;
+                const int column_count = d_v;
+                const size_t head_state_floats =
+                    static_cast<size_t>(d_k) * d_v;
+                float *input_head_state =
+                    state + static_cast<size_t>(head) * head_state_floats;
 
 #if defined(__AVX512F__)
                 if (d_v == 128)
                 {
-                    // ══════════════════════════════════════════════════════
-                    // Specialized path: d_v=128 (8 ZMMs), register-resident
-                    // accumulators.  Eliminates ~5000 L1 load/stores per
-                    // timestep vs the generic loop.
-                    // ══════════════════════════════════════════════════════
-
-                    for (int t = 0; t < seq_len; ++t)
-                    {
-                        const float *q_t = q_scratch_.data() + t * qk_stride + h * d_k;
-                        const float *k_t = k_scratch_.data() + t * qk_stride + h * d_k;
-                        const float *v_t = V + t * v_stride + h * d_v;
-                        const float decay_val = gate_scratch_[t * n_heads + h];
-                        const float beta_t = beta_sig_scratch_[t * n_heads + h];
-                        float *o_t = output + t * v_stride + h * d_v;
-
-                        // ── Fused step 1+2: Decay S + kv_mem = S^T * k ──
-                        // kv_mem in 8 ZMM registers (not stack)
-                        __m512 kv0 = _mm512_setzero_ps();
-                        __m512 kv1 = _mm512_setzero_ps();
-                        __m512 kv2 = _mm512_setzero_ps();
-                        __m512 kv3 = _mm512_setzero_ps();
-                        __m512 kv4 = _mm512_setzero_ps();
-                        __m512 kv5 = _mm512_setzero_ps();
-                        __m512 kv6 = _mm512_setzero_ps();
-                        __m512 kv7 = _mm512_setzero_ps();
-
-                        const __m512 vdecay = _mm512_set1_ps(decay_val);
-
-                        for (int j = 0; j < d_k; ++j)
-                        {
-                            if (j + pf_rows_ahead < d_k)
-                                GDN_PREFETCH_S(S + (j + pf_rows_ahead) * 128, pf_to_l1);
-
-                            const __m512 vk = _mm512_set1_ps(k_t[j]);
-                            float *S_row = S + j * 128;
-
-                            __m512 s0 = _mm512_mul_ps(_mm512_loadu_ps(S_row + 0), vdecay);
-                            __m512 s1 = _mm512_mul_ps(_mm512_loadu_ps(S_row + 16), vdecay);
-                            __m512 s2 = _mm512_mul_ps(_mm512_loadu_ps(S_row + 32), vdecay);
-                            __m512 s3 = _mm512_mul_ps(_mm512_loadu_ps(S_row + 48), vdecay);
-                            __m512 s4 = _mm512_mul_ps(_mm512_loadu_ps(S_row + 64), vdecay);
-                            __m512 s5 = _mm512_mul_ps(_mm512_loadu_ps(S_row + 80), vdecay);
-                            __m512 s6 = _mm512_mul_ps(_mm512_loadu_ps(S_row + 96), vdecay);
-                            __m512 s7 = _mm512_mul_ps(_mm512_loadu_ps(S_row + 112), vdecay);
-
-                            _mm512_storeu_ps(S_row + 0, s0);
-                            _mm512_storeu_ps(S_row + 16, s1);
-                            _mm512_storeu_ps(S_row + 32, s2);
-                            _mm512_storeu_ps(S_row + 48, s3);
-                            _mm512_storeu_ps(S_row + 64, s4);
-                            _mm512_storeu_ps(S_row + 80, s5);
-                            _mm512_storeu_ps(S_row + 96, s6);
-                            _mm512_storeu_ps(S_row + 112, s7);
-
-                            kv0 = _mm512_fmadd_ps(s0, vk, kv0);
-                            kv1 = _mm512_fmadd_ps(s1, vk, kv1);
-                            kv2 = _mm512_fmadd_ps(s2, vk, kv2);
-                            kv3 = _mm512_fmadd_ps(s3, vk, kv3);
-                            kv4 = _mm512_fmadd_ps(s4, vk, kv4);
-                            kv5 = _mm512_fmadd_ps(s5, vk, kv5);
-                            kv6 = _mm512_fmadd_ps(s6, vk, kv6);
-                            kv7 = _mm512_fmadd_ps(s7, vk, kv7);
-                        }
-
-                        // ── Step 3: delta = (v - kv_mem) * beta ──
-                        // delta stays in registers (reuse kv0-kv7)
-                        const __m512 vbeta = _mm512_set1_ps(beta_t);
-                        kv0 = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(v_t + 0), kv0), vbeta);
-                        kv1 = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(v_t + 16), kv1), vbeta);
-                        kv2 = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(v_t + 32), kv2), vbeta);
-                        kv3 = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(v_t + 48), kv3), vbeta);
-                        kv4 = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(v_t + 64), kv4), vbeta);
-                        kv5 = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(v_t + 80), kv5), vbeta);
-                        kv6 = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(v_t + 96), kv6), vbeta);
-                        kv7 = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(v_t + 112), kv7), vbeta);
-                        // kv0-kv7 now hold delta[0..127]
-
-                        // ── Fused step 4+5: S += k⊗δ, output += S^T * q ──
-                        // output in 8 ZMM registers
-                        __m512 o0 = _mm512_setzero_ps();
-                        __m512 o1 = _mm512_setzero_ps();
-                        __m512 o2 = _mm512_setzero_ps();
-                        __m512 o3 = _mm512_setzero_ps();
-                        __m512 o4 = _mm512_setzero_ps();
-                        __m512 o5 = _mm512_setzero_ps();
-                        __m512 o6 = _mm512_setzero_ps();
-                        __m512 o7 = _mm512_setzero_ps();
-
-                        for (int j = 0; j < d_k; ++j)
-                        {
-                            if (j + pf_rows_ahead < d_k)
-                                GDN_PREFETCH_S(S + (j + pf_rows_ahead) * 128, pf_to_l1);
-
-                            const __m512 vk = _mm512_set1_ps(k_t[j]);
-                            const __m512 vq = _mm512_set1_ps(q_t[j]);
-                            float *S_row = S + j * 128;
-
-                            // S update: s = S_row + k * delta  (all 8 segments)
-                            __m512 s0 = _mm512_fmadd_ps(vk, kv0, _mm512_loadu_ps(S_row + 0));
-                            __m512 s1 = _mm512_fmadd_ps(vk, kv1, _mm512_loadu_ps(S_row + 16));
-                            __m512 s2 = _mm512_fmadd_ps(vk, kv2, _mm512_loadu_ps(S_row + 32));
-                            __m512 s3 = _mm512_fmadd_ps(vk, kv3, _mm512_loadu_ps(S_row + 48));
-                            __m512 s4 = _mm512_fmadd_ps(vk, kv4, _mm512_loadu_ps(S_row + 64));
-                            __m512 s5 = _mm512_fmadd_ps(vk, kv5, _mm512_loadu_ps(S_row + 80));
-                            __m512 s6 = _mm512_fmadd_ps(vk, kv6, _mm512_loadu_ps(S_row + 96));
-                            __m512 s7 = _mm512_fmadd_ps(vk, kv7, _mm512_loadu_ps(S_row + 112));
-
-                            _mm512_storeu_ps(S_row + 0, s0);
-                            _mm512_storeu_ps(S_row + 16, s1);
-                            _mm512_storeu_ps(S_row + 32, s2);
-                            _mm512_storeu_ps(S_row + 48, s3);
-                            _mm512_storeu_ps(S_row + 64, s4);
-                            _mm512_storeu_ps(S_row + 80, s5);
-                            _mm512_storeu_ps(S_row + 96, s6);
-                            _mm512_storeu_ps(S_row + 112, s7);
-
-                            // output accumulation: o += S * q  (all 8 segments)
-                            o0 = _mm512_fmadd_ps(s0, vq, o0);
-                            o1 = _mm512_fmadd_ps(s1, vq, o1);
-                            o2 = _mm512_fmadd_ps(s2, vq, o2);
-                            o3 = _mm512_fmadd_ps(s3, vq, o3);
-                            o4 = _mm512_fmadd_ps(s4, vq, o4);
-                            o5 = _mm512_fmadd_ps(s5, vq, o5);
-                            o6 = _mm512_fmadd_ps(s6, vq, o6);
-                            o7 = _mm512_fmadd_ps(s7, vq, o7);
-                        }
-
-                        // Store output (single write, no read-modify-write)
-                        _mm512_storeu_ps(o_t + 0, o0);
-                        _mm512_storeu_ps(o_t + 16, o1);
-                        _mm512_storeu_ps(o_t + 32, o2);
-                        _mm512_storeu_ps(o_t + 48, o3);
-                        _mm512_storeu_ps(o_t + 64, o4);
-                        _mm512_storeu_ps(o_t + 80, o5);
-                        _mm512_storeu_ps(o_t + 96, o6);
-                        _mm512_storeu_ps(o_t + 112, o7);
-
-                        if (capture_state_snapshots && t < max_snapshot_rows)
-                        {
-                            float *snapshot_head =
-                                state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats +
-                                static_cast<size_t>(h) * head_state_floats;
-                            std::memcpy(snapshot_head, S, head_state_floats * sizeof(float));
-                        }
-
-                    } // timesteps
+                    gdnChunkForwardAVX512DV128(
+                        q_scratch_.data(), k_scratch_.data(), input.v,
+                        gate_scratch_.data(), beta_sig_scratch_.data(),
+                        output, state, seq_len, n_heads, d_k, head,
+                        input.v_row_stride,
+                        pf_rows_ahead, pf_to_l1,
+                        state_snapshots,
+                        snapshot_stride_floats);
+                    continue;
                 }
-                else
-#endif // __AVX512F__
-                {
-                    // ── Generic fallback (non-128 d_v or no AVX-512) ──────
-                    alignas(64) float kv_mem[512]; // d_v <= 512
-                    alignas(64) float delta[512];
+#endif
 
-                    for (int t = 0; t < seq_len; ++t)
+                // Generic AVX2/scalar whole-head implementation. Scratch is
+                // private to the OpenMP head owner.
+                alignas(64) float kv_mem[512];
+                alignas(64) float delta[512];
+                for (int token = 0; token < seq_len; ++token)
+                {
+                    const float *q = q_scratch_.data() +
+                                     static_cast<size_t>(token) * qk_stride +
+                                     static_cast<size_t>(head) * d_k;
+                    const float *k = k_scratch_.data() +
+                                     static_cast<size_t>(token) * qk_stride +
+                                     static_cast<size_t>(head) * d_k;
+                    const float *v = input.v +
+                                     static_cast<size_t>(token) * input.v_row_stride +
+                                     static_cast<size_t>(head) * d_v;
+                    float *o = output +
+                               static_cast<size_t>(token) * v_stride +
+                               static_cast<size_t>(head) * d_v;
+                    const float decay = gate_scratch_[
+                        static_cast<size_t>(token) * n_heads + head];
+                    const float beta = beta_sig_scratch_[
+                        static_cast<size_t>(token) * n_heads + head];
+                    const float *source_head_state = input_head_state;
+                    float *destination_head_state = input_head_state;
+                    if (capture_state_snapshots)
                     {
-                        const float *q_t = q_scratch_.data() + t * qk_stride + h * d_k;
-                        const float *k_t = k_scratch_.data() + t * qk_stride + h * d_k;
-                        const float *v_t = V + t * v_stride + h * d_v;
-                        const float decay_val = gate_scratch_[t * n_heads + h];
-                        const float beta_t = beta_sig_scratch_[t * n_heads + h];
-                        float *o_t = output + t * v_stride + h * d_v;
+                        if (token > 0)
+                        {
+                            source_head_state =
+                                state_snapshots +
+                                static_cast<size_t>(token - 1) *
+                                    snapshot_stride_floats +
+                                static_cast<size_t>(head) * head_state_floats;
+                        }
+                        destination_head_state =
+                            state_snapshots +
+                            static_cast<size_t>(token) * snapshot_stride_floats +
+                            static_cast<size_t>(head) * head_state_floats;
+                    }
 
 #if defined(__AVX2__)
-                        // Fused step 1+2: Decay S + kv_mem = S^T * k
-                        avx2::zero(kv_mem, d_v);
-                        for (int j = 0; j < d_k; ++j)
-                        {
+                    avx2::zero(kv_mem, column_count);
+                    for (int row = 0; row < d_k; ++row)
+                    {
 #if defined(__AVX512F__) || defined(__AVX2__)
-                            if (j + pf_rows_ahead < d_k)
-                                GDN_PREFETCH_S(S + (j + pf_rows_ahead) * d_v, pf_to_l1);
-#endif
-                            float *S_row = S + j * d_v;
-                            avx2::scale(S_row, d_v, decay_val);
-                            avx2::axpy(kv_mem, S_row, k_t[j], d_v);
-                        }
-
-                        // Step 3: delta = (v - kv_mem) * beta
-                        avx2::sub_mul(delta, v_t, kv_mem, beta_t, d_v);
-
-                        // Fused step 4+5: S += k⊗δ, output += S^T * q
-                        avx2::zero(o_t, d_v);
-                        for (int j = 0; j < d_k; ++j)
+                        if (row + pf_rows_ahead < d_k)
                         {
-#if defined(__AVX512F__) || defined(__AVX2__)
-                            if (j + pf_rows_ahead < d_k)
-                                GDN_PREFETCH_S(S + (j + pf_rows_ahead) * d_v, pf_to_l1);
-#endif
-                            float *S_row = S + j * d_v;
-                            avx2::axpy(S_row, delta, k_t[j], d_v);
-                            avx2::axpy(o_t, S_row, q_t[j], d_v);
+                            GDN_PREFETCH_S(
+                                source_head_state +
+                                    static_cast<size_t>(row + pf_rows_ahead) * d_v,
+                                pf_to_l1);
                         }
+#endif
+                        const float *source_state_range =
+                            source_head_state + static_cast<size_t>(row) * d_v;
+                        float *destination_state_range =
+                            destination_head_state +
+                            static_cast<size_t>(row) * d_v;
+                        avx2::copy_scale(
+                            destination_state_range,
+                            source_state_range,
+                            decay,
+                            column_count);
+                        avx2::axpy(
+                            kv_mem,
+                            destination_state_range,
+                            k[row],
+                            column_count);
+                    }
+                    avx2::sub_mul(delta, v, kv_mem, beta, column_count);
+                    avx2::zero(o, column_count);
+                    for (int row = 0; row < d_k; ++row)
+                    {
+#if defined(__AVX512F__) || defined(__AVX2__)
+                        if (row + pf_rows_ahead < d_k)
+                        {
+                            GDN_PREFETCH_S(
+                                destination_head_state +
+                                    static_cast<size_t>(row + pf_rows_ahead) * d_v,
+                                pf_to_l1);
+                        }
+#endif
+                        float *state_range =
+                            destination_head_state +
+                            static_cast<size_t>(row) * d_v;
+                        avx2::axpy(state_range, delta, k[row], column_count);
+                        avx2::axpy(o, state_range, q[row], column_count);
+                    }
 #else
-                        // Fused step 1+2: Decay S + kv_mem = S^T * k
-                        std::memset(kv_mem, 0, d_v * sizeof(float));
-                        for (int j = 0; j < d_k; ++j)
+                    std::memset(
+                        kv_mem,
+                        0,
+                        static_cast<size_t>(column_count) * sizeof(float));
+                    for (int row = 0; row < d_k; ++row)
+                    {
+                        const float *source_state_range =
+                            source_head_state + static_cast<size_t>(row) * d_v;
+                        float *destination_state_range =
+                            destination_head_state +
+                            static_cast<size_t>(row) * d_v;
+                        for (int column = 0; column < column_count; ++column)
                         {
-                            float *S_row = S + j * d_v;
-                            const float k_j = k_t[j];
-                            for (int vi = 0; vi < d_v; ++vi)
-                            {
-                                S_row[vi] *= decay_val;
-                                kv_mem[vi] += S_row[vi] * k_j;
-                            }
+                            destination_state_range[column] =
+                                source_state_range[column] * decay;
+                            kv_mem[column] +=
+                                destination_state_range[column] * k[row];
                         }
+                    }
+                    for (int column = 0; column < column_count; ++column)
+                        delta[column] = (v[column] - kv_mem[column]) * beta;
 
-                        // Step 3: delta = (v - kv_mem) * beta
-                        for (int vi = 0; vi < d_v; ++vi)
-                            delta[vi] = (v_t[vi] - kv_mem[vi]) * beta_t;
-
-                        // Fused step 4+5: S += k⊗δ, output += S^T * q
-                        std::memset(o_t, 0, d_v * sizeof(float));
-                        for (int j = 0; j < d_k; ++j)
+                    std::memset(
+                        o,
+                        0,
+                        static_cast<size_t>(column_count) * sizeof(float));
+                    for (int row = 0; row < d_k; ++row)
+                    {
+                        float *state_range =
+                            destination_head_state +
+                            static_cast<size_t>(row) * d_v;
+                        for (int column = 0; column < column_count; ++column)
                         {
-                            float *S_row = S + j * d_v;
-                            const float k_j = k_t[j];
-                            const float q_j = q_t[j];
-                            for (int vi = 0; vi < d_v; ++vi)
-                            {
-                                S_row[vi] += k_j * delta[vi];
-                                o_t[vi] += S_row[vi] * q_j;
-                            }
+                            state_range[column] += k[row] * delta[column];
+                            o[column] += state_range[column] * q[row];
                         }
+                    }
 #endif
-                        if (capture_state_snapshots && t < max_snapshot_rows)
-                        {
-                            float *snapshot_head =
-                                state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats +
-                                static_cast<size_t>(h) * head_state_floats;
-                            std::memcpy(snapshot_head, S, head_state_floats * sizeof(float));
-                        }
-                    } // timesteps
+
                 }
-            } // heads
+            }
+
+            if (capture_state_snapshots &&
+                input_state_disposition ==
+                    InputStateDisposition::PublishTerminalState)
+            {
+                const float *terminal_snapshot =
+                    state_snapshots +
+                    static_cast<size_t>(seq_len - 1) * snapshot_stride_floats;
+#pragma omp for schedule(static)
+                for (int head = 0; head < n_heads; ++head)
+                {
+                    const size_t head_state_floats =
+                        static_cast<size_t>(d_k) * d_v;
+                    std::memcpy(
+                        state + static_cast<size_t>(head) * head_state_floats,
+                        terminal_snapshot +
+                            static_cast<size_t>(head) * head_state_floats,
+                        head_state_floats * sizeof(float));
+                }
+            }
         };
+        /*
+         * Use the stable process-wide team even when the number of recurrent
+         * heads is smaller than the socket width. A bounded team looks cheaper
+         * in an isolated kernel sample, but libgomp may retire every omitted
+         * worker and make the following full-width projection recreate it.
+         * The omp-for loops naturally leave workers without a head idle while
+         * preserving the process-wide team for the next captured CPU stage.
+         */
         OMP_WORKSHARE_REGION(do_work);
 
 #if defined(__AVX512F__)

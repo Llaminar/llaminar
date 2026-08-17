@@ -5,8 +5,8 @@
  * These tests mirror the Qwen3.5 and Qwen3.6 MoE layer-by-layer parity
  * harnesses.  The prefix/MTP parity suite proves request-level behavior; this
  * suite proves the underlying dense graph math by comparing PyTorch snapshots
- * against Llaminar snapshots for prefill, decode, and snapshot availability on
- * CPU, CUDA, and ROCm.
+ * against one live Llaminar production session for prefill, decode, and
+ * snapshot availability on CPU, CUDA, and ROCm.
  */
 
 #include <gtest/gtest.h>
@@ -105,48 +105,9 @@ public:
     const TestConfig &getTestConfig() const { return GetParam(); }
 };
 
-TEST_P(Qwen36DenseSingleDeviceParityTest, PrefillParity)
+TEST_P(Qwen36DenseSingleDeviceParityTest, ProductionParity)
 {
-    auto summary = runSingleDevicePrefillParity();
-    assertParity(summary);
-}
-
-TEST_P(Qwen36DenseSingleDeviceParityTest, DecodeParity)
-{
-    auto summary = runSingleDeviceDecodeParity();
-    assertDecodeParity(summary);
-}
-
-TEST_P(Qwen36DenseSingleDeviceParityTest, SnapshotInfrastructure)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    auto embedding = loadPyTorchSnapshot("EMBEDDING");
-    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
-
-    ASSERT_NE(runner_, nullptr);
-    ASSERT_TRUE(runner_->forward(config_.token_ids.data(), config_.token_ids.size()));
-
-    auto keys = runner_->getSnapshotKeys();
-    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
-
-    EXPECT_NE(std::find(keys.begin(), keys.end(), "EMBEDDING"), keys.end())
-        << "Missing EMBEDDING snapshot";
-    EXPECT_NE(std::find(keys.begin(), keys.end(), "LM_HEAD"), keys.end())
-        << "Missing LM_HEAD snapshot";
-
-    bool has_gdn_state = false;
-    for (const auto &key : keys)
-    {
-        if (key.find("GDN_DELTA_RULE_OUTPUT") != std::string::npos ||
-            key.find("GDN_NORM_GATE_OUTPUT") != std::string::npos)
-        {
-            has_gdn_state = true;
-            break;
-        }
-    }
-    EXPECT_TRUE(has_gdn_state)
-        << "Dense Qwen3.6 snapshots should include GDN stage outputs";
+    runProductionParityCampaign();
 }
 
 INSTANTIATE_TEST_SUITE_P(

@@ -81,7 +81,10 @@ namespace llaminar2
         const std::string &path,
         const DeviceId target_device)
     {
-        loader.setTargetIsGpu(target_device.is_gpu());
+        loader.setPayloadAccessPattern(
+            target_device.is_gpu()
+                ? ModelPayloadAccessPattern::DeviceStaging
+                : ModelPayloadAccessPattern::DenseCpuResident);
         return tryLoadModel(loader, path);
     }
 

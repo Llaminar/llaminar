@@ -1,3 +1,13 @@
+/**
+ * @file DeviceMoETransferSlotDirectory.cpp
+ * @brief Persistent participant-local storage for device MoE transfer arrivals.
+ *
+ * Directory entries separate immutable allocation identity from request-owned
+ * logical occupants. Construction validates exact arithmetic format and
+ * geometry before publishing pointer-bearing descriptors; request reset then
+ * restores the immutable device baseline with one ordered D2D copy.
+ */
+
 #include "DeviceMoETransferSlotDirectory.h"
 
 #include "../../backends/IBackend.h"
@@ -30,6 +40,13 @@ namespace llaminar2
                 static_cast<uint8_t>(spec.payload_bytes_per_block);
             desc.allocation_has_mins = spec.is_asymmetric ? 1u : 0u;
             desc.allocation_has_emins = spec.has_emins ? 1u : 0u;
+            if (!spec.format.isNativeVnni())
+                return {};
+            desc.source_codebook_id = spec.format.native_vnni.codebook_id;
+            desc.source_is_superblock = static_cast<uint8_t>(
+                spec.format.native_vnni.is_superblock);
+            desc.source_identity_present = static_cast<uint8_t>(
+                spec.format.native_vnni.present);
             return desc;
         }
 
@@ -71,10 +88,11 @@ namespace llaminar2
                         "DeviceMoETransferSlotDirectory projection label must be gate, up, or down");
 
                 if (spec.N <= 0 || spec.K <= 0 || (spec.K % 32) != 0 ||
-                    spec.payload_bytes_per_block <= 0)
+                    spec.payload_bytes_per_block <= 0 ||
+                    !spec.format.valid())
                 {
                     throw std::invalid_argument(
-                        "DeviceMoETransferSlotDirectory projection spec has invalid NativeVNNI shape");
+                        "DeviceMoETransferSlotDirectory projection spec has invalid NativeVNNI shape or source format");
                 }
             }
 

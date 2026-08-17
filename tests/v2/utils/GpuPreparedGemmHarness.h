@@ -171,6 +171,29 @@ namespace llaminar2::test
     };
 
     /**
+     * @brief Own three production-prepared Q/K/V kernels in one model store.
+     *
+     * `FusedQKVGEMMStage` resolves all projections from one
+     * `PreparedWeightStore`; separate single-weight helpers do not represent
+     * that ownership graph. The retained load orchestrators own each VRAM pool
+     * until the stage and its prepared handles are destroyed.
+     */
+    struct GpuPreparedQKVFixture
+    {
+        std::vector<std::shared_ptr<LoadOrchestrator>> orchestrators; ///< VRAM lifetime owners.
+        std::unique_ptr<PreparedWeightStore> store;                   ///< Owns Q/K/V handles.
+        WeightBinding q_binding;
+        WeightBinding k_binding;
+        WeightBinding v_binding;
+        PreparedWeightRef q_ref;
+        PreparedWeightRef k_ref;
+        PreparedWeightRef v_ref;
+        ITensorGemm *q_kernel = nullptr; ///< Borrowed from store.
+        ITensorGemm *k_kernel = nullptr; ///< Borrowed from store.
+        ITensorGemm *v_kernel = nullptr; ///< Borrowed from store.
+    };
+
+    /**
      * @brief Register one quantized GPU GEMM into an existing prepared store.
      *
      * This is the multi-weight equivalent of `makeGpuPreparedGemm()`: it drives
@@ -263,7 +286,11 @@ namespace llaminar2::test
                 static_cast<uint16_t *>(slot->d_native_vnni_mins),
                 static_cast<uint32_t *>(slot->d_native_vnni_emins),
                 canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
-                orchestrator);
+                orchestrator,
+                NativeVnniSourceIdentity{
+                    .codebook_id = vnni->codebook_id,
+                    .is_superblock = vnni->is_superblock,
+                    .present = true});
             prep_kind = kf::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED;
         }
 #endif
@@ -277,7 +304,11 @@ namespace llaminar2::test
                 slot->d_native_vnni_mins,
                 slot->d_native_vnni_emins,
                 canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
-                orchestrator);
+                orchestrator,
+                NativeVnniSourceIdentity{
+                    .codebook_id = vnni->codebook_id,
+                    .is_superblock = vnni->is_superblock,
+                    .present = true});
             prep_kind = kf::KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;
         }
 #endif
@@ -360,6 +391,56 @@ namespace llaminar2::test
             &fixture.orchestrators,
             &fixture.down_binding,
             &fixture.down_kernel);
+        return fixture;
+    }
+
+    /**
+     * @brief Build Q/K/V GPU GEMM refs through the production load pipeline.
+     * @param q Query projection source tensor.
+     * @param k Key projection source tensor.
+     * @param v Value projection source tensor.
+     * @param device Exact CUDA or ROCm endpoint.
+     * @param name_prefix Stable model-weight prefix for the three VRAM slots.
+     * @param model_id Model authority shared by all prepared bindings.
+     * @return One-store fixture suitable for `FusedQKVGEMMStage`.
+     */
+    inline GpuPreparedQKVFixture makeGpuPreparedQKVFixture(
+        TensorBase *q,
+        TensorBase *k,
+        TensorBase *v,
+        DeviceId device,
+        const std::string &name_prefix = "test.gpu_prepared_qkv",
+        ModelContextId model_id = ModelContextId{9900})
+    {
+        GpuPreparedQKVFixture fixture;
+        fixture.store = std::make_unique<PreparedWeightStore>(model_id);
+        fixture.q_ref = registerGpuPreparedGemmInStore(
+            q,
+            device,
+            name_prefix + ".q",
+            model_id,
+            fixture.store.get(),
+            &fixture.orchestrators,
+            &fixture.q_binding,
+            &fixture.q_kernel);
+        fixture.k_ref = registerGpuPreparedGemmInStore(
+            k,
+            device,
+            name_prefix + ".k",
+            model_id,
+            fixture.store.get(),
+            &fixture.orchestrators,
+            &fixture.k_binding,
+            &fixture.k_kernel);
+        fixture.v_ref = registerGpuPreparedGemmInStore(
+            v,
+            device,
+            name_prefix + ".v",
+            model_id,
+            fixture.store.get(),
+            &fixture.orchestrators,
+            &fixture.v_binding,
+            &fixture.v_kernel);
         return fixture;
     }
 
@@ -469,7 +550,11 @@ namespace llaminar2::test
                 static_cast<uint16_t *>(slot->d_native_vnni_mins),
                 static_cast<uint32_t *>(slot->d_native_vnni_emins),
                 canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
-                out.orchestrator); // lifetime owner: keeps VRAM pool alive
+                out.orchestrator,
+                NativeVnniSourceIdentity{
+                    .codebook_id = vnni->codebook_id,
+                    .is_superblock = vnni->is_superblock,
+                    .present = true}); // lifetime owner: keeps VRAM pool alive
             prep_kind = kf::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED;
         }
 #endif
@@ -483,7 +568,11 @@ namespace llaminar2::test
                 slot->d_native_vnni_mins,
                 slot->d_native_vnni_emins,
                 canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
-                out.orchestrator); // lifetime owner: keeps VRAM pool alive
+                out.orchestrator,
+                NativeVnniSourceIdentity{
+                    .codebook_id = vnni->codebook_id,
+                    .is_superblock = vnni->is_superblock,
+                    .present = true}); // lifetime owner: keeps VRAM pool alive
             prep_kind = kf::KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;
         }
 #endif

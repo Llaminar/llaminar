@@ -1,13 +1,28 @@
+/**
+ * @file TransferEngine.cpp
+ * @brief Canonical event-ordered tensor movement and coherence publication.
+ *
+ * TransferEngine owns the relationship between byte movement, tensor
+ * authority, and producer/consumer ordering. GPU copies are submitted on one
+ * exact non-null stream and publish an exact event. Device consumers import
+ * that event without blocking the host; host consumers wait only for the event
+ * that makes their destination bytes observable. Backend copy functions remain
+ * low-level submission mechanisms and never decide tensor coherence.
+ */
+
 #include "transfer/TransferEngine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <sstream>
 #include <stdexcept>
 
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
+#include "backends/IGPUGraphCapture.h"
 #include "collective/BackendRouter.h"
 #include "collective/ICollectiveBackend.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -15,6 +30,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/StackTrace.h"
 
 #ifdef HAVE_ROCM
@@ -143,6 +159,1243 @@ namespace llaminar2
         }
     } // namespace
 
+    PinnedHostTransferBuffer::PinnedHostTransferBuffer(
+        size_t bytes,
+        DeviceId registration_device)
+        : bytes_(bytes),
+          registration_device_(registration_device)
+    {
+        if (bytes_ == 0 || !registration_device_.is_gpu())
+        {
+            throw std::invalid_argument(
+                "PinnedHostTransferBuffer requires positive bytes and a GPU registration device");
+        }
+    }
+
+    void PinnedHostTransferBuffer::bind(IBackend *backend)
+    {
+        if (!backend)
+        {
+            throw std::invalid_argument(
+                "PinnedHostTransferBuffer::bind requires the exact backend");
+        }
+        if (allocation_)
+        {
+            if (backend_ == backend)
+                return;
+            throw std::logic_error(
+                "PinnedHostTransferBuffer cannot change backend after binding");
+        }
+
+        void *const allocation = backend->allocatePinned(
+            bytes_, registration_device_.gpu_ordinal());
+        if (!allocation)
+        {
+            throw std::runtime_error(
+                "PinnedHostTransferBuffer allocation failed for " +
+                registration_device_.toString() +
+                " bytes=" + std::to_string(bytes_));
+        }
+
+        /*
+         * A captured copy can execute during the transaction that creates the
+         * graph.  Deterministic initialization makes any missing protocol
+         * publication observable as zeros instead of exposing stale host
+         * pages while the packet-level correctness checks diagnose the fault.
+         */
+        std::memset(allocation, 0, bytes_);
+        backend_ = backend;
+        allocation_ = allocation;
+        ownership_ = Ownership::BackendAllocation;
+    }
+
+    void PinnedHostTransferBuffer::bindExternal(
+        IBackend *backend,
+        void *allocation,
+        std::shared_ptr<void> lifetime)
+    {
+        if (!backend || !allocation || !lifetime)
+        {
+            throw std::invalid_argument(
+                "PinnedHostTransferBuffer::bindExternal requires a backend, address, and lifetime");
+        }
+        if (allocation_ || ownership_ != Ownership::Unbound)
+        {
+            throw std::logic_error(
+                "PinnedHostTransferBuffer external registration cannot be rebound");
+        }
+        if (!backend->pinHostMemory(allocation, bytes_))
+        {
+            throw std::runtime_error(
+                "PinnedHostTransferBuffer external registration failed for " +
+                registration_device_.toString() +
+                " bytes=" + std::to_string(bytes_));
+        }
+        backend_ = backend;
+        allocation_ = allocation;
+        ownership_ = Ownership::ExternalRegistration;
+        external_lifetime_ = std::move(lifetime);
+    }
+
+    PinnedHostTransferBuffer::~PinnedHostTransferBuffer()
+    {
+        if (allocation_ && backend_ && registration_device_.is_gpu())
+        {
+            if (ownership_ == Ownership::BackendAllocation)
+            {
+                backend_->freePinned(
+                    allocation_, registration_device_.gpu_ordinal());
+            }
+            else if (ownership_ == Ownership::ExternalRegistration)
+            {
+                if (!backend_->unpinHostMemory(allocation_))
+                {
+                    LOG_ERROR(
+                        "PinnedHostTransferBuffer could not unregister external pages for "
+                        << registration_device_.toString());
+                }
+            }
+        }
+        allocation_ = nullptr;
+        bytes_ = 0;
+        backend_ = nullptr;
+        registration_device_ = DeviceId::invalid();
+        ownership_ = Ownership::Unbound;
+        external_lifetime_.reset();
+    }
+
+    void *PinnedHostTransferBuffer::mutableData(size_t offset) const
+    {
+        if (!isBound() || !contains(offset, 0))
+        {
+            throw std::out_of_range(
+                "PinnedHostTransferBuffer mutable access requires a bound in-range allocation");
+        }
+        return static_cast<void *>(
+            static_cast<unsigned char *>(allocation_) + offset);
+    }
+
+    const void *PinnedHostTransferBuffer::data(size_t offset) const
+    {
+        if (!isBound() || !contains(offset, 0))
+        {
+            throw std::out_of_range(
+                "PinnedHostTransferBuffer access requires a bound in-range allocation");
+        }
+        return static_cast<const void *>(
+            static_cast<const unsigned char *>(allocation_) + offset);
+    }
+
+    DeviceTransferBuffer::DeviceTransferBuffer(
+        size_t bytes,
+        DeviceId device)
+        : bytes_(bytes), device_(device)
+    {
+        if (bytes_ == 0u || !device_.is_gpu())
+        {
+            throw std::invalid_argument(
+                "DeviceTransferBuffer requires positive bytes and an exact GPU");
+        }
+    }
+
+    void DeviceTransferBuffer::bind(IBackend *backend)
+    {
+        if (!backend)
+        {
+            throw std::invalid_argument(
+                "DeviceTransferBuffer::bind requires the exact backend");
+        }
+        if (allocation_)
+        {
+            if (backend_ == backend)
+                return;
+            throw std::logic_error(
+                "DeviceTransferBuffer cannot change backend after binding");
+        }
+        void *const allocation = backend->allocate(
+            bytes_, device_.gpu_ordinal());
+        if (!allocation)
+        {
+            throw std::runtime_error(
+                "DeviceTransferBuffer allocation failed for " +
+                device_.toString() + " bytes=" + std::to_string(bytes_));
+        }
+        backend_ = backend;
+        allocation_ = allocation;
+    }
+
+    DeviceTransferBuffer::~DeviceTransferBuffer()
+    {
+        if (allocation_ && backend_ && device_.is_gpu())
+            backend_->free(allocation_, device_.gpu_ordinal());
+        allocation_ = nullptr;
+        bytes_ = 0u;
+        device_ = DeviceId::invalid();
+        backend_ = nullptr;
+    }
+
+    void *DeviceTransferBuffer::mutableDeviceData(size_t offset) const
+    {
+        if (!isBound() || !contains(offset, 0u))
+        {
+            throw std::out_of_range(
+                "DeviceTransferBuffer mutable access requires a bound in-range allocation");
+        }
+        return static_cast<void *>(
+            static_cast<unsigned char *>(allocation_) + offset);
+    }
+
+    const void *DeviceTransferBuffer::deviceData(size_t offset) const
+    {
+        if (!isBound() || !contains(offset, 0u))
+        {
+            throw std::out_of_range(
+                "DeviceTransferBuffer access requires a bound in-range allocation");
+        }
+        return static_cast<const void *>(
+            static_cast<const unsigned char *>(allocation_) + offset);
+    }
+
+    MappedHostTransferRegion::MappedHostTransferRegion(
+        void *allocation,
+        size_t bytes,
+        std::span<const DeviceId> devices,
+        std::shared_ptr<void> lifetime)
+        : allocation_(allocation),
+          bytes_(bytes),
+          devices_(devices.begin(), devices.end()),
+          external_lifetime_(std::move(lifetime))
+    {
+        if (!allocation_ || bytes_ == 0u || devices_.empty() ||
+            !external_lifetime_)
+        {
+            throw std::invalid_argument(
+                "MappedHostTransferRegion requires stable pages, positive bytes, endpoints, and a retained lifetime");
+        }
+        std::sort(devices_.begin(), devices_.end());
+        for (std::size_t index = 0; index < devices_.size(); ++index)
+        {
+            if (!devices_[index].is_valid())
+            {
+                throw std::invalid_argument(
+                    "MappedHostTransferRegion contains an invalid endpoint");
+            }
+            if (index != 0u && devices_[index] == devices_[index - 1u])
+            {
+                throw std::invalid_argument(
+                    "MappedHostTransferRegion contains a duplicate endpoint " +
+                    devices_[index].toString());
+            }
+        }
+        aliases_.reserve(devices_.size());
+        registrations_.reserve(2u);
+    }
+
+    MappedHostTransferRegion::~MappedHostTransferRegion()
+    {
+        /*
+         * The enclosing graph family proves stream quiescence before releasing
+         * this owner. Unregister each runtime while the external mmap lifetime
+         * is still held; unmapping first would leave a driver registration
+         * pointing at invalid virtual memory.
+         */
+        for (auto registration = registrations_.rbegin();
+             registration != registrations_.rend(); ++registration)
+        {
+            if (registration->backend &&
+                !registration->backend->unregisterExternalMappedHostMemory(
+                    allocation_, registration->registration_ordinal))
+            {
+                LOG_ERROR(
+                    "MappedHostTransferRegion could not unregister external pages for backend family "
+                    << static_cast<int>(registration->type)
+                    << " registration_device="
+                    << registration->registration_ordinal);
+            }
+        }
+        bound_ = false;
+        aliases_.clear();
+        registrations_.clear();
+        allocation_ = nullptr;
+        bytes_ = 0u;
+        devices_.clear();
+        external_lifetime_.reset();
+    }
+
+    bool MappedHostTransferRegion::isBound() const noexcept
+    {
+        return bound_ && allocation_ && external_lifetime_ &&
+               aliases_.size() == devices_.size();
+    }
+
+    void *MappedHostTransferRegion::mutableHostData(size_t offset) const
+    {
+        if (!isBound() || !contains(offset, 0u))
+        {
+            throw std::out_of_range(
+                "MappedHostTransferRegion host access requires a bound in-range region");
+        }
+        return static_cast<void *>(
+            static_cast<unsigned char *>(allocation_) + offset);
+    }
+
+    void *MappedHostTransferRegion::deviceAlias(
+        DeviceId device,
+        size_t offset) const
+    {
+        if (!isBound() || !contains(offset, 0u))
+        {
+            throw std::out_of_range(
+                "MappedHostTransferRegion alias access requires a bound in-range region");
+        }
+        const auto found = std::find_if(
+            aliases_.begin(),
+            aliases_.end(),
+            [&](const DeviceAlias &alias)
+            {
+                return alias.device == device;
+            });
+        if (found == aliases_.end() || !found->address)
+        {
+            throw std::invalid_argument(
+                "MappedHostTransferRegion has no alias for " +
+                device.toString());
+        }
+        return static_cast<void *>(
+            static_cast<unsigned char *>(found->address) + offset);
+    }
+
+    bool MappedHostTransferRegion::hasDevice(DeviceId device) const noexcept
+    {
+        return isBound() && std::any_of(
+            aliases_.begin(),
+            aliases_.end(),
+            [&](const DeviceAlias &alias)
+            {
+                return alias.device == device && alias.address != nullptr;
+            });
+    }
+
+    IBackend *MappedHostTransferRegion::backendFor(
+        DeviceId device) const noexcept
+    {
+        const auto found = std::find_if(
+            aliases_.begin(),
+            aliases_.end(),
+            [&](const DeviceAlias &alias)
+            {
+                return alias.device == device;
+            });
+        return found == aliases_.end() ? nullptr : found->backend;
+    }
+
+    std::shared_ptr<PinnedHostTransferBuffer>
+    TransferEngine::declarePinnedHostBuffer(
+        size_t bytes,
+        DeviceId registration_device) const
+    {
+        return std::shared_ptr<PinnedHostTransferBuffer>(
+            new PinnedHostTransferBuffer(bytes, registration_device));
+    }
+
+    void TransferEngine::bindPinnedHostBuffer(
+        PinnedHostTransferBuffer &buffer) const
+    {
+        IBackend *const backend = resolveBackend(buffer.registration_device_);
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "TransferEngine::bindPinnedHostBuffer has no backend for " +
+                buffer.registration_device_.toString());
+        }
+        buffer.bind(backend);
+    }
+
+    std::shared_ptr<PinnedHostTransferBuffer>
+    TransferEngine::allocatePinnedHostBuffer(
+        size_t bytes,
+        DeviceId registration_device) const
+    {
+        if (bytes == 0 || !registration_device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "TransferEngine::allocatePinnedHostBuffer requires positive bytes and a GPU registration device");
+        }
+        IBackend *const backend = resolveBackend(registration_device);
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "TransferEngine::allocatePinnedHostBuffer has no backend for " +
+                registration_device.toString());
+        }
+        auto buffer = declarePinnedHostBuffer(bytes, registration_device);
+        buffer->bind(backend);
+        return buffer;
+    }
+
+    std::shared_ptr<DeviceTransferBuffer>
+    TransferEngine::allocateDeviceTransferBuffer(
+        size_t bytes,
+        DeviceId device) const
+    {
+        if (bytes == 0u || !device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "TransferEngine::allocateDeviceTransferBuffer requires positive bytes and an exact GPU");
+        }
+        IBackend *const backend = resolveBackend(device);
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "TransferEngine::allocateDeviceTransferBuffer has no backend for " +
+                device.toString());
+        }
+        auto buffer = std::shared_ptr<DeviceTransferBuffer>(
+            new DeviceTransferBuffer(bytes, device));
+        buffer->bind(backend);
+        return buffer;
+    }
+
+    std::shared_ptr<PinnedHostTransferBuffer>
+    TransferEngine::registerExternalPinnedHostBuffer(
+        void *allocation,
+        size_t bytes,
+        DeviceId registration_device,
+        std::shared_ptr<void> lifetime) const
+    {
+        if (!allocation || bytes == 0 || !registration_device.is_gpu() ||
+            !lifetime)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::registerExternalPinnedHostBuffer requires stable pages, positive bytes, a GPU, and a lifetime");
+        }
+        IBackend *const backend = resolveBackend(registration_device);
+        if (!backend)
+        {
+            throw std::runtime_error(
+                "TransferEngine::registerExternalPinnedHostBuffer has no backend for " +
+                registration_device.toString());
+        }
+        auto buffer = declarePinnedHostBuffer(bytes, registration_device);
+        buffer->bindExternal(
+            backend, allocation, std::move(lifetime));
+        return buffer;
+    }
+
+    std::shared_ptr<MappedHostTransferRegion>
+    TransferEngine::registerExternalMappedHostRegion(
+        void *allocation,
+        size_t bytes,
+        std::span<const DeviceId> devices,
+        std::shared_ptr<void> lifetime) const
+    {
+        auto region = std::shared_ptr<MappedHostTransferRegion>(
+            new MappedHostTransferRegion(
+                allocation, bytes, devices, std::move(lifetime)));
+
+        for (const DeviceId device : region->devices_)
+        {
+            if (device.is_cpu())
+            {
+                region->aliases_.push_back({
+                    .device = device,
+                    .address = allocation,
+                    .backend = nullptr,
+                });
+                continue;
+            }
+            if (!device.is_gpu())
+            {
+                throw std::invalid_argument(
+                    "TransferEngine mapped region endpoint is neither CPU nor GPU");
+            }
+
+            IBackend *const backend = resolveBackend(device);
+            if (!backend)
+            {
+                throw std::runtime_error(
+                    "TransferEngine mapped region has no backend for " +
+                    device.toString());
+            }
+            auto registration = std::find_if(
+                region->registrations_.begin(),
+                region->registrations_.end(),
+                [&](const MappedHostTransferRegion::BackendRegistration &item)
+                {
+                    return item.type == device.type;
+                });
+            if (registration == region->registrations_.end())
+            {
+                if (!backend->registerExternalMappedHostMemory(
+                        allocation, bytes, device.gpu_ordinal()))
+                {
+                    throw std::runtime_error(
+                        "TransferEngine could not register mapped external pages for " +
+                        device.toString());
+                }
+                region->registrations_.push_back({
+                    .type = device.type,
+                    .backend = backend,
+                    .registration_ordinal = device.gpu_ordinal(),
+                });
+            }
+            else if (registration->backend != backend)
+            {
+                throw std::logic_error(
+                    "TransferEngine resolved multiple backend authorities for one mapped device family");
+            }
+
+            void *device_alias = nullptr;
+            if (!backend->externalMappedHostDevicePointer(
+                    allocation,
+                    device.gpu_ordinal(),
+                    &device_alias) ||
+                !device_alias)
+            {
+                throw std::runtime_error(
+                    "TransferEngine could not resolve mapped external alias for " +
+                    device.toString());
+            }
+            region->aliases_.push_back({
+                .device = device,
+                .address = device_alias,
+                .backend = backend,
+            });
+        }
+        region->bound_ = true;
+        if (PerfStatsCollector::isDomainEnabled(
+                "moe_overlay_activation_epoch"))
+        {
+            const PerfStatsCollector::Tags tags{
+                {"scope", "node_local"},
+                {"mapping", "portable_external_host_pages"},
+                {"blocking", "false"},
+            };
+            PerfStatsCollector::addCounter(
+                "moe_overlay_activation_epoch",
+                "mapped_regions_registered",
+                1.0,
+                "setup",
+                "heterogeneous",
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_overlay_activation_epoch",
+                "mapped_endpoint_aliases",
+                static_cast<double>(region->aliases_.size()),
+                "setup",
+                "heterogeneous",
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_overlay_activation_epoch",
+                "mapped_backend_families",
+                static_cast<double>(region->registrations_.size()),
+                "setup",
+                "heterogeneous",
+                tags);
+        }
+        return region;
+    }
+
+    void *TransferEngine::resolveMappedTimelineKernelSignal64(
+        const MappedHostTransferRegion &region,
+        size_t signal_offset,
+        std::uint64_t value,
+        DeviceId device,
+        const char *operation) const
+    {
+        if (!operation || operation[0] == '\0' || !region.isBound() ||
+            !device.is_gpu() || value == 0u ||
+            !region.contains(signal_offset, sizeof(std::uint64_t)) ||
+            !region.hasDevice(device))
+        {
+            throw std::invalid_argument(
+                "TransferEngine mapped timeline kernel binding requires a bound region, aligned signal, positive value, and declared GPU endpoint");
+        }
+        void *const signal = region.deviceAlias(device, signal_offset);
+        if ((reinterpret_cast<std::uintptr_t>(signal) &
+             (alignof(std::uint64_t) - 1u)) != 0u)
+        {
+            throw std::invalid_argument(
+                "TransferEngine mapped timeline kernel signal is not 64-bit aligned");
+        }
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != region.backendFor(device) ||
+            !backend->supportsStreamTimelineSignal64(device.gpu_ordinal()))
+        {
+            throw std::runtime_error(
+                std::string("TransferEngine could not bind mapped timeline kernel ") +
+                operation + " for " + device.toString());
+        }
+        return signal;
+    }
+
+    MappedTimelineKernelWait64Binding
+    TransferEngine::bindMappedTimelineKernelWait64(
+        const MappedHostTransferRegion &region,
+        size_t signal_offset,
+        std::uint64_t value,
+        DeviceId device) const
+    {
+        auto *const signal = static_cast<const std::uint64_t *>(
+            resolveMappedTimelineKernelSignal64(
+                region, signal_offset, value, device, "wait"));
+        if (PerfStatsCollector::isDomainEnabled(
+                "moe_overlay_activation_epoch"))
+        {
+            PerfStatsCollector::addCounter(
+                "moe_overlay_activation_epoch",
+                "device_timeline_kernel_wait_bindings",
+                1.0,
+                "graph_setup",
+                device.toString(),
+                {{"scope", "node_local"},
+                 {"ordering", "fused_packet_system_acquire"},
+                 {"host_blocking", "false"}});
+        }
+        return MappedTimelineKernelWait64Binding(signal, value, device);
+    }
+
+    MappedTimelineKernelPublish64Binding
+    TransferEngine::bindMappedTimelineKernelPublish64(
+        const MappedHostTransferRegion &region,
+        size_t signal_offset,
+        std::uint64_t value,
+        DeviceId device) const
+    {
+        auto *const signal = static_cast<std::uint64_t *>(
+            resolveMappedTimelineKernelSignal64(
+                region, signal_offset, value, device, "publication"));
+        if (PerfStatsCollector::isDomainEnabled(
+                "moe_overlay_activation_epoch"))
+        {
+            PerfStatsCollector::addCounter(
+                "moe_overlay_activation_epoch",
+                "device_timeline_kernel_publication_bindings",
+                1.0,
+                "graph_setup",
+                device.toString(),
+                {{"scope", "node_local"},
+                 {"ordering", "fused_packet_system_release"},
+                 {"host_blocking", "false"}});
+        }
+        return MappedTimelineKernelPublish64Binding(signal, value, device);
+    }
+
+    void TransferEngine::enqueueMappedTimelineWait64(
+        const MappedHostTransferRegion &region,
+        size_t signal_offset,
+        std::uint64_t value,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!region.isBound() || !device.is_gpu() || !stream || value == 0u ||
+            !region.contains(signal_offset, sizeof(std::uint64_t)))
+        {
+            throw std::invalid_argument(
+                "TransferEngine mapped timeline wait requires a bound region, aligned signal, positive value, GPU, and exact stream");
+        }
+        void *const signal = region.deviceAlias(device, signal_offset);
+        if ((reinterpret_cast<std::uintptr_t>(signal) &
+             (alignof(std::uint64_t) - 1u)) != 0u)
+        {
+            throw std::invalid_argument(
+                "TransferEngine mapped timeline wait signal is not 64-bit aligned");
+        }
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != region.backendFor(device) ||
+            !backend->supportsStreamTimelineSignal64(device.gpu_ordinal()) ||
+            !backend->streamWaitTimelineSignal64(
+                stream,
+                signal,
+                value,
+                device.gpu_ordinal()))
+        {
+            throw std::runtime_error(
+                "TransferEngine could not enqueue mapped 64-bit timeline wait for " +
+                device.toString());
+        }
+        if (PerfStatsCollector::isDomainEnabled(
+                "moe_overlay_activation_epoch"))
+        {
+            PerfStatsCollector::addCounter(
+                "moe_overlay_activation_epoch",
+                "device_timeline_waits_enqueued",
+                1.0,
+                "device_epoch",
+                device.toString(),
+                {
+                    {"scope", "node_local"},
+                    {"ordering", "exact_stream_64bit_geq"},
+                    {"host_blocking", "false"},
+                });
+        }
+    }
+
+    void TransferEngine::enqueueMappedTimelinePublish64(
+        const MappedHostTransferRegion &region,
+        size_t signal_offset,
+        std::uint64_t value,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!region.isBound() || !device.is_gpu() || !stream || value == 0u ||
+            !region.contains(signal_offset, sizeof(std::uint64_t)))
+        {
+            throw std::invalid_argument(
+                "TransferEngine mapped timeline publication requires a bound region, aligned signal, positive value, GPU, and exact stream");
+        }
+        void *const signal = region.deviceAlias(device, signal_offset);
+        if ((reinterpret_cast<std::uintptr_t>(signal) &
+             (alignof(std::uint64_t) - 1u)) != 0u)
+        {
+            throw std::invalid_argument(
+                "TransferEngine mapped timeline publication signal is not 64-bit aligned");
+        }
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != region.backendFor(device) ||
+            !backend->supportsStreamTimelineSignal64(device.gpu_ordinal()) ||
+            !backend->streamPublishTimelineSignal64(
+                stream,
+                signal,
+                value,
+                device.gpu_ordinal()))
+        {
+            throw std::runtime_error(
+                "TransferEngine could not enqueue mapped 64-bit timeline publication for " +
+                device.toString());
+        }
+        if (PerfStatsCollector::isDomainEnabled(
+                "moe_overlay_activation_epoch"))
+        {
+            PerfStatsCollector::addCounter(
+                "moe_overlay_activation_epoch",
+                "device_timeline_publications_enqueued",
+                1.0,
+                "device_epoch",
+                device.toString(),
+                {
+                    {"scope", "node_local"},
+                    {"ordering", "exact_stream_64bit_fenced"},
+                    {"host_blocking", "false"},
+                });
+        }
+    }
+
+    void TransferEngine::enqueueMappedHostToDevice(
+        const MappedHostTransferRegion &region,
+        size_t source_offset,
+        ITensor *destination,
+        size_t destination_offset,
+        size_t bytes,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!destination || !region.isBound() || !device.is_gpu() ||
+            !stream || bytes == 0u)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::enqueueMappedHostToDevice requires a bound region, destination, positive bytes, GPU, and exact stream");
+        }
+        if (!region.contains(source_offset, bytes))
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueueMappedHostToDevice source region exceeds registered shared pages");
+        }
+
+        TensorBase *const destination_owner = requireTransferStorageOwner(
+            destination,
+            "TransferEngine::enqueueMappedHostToDevice");
+        const size_t destination_bytes = destination_owner->size_bytes();
+        if (destination_offset > destination_bytes ||
+            bytes > destination_bytes - destination_offset)
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueueMappedHostToDevice destination region exceeds tensor storage");
+        }
+        requireDeviceOutput(destination_owner, device, stream);
+
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != region.backendFor(device))
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueMappedHostToDevice backend identity does not match the mapped registration");
+        }
+        auto *const destination_ptr =
+            static_cast<unsigned char *>(destination_owner->gpu_data_ptr()) +
+            destination_offset;
+        if (!backend->hostToDeviceOnStream(
+                destination_ptr,
+                region.mutableHostData(source_offset),
+                bytes,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueMappedHostToDevice failed to enqueue the exact H2D copy");
+        }
+        publishDeviceWrite(destination_owner, device, stream);
+    }
+
+    void TransferEngine::enqueueMappedHostToDevice(
+        const MappedHostTransferRegion &region,
+        size_t source_offset,
+        DeviceTransferBuffer &destination,
+        size_t destination_offset,
+        size_t bytes,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!region.isBound() || !destination.isBound() ||
+            !device.is_gpu() || !stream || bytes == 0u)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::enqueueMappedHostToDevice transport scratch requires bound regions, positive bytes, a GPU, and an exact stream");
+        }
+        if (!region.contains(source_offset, bytes) ||
+            !destination.contains(destination_offset, bytes))
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueueMappedHostToDevice transport scratch exceeds a fixed region");
+        }
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != region.backendFor(device) ||
+            backend != destination.backend_ || destination.device_ != device)
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueMappedHostToDevice transport scratch backend identity mismatch");
+        }
+        if (!backend->hostToDeviceOnStream(
+                destination.mutableDeviceData(destination_offset),
+                region.mutableHostData(source_offset),
+                bytes,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueMappedHostToDevice transport scratch copy enqueue failed");
+        }
+    }
+
+    void TransferEngine::enqueueDeviceToMappedHost(
+        ITensor *source,
+        size_t source_offset,
+        const MappedHostTransferRegion &region,
+        size_t destination_offset,
+        size_t bytes,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!source || !region.isBound() || !device.is_gpu() || !stream ||
+            bytes == 0u)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::enqueueDeviceToMappedHost requires a source, bound region, positive bytes, GPU, and exact stream");
+        }
+        if (!region.contains(destination_offset, bytes))
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueueDeviceToMappedHost destination region exceeds registered shared pages");
+        }
+
+        TensorBase *const source_owner = requireTransferStorageOwner(
+            source,
+            "TransferEngine::enqueueDeviceToMappedHost");
+        const size_t source_bytes = source_owner->size_bytes();
+        if (source_offset > source_bytes || bytes > source_bytes - source_offset)
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueueDeviceToMappedHost source region exceeds tensor storage");
+        }
+        requireDeviceInput(source_owner, device, stream);
+
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != region.backendFor(device))
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueDeviceToMappedHost backend identity does not match the mapped registration");
+        }
+        const auto *const source_ptr =
+            static_cast<const unsigned char *>(source_owner->gpu_data_ptr()) +
+            source_offset;
+        if (!backend->deviceToHostOnStream(
+                region.mutableHostData(destination_offset),
+                source_ptr,
+                bytes,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueDeviceToMappedHost failed to enqueue the exact D2H copy");
+        }
+    }
+
+    DeviceTransferInputFork TransferEngine::recordDeviceInputFork(
+        ITensor *source,
+        DeviceId device,
+        void *producer_stream,
+        void *event) const
+    {
+        if (!source || !device.is_gpu() || !producer_stream || !event)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::recordDeviceInputFork requires a tensor, GPU, exact producer stream, and retained event");
+        }
+
+        TensorBase *const source_owner = requireTransferStorageOwner(
+            source,
+            "TransferEngine::recordDeviceInputFork");
+        /* Validate against the canonical graph stream before branching. The
+         * dependency ledger must never be asked to reinterpret an auxiliary
+         * stream as the tensor's producer. */
+        requireDeviceInput(source_owner, device, producer_stream);
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        if (!context.recordEventChecked(event, producer_stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine::recordDeviceInputFork could not record the producer frontier");
+        }
+        return DeviceTransferInputFork(
+            source_owner, device, producer_stream, event);
+    }
+
+    AcquiredDeviceTransferInput TransferEngine::acquireDeviceInputFork(
+        const DeviceTransferInputFork &publication,
+        void *consumer_stream) const
+    {
+        if (!publication.valid() || !consumer_stream)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::acquireDeviceInputFork requires a valid publication and exact consumer stream");
+        }
+        auto &context =
+            GPUDeviceContextPool::instance().getContext(publication.device_);
+        if (!context.waitEventChecked(publication.event_, consumer_stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine::acquireDeviceInputFork could not enqueue the producer-event wait");
+        }
+        return AcquiredDeviceTransferInput(
+            publication.source_owner_,
+            publication.device_,
+            consumer_stream,
+            publication.event_);
+    }
+
+    void TransferEngine::enqueueDeviceToMappedHost(
+        const AcquiredDeviceTransferInput &source,
+        size_t source_offset,
+        const MappedHostTransferRegion &region,
+        size_t destination_offset,
+        size_t bytes) const
+    {
+        if (!source.valid() || !region.isBound() || bytes == 0u)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::enqueueDeviceToMappedHost requires an acquired fork, bound region, and positive byte count");
+        }
+        if (!region.contains(destination_offset, bytes))
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueueDeviceToMappedHost fork destination exceeds registered shared pages");
+        }
+        const size_t source_bytes = source.source_owner_->size_bytes();
+        if (source_offset > source_bytes || bytes > source_bytes - source_offset)
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueueDeviceToMappedHost fork source exceeds tensor storage");
+        }
+        const auto *const source_ptr =
+            static_cast<const unsigned char *>(
+                source.source_owner_->gpu_data_ptr()) +
+            source_offset;
+        IBackend *const backend = resolveBackend(source.device_);
+        if (!source_ptr || !backend ||
+            backend != region.backendFor(source.device_))
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueDeviceToMappedHost fork backend or stable tensor storage is incomplete");
+        }
+        if (!backend->deviceToHostOnStream(
+                region.mutableHostData(destination_offset),
+                source_ptr,
+                bytes,
+                source.device_.gpu_ordinal(),
+                source.consumer_stream_))
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueDeviceToMappedHost fork D2H enqueue failed");
+        }
+    }
+
+    void TransferEngine::enqueueDeviceToMappedHost(
+        const DeviceTransferBuffer &source,
+        size_t source_offset,
+        const MappedHostTransferRegion &region,
+        size_t destination_offset,
+        size_t bytes,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!source.isBound() || !region.isBound() || !device.is_gpu() ||
+            !stream || bytes == 0u)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::enqueueDeviceToMappedHost transport scratch requires bound regions, positive bytes, a GPU, and an exact stream");
+        }
+        if (!source.contains(source_offset, bytes) ||
+            !region.contains(destination_offset, bytes))
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueueDeviceToMappedHost transport scratch exceeds a fixed region");
+        }
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != region.backendFor(device) ||
+            backend != source.backend_ || source.device_ != device)
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueDeviceToMappedHost transport scratch backend identity mismatch");
+        }
+        if (!backend->deviceToHostOnStream(
+                region.mutableHostData(destination_offset),
+                source.deviceData(source_offset),
+                bytes,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueDeviceToMappedHost transport scratch copy enqueue failed");
+        }
+    }
+
+    void TransferEngine::buildMappedTimelineTransaction(
+        IGPUGraphCapture &destination,
+        std::span<const MappedTimelineTransactionStep> ordered_steps,
+        DeviceId device) const
+    {
+        if (!device.is_gpu() || ordered_steps.empty() ||
+            !destination.executionStream() || destination.hasExecutable() ||
+            destination.nodeCount() != 0u)
+        {
+            throw std::invalid_argument(
+                "TransferEngine mapped timeline transaction requires an empty exact-device graph and non-empty steps");
+        }
+        IBackend *const backend = resolveBackend(device);
+        if (!backend ||
+            !backend->supportsStreamTimelineSignal64(device.gpu_ordinal()))
+        {
+            throw std::invalid_argument(
+                "TransferEngine mapped timeline transaction requires native 64-bit timeline support for " +
+                device.toString());
+        }
+
+        std::vector<GPUOrderedTimelineStep> lowered;
+        lowered.reserve(ordered_steps.size());
+        const auto requireName = [](const char *name)
+        {
+            return name && name[0] != '\0';
+        };
+        for (const auto &step : ordered_steps)
+        {
+            if (const auto *fragment =
+                    std::get_if<MappedTimelineCapturedFragment>(&step))
+            {
+                if (!requireName(fragment->name) || !fragment->capture ||
+                    fragment->capture == &destination ||
+                    !fragment->capture->executionStream() ||
+                    fragment->capture->nodeCount() == 0u)
+                {
+                    throw std::invalid_argument(
+                        "TransferEngine mapped timeline fragment is incomplete or aliases its destination");
+                }
+                lowered.push_back({
+                    .name = fragment->name,
+                    .kind =
+                        GPUOrderedTimelineStepKind::CapturedFragment,
+                    .capture = fragment->capture,
+                    .signal = nullptr,
+                    .value = 0u,
+                });
+                continue;
+            }
+
+            const MappedHostTransferRegion *region = nullptr;
+            const char *name = nullptr;
+            size_t signal_offset = 0u;
+            std::uint64_t value = 0u;
+            GPUOrderedTimelineStepKind kind =
+                GPUOrderedTimelineStepKind::WaitValue64;
+            if (const auto *wait =
+                    std::get_if<MappedTimelineWait64>(&step))
+            {
+                region = wait->region;
+                name = wait->name;
+                signal_offset = wait->signal_offset;
+                value = wait->value;
+            }
+            else
+            {
+                const auto &publish =
+                    std::get<MappedTimelinePublish64>(step);
+                region = publish.region;
+                name = publish.name;
+                signal_offset = publish.signal_offset;
+                value = publish.value;
+                kind = GPUOrderedTimelineStepKind::PublishValue64;
+            }
+            if (!requireName(name) || !region || !region->isBound() ||
+                !region->hasDevice(device) || value == 0u ||
+                !region->contains(signal_offset, sizeof(std::uint64_t)) ||
+                region->backendFor(device) != backend)
+            {
+                throw std::invalid_argument(
+                    "TransferEngine mapped timeline step has incomplete region/device/value ownership");
+            }
+            void *const signal = region->deviceAlias(device, signal_offset);
+            if ((reinterpret_cast<std::uintptr_t>(signal) &
+                 (alignof(std::uint64_t) - 1u)) != 0u)
+            {
+                throw std::invalid_argument(
+                    "TransferEngine mapped timeline graph signal is not 64-bit aligned");
+            }
+            lowered.push_back({
+                .name = name,
+                .kind = kind,
+                .capture = nullptr,
+                .signal = signal,
+                .value = value,
+            });
+        }
+        if (!destination.buildOrderedTimelineTransaction(lowered))
+        {
+            throw std::runtime_error(
+                "TransferEngine could not lower mapped timeline transaction for " +
+                device.toString());
+        }
+        if (PerfStatsCollector::isDomainEnabled(
+                "moe_overlay_activation_epoch"))
+        {
+            PerfStatsCollector::addCounter(
+                "moe_overlay_activation_epoch",
+                "native_graph_timeline_transactions_built",
+                1.0,
+                "graph_setup",
+                device.toString(),
+                {
+                    {"host_blocking", "false"},
+                    {"ordering", "device_owned_graph_timeline_nodes"},
+                    {"steps", std::to_string(lowered.size())},
+                });
+        }
+    }
+
+    void TransferEngine::enqueuePinnedHostToDevice(
+        const PinnedHostTransferBuffer &pinned_source,
+        size_t source_offset,
+        ITensor *destination,
+        size_t destination_offset,
+        size_t bytes,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!destination || !device.is_gpu() || !stream || bytes == 0)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::enqueuePinnedHostToDevice requires a destination, positive bytes, a GPU, and an exact stream");
+        }
+        if (pinned_source.registration_device_ != device ||
+            !pinned_source.contains(source_offset, bytes))
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueuePinnedHostToDevice source region or registration device is invalid");
+        }
+
+        TensorBase *const destination_owner = requireTransferStorageOwner(
+            destination,
+            "TransferEngine::enqueuePinnedHostToDevice");
+        const size_t destination_bytes = destination_owner->size_bytes();
+        if (destination_offset > destination_bytes ||
+            bytes > destination_bytes - destination_offset)
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueuePinnedHostToDevice destination region exceeds tensor storage");
+        }
+        requireDeviceOutput(destination_owner, device, stream);
+
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != pinned_source.backend_)
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueuePinnedHostToDevice backend identity does not match the pinned registration");
+        }
+        auto *const destination_ptr =
+            static_cast<unsigned char *>(destination_owner->gpu_data_ptr()) +
+            destination_offset;
+        if (!backend->hostToDeviceOnStream(
+                destination_ptr,
+                pinned_source.data(source_offset),
+                bytes,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueuePinnedHostToDevice failed to enqueue the exact H2D copy");
+        }
+        publishDeviceWrite(destination_owner, device, stream);
+    }
+
+    void TransferEngine::enqueueDeviceToPinnedHost(
+        ITensor *source,
+        size_t source_offset,
+        const PinnedHostTransferBuffer &pinned_destination,
+        size_t destination_offset,
+        size_t bytes,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!source || !device.is_gpu() || !stream || bytes == 0)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::enqueueDeviceToPinnedHost requires a source, positive bytes, a GPU, and an exact stream");
+        }
+        if (pinned_destination.registration_device_ != device ||
+            !pinned_destination.contains(destination_offset, bytes))
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueueDeviceToPinnedHost destination region or registration device is invalid");
+        }
+
+        TensorBase *const source_owner = requireTransferStorageOwner(
+            source,
+            "TransferEngine::enqueueDeviceToPinnedHost");
+        const size_t source_bytes = source_owner->size_bytes();
+        if (source_offset > source_bytes || bytes > source_bytes - source_offset)
+        {
+            throw std::out_of_range(
+                "TransferEngine::enqueueDeviceToPinnedHost source region exceeds tensor storage");
+        }
+        requireDeviceInput(source_owner, device, stream);
+
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != pinned_destination.backend_)
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueDeviceToPinnedHost backend identity does not match the pinned registration");
+        }
+        const auto *const source_ptr =
+            static_cast<const unsigned char *>(source_owner->gpu_data_ptr()) +
+            source_offset;
+        if (!backend->deviceToHostOnStream(
+                pinned_destination.mutableData(destination_offset),
+                source_ptr,
+                bytes,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine::enqueueDeviceToPinnedHost failed to enqueue the exact D2H copy");
+        }
+    }
+
     // ============================================================================
     // Singleton
     // ============================================================================
@@ -240,8 +1493,22 @@ namespace llaminar2
             const auto disposition = ledger->classifyInput(
                 base, target_device, consumer_stream);
             if (disposition ==
-                GraphCaptureDependencyLedger::InputDisposition::InternalRecorded)
+                    GraphCaptureDependencyLedger::InputDisposition::InternalRecorded ||
+                disposition ==
+                    GraphCaptureDependencyLedger::InputDisposition::RetainedParentRecorded ||
+                disposition ==
+                    GraphCaptureDependencyLedger::InputDisposition::SetupAddressOnlyExternal)
             {
+                /*
+                 * A retained-parent import is deliberately no more globally
+                 * authoritative than an ordinary earlier recorded producer.
+                 * Its child graph records a stable pointer read, and the
+                 * topology-owned parent later inserts the exact child edge.
+                 * A setup-only external is similarly address-authoritative but
+                 * not payload-authoritative. It is admitted only when the
+                 * ledger names it as a declared arena frontier; transaction
+                 * zero performs the live-byte preflight before graph launch.
+                 */
                 return;
             }
         }
@@ -1267,6 +2534,50 @@ namespace llaminar2
         return backend->waitForEvent(event, device_id);
     }
 
+    void TransferEngine::waitForPendingHostSourceUseLocked(TensorBase *tensor)
+    {
+        if (!tensor ||
+            tensor->device_completion_purpose_ !=
+                TensorBase::CompletionEventPurpose::HOST_TO_DEVICE_SOURCE_USE)
+        {
+            return;
+        }
+        if (!tensor->device_completion_event_ ||
+            !tensor->event_device_.has_value() ||
+            !tensor->event_device_->is_gpu())
+        {
+            throw std::runtime_error(
+                "Queued H2D host-source use has no exact completion event");
+        }
+
+        IBackend *const backend =
+            tensor->resolveBackend(*tensor->event_device_);
+        if (!backend ||
+            backend->backendDeviceType() != tensor->event_device_->type)
+        {
+            throw std::runtime_error(
+                "Queued H2D host-source event has no matching backend on " +
+                tensor->event_device_->toString());
+        }
+        if (!waitForEventWithProxy(
+                backend,
+                tensor->device_completion_event_,
+                tensor->event_device_->gpu_ordinal(),
+                *tensor->event_device_))
+        {
+            throw std::runtime_error(
+                "Queued H2D host-source completion event failed on " +
+                tensor->event_device_->toString());
+        }
+
+        /*
+         * The host wait proves both DMA completion and device visibility. The
+         * event no longer carries an outstanding lifetime, so retire it rather
+         * than letting a later generation accidentally reuse its identity.
+         */
+        tensor->retireCompletionEvent_();
+    }
+
     // ============================================================================
     // uploadFull — full ensureOnDevice lifecycle (called with coherence_mutex_ held)
     // ============================================================================
@@ -1340,21 +2651,6 @@ namespace llaminar2
                                     "; refusing a host-blocking fallback");
                         }
                     }
-                    else
-                    {
-                        // No stream provided (host-side access like tensor->data()).
-                        // Must block CPU until GPU work completes.
-                        if (!waitForEventWithProxy(backend, tensor->device_completion_event_, backend_device_id, target_device))
-                        {
-                            LOG_ERROR("[TransferEngine::uploadFull] Event wait failed for tensor '"
-                                      << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
-                                      << "' on device " << target_device.toString()
-                                      << " — this indicates a corrupted or invalid completion event "
-                                      << "(e.g., event recorded during graph capture)");
-                            return TransferResult::fail(TransferMethod::NOOP,
-                                                        "Event wait failed: completion event is invalid");
-                        }
-                    }
                 }
             }
             return TransferResult::ok(TransferMethod::NOOP);
@@ -1378,6 +2674,12 @@ namespace llaminar2
                                                          << " device_completion_event_=" << tensor->device_completion_event_);
         if (tensor->gpu_data_ptr_ && tensor->gpu_device_.has_value() && *tensor->gpu_device_ != target_device)
         {
+            /*
+             * A device migration may retire the old event and eventually reuse
+             * the host allocation as a source for the new device. Quiesce only
+             * an outstanding H2D source use before changing event ownership.
+             */
+            waitForPendingHostSourceUseLocked(tensor);
             DeviceId old_device = *tensor->gpu_device_;
             LOG_TRACE("[TransferEngine::uploadFull] Device migration: " << tensor->gpu_device_->toString()
                                                                         << " -> " << target_device.toString());
@@ -1411,6 +2713,8 @@ namespace llaminar2
                     }
                     tensor->device_completion_event_ = nullptr;
                     tensor->event_device_.reset();
+                    tensor->device_completion_purpose_ =
+                        TensorBase::CompletionEventPurpose::NONE;
                 }
 
                 LOG_TRACE("[TransferEngine::uploadFull] Promoted secondary buffer to primary for "
@@ -1437,6 +2741,8 @@ namespace llaminar2
                     }
                     tensor->device_completion_event_ = nullptr;
                     tensor->event_device_.reset();
+                    tensor->device_completion_purpose_ =
+                        TensorBase::CompletionEventPurpose::NONE;
                 }
 
                 tensor->gpu_data_ptr_ = nullptr;
@@ -1539,8 +2845,48 @@ namespace llaminar2
                     : requireTransferStream(
                           target_device,
                           "TransferEngine::uploadFull");
+            /*
+             * Order an overwrite after any previous producer of this device
+             * allocation. This is a device-side edge; the submitting CPU never
+             * waits for the prior generation.
+             */
+            if (tensor->device_completion_event_)
+            {
+                if (!tensor->event_device_.has_value() ||
+                    *tensor->event_device_ != target_device)
+                {
+                    return TransferResult::fail(
+                        TransferMethod::HOST_TO_DEVICE,
+                        "H2D upload found completion-event ownership on the wrong device");
+                }
+                if (!target_backend->streamWaitEvent(
+                        upload_stream,
+                        tensor->device_completion_event_,
+                        backend_device_id))
+                {
+                    return TransferResult::fail(
+                        TransferMethod::HOST_TO_DEVICE,
+                        "H2D upload could not join the prior device producer event");
+                }
+            }
+
+            bool created_event = false;
+            if (!tensor->device_completion_event_)
+            {
+                tensor->device_completion_event_ =
+                    target_backend->createEvent(backend_device_id);
+                if (!tensor->device_completion_event_)
+                {
+                    return TransferResult::fail(
+                        TransferMethod::HOST_TO_DEVICE,
+                        "H2D upload could not create its completion event");
+                }
+                tensor->event_device_ = target_device;
+                created_event = true;
+            }
+
             auto h2d_start = std::chrono::high_resolution_clock::now();
-            bool h2d_ok = target_backend->hostToDevice(
+            bool h2d_ok = target_backend->hostToDeviceOnStream(
                 tensor->gpu_data_ptr_,
                 src,
                 bytes,
@@ -1549,9 +2895,6 @@ namespace llaminar2
             auto h2d_end = std::chrono::high_resolution_clock::now();
             auto h2d_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(h2d_end - h2d_start).count();
             auto h2d_us = h2d_ns / 1000;
-            double bandwidth_gbps = (bytes / 1e9) / (h2d_us / 1e6);
-
-            TransferProfiler::recordH2D(bytes, static_cast<uint64_t>(h2d_ns));
 
             if (trace_cfg.enabled)
             {
@@ -1560,25 +2903,58 @@ namespace llaminar2
 
             if (trace)
             {
-                LOG_TRACE("[TransferEngine::uploadFull] hostToDevice(" << bytes << " bytes) took "
-                                                                       << h2d_us << " us (" << bandwidth_gbps << " GB/s)");
+                LOG_TRACE("[TransferEngine::uploadFull] queued hostToDevice(" << bytes
+                                                                               << " bytes) in "
+                                                                               << h2d_us << " us");
             }
 
             if (!h2d_ok)
             {
-                target_backend->free(tensor->gpu_data_ptr_, backend_device_id);
-                tensor->gpu_data_ptr_ = nullptr;
-                tensor->gpu_device_.reset();
-                return TransferResult::fail(TransferMethod::HOST_TO_DEVICE, "hostToDevice failed");
+                if (created_event)
+                {
+                    target_backend->destroyEvent(
+                        tensor->device_completion_event_,
+                        backend_device_id);
+                    tensor->device_completion_event_ = nullptr;
+                    tensor->event_device_.reset();
+                }
+                return TransferResult::fail(
+                    TransferMethod::HOST_TO_DEVICE,
+                    "asynchronous hostToDevice enqueue failed");
             }
 
+            if (!target_backend->recordEvent(
+                    tensor->device_completion_event_,
+                    backend_device_id,
+                    upload_stream))
+            {
+                /*
+                 * The runtime accepted DMA but failed to publish the only safe
+                 * source-lifetime boundary. Continuing could free or overwrite
+                 * pinned host bytes still in use, so this is unrecoverable.
+                 */
+                LOG_ERROR("[TransferEngine::uploadFull] Accepted H2D copy could not publish its exact completion event on "
+                          << target_device.toString());
+                std::terminate();
+            }
+
+            tensor->last_joined_completion_event_ = nullptr;
+            tensor->last_joined_consumer_stream_ = nullptr;
+            tensor->device_completion_purpose_ =
+                TensorBase::CompletionEventPurpose::HOST_TO_DEVICE_SOURCE_USE;
             tensor->applyCoherenceOp_(CoherenceOp::UPLOAD);
+            tensor->authoritative_device_.reset();
+            TransferProfiler::recordH2D(bytes);
 
             // GPU_ONLY policy: free host data now that device has it
             if (tensor->memoryResidency() == MemoryResidency::GPU_ONLY &&
                 !tensor->is_raw_data_released())
             {
+                waitForPendingHostSourceUseLocked(tensor);
                 tensor->release_host_weight_data();
+                tensor->setCoherenceState_(
+                    TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                tensor->authoritative_device_ = target_device;
             }
 
             LOG_TRACE("[TransferEngine::uploadFull] Uploaded " << bytes
@@ -1690,36 +3066,7 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::DEVICE_TO_HOST, "Host data pointer is null");
             }
 
-            /*
-             * Explicit-stream host publication is already an ordering contract:
-             * the caller passes the stream that produced the device bytes, and
-             * IBackend::deviceToHost() enqueues the D2H copy on that stream and
-             * synchronizes it before returning.  Waiting a tensor completion
-             * event first is redundant, and on HIP it can be illegal when the
-             * event came from graph-capture bookkeeping for a replay stream.
-             *
-             * Keep the hard-error event path for ordinary host publication with
-             * no producer stream; those callers do not have a stream dependency
-             * that can safely replace the completion event.
-             */
-            if (stream)
-            {
-                LOG_TRACE("[TransferEngine::downloadFull] Explicit producer stream supplied; D2H copy will synchronize that stream");
-            }
-            else if (tensor->device_completion_event_)
-            {
-                LOG_TRACE("[TransferEngine::downloadFull] Using event-based sync (waiting for specific kernel)");
-                if (!waitForEventWithProxy(backend, tensor->device_completion_event_, backend_device_id, *tensor->gpu_device_))
-                {
-                    LOG_ERROR("[TransferEngine::downloadFull] Event wait failed for tensor '"
-                              << tensor->debug_name_ << "' on device " << tensor->gpu_device_->toString()
-                              << " — this indicates a corrupted or invalid completion event "
-                              << "(e.g., event recorded during graph capture)");
-                    return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
-                                                "Event wait failed: completion event is invalid");
-                }
-            }
-            else
+            if (!stream && !tensor->device_completion_event_)
             {
                 return TransferResult::fail(
                     TransferMethod::DEVICE_TO_HOST,
@@ -1766,20 +3113,88 @@ namespace llaminar2
                     : requireTransferStream(
                           *tensor->gpu_device_,
                           "TransferEngine::downloadFull");
+
+            /*
+             * A caller-provided stream is the exact producer stream and already
+             * carries the source dependency. Otherwise import the published
+             * producer event onto the dedicated transfer stream. Neither path
+             * blocks the host before the D2H copy is submitted.
+             */
+            if (!stream)
+            {
+                if (!tensor->event_device_.has_value() ||
+                    *tensor->event_device_ != *tensor->gpu_device_ ||
+                    !backend->streamWaitEvent(
+                        download_stream,
+                        tensor->device_completion_event_,
+                        backend_device_id))
+                {
+                    return TransferResult::fail(
+                        TransferMethod::DEVICE_TO_HOST,
+                        "D2H transfer could not join the exact device producer event");
+                }
+            }
+
+            bool created_event = false;
+            if (!tensor->device_completion_event_)
+            {
+                tensor->device_completion_event_ =
+                    backend->createEvent(backend_device_id);
+                if (!tensor->device_completion_event_)
+                {
+                    return TransferResult::fail(
+                        TransferMethod::DEVICE_TO_HOST,
+                        "D2H transfer could not create its host-publication event");
+                }
+                tensor->event_device_ = *tensor->gpu_device_;
+                created_event = true;
+            }
+
             auto d2h_start = std::chrono::high_resolution_clock::now();
-            bool d2h_ok = backend->deviceToHost(
+            bool d2h_ok = backend->deviceToHostOnStream(
                 dst,
                 tensor->gpu_data_ptr_,
                 bytes,
                 backend_device_id,
                 download_stream);
-            auto d2h_end = std::chrono::high_resolution_clock::now();
-            auto d2h_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(d2h_end - d2h_start).count();
-
             if (!d2h_ok)
             {
-                return TransferResult::fail(TransferMethod::DEVICE_TO_HOST, "deviceToHost failed");
+                if (created_event)
+                {
+                    backend->destroyEvent(
+                        tensor->device_completion_event_,
+                        backend_device_id);
+                    tensor->device_completion_event_ = nullptr;
+                    tensor->event_device_.reset();
+                }
+                return TransferResult::fail(
+                    TransferMethod::DEVICE_TO_HOST,
+                    "asynchronous deviceToHost enqueue failed");
             }
+            if (!backend->recordEvent(
+                    tensor->device_completion_event_,
+                    backend_device_id,
+                    download_stream))
+            {
+                LOG_ERROR("[TransferEngine::downloadFull] Accepted D2H copy could not publish its exact host-completion event on "
+                          << tensor->gpu_device_->toString());
+                std::terminate();
+            }
+            tensor->last_joined_completion_event_ = nullptr;
+            tensor->last_joined_consumer_stream_ = nullptr;
+            if (!waitForEventWithProxy(
+                    backend,
+                    tensor->device_completion_event_,
+                    backend_device_id,
+                    *tensor->gpu_device_))
+            {
+                return TransferResult::fail(
+                    TransferMethod::DEVICE_TO_HOST,
+                    "D2H host-publication event wait failed; completion event "
+                    "is invalid or could not be observed");
+            }
+            auto d2h_end = std::chrono::high_resolution_clock::now();
+            auto d2h_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(d2h_end - d2h_start).count();
 
             // Optional transfer trace diagnostic. This only samples the first
             // few floats, so keep it out of normal logs and validation output.
@@ -1818,6 +3233,7 @@ namespace llaminar2
 
             tensor->applyCoherenceOp_(CoherenceOp::DOWNLOAD);
             tensor->authoritative_device_ = std::nullopt;
+            tensor->retireCompletionEvent_();
 
             LOG_TRACE("[TransferEngine::downloadFull] Downloaded " << bytes
                                                                    << " bytes from device " << tensor->gpu_device_->toString()

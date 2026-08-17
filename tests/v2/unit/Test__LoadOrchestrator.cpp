@@ -226,7 +226,7 @@ namespace llaminar2
             << "Null sources stay last for processJobs() validation";
     }
 
-    TEST(Test__LoadOrchestrator, CoalescesShuffledContiguousExpertViewsIntoOneParentRun)
+    TEST(Test__LoadOrchestrator, CoalescesViewsUsingNonOwningParentIdentity)
     {
         constexpr int rows_per_expert = 2;
         constexpr int columns = 32;
@@ -240,7 +240,7 @@ namespace llaminar2
         // expert identity cannot be permuted by I/O coalescing.
         constexpr std::array<size_t, 4> discovery_order = {2, 0, 3, 1};
         std::vector<WeightJob> jobs;
-        std::vector<const void *> owners;
+        std::vector<const void *> source_identities;
         for (const size_t expert : discovery_order)
         {
             WeightJob job;
@@ -251,10 +251,12 @@ namespace llaminar2
             job.N = rows_per_expert;
             job.K = columns;
             jobs.push_back(job);
-            owners.push_back(&parent_identity);
+            // The identity is deliberately an unrelated scalar, proving that
+            // coalescing neither dereferences it nor treats it as byte ownership.
+            source_identities.push_back(&parent_identity);
         }
 
-        const auto runs = coalesceContiguousWeightJobs(jobs, owners);
+        const auto runs = coalesceContiguousWeightJobs(jobs, source_identities);
 
         ASSERT_EQ(runs.size(), 1u);
         EXPECT_EQ(runs[0].job.host_raw_data, parent.data());
@@ -312,11 +314,11 @@ namespace llaminar2
             make_job("different_n", 176, RepackFormat::Q4_0, 1, 32, 16),
             make_job("different_format", 192, RepackFormat::Q5_0, 1, 32, 16),
         };
-        std::vector<const void *> owners{
+        std::vector<const void *> source_identities{
             &owner_a, &owner_a, &owner_b, &owner_b,
             &owner_b, &owner_b, &owner_b};
 
-        const auto runs = coalesceContiguousWeightJobs(jobs, owners);
+        const auto runs = coalesceContiguousWeightJobs(jobs, source_identities);
         ASSERT_EQ(runs.size(), jobs.size());
         for (const auto &run : runs)
         {

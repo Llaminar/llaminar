@@ -1817,7 +1817,7 @@ namespace
     {
         RoutedExpertDomain domain;
         domain.name = name;
-        domain.scope = ExecutionDomainScope::LOCAL;
+        domain.scope = ExecutionDomainScope::RANK_LOCAL;
         domain.backend = backend;
         domain.participants = std::move(participants);
         domain.owner_rank = 0;
@@ -3101,7 +3101,7 @@ namespace
         else
         {
             config.tp_degree = static_cast<int>(local_tp_devices.size());
-            config.tp_scope = TPScope::LOCAL;
+            config.tp_scope = TPScope::RANK_LOCAL;
             config.tp_devices = local_tp_devices;
             config.default_backend = device.isCUDA()
                                          ? CollectiveBackendType::NCCL
@@ -3623,7 +3623,7 @@ namespace
         SingleDevice,
         LocalTP,
         LocalPP,
-        NodeLocalTP,
+        NodeTP,
     };
 
     enum class PrefixRestoreParityMode
@@ -3653,7 +3653,7 @@ namespace
         const DensePrefixRestoreParityCase &test_case)
     {
         const int world_size = mpiWorldSize();
-        if (test_case.topology == DensePrefixParityTopology::NodeLocalTP)
+        if (test_case.topology == DensePrefixParityTopology::NodeTP)
         {
             if (world_size != test_case.mpi_ranks)
             {
@@ -3746,7 +3746,7 @@ namespace
 
         case DensePrefixParityTopology::LocalTP:
             config.tp_degree = static_cast<int>(test_case.devices.size());
-            config.tp_scope = TPScope::LOCAL;
+            config.tp_scope = TPScope::RANK_LOCAL;
             config.tp_devices = test_case.devices;
             config.pp_degree = 1;
             config.default_backend = CollectiveBackendType::RCCL;
@@ -3764,7 +3764,7 @@ namespace
                 DomainDefinition domain;
                 domain.name = "stage" + std::to_string(i);
                 domain.devices = {test_case.devices[i]};
-                domain.scope = TPScope::LOCAL;
+                domain.scope = TPScope::RANK_LOCAL;
                 domain.owner_rank = 0;
                 domain.backend = CollectiveBackendType::AUTO;
                 config.domain_definitions.push_back(std::move(domain));
@@ -3772,7 +3772,7 @@ namespace
             break;
         }
 
-        case DensePrefixParityTopology::NodeLocalTP:
+        case DensePrefixParityTopology::NodeTP:
             config.tp_degree = test_case.mpi_ranks;
             config.tp_scope = TPScope::NODE_LOCAL;
             config.pp_degree = 1;
@@ -5607,7 +5607,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmoke)
     config.max_seq_len = 32;
     config.batch_size = 1;
     config.tp_degree = 2;
-    config.tp_scope = TPScope::LOCAL;
+    config.tp_scope = TPScope::RANK_LOCAL;
     config.tp_devices = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
     config.pp_degree = 1;
     config.kv_cache_precision = "auto";
@@ -5671,7 +5671,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke)
         config.max_seq_len = 32;
         config.batch_size = 1;
         config.tp_degree = 2;
-        config.tp_scope = TPScope::LOCAL;
+        config.tp_scope = TPScope::RANK_LOCAL;
         config.tp_devices = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
         config.pp_degree = 1;
         config.kv_cache_precision = "auto";
@@ -5863,7 +5863,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPLongContextSt
         config.moe_rebalance.device_min_load_spread_improvement = 0;
         config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
         config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
-        config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+        config.moe_rebalance
+            .device_min_foreign_rows_per_critical_path_payload_slot = 0;
         config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
         config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
         config.moe_rebalance.release_raw_expert_weights = true;
@@ -6243,7 +6244,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPLongContextSt
         config.moe_rebalance.device_min_load_spread_improvement = 0;
         config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
         config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
-        config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+        config.moe_rebalance
+            .device_min_foreign_rows_per_critical_path_payload_slot = 0;
         config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
         config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
         config.moe_rebalance.release_raw_expert_weights = true;
@@ -6563,7 +6565,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPNeedleRecallM
         config.max_seq_len = context_length;
         config.batch_size = 1;
         config.tp_degree = 2;
-        config.tp_scope = TPScope::LOCAL;
+        config.tp_scope = TPScope::RANK_LOCAL;
         config.tp_devices = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
         config.pp_degree = 1;
         config.activation_precision = "fp32";
@@ -6611,7 +6613,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayROCm2TPLLEPNeedleRecallM
         config.moe_rebalance.device_min_load_spread_improvement = 0;
         config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
         config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
-        config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+        config.moe_rebalance
+            .device_min_foreign_rows_per_critical_path_payload_slot = 0;
         config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
         config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
         config.moe_rebalance.release_raw_expert_weights = true;
@@ -6778,7 +6781,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPNeedleRecallM
         config.max_seq_len = context_length;
         config.batch_size = 1;
         config.tp_degree = 2;
-        config.tp_scope = TPScope::LOCAL;
+        config.tp_scope = TPScope::RANK_LOCAL;
         config.tp_devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
         config.pp_degree = 1;
         config.default_backend = CollectiveBackendType::NCCL;
@@ -6827,7 +6830,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEExpertOverlayCUDA2TPLLEPNeedleRecallM
         config.moe_rebalance.device_min_load_spread_improvement = 0;
         config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
         config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
-        config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+        config.moe_rebalance
+            .device_min_foreign_rows_per_critical_path_payload_slot = 0;
         config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
         config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
         config.moe_rebalance.release_raw_expert_weights = true;
@@ -7132,7 +7136,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEDynamicPrefixMTPPenaltyCUDA2LongReque
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT", "0"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR", "0"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "0"},
-        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER", "0"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT", "0"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "0"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PER_MILLE", "1000"},
         {"LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS", "32"},
@@ -7194,7 +7198,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEDynamicPrefixMTPPenaltyCUDA2LongReque
     }
     else if (diagnostic_placement == 2)
     {
-        config.tp_scope = TPScope::LOCAL;
+        config.tp_scope = TPScope::RANK_LOCAL;
         config.tp_devices = {
             GlobalDeviceAddress::cuda(0),
             GlobalDeviceAddress::cuda(1)};
@@ -7238,7 +7242,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36MoEDynamicPrefixMTPPenaltyCUDA2LongReque
     config.moe_rebalance.device_min_load_spread_improvement = 0;
     config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
     config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
-    config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+    config.moe_rebalance
+        .device_min_foreign_rows_per_critical_path_payload_slot = 0;
     config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
     config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
     config.moe_rebalance.release_raw_expert_weights = true;

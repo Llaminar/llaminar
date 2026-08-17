@@ -2,6 +2,7 @@
 #include <gmock/gmock.h>
 
 #include "app/AppContext.h"
+#include "app/modes/BenchmarkMode.h"
 #include "app/modes/CompletionMode.h"
 #include "app/modes/SingleShotChatMode.h"
 #include "mocks/MockMPIContext.h"
@@ -91,6 +92,41 @@ namespace
     private:
         LogLevel previous_level_;
     };
+}
+
+TEST(Test__BenchmarkMode, NonRootRankEntersWorkerLoopWithoutStartingASecondController)
+{
+    ModeHarness h(/*rank=*/1, /*world_size=*/2);
+    h.ctx.config.benchmark_mode = true;
+
+    EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
+    EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(1);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+    EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(0);
+    EXPECT_CALL(*h.runner, clearCache()).Times(0);
+    EXPECT_CALL(*h.runner, prefill(_)).Times(0);
+    EXPECT_CALL(*h.runner, decodeStep()).Times(0);
+    EXPECT_CALL(*h.tokenizer, encode(_, _, _)).Times(0);
+
+    BenchmarkMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 0);
+}
+
+TEST(Test__BenchmarkMode, RootRankOwnsControllerAndClosesWorkersOnEarlyFailure)
+{
+    ModeHarness h(/*rank=*/0, /*world_size=*/2);
+    h.ctx.config.benchmark_mode = true;
+
+    EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
+    EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(0);
+    EXPECT_CALL(*h.tokenizer, encode(_, false, false))
+        .WillOnce(Return(std::vector<int>{}));
+    EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(1);
+    EXPECT_CALL(*h.runner, abortMPIWorkers(_)).Times(0);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+
+    BenchmarkMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 1);
 }
 
 TEST(Test__CompletionMode, NonRootRankEntersWorkerLoopWithoutTokenization)

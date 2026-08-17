@@ -380,8 +380,8 @@ namespace llaminar2
                 {"mtp_gate", {"mtp_target_query_rows", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
                 {"mtp_up", {"mtp_target_query_rows", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
                 {"mtp_ffn_output", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
-                {"mtp_logits", {"mtp_target_query_rows", "mtp_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits rows; local shard normally, full vocab when LocalTP mirrors the MTP head"},
-                {"mtp_logits_gathered", {"mtp_global_gather_rows", "mtp_global_gather_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Full-vocabulary CPU GlobalTP MTP rows; conditionally 1x1 outside GlobalTP"},
+                {"mtp_logits", {"mtp_target_query_rows", "mtp_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Participant MTP logits: explicit vocabulary shard or mirrored full vocabulary at any TP scope"},
+                {"mtp_logits_gathered", {"mtp_global_gather_rows", "mtp_global_gather_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Full-vocabulary explicit-sharded GlobalTP MTP rows; conditionally 1x1 when no gather is owned"},
             };
 
             schema.model_buffers = {
@@ -494,7 +494,16 @@ namespace llaminar2
             // declarative StageType names from the schema template.
             config["GDN_PROJECTION"] = SnapshotShardingMode::COLUMN_PARALLEL;
             config["GDN_CONV1D"] = SnapshotShardingMode::COLUMN_PARALLEL;
-            config["GDN_CONV1D_OUTPUT"] = SnapshotShardingMode::COLUMN_PARALLEL;
+            /*
+             * These checkpoints are packed `[Q_local|K_local|V_local]` rows,
+             * not one contiguous column shard.  Their semantic groups must be
+             * reassembled independently across TP participants before parity
+             * applies the model-format V-head permutation.
+             */
+            config["QKV_PROJECTION"] =
+                SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+            config["GDN_CONV1D_OUTPUT"] =
+                SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
             config["GDN_RECURRENCE"] = SnapshotShardingMode::COLUMN_PARALLEL;
             config["GDN_DELTA_RULE_OUTPUT"] = SnapshotShardingMode::COLUMN_PARALLEL;
             config["GATED_RMSNORM"] = SnapshotShardingMode::COLUMN_PARALLEL;
@@ -506,6 +515,26 @@ namespace llaminar2
             config["ATTENTION_OUTPUT_GATE"] = SnapshotShardingMode::REPLICATED;
             config["FA_GATE"] = SnapshotShardingMode::COLUMN_PARALLEL;
             config["ATTENTION_CONTEXT_GATED"] = SnapshotShardingMode::COLUMN_PARALLEL;
+
+            /*
+             * The MTP front-end is replicated across TP participants. Its
+             * token embedding checkpoint keeps the ordinary EMBEDDING name
+             * and therefore inherits the vocab-parallel row-sum contract;
+             * these sidecar-only boundaries begin after that embedding has
+             * been allreduced and consume replicated weights/state.
+             */
+            config["MTP_TERMINAL_HIDDEN_ROW_SELECT"] =
+                SnapshotShardingMode::REPLICATED;
+            config["MTP_TERMINAL_HIDDEN_CONTIGUOUS_ROWS_*"] =
+                SnapshotShardingMode::REPLICATED;
+            config["MTP_TERMINAL_HIDDEN_DEVICE_ACCEPTED_ROWS_*"] =
+                SnapshotShardingMode::REPLICATED;
+            config["MTP_TERMINAL_HIDDEN_REQUEST_ROWS_*"] =
+                SnapshotShardingMode::REPLICATED;
+            config["NORM_HIDDEN"] = SnapshotShardingMode::REPLICATED;
+            config["NORM_EMBEDDING"] = SnapshotShardingMode::REPLICATED;
+            config["CONCAT"] = SnapshotShardingMode::REPLICATED;
+            config["FC"] = SnapshotShardingMode::REPLICATED;
 
             return config;
         }

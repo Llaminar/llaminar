@@ -1,608 +1,319 @@
-# Parity Test Framework
-
-This directory contains parity tests that compare Llaminar inference against PyTorch ground truth. These tests validate that our implementations produce numerically correct results across different backends (CPU, CUDA, ROCm) and model architectures.
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Directory Structure](#directory-structure)
-- [ParityTestBase Class](#paritytestbase-class)
-- [Configuration Options](#configuration-options)
-- [Metrics Computed](#metrics-computed)
-- [Test Coverage](#test-coverage)
-- [Writing a New Parity Test](#writing-a-new-parity-test)
-- [Running Tests](#running-tests)
-- [Adding Support for New Models](#adding-support-for-new-models)
-- [Troubleshooting](#troubleshooting)
-
----
-
-## Overview
-
-Parity tests ensure that Llaminar's inference results match PyTorch's ground truth within acceptable tolerances. The key insight is that while quantization introduces numerical differences, the **direction** of activations (measured by cosine similarity) and **prediction quality** (measured by KL divergence and Top-K accuracy) should remain stable.
-
-**Test Philosophy:**
-- **Layer-by-layer comparison**: Compare intermediate activations at each transformer layer
-- **Final output validation**: Validate logit distribution similarity (KL divergence, Top-K overlap)
-- **Backend-specific thresholds**: Different quantization schemes need different tolerances
-  - CPU (Q8_1): Tighter thresholds (~0.999 cosine) due to per-block quantization
-  - CUDA (INT8): Relaxed thresholds (~0.99 cosine) due to per-row symmetric quantization
-
----
-
-## Directory Structure
-
-```
-tests/v2/integration/parity/
-├── README.md                          # This file
-├── ParityTestBase.h                   # Generic base class (metrics, rendering, orchestration)
-├── qwen2/                             # Qwen2 model family tests
-│   ├── Qwen2ParityTestBase.h          # Model-specific base class + macros
-│   ├── Test__Qwen2_CUDA_vs_PyTorch.cpp
-│   └── Test__Qwen2_CPU_vs_PyTorch.cpp
-├── llama3/                            # (Future) Llama 3 model tests
-│   ├── Llama3ParityTestBase.h
-│   └── ...
-└── mistral/                           # (Future) Mistral model tests
-```
-
-**Naming Convention:**
-- Directory: `parity/<model_family>/`
-- Base class: `<Model>ParityTestBase.h`
-- Test files: `Test__<Model>_<Backend>_vs_PyTorch.cpp`
-- Test Fixture: `Test__<Model>_<Backend>_vs_PyTorch`
-- CTest Name: `V2_Integration_Parity_<Model>_<Backend>_vs_PyTorch`
-- CMake Target: `v2_integration_parity_<model>_<backend>_vs_pytorch`
-
----
-
-## Declarative Test Architecture
-
-Parity tests use a **three-tier inheritance hierarchy** for maximum code reuse:
-
-```
-ParityTestBase (utils/)
-    ↓
-Qwen2ParityTestBase (qwen2/)     # Model-specific base
-    ↓
-Test__Qwen2_CPU_vs_PyTorch       # Backend-specific test (pure configuration)
-```
-
-### Tier 1: ParityTestBase (Generic)
-
-Located in `tests/v2/integration/parity/ParityTestBase.h`. Provides:
-- Metric computation (cosine similarity, KL divergence, Top-K overlap)
-- PyTorch snapshot loading and regeneration
-- Unicode table rendering
-- Generic `runSingleDevicePrefillParity()` and `assertParity()` methods for single-device tests
-- TP-aware `runTPPrefillParity()` and `assertTPParity()` methods for multi-device tests
-
-### Tier 2: Model-Specific Base (e.g., Qwen2ParityTestBase)
-
-Located in `parity/<model>/`. Provides:
-- Model-specific configuration (model path, snapshot dir, token IDs)
-- `BackendThresholds` struct for declarative threshold configuration
-- `INSTANTIATE_<MODEL>_PARITY_TESTS` macro to generate test cases
-
-### Tier 3: Backend-Specific Tests (Pure Configuration)
-
-Each backend test file is **purely declarative** (~30-70 lines):
-
-```cpp
-class Test__Qwen2_CPU_vs_PyTorch : public Qwen2ParityTestBase {
-    BackendThresholds getBackendThresholds() override {
-        return {.cosine_threshold=0.999f, .early_layers_count=4, ...};
-    }
-    DeviceId getDevice() override { return DeviceId::cpu(); }
-    std::string getBackendName() override { return "CPU"; }
-};
-INSTANTIATE_QWEN2_PARITY_TESTS(Test__Qwen2_CPU_vs_PyTorch);
-```
-
----
-
-## ParityTestBase Class
-
-All parity tests ultimately inherit from `ParityTestBase` (located in `tests/v2/integration/parity/ParityTestBase.h`). This base class provides:
-
-### Core Methods
-
-| Method | Description |
-|--------|-------------|
-| `getDevice()` | **Required** - Returns `DeviceId` for inference (e.g., `DeviceId::cpu()`, `DeviceId::cuda(0)`) |
-| `getBackendName()` | **Required** - Returns display name (e.g., `"CUDA"`, `"CPU"`, `"ROCm"`) |
-| `setupDeviceSpecific()` | Optional - Device availability checks, initialization |
-| `runSingleDevicePrefillParity()` | Main test driver for single-device tests - runs inference and compares against PyTorch |
-| `runTPPrefillParity()` | TP test driver for multi-device tests - compares per-device outputs against PyTorch |
-| `assertParity()` | Standard assertion helper with threshold checks |
-
-### Model-Specific Base Classes
-
-Each model family has its own base class (e.g., `Qwen2ParityTestBase`) that provides:
-
-| Method | Description |
-|--------|-------------|
-| `getBackendThresholds()` | **Required** - Returns `BackendThresholds` struct |
-
-```cpp
-struct BackendThresholds {
-    float cosine_threshold = 0.99f;    // Minimum cosine similarity
-    int early_layers_count = 6;        // How many early layers to check
-    int min_early_layers_passed = 6;   // How many must pass
-    float kl_threshold = 0.15f;        // Maximum KL divergence
-};
-```
-
-### Automatic Snapshot Management
-
-The base class automatically:
-1. **Regenerates PyTorch snapshots** on each test run via `python/reference/generate_qwen_pipeline_snapshots.py`
-2. **Loads snapshots** from `.npy` files using the cnpy library
-3. **Caches snapshots** in memory for efficient multi-snapshot comparisons
-
-### Result Structures
-
-```cpp
-// Per-layer statistics
-struct LayerStats {
-    int layer_idx;
-    float avg_cosine_sim;     // Average across all stage comparisons
-    float min_cosine_sim;     // Minimum (worst) stage similarity
-    std::string worst_stage;  // Name of the worst-performing stage
-    int stages_compared;      // Number of stages compared
-    bool passed;              // Met threshold criteria
-};
-
-// Overall test summary
-struct ParityTestSummary {
-    float embedding_cosine;
-    std::vector<LayerStats> layer_stats;  // Per-layer results
-    float lm_head_cosine, lm_head_kl;     // LM head metrics
-    float lm_head_top1, lm_head_top5;     // Top-K accuracy
-    int early_layers_passed;              // Layers meeting threshold
-    bool overall_passed;
-};
-```
-
----
-
-## Configuration Options
-
-Configure thresholds in your test's `SetUp()` method via `config_`:
-
-```cpp
-struct ParityConfig {
-    // Model and test setup
-    std::string model_path = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
-    std::string snapshot_dir;  // auto-derived from model_path when empty
-    std::string prompt = "The quick brown fox jumps over the lazy dog";
-    std::vector<int> token_ids = {785, 3974, ...};  // Pre-tokenized prompt
-    int decode_steps = 5;
-
-    // Layer-by-layer thresholds
-    float cosine_threshold = 0.99f;    // Minimum cosine similarity
-    bool use_avg_cosine = true;        // Use average (true) or min (false)
-    int early_layers_count = 6;        // How many early layers to check strictly
-    int min_early_layers_passed = 6;   // How many must pass
-
-    // LM_HEAD thresholds
-    float kl_threshold = 0.15f;        // Maximum KL divergence (nats)
-    float min_top1_accuracy = 60.0f;   // Minimum Top-1 accuracy %
-};
-```
-
-**Recommended Thresholds by Backend:**
-
-| Backend | `cosine_threshold` | `early_layers_count` | `kl_threshold` | Rationale |
-|---------|-------------------|---------------------|----------------|-----------|
-| CPU (Q8_1) | 0.999 | 4 | 0.15 | Per-block quantization preserves accuracy |
-| CUDA (INT8) | 0.99 | 6 | 0.15 | Per-row symmetric has more error |
-| ROCm | 0.99 | 6 | 0.15 | Similar to CUDA |
-| FP32 | 0.9999 | 8 | 0.05 | Near-perfect match expected |
-
----
-
-## Metrics Computed
-
-### Cosine Similarity
-
-```cpp
-float computeCosineSimilarity(const float* a, const float* b, size_t size);
-```
-
-Measures directional alignment, ignoring magnitude. Range: `[-1, 1]`, where 1 = identical direction.
-
-**Why cosine?** Quantization affects magnitude but preserves direction. High cosine similarity indicates the model "understands" the same features even if numerical values differ.
-
-### KL Divergence
-
-```cpp
-float computeKLDivergence(const float* actual_logits, const float* expected_logits, 
-                          size_t size, size_t vocab_size);
-```
-
-Measures how the actual probability distribution diverges from expected. Lower is better.
-
-**Interpretation:**
-- `< 0.05`: Excellent match
-- `< 0.15`: Good match (acceptable for quantized models)
-- `> 0.30`: Poor match, investigate
-
-### Top-K Overlap
-
-```cpp
-float computeTopKOverlap(const float* actual, const float* expected, 
-                         size_t size, size_t vocab_size, int k);
-```
-
-Checks if the Top-K predicted tokens overlap. Range: `[0, 1]`, where 1 = 100% overlap.
-
-**Why Top-K?** This is the "smoke test" - even if logits differ numerically, the model should predict similar tokens.
-
----
-
-## Test Coverage
-
-Parity tests cover both **prefill** and **incremental decode** phases:
-
-### Prefill Parity (`PrefillParity_LayerByLayer`)
-
-Compares Llaminar's prefill output against PyTorch layer-by-layer:
-- Processes the full input prompt in a single batch
-- Compares activations at each transformer layer
-- Validates embedding, attention, FFN, and LM_HEAD stages
-- Pass criteria: average cosine similarity >= threshold per layer
-
-### Decode Parity (`DecodeParity_Incremental`)
-
-Compares incremental token generation (autoregressive decode):
-- First runs prefill to initialize KV cache
-- Generates tokens one at a time using the sampled token from PyTorch
-- Compares LM_HEAD logit distribution at each decode step
-- Pass criteria:
-  - Each step: cosine >= threshold OR KL < threshold
-  - Overall: min_decode_pass_rate (default 80%)
-  - Top-1 accuracy >= min_top1_accuracy (default 60%)
-
-**Example Decode Parity Output:**
-
-```
-╔════════════════════════════════════════════════════════════════════════════════════╗
-║                    CPU INCREMENTAL DECODE PARITY                                   ║
-║                    (Threshold: cosine >= 0.990 OR KL < 0.150)                      ║
-╠═════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦══════════╣
-║  Step   ║    Cosine     ║      KL       ║   Llaminar    ║    PyTorch    ║  Status  ║
-╠═════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬══════════╣
-║      0  ║     0.998922  ║     0.001664  ║       323 ✓   ║       323     ║    ✓     ║
-║      1  ║     0.999334  ║     0.005113  ║      1221 ✗   ║       279     ║    ✓     ║
-║      2  ║     0.999353  ║     0.008595  ║      5562 ✗   ║      3974     ║    ✓     ║
-║      3  ║     0.999493  ║     0.000528  ║     13876 ✓   ║     13876     ║    ✓     ║
-║      4  ║     0.999577  ║     0.000179  ║     38835 ✓   ║     38835     ║    ✓     ║
-╠═════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩══════════╣
-║  SUMMARY:  Steps=5/5  AvgCosine=0.9993  Top1=60.0%  ✓ PASSED                       ║
-╚════════════════════════════════════════════════════════════════════════════════════╝
-```
-
-**Note:** Token mismatches (✗ in Llaminar column) are expected when quantization shifts probability mass slightly. The key metric is cosine similarity of the logit distributions.
-
-### Snapshot Infrastructure (`SnapshotInfrastructure`)
-
-Verifies the PyTorch snapshot generation and loading works correctly:
-- Checks that snapshots can be generated
-- Validates embedding snapshot loads successfully
-
----
-
-## Writing a New Parity Test
-
-### Adding a Backend to an Existing Model (e.g., ROCm for Qwen2)
-
-Create `tests/v2/integration/parity/qwen2/Test__Qwen2_ROCm_vs_PyTorch.cpp`:
-
-```cpp
-/**
- * @file Test__Qwen2_ROCm_vs_PyTorch.cpp
- * @brief Integration: Qwen2 ROCm Pipeline vs PyTorch Reference
- */
-
-#include <gtest/gtest.h>
-#include "Qwen2ParityTestBase.h"
-#include "backends/ComputeBackend.h"
-
-#ifdef HAVE_ROCM
-#include "backends/rocm/ROCmBackend.h"
-#include <hip/hip_runtime.h>
-#endif
-
-using namespace llaminar2;
-using namespace llaminar2::test::parity::qwen2;
-
-class Test__Qwen2_ROCm_vs_PyTorch : public Qwen2ParityTestBase
-{
-protected:
-    DeviceId rocm_device_ = DeviceId::cpu();
-
-    BackendThresholds getBackendThresholds() override
-    {
-        return {
-            .cosine_threshold = 0.99f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 6,
-            .kl_threshold = 0.15f
-        };
-    }
-
-    void setupDeviceSpecific() override
-    {
-#ifndef HAVE_ROCM
-        GTEST_SKIP() << "Built without ROCm support";
-#else
-        auto &dm = DeviceManager::instance();
-        dm.initialize(-1);
-
-        int gpu_idx = dm.find_device(ComputeBackendType::GPU_ROCM);
-        if (gpu_idx < 0) {
-            GTEST_SKIP() << "No ROCm device found";
-        }
-
-        rocm_device_ = DeviceId::rocm(gpu_idx - 1);
-#endif
-    }
-
-    DeviceId getDevice() override { return rocm_device_; }
-    std::string getBackendName() override { return "ROCm"; }
-};
-
-INSTANTIATE_QWEN2_PARITY_TESTS(Test__Qwen2_ROCm_vs_PyTorch);
-```
-
-That's it! The `INSTANTIATE_QWEN2_PARITY_TESTS` macro generates:
-- `PrefillParity_LayerByLayer` test
-- `SnapshotInfrastructure` test
-
-### Adding a New Model Family (e.g., Llama3)
-
-#### Step 1: Create Model Directory and Base Class
-
-Create `tests/v2/integration/parity/llama3/Llama3ParityTestBase.h`:
-
-```cpp
-#pragma once
-#include "../ParityTestBase.h"
-
-namespace llaminar2::test::parity::llama3
-{
-
-struct BackendThresholds {
-    float cosine_threshold = 0.99f;
-    int early_layers_count = 8;      // Llama3 has 32 layers
-    int min_early_layers_passed = 7;
-    float kl_threshold = 0.15f;
-};
-
-class Llama3ParityTestBase : public ParityTestBase
-{
-protected:
-    virtual BackendThresholds getBackendThresholds() = 0;
-
-    void SetUp() override
-    {
-        auto thresholds = getBackendThresholds();
-        config_.cosine_threshold = thresholds.cosine_threshold;
-        config_.use_avg_cosine = true;
-        config_.early_layers_count = thresholds.early_layers_count;
-        config_.min_early_layers_passed = thresholds.min_early_layers_passed;
-        config_.kl_threshold = thresholds.kl_threshold;
-
-        // Llama3-specific model configuration
-        config_.model_path = "models/llama-3-8b-instruct-q4_0.gguf";
-        config_.snapshot_dir = "pytorch_llama3_snapshots";
-        config_.prompt = "Hello, my name is";
-        config_.token_ids = {/* tokenized prompt */};
-
-        ParityTestBase::SetUp();
-    }
-};
-
-} // namespace
-
-#define INSTANTIATE_LLAMA3_PARITY_TESTS(TestFixture)                                   \
-    TEST_F(TestFixture, PrefillParity_LayerByLayer) {                                  \
-        auto summary = runSingleDevicePrefillParity();                                 \
-        assertParity(summary);                                                         \
-    }                                                                                  \
-    TEST_F(TestFixture, SnapshotInfrastructure) {                                      \
-        ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";                       \
-        auto embedding = loadPyTorchSnapshot("EMBEDDING");                             \
-        ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";        \
-    }
-```
-
-#### Step 2: Create Backend Test (CPU example)
-
-Create `tests/v2/integration/parity/llama3/Test__Llama3_CPU_vs_PyTorch.cpp`:
-
-```cpp
-#include <gtest/gtest.h>
-#include "Llama3ParityTestBase.h"
-
-using namespace llaminar2;
-using namespace llaminar2::test::parity::llama3;
-
-class Test__Llama3_CPU_vs_PyTorch : public Llama3ParityTestBase
-{
-protected:
-    BackendThresholds getBackendThresholds() override {
-        return {.cosine_threshold=0.999f, .early_layers_count=8, .min_early_layers_passed=7};
-    }
-    DeviceId getDevice() override { return DeviceId::cpu(); }
-    std::string getBackendName() override { return "CPU"; }
-};
-
-INSTANTIATE_LLAMA3_PARITY_TESTS(Test__Llama3_CPU_vs_PyTorch);
-```
-
-#### Step 3: Add CMake Target
-
-In `tests/v2/CMakeLists.txt`, add under the appropriate model section:
-
-```cmake
-# Llama3 CUDA vs PyTorch Parity Test
-add_executable(v2_integration_parity_llama3_cuda_vs_pytorch 
-    integration/parity/llama3/Test__Llama3_CUDA_vs_PyTorch.cpp
-    ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-)
-target_link_libraries(v2_integration_parity_llama3_cuda_vs_pytorch 
-    llaminar2_core 
-    GTest::gtest 
-    GTest::gtest_main
-    ZLIB::ZLIB
-)
-target_include_directories(v2_integration_parity_llama3_cuda_vs_pytorch PRIVATE 
-    ${WORKSPACE_ROOT_PARITY}/external/cnpy
-)
-add_v2_test(V2_Integration_Parity_Llama3_CUDA_vs_PyTorch
-    COMMAND $<TARGET_FILE:v2_integration_parity_llama3_cuda_vs_pytorch>
-    LABELS "V2;Integration;Parity;Llama3;CUDA;PyTorch;GoldenReference;FullModel;Pipeline"
-    MPI_PROCS 1
-)
-```
-
-### Step 3: Create PyTorch Snapshot Generator (If New Model)
-
-For new model architectures, create a snapshot generator in `python/reference/`:
-
-```python
-# python/reference/generate_llama3_pipeline_snapshots.py
-# (Similar to generate_qwen_pipeline_snapshots.py)
-```
-
-Update `ParityTestBase::regeneratePyTorchSnapshots()` if the script name differs.
-
----
-
-## Running Tests
+# Production parity campaigns
+
+The V2 parity framework compares the live Llaminar inference path against a
+CPU/FP32 PyTorch reference generated from the same real GGUF bytes. It retains
+the existing layer-by-layer mathematics and diagnostic CSVs while avoiding a
+new model load for every prefill, decode, snapshot, backend, and KV-precision
+case.
+
+CTest registration in `tests/v2/CMakeLists.txt` is the matrix source of truth.
+Do not maintain a second model/backend/precision manifest in scripts or docs.
+
+## What one production cell proves
+
+Each parameterized `ProductionParity` cell uses one production runner session
+to perform this contract:
+
+1. Authenticate or generate the CPU PyTorch reference pack.
+2. Construct the configured production model, topology, collectives, kernels,
+   arenas, streams, graph, and KV-cache policy.
+3. Run prefill and compare embedding, every published per-layer stage, final
+   norm, and LM-head distributions against PyTorch.
+4. Assert that the live graph published the required snapshot boundaries.
+5. Reset request-owned snapshots and cache data without rebuilding topology or
+   recapturing merely to cross the request boundary.
+6. Run incremental decode and compare every requested decode checkpoint and
+   output distribution.
+7. Export the normal numerical diagnostics plus structured production-path and
+   wall-time evidence.
+
+The comparison code remains in `ParityTestBase.h`: cosine similarity, relative
+L2, KL divergence, Top-K overlap, distribution statistics, NaN/Inf checks, and
+per-layer threshold assertions are unchanged. Fusing phases removes duplicate
+setup; it does not weaken the oracle or compare fewer checkpoints.
+
+Missing models, hardware, decode references, graph evidence, or snapshot
+publication are failures in a production campaign. Focused developer tests may
+still skip when their optional prerequisite is absent.
+
+## Reference-pack identity
+
+`metadata.txt` is published atomically after the NumPy files. A production
+campaign accepts an existing pack only when it binds all of the following:
+
+- supported snapshot schema;
+- PyTorch on CPU using FP32;
+- SHA-256 of the exact GGUF file used by the native runner;
+- SHA-256 of the exact UTF-8 prompt bytes;
+- nonempty tokenizer output and its SHA-256;
+- sufficient decode depth, decode tokens, and boundary snapshots.
+
+Before inference, the aggregate runner copies the complete selected GGUF corpus
+into a private directory on `/dev/shm`. CTest's `REQUIRED_FILES` property is the
+machine-readable model declaration for each production campaign. The runner
+expands split GGUF siblings, resolves symlink aliases, rejects basename
+collisions, verifies that the entire corpus plus a reserve fits on tmpfs, and
+computes source SHA-256 while atomically publishing each read-only RAM copy.
+Full-write and byte-count checks, source mutation detection, read-only mode, and
+source/destination identity binding protect the transaction. Each production
+child then performs the single canonical destination SHA-256 check against its
+authenticated reference pack before inference; a shared identity-keyed digest
+cache coalesces that check across campaigns. Any missing declaration,
+non-memory filesystem, capacity shortfall, mutation during copy, reference
+digest mismatch, or completion timeout is a hard failure. The staging and
+authentication time are part of the same one-hour target; by default the
+temporary corpus is removed when the run exits.
+
+Runners with a different memory mount can pass
+`--model-ramdisk-root /path/to/tmpfs`. The directory must already reside on
+`tmpfs` or `ramfs`; the driver never falls back to disk or a partial corpus.
+
+For rapid local iteration, explicitly retain the authenticated corpus and digest
+records in a stable child directory:
 
 ```bash
-# Build integration tests
-cmake --build build_v2_integration --parallel
-
-# Run all Qwen2 parity tests
-ctest --test-dir build_v2_integration -R "V2_Integration_Parity_Qwen2" --output-on-failure
-
-# Run all CUDA parity tests (across all models)
-ctest --test-dir build_v2_integration -L "CUDA" -L "Parity" --output-on-failure
-
-# Run a specific test
-ctest --test-dir build_v2_integration -R "V2_Integration_Parity_Qwen2_CUDA_vs_PyTorch" -V
-
-# Run all parity tests
-ctest --test-dir build_v2_integration -L "Parity" --output-on-failure
+python3 scripts/ci/run_production_parity_campaigns.py \
+  --build-dir build_v2_integration \
+  --persistent-model-cache-dir /dev/shm/llaminar-production-parity-cache
 ```
 
-### Test Output
+The first invocation computes source SHA-256 during the copy, atomically
+publishes each read-only GGUF, and authenticates the published bytes once through
+the reference-pack gate. Later invocations reuse an entry only when its source
+device, inode, size, nanosecond mtime, nanosecond ctime, and read-only cached-file
+identity are unchanged; the persistent digest cache binds the prior reference
+authentication to that exact destination identity. Changed entries are replaced
+atomically, while a changed cached identity is reauthenticated before inference.
+One exclusive cache lock spans staging and every child inference process, so a
+concurrent run cannot replace weights still in use. After acquiring that lock,
+the driver reclaims only unpublished copy/manifest transaction files left by an
+interrupted process or host reboot; published models and operator-owned files
+remain untouched. The driver never deletes this directory; remove that exact
+cache manually when no campaign owns it.
 
-Tests produce a formatted Unicode table showing layer-by-layer results:
+Every child process then re-authenticates the RAM copy against the reference
+pack. Those streaming digests are coalesced through a private run-scoped cache,
+or the explicitly selected persistent cache, keyed by canonical path, device,
+inode, size, nanosecond mtime, and nanosecond ctime. This prevents both repeated
+multi-gigabyte scans and stale pathname trust. Qwen2/Qwen3 use
+`python/reference/generate_qwen_pipeline_snapshots.py`; Qwen3.5, Qwen3.6, and
+their MoE variants use the architecture-specific generators under
+`python/reference/`.
 
-```
-╔══════════════════════════════════════════════════════════════════════════════════════════╗
-║                    CUDA vs PyTorch LAYER-BY-LAYER PARITY                                 ║
-║                    (Threshold: avg cosine similarity >= 0.990)                           ║
-╠═══════════╦═══════════════╦═══════════════╦════════════════════════════════════════╦══════╣
-║   Layer   ║   Avg Cosine  ║   Min Cosine  ║            Worst Stage                 ║Status║
-╠═══════════╬═══════════════╬═══════════════╬════════════════════════════════════════╬══════╣
-║ EMBEDDING ║      0.999912 ║      0.999912 ║                      -                 ║  ✓  ║
-║   Layer 0 ║      0.998234 ║      0.995123 ║              FFN_RESIDUAL              ║  ✓  ║
-║   Layer 1 ║      0.997856 ║      0.993456 ║           ATTENTION_OUTPUT             ║  ✓  ║
-...
-╠═══════════╬═══════════════╬═══════════════╬════════════════════════════════════════╬══════╣
-║  LM_HEAD  ║      0.982345 ║      0.982345 ║    KL=  0.0234 Top1=100.0%             ║  ✓  ║
-╚═══════════╩═══════════════╩═══════════════╩════════════════════════════════════════╩══════╝
-```
+## Process campaign and ownership
 
----
+`discover_v2_parity_tests()` runs `--gtest_list_tests` after each parity binary
+is built. Focused diagnostics remain isolated CTests. Every discovered
+`ProductionParity` case is instead placed in one exact, wildcard-free GTest
+filter per test type and backend signature. All precision cells for that test
+type/backend execute in one process.
 
-## Adding Support for New Models
+Across compatible precision cells, the process retains one bounded
+`ModelContext` and its authoritative `PreparedWeightStore`. The reuse key
+includes model path, weight distribution, topology, devices, collectives,
+activation precision, ranks, and PP partitioning. KV precision is deliberately
+excluded because KV storage is runner-owned. Every cell still constructs an
+exact runner, arena, stream set, graph identity, and KV policy; a key change
+evicts the prior model before loading another, so the cache cannot grow without
+bound.
 
-### 1. Create Model Directory
+## Production-path evidence
+
+Production campaigns force declarative graph execution and enable structured
+PerfStats. Every homogeneous CUDA-only or ROCm-only cell requires:
+
+- native decode graph capture or replay;
+- no segmented plan, segmented capture, or segmented replay.
+
+Ordinary non-MTP inference additionally requires a complete native graph
+capture or replay. MTP uses a backend-specific generation proof:
+
+- CUDA requires one native conditional parent and complete `full_graph_*`
+  capture/replay.
+- ROCm requires HIP's authenticated 60-byte immutable scheduler ticket and the
+  retained captured transaction family it selects. The device controller owns
+  every decision and mutable value; the host only submits the named branch.
+  Consequently `forward_full_graph_*` proves each captured transaction while
+  the complete `full_graph_*` fields truthfully remain false.
+
+Explicitly heterogeneous placements may segment only at their declared
+backend/collective boundary. CPU cells must still use the production graph
+execution path. No campaign falls back to eager execution, deterministic test
+kernels, serial replay, or a different backend.
+
+Each results directory contains `production_path.csv`, recording execution
+path, inner-forward versus complete graph evidence, MTP generation-controller
+authority, backend policy certification, segmentation evidence, model-context
+reuse, elapsed time, budget, and pass/fail status. ROCm certification requires
+exact ticket ABI/provenance, participant graph-family evidence, matching
+ticket/submission/controller ledgers, and a standalone or participant-complete
+rank launch. `generation_certification_detail` identifies the first missing
+invariant. Every mathematical production cell retains the canonical numerical
+artifacts:
+
+- `prefill_layers.csv`
+- `prefill_summary.csv`
+- `prefill_stages.csv`
+- `decode_steps.csv`
+- `decode_layers.csv`
+- `decode_stages.csv`
+
+Cross-rank pipeline cells first write rank-local diagnostic fragments, then
+merge them into the same canonical files. The merged result must contain every
+owned layer and stage from every rank, the head-rank embedding boundary, and
+the tail-rank norm/LM-head distribution; partial rank-zero CSVs are a failure.
+Temporary rank fragments are removed after a successful merge.
+
+MoE policy cells certify behavior through request-local `moe_rebalance`
+PerfStats in addition to checkpoint mathematics. Fresh Dynamic and LLEP cells
+must prove a payload was copied, nonzero packed expert bytes crossed the live
+transport, and the destination placement was applied. Static-owner cells assert
+that CPU, CUDA, and ROCm planner/copy/transport/apply movement counters all
+remain zero. Setup-only `moe_placement` records separately authenticate ordinal
+or random physical expert placement and are not counted as request movement.
+A restored full-prefix request need not invent a redundant migration; its
+preceding fresh request must already have supplied the positive movement proof.
+
+## One-hour economy gate
+
+The complete discovered matrix is the performance unit. All model families,
+topologies, backends, precision cells, MoE policies/owner placements, and MTP
+depths selected for a run share one 3,600-second wall-clock target. A CTest
+campaign is only a process-resident scheduling unit used to amortize immutable
+weights and claim backend resources; it does not receive a fresh hour. Missing
+the target is a performance failure reported after the matrix completes, not a
+reason to stop admitting work or discard later correctness evidence.
+
+The driver stages the download fixture once, stages and authenticates the
+selected real weights into RAM once, overlaps only backend-disjoint work,
+runs every campaign even after the target is missed, and records the complete
+correctness result. An independent 21,600-second completion timeout is a
+stuck-run safety ceiling, not the economy requirement; configure it separately
+with `--completion-timeout-seconds`. C++ cells write timing evidence but do not
+assert the one-hour target individually. `production-campaigns.json` records
+separate correctness and performance statuses, staged byte count,
+source/destination digests, staging filesystem/time, and campaign coverage.
+
+List the configured coverage without loading a model:
 
 ```bash
-mkdir -p tests/v2/integration/parity/<model_name>
+python3 scripts/ci/run_production_parity_campaigns.py \
+  --build-dir build_v2_integration --list
 ```
 
-### 2. Create PyTorch Reference Script
+The listing validates campaign labels, environment, timeout, declared GGUF
+manifest, forward-graph PerfStats, and exact GTest filters, then reports
+campaign count, exact matrix cell count, backend signatures, and precision
+tags.
 
-Copy and adapt `python/reference/generate_qwen_pipeline_snapshots.py`:
-- Update model loading logic
-- Adjust layer naming to match model architecture
-- Update snapshot key names if layer structure differs
+Run every configured campaign and write machine-readable timing evidence:
 
-### 3. Verify Stage Names
-
-Check what stages Llaminar captures for the model:
-
-```cpp
-// In a test, print available snapshot keys
-auto keys = runner_->getSnapshotKeys();
-for (const auto& key : keys) {
-    std::cout << key << std::endl;
-}
+```bash
+python3 scripts/ci/run_production_parity_campaigns.py \
+  --build-dir build_v2_integration \
+  --report parity-results/production-campaigns.json
 ```
 
-Ensure the PyTorch generator uses matching key names.
+Architecture slices retain the same discovery authority, backend-exclusive
+scheduler, whole-slice target, and JSON evidence. Select only registered CTest
+campaign names; do not maintain a copied model/topology list. For example, a
+non-ExpertOverlay certification pass can omit the tier implementation slice:
 
-### 4. Adjust Thresholds
+```bash
+python3 scripts/ci/run_production_parity_campaigns.py \
+  --build-dir build_v2_integration \
+  --exclude-campaign '.*(?:ExpertOverlay|MoEGraphNative).*' \
+  --report /tmp/non-overlay-production-campaigns.json
+```
 
-Different architectures may need different thresholds:
-- More layers = more error accumulation → may need relaxed thresholds
-- Different attention mechanisms → check attention-specific stages
-- MoE models → additional stages to compare
+Filter with full-match regular expressions when validating one backend or
+precision subset:
 
----
+```bash
+python3 scripts/ci/run_production_parity_campaigns.py \
+  --build-dir build_v2_integration \
+  --backend 'CUDA' --precision 'ALL'
+```
+
+The report path is generated debris and must not be committed.
+
+To run one exact campaign directly, discover its name first:
+
+```bash
+ctest --test-dir build_v2_integration -N -L Campaign
+ctest --test-dir build_v2_integration \
+  -R '^V2_Integration_Parity_Qwen2_SingleDevice_ProductionCampaign_CUDA_ALL_PRECISIONS$' \
+  --output-on-failure
+```
+
+## Adding or extending a matrix
+
+Use a substantive file header and keep configurations declarative.
+
+1. Add each supported model/topology/backend/precision configuration to the
+   fixture's existing `TestConfig` parameter list. Backend identity must appear
+   unambiguously in the generated case name as `CPU`, `CUDA`, or `ROCm`.
+2. Implement one `ProductionParity` test that calls
+   `runProductionParityCampaign()`, or an architecture-specific fused body when
+   additional production evidence is required.
+3. Register the binary with `discover_v2_parity_tests()` and declare every GGUF
+   that all of its `ProductionParity` cells can select with `MODEL_FILES`.
+   Backend-specific additions use `CPU_MODEL_FILES`, `CUDA_MODEL_FILES`, or
+   `ROCM_MODEL_FILES`, which prevents a focused backend slice from staging
+   unrelated large models. Registration and runtime path resolution fail closed
+   if these drift. If a specialized path asserts another PerfStats domain, pass
+   `PRODUCTION_PERF_STATS_FILTER "forward_graph,<domain>"`.
+4. Build the target so its generated CTest include is refreshed, then run the
+   campaign unit test and `--list` coverage audit.
+5. Stage the real model files and run every affected backend campaign. A new
+   defect needs a focused regression in addition to the full campaign cell.
+
+Do not create separate `PrefillParity`, `DecodeParity`, and
+`SnapshotInfrastructure` model-loading tests for a new matrix. Their contracts
+belong in the fused production cell. Prefix-cache, MTP, stochastic sampling,
+dynamic-depth, and other specialized behavioral suites remain focused gates
+when they exercise a different state machine; they do not replace mathematical
+production parity. MTP registration must cover fixed depths 1, 2, and 3 plus
+dynamic depth on CPU, CUDA, and ROCm. MoE MTP cells inherit the same explicit
+Static/Dynamic/LLEP movement contract and routed-owner placement as their
+ordinary inference cells.
+
+## Local verification
+
+Fast, device-free framework checks:
+
+```bash
+python3 tests/v2/unit/scripts/test_production_parity_campaigns.py
+python3 -m pytest -q python/reference/tests/test_snapshot_metadata.py
+ctest --test-dir build_v2_integration \
+  -R '^V2_Unit_ProductionParityCampaigns$' --output-on-failure
+```
+
+Build parity targets with the repository's normal unrestricted concurrency:
+
+```bash
+cmake --build build_v2_integration --parallel \
+  --target v2_integration_parity_qwen2_single_device
+```
 
 ## Troubleshooting
 
-### Test Fails with "PyTorch snapshot generation failed"
+- “reference pack is stale or unauthenticated” names the exact failed identity
+  field; regeneration occurs once on rank zero and all ranks wait for its
+  completion.
+- A production model or accelerator prerequisite failure is intentional. Stage
+  the configured GGUF and schedule the campaign on its declared backend.
+- A homogeneous GPU segmentation failure means the live path violated its
+  backend-native captured-generation contract; fix graph construction or
+  capture identity.
+- A generation certification failure is diagnosed first through
+  `generation_certification_detail`. Do not accept a policy name without its
+  native-parent or authenticated-ticket ledger proof.
+- Numerical failures retain the layer/stage/decode CSVs and test log in the
+  case-specific results directory.
+- Use `LLAMINAR_LOG_LEVEL=DEBUG` for lifecycle diagnostics. Stage dumping is a
+  focused diagnostic and is not production-path certification.
 
-1. Check Python environment: `source .venv/bin/activate`
-2. Install dependencies: `pip install -r requirements.txt`
-3. Verify model exists: `ls models/`
-4. Run generator manually:
-   ```bash
-    python python/reference/generate_qwen_pipeline_snapshots.py \
-       --model models/qwen2.5-0.5b-instruct-q4_0.gguf \
-       --prompt "Test" --output pytorch_test_snapshots
-   ```
-
-### Layer Cosine Similarity Too Low
-
-1. Check the "Worst Stage" column - identifies where divergence occurs
-2. Run with `LLAMINAR_LOG_LEVEL=DEBUG` for detailed execution trace
-3. Compare specific tensors manually using stage dumps:
-   ```bash
-   LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_STAGE_DUMP_LAYERS=0 ./test_binary
-   ```
-
-### KL Divergence High but Top-1 Accuracy Good
-
-This is often acceptable - it means the model predicts the same tokens but with different confidence levels. Consider:
-- Relaxing `kl_threshold` slightly
-- Focusing on Top-K accuracy as the primary quality metric
-
-### CUDA Test Skipped
-
-1. Verify CUDA is available: `nvidia-smi`
-2. Check build has CUDA: `cmake -B build_v2_integration -S src/v2 -DHAVE_CUDA=ON`
-3. Ensure GPU is detected: Run with `LLAMINAR_LOG_LEVEL=INFO`
-
----
-
-## Dependencies
-
-Parity tests require:
-- **ZLIB** - For cnpy .npy file loading
-- **cnpy** - NumPy file format library (in `external/cnpy/`)
-- **Python** - For PyTorch snapshot generation
-- **PyTorch** - Ground truth implementation (in Python environment)
-
-If ZLIB is not found, parity tests are disabled at CMake configure time.
+Parity tests require Python with PyTorch/Transformers/NumPy, `cnpy`, ZLIB, the
+configured MPI runtime, and the relevant backend libraries. Integration builds
+must have pipeline snapshots enabled.

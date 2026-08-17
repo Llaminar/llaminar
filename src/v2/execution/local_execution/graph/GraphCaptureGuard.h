@@ -54,6 +54,23 @@ namespace llaminar2
     class GraphCaptureDependencyLedger final
     {
     public:
+        /**
+         * @brief Authority required for declared inputs entering this capture unit.
+         *
+         * A normal capture immediately submits the resulting executable, so all
+         * graph-frontier inputs must already own valid bytes. Setup
+         * materialization records an executable before request admission and may
+         * therefore consume only the permanent address of a declared arena
+         * input. Tensor identities absent from StagePlan::external_inputs remain
+         * strict in both modes; this keeps weights and undeclared stage metadata
+         * from borrowing the setup exception.
+         */
+        enum class ExternalInputAuthority : uint8_t
+        {
+            RequireReadyBytes = 0, ///< The executable may launch in this transaction.
+            BindDeclaredAddressesOnly, ///< Setup records declared frontier pointers only.
+        };
+
         /** @brief One tensor consumed from an earlier stage in this transaction. */
         struct InternalInput
         {
@@ -68,6 +85,12 @@ namespace llaminar2
             std::string stage_name;               ///< Stable diagnostic name.
             std::vector<const TensorBase *> external_inputs; ///< Inputs joined before capture.
             std::vector<InternalInput> internal_inputs;       ///< Inputs produced in this graph.
+            /**
+             * Inputs produced by an earlier child of the same retained parent.
+             * The child graph records only a stable pointer read; parent
+             * composition later installs the exact child-to-child device edge.
+             */
+            std::vector<const TensorBase *> retained_parent_inputs;
             std::vector<const TensorBase *> outputs;          ///< Declared arena write owners.
         };
 
@@ -75,7 +98,9 @@ namespace llaminar2
         enum class InputDisposition
         {
             StrictExternal, ///< Require globally valid residency and a prejoined event.
-            InternalRecorded ///< Earlier producer is ordered by this native graph stream.
+            InternalRecorded, ///< Earlier producer is ordered by this native graph stream.
+            RetainedParentRecorded, ///< Earlier retained child is ordered by the composed parent.
+            SetupAddressOnlyExternal, ///< Declared setup frontier owns storage but no request bytes.
         };
 
         /**
@@ -85,16 +110,21 @@ namespace llaminar2
          * @param stream Exact non-null native capture stream.
          * @param stages Stages in the precise order in which they will be recorded.
          * @param context Stable diagnostic label for lifecycle failures.
+         * @param external_input_authority Whether declared graph-frontier reads
+         *        require live bytes or setup may bind their stable addresses.
          */
         GraphCaptureDependencyLedger(
             DeviceId device,
             void *stream,
             std::vector<StagePlan> stages,
-            std::string context)
+            std::string context,
+            ExternalInputAuthority external_input_authority =
+                ExternalInputAuthority::RequireReadyBytes)
             : device_(device),
               stream_(stream),
               stages_(std::move(stages)),
-              context_(std::move(context))
+              context_(std::move(context)),
+              external_input_authority_(external_input_authority)
         {
             if (!device_.is_gpu())
                 throw std::invalid_argument(
@@ -220,7 +250,11 @@ namespace llaminar2
                         [tensor](const InternalInput &input)
                         {
                             return input.tensor == tensor;
-                        });
+                        }) ||
+                    std::find(
+                        stage.retained_parent_inputs.begin(),
+                        stage.retained_parent_inputs.end(),
+                        tensor) != stage.retained_parent_inputs.end();
                 if (!declared_read)
                 {
                     throw std::logic_error(
@@ -242,6 +276,28 @@ namespace llaminar2
                         stage.stage_name + "' (" + context_ + ")");
                 }
                 return InputDisposition::InternalRecorded;
+            }
+            if (std::find(
+                    stage.retained_parent_inputs.begin(),
+                    stage.retained_parent_inputs.end(),
+                    tensor) != stage.retained_parent_inputs.end())
+            {
+                return InputDisposition::RetainedParentRecorded;
+            }
+            if (external_input_authority_ ==
+                    ExternalInputAuthority::BindDeclaredAddressesOnly &&
+                std::find(
+                    stage.external_inputs.begin(),
+                    stage.external_inputs.end(),
+                    tensor) != stage.external_inputs.end())
+            {
+                /*
+                 * The setup owner has proven stable exact-device storage for
+                 * this typed arena frontier before beginCapture(). The kernel
+                 * only records that address now; transaction zero will perform
+                 * the strict producer/event preflight before any launch.
+                 */
+                return InputDisposition::SetupAddressOnlyExternal;
             }
             return InputDisposition::StrictExternal;
         }
@@ -302,7 +358,12 @@ namespace llaminar2
             {
                 throw std::logic_error(
                     "Graph capture dependency used a different device or stream: " +
-                    context_);
+                    context_ + " expected_device=" + device_.toString() +
+                    " observed_device=" + device.toString() +
+                    " expected_stream=" +
+                    std::to_string(reinterpret_cast<std::uintptr_t>(stream_)) +
+                    " observed_stream=" +
+                    std::to_string(reinterpret_cast<std::uintptr_t>(stream)));
             }
         }
 
@@ -321,6 +382,8 @@ namespace llaminar2
         void *stream_ = nullptr;
         std::vector<StagePlan> stages_;
         std::string context_;
+        ExternalInputAuthority external_input_authority_ =
+            ExternalInputAuthority::RequireReadyBytes;
         std::vector<uint8_t> current_stage_publications_;
         size_t max_stage_outputs_ = 0;
         size_t stage_cursor_ = 0;

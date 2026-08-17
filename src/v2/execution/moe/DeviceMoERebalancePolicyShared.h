@@ -30,6 +30,7 @@ namespace llaminar2::moe_rebalance_policy
     constexpr uint32_t kDefaultDynamicMaxSwapsPerLayer = 4u;
     constexpr uint32_t kDefaultDynamicMaxPlanEntriesPerWave = 16u;
     constexpr uint64_t kDefaultDynamicMinWindowActivations = 64u;
+    constexpr uint64_t kDefaultMigrationPayoffHorizonTokens = 2048u;
     constexpr uint32_t kDefaultDeviceMinLoadSpreadImprovementDivisor = 15u;
     /**
      * @brief Bit layout for one all-gathered rebalance-state word.
@@ -1131,6 +1132,139 @@ namespace llaminar2::moe_rebalance_policy
         }
         if (participant_count == 0 || min_load == UINT64_MAX)
             min_load = 0;
+    }
+
+    /**
+     * @brief Project one layer-local ownership swap onto the whole wave load.
+     *
+     * A Dynamic candidate is selected from one layer, but the devices execute
+     * every layer in the maintenance wave. Independently beneficial layer
+     * swaps can all move work in the same direction and make the aggregate
+     * participant imbalance worse. This helper evaluates the candidate against
+     * the transaction's current all-layer load before any command is published.
+     *
+     * The returned proposal preserves the input array. Call
+     * @ref applyDynamicOwnershipSwapToAggregateLoadIfImproved only after all
+     * physical-source and transfer-capacity checks have also passed.
+     *
+     * @param aggregate_participant_load Current projected load across the wave.
+     * @param participant_count Number of participants represented by the array.
+     * @param choice Layer-local paired ownership swap under consideration.
+     * @return Exact before/after spread evidence; `improves` is true only for a
+     *         total-preserving strict aggregate improvement.
+     */
+    LLAMINAR_MOE_REBALANCE_HD LoadSpreadDelta
+    evaluateDynamicOwnershipSwapAgainstAggregateLoad(
+        const uint64_t *aggregate_participant_load,
+        uint32_t participant_count,
+        const OwnershipSwapChoice &choice) noexcept
+    {
+        LoadSpreadDelta delta{};
+        if (!aggregate_participant_load ||
+            !choice.valid ||
+            participant_count < 2u ||
+            participant_count > kMaxPolicyParticipants ||
+            choice.overloaded_participant >= participant_count ||
+            choice.underloaded_participant >= participant_count ||
+            choice.overloaded_participant == choice.underloaded_participant ||
+            choice.heavy_count <= choice.light_count)
+        {
+            return delta;
+        }
+
+        finalizeLoadSpread(
+            aggregate_participant_load,
+            participant_count,
+            delta.current_total,
+            delta.current_min,
+            delta.current_max);
+        delta.current_spread = delta.current_max - delta.current_min;
+
+        const uint64_t shifted_load =
+            choice.heavy_count - choice.light_count;
+        const uint64_t source_load =
+            aggregate_participant_load[choice.overloaded_participant];
+        const uint64_t destination_load =
+            aggregate_participant_load[choice.underloaded_participant];
+        if (source_load < shifted_load ||
+            destination_load > UINT64_MAX - shifted_load)
+        {
+            return delta;
+        }
+
+        delta.proposed_min = UINT64_MAX;
+        for (uint32_t participant = 0;
+             participant < participant_count;
+             ++participant)
+        {
+            uint64_t proposed_load = aggregate_participant_load[participant];
+            if (participant == choice.overloaded_participant)
+                proposed_load -= shifted_load;
+            else if (participant == choice.underloaded_participant)
+                proposed_load += shifted_load;
+
+            delta.proposed_total += proposed_load;
+            if (proposed_load < delta.proposed_min)
+                delta.proposed_min = proposed_load;
+            if (proposed_load > delta.proposed_max)
+                delta.proposed_max = proposed_load;
+        }
+        if (delta.proposed_min == UINT64_MAX)
+            delta.proposed_min = 0u;
+        delta.proposed_spread =
+            delta.proposed_max - delta.proposed_min;
+        delta.total_preserved =
+            delta.proposed_total == delta.current_total;
+        delta.improves =
+            delta.total_preserved &&
+            delta.proposed_spread < delta.current_spread;
+        delta.meets_floor = delta.improves;
+        delta.improvement =
+            delta.improves
+                ? delta.current_spread - delta.proposed_spread
+                : 0u;
+        return delta;
+    }
+
+    /**
+     * @brief Commit one layer-local swap to the wave aggregate when beneficial.
+     *
+     * This mutates planner scratch only. Runtime ownership remains unchanged
+     * until the graph-ordered payload publication and bank flip authenticate
+     * the complete command wave.
+     *
+     * @param aggregate_participant_load Mutable all-layer projected load.
+     * @param participant_count Number of participants represented by the array.
+     * @param choice Layer-local paired ownership swap under consideration.
+     * @param out_improvement Optional destination for the aggregate spread gain.
+     * @return true only when the aggregate load was updated with a strict gain.
+     */
+    LLAMINAR_MOE_REBALANCE_HD bool
+    applyDynamicOwnershipSwapToAggregateLoadIfImproved(
+        uint64_t *aggregate_participant_load,
+        uint32_t participant_count,
+        const OwnershipSwapChoice &choice,
+        uint64_t *out_improvement = nullptr) noexcept
+    {
+        if (out_improvement)
+            *out_improvement = 0u;
+        const LoadSpreadDelta delta =
+            evaluateDynamicOwnershipSwapAgainstAggregateLoad(
+                aggregate_participant_load,
+                participant_count,
+                choice);
+        if (!delta.improves)
+            return false;
+
+        const uint64_t shifted_load =
+            choice.heavy_count - choice.light_count;
+        aggregate_participant_load[choice.overloaded_participant] -=
+            shifted_load;
+        aggregate_participant_load[choice.underloaded_participant] +=
+            shifted_load;
+        if (out_improvement)
+            *out_improvement = delta.improvement;
+        return true;
     }
 
     LLAMINAR_MOE_REBALANCE_HD uint64_t requiredLoadSpreadImprovement(

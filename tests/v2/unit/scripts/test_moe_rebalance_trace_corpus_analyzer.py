@@ -276,10 +276,14 @@ class MoERebalanceTraceCorpusAnalyzerTest(unittest.TestCase):
         self.assertEqual(run_rows[0]["candidate_below_floor"], 2)
         self.assertEqual(run_rows[0]["llep_assignment_spans"], 17)
         self.assertEqual(run_rows[0]["llep_weight_transfers"], 2)
+        self.assertEqual(run_rows[0]["llep_critical_path_payload_slots"], 1)
         self.assertEqual(run_rows[0]["llep_native_rows"], 90)
         self.assertEqual(run_rows[0]["llep_spilled_rows"], 30)
         self.assertEqual(run_rows[0]["llep_spilled_row_ratio"], "0.25")
-        self.assertEqual(run_rows[0]["llep_spilled_rows_per_transfer"], "15")
+        self.assertEqual(
+            run_rows[0]["llep_spilled_rows_per_critical_path_payload_slot"],
+            "30",
+        )
         self.assertEqual(run_rows[0]["llep_standard_ep_selected"], 0)
         self.assertEqual(run_rows[0]["llep_skipped_balanced"], 0)
         self.assertEqual(run_rows[0]["llep_skipped_insufficient_spread_improvement"], 1)
@@ -325,10 +329,14 @@ class MoERebalanceTraceCorpusAnalyzerTest(unittest.TestCase):
         self.assertEqual(window_rows[0]["candidate_below_floor"], 2)
         self.assertEqual(window_rows[0]["llep_assignment_spans"], 17)
         self.assertEqual(window_rows[0]["llep_weight_transfers"], 2)
+        self.assertEqual(window_rows[0]["llep_critical_path_payload_slots"], 1)
         self.assertEqual(window_rows[0]["llep_native_rows"], 90)
         self.assertEqual(window_rows[0]["llep_spilled_rows"], 30)
         self.assertEqual(window_rows[0]["llep_spilled_row_ratio"], "0.25")
-        self.assertEqual(window_rows[0]["llep_spilled_rows_per_transfer"], "15")
+        self.assertEqual(
+            window_rows[0]["llep_spilled_rows_per_critical_path_payload_slot"],
+            "30",
+        )
         self.assertEqual(window_rows[0]["llep_skipped_insufficient_spread_improvement"], 1)
         self.assertEqual(window_rows[0]["skipped_post_load_spread_ceiling"], 1)
         self.assertEqual(window_rows[0]["router_spread_improvement"], 31)

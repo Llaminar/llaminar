@@ -226,6 +226,57 @@ namespace llaminar2
     };
 
     /**
+     * @brief Closed set of steps in one retained mapped-timeline transaction.
+     *
+     * A captured fragment owns ordinary kernels/library nodes. Wait and publish
+     * steps become backend-native graph nodes with device-owned ordering,
+     * avoiding scalar stream APIs whose capture behavior differs across GPUs.
+     */
+    enum class GPUOrderedTimelineStepKind : std::uint8_t
+    {
+        CapturedFragment, ///< Ordered retained graph captured on the same device.
+        WaitValue64, ///< Unsigned-GEQ wait on an aligned GPU-visible word.
+        PublishValue64, ///< Fenced 64-bit write after preceding graph work.
+    };
+
+    /**
+     * @brief Backend-internal lowered step for an ordered native transaction.
+     *
+     * Public inference code obtains these bindings through TransferEngine,
+     * which validates mapped-region ownership and resolves the exact device
+     * alias. Backends borrow every pointer only while constructing the parent;
+     * embedded fragment graphs and signal addresses must remain alive for the
+     * executable's complete lifetime.
+     */
+    struct GPUOrderedTimelineStep
+    {
+        const char *name = nullptr; ///< Stable non-empty semantic identity.
+        GPUOrderedTimelineStepKind kind =
+            GPUOrderedTimelineStepKind::CapturedFragment;
+        const IGPUGraphCapture *capture = nullptr; ///< Fragment for CapturedFragment.
+        void *signal = nullptr; ///< Aligned device alias for timeline operations.
+        std::uint64_t value = 0u; ///< Positive capture-stable timeline value.
+
+        /** @return Whether exactly the fields required by @ref kind are bound. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            if (!name || name[0] == '\0')
+                return false;
+            switch (kind)
+            {
+            case GPUOrderedTimelineStepKind::CapturedFragment:
+                return capture != nullptr && signal == nullptr && value == 0u;
+            case GPUOrderedTimelineStepKind::WaitValue64:
+            case GPUOrderedTimelineStepKind::PublishValue64:
+                return capture == nullptr && signal != nullptr && value != 0u &&
+                       (reinterpret_cast<std::uintptr_t>(signal) &
+                        (alignof(std::uint64_t) - 1u)) == 0u;
+            }
+            return false;
+        }
+    };
+
+    /**
      * @brief One complete transaction body selected by a device control value.
      *
      * Fragments are cloned in producer-to-consumer order. A branch inside the
@@ -329,6 +380,65 @@ namespace llaminar2
          */
         [[nodiscard]] virtual bool supportsDeviceControlledSwitchWhileLoop() const noexcept
         {
+            return false;
+        }
+
+        /**
+         * @brief Report support for a one-shot device-controlled transaction.
+         *
+         * This capability is narrower than a device-controlled loop. The
+         * backend must compose an ordered fragment list exactly once and must
+         * lower @ref DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero
+         * without observing the predicate on the host. It is used for sparse
+         * maintenance work whose cheap publisher runs at every boundary while
+         * the expensive transaction runs only when device state says it is due.
+         */
+        [[nodiscard]] virtual bool
+        supportsDeviceControlledTransaction() const noexcept
+        {
+            return false;
+        }
+
+        /**
+         * @brief Replace this graph with one ordered device-controlled transaction.
+         *
+         * Every unconditional fragment executes once. Conditional fragments
+         * evaluate their persistent device word after all preceding fragments
+         * complete and execute once only when that word is non-zero. The
+         * implementation must preserve producer-to-consumer ordering in one
+         * native graph and may not read a predicate on the host, add a host
+         * callback, allocate replay-time storage, or synchronize a stream.
+         *
+         * On success the graph is built but not instantiated. The caller must
+         * retain all source captures through this call and then invoke
+         * instantiate() before replay.
+         *
+         * @param ordered_fragments Non-empty captured fragments in execution order.
+         * @return true when this object owns a complete one-shot transaction.
+         */
+        virtual bool buildDeviceControlledTransaction(
+            std::span<const DeviceControlledLoopFragment> ordered_fragments)
+        {
+            (void)ordered_fragments;
+            return false;
+        }
+
+        /**
+         * @brief Build one retained native graph from fragments and timeline edges.
+         *
+         * Every step depends directly on the complete preceding frontier.
+         * Implementations lower waits/publications to native device graph
+         * nodes, never to a host callback, host polling thread, scalar stream
+         * capture, or replay-time graph mutation. The result is built but
+         * uninstantiated.
+         *
+         * @param ordered_steps Non-empty exact producer-to-consumer sequence.
+         * @return true when this capture owns the complete parent graph.
+         */
+        virtual bool buildOrderedTimelineTransaction(
+            std::span<const GPUOrderedTimelineStep> ordered_steps)
+        {
+            (void)ordered_steps;
             return false;
         }
 

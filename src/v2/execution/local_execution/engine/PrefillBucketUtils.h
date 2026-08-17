@@ -144,6 +144,41 @@ namespace llaminar2
     std::vector<int> normalizePrefillGraphBuckets(const std::vector<int> &buckets);
 
     /**
+     * @brief Return resident graph-row candidates in throughput-first order.
+     *
+     * Only configured buckets at or below @p max_rows are candidates. When a
+     * valid context is shorter than every configured bucket, its exact length
+     * is returned as the sole candidate so short-context execution remains
+     * total without inventing intermediate capture shapes.
+     *
+     * @param buckets User/default captured-prefill bucket inventory.
+     * @param max_rows Maximum rows permitted by the request context.
+     * @return Unique positive candidates ordered from largest to smallest.
+     */
+    std::vector<int> residentPrefillGraphRowCandidates(
+        const std::vector<int> &buckets,
+        int max_rows);
+
+    /**
+     * @brief Return captured-prefill candidates bounded by a segment contract.
+     *
+     * Heterogeneous execution may keep a full logical context in KV/request
+     * state while admitting only one smaller physical graph segment. This
+     * helper makes that distinction explicit so memory planning never builds
+     * a non-executable full-context workspace participant.
+     *
+     * @param buckets User/default captured-prefill bucket inventory.
+     * @param max_context_rows Logical request/KV context capacity.
+     * @param max_segment_rows Maximum rows in one physical graph transaction.
+     * @return Throughput-first candidates no larger than either capacity, or
+     *         an empty vector when either capacity is non-positive.
+     */
+    std::vector<int> segmentedPrefillGraphRowCandidates(
+        const std::vector<int> &buckets,
+        int max_context_rows,
+        int max_segment_rows);
+
+    /**
      * @brief Restrict configured buckets to one resident graph-row capacity.
      *
      * The capacity itself is included as a final boundary when it is positive,
@@ -153,6 +188,43 @@ namespace llaminar2
     std::vector<int> prefillGraphBucketsAtOrBelowCapacity(
         const std::vector<int> &buckets,
         int resident_graph_rows);
+
+    /**
+     * @brief Bound the raw-prompt bucket floor by resident graph capacity.
+     *
+     * The configured floor controls padding economy for ordinary contexts. A
+     * smaller memory-planned context has no graph shape at that global floor,
+     * so its exact resident capacity becomes the sole admissible padded
+     * bucket. Returning the configured floor unchanged in that case creates an
+     * impossible contract and would force an illegal eager fallback.
+     *
+     * @param configured_floor User/default minimum padded bucket length.
+     * @param resident_graph_rows Maximum rows owned by the resident graph; a
+     *        non-positive value means no capacity bound is available.
+     * @return Positive effective floor shared by selection and graph preflight.
+     */
+    int effectivePrefillGraphMinimumPaddedBucketSeqLen(
+        int configured_floor,
+        int resident_graph_rows) noexcept;
+
+    /**
+     * @brief Resolve the exact raw-prompt bucket inventory for one resident graph.
+     *
+     * Forward graph selection and any sideband protocol that authenticates
+     * physical row geometry must call this function. Keeping the capacity
+     * bound and minimum-padding floor here prevents an outer transaction from
+     * publishing the caller's real length while the forward engine captures a
+     * different physical bucket.
+     *
+     * @param configured_buckets User/default captured-prefill buckets.
+     * @param resident_graph_rows Maximum rows admitted by the memory plan.
+     * @param configured_floor Minimum economical raw-prompt bucket.
+     * @return Sorted unique buckets admitted by both bounds.
+     */
+    std::vector<int> rawPrefillGraphBucketsForResidentCapacity(
+        const std::vector<int> &configured_buckets,
+        int resident_graph_rows,
+        int configured_floor);
 
     /**
      * @brief Select the smallest bucket that can contain real_seq_len tokens.

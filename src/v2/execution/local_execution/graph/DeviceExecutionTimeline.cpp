@@ -125,6 +125,7 @@ namespace llaminar2
                     .name = "accepted_spec_publication_ready",
                     .producer = DeviceTimelineRole::AcceptedStatePublication,
                     .consumers = roles({
+                        DeviceTimelineRole::DeviceGenerationController,
                         DeviceTimelineRole::MainForwardGraph,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::PrefixCheckpointArchive,
@@ -185,12 +186,14 @@ namespace llaminar2
                     .name = "live_prefix_mutation_ready",
                     .producer = DeviceTimelineRole::PrefixRestoreMutation,
                     .consumers = roles({
+                        DeviceTimelineRole::DeviceGenerationController,
                         DeviceTimelineRole::MainForwardGraph,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::PrefixCheckpointArchive,
                         DeviceTimelineRole::PrefixRestoreMutation,
                         DeviceTimelineRole::MoERebalanceMaintenance,
                         DeviceTimelineRole::TargetSampler,
+                        DeviceTimelineRole::HostResultBridge,
                         DeviceTimelineRole::RequestStateReset,
                         DeviceTimelineRole::Diagnostics,
                     }),
@@ -219,6 +222,7 @@ namespace llaminar2
                     .name = "forward_graph_output_ready",
                     .producer = DeviceTimelineRole::MainForwardGraph,
                     .consumers = roles({
+                        DeviceTimelineRole::DeviceGenerationController,
                         DeviceTimelineRole::MTPSidecarGraph,
                         DeviceTimelineRole::TargetSampler,
                         DeviceTimelineRole::VerifierSummary,

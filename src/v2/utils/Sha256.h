@@ -22,9 +22,9 @@ namespace llaminar2
      * @brief Compute the lowercase hexadecimal SHA-256 digest of a file.
      *
      * The implementation reads the file through a bounded streaming buffer.
-     * Calls for the same canonical path, size, and modification time are
-     * coalesced within the process so LocalTP/EP children do not independently
-     * rescan one model.
+     * Calls for the same canonical path, device/inode, size, modification time,
+     * and change time are coalesced within one process. The identity is checked
+     * again after the scan so a concurrent replacement is never memoized.
      *
      * @param path File whose exact contents identify the artifact namespace.
      * @param error Optional diagnostic populated when hashing fails.
@@ -32,6 +32,31 @@ namespace llaminar2
      */
     std::optional<std::string> sha256FileHex(
         const std::filesystem::path &path,
+        std::string *error = nullptr);
+
+    /**
+     * @brief Compute a file digest through a trusted cross-process cache.
+     *
+     * The cache key binds the canonical path, device/inode identity, byte
+     * length, modification time, and change time. A process takes an advisory
+     * lock for that exact identity, validates the identity again, and either
+     * consumes the already-authenticated digest or streams every file byte and
+     * atomically publishes the result. Consequently several parity processes
+     * can authenticate one immutable GGUF once without accepting a digest for
+     * replaced or modified bytes.
+     *
+     * The caller must provide a private, trusted cache directory. Cache setup,
+     * locking, identity instability, and publication failures are reported as
+     * hard errors; this explicit mode never falls back to independent scans.
+     *
+     * @param path File whose exact contents identify the artifact namespace.
+     * @param cache_directory Private directory shared by cooperating processes.
+     * @param error Optional diagnostic populated when authentication fails.
+     * @return Sixty-four lowercase hexadecimal characters on success.
+     */
+    std::optional<std::string> sha256FileHexShared(
+        const std::filesystem::path &path,
+        const std::filesystem::path &cache_directory,
         std::string *error = nullptr);
 
     /**

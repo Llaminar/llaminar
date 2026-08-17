@@ -304,7 +304,13 @@ namespace llaminar2
         // =========================================================================
 
         /// Check if two ranks are on the same physical node
-        bool same_node(int rank_a, int rank_b) const;
+        bool same_node(int rank_a, int rank_b) const override;
+
+        /** @return Fresh non-zero namespace shared by ranks on this host. */
+        uint64_t node_shared_memory_namespace() const override
+        {
+            return node_shared_memory_namespace_;
+        }
 
         /// Get communicator for ranks on same node (MPI_COMM_TYPE_SHARED)
         /// Returns MPI_COMM_NULL if not available
@@ -560,6 +566,8 @@ namespace llaminar2
         RankPlacement placement_;
         std::vector<int> rank_node_ids_;               ///< Node ID per rank (from NodeDetection)
         std::vector<RankPlacement> all_placements_;    ///< Placements from all ranks
+        /** Fresh run identity broadcast through the node-local communicator. */
+        uint64_t node_shared_memory_namespace_ = 0;
         mutable ClusterInventory cluster_inventory_;   ///< Cached cluster inventory (lazy-built)
         mutable bool cluster_inventory_built_ = false; ///< Whether cluster inventory was built
 

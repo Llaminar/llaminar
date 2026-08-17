@@ -110,6 +110,13 @@ namespace llaminar2
         void resetSessionStatePreservingCapturedReplay() override;
         void resetSessionStatePreservingLazyInitialization() override;
 
+        /** @brief Provision gate/up side-stream resources before capture. */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return GraphLaunchPreparationPolicy::CaptureOnly;
+        }
+
     private:
         Params params_;
         ITensorFusedGateUpGemm *cached_kernel_ = nullptr; ///< Cached for workspace binding

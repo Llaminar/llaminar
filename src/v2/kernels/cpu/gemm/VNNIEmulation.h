@@ -12,11 +12,11 @@
  *
  *   AVX2 emulation (8 i32 lanes):
  *     Split a/b into even-indexed and odd-indexed bytes within each i16 slot,
- *     widen to i16, then use _mm256_madd_epi16 (i16×i16→i32, no saturation).
+ *     widen to i16, then use _mm256_madd_epi16 (i16x i16 -> i32, no saturation).
  *     Two madd calls cover all 4 bytes per i32 lane.
  *
  * Why not maddubs+madd?
- *   _mm256_maddubs_epi16 saturates to INT16 (±32767). For value ranges like
+ *   _mm256_maddubs_epi16 saturates to INT16 (+/-32767). For value ranges like
  *   IQ4_NL (-127..113), pair sums can reach 255*113+255*113=57630 > 32767,
  *   causing incorrect saturation. The even/odd split avoids this entirely.
  */
@@ -38,10 +38,10 @@ namespace llaminar2::cpu::native_vnni::isa
      *
      * Computes acc[i] += dot(a_u8[4i..4i+3], b_i8[4i..4i+3]) for i=0..7.
      *
-     * Strategy: split even/odd bytes, widen to i16, use madd_epi16 (i16×i16→i32).
-     *   - Even bytes (0,2,4,...): zero-extend a, sign-extend b → madd → i32 products
-     *   - Odd bytes (1,3,5,...): shift right → same treatment → i32 products
-     *   - Sum even + odd → full 4-byte dot product per i32 lane
+     * Strategy: split even/odd bytes, widen to i16, use madd_epi16 (i16x i16 -> i32).
+     *   - Even bytes (0,2,4,...): zero-extend a, sign-extend b -> madd -> i32 products
+     *   - Odd bytes (1,3,5,...): shift right -> same treatment -> i32 products
+     *   - Sum even + odd -> full 4-byte dot product per i32 lane
      *
      * This avoids the INT16 saturation of _mm256_maddubs_epi16 entirely.
      * Correct for ALL input ranges including IQ4_NL codebook values.
@@ -50,24 +50,16 @@ namespace llaminar2::cpu::native_vnni::isa
     {
         const __m256i mask_lo = _mm256_set1_epi16(0x00FF);
 
-        // Even-indexed bytes (positions 0,2,4,...): low byte of each i16 slot
-        __m256i a_even = _mm256_and_si256(a_u8, mask_lo);               // zero-extend u8→i16
-        __m256i b_even = _mm256_srai_epi16(_mm256_slli_epi16(b_i8, 8), 8); // sign-extend i8→i16
+        const __m256i a_even = _mm256_and_si256(a_u8, mask_lo);
+        const __m256i b_even = _mm256_srai_epi16(
+            _mm256_slli_epi16(b_i8, 8), 8);
+        const __m256i a_odd = _mm256_srli_epi16(a_u8, 8);
+        const __m256i b_odd = _mm256_srai_epi16(b_i8, 8);
 
-        // Odd-indexed bytes (positions 1,3,5,...): high byte of each i16 slot
-        __m256i a_odd = _mm256_srli_epi16(a_u8, 8);  // zero-extend u8→i16
-        __m256i b_odd = _mm256_srai_epi16(b_i8, 8);  // sign-extend i8→i16
-
-        // madd_epi16: multiply i16 pairs and sum adjacent to i32 (no saturation)
-        // prod_even[i] = a_even[2i]*b_even[2i] + a_even[2i+1]*b_even[2i+1]
-        //              = a[4i]*b[4i] + a[4i+2]*b[4i+2]
-        __m256i prod_even = _mm256_madd_epi16(a_even, b_even);
-
-        // prod_odd[i]  = a[4i+1]*b[4i+1] + a[4i+3]*b[4i+3]
-        __m256i prod_odd = _mm256_madd_epi16(a_odd, b_odd);
-
-        // Sum = a[4i]*b[4i] + a[4i+1]*b[4i+1] + a[4i+2]*b[4i+2] + a[4i+3]*b[4i+3]
-        return _mm256_add_epi32(acc, _mm256_add_epi32(prod_even, prod_odd));
+        const __m256i prod_even = _mm256_madd_epi16(a_even, b_even);
+        const __m256i prod_odd = _mm256_madd_epi16(a_odd, b_odd);
+        return _mm256_add_epi32(
+            acc, _mm256_add_epi32(prod_even, prod_odd));
     }
 
     // =========================================================================

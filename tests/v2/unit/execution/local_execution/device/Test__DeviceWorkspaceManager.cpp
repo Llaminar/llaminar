@@ -17,6 +17,7 @@
 #include <map>
 
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/moe/MoERuntimePointerWorkspaceOwners.h"
 #include "backends/BackendManager.h"
 #include "kernels/common/DeviceResidentRouterGateCache.h"
 #include "utils/DebugEnv.h"
@@ -861,6 +862,83 @@ TEST_F(Test__DeviceWorkspaceManager, PersistentMetadataLeasesAreExclusiveAndReus
     ASSERT_NE(independent_domain, nullptr);
     EXPECT_EQ(independent_domain->slot(), 0u)
         << "Separate physical descriptor tables have separate ownership domains";
+}
+
+/**
+ * @brief Mutable pointer tables remain exclusive when weight descriptors are shared.
+ *
+ * Two captured graph owners may adopt the same immutable descriptor identity,
+ * but their gate/up scratch arrays must resolve to different physical slots.
+ * Capture is lookup-only and cannot silently acquire an unprepared owner slot.
+ */
+TEST_F(Test__DeviceWorkspaceManager, RuntimePointerOwnersDoNotAliasSharedDescriptors)
+{
+    DeviceWorkspaceManager mgr(device, budget);
+    MoERuntimePointerWorkspaceOwners first_graph;
+    MoERuntimePointerWorkspaceOwners second_graph;
+    MoERuntimePointerWorkspaceOwners cold_graph;
+
+    constexpr std::size_t shared_descriptor_slot = 17;
+    constexpr std::size_t table_decode_scope = 0;
+    const auto first_slot = first_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::GateUp,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+        "first graph gate/up");
+    const auto first_slot_again = first_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::GateUp,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::CaptureExistingOnly,
+        "first graph gate/up capture");
+    const auto second_slot = second_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::GateUp,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+        "second graph gate/up");
+
+    ASSERT_TRUE(first_slot.has_value());
+    ASSERT_TRUE(first_slot_again.has_value());
+    ASSERT_TRUE(second_slot.has_value());
+    EXPECT_EQ(*first_slot_again, *first_slot);
+    EXPECT_NE(*second_slot, *first_slot)
+        << "A descriptor publication slot is not mutable pointer-array ownership";
+
+    EXPECT_FALSE(cold_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::GateUp,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::CaptureExistingOnly,
+        "cold graph capture").has_value())
+        << "Capture must fail closed when warmup did not reserve its exact slot";
+
+    // Gate/up and down have distinct physical buffers and ownership domains.
+    const auto down_slot = first_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::Down,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+        "first graph down");
+    ASSERT_TRUE(down_slot.has_value());
+
+    first_graph.reset();
+    const auto replacement_slot = cold_graph.resolve(
+        &mgr,
+        MoERuntimePointerArrayRole::GateUp,
+        shared_descriptor_slot,
+        table_decode_scope,
+        MoERuntimePointerWorkspaceAccess::WarmupMayAcquire,
+        "replacement graph gate/up");
+    ASSERT_TRUE(replacement_slot.has_value());
+    EXPECT_EQ(*replacement_slot, *first_slot)
+        << "Retiring a graph must return its pointer slot to the RAII registry";
 }
 
 TEST_F(Test__DeviceWorkspaceManager, PersistentSlotAddressesUseTheDeclaredTableStride)

@@ -30,8 +30,10 @@ Options:
   --cpu-threads N              OpenMP threads per CPU policy regime; defaults
                                to detected physical cores per socket
   --cpu-measurement-lanes N|auto
-                               Independent socket-local CPU timing jobs
-                               (default: every detected physical socket)
+                               Concurrent socket-local diagnostic timing jobs.
+                               Production M=1/grouped collection requires one;
+                               paired confirmation is always process-isolated
+                               (default: 1)
   --cpu-format-shards          Run one CPU source format per measurement job
                                instead of all formats in each shape process
   --cpu-batch-limit N          Stop successfully after N pending CPU MPMD
@@ -91,6 +93,10 @@ Options:
   --cpu-decode-burned-sealed-paired-dir PATH
                               Complete paired CSV directory matched by position
                               to each burned M=1 plan
+  --cpu-decode-max-leaves N   Maximum M=1 generic-tree leaf budget
+                              (default: 16). The fitter incrementally reuses
+                              smaller promotable trees, so only domains that
+                              need more capacity pay for the larger ceiling.
   --cpu-grouped-burned-sealed-plan PATH
                               Inspected grouped sealed plan reused as generic-
                               only development evidence; repeat per generation
@@ -348,6 +354,7 @@ cpu_decode_burned_sealed_plans=()
 cpu_decode_burned_sealed_paired_dirs=()
 cpu_grouped_burned_sealed_plans=()
 cpu_grouped_burned_sealed_paired_dirs=()
+cpu_decode_max_leaves="${LLAMINAR_NATIVE_VNNI_CPU_DECODE_MAX_LEAVES:-16}"
 cpu_grouped_max_leaves="${LLAMINAR_NATIVE_VNNI_CPU_GROUPED_MAX_LEAVES:-16}"
 cuda_generic_max_leaves="${LLAMINAR_NATIVE_VNNI_CUDA_GENERIC_MAX_LEAVES:-16}"
 rocm_generic_max_leaves="${LLAMINAR_NATIVE_VNNI_ROCM_GENERIC_MAX_LEAVES:-1}"
@@ -507,6 +514,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cpu-decode-burned-sealed-paired-dir)
       cpu_decode_burned_sealed_paired_dirs+=("${2:-}")
+      shift 2
+      ;;
+    --cpu-decode-max-leaves)
+      cpu_decode_max_leaves="${2:-}"
       shift 2
       ;;
     --cpu-grouped-burned-sealed-plan)
@@ -1084,6 +1095,11 @@ fi
 if [[ ! "${cuda_generic_max_leaves}" =~ ^[1-9][0-9]*$ ]] ||
    (( cuda_generic_max_leaves > 32 )); then
   echo "error: --cuda-generic-max-leaves must be in [1, 32]" >&2
+  exit 2
+fi
+if [[ ! "${cpu_decode_max_leaves}" =~ ^[1-9][0-9]*$ ]] ||
+   (( cpu_decode_max_leaves > 32 )); then
+  echo "error: --cpu-decode-max-leaves must be in [1, 32]" >&2
   exit 2
 fi
 if [[ ! "${cpu_grouped_max_leaves}" =~ ^[1-9][0-9]*$ ]] ||
@@ -1986,11 +2002,18 @@ if [[ ! "${available_cpu_sockets}" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 if [[ "${cpu_measurement_lanes}" == "auto" ]]; then
-  cpu_measurement_lanes="${available_cpu_sockets}"
+  cpu_measurement_lanes=1
 fi
 if (( cpu_measurement_lanes > available_cpu_sockets )); then
   echo "error: --cpu-measurement-lanes=${cpu_measurement_lanes} exceeds the " \
        "${available_cpu_sockets} physical CPU socket(s)" >&2
+  exit 2
+fi
+if [[ "${measurement_profile}" == "production" &&
+      ( "${backend}" == "cpu" || "${backend}" == "all" ) ]] &&
+   (( cpu_measurement_lanes != 1 )); then
+  printf '%s\n' \
+    "error: production CPU M=1/grouped timing requires --cpu-measurement-lanes 1; unrelated socket co-runners change candidate ordering and cannot produce certifiable evidence" >&2
   exit 2
 fi
 if [[ -z "${profiler_cpu_list}" ]]; then
@@ -4105,20 +4128,33 @@ collect_cpu_prefill_candidate_expansion() {
   fi
 }
 
-cpu_shape_n() {
-  if [[ -z "${native_vnni_shape_n[$1]:-}" ]]; then
-    echo "error: unsupported CPU NativeVNNI verifier shape: $1" >&2
-    exit 2
-  fi
-  printf '%s\n' "${native_vnni_shape_n[$1]}"
-}
+# Resolve both matrix dimensions without creating a command-substitution
+# subprocess.  Decode and grouped-verifier planning visit every
+# format/shape/ISA cell, so even a trivial `$(getter)` here previously created
+# tens of thousands of short-lived Bash processes before the first benchmark
+# launched.  Nameref outputs preserve validation while keeping this operation
+# inside the collection shell.
+#
+# Arguments:
+#   $1  Manifest shape name.
+#   $2  Name of the caller variable that receives N.
+#   $3  Name of the caller variable that receives K.
+cpu_shape_dimensions() {
+  local shape="$1"
+  local n_output_name="$2"
+  local k_output_name="$3"
+  local shape_n="${native_vnni_shape_n[${shape}]:-}"
+  local shape_k="${native_vnni_shape_k[${shape}]:-}"
 
-cpu_shape_k() {
-  if [[ -z "${native_vnni_shape_k[$1]:-}" ]]; then
-    echo "error: unsupported CPU NativeVNNI verifier shape: $1" >&2
-    exit 2
+  if [[ -z "${shape_n}" || -z "${shape_k}" ]]; then
+    echo "error: unsupported CPU NativeVNNI verifier shape: ${shape}" >&2
+    return 2
   fi
-  printf '%s\n' "${native_vnni_shape_k[$1]}"
+
+  local -n n_result_ref="${n_output_name}"
+  local -n k_result_ref="${k_output_name}"
+  n_result_ref="${shape_n}"
+  k_result_ref="${shape_k}"
 }
 
 run_cuda_measurement_lanes() {
@@ -5788,49 +5824,64 @@ rebuild_cpu_native_vnni_trainer() {
 cpu_decode_paired_evidence=()
 cpu_grouped_paired_evidence=()
 
+# Load one validated append-only paired history. The Python state machine owns
+# report/shard cardinality and terminal-generation semantics; Bash receives one
+# explicit action plus the complete prior evidence inventory. This prevents a
+# zero-request diagnostic generation from hiding a later repair and prevents
+# interrupted pending shards from triggering an expensive duplicate fit.
+load_cpu_paired_refinement_history() {
+  local paired_dir="$1"
+  local evidence_output_name="$2"
+  local iteration_output_name="$3"
+  local mode_output_name="$4"
+  local -n evidence_output_ref="${evidence_output_name}"
+  local -n iteration_output_ref="${iteration_output_name}"
+  local -n mode_output_ref="${mode_output_name}"
+  local history_text
+  if ! history_text="$(
+    PYTHONPATH="${paired_planner_root}" \
+      python3 -m native_vnni_dispatch.paired_history \
+      "${paired_dir}" --format lines
+  )"; then
+    echo "error: invalid CPU paired refinement history in ${paired_dir}" >&2
+    return 2
+  fi
+  local history_lines=()
+  mapfile -t history_lines <<< "${history_text}"
+  if (( ${#history_lines[@]} == 0 )); then
+    echo "error: CPU paired history scanner returned no state" >&2
+    return 2
+  fi
+  IFS=$'\t' read -r mode_output_ref iteration_output_ref <<< \
+    "${history_lines[0]}"
+  case "${mode_output_ref}" in
+    plan|collect|green) ;;
+    *)
+      echo "error: CPU paired history returned unknown mode ${mode_output_ref}" >&2
+      return 2
+      ;;
+  esac
+  if [[ ! "${iteration_output_ref}" =~ ^[0-9]+$ ]]; then
+    echo "error: CPU paired history returned invalid iteration" >&2
+    return 2
+  fi
+  evidence_output_ref=("${history_lines[@]:1}")
+}
+
 run_cpu_decode_paired_refinement() {
   local common_observations="$1"
   local paired_dir="${output_dir}/cpu_decode_paired_refinement"
   mkdir -p "${paired_dir}"
 
-  # Consume only complete earlier iterations. A partially collected iteration
-  # is resumed from its immutable content-addressed manifests and must not
-  # influence the fit that generated those manifests. This also means an
-  # interruption after collection but before certification naturally advances
-  # to the next fit round without rewriting iteration zero.
-  cpu_decode_paired_evidence=()
-  local first_iteration=0
-  local candidate_iteration candidate_tag candidate_shard_dir
-  for ((candidate_iteration = 0; ; ++candidate_iteration)); do
-    printf -v candidate_tag '%03d' "${candidate_iteration}"
-    candidate_shard_dir="${paired_dir}/iteration-${candidate_tag}.shards"
-    local completed_manifests=()
-    mapfile -t completed_manifests < <(
-      find "${candidate_shard_dir}" -maxdepth 1 -type f \
-        -name 'shard-*.requests.json' 2>/dev/null | sort
-    )
-    if (( ${#completed_manifests[@]} == 0 )); then
-      first_iteration="${candidate_iteration}"
-      break
-    fi
-    local candidate_complete=1
-    local completed_manifest completed_evidence
-    local candidate_evidence=()
-    for completed_manifest in "${completed_manifests[@]}"; do
-      completed_evidence="${completed_manifest%.requests.json}.csv"
-      if [[ ! -s "${completed_evidence}" ]]; then
-        candidate_complete=0
-        break
-      fi
-      candidate_evidence+=("${completed_evidence}")
-    done
-    if (( ! candidate_complete )); then
-      first_iteration="${candidate_iteration}"
-      break
-    fi
-    cpu_decode_paired_evidence+=("${candidate_evidence[@]}")
-    first_iteration=$((candidate_iteration + 1))
-  done
+  local first_iteration resume_mode
+  load_cpu_paired_refinement_history \
+    "${paired_dir}" cpu_decode_paired_evidence first_iteration resume_mode || \
+    return 2
+  if [[ "${resume_mode}" == "green" ]]; then
+    printf 'CPU paired refinement reuses green iteration=%03d retained_shards=%s\n' \
+      "${first_iteration}" "${#cpu_decode_paired_evidence[@]}"
+    return 0
+  fi
 
   local iteration
   local iteration_limit=$((first_iteration + paired_max_iterations))
@@ -5853,6 +5904,7 @@ run_cpu_decode_paired_refinement() {
       --max-requests-per-shard 16
       --shape-manifest "${shape_manifest_path}"
       --fit-cache-dir "${cpu_decode_fit_cache_dir}"
+      --max-leaves "${cpu_decode_max_leaves}"
     )
     local burned_index
     for burned_index in "${!cpu_decode_burned_sealed_plans[@]}"; do
@@ -5893,7 +5945,14 @@ run_cpu_decode_paired_refinement() {
     for paired_path in "${cpu_decode_paired_evidence[@]}"; do
       planner+=(--paired-csv "${paired_path}")
     done
-    run_cmd "PYTHONPATH=${paired_planner_root}" "${planner[@]}"
+    if (( iteration == first_iteration )) && \
+       [[ "${resume_mode}" == "collect" ]]; then
+      printf 'CPU paired refinement resumes immutable iteration=%s\n' \
+        "${iteration_tag}"
+    else
+      run_cmd "PYTHONPATH=${paired_planner_root}" "${planner[@]}"
+    fi
+    resume_mode="plan"
 
     if (( dry_run )); then
       printf 'dry-run: CPU paired refinement would consume %s\n' "${report}"
@@ -5957,8 +6016,10 @@ run_cpu_decode_paired_refinement() {
     local batch_start batch_end index
     for ((batch_start = 0;
           batch_start < ${#pending_manifests[@]};
-          batch_start += cpu_measurement_lanes)); do
-      batch_end=$((batch_start + cpu_measurement_lanes))
+          batch_start += 1)); do
+      # Paired ratios are promotion evidence, not throughput-oriented corpus
+      # generation. A one-rank MPI world is part of their authenticated ABI.
+      batch_end=$((batch_start + 1))
       if (( batch_end > ${#pending_manifests[@]} )); then
         batch_end=${#pending_manifests[@]}
       fi
@@ -6101,8 +6162,10 @@ run_cpu_sealed_paired_shards() {
   local batch_start batch_end index
   for ((batch_start = 0;
         batch_start < ${#pending[@]};
-        batch_start += cpu_measurement_lanes)); do
-    batch_end=$((batch_start + cpu_measurement_lanes))
+        batch_start += 1)); do
+    # The C++ producer independently rejects a larger MPI world. Keeping the
+    # launch plan single-lane avoids creating an inadmissible timing process.
+    batch_end=$((batch_start + 1))
     if (( batch_end > ${#pending[@]} )); then
       batch_end=${#pending[@]}
     fi
@@ -6208,39 +6271,15 @@ run_cpu_grouped_paired_refinement() {
   local paired_dir="${output_dir}/cpu_grouped_paired_refinement"
   mkdir -p "${paired_dir}"
 
-  cpu_grouped_paired_evidence=()
-  local first_iteration=0
-  local candidate_iteration candidate_tag candidate_shard_dir
-  for ((candidate_iteration = 0; ; ++candidate_iteration)); do
-    printf -v candidate_tag '%03d' "${candidate_iteration}"
-    candidate_shard_dir="${paired_dir}/iteration-${candidate_tag}.shards"
-    local completed_manifests=()
-    mapfile -t completed_manifests < <(
-      find "${candidate_shard_dir}" -maxdepth 1 -type f \
-        -name 'shard-*.requests.json' 2>/dev/null | sort
-    )
-    if (( ${#completed_manifests[@]} == 0 )); then
-      first_iteration="${candidate_iteration}"
-      break
-    fi
-    local candidate_complete=1
-    local completed_manifest completed_evidence
-    local candidate_evidence=()
-    for completed_manifest in "${completed_manifests[@]}"; do
-      completed_evidence="${completed_manifest%.requests.json}.csv"
-      if [[ ! -s "${completed_evidence}" ]]; then
-        candidate_complete=0
-        break
-      fi
-      candidate_evidence+=("${completed_evidence}")
-    done
-    if (( ! candidate_complete )); then
-      first_iteration="${candidate_iteration}"
-      break
-    fi
-    cpu_grouped_paired_evidence+=("${candidate_evidence[@]}")
-    first_iteration=$((candidate_iteration + 1))
-  done
+  local first_iteration resume_mode
+  load_cpu_paired_refinement_history \
+    "${paired_dir}" cpu_grouped_paired_evidence first_iteration resume_mode || \
+    return 2
+  if [[ "${resume_mode}" == "green" ]]; then
+    printf 'CPU grouped paired refinement reuses green iteration=%03d retained_shards=%s\n' \
+      "${first_iteration}" "${#cpu_grouped_paired_evidence[@]}"
+    return 0
+  fi
 
   local iteration
   local iteration_limit=$((first_iteration + paired_max_iterations))
@@ -6282,7 +6321,14 @@ run_cpu_grouped_paired_refinement() {
     for paired_path in "${cpu_grouped_paired_evidence[@]}"; do
       planner+=(--paired-csv "${paired_path}")
     done
-    run_cmd "PYTHONPATH=${paired_planner_root}" "${planner[@]}"
+    if (( iteration == first_iteration )) && \
+       [[ "${resume_mode}" == "collect" ]]; then
+      printf 'CPU grouped paired refinement resumes immutable iteration=%s\n' \
+        "${iteration_tag}"
+    else
+      run_cmd "PYTHONPATH=${paired_planner_root}" "${planner[@]}"
+    fi
+    resume_mode="plan"
 
     if (( dry_run )); then
       printf 'dry-run: grouped CPU paired refinement would consume %s\n' \
@@ -6382,12 +6428,12 @@ refresh_cpu_decode() {
   fi
 
   local weighted_shapes=()
-  local shape n k work
+  local shape n k work weighted_shape_record
   while IFS= read -r shape; do
-    n="$(cpu_shape_n "${shape}")"
-    k="$(cpu_shape_k "${shape}")"
+    cpu_shape_dimensions "${shape}" n k
     work=$((n * k))
-    weighted_shapes+=("$(printf '%020d\t%s' "${work}" "${shape}")")
+    printf -v weighted_shape_record '%020d\t%s' "${work}" "${shape}"
+    weighted_shapes+=("${weighted_shape_record}")
   done < <(csv_values "${decode_shapes}")
   local measurement_shapes
   measurement_shapes="$({
@@ -6395,6 +6441,85 @@ refresh_cpu_decode() {
       sort -t $'\t' -k1,1nr -k2,2 |
       cut -f2
   } | paste -sd, -)"
+
+  # M=1 collection is independently resumable because the turnkey workflow
+  # intentionally checkpoints before grouped-verifier fitting. Bind every
+  # reusable shard to the exact binary, arithmetic contract, inventory, and
+  # timing regimen before consulting its filename. Older contract-less shards
+  # cannot be authenticated and are rejected rather than silently mixed with
+  # evidence from a changed harness.
+  local cpu_decode_contract_path="${output_dir}/cpu_decode_collection_contract.sha256"
+  local cpu_decode_contract_payload cpu_decode_contract_digest
+  if (( ! skip_sweep )); then
+    cpu_decode_contract_payload="$(printf '%s\n' \
+      "schema=cpu-native-vnni-decode-collection-v1" \
+      "profile=${measurement_profile}" \
+      "shape_partition=${shape_partition}" \
+      "shapes=${measurement_shapes}" \
+      "formats=${cpu_formats}" \
+      "m_values=1" \
+      "threads=${cpu_threads}" \
+      "measurement_lanes=${cpu_measurement_lanes}" \
+      "paired_measurement_lanes=1" \
+      "format_shards=${cpu_format_shards}" \
+      "warmups=${cpu_warmup}" \
+      "samples=${cpu_iters}" \
+      "max_cases=${cpu_max_cases}" \
+      "build_id=${cpu_build_id}" \
+      "serial_policy_hash=${cpu_serial_policy_hash}" \
+      "shape_manifest_hash=$(sha256sum "${shape_manifest_path}" | awk '{print $1}')")"
+    cpu_decode_contract_digest="$(
+      printf '%s' "${cpu_decode_contract_payload}" |
+        sha256sum | awk '{print $1}'
+    )"
+
+    local decode_contractless_shards=()
+    local decode_nullglob_was_set=0
+    if shopt -q nullglob; then
+      decode_nullglob_was_set=1
+    fi
+    shopt -s nullglob
+    decode_contractless_shards=(
+      "${output_dir}"/cpu_decode_m1.*.csv
+      "${output_dir}"/cpu_decode_m1.*.csv.inprogress
+    )
+    if (( ! decode_nullglob_was_set )); then
+      shopt -u nullglob
+    fi
+
+    if [[ -f "${cpu_decode_contract_path}" ]]; then
+      if (( dry_run )); then
+        printf 'dry-run: verify CPU decode collection contract %s == %s\n' \
+          "${cpu_decode_contract_path}" "${cpu_decode_contract_digest}"
+      else
+        local existing_cpu_decode_contract
+        existing_cpu_decode_contract="$(<"${cpu_decode_contract_path}")"
+        if [[ "${existing_cpu_decode_contract}" != \
+              "${cpu_decode_contract_digest}" ]]; then
+          echo "error: CPU decode partial collection contract changed; use " \
+               "a new output directory" >&2
+          return 2
+        fi
+      fi
+    elif (( ${#decode_contractless_shards[@]} > 0 )); then
+      echo "error: CPU decode shards exist without an authenticated " \
+           "cpu_decode_collection_contract.sha256; use a new output " \
+           "directory" >&2
+      return 2
+    elif (( resume_cpu_partials )); then
+      echo "error: --resume-cpu-partials requires " \
+           "${cpu_decode_contract_path}" >&2
+      return 2
+    elif (( dry_run )); then
+      printf 'dry-run: publish CPU decode collection contract %s -> %s\n' \
+        "${cpu_decode_contract_digest}" "${cpu_decode_contract_path}"
+    else
+      printf '%s\n' "${cpu_decode_contract_digest}" > \
+        "${cpu_decode_contract_path}.inprogress"
+      mv "${cpu_decode_contract_path}.inprogress" \
+        "${cpu_decode_contract_path}"
+    fi
+  fi
 
   local partials=()
   local timing_partials=()
@@ -6431,8 +6556,7 @@ refresh_cpu_decode() {
       for regime_spec in "${regime_specs[@]}"; do
         IFS='|' read -r regime_name runtime_isa regime_bin <<< "${regime_spec}"
         while IFS= read -r shape; do
-          n="$(cpu_shape_n "${shape}")"
-          k="$(cpu_shape_k "${shape}")"
+          cpu_shape_dimensions "${shape}" n k
           partial="${output_dir}/cpu_decode_m1.${format_label}.${shape}.${regime_name}.csv"
           timing_partial="${output_dir}/cpu_decode_m1.${format_label}.${shape}.${regime_name}.timing.csv"
           partials+=("${partial}")
@@ -6667,6 +6791,7 @@ refresh_cpu_decode() {
       --serial-m1-policy-hash "${cpu_serial_policy_hash}" \
       --shape-manifest "${shape_manifest_path}" \
       --fit-cache-dir "${cpu_decode_fit_cache_dir}" \
+      --generic-max-leaves "${cpu_decode_max_leaves}" \
       --development-profiler-requests "${cpu_decode_profiler_requests}" \
       --development-profiler-evidence "${cpu_decode_profiler_evidence}" \
       --development-profiler-observations "${cpu_decode_profiler_witnesses}" \
@@ -6743,6 +6868,7 @@ refresh_cpu_decode() {
       --serial-m1-policy-hash "${cpu_serial_policy_hash}"
       --shape-manifest "${shape_manifest_path}"
       --fit-cache-dir "${cpu_decode_fit_cache_dir}"
+      --generic-max-leaves "${cpu_decode_max_leaves}"
       --development-profiler-requests "${cpu_decode_profiler_requests}"
       --development-profiler-evidence "${cpu_decode_profiler_evidence}"
       --development-profiler-observations "${cpu_decode_profiler_witnesses}"
@@ -6783,6 +6909,7 @@ refresh_cpu_decode() {
       --serial-m1-policy-hash "${cpu_serial_policy_hash}" \
       --shape-manifest "${shape_manifest_path}" \
       --fit-cache-dir "${cpu_decode_fit_cache_dir}" \
+      --generic-max-leaves "${cpu_decode_max_leaves}" \
       --development-profiler-requests "${cpu_decode_profiler_requests}" \
       --development-profiler-evidence "${cpu_decode_profiler_evidence}" \
       --development-profiler-observations "${cpu_decode_profiler_witnesses}" \
@@ -6951,12 +7078,13 @@ refresh_cpu() {
   # and rebuilding it identically for each ISA regime keeps a shape on the
   # same rank/socket while giving the two ranks comparable work.
   local weighted_cpu_shapes=()
-  local weighted_shape weighted_n weighted_k weighted_work
+  local weighted_shape weighted_n weighted_k weighted_work weighted_shape_record
   while IFS= read -r weighted_shape; do
-    weighted_n="$(cpu_shape_n "${weighted_shape}")"
-    weighted_k="$(cpu_shape_k "${weighted_shape}")"
+    cpu_shape_dimensions "${weighted_shape}" weighted_n weighted_k
     weighted_work=$((weighted_n * weighted_k))
-    weighted_cpu_shapes+=("$(printf '%020d\t%s' "${weighted_work}" "${weighted_shape}")")
+    printf -v weighted_shape_record \
+      '%020d\t%s' "${weighted_work}" "${weighted_shape}"
+    weighted_cpu_shapes+=("${weighted_shape_record}")
   done < <(csv_values "${cpu_sweep_shapes}")
   local cpu_measurement_shapes
   cpu_measurement_shapes="$({
@@ -6975,6 +7103,7 @@ refresh_cpu() {
     "m_values=${cpu_sweep_m_values}" \
     "threads=${cpu_threads}" \
     "measurement_lanes=${cpu_measurement_lanes}" \
+    "paired_measurement_lanes=1" \
     "format_shards=${cpu_format_shards}" \
     "warmups=${cpu_warmup}" \
     "samples=${cpu_iters}" \
@@ -7046,7 +7175,7 @@ refresh_cpu() {
     local format_spec shape n k regime_spec regime_name runtime_isa regime_bin
     local format_label partial timing_partial
     for format_spec in "${format_shards[@]}"; do
-      if (( stratified_formats )); then
+      if (( stratified_formats || cpu_format_shards )); then
         format_label="${format_spec}"
       else
         format_label="all-formats"
@@ -7055,8 +7184,7 @@ refresh_cpu() {
         IFS='|' read -r regime_name runtime_isa regime_bin <<< "${regime_spec}"
         job_group_starts+=("${#job_shapes[@]}")
         while IFS= read -r shape; do
-          n="$(cpu_shape_n "${shape}")"
-          k="$(cpu_shape_k "${shape}")"
+          cpu_shape_dimensions "${shape}" n k
           partial="${output_dir}/cpu_verifier_rows.${format_label}.${shape}.${regime_name}.csv"
           timing_partial="${output_dir}/cpu_verifier_rows.${format_label}.${shape}.${regime_name}.timing.csv"
           partials+=("${partial}")

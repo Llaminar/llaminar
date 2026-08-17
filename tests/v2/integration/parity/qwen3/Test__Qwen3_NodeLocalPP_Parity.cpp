@@ -114,23 +114,11 @@ TEST_P(Qwen3NodeLocalPPParityTest, GlobalOrchestratorSetup)
 }
 
 /**
- * @brief Prefill parity test with NodeLocalPP via GlobalOrchestrator
+ * @brief Full prefill/decode production parity via GlobalOrchestrator.
  */
-TEST_P(Qwen3NodeLocalPPParityTest, PrefillParity)
+TEST_P(Qwen3NodeLocalPPParityTest, ProductionParity)
 {
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runPrefillParity();
-    assertParity(summary);
-}
-
-/**
- * @brief Decode parity test with NodeLocalPP via GlobalOrchestrator
- */
-TEST_P(Qwen3NodeLocalPPParityTest, DecodeParity)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runDecodeParity();
-    assertDecodeParity(summary);
+    runProductionParityCampaign();
 }
 
 // =============================================================================

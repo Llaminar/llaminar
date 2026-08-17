@@ -334,13 +334,13 @@ TEST(AVX2TQFusedParity, TQ8DotRotatedQ)
     struct MockTQ8
     {
         float norm;
-        float residual_norm;
+        float reconstruction_norm;
         uint8_t indices[D];
     };
 
     MockTQ8 block;
     block.norm = 1.5f;
-    block.residual_norm = -1.0f;
+    block.reconstruction_norm = 1.45f;
     std::mt19937 rng(42);
     for (int i = 0; i < D; ++i)
         block.indices[i] = rng() % 256;
@@ -355,6 +355,8 @@ TEST(AVX2TQFusedParity, TQ8DotRotatedQ)
     float ref = 0.0f;
     for (int i = 0; i < D; ++i)
         ref += Q_rot[i] * TQ8_CENTROIDS[block.indices[i]];
+    // Key dot products intentionally use the source norm. The fitted radius is
+    // reserved for reconstructing values, where vector MSE is the objective.
     ref *= block.norm;
 
     EXPECT_NEAR(result, ref, std::abs(ref) * 0.001f);
@@ -366,7 +368,7 @@ TEST(AVX2TQFusedParity, TQ4AccumWeighted)
     // Create a mock TQ4 block
     TQ4Block<D> block;
     block.norm = 2.0f;
-    block.residual_norm = -1.0f;
+    block.reconstruction_norm = 1.9f;
     std::mt19937 rng(42);
     // Pack random 4-bit indices
     for (int i = 0; i < D; i += 8)
@@ -393,7 +395,7 @@ TEST(AVX2TQFusedParity, TQ4AccumWeighted)
 
     // Scalar reference
     std::vector<float> accum_ref(D, 0.0f);
-    float combined = weight * block.norm;
+    float combined = weight * block.reconstruction_norm;
     for (int i = 0; i < D; i += 8)
     {
         uint8_t idx8[8], hb[8];

@@ -155,8 +155,8 @@ namespace llaminar2
         MTP_GATE_PROJ,
         MTP_UP_PROJ,
         MTP_FFN_OUTPUT,
-        MTP_LOGITS, ///< Column-parallel shard, or full row for non-GlobalTP/Mirrored LocalTP
-        MTP_LOGITS_GATHERED, ///< Full-vocabulary CPU GlobalTP sidecar rows after allgather
+        MTP_LOGITS, ///< Participant output: vocabulary shard or full row according to the resolved terminal-head layout
+        MTP_LOGITS_GATHERED, ///< Full-vocabulary explicit-sharded GlobalTP sidecar rows after allgather
         MTP_CONDITION_TOKEN, ///< Arena-owned INT32 condition-token rows for device-resident MTP sidecar input
         MTP_POSITION_IDS, ///< Arena-owned INT32 request positions for device-resident batched MTP sidecar replay
         MTP_VERIFIER_INPUT_TOKENS, ///< Arena-owned INT32 verifier token row fed directly to GPU embedding

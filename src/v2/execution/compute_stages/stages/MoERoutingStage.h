@@ -15,6 +15,7 @@
 #include "../../../memory/BufferId.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../moe/DecodeExpertHistogram.h"
+#include "../../moe/IMoEGroupedVerifierHistogramPublisher.h"
 #include "../../moe/MoERuntimeTable.h"
 
 #include <memory>
@@ -22,6 +23,23 @@
 #include <vector>
 namespace llaminar2
 {
+    /**
+     * @brief Authority that consumes one GPU decode router publication.
+     *
+     * Ordinary homogeneous decode publishes both top-k tensors and the
+     * persistent device runtime table consumed by the local expert kernel.
+     * A heterogeneous ExpertOverlay graph instead captures the top-k tensors
+     * into a fixed-capacity dispatch ticket; its explicitly declared manual
+     * boundary owns placement and expert execution.  Keeping that distinction
+     * typed prevents a missing runtime table from silently selecting grouped
+     * prefill routing in an unrelated decode graph.
+     */
+    enum class MoEDecodeRoutePublicationPolicy
+    {
+        DeviceRuntimeTable,
+        FixedCapacityOverlayTicket,
+    };
+
 
     /**
      * @brief MoE routing stage: compute expert selection via softmax top-k
@@ -34,7 +52,10 @@ namespace llaminar2
      * - output_indices: FP32 [seq_len * top_k] expert IDs cast to float
      * - output_weights: FP32 [seq_len * top_k] normalized routing weights
      */
-    class MoERoutingStage : public IComputeStage, public IWorkspaceConsumer
+    class MoERoutingStage : public IComputeStage,
+                            public IWorkspaceConsumer,
+                            public IMoEGroupedVerifierHistogramPublisher,
+                            public IMoEHostGroupedVerifierHistogramPublisher
     {
     public:
         struct Params
@@ -55,7 +76,26 @@ namespace llaminar2
             // Layer info for histogram
             int layer_idx = -1;
             DecodeExpertHistogram *decode_histogram = nullptr;
+            /**
+             * @brief CPU-owned logical rows eligible for routing evidence.
+             *
+             * CPU graphs have exact host-owned request geometry, but the
+             * routing tensor may still have a larger physical row capacity in
+             * focused tests or future fixed-width execution.  When a CPU
+             * histogram is attached and `seq_len > 1`, graph construction must
+             * publish the exact leading row count here.  The stage rejects a
+             * missing or out-of-range count instead of allowing physical
+             * padding to bias Dynamic expert placement.
+             *
+             * GPU callers must leave this zero.  Their logical row count is
+             * device-owned through `active_row_count_device`, and routing must
+             * never download it merely to update a host histogram.
+             */
+            int host_logical_row_count = 0;
             IMoERuntimeTable *moe_runtime_table = nullptr;
+            /** @brief Typed owner of single-row GPU decode route metadata. */
+            MoEDecodeRoutePublicationPolicy decode_route_publication =
+                MoEDecodeRoutePublicationPolicy::DeviceRuntimeTable;
             /**
              * @brief Graph-lowered ownership of each selected routed row.
              *
@@ -110,6 +150,24 @@ namespace llaminar2
             bool force_decode_equivalent_verifier_prefill = false;
 
             /**
+             * @brief Retain selected verifier routes at an overlay ticket boundary.
+             *
+             * A manual heterogeneous ExpertOverlay graph has no local grouped
+             * expert stage on the continuation GPU, so its decode-equivalent
+             * router is the last device stage that sees all selected expert
+             * IDs.  Enabling this policy makes that router fuse selected-ID
+             * retention into top-k publication.  Participant IDs are retained
+             * as `-1`: global demand drives overlay placement, while local
+             * participant demand belongs to the remote execution domains.
+             *
+             * This is valid only for a GPU main verifier with a complete
+             * per-layer runtime ledger.  Ordinary and LocalTP overlay graphs
+             * leave it false because their expert stage owns final assignment
+             * retention.
+             */
+            bool defer_overlay_grouped_verifier_histogram_publication = false;
+
+            /**
              * @brief Device-owned logical row count for every variable-row GPU graph.
              *
              * Bucketed prefill and grouped verification both launch a stable
@@ -138,6 +196,85 @@ namespace llaminar2
         size_t estimatedFlops() const override;
 
         int layerIndex() const { return params_.layer_idx; }
+
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        [[nodiscard]] bool
+        requiresCommittedGroupedVerifierHistogramPublication() const noexcept override
+        {
+            return params_.device_id.is_gpu() &&
+                   params_.defer_overlay_grouped_verifier_histogram_publication;
+        }
+
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        [[nodiscard]] int
+        groupedVerifierHistogramLayerIndex() const noexcept override
+        {
+            return params_.layer_idx;
+        }
+
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        [[nodiscard]] std::string_view
+        groupedVerifierHistogramPublisherName() const noexcept override
+        {
+            return "moe_router_overlay_ticket";
+        }
+
+        /**
+         * @brief Commit accepted overlay-verifier selections from this ledger.
+         *
+         * @copydetails IMoEGroupedVerifierHistogramPublisher::enqueueCommittedGroupedVerifierHistograms
+         */
+        bool enqueueCommittedGroupedVerifierHistograms(
+            const int32_t *accepted_state_counts_device,
+            const int32_t *publication_ok_flags_device,
+            int request_count,
+            int rows_per_request,
+            void *producer_stream) override;
+
+        /** @inheritdoc IMoEHostGroupedVerifierHistogramPublisher */
+        [[nodiscard]] bool
+        requiresHostGroupedVerifierHistogramPublication() const noexcept override
+        {
+            return params_.device_id.is_cpu() &&
+                   params_.decode_histogram != nullptr &&
+                   params_.force_decode_equivalent_verifier_prefill;
+        }
+
+        /** @inheritdoc IMoEHostGroupedVerifierHistogramPublisher */
+        [[nodiscard]] int
+        hostGroupedVerifierHistogramLayerIndex() const noexcept override
+        {
+            return params_.layer_idx;
+        }
+
+        /** @inheritdoc IMoEHostGroupedVerifierHistogramPublisher */
+        [[nodiscard]] std::string_view
+        hostGroupedVerifierHistogramPublisherName() const noexcept override
+        {
+            return "moe_router_cpu_grouped_verifier";
+        }
+
+        /**
+         * @brief Validate retained CPU routes against accepted request geometry.
+         *
+         * @copydetails IMoEHostGroupedVerifierHistogramPublisher::validateHostGroupedVerifierHistogramPublication
+         */
+        [[nodiscard]] bool validateHostGroupedVerifierHistogramPublication(
+            const int32_t *accepted_state_counts,
+            int request_count,
+            int rows_per_request,
+            std::string *error) const override;
+
+        /**
+         * @brief Commit accepted CPU verifier prefixes into routing demand.
+         *
+         * @copydetails IMoEHostGroupedVerifierHistogramPublisher::publishHostGroupedVerifierHistograms
+         */
+        bool publishHostGroupedVerifierHistograms(
+            const int32_t *accepted_state_counts,
+            int request_count,
+            int rows_per_request,
+            std::string *error) override;
 
         bool allowsZeroOutput() const override { return false; }
         bool isGraphCapturable() const override;
@@ -251,6 +388,19 @@ namespace llaminar2
             return params_.active_row_count_device;
         }
 
+        /** @brief Expose immutable CPU routing-evidence geometry to graph tests. */
+        int hostLogicalRowCountForTesting() const noexcept
+        {
+            return params_.host_logical_row_count;
+        }
+
+        /** @brief Expose the typed decode publication authority to graph tests. */
+        MoEDecodeRoutePublicationPolicy
+        decodeRoutePublicationPolicyForTesting() const noexcept
+        {
+            return params_.decode_route_publication;
+        }
+
     private:
         Params params_;
 
@@ -292,15 +442,39 @@ namespace llaminar2
         /** @brief Classify the production arithmetic route prepared for capture. */
         MoERouteLaunchKind routeLaunchKind() const noexcept;
         bool isDeviceRoutedDecodeGraphCapturable() const;
+        bool isRuntimeTableDecodeGraphCapturable() const;
+        bool isOverlayTicketDecodeGraphCaptureSupported() const;
+        bool isOverlayTicketDecodeGraphCapturable() const;
         bool isDeviceRoutedPrefillExecutionSupported() const;
         bool isDeviceRoutedPrefillGraphCaptureSupported() const;
         bool isDeviceRoutedPrefillGraphCapturable() const;
         bool isDecodeEquivalentVerifierPrefillExecutionSupported() const;
         bool isDecodeEquivalentVerifierPrefillGraphCaptureSupported() const;
         bool isDecodeEquivalentVerifierPrefillGraphCapturable() const;
+        /**
+         * @brief Validate the router-owned overlay verifier ledger binding.
+         *
+         * @return true when the policy is disabled or the model-lifetime
+         *         runtime table exposes a complete per-layer route capacity.
+         */
+        bool hasCompleteOverlayVerifierLedgerBinding() const;
         bool hasInitializedRuntimeTableIfProvided() const;
         bool executeDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
         void recordRuntimeHistogramTokenBoundary() const;
+        /**
+         * @brief Publish one CPU grouped-routing result into Dynamic evidence.
+         *
+         * The helper consumes only the leading `host_logical_row_count` rows
+         * from `cached_routing_`.  It is deliberately unavailable to GPU
+         * execution, whose evidence remains device-owned and is merged by the
+         * runtime-table lifecycle at an explicit maintenance boundary.
+         *
+         * @param source Workload regime that produced the grouped rows.
+         * @return True when no histogram is attached or the complete logical
+         *         row prefix was validated and merged; false on any contract
+         *         violation.
+         */
+        bool publishCPUGroupedRoutingEvidence(ExpertHistogramSource source) const;
         void stashRoutingResults(
             const std::vector<int> &expert_indices,
             const std::vector<float> &expert_weights,

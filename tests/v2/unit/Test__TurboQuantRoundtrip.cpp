@@ -191,33 +191,53 @@ TEST(Test__TurboQuantRoundtrip, TQ4_ScalarFull_Quality_64)
 
     double total_cosine = 0.0;
     double total_mse = 0.0;
+    double source_norm_mse = 0.0;
 
     for (int trial = 0; trial < N; ++trial)
     {
-        float input[D], output[D], scratch0[D], scratch1[D];
+        float input[D], output[D], source_norm_output[D];
+        float scratch0[D], scratch1[D];
         for (int i = 0; i < D; ++i)
             input[i] = dist(rng);
 
         TQ4Block_64 block;
         turboquant_quantize_tq4<D>(input, head_ctx, block, scratch0, scratch1);
 
-        // Verify sentinel: scalar-full sets residual_norm < 0
-        ASSERT_LT(block.residual_norm, 0.0f)
-            << "Scalar-full must set negative residual_norm sentinel";
+        ASSERT_TRUE(std::isfinite(block.reconstruction_norm));
+        ASSERT_GT(block.reconstruction_norm, 0.0f)
+            << "A nonzero TQ4 vector needs a positive fitted radius";
 
         turboquant_dequantize_tq4<D>(block, head_ctx, output, scratch0);
 
+        // Reconstruct the historical source-norm assumption against the same
+        // indices. The fitted coefficient is the exact one-dimensional least-
+        // squares solution, so it must improve aggregate MSE without changing
+        // the codebook, rotation, or physical footprint.
+        TQ4Block_64 source_norm_block = block;
+        source_norm_block.reconstruction_norm = source_norm_block.norm;
+        turboquant_dequantize_tq4<D>(
+            source_norm_block,
+            head_ctx,
+            source_norm_output,
+            scratch0);
+
         total_cosine += compute_cosine_similarity(input, output, D);
         total_mse += compute_mse(input, output, D);
+        source_norm_mse += compute_mse(input, source_norm_output, D);
     }
 
     double avg_cosine = total_cosine / N;
     double avg_mse = total_mse / N;
+    double avg_source_norm_mse = source_norm_mse / N;
     std::cout << "Scalar-full D=64: avg cosine=" << avg_cosine
-              << " avg MSE=" << avg_mse << " (over " << N << " vectors)" << std::endl;
+              << " fitted MSE=" << avg_mse
+              << " source-norm MSE=" << avg_source_norm_mse
+              << " (over " << N << " vectors)" << std::endl;
 
     EXPECT_GT(avg_cosine, 0.95) << "4-bit MSE should have high cosine similarity";
     EXPECT_LT(avg_mse, 0.05) << "Scalar-full MSE unexpectedly high";
+    EXPECT_LT(avg_mse, avg_source_norm_mse)
+        << "Least-squares radial fitting must improve TQ4 reconstruction MSE";
 }
 
 TEST(Test__TurboQuantRoundtrip, TQ4_ScalarFull_Quality_128)
@@ -240,7 +260,8 @@ TEST(Test__TurboQuantRoundtrip, TQ4_ScalarFull_Quality_128)
 
         TQ4Block_128 block;
         turboquant_quantize_tq4<D>(input, head_ctx, block, scratch0, scratch1);
-        ASSERT_LT(block.residual_norm, 0.0f);
+        ASSERT_TRUE(std::isfinite(block.reconstruction_norm));
+        ASSERT_GT(block.reconstruction_norm, 0.0f);
 
         turboquant_dequantize_tq4<D>(block, head_ctx, output, scratch0);
         total_cosine += compute_cosine_similarity(input, output, D);

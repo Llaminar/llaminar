@@ -22,6 +22,7 @@
 #include "../../../models/GraphTypes.h"
 #include "../../../backends/DeviceId.h"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -40,10 +41,70 @@ namespace llaminar2
     class ILocalTPContext;
     class ITPContext;
     class PreparedWeightStore;
+    class ICPUCurrentBatchLLEPPhysicalExecutor;
     class IModelContext;
     class IBackend;
+    class DeviceMoEOverlayEpochArena;
     struct PrefixFingerprintMaterial;
     struct DeviceMoELayerRuntime;
+
+    /**
+     * @brief Mutation policy for one MTP sidecar forward transaction.
+     *
+     * The model graph that owns the actual sidecar wiring declares this
+     * policy. Runtime orchestration must not infer the contract from a model
+     * name, backend, or topology: none of those prove that every sidecar stage
+     * is bound to MTP-owned scratch and shifted KV state.
+     */
+    enum class MTPSidecarMainStatePolicy
+    {
+        Undeclared,
+        Preserved,
+    };
+
+    /**
+     * @brief Authoritative source for the first accepted shifted-MTP row.
+     *
+     * Dense sidecars can retain their first shifted row when it is exactly the
+     * accepted target row. MoE sidecars intentionally defer that publication
+     * to the target verifier so routed expert state and shifted KV are committed
+     * from one accepted row boundary.
+     */
+    enum class MTPShiftedRowPublicationPolicy
+    {
+        Undeclared,
+        ReuseSidecarRow,
+        TargetVerifierAuthoritative,
+    };
+
+    /**
+     * @brief Declarative ownership contract for a model's MTP sidecar graph.
+     *
+     * A graph may advertise this contract only when its sidecar activations,
+     * cache, recurrent state, router metadata, and bookkeeping have explicit
+     * owners. The orchestrator uses it to decide whether a verifier-base
+     * restore is required; an undeclared contract cannot enable the shortcut.
+     */
+    struct MTPSidecarStateContract
+    {
+        MTPSidecarMainStatePolicy main_state =
+            MTPSidecarMainStatePolicy::Undeclared;
+        MTPShiftedRowPublicationPolicy shifted_row =
+            MTPShiftedRowPublicationPolicy::Undeclared;
+
+        /** @return Whether sidecar execution leaves every main-model state surface unchanged. */
+        [[nodiscard]] constexpr bool preservesMainState() const noexcept
+        {
+            return main_state == MTPSidecarMainStatePolicy::Preserved;
+        }
+
+        /** @return Whether the first accepted shifted row may remain from sidecar execution. */
+        [[nodiscard]] constexpr bool reusesSidecarShiftedRow() const noexcept
+        {
+            return shifted_row ==
+                   MTPShiftedRowPublicationPolicy::ReuseSidecarRow;
+        }
+    };
 
     /**
      * @brief Device-owned source for request-final current-batch LLEP evidence.
@@ -52,17 +113,49 @@ namespace llaminar2
      * and non-owner-assignment marker in every layer runtime.  The orchestrator
      * borrows this contiguous table only to enqueue a backend reduction on an
      * explicitly ordered stream.  It must never inspect or mirror the table on
-     * the host during production execution.
+     * the host during production execution.  The graph also publishes the
+     * immutable byte extent of one complete expert payload so the terminal
+     * reduction can turn each apply-only movement marker into a conservative
+     * physical-byte lower bound without consulting a rolling maintenance wave.
      */
     struct DeviceMoECurrentBatchLLEPEvidenceSource
     {
         const DeviceMoELayerRuntime *runtime_layers_device = nullptr;
         int layer_count = 0;
+        uint64_t expert_payload_slot_bytes = 0;
 
         /** @return true when the complete contiguous runtime table is bound. */
         constexpr bool valid() const noexcept
         {
-            return runtime_layers_device != nullptr && layer_count > 0;
+            return runtime_layers_device != nullptr && layer_count > 0 &&
+                   expert_payload_slot_bytes > 0;
+        }
+    };
+
+    /**
+     * @brief Stable device-side admission state for one ExpertOverlay request family.
+     *
+     * A complete durable main/MTP transaction must select one placement epoch before
+     * its first graph and retain that reader through its final state
+     * publication.  The graph builder owns the model-lifetime arena because it
+     * also owns every durable runtime table that embeds the ticket address;
+     * transient current-batch LLEP tables are outside this publication domain. The
+     * orchestrator owns admission and release because only it can see the
+     * complete transaction boundary.
+     *
+     * The request slot is immutable graph topology.  A runner that admits more
+     * concurrent transactions than the arena declares must fail admission
+     * rather than alias one live ticket between requests.
+     */
+    struct DeviceMoEOverlayEpochExecutionBinding
+    {
+        std::shared_ptr<DeviceMoEOverlayEpochArena> arena; ///< Stable model-lifetime storage.
+        std::uint32_t request_slot = 0u;                   ///< Captured ticket/status slot.
+
+        /** @return Whether a model supplied an epoch arena for this participant. */
+        [[nodiscard]] explicit operator bool() const noexcept
+        {
+            return arena != nullptr;
         }
     };
 
@@ -79,6 +172,22 @@ namespace llaminar2
      */
     struct ShiftedMTPPrefillGraphBinding
     {
+        /**
+         * @brief Lifecycle in which this immutable pointer set may be used.
+         *
+         * RuntimeExecution is the ordinary captured production transaction and
+         * carries the finalized workspace generation in `capture_identity`.
+         * WorkspaceFamilyDeclaration exists only while setup materializes the
+         * exact graph topology used to size the first workspace generation.
+         * ForwardExecutionEngine rejects the latter, making a declaration graph
+         * structurally incapable of becoming an inference fallback.
+         */
+        enum class Purpose
+        {
+            RuntimeExecution,
+            WorkspaceFamilyDeclaration,
+        };
+
         IKVCache *kv_cache = nullptr; ///< Depth-zero shifted MTP KV cache.
         TensorBase *terminal_hidden_archive = nullptr; ///< One persistent terminal hidden row per request.
         const int32_t *request_token_ids_device = nullptr; ///< Stable admitted request-token bank.
@@ -91,6 +200,7 @@ namespace llaminar2
         std::vector<const int32_t *> shifted_cached_tokens_device; ///< Canonical shifted-KV count per request.
         MTPForwardOutput output; ///< Arena-owned depth-zero KV-only scratch tensors.
         uint64_t capture_identity = 0; ///< Complete immutable pointer/generation identity used by graph caching.
+        Purpose purpose = Purpose::RuntimeExecution; ///< Permitted lifecycle for this binding.
 
         /**
          * @brief Validate the immutable portion of the graph binding.
@@ -111,6 +221,23 @@ namespace llaminar2
                        static_cast<size_t>(request_count) &&
                    shifted_cached_tokens_device.size() ==
                        static_cast<size_t>(request_count);
+        }
+
+        /**
+         * @brief Return whether this binding may enter an inference executor.
+         *
+         * The common validity check intentionally accepts declaration-only
+         * bindings so model builders can expose their exact stage topology to
+         * workspace planning. This stricter predicate is the execution gate.
+         *
+         * @param request_count Number of logical requests in the graph.
+         * @return true only for a complete runtime binding.
+         */
+        [[nodiscard]] bool executableForRequestCount(
+            int request_count) const noexcept
+        {
+            return purpose == Purpose::RuntimeExecution &&
+                   validForRequestCount(request_count);
         }
     };
 
@@ -317,6 +444,22 @@ namespace llaminar2
     };
 
     /**
+     * @brief Submission lifecycle requested for one forward graph.
+     *
+     * Production inference normally builds and launches the graph atomically.
+     * A setup authority may instead capture and instantiate the exact executable
+     * while leaving all model arithmetic, manual boundaries, output publication,
+     * and transaction numbering untouched. The first ordinary invocation then
+     * owns transaction zero. This policy is deliberately carried beside the
+     * input rather than inferred from missing request data.
+     */
+    enum class ForwardGraphSubmissionIntent : uint8_t
+    {
+        Execute = 0, ///< Submit one production forward transaction.
+        MaterializeExecutableWithoutLaunch, ///< Setup-only capture/instantiation.
+    };
+
+    /**
      * @brief Complete asynchronous work represented by a forward completion event.
      *
      * A main-model prefill can either end after the ordinary model graph or own
@@ -388,6 +531,8 @@ namespace llaminar2
             ForwardExecutionRole::MainInference; ///< Semantic owner of this invocation.
         ForwardExecutionPhase execution_phase =
             ForwardExecutionPhase::Prefill; ///< Typed math/topology phase; never inferred from M.
+        ForwardGraphSubmissionIntent graph_submission_intent =
+            ForwardGraphSubmissionIntent::Execute; ///< Whether this call executes or only seals native graph units.
         int batch_size = 1;                ///< Number of sequences
         int seq_len = 0;                   ///< Sequence length per batch
         /**
@@ -413,6 +558,45 @@ namespace llaminar2
          */
         int token_offset = 0;
         int prefill_chunk_index = 0;       ///< Stable chunk ordinal for chunked graph-captured prefill.
+        /**
+         * @brief Monotonic request generation for graph-native MoE sparse collectives.
+         *
+         * This scalar is published by @c OrchestrationRunner to every overlay
+         * rank at the request boundary. It makes wire keys independent of
+         * graph capture, cache residency, and stage-object construction order.
+         * A value of zero means this invocation does not use the explicit
+         * distributed overlay protocol.
+         */
+        uint64_t moe_overlay_collective_generation_id = 0;
+        /**
+         * @brief Absolute logical operation offset for graph-native MoE wire keys.
+         *
+         * Chunked prefill sets this to the chunk's real-token start; decode and
+         * MTP lanes set it to their current logical position. The generation
+         * and this value together identify one logical collective operation.
+         */
+        uint64_t moe_overlay_collective_step_id = 0;
+        /**
+         * @brief Exact pre-launch arm for a heterogeneous ExpertOverlay graph.
+         *
+         * The continuation coordinator reserves the transaction identity before
+         * graph construction so sparse stages can capture immutable wire keys,
+         * but it must not publish the remote follower ticket until native capture
+         * and instantiation are complete. The executor invokes this callback on
+         * its exact non-null execution stream immediately before every initial or
+         * replay launch. It is request-scoped orchestration state and deliberately
+         * does not participate in graph-cache identity.
+         */
+        DeviceGraphExecutor::GraphLaunchDependencyHook
+            moe_overlay_graph_launch_dependency;
+        /**
+         * @brief Explicit MTP namespace depth for an overlay transaction.
+         *
+         * Main-model decode/prefill leave this at -1. Grouped verification
+         * publishes the controller-admitted maximum draft depth, independent
+         * of the fixed physical verifier bucket.
+         */
+        int moe_overlay_mtp_depth = -1;
         /**
          * @brief Select the one-shot graph that reconstructs prefix-owned GPU state.
          *
@@ -669,6 +853,19 @@ namespace llaminar2
             return {};
         }
 
+        /**
+         * @brief Return the graph-declared mutation and publication contract for MTP sidecars.
+         *
+         * The default is deliberately undeclared. A concrete model graph must
+         * opt in only after its real sidecar has focused state-preservation
+         * coverage; merely implementing buildMTPGraph() is not sufficient.
+         */
+        [[nodiscard]] virtual MTPSidecarStateContract
+        mtpSidecarStateContract() const noexcept
+        {
+            return {};
+        }
+
         // =====================================================================
         // Optional Methods (with default implementations)
         // =====================================================================
@@ -789,6 +986,20 @@ namespace llaminar2
 
         /// Set prepared weight store for kernel lifecycle management (Phase 10)
         virtual void setPreparedWeightStore(PreparedWeightStore *store) { (void)store; }
+
+        /**
+         * @brief Bind the CPU current-batch LLEP physical transfer executor.
+         *
+         * The ExpertOverlay residency controller remains the placement
+         * authority and pins the parent epoch. Model graphs declare the child
+         * begin/restore stages; the device orchestrator only executes their
+         * packed expert movement and graph-local publication.
+         */
+        virtual void setCPUCurrentBatchLLEPPhysicalExecutor(
+            ICPUCurrentBatchLLEPPhysicalExecutor *executor)
+        {
+            (void)executor;
+        }
 
         /// Enable or disable all-position LM-head logits for speculative verification.
         virtual bool setComputeAllPositionLogits(bool enabled)
@@ -1069,6 +1280,25 @@ namespace llaminar2
          */
         virtual ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
             DeviceId device)
+        {
+            (void)device;
+            return {};
+        }
+
+        /**
+         * @brief Return the stable ExpertOverlay epoch binding for one device.
+         *
+         * Non-overlay builders return an empty binding.  Overlay builders must
+         * return the same arena and slot every time, including while main and
+         * MTP graph variants are being materialized.  This method is allowed to
+         * allocate during model setup; callers must resolve it before capture
+         * or request admission.
+         *
+         * @param device Exact participant whose runtime tables consume the ticket.
+         * @return Stable arena/slot binding, or empty for an explicit non-overlay graph.
+         */
+        virtual DeviceMoEOverlayEpochExecutionBinding
+        deviceMoEOverlayEpochExecutionBinding(DeviceId device)
         {
             (void)device;
             return {};

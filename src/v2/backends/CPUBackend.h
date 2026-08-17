@@ -220,6 +220,15 @@ namespace llaminar2
         bool recordEvent(void *event, int device_id, void *stream = nullptr) override;
 
         /**
+         * @brief Report a CPU event as immediately complete.
+         * @param event Dummy CPU event returned by createEvent().
+         * @param device_id Must identify the sole CPU backend.
+         * @param ready Non-null completion destination.
+         * @return true for a valid CPU event and device.
+         */
+        bool queryEvent(void *event, int device_id, bool *ready) override;
+
+        /**
          * @brief Wait for event (no-op for CPU - always synchronous)
          * @param event Event handle
          * @param device_id Must be 0

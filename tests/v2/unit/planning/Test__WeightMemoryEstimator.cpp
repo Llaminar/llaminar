@@ -2,7 +2,9 @@
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/ModelMemoryProfile.h"
 #include "backends/DeviceId.h"
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 /**
@@ -81,6 +83,72 @@ namespace
         addTensor("blk.1.ffn_norm.weight", 1, 896, "F32", 1);
 
         return p;
+    }
+
+    ModelMemoryProfile createMoEResidencyProfile()
+    {
+        ModelMemoryProfile profile;
+        profile.architecture = "qwen3.5moe";
+        profile.n_layers = 2;
+        profile.d_model = 32;
+        profile.d_ff = 64;
+        profile.n_heads = 4;
+        profile.n_kv_heads = 2;
+        profile.head_dim = 8;
+        profile.vocab_size = 100;
+        profile.max_seq_len = 64;
+        profile.expert_count = 8;
+        profile.expert_used_count = 2;
+        profile.expert_feed_forward_length = 64;
+        profile.expert_shared_feed_forward_length = 64;
+
+        auto addF32 = [&](const std::string &name,
+                          size_t elements,
+                          size_t k,
+                          int layer)
+        {
+            TensorSizeInfo tensor;
+            tensor.name = name;
+            tensor.elements = elements;
+            tensor.K = k;
+            tensor.quant_type = "F32";
+            tensor.native_bytes = elements * sizeof(float);
+            tensor.layer_index = layer;
+            profile.total_native_bytes += tensor.native_bytes;
+            profile.tensors.push_back(std::move(tensor));
+        };
+
+        addF32("token_embd.weight", 100u * 32u, 32, -1);
+        addF32("output.weight", 100u * 32u, 32, -1);
+        for (int layer = 0; layer < profile.n_layers; ++layer)
+        {
+            const std::string prefix = "blk." + std::to_string(layer);
+            addF32(prefix + ".attn_q.weight", 32u * 32u, 32, layer);
+            addF32(prefix + ".ffn_gate_shexp.weight", 64u * 32u, 32, layer);
+            addF32(
+                prefix + ".ffn_gate_exps.weight",
+                8u * 64u * 32u,
+                32,
+                layer);
+            addF32(
+                prefix + ".ffn_up_exps.weight",
+                8u * 64u * 32u,
+                32,
+                layer);
+            addF32(
+                prefix + ".ffn_down_exps.weight",
+                8u * 32u * 64u,
+                64,
+                layer);
+        }
+        return profile;
+    }
+
+    bool isSyntheticRoutedExpertTensor(const std::string &name)
+    {
+        return name.ends_with(".ffn_gate_exps.weight") ||
+               name.ends_with(".ffn_up_exps.weight") ||
+               name.ends_with(".ffn_down_exps.weight");
     }
 
     struct ExpectedBytesPerWeight
@@ -445,4 +513,89 @@ TEST(Test__WeightMemoryEstimator, CPUPackedBytes)
     auto est = WeightMemoryEstimator::estimate(profile, DeviceId::cpu());
 
     EXPECT_GT(est.device_bytes, 0u);
+}
+
+TEST(Test__WeightMemoryEstimator, ContinuationResidencyCountsDenseSharedAndExactExpertFractions)
+{
+    const auto profile = createMoEResidencyProfile();
+    const auto residency =
+        DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,
+            {2, 4});
+
+    const auto estimate = WeightMemoryEstimator::estimate(
+        profile,
+        DeviceId::cpu(),
+        0,
+        1,
+        0,
+        1,
+        residency);
+
+    size_t expected = 0;
+    for (const auto &tensor : profile.tensors)
+    {
+        if (!isSyntheticRoutedExpertTensor(tensor.name))
+        {
+            expected += tensor.native_bytes;
+            continue;
+        }
+        const int selected = tensor.layer_index == 0 ? 2 : 4;
+        expected += tensor.native_bytes * static_cast<size_t>(selected) /
+                    static_cast<size_t>(profile.expert_count);
+    }
+    EXPECT_EQ(estimate.native_bytes, expected);
+    EXPECT_EQ(estimate.device_bytes, expected)
+        << "F32 CPU preparation must preserve the exact selected byte count";
+    EXPECT_LT(estimate.device_bytes, profile.total_native_bytes);
+}
+
+TEST(Test__WeightMemoryEstimator, ExpertOnlyResidencyExcludesEveryDenseAndSharedTensor)
+{
+    const auto profile = createMoEResidencyProfile();
+    const auto residency =
+        DeviceWeightResidency::selectedRoutedExpertsOnly(
+            profile.expert_count,
+            {3, 1});
+
+    const auto estimate = WeightMemoryEstimator::estimate(
+        profile,
+        DeviceId::cpu(),
+        0,
+        1,
+        0,
+        1,
+        residency);
+
+    size_t expected = 0;
+    for (const auto &tensor : profile.tensors)
+    {
+        if (!isSyntheticRoutedExpertTensor(tensor.name))
+            continue;
+        const int selected = tensor.layer_index == 0 ? 3 : 1;
+        expected += tensor.native_bytes * static_cast<size_t>(selected) /
+                    static_cast<size_t>(profile.expert_count);
+    }
+    EXPECT_EQ(estimate.native_bytes, expected);
+    EXPECT_EQ(estimate.device_bytes, expected);
+}
+
+TEST(Test__WeightMemoryEstimator, SelectedResidencyRejectsModelGeometryDrift)
+{
+    const auto profile = createMoEResidencyProfile();
+    const auto wrong_denominator =
+        DeviceWeightResidency::selectedRoutedExpertsOnly(
+            /*model_expert_count=*/7,
+            {1, 1});
+
+    EXPECT_THROW(
+        WeightMemoryEstimator::estimate(
+            profile,
+            DeviceId::cuda(0),
+            0,
+            1,
+            0,
+            1,
+            wrong_denominator),
+        std::invalid_argument);
 }

@@ -5,17 +5,23 @@
 
 #pragma once
 
+#include "DeviceMoEOverlayEpochABI.h"
 #include "DeviceMoERuntimeABI.h"
 #include "LeastLoadedExpertAssignment.h"
+#include "MoEOverlayActivationPacketABI.h"
+#include "RuntimeExpertHistogramDrain.h"
 
 #include "../../backends/DeviceId.h"
+#include "../../kernels/common/DeviceMoEFloatingMatrixDesc.h"
 #include "../../tensors/TensorKernels.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <vector>
 
@@ -23,6 +29,15 @@ namespace llaminar2
 {
 
     class DecodeExpertHistogram;
+    class DeviceMoEOverlayEpochArena;
+    using DeviceMoERuntimeHistogramBank =
+        moe_runtime_abi::DeviceMoERuntimeHistogramBank;
+    using RuntimeExpertHistogramSourceMask =
+        std::array<bool, moe_runtime_abi::kHistogramSourceCount>;
+
+    /** Every runtime phase is collected by a non-overlay table. */
+    inline constexpr RuntimeExpertHistogramSourceMask
+        kAllRuntimeExpertHistogramSources{true, true, true};
 
     inline constexpr uint32_t kDeviceMoEMaxExperts = 256;
     /**
@@ -86,13 +101,31 @@ namespace llaminar2
 
     struct DeviceMoEExpertDescriptor
     {
+        /** Prepared NativeVNNI views used when weight_format is NativeVNNI. */
         DeviceNativeVNNIMatrixDesc gate;
         DeviceNativeVNNIMatrixDesc up;
         DeviceNativeVNNIMatrixDesc down;
+        /** Contiguous floating views used for FP16, BF16, or FP32 experts. */
+        DeviceMoEFloatingMatrixDesc floating_gate;
+        DeviceMoEFloatingMatrixDesc floating_up;
+        DeviceMoEFloatingMatrixDesc floating_down;
         int32_t logical_expert_id = -1;
         int32_t owner_participant = -1;
         int32_t local_slot = -1;
         uint32_t flags = 0;
+        DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
+        uint32_t reserved = 0;
+
+        /** @return Whether the selected arithmetic family has a complete triple. */
+        [[nodiscard]] constexpr bool weightsReady() const noexcept
+        {
+            if (weight_format == DeviceMoEWeightFormat::NativeVNNI)
+                return gate.valid() && up.valid() && down.valid();
+            return deviceMoEWeightFormatIsFloating(weight_format) &&
+                   floating_gate.valid() &&
+                   floating_up.valid() &&
+                   floating_down.valid();
+        }
     };
 
     struct DeviceMoEPlacementBank
@@ -101,6 +134,18 @@ namespace llaminar2
         uint8_t local_compute_mask[kDeviceMoEMaxExperts] = {};
         uint8_t replica_role[kDeviceMoEMaxExperts] = {};
         uint32_t resident_participant_mask[kDeviceMoEMaxExperts] = {};
+        /**
+         * Overlay-wide logical packet destination for each expert.
+         *
+         * This identity is deliberately distinct from
+         * DeviceMoEExpertDescriptor::owner_participant, which is local to one
+         * homogeneous compute domain. Values are stable logical participant
+         * IDs from the global owner map; `-1` means that no overlay endpoint is
+         * assigned. Publishing this array in the same double-buffered bank as
+         * residency prevents a captured sparse dispatcher from observing a
+         * new owner with an old routing target.
+         */
+        int32_t overlay_route_participant[kDeviceMoEMaxExperts] = {};
         uint32_t epoch = 0;
         uint32_t expert_count = 0;
         /// Number of experts resident on more than one participant.
@@ -130,8 +175,15 @@ namespace llaminar2
 
         int32_t topk_expert_ids[kDeviceMoEMaxTopK] = {};
         float topk_weights[kDeviceMoEMaxTopK] = {};
+        /// Serial decode selected/local demand for this request generation.
         uint64_t decode_histogram[kDeviceMoEMaxExperts] = {};
         uint64_t decode_local_histogram[kDeviceMoEMaxExperts] = {};
+        /// Real (unpadded) ordinary prefill selected/local demand.
+        uint64_t prefill_histogram[kDeviceMoEMaxExperts] = {};
+        uint64_t prefill_local_histogram[kDeviceMoEMaxExperts] = {};
+        /// Accepted grouped-MTP verifier selected/local demand.
+        uint64_t grouped_verifier_histogram[kDeviceMoEMaxExperts] = {};
+        uint64_t grouped_verifier_local_histogram[kDeviceMoEMaxExperts] = {};
         uint64_t router_hot_cache_eligible_dispatches = 0;
         uint64_t router_hot_cache_used_dispatches = 0;
         uint64_t router_hot_cache_improved_dispatches = 0;
@@ -213,10 +265,61 @@ namespace llaminar2
          * publication.
          */
         uint32_t current_batch_llep_non_owner_assignment_observed = 0;
+        /**
+         * @brief Select this child table's request-local placement bank.
+         *
+         * An ExpertOverlay LLEP child normally reads the canonical parent bank
+         * selected by @ref overlay_epoch_ticket. A successful current-batch
+         * payload apply first clones that exact parent bank into one embedded
+         * child bank, applies transient arrivals there, and publishes this bit
+         * last. Subsequent captured kernels then consume the child bank while
+         * still validating the pinned durable parent epoch. Request reset
+         * clears the bit by restoring the immutable child template.
+         */
+        uint32_t current_batch_llep_transient_bank_active = 0;
+        /**
+         * Model-lifetime double-buffered routing evidence. Null selects the
+         * embedded request-local arrays retained for CPU/legacy controllers.
+         */
+        DeviceMoERuntimeHistogramBank *runtime_histogram_banks = nullptr;
+        /** Shared device scalar selecting the writable external bank. */
+        const uint32_t *runtime_histogram_active_bank = nullptr;
+        /**
+         * @brief Stable request ticket selecting the immutable execution bank.
+         *
+         * A non-null pointer is the explicit ExpertOverlay mode contract.  Its
+         * selected bank remains pinned across captured main-model, sparse
+         * collective, continuation, and MTP graphs even while maintenance
+         * publishes a newer epoch.  Null is reserved for non-overlay tables,
+         * whose execution bank remains @ref active_bank.
+         */
+        const DeviceMoEOverlayEpochTicket *overlay_epoch_ticket = nullptr;
+        /**
+         * @brief Optional canonical placement banks for durable overlay roles.
+         *
+         * Main-model runtime layers leave this null and own their embedded
+         * banks. MTP sidecars and current-batch LLEP children point it at the
+         * corresponding main-model layer, so route scratch and histograms
+         * remain child-local while every captured reader begins from one
+         * device-owned durable placement authority. LLEP switches to an
+         * embedded child bank only after a successful transient apply.
+         */
+        const DeviceMoEPlacementBank *overlay_placement_banks = nullptr;
     };
 
     static_assert(std::is_trivially_copyable_v<DeviceMoEExpertDescriptor>);
+    static_assert(
+        sizeof(DeviceMoEExpertDescriptor) == 240,
+        "host expert descriptors must retain the CUDA/ROCm runtime ABI size");
     static_assert(std::is_trivially_copyable_v<DeviceMoEPlacementBank>);
+    static_assert(
+        sizeof(DeviceMoEPlacementBank) ==
+            moe_runtime_abi::kPlacementBankBytes,
+        "host placement banks must retain the CUDA/ROCm runtime ABI size");
+    static_assert(
+        offsetof(DeviceMoEPlacementBank, overlay_route_participant) ==
+            moe_runtime_abi::kOverlayRouteParticipantOffset,
+        "host overlay route targets must retain the CUDA/ROCm ABI offset");
     static_assert(std::is_trivially_copyable_v<DeviceMoELayerRuntime>);
     static_assert(sizeof(DeviceMoELayerRuntime) ==
                   moe_runtime_abi::kLayerRuntimeBytes);
@@ -245,6 +348,19 @@ namespace llaminar2
         offsetof(DeviceMoELayerRuntime,
                  current_batch_llep_non_owner_assignment_observed) ==
         moe_runtime_abi::kCurrentBatchLLEPNonOwnerAssignmentObservedOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntime,
+                 current_batch_llep_transient_bank_active) ==
+        moe_runtime_abi::kCurrentBatchLLEPTransientBankActiveOffset);
+    static_assert(offsetof(DeviceMoELayerRuntime, runtime_histogram_banks) ==
+                  moe_runtime_abi::kRuntimeHistogramBanksOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntime, runtime_histogram_active_bank) ==
+        moe_runtime_abi::kRuntimeHistogramActiveBankOffset);
+    static_assert(offsetof(DeviceMoELayerRuntime, overlay_epoch_ticket) ==
+                  moe_runtime_abi::kOverlayEpochTicketOffset);
+    static_assert(offsetof(DeviceMoELayerRuntime, overlay_placement_banks) ==
+                  moe_runtime_abi::kOverlayPlacementBanksOffset);
 
     /**
      * @brief Count active experts backed by graph-owned transient transfer slots.
@@ -316,6 +432,15 @@ namespace llaminar2
         /// Optional [expert] bitmask of participants with resident weights.
         /// If omitted, prepareInactiveBank synthesizes owner/local residency.
         std::vector<uint32_t> resident_participant_mask;
+        /**
+         * Optional overlay-wide logical sparse-packet target per expert.
+         *
+         * Omission preserves non-overlay callers by deriving each value from
+         * the descriptor's domain-local owner. ExpertOverlay construction must
+         * provide the global owner-map values explicitly whenever participant
+         * numbering differs across domains.
+         */
+        std::vector<int32_t> overlay_route_participant;
         /**
          * @brief Whether this bank includes request-lifetime transfer placement.
          *
@@ -395,8 +520,15 @@ namespace llaminar2
          */
         uint32_t requires_device_payload_rehydration = 0;
         std::vector<DeviceMoEPortableExpertRuntimeState> experts;
+        /// Serial-decode selected/local demand.
         std::vector<uint64_t> selected_histogram;
         std::vector<uint64_t> local_histogram;
+        /// Ordinary-prefill selected/local demand.
+        std::vector<uint64_t> prefill_selected_histogram;
+        std::vector<uint64_t> prefill_local_histogram;
+        /// Accepted grouped-verifier selected/local demand.
+        std::vector<uint64_t> grouped_verifier_selected_histogram;
+        std::vector<uint64_t> grouped_verifier_local_histogram;
     };
 
     /**
@@ -542,6 +674,25 @@ namespace llaminar2
         virtual bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
                                                void *stream = nullptr,
                                                bool reset_runtime_counts = true) = 0;
+        /**
+         * @brief Install persistent double-buffered device histogram storage.
+         *
+         * This is model-setup work and must run before any graph captures a
+         * layer runtime pointer. @p sources selects the phases this table owns;
+         * unselected phases may still be counted for diagnostics but are not
+         * merged into the shared placement window.
+         */
+        virtual void enableAsyncDecodeHistogramDrain(
+            RuntimeExpertHistogramSourceMask sources) = 0;
+        /**
+         * @brief Begin or poll one exact non-blocking runtime drain generation.
+         *
+         * Ready means the inactive bank was copied, cleared, and merged exactly
+         * once. Pending must return without synchronizing a stream or device.
+         */
+        virtual RuntimeExpertHistogramDrainResult
+        progressAsyncDecodeHistogramDrain(
+            DecodeExpertHistogram &histogram) = 0;
         virtual bool captureDecodeHistogramCounts(std::vector<uint64_t> &selected_counts,
                                                   std::vector<uint64_t> &local_counts,
                                                   void *stream = nullptr) = 0;
@@ -552,6 +703,19 @@ namespace llaminar2
                                                   void *stream = nullptr) = 0;
         virtual void resetDecodeHistogramCounts(void *stream = nullptr) = 0;
         virtual void resetDecodeRuntimeState(void *stream = nullptr) = 0;
+        /**
+         * @brief Resolve one exact captured ExpertOverlay packet-placement input.
+         *
+         * Non-overlay implementations return an invalid binding. Implementations
+         * that expose it must bind both durable banks, their shared request
+         * ticket, and the expert geometry from one placement authority.
+         */
+        virtual MoEOverlayRoutePlacementDeviceBinding
+        overlayRoutePlacementBinding(int layer_idx) const
+        {
+            (void)layer_idx;
+            return {};
+        }
     };
 
     class DeviceMoERuntimeTable final : public IMoERuntimeTable
@@ -583,6 +747,27 @@ namespace llaminar2
              */
             std::shared_ptr<DeviceMoESerialRouteScratchArena>
                 serial_route_scratch_arena;
+            /**
+             * @brief Optional shared request-lifetime ExpertOverlay epoch arena.
+             *
+             * Main-model and MTP runtime tables for one serial request family
+             * bind the same arena and slot.  This is model topology, not
+             * request data: reset and prefix restore preserve the pointer.
+             */
+            std::shared_ptr<DeviceMoEOverlayEpochArena> overlay_epoch_arena;
+            /** @brief Immutable admission slot bound into every layer. */
+            uint32_t overlay_epoch_ticket_slot = 0u;
+            /**
+             * @brief Optional canonical main-model placement authority.
+             *
+             * MTP sidecars and request-local LLEP child tables set this pointer.
+             * The source must be the canonical mirrored main table on the same
+             * device, cover every target layer, and consume the exact same
+             * epoch ticket. Child tables may publish transient routing and
+             * arrival state, but always resolve durable owners from these banks.
+             * The graph builder owns both tables for their captured lifetime.
+             */
+            DeviceMoERuntimeTable *overlay_placement_source = nullptr;
         };
 
         explicit DeviceMoERuntimeTable(Config config);
@@ -611,6 +796,13 @@ namespace llaminar2
         bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
                                        void *stream = nullptr,
                                        bool reset_runtime_counts = true) override;
+        /** @copydoc IMoERuntimeTable::enableAsyncDecodeHistogramDrain */
+        void enableAsyncDecodeHistogramDrain(
+            RuntimeExpertHistogramSourceMask sources) override;
+        /** @copydoc IMoERuntimeTable::progressAsyncDecodeHistogramDrain */
+        RuntimeExpertHistogramDrainResult
+        progressAsyncDecodeHistogramDrain(
+            DecodeExpertHistogram &histogram) override;
         bool captureDecodeHistogramCounts(std::vector<uint64_t> &selected_counts,
                                           std::vector<uint64_t> &local_counts,
                                           void *stream = nullptr) override;
@@ -681,6 +873,41 @@ namespace llaminar2
         {
             return serial_route_scratch_arena_ != nullptr;
         }
+        /** @return Whether this table executes through an epoch-pinned bank. */
+        bool usesOverlayEpochTicket() const noexcept
+        {
+            return overlay_epoch_arena_ != nullptr;
+        }
+        /** @return Model-lifetime epoch arena identity, or null when unbound. */
+        const DeviceMoEOverlayEpochArena *overlayEpochArena() const noexcept
+        {
+            return overlay_epoch_arena_.get();
+        }
+        /**
+         * @return Stable backend-resident request ticket, or null for a
+         * non-overlay table.
+         */
+        const DeviceMoEOverlayEpochTicket *overlayEpochTicket() const noexcept;
+        /** @return Mutable canonical main table, or null when this table owns placement. */
+        DeviceMoERuntimeTable *overlayPlacementSource() noexcept
+        {
+            return overlay_placement_source_;
+        }
+        /** @return Canonical main table, or null when this table owns placement. */
+        const DeviceMoERuntimeTable *overlayPlacementSource() const noexcept
+        {
+            return overlay_placement_source_;
+        }
+        /**
+         * @brief Return the stable device address of one layer's placement banks.
+         * @param layer_idx Model layer in this table.
+         * @return First of the two embedded placement banks on host/device.
+         */
+        const DeviceMoEPlacementBank *devicePlacementBanks(
+            int layer_idx) const;
+        /** @copydoc IMoERuntimeTable::overlayRoutePlacementBinding */
+        MoEOverlayRoutePlacementDeviceBinding
+        overlayRoutePlacementBinding(int layer_idx) const override;
         bool hasDeferredVerifierRouteLedgerCapacity(int layer_idx,
                                                     int token_count) const;
 
@@ -710,8 +937,48 @@ namespace llaminar2
         DeviceMoELayerRuntime *device_empty_layers_ = nullptr;
         void *decode_histogram_producer_stream_ = nullptr;
 
+        /** Exact stream plus its reusable flip-arrival event. */
+        struct RuntimeHistogramProducerStream
+        {
+            void *stream = nullptr;
+            void *flip_arrival_event = nullptr;
+        };
+
+        mutable std::mutex runtime_histogram_drain_mutex_;
+        RuntimeExpertHistogramSourceMask runtime_histogram_sources_{};
+        std::vector<RuntimeHistogramProducerStream>
+            runtime_histogram_producer_streams_;
+        DeviceMoERuntimeHistogramBank *device_runtime_histogram_banks_ =
+            nullptr;
+        uint32_t *device_runtime_histogram_active_bank_ = nullptr;
+        DeviceMoERuntimeHistogramBank *host_runtime_histogram_snapshot_ =
+            nullptr;
+        uint32_t *host_runtime_histogram_bank_indices_ = nullptr;
+        void *runtime_histogram_maintenance_stream_ = nullptr;
+        /**
+         * @brief Model-setup fence consumed by every exact producer stream.
+         *
+         * Histogram banks and the active-bank selector are initialized on the
+         * maintenance stream.  Producers wait on this event once, during
+         * topology registration, so inference never needs a host-side setup
+         * synchronization.
+         */
+        void *runtime_histogram_initialization_event_ = nullptr;
+        void *runtime_histogram_drain_complete_event_ = nullptr;
+        uint32_t runtime_histogram_active_bank_host_ = 0;
+        uint32_t runtime_histogram_frozen_bank_host_ = 0;
+        bool runtime_histogram_drain_enabled_ = false;
+        bool runtime_histogram_drain_in_flight_ = false;
+        bool runtime_histogram_producers_sealed_ = false;
+
         std::shared_ptr<DeviceMoESerialRouteScratchArena>
             serial_route_scratch_arena_;
+        /** Keeps the stable ticket allocation alive beyond every graph/table. */
+        std::shared_ptr<DeviceMoEOverlayEpochArena> overlay_epoch_arena_;
+        /** Exact immutable request slot selected during model construction. */
+        uint32_t overlay_epoch_ticket_slot_ = 0u;
+        /** Non-owning model-lifetime source retained by the owning graph builder. */
+        DeviceMoERuntimeTable *overlay_placement_source_ = nullptr;
         std::vector<DeviceMoEPrefillRouteScratchBindings>
             prefill_route_scratch_;
         int32_t *deferred_verifier_route_expert_ids_ = nullptr;
@@ -730,6 +997,21 @@ namespace llaminar2
             const DeviceMoEPrefillRouteScratchBindings &allocation);
         void allocateDeviceMirror();
         void releaseDeviceMirror() noexcept;
+        /** Allocate and bind model-lifetime asynchronous histogram resources. */
+        void allocateRuntimeHistogramDrainResources();
+        /**
+         * @brief Register one producer and order it after bank initialization.
+         *
+         * @param stream Exact non-null stream that writes runtime histograms.
+         *
+         * The caller must hold @ref runtime_histogram_drain_mutex_.
+         */
+        void registerRuntimeHistogramProducerStreamLocked(void *stream);
+        /** Drain/destroy histogram resources during model teardown. */
+        void releaseRuntimeHistogramDrainResources() noexcept;
+        /** Merge one completed pinned generation into the host RCU histogram. */
+        bool mergeRuntimeHistogramSnapshot(
+            DecodeExpertHistogram &histogram);
         void allocatePrefillRouteScratchForLayer(int layer_idx, int token_capacity);
         void releasePrefillRouteScratch() noexcept;
         void allocateDeferredVerifierRouteLedger();

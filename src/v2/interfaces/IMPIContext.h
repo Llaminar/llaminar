@@ -314,6 +314,22 @@ namespace llaminar2
         virtual void wait(MPI_Request *request, MPI_Status *status = nullptr) const = 0;
 
         /**
+         * @brief Progress one non-blocking operation without blocking the caller.
+         *
+         * The request remains live when this returns false and is set to
+         * `MPI_REQUEST_NULL` by MPI when it returns true. Transport owners use
+         * this operation to retain fixed buffers until their exact request has
+         * completed instead of issuing an immediate `wait()` after `isend()`.
+         *
+         * @param request Non-null request handle owned by the caller.
+         * @param status Optional completion status.
+         * @return True only when the request completed during this call.
+         */
+        virtual bool test(
+            MPI_Request *request,
+            MPI_Status *status = nullptr) const = 0;
+
+        /**
          * @brief Wait for all non-blocking operations to complete
          * @param requests Vector of MPI_Request handles
          */

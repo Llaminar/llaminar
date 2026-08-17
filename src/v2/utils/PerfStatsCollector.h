@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace llaminar2
@@ -55,7 +56,41 @@ namespace llaminar2
             std::string name;   ///< Exact counter/timer name within the domain.
         };
 
+        /**
+         * @brief Return whether any structured performance evidence is requested.
+         *
+         * This broad gate controls inexpensive producers only. Expensive
+         * instrumentation families, such as per-stage CPU clocks or GPU
+         * events, must additionally consult their family-specific gate.
+         */
         static bool isEnabled();
+
+        /**
+         * @brief Return whether one structured evidence domain is requested.
+         *
+         * `LLAMINAR_PERF_STATS_FILTER` is a collection contract, not merely an
+         * export formatter. A non-empty filter enables only matching domains
+         * (including a qualified `domain.name` prefix), allowing expensive
+         * producers to remain entirely dormant during focused measurements.
+         * An enabled export with no filter retains all domains.
+         *
+         * @param domain Exact PerfStats domain owned by the caller.
+         */
+        static bool isDomainEnabled(std::string_view domain);
+
+        /**
+         * @brief Return whether per-stage CPU wall-clock timing is requested.
+         *
+         * A generic PerfStats export does not enable this hot-path
+         * instrumentation. Callers must explicitly request a `stage_cpu` or
+         * `stage_cpu_detail` filter, or set
+         * `LLAMINAR_PERF_STATS_CPU_STAGE_TIMING=1`.
+         */
+        static bool cpuStageTimingEnabled();
+
+        /**
+         * @brief Return whether per-stage GPU event timing is requested.
+         */
         static bool gpuStageEventTimingEnabled();
         static void reset();
         static void resetPreservingDomains(
@@ -117,6 +152,15 @@ namespace llaminar2
             const std::vector<std::string> &filters = {},
             size_t max_records = 120);
 
+        /**
+         * @brief Export configured reports without allowing MPI ranks to race.
+         *
+         * Plain JSON/CSV paths are written by rank zero. A path containing the
+         * literal `{rank}` token opts into one report per participant and is
+         * expanded with that process's MPI rank before writing.
+         *
+         * @return true when every requested export completed successfully.
+         */
         static bool flushFromEnv();
 
         class ScopedTimer

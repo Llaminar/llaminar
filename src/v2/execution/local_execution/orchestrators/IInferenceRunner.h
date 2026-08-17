@@ -19,6 +19,8 @@
 #include <stdexcept>
 
 #include "../../../backends/DeviceId.h"
+#include "../../moe/DeviceMoERebalanceABI.h"
+#include "../../moe/MoEOverlayAuthorityExecution.h"
 #include "../../mtp/MTPRejectionSampler.h"
 #include "../../mtp/MTPVerifierOutcomeGraph.h"
 #include "../../prefix_cache/PrefixCacheStateProbe.h"
@@ -37,6 +39,34 @@ namespace llaminar2
     struct MTPSpecDecodeVerifierInputPlan;
     struct PrefillChunkSchedulerPolicy;
     class MoERebalanceController;
+    class MoEOverlayInferenceTransactionCoordinator;
+
+    /**
+     * @brief Frozen setup contract for the executable serving graph family.
+     *
+     * The orchestration memory plan is the authority for every physical
+     * prefill shape admitted by a distributed ExpertOverlay cell.  Passing
+     * that exact list into graph materialization prevents a device runner from
+     * independently re-deriving capacity from local environment state.  The
+     * padding token participates in native graph identity because it is an
+     * immediate parameter of the captured chunk-materialization kernel.
+     */
+    struct ServingGraphFamilyMaterializationPlan
+    {
+        std::vector<int> prefill_bucket_rows; ///< Complete admitted physical bucket ladder.
+        int prefill_pad_token_id = 0;         ///< Token written to inactive rows in every bucket.
+
+        /** @brief True when the setup contract names at least one physical graph. */
+        bool valid() const noexcept
+        {
+            return !prefill_bucket_rows.empty() &&
+                   std::all_of(
+                       prefill_bucket_rows.begin(),
+                       prefill_bucket_rows.end(),
+                       [](int rows)
+                       { return rows > 0; });
+        }
+    };
 
     /**
      * @brief Lightweight view of a device runner's local logits state
@@ -352,6 +382,8 @@ namespace llaminar2
         int published_state_commit_count = 0; ///< Total main-graph state rows committed by the device.
         int attempted_draft_token_count = 0; ///< Sum of device-selected draft widths.
         int verifier_token_count = 0; ///< Sum of logical verifier widths, including condition rows.
+        int last_transaction_draft_depth = 0; ///< Selected width of the final committed transaction.
+        int last_transaction_emitted_token_count = 0; ///< Response width of the final transaction.
         int final_draft_depth = 0; ///< Device selector at the terminal boundary.
         int depth_evaluated_window_count = 0; ///< Device-owned dynamic-policy windows evaluated.
         int depth_update_count = 0; ///< Applied dynamic selector transitions.
@@ -461,6 +493,88 @@ namespace llaminar2
         HostScheduledCapturedTransactions,
         Unsupported,
     };
+
+    /**
+     * @brief Backend policy for one committed device MoE maintenance edge.
+     *
+     * CUDA owns the complete `publish -> IF(due) maintenance -> acknowledge`
+     * graph on device. HIP lacks conditional graph nodes, so homogeneous ROCm
+     * domains use a rank-validated ticket to choose between already captured
+     * maintenance and acknowledgement graphs. `Inactive` means this runner has
+     * no homogeneous device-owned rebalance controller; `Unsupported` is a
+     * fatal incomplete implementation, never permission to select another path.
+     */
+    enum class DeviceMoERebalanceMaintenanceExecutionPolicy : uint8_t
+    {
+        Inactive = 0,
+        NativeConditionalGraph,
+        HostScheduledCapturedMaintenance,
+        Unsupported,
+    };
+
+    /**
+     * @brief Conservative HIP ticket-observation cadence from immutable setup.
+     *
+     * This is not a host mirror of the device controller. The two round
+     * intervals are immutable graph configuration and the per-boundary bound
+     * is the largest commit that the configured serial/MTP transaction can
+     * make. Together they prove how many complete decode transactions can run
+     * through a captured device-only publish/ack graph before maintenance could
+     * possibly become due. The eventual ticket remains the sole live decision.
+     */
+    struct DeviceMoERebalanceHostedObservationSchedule
+    {
+        uint32_t initial_round_interval = 0;
+        uint32_t recurring_round_interval = 0;
+        uint32_t maximum_committed_rounds_per_boundary = 0;
+
+        /** @brief Return true when every cadence divisor is usable. */
+        constexpr bool valid() const noexcept
+        {
+            return initial_round_interval > 0u &&
+                   recurring_round_interval > 0u &&
+                   maximum_committed_rounds_per_boundary > 0u;
+        }
+
+        /**
+         * @brief Boundaries required before @p remaining_rounds can reach zero.
+         *
+         * The ceiling division deliberately permits an early observation when
+         * MTP accepts fewer rows than its configured maximum. It can never
+         * schedule an observation after a due edge.
+         */
+        constexpr uint32_t boundariesUntilPotentiallyDue(
+            uint32_t remaining_rounds) const noexcept
+        {
+            return valid() && remaining_rounds > 0u
+                       ? 1u +
+                             (remaining_rounds - 1u) /
+                                 maximum_committed_rounds_per_boundary
+                       : 0u;
+        }
+
+        friend constexpr bool operator==(
+            const DeviceMoERebalanceHostedObservationSchedule &,
+            const DeviceMoERebalanceHostedObservationSchedule &) = default;
+    };
+
+    /** @brief Stable diagnostic name for a device MoE scheduler policy. */
+    constexpr const char *deviceMoERebalanceMaintenanceExecutionPolicyName(
+        DeviceMoERebalanceMaintenanceExecutionPolicy policy) noexcept
+    {
+        switch (policy)
+        {
+        case DeviceMoERebalanceMaintenanceExecutionPolicy::Inactive:
+            return "inactive";
+        case DeviceMoERebalanceMaintenanceExecutionPolicy::NativeConditionalGraph:
+            return "native_conditional_graph";
+        case DeviceMoERebalanceMaintenanceExecutionPolicy::HostScheduledCapturedMaintenance:
+            return "host_scheduled_captured_maintenance";
+        case DeviceMoERebalanceMaintenanceExecutionPolicy::Unsupported:
+            return "unsupported";
+        }
+        return "invalid";
+    }
 
     /**
      * @brief Return the stable diagnostic name for an MTP loop policy.
@@ -936,14 +1050,27 @@ namespace llaminar2
      * Returned by getSnapshotWithShape() to provide shape information
      * alongside the raw FP32 data pointer. The shape (rows, cols) comes
      * from the stage's getDumpInfo() at capture time, so stages own their
-     * own dimension reporting.
+     * own dimension reporting. Production snapshot providers also attach a
+     * type-erased lifetime token: code that retains SnapshotInfo across a
+     * later graph callback, reset, or map replacement keeps the exact
+     * captured tensor alive through that token.
      */
     struct SnapshotInfo
     {
-        const float *data = nullptr; ///< Pointer to FP32 snapshot data (not owned)
+        const float *data = nullptr; ///< Pointer to immutable FP32 snapshot data.
         size_t size = 0;             ///< Total element count (rows * cols)
         size_t rows = 0;             ///< Logical rows (e.g. seq_len)
         size_t cols = 0;             ///< Logical cols (e.g. hidden_dim, kv_dim, d_ff)
+
+        /**
+         * @brief Retains the publication backing data when the provider has ownership.
+         *
+         * SnapshotInfo remains a lightweight view, so this type-erased token
+         * avoids exposing SnapshotCapture storage through every runner
+         * interface. A null token is permitted for older mock/static providers
+         * whose runner itself owns the data for the caller's whole operation.
+         */
+        std::shared_ptr<const void> lifetime_owner;
 
         explicit operator bool() const { return data != nullptr && size > 0; }
     };
@@ -1138,6 +1265,67 @@ namespace llaminar2
         virtual bool forwardPrefill(const int *tokens, int seq_len)
         {
             return forward(tokens, seq_len);
+        }
+
+        /**
+         * @brief Capture and instantiate the complete serving graph family.
+         *
+         * This setup-only operation must not execute model arithmetic, mutate
+         * request/KV state, publish sparse tickets, or advance a transaction.
+         * GPU implementations retain the resulting native executables so the
+         * first admitted request is an ordinary replay. Composite runners must
+         * invoke every symmetric LocalTP participant concurrently.
+         *
+         * @param plan Frozen orchestration-owned physical graph inventory.
+         * @return True only when every required executable is resident.
+         */
+        virtual bool materializeServingGraphFamilyWithoutLaunch(
+            const ServingGraphFamilyMaterializationPlan &plan)
+        {
+            (void)plan;
+            return false;
+        }
+
+        /**
+         * @brief Install the request generation used by graph-native MoE sparse collectives.
+         *
+         * Distributed ExpertOverlay graphs are materialized independently on
+         * their continuation and expert ranks. The orchestration layer supplies
+         * one non-zero generation at each request boundary so graph capture or
+         * cache lifetime can never become part of a sparse wire key. Runners
+         * that do not implement graph-native ExpertOverlay return false.
+         *
+         * @param generation_id Monotonic root-authoritative request generation.
+         * @return True only when the runner accepted the immutable generation.
+         */
+        virtual bool setMoEOverlayCollectiveRequestGeneration(
+            uint64_t generation_id)
+        {
+            (void)generation_id;
+            return false;
+        }
+
+        /**
+         * @brief Bind the rank-wide heterogeneous ExpertOverlay ticket authority.
+         *
+         * A single-device continuation uses participant index zero. Composite
+         * rank runners propagate the same shared coordinator to every local
+         * graph with a distinct stable index. The coordinator publishes one
+         * remote ticket only after authenticating symmetric graph geometry;
+         * remote expert-only runners never receive this source-side binding.
+         *
+         * @param coordinator Setup-owned rank transaction coordinator.
+         * @param continuation_participant_index Stable local graph index.
+         * @return True only when this runner can publish at real graph edges.
+         */
+        virtual bool setMoEOverlayInferenceTransactionCoordinator(
+            std::shared_ptr<MoEOverlayInferenceTransactionCoordinator>
+                coordinator,
+            int continuation_participant_index)
+        {
+            (void)coordinator;
+            (void)continuation_participant_index;
+            return false;
         }
 
         /**
@@ -2502,16 +2690,16 @@ namespace llaminar2
         virtual bool supportsMTPTokenCoordination() const { return false; }
 
         /**
-         * @brief True when LocalTP MTP verifier graphs use a replicated full head.
+         * @brief True when MTP verifier graphs use a mirrored terminal head.
          *
-         * This is a topology/configuration fact, not a fallback capability. A
-         * LocalTP rank uses it to choose the economical verifier contract: every
-         * child has full-vocabulary verifier logits, so every child can reduce its
-         * own compact outcome and later publish from that same device-resident
-         * handle. Returning false means the child is exposing sharded verifier
-         * logits and rank-scope candidate coordination is still required.
+         * This is a declarative ownership fact, not a fallback capability. In
+         * every TP scope, each participant owns full-vocabulary verifier logits
+         * and may reduce its compact outcome locally before publishing from the
+         * same device-resident handle. Returning false means the explicitly
+         * vocabulary-sharded policy is active and rank-scope candidate
+         * coordination is required.
          */
-        virtual bool usesMirroredLocalTPMTPHeadForVerifier() const { return false; }
+        virtual bool usesMirroredMTPHeadForVerifier() const { return false; }
 
         /**
          * @brief Sample the current MTP sidecar logits in greedy mode.
@@ -3122,6 +3310,86 @@ namespace llaminar2
          * forward execution is deliberately not a substitute for this hook.
          */
         virtual bool maybeApplyDecodeBoundaryMaintenance() { return true; }
+
+        /**
+         * @brief Select the exact maintenance scheduler before a boundary.
+         *
+         * Rank schedulers require every collective participant to report the
+         * same non-inactive policy. A homogeneous CUDA domain must report the
+         * native conditional graph; a homogeneous ROCm domain must report the
+         * authenticated hosted-ticket policy until HIP gains equivalent graph
+         * nodes. The default is inactive for CPU and non-MoE runners.
+         */
+        virtual DeviceMoERebalanceMaintenanceExecutionPolicy
+        deviceMoERebalanceMaintenanceExecutionPolicy() const noexcept
+        {
+            return DeviceMoERebalanceMaintenanceExecutionPolicy::Inactive;
+        }
+
+        /**
+         * @brief Return immutable bounds for economical hosted observation.
+         *
+         * Hosted ROCm implementations must return one valid schedule shared by
+         * every collective participant. Other policies return an invalid empty
+         * schedule because they never use a host ticket cadence.
+         */
+        virtual DeviceMoERebalanceHostedObservationSchedule
+        deviceMoERebalanceHostedObservationSchedule() const noexcept
+        {
+            return {};
+        }
+
+        /**
+         * @brief Validate one provably non-due HIP boundary transaction.
+         *
+         * Ordinary serial decode owns publish/ack inside its complete captured
+         * graph, while grouped MTP owns publication in accepted-state commit
+         * and acknowledgement at its next admission. This hook verifies that
+         * graph topology was installed and records scheduler evidence; it must
+         * launch no graph, record no event, release no ExpertOverlay reader,
+         * and perform no D2H. Callers may use it only while the immutable
+         * hosted schedule proves the current boundary cannot be due.
+         */
+        virtual bool
+        submitHostScheduledDeviceMoERebalanceKnownNonDueBoundary()
+        {
+            return false;
+        }
+
+        /**
+         * @brief Publish and observe one fresh HIP maintenance ticket.
+         *
+         * Implementations join the committed inference timeline, replay the
+         * captured ticket publisher over the already-published device edge,
+         * and copy only
+         * @ref DeviceMoERebalanceDispatchTicket to host. They retain the current
+         * ExpertOverlay reader until an authenticated due decision establishes
+         * that a placement writer will run. They do not submit maintenance or
+         * acknowledgement until the rank has compared every participant's
+         * decision.
+         */
+        virtual bool observeDeviceMoERebalanceDispatchTicket(
+            DeviceMoERebalanceDispatchTicket *out_ticket)
+        {
+            (void)out_ticket;
+            return false;
+        }
+
+        /**
+         * @brief Submit the rank-authenticated HIP maintenance decision.
+         *
+         * A due ticket submits the retained collective maintenance graph. A
+         * pending non-due MTP ticket submits the retained acknowledgement
+         * graph, while an already-acknowledged serial-decode ticket performs no
+         * graph work. The call must byte-match this runner's last observation
+         * and performs no host state upload or additional ticket read.
+         */
+        virtual bool submitHostScheduledDeviceMoERebalanceMaintenance(
+            const DeviceMoERebalanceDispatchTicket &ticket)
+        {
+            (void)ticket;
+            return false;
+        }
 
         /**
          * @brief Drain completed decode-boundary maintenance diagnostics.
@@ -4201,16 +4469,18 @@ namespace llaminar2
          * The first externally orchestrated transaction must already have
          * committed its resident response/state rows, and every child graph in
          * the family must already own a strict monolithic executable. In MoE
-         * domains this includes one completed maintenance boundary: its first
-         * execution both consumes the committed transaction and atomically
-         * materializes the reusable maintenance child before this method clones
-         * it into the parent.
+         * domains this method also owns the first completed maintenance
+         * boundary: every rank participant launches that boundary on its
+         * persistent worker before cloning the now-materialized maintenance
+         * child into the parent. Keeping the bootstrap inside the runner makes
+         * it impossible for host orchestration to become a second placement
+         * scheduler.
          *
          * Rank implementations must complete this preparation for every local
-         * participant before any participant launches. The method performs
-         * graph composition only; it must not launch generation, synchronize a
-         * stream/device, materialize live state on the host, or recover through
-         * segmented/eager execution.
+         * participant before any participant launches. The method performs the
+         * first asynchronous maintenance publication and graph composition; it
+         * must not launch generation, synchronize a stream/device, materialize
+         * live state on the host, or recover through segmented/eager execution.
          *
          * @param request_count Number of admitted resident controller rows.
          * @param draft_depth Fixed depth, or maximum capture depth for a dynamic
@@ -4255,8 +4525,9 @@ namespace llaminar2
         /**
          * @brief Observe one authenticated device-owned graph-dispatch decision.
          *
-         * This operation exists only for the explicit HIP hosted-transaction
-         * policy. Implementations publish a fixed ticket on device, enqueue one
+         * This operation exists only for the explicit hosted-transaction
+         * policy used by HIP conditional-graph emulation and heterogeneous
+         * sparse-collective boundaries. Implementations publish a fixed ticket on device, enqueue one
          * ticket-only D2H copy, and wait on that copy's exact event. They must
          * never materialize a compact verifier outcome or any mutable inference
          * state. Rank schedulers call this method for every participant and
@@ -4273,13 +4544,68 @@ namespace llaminar2
         }
 
         /**
-         * @brief Submit the branch selected by the last observed HIP ticket.
+         * @brief Validate one ticket and expose its ordered hosted fragments.
          *
-         * The ticket must byte-match the runner's last authenticated snapshot.
-         * A due maintenance graph is submitted first; a complete ticket then
-         * publishes terminal readiness, while a live ticket submits exactly one
-         * retained depth branch followed by the next ticket observation. The
-         * call is asynchronous and performs no host wait or state upload.
+         * A rank scheduler calls this for every participant before submitting
+         * any fragment. Implementations must authenticate the last observed
+         * ticket, retire the prior sparse graph sequence at its exact ticket
+         * fence, and open the selected next sequence without launching work.
+         * The returned count includes due maintenance and is zero only for a
+         * terminal ticket with no maintenance.
+         *
+         * @param ticket Last authenticated device dispatch decision.
+         * @param out_fragment_count Number of fragments selected by the ticket.
+         * @return True when a non-overlapping advance was opened.
+         */
+        virtual bool beginHostScheduledDeviceGenerationAdvance(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket,
+            size_t *out_fragment_count)
+        {
+            (void)ticket;
+            if (out_fragment_count)
+                *out_fragment_count = 0;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue one ordered fragment of an opened hosted advance.
+         *
+         * Rank orchestration submits the same fragment ordinal concurrently on
+         * every LocalTP participant, then waits only for those host submissions
+         * to return before moving to the next ordinal. This preserves symmetric
+         * sparse graph-group entry without synchronizing device execution.
+         */
+        virtual bool submitHostScheduledDeviceGenerationFragment(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket,
+            size_t fragment_index)
+        {
+            (void)ticket;
+            (void)fragment_index;
+            return false;
+        }
+
+        /**
+         * @brief Seal one fully submitted hosted advance.
+         *
+         * Live tickets enqueue the next immutable ticket observation. Terminal
+         * tickets publish terminal device-state readiness. The method performs
+         * no device synchronization and rejects missing or duplicate fragments.
+         */
+        virtual bool finishHostScheduledDeviceGenerationAdvance(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket)
+        {
+            (void)ticket;
+            return false;
+        }
+
+        /**
+         * @brief Submit the branch selected by the last observed hosted ticket.
+         *
+         * The default remains unsupported. Production device/rank runners use
+         * the begin/fragment/finish protocol above so a heterogeneous retained
+         * branch can interleave symmetric participant submissions at each
+         * sparse-collective boundary. The call is asynchronous with respect to
+         * device execution and never uploads mutable inference state.
          *
          * @param ticket Last ticket returned by this runner.
          * @return true when the next device work was submitted successfully.
@@ -4697,14 +5023,35 @@ namespace llaminar2
         }
 
         /**
-         * @brief True when graph execution owns the MoE rebalance publish/apply loop.
+         * @brief Return where the sole ExpertOverlay authority executes.
          *
-         * Homogeneous GPU LocalTP domains can keep decode histograms, replica
-         * selection, and runtime-table bank flips on device. Runners reporting
-         * this capability must not also run the legacy host histogram sync +
-         * apply path at decode boundaries.
+         * This is topology, not an optional capability bit. A runner that
+         * participates in an ExpertOverlay graph returns the frozen selection
+         * carried by its graph configuration. Composite runners must require
+         * every participant to report the same selection; disagreement is an
+         * invalid graph family rather than permission to choose a fallback.
          */
-        virtual bool usesDeviceSideMoERebalanceController() const { return false; }
+        virtual MoEOverlayAuthorityExecutionKind
+        moeOverlayAuthorityExecution() const
+        {
+            return MoEOverlayAuthorityExecutionKind::Unresolved;
+        }
+
+        /**
+         * @brief Confirm that the selected device authority owns executable topology.
+         *
+         * This setup-time query is true only for an active dynamic authority
+         * whose required captured maintenance graph, persistent workspace
+         * generation, collective participant, and epoch arena were
+         * materialized. It is not a runtime fallback or a feature probe: a
+         * false result after dynamic device-resident selection is a fatal
+         * model-construction error. Static authorities return false because
+         * they deliberately own no movement executable.
+         */
+        virtual bool deviceResidentMoEOverlayMaintenanceReady() const
+        {
+            return false;
+        }
 
         /**
          * @brief Participant index used for domain-scoped MoE rebalance actions.

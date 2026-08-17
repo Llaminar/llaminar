@@ -39,13 +39,16 @@ namespace llaminar2
           device_(DeviceId::cpu()),
           device_blocks_(nullptr)
     {
-        if (shape_.size() != 2)
+        if (shape_.size() != 2u && shape_.size() != 3u)
         {
-            throw std::invalid_argument("Q5_0Tensor requires 2D shape");
+            throw std::invalid_argument("Q5_0Tensor requires a 2D matrix or 3D expert tensor");
         }
 
-        // Validate block alignment
-        const size_t num_elements = shape_[0] * shape_[1];
+        // A 3D GGUF expert tensor is [K, N, E]. The payload remains one
+        // contiguous sequence of Q5 blocks; expert views later expose [N, K].
+        size_t num_elements = 1u;
+        for (const size_t dimension : shape_)
+            num_elements *= dimension;
         const size_t num_blocks = (num_elements + Q5_0Block::BLOCK_SIZE - 1) / Q5_0Block::BLOCK_SIZE;
         const size_t expected_bytes = num_blocks * sizeof(Q5_0Block);
 
@@ -636,10 +639,10 @@ namespace llaminar2
         return fp16_to_fp32(q5_block.d);
     }
 
-    void Q5_0Tensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    void Q5_0Tensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
     {
-        const size_t linear = vnniLinearIdx(ctx, n, b);
-        const auto *blk = &typed_data()[static_cast<size_t>(n) * ctx.blocks_per_row + b];
+        const size_t linear = vnniLinearIdx(ctx, destination_n, b);
+        const auto *blk = &typed_data()[static_cast<size_t>(source_n) * ctx.blocks_per_row + b];
         uint8_t *dst = vnniPayloadDst(ctx, linear);
         std::memcpy(dst, blk->qs, 16);
         std::memcpy(dst + 16, blk->qh, 4);

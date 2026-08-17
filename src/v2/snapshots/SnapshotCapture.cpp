@@ -1,13 +1,27 @@
 /**
  * @file SnapshotCapture.cpp
- * @brief Implementation of snapshot capture logic
+ * @brief Converts concrete graph-stage observations into stable parity keys.
+ *
+ * Snapshot capture is diagnostic-only: graph execution publishes each selected
+ * stage's already-produced tensor through its declared stream/event edge, and
+ * this component copies that host-visible observation into the semantic names
+ * consumed by model parity tests and their CSV evidence.  It deliberately
+ * maps by the real producing graph node rather than by a historical model
+ * convention so optimized, captured, and heterogeneous paths expose the same
+ * numerical checkpoints without changing production arithmetic. Segmented
+ * prefill additionally retains each live bucket under an explicit context and
+ * joins sequence-shaped values back into one full-prompt checkpoint only after
+ * all chunks have published their diagnostic copies.
  *
  * Extracted from DeviceGraphOrchestrator.h (Phase 2 of DGO refactor).
  */
 
 #include "SnapshotCapture.h"
 
+#include <algorithm>
 #include <cctype>
+#include <limits>
+#include <string_view>
 
 namespace llaminar2
 {
@@ -35,6 +49,39 @@ namespace llaminar2
             while (!result.empty() && result.back() == '_')
                 result.pop_back();
             return result.empty() ? "CONTEXT" : result;
+        }
+
+        /**
+         * @brief Name one ordered cumulative ExpertOverlay contribution.
+         *
+         * Each graph-native overlay ticket consume copies the routed-expert
+         * accumulator back to the continuation participant after exactly one
+         * target has returned its sparse rows.  The ordinary
+         * `MOE_EXPERT_OUTPUT` key intentionally keeps only the final consume,
+         * which is the semantic model checkpoint.  This diagnostic key retains
+         * each intermediate cumulative value as well, allowing a parity report
+         * to isolate the participant that first introduces a numerical error.
+         *
+         * @param stage_name Concrete ticket-consume graph node name.
+         * @return Stable semantic key, or an empty string for a malformed name.
+         */
+        std::string overlayTicketCumulativeSnapshotKey(
+            const std::string &stage_name)
+        {
+            constexpr std::string_view kTicketConsume =
+                "_moe_overlay_ticket_consume_";
+            const size_t marker = stage_name.find(kTicketConsume);
+            if (marker == std::string::npos)
+                return {};
+
+            const std::string prefix = stage_name.substr(0, marker);
+            const std::string participant = stage_name.substr(
+                marker + kTicketConsume.size());
+            if (prefix.empty() || participant.empty())
+                return {};
+
+            return prefix + "_MOE_OVERLAY_CUMULATIVE_" +
+                   snapshotContextPrefix(participant);
         }
     } // namespace
 
@@ -72,6 +119,25 @@ namespace llaminar2
                 storeOutput(prefix + "_Q_PROJECTION", dump.outputs[0]);
                 storeOutput(prefix + "_K_PROJECTION", dump.outputs[1]);
                 storeOutput(prefix + "_V_PROJECTION", dump.outputs[2]);
+            }
+            return;
+        }
+
+        /*
+         * A K/V-only MTP catch-up graph deliberately omits query projection,
+         * but the fused stage still owns two independently meaningful outputs.
+         * Never collapse output K into an ambiguous `KV_PROJ` alias and drop V:
+         * the canonical K/V names retain their column-parallel schema contract
+         * and line up with the same PyTorch checkpoints as the full sidecar.
+         */
+        if (name.find("_kv_proj") != std::string::npos)
+        {
+            const size_t kv_pos = name.find("_kv_proj");
+            const std::string prefix = name.substr(0, kv_pos);
+            if (dump.outputs.size() >= 2)
+            {
+                storeOutput(prefix + "_K_PROJECTION", dump.outputs[0]);
+                storeOutput(prefix + "_V_PROJECTION", dump.outputs[1]);
             }
             return;
         }
@@ -272,7 +338,7 @@ namespace llaminar2
                 auto data = extractFp32FromOutput(out);
                 LOG_DEBUG("[Snapshot] lm_head_allgather handler: storing as LM_HEAD (overwriting partial), count=" << data.size());
                 if (!data.empty())
-                    snapshots_["LM_HEAD"] = {std::move(data), out.rows, out.cols};
+                    storeSnapshot("LM_HEAD", std::move(data), out.rows, out.cols);
             }
             return;
         }
@@ -295,8 +361,11 @@ namespace llaminar2
                 LOG_DEBUG("[Snapshot] FusedResidualNorm: storing residual_out as key="
                           << key << "_RESIDUAL_OUT count=" << data.size());
                 if (!data.empty())
-                    snapshots_[key + "_RESIDUAL_OUT"] =
-                        {std::move(data), dump.outputs[0].rows, dump.outputs[0].cols};
+                    storeSnapshot(
+                        key + "_RESIDUAL_OUT",
+                        std::move(data),
+                        dump.outputs[0].rows,
+                        dump.outputs[0].cols);
             }
 
             if (dump.outputs[1].data)
@@ -305,7 +374,11 @@ namespace llaminar2
                 LOG_DEBUG("[Snapshot] FusedResidualNorm: storing norm_output as key="
                           << key << " count=" << data.size());
                 if (!data.empty())
-                    snapshots_[key] = {std::move(data), dump.outputs[1].rows, dump.outputs[1].cols};
+                    storeSnapshot(
+                        key,
+                        std::move(data),
+                        dump.outputs[1].rows,
+                        dump.outputs[1].cols);
             }
             return;
         }
@@ -451,12 +524,44 @@ namespace llaminar2
             if (router_logits && router_logits->data)
                 storeOutput(prefix + "_MOE_ROUTER_OUTPUT", *router_logits);
             if (routing_indices && routing_indices->data)
+            {
+                LOG_DEBUG("[Snapshot] MoE routing indices stage=" << name
+                                                                     << " shape=["
+                                                                     << routing_indices->rows
+                                                                     << ','
+                                                                     << routing_indices->cols
+                                                                     << "] bytes="
+                                                                     << routing_indices->byte_size);
                 storeOutput(prefix + "_MOE_ROUTING_INDICES", *routing_indices);
+            }
             if (routing_weights && routing_weights->data)
+            {
+                LOG_DEBUG("[Snapshot] MoE routing weights stage=" << name
+                                                                     << " shape=["
+                                                                     << routing_weights->rows
+                                                                     << ','
+                                                                     << routing_weights->cols
+                                                                     << "] bytes="
+                                                                     << routing_weights->byte_size);
                 storeOutput(prefix + "_MOE_ROUTING_WEIGHTS", *routing_weights);
+            }
 
             if (router_logits || routing_indices || routing_weights)
                 return;
+        }
+
+        /*
+         * Preserve the real per-target accumulator before the generic mapping
+         * below overwrites `layerN_MOE_EXPERT_OUTPUT` with the final target's
+         * result.  This creates diagnostic-only snapshots; it neither changes
+         * the ticket protocol nor adds a producer-side copy.
+         */
+        if (const std::string cumulative_key =
+                overlayTicketCumulativeSnapshotKey(name);
+            !cumulative_key.empty() && !dump.outputs.empty() &&
+            dump.outputs.front().data)
+        {
+            storeOutput(cumulative_key, dump.outputs.front());
         }
 
         // Standard single-output stages
@@ -478,8 +583,197 @@ namespace llaminar2
             }
 
             if (!data.empty())
-                snapshots_[key] = {std::move(data), out.rows, out.cols};
+                storeSnapshot(key, std::move(data), out.rows, out.cols);
         }
+    }
+
+    /**
+     * @brief Join context-qualified live rows into the prompt-wide parity view.
+     *
+     * The graph executor has already waited on each producing stream before
+     * this diagnostic boundary. We therefore only copy host-visible FP32
+     * values here. The bare semantic key remains the public parity API, while
+     * each qualified key stays available for a CSV/artifact consumer that must
+     * inspect the exact chunk where a numerical divergence began.
+     */
+    SnapshotChunkSequenceAggregation
+    SnapshotCapture::aggregateSequentialChunkSnapshots(
+        const std::vector<SnapshotChunkSequencePart> &chunks)
+    {
+        SnapshotChunkSequenceAggregation result;
+        if (chunks.empty())
+        {
+            result.error = "cannot aggregate an empty prefill chunk sequence";
+            return result;
+        }
+
+        struct SequencePieces
+        {
+            std::vector<StoredSnapshotHandle> snapshots;
+            std::vector<bool> present;
+        };
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> prefixes;
+        prefixes.reserve(chunks.size());
+        for (size_t index = 0; index < chunks.size(); ++index)
+        {
+            const auto &chunk = chunks[index];
+            if (chunk.context.empty() || chunk.logical_rows == 0)
+            {
+                result.error = "prefill chunk snapshot context is incomplete";
+                return result;
+            }
+
+            const std::string prefix = snapshotContextPrefix(chunk.context) + "_";
+            if (std::find(prefixes.begin(), prefixes.end(), prefix) != prefixes.end())
+            {
+                result.error = "prefill chunk snapshot contexts are not unique";
+                return result;
+            }
+            prefixes.push_back(prefix);
+        }
+
+        std::unordered_map<std::string, SequencePieces> sequences;
+        for (const auto &[key, snapshot] : snapshots_)
+        {
+            for (size_t chunk_index = 0;
+                 chunk_index < prefixes.size();
+                 ++chunk_index)
+            {
+                const std::string &prefix = prefixes[chunk_index];
+                if (key.compare(0, prefix.size(), prefix) != 0)
+                    continue;
+
+                const std::string semantic_key = key.substr(prefix.size());
+                if (semantic_key.empty())
+                {
+                    result.error = "prefill chunk snapshot has an empty semantic key";
+                    return result;
+                }
+
+                auto [it, inserted] = sequences.try_emplace(semantic_key);
+                if (inserted)
+                {
+                    it->second.snapshots.resize(chunks.size());
+                    it->second.present.assign(chunks.size(), false);
+                }
+                if (it->second.present[chunk_index])
+                {
+                    result.error = "duplicate prefill chunk snapshot for '" +
+                                   semantic_key + "'";
+                    return result;
+                }
+
+                /*
+                 * Keep a shared immutable publication while we insert final
+                 * bare aggregates below.  That insertion can rehash the map,
+                 * but it cannot invalidate this handle or its FP32 vector.
+                 */
+                it->second.snapshots[chunk_index] = snapshot;
+                it->second.present[chunk_index] = true;
+                break;
+            }
+        }
+
+        for (const auto &[semantic_key, pieces] : sequences)
+        {
+            if (!pieces.present.front())
+            {
+                result.error = "prefill chunk sequence for '" + semantic_key +
+                               "' has no first chunk";
+                return result;
+            }
+
+            const StoredSnapshot &first = *pieces.snapshots.front();
+            if (first.rows != chunks.front().logical_rows)
+            {
+                /*
+                 * Last-token logits and other terminal-state values are
+                 * legitimately narrower than an input chunk. Publish the
+                 * latest context-qualified observation under the bare key.
+                 * DeviceGraphOrchestrator normally captures an unscoped copy
+                 * too, but making the aggregation self-contained keeps an
+                 * artifact consumer from depending on callback ordering.
+                 */
+                size_t latest_chunk = pieces.present.size();
+                while (latest_chunk > 0 && !pieces.present[latest_chunk - 1])
+                    --latest_chunk;
+                if (latest_chunk == 0)
+                {
+                    result.error = "terminal prefill snapshot for '" +
+                                   semantic_key + "' has no captured chunk";
+                    return result;
+                }
+                snapshots_[semantic_key] = pieces.snapshots[latest_chunk - 1];
+                ++result.terminal_or_nonsequence_keys;
+                continue;
+            }
+
+            if (first.cols == 0 ||
+                first.rows > std::numeric_limits<size_t>::max() / first.cols ||
+                first.data.size() != first.rows * first.cols)
+            {
+                result.error = "prefill chunk sequence for '" + semantic_key +
+                               "' has an invalid first-chunk shape";
+                return result;
+            }
+
+            size_t total_rows = 0;
+            std::vector<float> joined;
+            for (size_t chunk_index = 0;
+                 chunk_index < chunks.size();
+                 ++chunk_index)
+            {
+                if (!pieces.present[chunk_index])
+                {
+                    result.error = "prefill chunk sequence for '" + semantic_key +
+                                   "' is missing chunk " +
+                                   std::to_string(chunk_index);
+                    return result;
+                }
+
+                const StoredSnapshot &piece = *pieces.snapshots[chunk_index];
+                if (piece.rows != chunks[chunk_index].logical_rows ||
+                    piece.cols != first.cols ||
+                    piece.rows > std::numeric_limits<size_t>::max() / piece.cols ||
+                    piece.data.size() != piece.rows * piece.cols ||
+                    total_rows > std::numeric_limits<size_t>::max() - piece.rows)
+                {
+                    result.error = "prefill chunk sequence for '" + semantic_key +
+                                   "' has inconsistent chunk " +
+                                   std::to_string(chunk_index) +
+                                   " (expected rows=" +
+                                   std::to_string(chunks[chunk_index].logical_rows) +
+                                   ", cols=" + std::to_string(first.cols) +
+                                   "; got rows=" + std::to_string(piece.rows) +
+                                   ", cols=" + std::to_string(piece.cols) +
+                                   ", elements=" + std::to_string(piece.data.size()) +
+                                   ")";
+                    return result;
+                }
+                total_rows += piece.rows;
+
+                if (joined.size() > std::numeric_limits<size_t>::max() -
+                                        piece.data.size())
+                {
+                    result.error = "prefill chunk sequence for '" + semantic_key +
+                                   "' overflows diagnostic storage";
+                    return result;
+                }
+                joined.insert(joined.end(), piece.data.begin(), piece.data.end());
+            }
+
+            storeSnapshot(
+                semantic_key,
+                std::move(joined),
+                total_rows,
+                first.cols);
+            ++result.aggregated_sequence_keys;
+        }
+
+        result.ok = true;
+        return result;
     }
 
     // =========================================================================
@@ -601,6 +895,37 @@ namespace llaminar2
             return stage_name.substr(0, pos) + "_MOE_EXPERT_OUTPUT_ALLREDUCED";
         }
 
+        /*
+         * The MTP graph builder names its embedding collective with the
+         * implementation-facing lower-case prefix `mtp<depth>`, whereas all
+         * other depth-qualified diagnostic keys use the canonical upper-case
+         * `MTP<depth>` grammar.  Normalize this one boundary before the generic
+         * suffix table runs.  Leaving the prefix lower-case makes
+         * extractStageType() correctly reject it as an operational key, so the
+         * post-allreduce embedding silently becomes UNKNOWN during LocalTP
+         * snapshot combination.
+         */
+        constexpr std::string_view kEmbeddingAllreduce =
+            "_embedding_allreduce";
+        if (stage_name.ends_with(kEmbeddingAllreduce))
+        {
+            std::string prefix = stage_name.substr(
+                0, stage_name.size() - kEmbeddingAllreduce.size());
+            if (prefix.starts_with("mtp") && prefix.size() > 3)
+            {
+                const bool numeric_depth = std::all_of(
+                    prefix.begin() + 3,
+                    prefix.end(),
+                    [](unsigned char character)
+                    {
+                        return std::isdigit(character) != 0;
+                    });
+                if (numeric_depth)
+                    prefix.replace(0, 3, "MTP");
+            }
+            return prefix + "_EMBEDDING_ALLREDUCED";
+        }
+
         // Ordered vector: longest/most-specific suffixes FIRST to ensure correct
         // prefix extraction. E.g. "_gdn_wo_allreduce" must match before "_wo_allreduce"
         // so the prefix is "layerN" (not "layerN_gdn").
@@ -611,6 +936,9 @@ namespace llaminar2
         // TPSnapshot. This prevents graph-captured collective diagnostics from
         // overwriting the semantic stage snapshot used by parity tests.
         static const std::vector<std::pair<std::string, std::string>> suffix_map = {
+            // MTP-prefixed embedding collectives retain the same canonical
+            // post-reduction name as the unprefixed model graph.
+            {"_embedding_allreduce", "_EMBEDDING_ALLREDUCED"},
             // GDN (Gated Delta Net) linear attention stages — longest suffixes first
             {"_gdn_wo_allreduce", "_ATTENTION_OUTPUT_ALLREDUCED"},
             {"_gdn_out_proj", "_ATTENTION_OUTPUT"},
@@ -644,7 +972,17 @@ namespace llaminar2
             {"_ffn_residual", "_FFN_RESIDUAL"},
             // MoE stages
             {"_moe_expert_overlay_fast_allreduce", "_MOE_EXPERT_OUTPUT_ALLREDUCED"},
+            {"_moe_overlay_continuation_broadcast", "_MOE_EXPERT_OUTPUT_ALLREDUCED"},
             {"_moe_canonical_publication_finalize", "_MOE_COMBINED_OUTPUT"},
+            /*
+             * A graph-native ExpertOverlay return is accumulated by CPU/MPI
+             * sparse boundaries and copied back to the continuation GPU by a
+             * ticket-consume stage.  The final consume in layer order holds
+             * the complete routed-expert sum, before shared-expert addition.
+             * Mapping it explicitly keeps heterogeneous parity evidence at
+             * the same semantic checkpoint as the ordinary MoE expert stage.
+             */
+            {"_moe_overlay_ticket_consume", "_MOE_EXPERT_OUTPUT"},
             {"_shared_expert_allreduce", "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"},
             {"_moe_sparse_return_reduce", "_MOE_EXPERT_OUTPUT"},
             {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
@@ -698,6 +1036,11 @@ namespace llaminar2
         {
             const std::string prefix = prefixBefore("_qkv_proj");
             return {prefix + "_Q_PROJECTION", prefix + "_K_PROJECTION", prefix + "_V_PROJECTION"};
+        }
+        if (stage_name.find("_kv_proj") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_kv_proj");
+            return {prefix + "_K_PROJECTION", prefix + "_V_PROJECTION"};
         }
         if (stage_name.find("_gate_up") != std::string::npos)
         {
@@ -763,6 +1106,13 @@ namespace llaminar2
         {
             return {prefixBefore("_shared_expert_allreduce") + "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"};
         }
+        if (stage_name.find("_moe_overlay_continuation_broadcast") !=
+            std::string::npos)
+        {
+            return {
+                prefixBefore("_moe_overlay_continuation_broadcast") +
+                "_MOE_EXPERT_OUTPUT_ALLREDUCED"};
+        }
         if (stage_name.find("_moe_expert_overlay_fast_allreduce") != std::string::npos)
         {
             return {prefixBefore("_moe_expert_overlay_fast_allreduce") + "_MOE_EXPERT_OUTPUT_ALLREDUCED"};
@@ -822,6 +1172,12 @@ namespace llaminar2
             const std::string prefix = prefixBefore("_shared_expert_gate");
             return {prefix + "_MOE_SHARED_GATE_OUTPUT",
                     prefix + "_MOE_COMBINED_OUTPUT"};
+        }
+        if (const std::string cumulative_key =
+                overlayTicketCumulativeSnapshotKey(stage_name);
+            !cumulative_key.empty())
+        {
+            return {convertStageNameToSnapshotKey(stage_name), cumulative_key};
         }
         if (stage_name.find("_moe_routing") != std::string::npos)
         {
@@ -915,13 +1271,27 @@ namespace llaminar2
     // Private helpers
     // =========================================================================
 
+    void SnapshotCapture::storeSnapshot(
+        const std::string &key,
+        std::vector<float> data,
+        size_t rows,
+        size_t cols)
+    {
+        snapshots_[key] = std::make_shared<const StoredSnapshot>(
+            StoredSnapshot{
+                .data = std::move(data),
+                .rows = rows,
+                .cols = cols,
+            });
+    }
+
     void SnapshotCapture::storeOutput(const std::string &key, const StageDumpInfo::OutputBuffer &out)
     {
         if (!out.data)
             return;
         auto data = extractFp32FromOutput(out);
         if (!data.empty())
-            snapshots_[key] = {std::move(data), out.rows, out.cols};
+            storeSnapshot(key, std::move(data), out.rows, out.cols);
     }
 
 } // namespace llaminar2

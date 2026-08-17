@@ -19,6 +19,7 @@ namespace llaminar2
     class ILocalTPContext;
     class IMoEKernel;
     class IMoERuntimeTable;
+    class DeviceMoEOverlayEpochArena;
 
     enum class DeviceMoERebalanceStagePhase
     {
@@ -218,6 +219,8 @@ namespace llaminar2
         static constexpr const char *WS_LLEP_LAYER_PLANS = "moe_rebalance_llep_layer_plans";
         static constexpr const char *WS_GATHERED_TRANSFER_PLAN = "moe_rebalance_gathered_transfer_plan";
         static constexpr const char *WS_GATHERED_COMMAND_HEADER = "moe_rebalance_gathered_command_header";
+        static constexpr const char *WS_TRANSFER_SLOT_CLAIM_INDEX =
+            "moe_rebalance_transfer_slot_claim_index";
         static constexpr const char *WS_WAVE_STATE = "moe_rebalance_wave_state";
         static constexpr const char *WS_GATHERED_WAVE_STATE = "moe_rebalance_gathered_wave_state";
         static constexpr const char *WS_STATUS = "moe_rebalance_status";
@@ -248,6 +251,15 @@ namespace llaminar2
             int apply_layer_idx = -1;
             bool join_transfer_stream_after_copy = true;
             std::shared_ptr<DeviceMoERebalanceTransferState> transfer_state;
+            /**
+             * @brief Optional durable placement-publication authority.
+             *
+             * Only the standalone all-layer maintenance graph may bind this
+             * arena. Current-batch LLEP and route-piggybacked apply stages must
+             * leave it null because their placement is transient or cannot
+             * publish a complete main/MTP runtime-table family.
+             */
+            std::shared_ptr<DeviceMoEOverlayEpochArena> overlay_epoch_arena;
         };
 
         static_assert(StageParamsRequired<Params>);
@@ -358,6 +370,7 @@ namespace llaminar2
         std::string llepLayerPlansBufferName() const;
         std::string gatheredTransferPlanBufferName() const;
         std::string gatheredCommandHeaderBufferName() const;
+        std::string transferSlotClaimIndexBufferName() const;
         std::string waveStateBufferName() const;
         std::string gatheredWaveStateBufferName() const;
         std::string statusBufferName() const;

@@ -250,6 +250,23 @@ namespace llaminar2
         }
 
         /**
+         * @brief Return immutable workspace-backed sideband declarations.
+         *
+         * Graph-lowering tests and topology diagnostics use this view to prove
+         * that a producer was attached to the intended physical collective.
+         * The returned declarations contain stable workspace names rather than
+         * bound device pointers, so inspecting them cannot observe or mutate a
+         * live graph transaction.
+         *
+         * @return Graph-owned sideband declarations in launch order.
+         */
+        [[nodiscard]] const std::vector<TPAllreduceSidebandWorkspaceBinding> &
+        sidebandWorkspaceBindings() const noexcept
+        {
+            return params_.sideband_workspace_bindings;
+        }
+
+        /**
          * @brief Update parameters (for stage reuse)
          * @param params New parameters
          */

@@ -38,6 +38,7 @@ for path_to_add in [str(python_dir), str(workspace_dir)]:
 from python.reference import create_reference_model
 # Reuse the snapshot save/run infrastructure from the dense Qwen3.5 generator
 from python.reference.generate_qwen35_pipeline_snapshots import (
+    QWEN36_MTP_SIDECAR_SNAPSHOT_SCHEMA,
     run_prefill_and_decode,
     write_metadata,
 )
@@ -47,7 +48,18 @@ from python.reference.generate_qwen35_pipeline_snapshots import (
 # C++ integration harness authenticates this marker before reusing expensive
 # 35B sidecar fixtures, preventing an old-but-present NPY file from silently
 # masquerading as the current reference contract.
-MTP_SIDECAR_SNAPSHOT_SCHEMA = 2
+# Schema 5 makes recursive MTP1/MTP2 consume the preceding predictor's
+# shared-head-normalized hidden result. Schema 4 introduced recursive packs
+# but incorrectly chained their pre-normalized FFN residual. Schema 3 restores
+# MOE_ROUTER_OUTPUT to the production graph's full
+# post-softmax expert distribution. Schema 2 incorrectly stored reconstructed
+# pre-softmax logits under that established key.
+MTP_SIDECAR_SNAPSHOT_SCHEMA = QWEN36_MTP_SIDECAR_SNAPSHOT_SCHEMA
+
+# Schema 1 binds the main-model MOE_ROUTER_OUTPUT key to the complete
+# post-softmax probability distribution retained by the live CUDA/ROCm routing
+# workspace. Packs without this marker used the retired raw linear projection.
+MOE_ROUTER_SNAPSHOT_SCHEMA = 1
 
 
 def main():
@@ -110,7 +122,7 @@ Examples:
     parser.add_argument(
         "--mtp-sidecar-snapshots",
         action="store_true",
-        help="Also save decode-step MTP0 sidecar reference snapshots",
+        help="Also save decode-step MTP0..MTP2 sidecar reference snapshots",
     )
 
     args = parser.parse_args()
@@ -149,6 +161,7 @@ Examples:
             args.prompt,
             args.decode_steps,
             args.output,
+            max_draft_depth=3,
             verbose=args.verbose,
         )
         total += mtp_total
@@ -166,6 +179,9 @@ Examples:
         token_ids,
         args.decode_steps,
         decode_tokens,
+        extra_metadata_lines=[
+            f"moe_router_snapshot_schema: {MOE_ROUTER_SNAPSHOT_SCHEMA}"
+        ],
     )
 
     print(f"\n✓ Done! {total} snapshots saved to: {args.output}")

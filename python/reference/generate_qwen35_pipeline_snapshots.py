@@ -41,6 +41,17 @@ for path_to_add in [str(python_dir), str(workspace_dir)]:
 
 from python.reference import create_reference_model, PipelineStage
 from python.reference.pipeline_stages import stage_to_string
+from python.reference.snapshot_metadata import (
+    build_reference_identity,
+    write_metadata_atomically,
+)
+
+
+# Recursive depth semantics are shared by dense and MoE Qwen3.6 sidecars.
+# Schema 5 means MTP1/MTP2 consume the preceding predictor's shared-head-
+# normalized hidden result; earlier experimental packs chained the raw decoder
+# residual and are not valid production parity oracles.
+QWEN36_MTP_SIDECAR_SNAPSHOT_SCHEMA = 5
 
 
 def save_snapshots_as_npy(
@@ -104,39 +115,48 @@ def write_metadata(
     token_ids: list,
     decode_steps: int,
     decode_tokens: Optional[list] = None,
+    extra_metadata_lines: Optional[list[str]] = None,
 ):
-    """Write metadata.txt compatible with parity test loader."""
+    """Publish metadata binding this pack to its exact inference inputs."""
     config = model.hf_model.config
     output_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = output_dir / "metadata.txt"
-    with open(metadata_path, "w") as f:
-        # Snapshot version: bumped when the snapshot format or V-head
-        # reversal semantics change. The C++ parity test framework checks
-        # this version and regenerates snapshots automatically when stale.
-        #   v1: original format
-        #   v2: MoE-only V-head reversal (dense models skip reversal)
-        #   v3: Qwen3.5 prefill GDN conv and Q/K norm snapshots match C++ layout
-        #   v4: GDN alpha/beta projection snapshots are emitted for recurrence debugging
-        f.write(f"snapshot_version: 4\n")
-        f.write(f"Model: {model_path}\n")
-        arch = getattr(config, "architectures", [config.__class__.__name__])
-        f.write(f"Architecture: {arch[0] if arch else config.__class__.__name__}\n")
-        f.write(f"n_layers: {config.num_hidden_layers}\n")
-        f.write(f"n_heads: {config.num_attention_heads}\n")
-        n_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
-        f.write(f"n_kv_heads: {n_kv_heads}\n")
-        f.write(f"d_model: {config.hidden_size}\n")
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        f.write(f"d_head: {head_dim}\n")
-        # MoE configs use moe_intermediate_size instead of intermediate_size
-        d_ff = getattr(config, "intermediate_size", None) or getattr(config, "moe_intermediate_size", 0)
-        f.write(f"d_ff: {d_ff}\n")
-        f.write(f"vocab_size: {config.vocab_size}\n")
-        f.write(f"prompt: {prompt}\n")
-        f.write(f"token_ids: {','.join(map(str, token_ids))}\n")
-        f.write(f"decode_steps: {decode_steps}\n")
-        if decode_tokens:
-            f.write(f"decode_tokens: {','.join(map(str, decode_tokens))}\n")
+    identity = build_reference_identity(
+        model_path, prompt, token_ids, decode_steps
+    )
+    arch = getattr(config, "architectures", [config.__class__.__name__])
+    n_kv_heads = getattr(
+        config, "num_key_value_heads", config.num_attention_heads
+    )
+    head_dim = getattr(
+        config, "head_dim", config.hidden_size // config.num_attention_heads
+    )
+    # MoE configs use moe_intermediate_size instead of intermediate_size.
+    d_ff = getattr(config, "intermediate_size", None) or getattr(
+        config, "moe_intermediate_size", 0
+    )
+    lines = [
+        # v4 emits GDN alpha/beta projections for recurrence diagnostics.
+        "snapshot_version: 4",
+        f"Model: {model_path}",
+        f"Architecture: {arch[0] if arch else config.__class__.__name__}",
+        f"n_layers: {config.num_hidden_layers}",
+        f"n_heads: {config.num_attention_heads}",
+        f"n_kv_heads: {n_kv_heads}",
+        f"d_model: {config.hidden_size}",
+        f"d_head: {head_dim}",
+        f"d_ff: {d_ff}",
+        f"vocab_size: {config.vocab_size}",
+        # Keep token_ids immediately after prompt for the legacy multiline
+        # prompt reader; SHA-256 is the production identity authority.
+        f"prompt: {prompt}",
+        f"token_ids: {','.join(map(str, token_ids))}",
+        *identity.metadata_lines(),
+        *(extra_metadata_lines or []),
+    ]
+    if decode_tokens:
+        lines.append(f"decode_tokens: {','.join(map(str, decode_tokens))}")
+    write_metadata_atomically(metadata_path, lines)
 
 
 def run_prefill_and_decode(
@@ -295,6 +315,14 @@ Examples:
         help="Save decode-step snapshots but skip prefill snapshots",
     )
     parser.add_argument(
+        "--mtp-sidecar-snapshots",
+        action="store_true",
+        help=(
+            "Also save recursive Qwen3.6 MTP0..MTP2 checkpoints from the "
+            "GGUF's real trailing nextn weights"
+        ),
+    )
+    parser.add_argument(
         "--snapshot-decode-steps",
         type=str,
         default="",
@@ -317,6 +345,7 @@ Examples:
     print(f"  Decode steps: {args.decode_steps}")
     print(f"  Metadata only: {args.metadata_only}")
     print(f"  Decode snapshots only: {args.decode_snapshots_only}")
+    print(f"  MTP sidecar snapshots: {args.mtp_sidecar_snapshots}")
     print(f"  Snapshot decode steps: {args.snapshot_decode_steps or '<all>'}")
 
     snapshot_decode_steps: Optional[Set[int]] = None
@@ -356,6 +385,20 @@ Examples:
         save_decode_snapshots=True,
         snapshot_decode_steps=snapshot_decode_steps,
     )
+
+    if args.mtp_sidecar_snapshots and not args.metadata_only:
+        mtp_total = model.generate_mtp_sidecar_decode_snapshots(
+            args.prompt,
+            args.decode_steps,
+            args.output,
+            max_draft_depth=3,
+            verbose=args.verbose,
+        )
+        total += mtp_total
+        (args.output / "mtp_sidecar_snapshot_schema.txt").write_text(
+            f"{QWEN36_MTP_SIDECAR_SNAPSHOT_SCHEMA}\n", encoding="ascii"
+        )
+        print(f"  Captured {mtp_total} MTP sidecar snapshots")
 
     # Write metadata
     write_metadata(

@@ -10,10 +10,13 @@
 #pragma once
 
 #include "../../backends/DeviceId.h"
+#include "MoELayeredExpertOwnership.h"
+#include "RuntimeExpertHistogramDrain.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -32,17 +35,64 @@ namespace llaminar2
         /// falls back to num_layers - 1 for dense/all-routed legacy configs.
         int token_boundary_layer_idx = -1;
         std::vector<DeviceId> sockets;
-        /// Map expert_id -> socket index (index into sockets vector).
-        /// Updated when placement changes.
-        std::vector<int> expert_to_socket;
+        /// Complete per-layer expert ownership used by load diagnostics.
+        /// Updated atomically at accepted Dynamic publication boundaries.
+        MoELayeredExpertOwnership ownership;
     };
 
+    /**
+     * @brief Semantic inference phase that produced routed-expert demand.
+     *
+     * The three production values are retained independently because one
+     * expert activation has a different service cost in serial decode,
+     * bucketed prefill, and grouped MTP verification. `SyntheticTest` is an
+     * ingestion-only alias for decode demand; it lets device-free fixtures use
+     * the historical merge API without creating a fourth production phase.
+     */
     enum class ExpertHistogramSource
     {
         DecodeToken,
         PrefillChunk,
+        GroupedVerifier,
         SyntheticTest,
     };
+
+    /// Number of separately retained production inference phases.
+    inline constexpr std::size_t kExpertHistogramProductionSourceCount = 3;
+
+    /** @brief Typed availability mask in decode/prefill/grouped order. */
+    using ExpertHistogramProductionSourceMask =
+        std::array<bool, kExpertHistogramProductionSourceCount>;
+
+    /** Every production phase is enabled unless runtime policy says otherwise. */
+    inline constexpr ExpertHistogramProductionSourceMask
+        kAllExpertHistogramProductionSources{true, true, true};
+
+    /** @return Dense retained-phase index, or the source-count sentinel. */
+    [[nodiscard]] constexpr std::size_t expertHistogramProductionSourceIndex(
+        ExpertHistogramSource source) noexcept
+    {
+        switch (source)
+        {
+        case ExpertHistogramSource::DecodeToken:
+            return 0;
+        case ExpertHistogramSource::PrefillChunk:
+            return 1;
+        case ExpertHistogramSource::GroupedVerifier:
+            return 2;
+        case ExpertHistogramSource::SyntheticTest:
+            break;
+        }
+        return kExpertHistogramProductionSourceCount;
+    }
+
+    /** @return Whether decode/prefill are present and every bit is typed. */
+    [[nodiscard]] constexpr bool validExpertHistogramProductionSourceMask(
+        const ExpertHistogramProductionSourceMask &mask) noexcept
+    {
+        /* Decode and prefill are universal; grouped verification is optional. */
+        return mask[0] && mask[1];
+    }
 
     struct RoutedExpertHistogramMerge
     {
@@ -79,6 +129,60 @@ namespace llaminar2
         double worst_spread = 0.0;             ///< Worst normalized spread, finite [0,1].
     };
 
+    /**
+     * @brief Immutable routing-evidence generation retained by a migration wave.
+     *
+     * Counts are copied only after the old preallocated bank has stopped
+     * receiving writers. Inference has already switched to the other bank by
+     * then, so a long-running placement/transfer wave cannot erase or mutate
+     * this evidence and cannot lose routes observed after rotation.
+     */
+    struct DecodeExpertHistogramWindow
+    {
+        uint64_t generation = 0;
+        uint64_t token_count = 0;
+        /// Logical rows counted in each production phase, in enum order.
+        std::array<uint64_t, kExpertHistogramProductionSourceCount>
+            source_token_counts{};
+        int num_layers = 0;
+        int num_experts = 0;
+        /// Aggregate [layer][expert] counts retained for existing diagnostics.
+        std::vector<uint64_t> expert_counts;
+        /**
+         * Exact [source][layer][expert] counts for DecodeToken, PrefillChunk,
+         * and GroupedVerifier. The aggregate vector must equal their elementwise
+         * sum; validation rejects a divergent distributed or restored window.
+         */
+        std::vector<uint64_t> source_expert_counts;
+
+        /** @brief Read one frozen layer/expert count, rejecting invalid geometry. */
+        [[nodiscard]] uint64_t activationCount(
+            int layer_idx,
+            int expert_id) const;
+
+        /**
+         * @brief Read one frozen phase/layer/expert count.
+         * @throws std::invalid_argument For the ingestion-only SyntheticTest source.
+         * @throws std::out_of_range For invalid layer or expert geometry.
+         */
+        [[nodiscard]] uint64_t activationCount(
+            ExpertHistogramSource source,
+            int layer_idx,
+            int expert_id) const;
+
+        /** @brief Return all frozen expert counts for one layer. */
+        [[nodiscard]] std::vector<uint64_t> layerHistogram(
+            int layer_idx) const;
+
+        /** @brief Return one phase's frozen expert counts for a layer. */
+        [[nodiscard]] std::vector<uint64_t> layerHistogram(
+            ExpertHistogramSource source,
+            int layer_idx) const;
+
+        /** @return Whether dimensions and flattened storage agree. */
+        [[nodiscard]] bool valid() const noexcept;
+    };
+
     class DecodeExpertHistogram
     {
     public:
@@ -101,7 +205,11 @@ namespace llaminar2
         /// This is used by graph-captured device routing paths where expert
         /// counts stay on device and are merged in batches. The token window is
         /// still advanced once per decode token by the final MoE layer.
-        void recordTokenBoundary(int layer_idx, uint64_t token_count = 1);
+        void recordTokenBoundary(
+            int layer_idx,
+            uint64_t token_count = 1,
+            ExpertHistogramSource source =
+                ExpertHistogramSource::DecodeToken);
 
         /// Merge per-expert activation counts that were accumulated outside the
         /// host hot path, for example in a runtime-table device histogram.
@@ -111,7 +219,9 @@ namespace llaminar2
         void mergeLayerCounts(int layer_idx,
                               const uint64_t *expert_counts,
                               int num_experts,
-                              bool count_window_tokens = false);
+                              bool count_window_tokens = false,
+                              ExpertHistogramSource source =
+                                  ExpertHistogramSource::SyntheticTest);
 
         /// Merge a routed-token slice into the histogram. Only the leading
         /// real_token_count rows are counted; padded bucket rows are ignored.
@@ -120,6 +230,8 @@ namespace llaminar2
             const RoutedExpertHistogramMerge &merge);
 
         using RuntimeHistogramSyncCallback = std::function<bool()>;
+        using RuntimeHistogramDrainCallback =
+            std::function<RuntimeExpertHistogramDrainResult()>;
 
         /// Register a lazy sync source for device/runtime histograms.
         /// Callbacks should merge pending counts into this histogram and reset
@@ -129,13 +241,45 @@ namespace llaminar2
         /// Merge all registered runtime histogram sources into this host view.
         bool syncRuntimeHistograms();
 
+        /**
+         * @brief Register one event-polled device/runtime evidence source.
+         *
+         * Registration is model-setup work and is rejected after a drain
+         * generation has begun. The callback must merge exactly once before
+         * returning Ready and must return promptly while device work is pending.
+         */
+        void registerRuntimeHistogramDrain(
+            RuntimeHistogramDrainCallback callback);
+
+        /**
+         * @brief Advance every registered source without blocking the caller.
+         *
+         * A source that has returned Ready is not polled again until every
+         * source completes the current aggregate generation. This prevents a
+         * fast CPU source from starting a second generation while a GPU DMA is
+         * still in flight.
+         */
+        [[nodiscard]] RuntimeExpertHistogramDrainResult
+        progressRuntimeHistogramDrains();
+
         // ── Queries (read-only, lock-free for counts) ─────
 
         /// Get activation count for a specific expert at a specific layer
         uint64_t activationCount(int layer_idx, int expert_id) const;
 
+        /** @brief Get one production phase's activation count. */
+        uint64_t activationCount(
+            ExpertHistogramSource source,
+            int layer_idx,
+            int expert_id) const;
+
         /// Get full per-expert activation counts for a layer [num_experts]
         std::vector<uint64_t> layerHistogram(int layer_idx) const;
+
+        /** @brief Get one production phase's per-expert layer counts. */
+        std::vector<uint64_t> layerHistogram(
+            ExpertHistogramSource source,
+            int layer_idx) const;
 
         /// Get per-socket total activations for a layer [num_sockets]
         std::vector<uint64_t> socketLoads(int layer_idx) const;
@@ -151,9 +295,9 @@ namespace llaminar2
         /// Average socket imbalance across all layers
         float averageSocketImbalance() const;
 
-        /// Score the current window for an arbitrary expert-to-participant placement.
+        /// Score the current window for an arbitrary layered ownership plan.
         ExpertLoadImbalanceStats placementImbalance(
-            const std::vector<int> &expert_to_socket) const;
+            const MoELayeredExpertOwnership &ownership) const;
 
         /// Score the current window using the histogram's active placement.
         ExpertLoadImbalanceStats currentPlacementImbalance() const;
@@ -172,13 +316,23 @@ namespace llaminar2
         /// Reset all counters and advance window generation
         void resetWindow();
 
+        /**
+         * @brief Atomically rotate inference to a clean bank and freeze the old.
+         * @return Immutable counts from the generation active before rotation.
+         *
+         * The caller must run on a maintenance worker. Existing writers finish
+         * in the old bank while new inference writers immediately use the new
+         * bank; inference never acquires `rotation_mutex_` and never waits.
+         */
+        [[nodiscard]] DecodeExpertHistogramWindow freezeAndRotateWindow();
+
         /// Update the window size (for adaptive window growth)
         void setWindowSize(int new_size) { config_.window_size = new_size; }
 
         // ── Placement update ──────────────────────────────
 
-        /// Update expert-to-socket mapping (called after rebalancing)
-        void updatePlacement(const std::vector<int> &expert_to_socket);
+        /// Publish a complete layered ownership plan after accepted rebalancing.
+        void updateOwnership(const MoELayeredExpertOwnership &ownership);
 
         // ── Diagnostics ───────────────────────────────────
 
@@ -197,8 +351,12 @@ namespace llaminar2
 
         struct LayerData
         {
-            /// Atomic counters for lock-free hot path [num_experts]
+            /// Aggregate atomic counters for lock-free hot path [num_experts].
             std::vector<std::atomic<uint64_t>> expert_counts;
+            /// Exact production-phase counters [source][num_experts].
+            std::array<std::vector<std::atomic<uint64_t>>,
+                       kExpertHistogramProductionSourceCount>
+                source_expert_counts;
 
             /// Protected by mutex (less frequent access)
             mutable std::mutex weight_mutex;
@@ -213,16 +371,67 @@ namespace llaminar2
             void reset();
         };
 
-        std::vector<LayerData> layer_data_; // [num_layers]
-        std::atomic<uint64_t> window_token_count_{0};
-        std::atomic<uint64_t> window_generation_{0};
+        /** @brief One of two persistent RCU histogram generations. */
+        struct HistogramBank
+        {
+            std::vector<LayerData> layers;
+            std::atomic<uint64_t> token_count{0};
+            std::array<std::atomic<uint64_t>,
+                       kExpertHistogramProductionSourceCount>
+                source_token_counts{};
+            std::atomic<uint64_t> active_users{0};
+            uint64_t generation = 0;
 
-        // Placement mapping protected by mutex (updated infrequently)
-        mutable std::mutex placement_mutex_;
-        std::vector<int> expert_to_socket_; // [num_experts]
+            HistogramBank(int num_layers, int num_experts);
+            void reset();
+        };
+
+        /** @brief Short RCU pin preventing a selected bank from being reset. */
+        class BankLease final
+        {
+        public:
+            BankLease() = default;
+            ~BankLease();
+            BankLease(const BankLease &) = delete;
+            BankLease &operator=(const BankLease &) = delete;
+            BankLease(BankLease &&other) noexcept;
+            BankLease &operator=(BankLease &&other) noexcept;
+
+            HistogramBank &mutableBank() noexcept { return *bank_; }
+            const HistogramBank &bank() const noexcept { return *bank_; }
+
+        private:
+            friend class DecodeExpertHistogram;
+            explicit BankLease(HistogramBank *bank) noexcept : bank_(bank) {}
+            void release() noexcept;
+
+            HistogramBank *bank_ = nullptr;
+        };
+
+        /** @brief Acquire and recheck the exact active RCU bank. */
+        [[nodiscard]] BankLease acquireActiveBank() const noexcept;
+
+        std::array<std::unique_ptr<HistogramBank>, 2> banks_;
+        /**
+         * Monotonic publication epoch; its low bit selects the active bank.
+         *
+         * Comparing the complete epoch, rather than only the bank index,
+         * prevents an inference writer delayed across two rotations from
+         * mistaking a recycled bank for the generation it originally pinned.
+         */
+        std::atomic<uint64_t> active_bank_epoch_{0};
+        mutable std::mutex rotation_mutex_;
+
+        // Ownership is read by diagnostics and replaced only at a safe
+        // rebalance boundary, never while route counters are being recorded.
+        mutable std::mutex ownership_mutex_;
+        MoELayeredExpertOwnership ownership_;
 
         mutable std::mutex runtime_sync_mutex_;
         std::vector<RuntimeHistogramSyncCallback> runtime_sync_callbacks_;
+        std::vector<RuntimeHistogramDrainCallback> runtime_drain_callbacks_;
+        std::vector<bool> runtime_drain_completed_;
+        bool runtime_drain_generation_active_ = false;
     };
 
     using DomainExpertHistogram = DecodeExpertHistogram;

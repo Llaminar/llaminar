@@ -206,6 +206,7 @@ namespace llaminar2
             dc.device = device;
             dc.device_total_bytes = gpu.memory_bytes;
             dc.device_free_bytes = gpu.free_memory_bytes;
+            dc.device_compute_units = gpu.compute_units;
             dc.first_layer = 0;
             dc.last_layer = profile.n_layers - 1;
             dc.batch_size = cfg.batch_size;
@@ -229,6 +230,7 @@ namespace llaminar2
                 dc.device = DeviceId(gpus[i].type, gpus[i].local_device_id);
                 dc.device_total_bytes = gpus[i].memory_bytes;
                 dc.device_free_bytes = gpus[i].free_memory_bytes;
+                dc.device_compute_units = gpus[i].compute_units;
                 dc.shard_index = i;
                 dc.total_shards = actual_tp;
                 dc.first_layer = 0;
@@ -260,6 +262,7 @@ namespace llaminar2
                 dc.device = DeviceId(gpus[i].type, gpus[i].local_device_id);
                 dc.device_total_bytes = gpus[i].memory_bytes;
                 dc.device_free_bytes = gpus[i].free_memory_bytes;
+                dc.device_compute_units = gpus[i].compute_units;
                 dc.first_layer = layer_offset;
                 dc.last_layer = layer_offset + stage_layers - 1;
                 dc.batch_size = cfg.batch_size;

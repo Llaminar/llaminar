@@ -70,8 +70,57 @@ namespace llaminar2
             PreparedWeightKind kind,
             DeviceId device,
             std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle> handle);
+        /**
+         * @brief Attach an existing prepared GEMM to a materialized binding.
+         *
+         * An exact `(binding_id, device)` hit also restores the store-owned
+         * source tensor into `binding`.  Repeated graph materialization can
+         * otherwise create an equivalent derived tensor (for example a GDN
+         * FP32 projection override) while retaining the earlier packed handle.
+         * Keeping the first model-lifetime tensor authoritative makes the
+         * stage contract and the prepared kernel name the same live value.
+         *
+         * @param binding Mutable graph binding to adopt or canonicalize.
+         * @param device Exact execution device for the prepared state.
+         * @return True when compatible prepared state was found and attached.
+         * @throws std::runtime_error when an exact stable identity names an
+         *         incompatible tensor, slice, canonical name, or prepared kind.
+         */
         bool adoptPreparedGemmForBinding(
-            const WeightBinding &binding,
+            WeightBinding &binding,
+            DeviceId device);
+
+        /**
+         * @brief Attach an existing prepared embedding to a rematerialized binding.
+         *
+         * Binding ids are local to one frozen-weight materialization. A later
+         * graph may assign the same immutable embedding a different id, including
+         * an id already used by a GEMM entry from an earlier graph. This typed
+         * adoption path resolves only embedding state and installs an alias for
+         * the new binding without rebuilding or copying device weights.
+         *
+         * @param binding Mutable embedding binding to adopt or canonicalize.
+         * @param device Exact execution device for the prepared state.
+         * @return True when compatible prepared embedding state was adopted.
+         * @throws std::runtime_error for an incompatible exact embedding-id hit.
+         */
+        bool adoptPreparedEmbeddingForBinding(
+            WeightBinding &binding,
+            DeviceId device);
+
+        /**
+         * @brief Adopt the representation declared by `binding.prepared`.
+         *
+         * This is the materialization boundary for callers that handle mixed
+         * graph roles. It dispatches embedding and GEMM bindings to their
+         * disjoint typed registries, preventing equal numeric binding ids from
+         * being interpreted as the wrong prepared representation.
+         *
+         * @return True when compatible prepared state was attached; false for
+         *         an unprepared binding, an expert-slab binding, or a miss.
+         */
+        bool adoptPreparedForBinding(
+            WeightBinding &binding,
             DeviceId device);
 
         /// Resolve GEMM kernel from a prepared ref. O(1) lookup by binding_id.
@@ -83,6 +132,18 @@ namespace llaminar2
         std::optional<PreparedWeightRef> preparedRefForBinding(
             uint64_t binding_id,
             DeviceId device) const;
+
+        /**
+         * @brief Resolve one exact prepared representation kind by binding id.
+         *
+         * GEMM and embedding entries deliberately occupy distinct typed
+         * registries. Callers that know the graph role must use this overload so
+         * a rematerialized id collision cannot select the wrong representation.
+         */
+        std::optional<PreparedWeightRef> preparedRefForBinding(
+            uint64_t binding_id,
+            DeviceId device,
+            PreparedWeightKind expected_kind) const;
 
         // =========================================================================
         // Fused Gate/Up Kernel Resolution
@@ -131,6 +192,21 @@ namespace llaminar2
         bool contains(const PreparedWeightRef &ref) const;
         std::optional<WeightBinding> binding(const PreparedWeightRef &ref) const;
         size_t size() const;
+
+        /**
+         * @brief Count prepared model records owned by one exact device.
+         *
+         * The count includes GEMM handles, prepared embeddings, and registered
+         * expert slabs. It is an existence/observability query, not a byte
+         * estimate and not by itself a completeness certificate; callers that
+         * make admission decisions must also require the WeightManager lifecycle
+         * gates and a matching production-plan reuse contract.
+         *
+         * @param device Backend type and ordinal whose records are counted.
+         * @return Number of prepared records registered for that device.
+         */
+        [[nodiscard]] size_t sizeForDevice(DeviceId device) const;
+
         /**
          * @brief Reset input-dependent state on all prepared kernels.
          *

@@ -217,7 +217,11 @@ namespace llaminar2
             bool ownsHandle() const { return owns_handle_; }
 
             /**
-             * @brief Bind a validated stream to this kernel and its cuBLAS handle.
+             * @brief Retain the exact validated stream for the next submission.
+             *
+             * The cuBLAS handle is rebound at every launch boundary, after the
+             * device is selected, so ambient handle state can never substitute
+             * for this operation-owned stream.
              *
              * @param stream Non-null CUDA stream validated by the public kernel
              *        interface.

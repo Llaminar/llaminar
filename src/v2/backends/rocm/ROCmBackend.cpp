@@ -10,9 +10,11 @@
 
 #include "ROCmBackend.h"
 #include "HipDeviceGuard.h"
+#include "HIPGraphTimelineKernels.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 #include "../../utils/VramBillOfMaterials.h"
+#include "../../execution/moe/DeviceMoERebalanceABI.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/rocm/ops/ROCmRowSelectKernels.h"
@@ -271,14 +273,20 @@ namespace llaminar2
             return false;
         }
 
-        hipStream_t operation_stream =
-            requireExplicitStream(stream, "ROCmBackend::deviceToHost");
-        hipError_t err = hipMemcpyAsync(
-            dst, src, bytes, hipMemcpyDeviceToHost, operation_stream);
-        if (err != hipSuccess)
+        if (!deviceToHostOnStream(dst, src, bytes, device_id, stream))
             return false;
-        err = hipStreamSynchronize(operation_stream);
-        return (err == hipSuccess);
+
+        /*
+         * The compatibility method returns host-owned bytes. Wait only an
+         * event recorded after this copy, never the entire producer stream.
+         */
+        void *const completion = createEvent(device_id);
+        if (!completion)
+            return false;
+        const bool recorded = recordEvent(completion, device_id, stream);
+        const bool completed = recorded && waitForEvent(completion, device_id);
+        destroyEvent(completion, device_id);
+        return completed;
     }
 
     bool ROCmBackend::deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id, void *stream)
@@ -289,13 +297,16 @@ namespace llaminar2
         {
             return false;
         }
-        hipStream_t s =
-            requireExplicitStream(stream, "ROCmBackend::deviceToHostFast");
-        hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost, s);
-        if (err != hipSuccess)
+        if (!deviceToHostOnStream(dst, src, bytes, device_id, stream))
             return false;
-        err = hipStreamSynchronize(s);
-        return (err == hipSuccess);
+
+        void *const completion = createEvent(device_id);
+        if (!completion)
+            return false;
+        const bool recorded = recordEvent(completion, device_id, stream);
+        const bool completed = recorded && waitForEvent(completion, device_id);
+        destroyEvent(completion, device_id);
+        return completed;
     }
 
     bool ROCmBackend::pinHostMemory(void *ptr, size_t bytes)
@@ -317,6 +328,86 @@ namespace llaminar2
         {
             LOG_WARN("[ROCmBackend::unpinHostMemory] hipHostUnregister failed: "
                      << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::registerExternalMappedHostMemory(
+        void *ptr,
+        size_t bytes,
+        int registration_device_id)
+    {
+        if (!ptr || bytes == 0u || registration_device_id < 0 ||
+            registration_device_id >= device_count_)
+        {
+            LOG_ERROR("[ROCmBackend::registerExternalMappedHostMemory] invalid region or registration device="
+                      << registration_device_id);
+            return false;
+        }
+        HipDeviceSaveRestore device_guard;
+        if (hipSetDevice(registration_device_id) != hipSuccess)
+            return false;
+        const hipError_t error = hipHostRegister(
+            ptr,
+            bytes,
+            hipHostRegisterMapped | hipHostRegisterPortable |
+                hipExtHostRegisterUncached);
+        if (error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::registerExternalMappedHostMemory] hipHostRegister(mapped|portable|uncached) failed for "
+                      << bytes << " bytes: " << hipGetErrorString(error));
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::externalMappedHostDevicePointer(
+        void *host_ptr,
+        int device_id,
+        void **device_ptr)
+    {
+        if (device_ptr)
+            *device_ptr = nullptr;
+        if (!host_ptr || !device_ptr || device_id < 0 ||
+            device_id >= device_count_)
+        {
+            LOG_ERROR("[ROCmBackend::externalMappedHostDevicePointer] invalid mapped region or device="
+                      << device_id);
+            return false;
+        }
+        HipDeviceSaveRestore device_guard;
+        if (hipSetDevice(device_id) != hipSuccess)
+            return false;
+        const hipError_t error = hipHostGetDevicePointer(
+            device_ptr, host_ptr, 0u);
+        if (error != hipSuccess || !*device_ptr)
+        {
+            LOG_ERROR("[ROCmBackend::externalMappedHostDevicePointer] hipHostGetDevicePointer failed for device="
+                      << device_id << ": " << hipGetErrorString(error));
+            *device_ptr = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::unregisterExternalMappedHostMemory(
+        void *ptr,
+        int registration_device_id)
+    {
+        if (!ptr || registration_device_id < 0 ||
+            registration_device_id >= device_count_)
+        {
+            return false;
+        }
+        HipDeviceSaveRestore device_guard;
+        if (hipSetDevice(registration_device_id) != hipSuccess)
+            return false;
+        const hipError_t error = hipHostUnregister(ptr);
+        if (error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::unregisterExternalMappedHostMemory] hipHostUnregister failed: "
+                      << hipGetErrorString(error));
             return false;
         }
         return true;
@@ -1213,6 +1304,38 @@ namespace llaminar2
         uint32_t *decode_rounds_until_maintenance,
         uint32_t *maintenance_due,
         uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_publish_serial_decode_commit_boundary(
+        uint32_t *decode_rounds_committed,
+        uint32_t *decode_rounds_until_maintenance,
+        uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_acknowledge_decode_commit_boundary(
+        uint32_t *decode_rounds_until_maintenance,
+        uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_initialize_device_moe_rebalance_dispatch_ticket(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        uint32_t participant_id,
+        uint32_t participant_count,
+        DeviceMoERebalanceDispatchTicket *ticket,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_publish_device_moe_rebalance_dispatch_ticket(
+        const uint32_t *controller_magic,
+        const uint32_t *controller_version,
+        const uint32_t *controller_error,
+        const uint32_t *decode_rounds_committed,
+        const uint32_t *decode_rounds_until_maintenance,
+        const uint32_t *maintenance_due,
+        const uint32_t *decode_boundary_advanced,
+        DeviceMoERebalanceDispatchTicket *ticket,
         int device_idx,
         void *stream);
     extern "C" bool rocmOps_initialize_device_generation(
@@ -2759,6 +2882,122 @@ namespace llaminar2
             stream);
     }
 
+    bool ROCmBackend::enqueuePublishSerialDecodeCommitBoundary(
+        void *decode_rounds_committed_device,
+        void *decode_rounds_until_maintenance_device,
+        void *maintenance_due_device,
+        void *decode_boundary_advanced_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !decode_rounds_committed_device ||
+            !decode_rounds_until_maintenance_device ||
+            !maintenance_due_device ||
+            !decode_boundary_advanced_device || !stream)
+        {
+            return false;
+        }
+
+        HipDeviceGuard::setDevice(device_id);
+        return rocmOps_publish_serial_decode_commit_boundary(
+            static_cast<uint32_t *>(decode_rounds_committed_device),
+            static_cast<uint32_t *>(decode_rounds_until_maintenance_device),
+            static_cast<uint32_t *>(maintenance_due_device),
+            static_cast<uint32_t *>(decode_boundary_advanced_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueAcknowledgeDecodeCommitBoundary(
+        void *decode_rounds_until_maintenance_device,
+        void *maintenance_due_device,
+        void *decode_boundary_advanced_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !decode_rounds_until_maintenance_device ||
+            !maintenance_due_device ||
+            !decode_boundary_advanced_device || !stream)
+        {
+            return false;
+        }
+
+        HipDeviceGuard::setDevice(device_id);
+        return rocmOps_acknowledge_decode_commit_boundary(
+            static_cast<uint32_t *>(decode_rounds_until_maintenance_device),
+            static_cast<uint32_t *>(maintenance_due_device),
+            static_cast<uint32_t *>(decode_boundary_advanced_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueInitializeDeviceMoERebalanceDispatchTicket(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        uint32_t participant_id,
+        uint32_t participant_count,
+        void *ticket_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            session_epoch == 0u || workspace_generation == 0u ||
+            participant_count == 0u || participant_id >= participant_count ||
+            !ticket_device || !stream)
+        {
+            return false;
+        }
+
+        HipDeviceGuard::setDevice(device_id);
+        return rocmOps_initialize_device_moe_rebalance_dispatch_ticket(
+            session_epoch,
+            workspace_generation,
+            participant_id,
+            participant_count,
+            static_cast<DeviceMoERebalanceDispatchTicket *>(ticket_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueuePublishDeviceMoERebalanceDispatchTicket(
+        const void *controller_magic_device,
+        const void *controller_version_device,
+        const void *controller_error_device,
+        const void *decode_rounds_committed_device,
+        const void *decode_rounds_until_maintenance_device,
+        const void *maintenance_due_device,
+        const void *decode_boundary_advanced_device,
+        void *ticket_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !controller_magic_device || !controller_version_device ||
+            !controller_error_device || !decode_rounds_committed_device ||
+            !decode_rounds_until_maintenance_device ||
+            !maintenance_due_device || !decode_boundary_advanced_device ||
+            !ticket_device || !stream)
+        {
+            return false;
+        }
+
+        HipDeviceGuard::setDevice(device_id);
+        return rocmOps_publish_device_moe_rebalance_dispatch_ticket(
+            static_cast<const uint32_t *>(controller_magic_device),
+            static_cast<const uint32_t *>(controller_version_device),
+            static_cast<const uint32_t *>(controller_error_device),
+            static_cast<const uint32_t *>(decode_rounds_committed_device),
+            static_cast<const uint32_t *>(
+                decode_rounds_until_maintenance_device),
+            static_cast<const uint32_t *>(maintenance_due_device),
+            static_cast<const uint32_t *>(decode_boundary_advanced_device),
+            static_cast<DeviceMoERebalanceDispatchTicket *>(ticket_device),
+            device_id,
+            stream);
+    }
+
     bool ROCmBackend::enqueueInitializeDeviceGeneration(
         int request_count,
         int max_new_tokens,
@@ -3538,12 +3777,16 @@ namespace llaminar2
             return false;
         }
 
-        hipStream_t s = requireExplicitStream(stream, "ROCmBackend::hostToDevice");
-        hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice, s);
-        if (err != hipSuccess)
+        if (!hostToDeviceOnStream(dst, src, bytes, device_id, stream))
             return false;
-        err = hipStreamSynchronize(s);
-        return (err == hipSuccess);
+
+        void *const completion = createEvent(device_id);
+        if (!completion)
+            return false;
+        const bool recorded = recordEvent(completion, device_id, stream);
+        const bool completed = recorded && waitForEvent(completion, device_id);
+        destroyEvent(completion, device_id);
+        return completed;
     }
 
     bool ROCmBackend::synchronize(int device_id)
@@ -3779,6 +4022,39 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    bool ROCmBackend::queryEvent(void *event, int device_id, bool *ready)
+    {
+        if (ready)
+            *ready = false;
+        if (!event || !ready || device_id < 0 || device_id >= device_count_)
+            return false;
+
+        HipDeviceSaveRestore device_guard;
+        const hipError_t set_error = hipSetDevice(device_id);
+        if (set_error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::queryEvent] hipSetDevice(" << device_id
+                                                                 << ") failed: "
+                      << hipGetErrorString(set_error));
+            return false;
+        }
+
+        const hipError_t err = hipEventQuery(
+            reinterpret_cast<hipEvent_t>(event));
+        if (err == hipSuccess)
+        {
+            *ready = true;
+            return true;
+        }
+        if (err == hipErrorNotReady)
+            return true;
+
+        LOG_ERROR("[ROCmBackend::queryEvent] hipEventQuery failed: "
+                  << hipGetErrorString(err)
+                  << " (device=" << device_id << ", event=" << event << ")");
+        return false;
     }
 
     bool ROCmBackend::setDevice(int device_id)
@@ -4498,6 +4774,266 @@ namespace llaminar2
         return true;
     }
 
+    bool ROCmBackend::supportsStreamTimelineSignal32(int device_id) const
+    {
+        if (device_id < 0 || device_id >= device_count_)
+            return false;
+
+        HipDeviceSaveRestore device_guard;
+        int supported = 0;
+        return hipSetDevice(device_id) == hipSuccess &&
+               hipDeviceGetAttribute(
+                   &supported,
+                   hipDeviceAttributeCanUseStreamWaitValue,
+                   device_id) == hipSuccess &&
+               supported != 0;
+    }
+
+    void *ROCmBackend::allocateStreamTimelineSignal32(int device_id)
+    {
+        if (!supportsStreamTimelineSignal32(device_id))
+        {
+            LOG_ERROR("[ROCmBackend::allocateStreamTimelineSignal32] unsupported device="
+                      << device_id);
+            return nullptr;
+        }
+
+        HipDeviceSaveRestore device_guard;
+        if (hipSetDevice(device_id) != hipSuccess)
+            return nullptr;
+
+        void *signal = nullptr;
+        /*
+         * hipMallocSignalMemory represents one native 64-bit HSA signal and
+         * the ROCm allocator therefore requires an exact eight-byte request,
+         * even when the queued protocol operates on its low 32 bits.  A
+         * four-byte allocation is rejected with hipErrorInvalidValue on the
+         * production gfx906 runtime.
+         */
+        const hipError_t error = hipExtMallocWithFlags(
+            &signal,
+            sizeof(uint64_t),
+            hipMallocSignalMemory);
+        if (error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::allocateStreamTimelineSignal32] hipExtMallocWithFlags failed: "
+                      << hipGetErrorString(error));
+            return nullptr;
+        }
+        return signal;
+    }
+
+    void ROCmBackend::freeStreamTimelineSignal32(void *signal, int device_id)
+    {
+        if (!signal)
+            return;
+        HipDeviceSaveRestore device_guard;
+        HIP_WARN_IF_FAIL(hipSetDevice(device_id));
+        HIP_WARN_IF_FAIL(hipFree(signal));
+    }
+
+    bool ROCmBackend::streamWaitTimelineSignal32(
+        void *stream,
+        void *signal,
+        uint32_t value,
+        int device_id)
+    {
+        const hipStream_t hip_stream =
+            requireExplicitStream(stream, "ROCmBackend::streamWaitTimelineSignal32");
+        if (!signal || device_id < 0 || device_id >= device_count_)
+        {
+            LOG_ERROR("[ROCmBackend::streamWaitTimelineSignal32] invalid ownership"
+                      << " device=" << device_id << " signal=" << signal);
+            return false;
+        }
+
+        HipDeviceSaveRestore device_guard;
+        if (hipSetDevice(device_id) != hipSuccess)
+            return false;
+        const hipError_t error = hipStreamWaitValue32(
+            hip_stream,
+            signal,
+            value,
+            hipStreamWaitValueGte,
+            UINT32_MAX);
+        if (error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::streamWaitTimelineSignal32] hipStreamWaitValue32 failed: "
+                      << hipGetErrorString(error));
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::streamPublishTimelineSignal32(
+        void *stream,
+        void *signal,
+        uint32_t value,
+        int device_id)
+    {
+        const hipStream_t hip_stream =
+            requireExplicitStream(stream, "ROCmBackend::streamPublishTimelineSignal32");
+        if (!signal || device_id < 0 || device_id >= device_count_)
+        {
+            LOG_ERROR("[ROCmBackend::streamPublishTimelineSignal32] invalid ownership"
+                      << " device=" << device_id << " signal=" << signal);
+            return false;
+        }
+
+        HipDeviceSaveRestore device_guard;
+        if (hipSetDevice(device_id) != hipSuccess)
+            return false;
+        const hipError_t error = hipStreamWriteValue32(
+            hip_stream,
+            signal,
+            value,
+            0);
+        if (error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::streamPublishTimelineSignal32] hipStreamWriteValue32 failed: "
+                      << hipGetErrorString(error));
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::supportsStreamTimelineSignal64(int device_id) const
+    {
+        return supportsStreamTimelineSignal32(device_id);
+    }
+
+    void *ROCmBackend::allocateStreamTimelineSignal64(int device_id)
+    {
+        if (!supportsStreamTimelineSignal64(device_id))
+        {
+            LOG_ERROR("[ROCmBackend::allocateStreamTimelineSignal64] unsupported device="
+                      << device_id);
+            return nullptr;
+        }
+        HipDeviceSaveRestore device_guard;
+        if (hipSetDevice(device_id) != hipSuccess)
+            return nullptr;
+        void *signal = nullptr;
+        const hipError_t error = hipExtMallocWithFlags(
+            &signal, sizeof(uint64_t), hipMallocSignalMemory);
+        if (error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::allocateStreamTimelineSignal64] hipExtMallocWithFlags failed: "
+                      << hipGetErrorString(error));
+            return nullptr;
+        }
+        return signal;
+    }
+
+    void ROCmBackend::freeStreamTimelineSignal64(
+        void *signal,
+        int device_id)
+    {
+        if (!signal)
+            return;
+        HipDeviceSaveRestore device_guard;
+        HIP_WARN_IF_FAIL(hipSetDevice(device_id));
+        HIP_WARN_IF_FAIL(hipFree(signal));
+    }
+
+    bool ROCmBackend::streamWaitTimelineSignal64(
+        void *stream,
+        void *signal,
+        uint64_t value,
+        int device_id)
+    {
+        const hipStream_t hip_stream = requireExplicitStream(
+            stream, "ROCmBackend::streamWaitTimelineSignal64");
+        if (!signal || device_id < 0 || device_id >= device_count_)
+        {
+            LOG_ERROR("[ROCmBackend::streamWaitTimelineSignal64] invalid ownership device="
+                      << device_id << " signal=" << signal);
+            return false;
+        }
+        HipDeviceSaveRestore device_guard;
+        if (hipSetDevice(device_id) != hipSuccess)
+            return false;
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+        const hipError_t capture_query =
+            hipStreamIsCapturing(hip_stream, &capture_status);
+        if (capture_query != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::streamWaitTimelineSignal64] hipStreamIsCapturing failed: "
+                      << hipGetErrorString(capture_query));
+            return false;
+        }
+        if (capture_status == hipStreamCaptureStatusActive)
+        {
+            return hip_graph_timeline::appendActiveCaptureSystemWaitValue64(
+                hip_stream, signal, value);
+        }
+        if (capture_status == hipStreamCaptureStatusInvalidated)
+        {
+            LOG_ERROR("[ROCmBackend::streamWaitTimelineSignal64] capture stream is invalidated");
+            return false;
+        }
+        const hipError_t error = hipStreamWaitValue64(
+            hip_stream,
+            signal,
+            value,
+            hipStreamWaitValueGte,
+            UINT64_MAX);
+        if (error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::streamWaitTimelineSignal64] hipStreamWaitValue64 failed: "
+                      << hipGetErrorString(error));
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::streamPublishTimelineSignal64(
+        void *stream,
+        void *signal,
+        uint64_t value,
+        int device_id)
+    {
+        const hipStream_t hip_stream = requireExplicitStream(
+            stream, "ROCmBackend::streamPublishTimelineSignal64");
+        if (!signal || device_id < 0 || device_id >= device_count_)
+        {
+            LOG_ERROR("[ROCmBackend::streamPublishTimelineSignal64] invalid ownership device="
+                      << device_id << " signal=" << signal);
+            return false;
+        }
+        HipDeviceSaveRestore device_guard;
+        if (hipSetDevice(device_id) != hipSuccess)
+            return false;
+        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+        const hipError_t capture_query =
+            hipStreamIsCapturing(hip_stream, &capture_status);
+        if (capture_query != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::streamPublishTimelineSignal64] hipStreamIsCapturing failed: "
+                      << hipGetErrorString(capture_query));
+            return false;
+        }
+        if (capture_status == hipStreamCaptureStatusActive)
+        {
+            return hip_graph_timeline::appendActiveCaptureSystemReleaseValue64(
+                hip_stream, signal, value);
+        }
+        if (capture_status == hipStreamCaptureStatusInvalidated)
+        {
+            LOG_ERROR("[ROCmBackend::streamPublishTimelineSignal64] capture stream is invalidated");
+            return false;
+        }
+        const hipError_t error = hipStreamWriteValue64(
+            hip_stream, signal, value, 0u);
+        if (error != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::streamPublishTimelineSignal64] hipStreamWriteValue64 failed: "
+                      << hipGetErrorString(error));
+            return false;
+        }
+        return true;
+    }
+
     // ====================================================================
     // Async H2D Without Sync (Pipeline Support)
     // ====================================================================
@@ -4654,24 +5190,16 @@ namespace llaminar2
 
     bool ROCmBackend::deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
-        if (device_id >= device_count_ || device_id < 0)
-        {
+        if (!deviceCopyAsync(dst, src, bytes, device_id, stream))
             return false;
-        }
 
-        HipDeviceSaveRestore device_guard;
-        hipError_t err_set = hipSetDevice(device_id);
-        if (err_set != hipSuccess)
-        {
+        void *const completion = createEvent(device_id);
+        if (!completion)
             return false;
-        }
-
-        hipStream_t s = requireExplicitStream(stream, "ROCmBackend::deviceToDevice");
-        hipError_t err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, s);
-        if (err != hipSuccess)
-            return false;
-        err = hipStreamSynchronize(s);
-        return (err == hipSuccess);
+        const bool recorded = recordEvent(completion, device_id, stream);
+        const bool completed = recorded && waitForEvent(completion, device_id);
+        destroyEvent(completion, device_id);
+        return completed;
     }
 
     bool ROCmBackend::deviceCopyAsync(void *dst, const void *src, size_t bytes,

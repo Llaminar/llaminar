@@ -1,6 +1,13 @@
 /**
  * @file TensorBase.cpp
- * @brief TensorBase class implementation (helper methods)
+ * @brief Tensor storage, coherence, and transfer-event lifetime implementation.
+ *
+ * TensorBase owns host and device allocations while TransferEngine owns every
+ * state transition that accompanies movement between them. This file enforces
+ * the complementary lifetime rule: host storage cannot be mutated, unpinned,
+ * or destroyed while an asynchronous GPU upload still reads it. The exact
+ * copy-completion event is retired at that host reuse boundary; unrelated GPU
+ * streams are never drained.
  *
  * @author David Sanftenberg
  */
@@ -152,6 +159,23 @@ namespace llaminar2
     // Also frees GPU memory and unpins host memory if allocated.
     TensorBase::~TensorBase()
     {
+        try
+        {
+            /*
+             * Async H2D may outlive the submitting host frame, but it may not
+             * outlive the tensor allocation that supplies its bytes.  Wait the
+             * one exact copy event before unpinning or releasing storage; a
+             * stream/device synchronization would also drain unrelated work.
+             */
+            TransferEngine::waitForPendingHostSourceUseLocked(this);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("[TensorBase::~TensorBase] Cannot retire in-flight H2D host source: "
+                      << error.what());
+            std::terminate();
+        }
+
         // Free mapped memory if allocated (must be done first)
         freeMappedMemory();
 
@@ -195,6 +219,8 @@ namespace llaminar2
                 {
                     backend->destroyEvent(device_completion_event_, backend_device_id);
                     device_completion_event_ = nullptr;
+                    event_device_.reset();
+                    device_completion_purpose_ = CompletionEventPurpose::NONE;
                 }
 
                 backend->free(gpu_data_ptr_, backend_device_id);
@@ -881,6 +907,13 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(coherence_mutex_);
 
+        /*
+         * mutable_data()/raw_mutable_data() reuse the host allocation.  If its
+         * previous generation is still feeding an async H2D, only that copy's
+         * completion event can release the source lifetime safely.
+         */
+        TransferEngine::waitForPendingHostSourceUseLocked(this);
+
         // Mark GPU data as stale - next ensureOnDevice() will re-upload from host
         // Mark device as invalid (stale) - do NOT free GPU memory
         // This is called when host data is modified and GPU copy is now stale.
@@ -897,6 +930,31 @@ namespace llaminar2
             }
             LOG_TRACE("[TensorBase::invalidateGpuData] Device data marked stale (memory retained)");
         }
+    }
+
+    void TensorBase::publishHostWriteState()
+    {
+        std::lock_guard<std::mutex> lock(coherence_mutex_);
+
+        /*
+         * A queued H2D copy still reads the host allocation even though both
+         * logical copies already contain the same generation. An external host
+         * writer may not reuse that storage until the exact copy-completion
+         * event has fired. TransferEngine owns the wait and event retirement so
+         * this tensor hook cannot substitute a stream-wide synchronization.
+         */
+        TransferEngine::waitForPendingHostSourceUseLocked(this);
+        if (is_mapped_)
+        {
+            setCoherenceState_(TensorCoherenceState::MAPPED);
+            mapped_needs_sync_ = false;
+        }
+        else
+        {
+            setCoherenceState_(gpu_data_ptr_ ? TensorCoherenceState::HOST_AUTHORITATIVE
+                                             : TensorCoherenceState::HOST_ONLY);
+        }
+        authoritative_device_.reset();
     }
 
     bool TensorBase::ensureOnDevice(DeviceId target_device, void *stream)
@@ -1267,6 +1325,8 @@ namespace llaminar2
                     "event on " +
                     publication_device.toString());
             }
+            device_completion_purpose_ =
+                CompletionEventPurpose::DEVICE_WRITE;
         }
 
         /*
@@ -1290,6 +1350,7 @@ namespace llaminar2
         if (!device_completion_event_)
         {
             event_device_.reset();
+            device_completion_purpose_ = CompletionEventPurpose::NONE;
             return;
         }
         if (!event_device_.has_value() || !event_device_->is_gpu())
@@ -1314,6 +1375,7 @@ namespace llaminar2
             event_device_->gpu_ordinal());
         device_completion_event_ = nullptr;
         event_device_.reset();
+        device_completion_purpose_ = CompletionEventPurpose::NONE;
     }
 
     bool TensorBase::releaseDeviceMemory()

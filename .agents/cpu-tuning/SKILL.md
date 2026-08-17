@@ -253,6 +253,123 @@ In annotated assembly, look for:
 Use `objdump -dC -Mintel <binary>` for a stable instruction census when sample
 annotation alone is ambiguous.
 
+### Classify spills by execution regime
+
+Do not treat a compiler spill count as either universally fatal or harmless.
+First delimit the actual inner loop by symbol address, branch targets, and
+source annotation; prologue saves, scalar pointer slots, exception paths, and
+unreached ISA branches are not hot-loop vector spills. Build AVX2 and AVX-512
+separately because an AVX-512 build can hide pressure in code that is meant to
+represent the 16-register AVX2 regime.
+
+For compute-bound GEMM and grouped-verifier candidates, a vector spill in the
+K loop disqualifies the candidate. Keep a no-spill geometry available and
+reduce the live set by narrowing the N tile, decoding/loading one subchunk at a
+time, scoping broadcasts to their use, or disabling an unprofitable unroll.
+Preserve independent accumulator chains so removing a spill does not replace
+memory traffic with a long dependency chain.
+
+A streaming GEMV candidate may retain measured spill traffic only when all of
+the following are true:
+
+- counters establish that the domain is memory-bound rather than
+  front-end/compute-bound;
+- a no-spill candidate for the same format, geometry, M, and ISA is measured in
+  the same tournament;
+- the spilling candidate wins canonical latency beyond the noise band and does
+  not increase bytes moved enough to lose at neighboring shapes;
+- byte-equivalence and thread/ISA totality gates pass.
+
+Never infer that a spill is acceptable merely because one memory-bound Q6
+shape tolerated it. Candidate evidence is domain-specific, and spilling
+variants must not be eligible in compute-bound dispatch domains.
+
+### Keep compact-format ILP while shortening decode live ranges
+
+Compact formats such as Q6_K can need more decode state than nibble-LUT or
+expanded-INT8 formats. When grouped M=2 work is under-filled, first widen the
+column span so one worker owns enough independent dot products; do not create
+two separate row launches. Then reduce register pressure inside that wider
+tile without collapsing its independent accumulator chains:
+
+- inspect the generated K loop itself, not prologue saves or cold scalar
+  branches, before classifying a spill;
+- load, decode, consume, and retire one low/high bitplane group before decoding
+  the next group;
+- combine disjoint bitplanes with masked integer adds when that removes a
+  longer merge/shuffle sequence and preserves the exact decoded bytes;
+- use the narrowest VNNI width that matches auxiliary reductions such as a
+  half-block activation sum, instead of keeping unnecessary ZMM constants live;
+- keep one accumulator per output row and column vector, and visit K blocks in
+  the same ascending order as serial M=1 decode.
+
+The acceptance gate is simultaneous: byte equality against independent serial
+rows across the all-format/runtime-M sweep, no hot-loop spill for a
+compute-bound candidate, and a repeated latency win over serial decode. A
+lower register count that loses cross-row reuse or changes FP accumulation is
+not an optimization.
+
+### Tune NativeVNNI cache tiles from the prepared execution layout
+
+Cache policy must model the bytes consumed by the production kernel, not the
+compact source GGUF block. Use `NativeVNNIPreparedFootprint` and include all
+live data owned by one physical microkernel tile:
+
+- the exact interleaved weight stride, including compensation, scales, and
+  optional minima;
+- the Q8 activation blocks for every simultaneously live physical row;
+- the FP32 output chunks that remain live while K is accumulated;
+- the prepared encoding and asymmetry, because nibble decode, expanded INT8,
+  and native dual-scale Q6 have different reuse/compute balances.
+
+Derive capacity and associativity from `CacheInfo`, reserve explicit
+associativity headroom, and keep the residency fraction a typed, testable
+policy. Unit tests must inject synthetic cache topologies and assert exact
+block counts for every physical prepared encoding. Do not use a guessed source
+bytes-per-weight ratio or let a benchmark-host cache size become a constant.
+
+Treat cache residency as a tournament parameter, not as a folklore percentage:
+
+1. Cover symmetric/asymmetric nibble, symmetric/asymmetric expanded INT8, and
+   native Q6. Source codebooks that map to the same prepared encoding still
+   belong in the final all-format correctness sweep.
+2. Measure grouped depths on both sides of any proposed mode transition and
+   include representative attention, FFN, and terminal-head geometries.
+3. Interleave candidates in rotating order. Bracket the automatic candidate
+   above and below, retain adjacent odd block counts, and include full K. A
+   tournament that only searches one side of a changed default cannot report
+   honest regret.
+4. Enclose one additional warmed production launch for one exact
+   `(format, ISA, M, N, K, candidate)` in the process-owned perf interval.
+   Setup, quantization, correctness, warmup, other candidates, and canonical
+   timing must remain outside that interval.
+5. Prefer a candidate when lower wall time and cycles coincide with an
+   explanatory signal such as fewer L2/LLC misses at similar instruction
+   count. A raw timing fluctuation without a mechanism is not enough to encode
+   a new generic policy.
+
+The focused NativeVNNI cache-tile tournament is
+`v2_perf_cpu_native_vnni_dispatch_sweep`, test
+`CacheKTilesCoverAllPreparedFootprints`. Select geometry with
+`LLAMINAR_CPU_NVNNI_CACHE_TILE_M`, `_N`, and `_K`; select one exact profiler
+launch with `_FORMAT`, `_CANDIDATE`,
+`LLAMINAR_NATIVE_VNNI_PROFILE_REQUEST_ID`, and
+`LLAMINAR_NATIVE_VNNI_PERF_STATS_PATH`. Pin one physical socket and set
+`OMP_NUM_THREADS`, `OMP_PLACES=cores`, and `OMP_PROC_BIND=close` explicitly so
+NUMA or SMT movement cannot masquerade as a tile result.
+
+One 32-element K block is already the NativeVNNI SIMD/decode unit. Do not round
+cache tiles to a larger block multiple unless annotated assembly and repeated
+measurements prove a real alignment requirement; odd tile lengths are valid
+and can win. Likewise, do not assume one residency regime fits every M: shallow
+grouped verification and deeper prefill may have materially different reuse.
+
+Every cache-policy change must keep the AVX-512 and forced-AVX2
+`V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_*` gates green. Those gates
+compare every K-tiled production result byte-for-byte with independent serial
+rows across all formats, odd/even M values, tail N, and tile boundaries. A
+faster tile that changes FP parenthesization is ineligible.
+
 ## 5. Tune one bottleneck at a time
 
 Apply changes in this order and remeasure after each one:
@@ -266,7 +383,8 @@ Apply changes in this order and remeasure after each one:
 5. Improve SIMD instruction-level parallelism, interleave independent
    loads/accumulators, and prefetch only when counters prove it helps.
 6. Reduce vector-register live ranges when annotation proves spills or shuffle
-   pressure. More unrolling is not automatically faster.
+   pressure. Prefer bounded load/decode/use tiles and multiple independent
+   accumulators; more unrolling is not automatically faster.
 7. Keep vectorized tail handling explicit: AVX-512, AVX2, narrower vectors,
    then scalar. Validate every tail and runtime ISA route.
 

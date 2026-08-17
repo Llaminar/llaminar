@@ -16,6 +16,8 @@
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/orchestrators/IRankOrchestrator.h"
+#include "execution/moe/MoEOverlayParticipantResidency.h"
+#include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/MoERebalanceController.h"
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
@@ -26,8 +28,10 @@
 #include "mocks/MockModelContext.h"
 
 #include <fstream>
+#include <filesystem>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -48,7 +52,48 @@ namespace
      */
     std::string readFactorySourceFile(const std::string &path)
     {
-        std::ifstream input(path);
+        namespace fs = std::filesystem;
+
+        const fs::path relative_path(path);
+        std::vector<fs::path> search_roots;
+        search_roots.push_back(fs::current_path());
+
+        /*
+         * CTest normally launches this binary from the repository root, while
+         * developers commonly invoke it directly from the build tree. Anchor a
+         * second search at this translation unit so source-policy coverage is
+         * independent of the caller's working directory.
+         */
+        fs::path source_anchor = fs::path(__FILE__).parent_path();
+        if (source_anchor.is_relative())
+            source_anchor = fs::absolute(source_anchor);
+        search_roots.push_back(std::move(source_anchor));
+
+        fs::path resolved_path;
+        for (fs::path root : search_roots)
+        {
+            while (!root.empty())
+            {
+                const fs::path candidate = root / relative_path;
+                if (fs::is_regular_file(candidate))
+                {
+                    resolved_path = candidate;
+                    break;
+                }
+
+                const fs::path parent = root.parent_path();
+                if (parent == root)
+                    break;
+                root = parent;
+            }
+            if (!resolved_path.empty())
+                break;
+        }
+
+        if (resolved_path.empty())
+            return {};
+
+        std::ifstream input(resolved_path);
         if (!input.good())
             return {};
 
@@ -76,6 +121,29 @@ namespace
             pos += needle.size();
         }
         return count;
+    }
+
+    /**
+     * @brief Remove formatting whitespace from a source-contract fragment.
+     *
+     * Source-contract tests should protect ownership and lifecycle expressions,
+     * not the formatter's current indentation or line wrapping. The returned
+     * text retains every non-whitespace token, allowing assertions to describe
+     * the required C++ expression without coupling the test to clang-format.
+     *
+     * @param source Source fragment whose token adjacency should be inspected.
+     * @return A copy containing no ASCII whitespace characters.
+     */
+    std::string withoutFactorySourceWhitespace(std::string_view source)
+    {
+        std::string compact;
+        compact.reserve(source.size());
+        for (const char ch : source)
+        {
+            if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' && ch != '\f' && ch != '\v')
+                compact.push_back(ch);
+        }
+        return compact;
     }
 
     // =============================================================================
@@ -213,6 +281,17 @@ namespace
         bool allreduce(TensorBase *) override { return false; }
         bool broadcast(TensorBase *, int = 0) override { return false; }
         bool allgather(const TensorBase *, TensorBase *) override { return false; }
+        bool gatherVariableFloatRecordsToRoot(
+            const float *, size_t, float *, size_t, size_t, int,
+            size_t &, const std::string &) override
+        {
+            return false;
+        }
+        bool broadcastFloatElements(
+            TensorBase *, size_t, int, const std::string &) override
+        {
+            return false;
+        }
         bool send(const TensorBase *, int) override { return false; }
         bool recv(TensorBase *, int) override { return false; }
 
@@ -246,6 +325,66 @@ namespace
         model_ctx->mockLoader().setIntParam("qwen3moe.expert_count", kMoEExperts);
         model_ctx->mockLoader().setIntParam("qwen3moe.expert_feed_forward_length", kMoEIntermediate);
         model_ctx->mockLoader().setIntParam("qwen3moe.expert_shared_count", 1);
+        return model_ctx;
+    }
+
+    /**
+     * @brief Build a tiny MoE model whose final raw block is a real NextN sidecar.
+     *
+     * Qwen3.6 reports four raw blocks in this reduced geometry, but only layers
+     * zero through two belong to the ordinary decoder.  The complete layer-three
+     * tensor inventory lets the production manifest resolver prove that its FFN
+     * is routed MoE rather than inferring that fact from a test-only flag.
+     */
+    std::shared_ptr<MockModelContext> makeMoEModelContextWithTrailingMTP()
+    {
+        constexpr int kRawLayerCount = kMoELayers + 1;
+        auto model_ctx = MockModelContextBuilder()
+                             .setArchitecture("qwen35moe")
+                             .setBlockCount(kRawLayerCount)
+                             .setEmbeddingLength(kMoEDModel)
+                             .setHeadCount(4)
+                             .setHeadCountKV(2)
+                             .setVocabSize(128)
+                             .setContextLength(256)
+                             .setFeedForwardLength(kMoEIntermediate)
+                             .build();
+
+        auto &loader = model_ctx->mockLoader();
+        loader.setIntParam("qwen35moe.expert_count", kMoEExperts);
+        loader.setIntParam(
+            "qwen35moe.expert_feed_forward_length",
+            kMoEIntermediate);
+        loader.setIntParam("qwen35moe.expert_shared_count", 1);
+        loader.setIntParam("qwen35moe.nextn_predict_layers", 1);
+
+        const std::string prefix =
+            "blk." + std::to_string(kMoELayers) + ".";
+        for (const char *suffix : {
+                 "nextn.eh_proj.weight",
+                 "nextn.hnorm.weight",
+                 "nextn.enorm.weight",
+                 "nextn.shared_head_norm.weight",
+                 "attn_norm.weight",
+                 "attn_q.weight",
+                 "attn_k.weight",
+                 "attn_v.weight",
+                 "attn_output.weight",
+                 "attn_q_norm.weight",
+                 "attn_k_norm.weight",
+                 "post_attention_norm.weight",
+                 "ffn_gate_inp.weight",
+                 "ffn_gate_exps.weight",
+                 "ffn_up_exps.weight",
+                 "ffn_down_exps.weight",
+                 "ffn_gate_shexp.weight",
+                 "ffn_up_shexp.weight",
+                 "ffn_down_shexp.weight",
+                 "ffn_gate_inp_shexp.weight",
+             })
+        {
+            loader.addFP32ZerosTensor(prefix + suffix, {4, 4});
+        }
         return model_ctx;
     }
 
@@ -309,9 +448,11 @@ namespace
 
         RoutedExpertDomain rocm_hot;
         rocm_hot.name = "rocm_hot";
-        rocm_hot.scope = ExecutionDomainScope::LOCAL;
+        rocm_hot.scope = ExecutionDomainScope::RANK_LOCAL;
         rocm_hot.backend = CollectiveBackendType::RCCL;
         rocm_hot.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+        /* Both local GPU participants belong to the current MPI rank. */
+        rocm_hot.owner_rank = 0;
         rocm_hot.participants = {
             GlobalDeviceAddress::rocm(0),
             GlobalDeviceAddress::rocm(1),
@@ -353,9 +494,11 @@ namespace
 
         RoutedExpertDomain cuda_hot;
         cuda_hot.name = "cuda_hot";
-        cuda_hot.scope = ExecutionDomainScope::LOCAL;
+        cuda_hot.scope = ExecutionDomainScope::RANK_LOCAL;
         cuda_hot.backend = CollectiveBackendType::NCCL;
         cuda_hot.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        /* Both local GPU participants belong to the current MPI rank. */
+        cuda_hot.owner_rank = 0;
         cuda_hot.participants = {
             GlobalDeviceAddress::cuda(0),
             GlobalDeviceAddress::cuda(1),
@@ -517,6 +660,53 @@ namespace
     }
 
     /**
+     * @brief Primary and mirrored-head plans must share one prepared store.
+     *
+     * NodeTP materializes the ordinary sharded model before its replicated
+     * MTP terminal head. Creating a new PreparedWeightStore for the second plan
+     * loses every primary prepared ref after CPU packing has released raw tensor
+     * bytes. The factory must compose both plans additively in the existing
+     * model-owned store and reject a competing explicit store.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract,
+         MirroredMTPHeadPlanReusesModelOwnedPreparedStore)
+    {
+        const std::string source =
+            readFactorySourceFile(
+                "src/v2/execution/factory/InferenceRunnerFactory.cpp");
+        ASSERT_FALSE(source.empty());
+
+        const size_t helper_begin = source.find(
+            "installPreparedWeightStoreForPlan(");
+        ASSERT_NE(helper_begin, std::string::npos);
+        const size_t helper_end = source.find(
+            "\n    namespace\n    {",
+            helper_begin);
+        ASSERT_NE(helper_end, std::string::npos);
+        const std::string helper =
+            source.substr(helper_begin, helper_end - helper_begin);
+        const std::string compact_helper =
+            withoutFactorySourceWhitespace(helper);
+
+        EXPECT_NE(
+            compact_helper.find("weight_mgr.preparedWeightStoreIfInitialized()"),
+            std::string::npos)
+            << "successive primary/mirrored plans must discover the existing model store";
+        EXPECT_NE(
+            compact_helper.find("installed_store!=config.prepared_weight_store"),
+            std::string::npos)
+            << "a second explicit prepared authority must fail closed";
+        EXPECT_NE(
+            compact_helper.find(":installed_store?installed_store:"),
+            std::string::npos)
+            << "the implicit path must reuse, not replace, the installed store";
+        EXPECT_NE(
+            compact_helper.find("if(!installed_store)weight_mgr.setPreparedWeightStore(store)"),
+            std::string::npos)
+            << "store installation must happen exactly once per model authority";
+    }
+
+    /**
      * @brief Replicated dense decode plans must keep MTP verifier sidecar weights.
      *
      * Base-layer routed experts are excluded from the dense decode subset because
@@ -589,6 +779,43 @@ namespace
     }
 
     /**
+     * @brief Every LocalTP graph must freeze only its exact overlay slices.
+     *
+     * Device runners on one MPI rank are built concurrently and share an
+     * additive PreparedWeightStore.  Their FrozenModelWeightSets remain
+     * graph-local: otherwise the CUDA:0 graph can page, prepare, or publish the
+     * CUDA:1 participant's experts and graph construction later observes an
+     * incomplete registry on the actual owner.  Guard both the exact
+     * rank-and-device filter and its use at the ordinary and LocalTP materialize
+     * sites without requiring a real GGUF in this fast unit suite.
+     */
+    TEST(Test__InferenceRunnerFactory_SourceContract,
+         ExpertOverlayWeightPlansAreGraphLocalInLocalTP)
+    {
+        const std::string source =
+            readFactorySourceFile(
+                "src/v2/execution/factory/InferenceRunnerFactory.cpp");
+        ASSERT_FALSE(source.empty());
+
+        EXPECT_NE(
+            source.find(
+                "participant.world_rank == rank &&\n"
+                "                participant.device == graph_device"),
+            std::string::npos)
+            << "overlay slice selection must authenticate both MPI rank and exact graph device";
+        EXPECT_GE(
+            countFactorySourceOccurrences(
+                source,
+                "includeGraphLocalOverlayParticipantWeights("),
+            3u)
+            << "the helper definition plus concrete and LocalTP materialization sites must remain wired";
+        EXPECT_EQ(
+            source.find("rankLocalOverlayPreparationDevices"),
+            std::string::npos)
+            << "one device graph must never prepare every sibling device on its MPI rank";
+    }
+
+    /**
      * @brief LLEP selection must validate, never synthesize, graph policy.
      *
      * The routed domain declaration is the authoritative description of
@@ -637,6 +864,11 @@ namespace
         ASSERT_NE(resolved_plan, nullptr);
         EXPECT_NE(resolved_plan.get(), requested_plan.get());
         EXPECT_TRUE(requested_plan->placements.empty());
+        EXPECT_TRUE(requested_plan->continuation_domain_spec.domain.empty());
+        EXPECT_EQ(
+            resolved_plan->continuation_domain_spec.domain,
+            requested_plan->continuation_domain)
+            << "model freezing must make the inherited continuation topology explicit";
         ASSERT_EQ(resolved_plan->placements.size(), static_cast<size_t>(kMoELayers));
         for (int layer = 0; layer < kMoELayers; ++layer)
         {
@@ -648,6 +880,9 @@ namespace
         ASSERT_EQ(resolved_plan->routed_tiers.size(), 2u);
         EXPECT_EQ(resolved_plan->routed_tiers[1].domain, "cpu_cold");
         EXPECT_TRUE(resolved_plan->routed_tiers[1].fallback);
+        EXPECT_EQ(
+            resolved_plan->authority_execution,
+            MoEOverlayAuthorityExecutionKind::HostCoordinated);
     }
 
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PreservesExplicitPlacements)
@@ -665,7 +900,20 @@ namespace
 
         auto resolved_plan = resolveMoERoutedExpertPlacementPlanForModel(*model_ctx, config);
 
-        EXPECT_EQ(resolved_plan, explicit_plan);
+        ASSERT_NE(resolved_plan, nullptr);
+        EXPECT_NE(resolved_plan, explicit_plan)
+            << "model freezing must seal authority execution without mutating declarative input";
+        EXPECT_EQ(
+            explicit_plan->authority_execution,
+            MoEOverlayAuthorityExecutionKind::Unresolved);
+        EXPECT_EQ(
+            resolved_plan->authority_execution,
+            MoEOverlayAuthorityExecutionKind::HostCoordinated);
+        EXPECT_TRUE(explicit_plan->continuation_domain_spec.domain.empty());
+        EXPECT_EQ(
+            resolved_plan->continuation_domain_spec.domain,
+            explicit_plan->continuation_domain)
+            << "explicit placements must not bypass frozen topology completion";
         ASSERT_EQ(resolved_plan->placements.size(), 3u);
         EXPECT_EQ(resolved_plan->placements[0].routed_expert_tier,
                   (std::vector<int>{0, 1, 0, 1, 0, 1}));
@@ -673,6 +921,100 @@ namespace
                   (std::vector<int>{1, 0, 1, 0, 1, 0}));
         EXPECT_EQ(resolved_plan->placements[2].routed_expert_tier,
                   (std::vector<int>{0, 0, 1, 1, 0, 1}));
+    }
+
+    /**
+     * @brief Runtime MTP policy selects whether the routed NextN bank exists.
+     *
+     * This is the focused regression for the real Qwen3.6 ExpertOverlay
+     * campaign: its serial graph built only forty main layers while residency
+     * incorrectly waited for layer forty, and the MTP graph needs that same
+     * layer forty bank. Both plans must be derived from one immutable request.
+     */
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning,
+         RuntimeMTPPolicySelectsTrailingRoutedSidecarLayer)
+    {
+        auto model_ctx = makeMoEModelContextWithTrailingMTP();
+        auto requested_plan = makeRequestedOverlayPlan();
+
+        InferenceRunnerConfig serial_config;
+        serial_config.moe_routed_expert_plan = requested_plan;
+        const auto serial_plan =
+            resolveMoERoutedExpertPlacementPlanForModel(
+                *model_ctx,
+                serial_config);
+
+        InferenceRunnerConfig mtp_config = serial_config;
+        mtp_config.mtp.enabled = true;
+        mtp_config.mtp.draft_tokens = 3;
+        const auto mtp_plan =
+            resolveMoERoutedExpertPlacementPlanForModel(
+                *model_ctx,
+                mtp_config);
+
+        ASSERT_NE(serial_plan, nullptr);
+        ASSERT_NE(mtp_plan, nullptr);
+        EXPECT_TRUE(requested_plan->placements.empty());
+        ASSERT_EQ(serial_plan->placements.size(), 3u);
+        EXPECT_EQ(serial_plan->placements.back().layer, 2);
+        ASSERT_EQ(mtp_plan->placements.size(), 4u);
+        EXPECT_EQ(mtp_plan->placements.back().layer, 3);
+    }
+
+    /**
+     * @brief An all-feature explicit plan produces an immutable serial view.
+     */
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning,
+         NonMTPRuntimeClonesAndTrimsOnlyAuthenticatedTrailingSidecar)
+    {
+        auto model_ctx = makeMoEModelContextWithTrailingMTP();
+        InferenceRunnerConfig mtp_config;
+        mtp_config.moe_routed_expert_plan = makeRequestedOverlayPlan();
+        mtp_config.mtp.enabled = true;
+        auto all_feature_plan =
+            resolveMoERoutedExpertPlacementPlanForModel(
+                *model_ctx,
+                mtp_config);
+        ASSERT_NE(all_feature_plan, nullptr);
+        ASSERT_EQ(all_feature_plan->placements.size(), 4u);
+
+        InferenceRunnerConfig serial_config;
+        serial_config.moe_routed_expert_plan = all_feature_plan;
+        auto serial_plan = resolveMoERoutedExpertPlacementPlanForModel(
+            *model_ctx,
+            serial_config);
+
+        ASSERT_NE(serial_plan, nullptr);
+        EXPECT_NE(serial_plan, all_feature_plan);
+        EXPECT_EQ(serial_plan->placements.size(), 3u);
+        EXPECT_EQ(all_feature_plan->placements.size(), 4u)
+            << "freezing a serial graph must not mutate the reusable declaration";
+    }
+
+    /**
+     * @brief MTP cannot run against an explicit plan missing its sidecar bank.
+     */
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning,
+         MTPRuntimeRejectsExplicitPlanWithoutRoutedSidecarLayer)
+    {
+        auto model_ctx = makeMoEModelContextWithTrailingMTP();
+        InferenceRunnerConfig serial_config;
+        serial_config.moe_routed_expert_plan = makeRequestedOverlayPlan();
+        auto main_only_plan =
+            resolveMoERoutedExpertPlacementPlanForModel(
+                *model_ctx,
+                serial_config);
+        ASSERT_NE(main_only_plan, nullptr);
+        ASSERT_EQ(main_only_plan->placements.size(), 3u);
+
+        InferenceRunnerConfig mtp_config;
+        mtp_config.moe_routed_expert_plan = main_only_plan;
+        mtp_config.mtp.enabled = true;
+        EXPECT_THROW(
+            (void)resolveMoERoutedExpertPlacementPlanForModel(
+                *model_ctx,
+                mtp_config),
+            std::invalid_argument);
     }
 
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PlanningErrorsSurfaceBeforeGraphExecution)
@@ -726,7 +1068,8 @@ namespace
         EXPECT_TRUE(continuation_domain.domain_scoped_collective_context_ready);
     }
 
-    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, RebalanceControllersIncludeRoutedOverlayDomains)
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning,
+         OverlayRuntimePlanWithoutRCUAuthorityIsRejected)
     {
         GraphConfig graph_config;
         graph_config.n_layers = kMoELayers;
@@ -739,25 +1082,14 @@ namespace
         graph_config.moe.expert_overlay_runtime_plan =
             resolveMoEExpertOverlayRuntimePlan(makeRequestedOverlayPlan());
 
-        auto controllers = createMoERebalanceControllersForGraph(
-            graph_config,
-            nullptr,
-            nullptr);
-
-        ASSERT_EQ(controllers.size(), 3u);
-        EXPECT_EQ(controllers[0]->domainId(), "single");
-        EXPECT_EQ(controllers[1]->domainId(), "overlay_routed_gpu_hot");
-        EXPECT_EQ(controllers[2]->domainId(), "overlay_routed_cpu_cold");
-        EXPECT_EQ(controllers[1]->participantCount(), 1);
-        EXPECT_EQ(controllers[2]->participantCount(), 1);
-        EXPECT_EQ(controllers[1]->mode(), MoERebalanceMode::OBSERVE);
-        EXPECT_EQ(controllers[2]->mode(), MoERebalanceMode::OBSERVE);
-        EXPECT_EQ(controllers[0]->maxReplicasPerSocket(), 2);
-        EXPECT_EQ(controllers[1]->maxReplicasPerSocket(), 2);
-        EXPECT_EQ(controllers[2]->maxReplicasPerSocket(), 2);
+        EXPECT_THROW(
+            validateMoEDurableResidencyAuthorityForGraph(
+                graph_config, nullptr, nullptr),
+            std::logic_error);
     }
 
-    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, GraphHistogramBindsToActiveOverlayRebalanceController)
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning,
+         DynamicOverlayCannotBindLegacyController)
     {
         GraphConfig graph_config;
         graph_config.n_layers = kMoELayers;
@@ -770,28 +1102,100 @@ namespace
         graph_config.moe.expert_overlay_runtime_plan =
             resolveMoEExpertOverlayRuntimePlan(makeRequestedOverlayPlan());
 
-        auto controllers = createMoERebalanceControllersForGraph(
-            graph_config,
+        EXPECT_THROW(
+            validateMoEDurableResidencyAuthorityForGraph(
+                graph_config, nullptr, nullptr),
+            std::logic_error);
+    }
+
+    /**
+     * @brief A live ExpertOverlay authority is the only representable writer.
+     *
+     * A one-domain overlay may have several participants, which is precisely
+     * the geometry that made the legacy graph-side Dynamic lowering eligible.
+     * `SingleDomain` must now bind the RCU owner map as the sole durable
+     * authority before graph construction; graph configuration has no second
+     * durable-writer mode to clear or reconcile.
+     */
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning,
+         InstalledExpertOverlayRCUIsTheOnlyDurableResidencyAuthority)
+    {
+        auto model_ctx = makeMoEModelContext();
+        InferenceRunnerConfig runner_config;
+        auto single_domain_plan =
+            makeActiveCudaLocalTPReplicatedOverlayPlan();
+        single_domain_plan->topology =
+            RoutedExpertPlacementTopology::SingleDomain;
+        single_domain_plan->residency_policy =
+            RoutedExpertResidencyPolicy::StaticById;
+        runner_config.moe_routed_expert_plan =
+            resolveMoERoutedExpertPlacementPlanForModel(
+                *model_ctx,
+                InferenceRunnerConfig{
+                    .moe_routed_expert_plan =
+                        std::move(single_domain_plan),
+                });
+        ASSERT_NE(runner_config.moe_routed_expert_plan, nullptr);
+
+        auto authority = std::make_shared<MoEOverlayResidencyAuthority>(
+            MoEOverlayResidencyAuthority::Config{
+                .initial_plan = *runner_config.moe_routed_expert_plan,
+                .model_metadata = {
+                    .num_layers = kMoELayers,
+                    .num_experts = kMoEExperts,
+                    .d_model = kMoEDModel,
+                    .routed_intermediate_size = kMoEIntermediate,
+                },
+                .maintenance_mode = MoERebalanceRuntimeMode::Off,
+                .histogram = nullptr,
+                .perf_device = "factory_unit",
+            });
+        const auto snapshot = authority->snapshot();
+        ASSERT_NE(snapshot, nullptr);
+        ASSERT_TRUE(snapshot->valid());
+
+        std::vector<int> local_participant_ids;
+        for (const auto &participant : snapshot->owner_map.participants())
+            local_participant_ids.push_back(participant.participant_id);
+        auto participant_residency =
+            std::make_shared<MoEOverlayParticipantResidencyRegistry>(
+                MoEOverlayParticipantResidencyRegistry::Config{
+                    .owner_map = snapshot->owner_map,
+                    .local_participant_ids = local_participant_ids,
+                    .num_layers = kMoELayers,
+                    .num_experts = kMoEExperts,
+                    .initial_epoch = snapshot->epoch,
+                });
+
+        runner_config.moe_expert_overlay_residency_authority = authority;
+        runner_config.moe_expert_overlay_participant_residency =
+            participant_residency;
+        runner_config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+
+        GraphConfig graph_config;
+        graph_config.moe.rebalance_config.mode =
+            MoERebalanceRuntimeMode::Off;
+        DomainTPContextMap owned_domain_tp_contexts;
+        ASSERT_TRUE(applyMoEExpertOverlayConfigToGraphForTesting(
+            *model_ctx,
+            runner_config,
             nullptr,
-            nullptr);
-
-        ASSERT_EQ(controllers.size(), 3u);
-        ASSERT_EQ(controllers.front()->domainId(), "single");
-
-        auto *active = bindActiveMoERebalanceControllerForGraph(
             graph_config,
-            controllers);
+            owned_domain_tp_contexts));
 
-        ASSERT_NE(active, nullptr);
-        EXPECT_EQ(active->domainId(), "overlay_routed_gpu_hot");
-        ASSERT_NE(active->histogram(), nullptr);
-        EXPECT_EQ(graph_config.moe.decode_histogram, active->histogram());
-        EXPECT_NE(graph_config.moe.decode_histogram, controllers.front()->histogram());
-        EXPECT_EQ(graph_config.moe.rebalance_mode, active->mode());
+        EXPECT_EQ(
+            graph_config.moe.durable_residency_authority,
+            MoEDurableResidencyAuthorityKind::ExpertOverlayRCU);
+        EXPECT_EQ(
+            graph_config.moe.expert_overlay_residency_authority,
+            authority);
+
+        EXPECT_NO_THROW(validateMoEDurableResidencyAuthorityForGraph(
+            graph_config, nullptr, nullptr));
     }
 
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning,
-         CurrentBatchLLEPDoesNotEnableDurableResidencyMaintenance)
+         CurrentBatchLLEPRequiresExpertOverlayParentAuthority)
     {
         GraphConfig graph_config;
         graph_config.n_layers = kMoELayers;
@@ -807,17 +1211,19 @@ namespace
         graph_config.moe.expert_overlay_runtime_plan =
             resolveMoEExpertOverlayRuntimePlan(makeActiveCudaLocalTPReplicatedOverlayPlan());
 
-        auto controllers = createMoERebalanceControllersForGraph(
-            graph_config,
-            nullptr,
-            nullptr);
-
-        EXPECT_TRUE(controllers.empty())
-            << "Current-batch LLEP is a routed-prefill assignment policy and "
-               "must not implicitly construct a durable ownership controller.";
+        EXPECT_THROW(
+            validateMoEDurableResidencyAuthorityForGraph(
+                graph_config, nullptr, nullptr),
+            std::logic_error)
+            << "Current-batch LLEP must be a child of an installed durable "
+               "ExpertOverlay epoch, never a reason to create another writer";
+        EXPECT_EQ(
+            graph_config.moe.durable_residency_authority,
+            MoEDurableResidencyAuthorityKind::None);
     }
 
-    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, HomogeneousGpuOwnershipMovesAreBoundedByLayerFanout)
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning,
+         HomogeneousGpuDynamicCannotReenterLegacyController)
     {
         GraphConfig graph_config;
         graph_config.n_layers = 40;
@@ -828,27 +1234,14 @@ namespace
         graph_config.moe.expert_overlay_runtime_plan =
             resolveMoEExpertOverlayRuntimePlan(makeActiveCudaLocalTPReplicatedOverlayPlan());
 
-        auto controllers = createMoERebalanceControllersForGraph(
-            graph_config,
-            nullptr,
-            nullptr);
-
-        auto it = std::find_if(
-            controllers.begin(),
-            controllers.end(),
-            [](const std::unique_ptr<MoERebalanceController> &controller)
-            {
-                return controller && controller->domainId() == "overlay_routed_cuda_hot";
-            });
-        ASSERT_NE(it, controllers.end());
-
-        const SocketRebalanceConfig &policy = (*it)->rebalanceConfig();
-        EXPECT_EQ(policy.max_total_swaps, 6)
-            << "Qwen-sized GPU ownership moves must fit the first-class staging arena";
-        EXPECT_EQ(policy.max_swaps_per_layer, 3);
+        EXPECT_THROW(
+            validateMoEDurableResidencyAuthorityForGraph(
+                graph_config, nullptr, nullptr),
+            std::logic_error);
     }
 
-    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, GlobalTPRebalanceControllerPreservesCpuDomain)
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning,
+         GlobalTPRequiresNormalizedExpertOverlayAuthority)
     {
         GraphConfig graph_config;
         graph_config.n_layers = kMoELayers;
@@ -858,32 +1251,10 @@ namespace
         graph_config.moe.rebalance_config.window_size = 32;
 
         FakeGlobalTPContext global_tp(/*domain_id=*/17, /*my_index=*/1, /*degree=*/2);
-        auto controllers = createMoERebalanceControllersForGraph(
-            graph_config,
-            nullptr,
-            &global_tp);
-
-        ASSERT_EQ(controllers.size(), 1u);
-        const auto &controller = *controllers.front();
-        EXPECT_EQ(controller.domainId(), "global_tp_domain_17");
-        EXPECT_EQ(controller.participantCount(), 2);
-        ASSERT_EQ(controller.participantDevices().size(), 2u);
-        EXPECT_EQ(controller.participantDevices()[0], DeviceId(DeviceType::CPU, 0));
-        EXPECT_EQ(controller.participantDevices()[1], DeviceId(DeviceType::CPU, 1));
-        EXPECT_EQ(controller.mode(), MoERebalanceMode::DYNAMIC);
-        EXPECT_EQ(controller.rebalanceConfig().max_total_swaps, 16)
-            << "CPU domains keep the historical socket-rebalancer default";
-
-        auto rank0_masks = controller.computeExpertMasksForParticipant(0);
-        auto rank1_masks = controller.computeExpertMasksForParticipant(1);
-        ASSERT_EQ(rank0_masks.size(), static_cast<size_t>(kMoELayers));
-        ASSERT_EQ(rank1_masks.size(), static_cast<size_t>(kMoELayers));
-        EXPECT_TRUE(rank0_masks[0][0]);
-        EXPECT_TRUE(rank0_masks[0][2]);
-        EXPECT_FALSE(rank0_masks[0][3]);
-        EXPECT_FALSE(rank1_masks[0][2]);
-        EXPECT_TRUE(rank1_masks[0][3]);
-        EXPECT_TRUE(rank1_masks[0][5]);
+        EXPECT_THROW(
+            validateMoEDurableResidencyAuthorityForGraph(
+                graph_config, nullptr, &global_tp),
+            std::logic_error);
     }
 
     // =============================================================================

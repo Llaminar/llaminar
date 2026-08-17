@@ -401,7 +401,10 @@ TEST_F(Test__CrossDomainTransferPerf, GpuCacheMasks_Scalability)
         rcfg.top_k = 2;
         rcfg.window_size = 128;
         rcfg.sockets = {DeviceId::rocm(0), DeviceId::cpu()};
-        rcfg.initial_expert_to_socket.assign(cfg.experts, 0);
+        rcfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+            cfg.layers,
+            2,
+            std::vector<int>(static_cast<size_t>(cfg.experts), 0));
 
         MoERebalanceController controller(rcfg);
 

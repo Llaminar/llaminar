@@ -43,6 +43,7 @@ namespace llaminar2
     __global__ void rocm_tq_ring_logical_block_export_device_kernel(
         const uint8_t *__restrict__ ring_k,
         const uint8_t *__restrict__ ring_v,
+        const uint8_t *__restrict__ ring_k_anchor,
         uint8_t *__restrict__ block_k,
         uint8_t *__restrict__ block_v,
         const int *__restrict__ ring_head,
@@ -51,7 +52,8 @@ namespace llaminar2
         int token_count,
         int max_seq_len,
         size_t k_row_bytes,
-        size_t v_row_bytes)
+        size_t v_row_bytes,
+        size_t k_anchor_bytes)
     {
         const int count = *cached_tokens;
         const int head = *ring_head;
@@ -73,14 +75,20 @@ namespace llaminar2
             static_cast<size_t>(token_count) * k_row_bytes;
         const size_t v_bytes =
             static_cast<size_t>(token_count) * v_row_bytes;
-        const size_t total = k_bytes + v_bytes;
+        const size_t total = k_anchor_bytes + k_bytes + v_bytes;
         for (size_t linear =
                  static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
              linear < total;
              linear += static_cast<size_t>(gridDim.x) * blockDim.x)
         {
-            const bool is_k = linear < k_bytes;
-            const size_t local = is_k ? linear : linear - k_bytes;
+            if (linear < k_anchor_bytes)
+            {
+                block_k[linear] = ring_k_anchor[linear];
+                continue;
+            }
+            const size_t payload = linear - k_anchor_bytes;
+            const bool is_k = payload < k_bytes;
+            const size_t local = is_k ? payload : payload - k_bytes;
             const size_t row_bytes = is_k ? k_row_bytes : v_row_bytes;
             const int token = static_cast<int>(local / row_bytes);
             const size_t byte_in_row = local % row_bytes;
@@ -89,7 +97,7 @@ namespace llaminar2
             const size_t source =
                 static_cast<size_t>(physical) * row_bytes + byte_in_row;
             if (is_k)
-                block_k[local] = ring_k[source];
+                block_k[k_anchor_bytes + local] = ring_k[source];
             else
                 block_v[local] = ring_v[source];
         }
@@ -106,6 +114,7 @@ namespace llaminar2
     __global__ void rocm_tq_ring_logical_block_import_device_kernel(
         uint8_t *__restrict__ ring_k,
         uint8_t *__restrict__ ring_v,
+        uint8_t *__restrict__ ring_k_anchor,
         const uint8_t *__restrict__ block_k,
         const uint8_t *__restrict__ block_v,
         const int *__restrict__ ring_head,
@@ -114,7 +123,8 @@ namespace llaminar2
         int token_count,
         int max_seq_len,
         size_t k_row_bytes,
-        size_t v_row_bytes)
+        size_t v_row_bytes,
+        size_t k_anchor_bytes)
     {
         const int count = *cached_tokens;
         const int head = *ring_head;
@@ -128,14 +138,20 @@ namespace llaminar2
             static_cast<size_t>(token_count) * k_row_bytes;
         const size_t v_bytes =
             static_cast<size_t>(token_count) * v_row_bytes;
-        const size_t total = k_bytes + v_bytes;
+        const size_t total = k_anchor_bytes + k_bytes + v_bytes;
         for (size_t linear =
                  static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
              linear < total;
              linear += static_cast<size_t>(gridDim.x) * blockDim.x)
         {
-            const bool is_k = linear < k_bytes;
-            const size_t local = is_k ? linear : linear - k_bytes;
+            if (linear < k_anchor_bytes)
+            {
+                ring_k_anchor[linear] = block_k[linear];
+                continue;
+            }
+            const size_t payload = linear - k_anchor_bytes;
+            const bool is_k = payload < k_bytes;
+            const size_t local = is_k ? payload : payload - k_bytes;
             const size_t row_bytes = is_k ? k_row_bytes : v_row_bytes;
             const int token = static_cast<int>(local / row_bytes);
             const size_t byte_in_row = local % row_bytes;
@@ -143,7 +159,7 @@ namespace llaminar2
             const size_t destination =
                 static_cast<size_t>(physical) * row_bytes + byte_in_row;
             if (is_k)
-                ring_k[destination] = block_k[local];
+                ring_k[destination] = block_k[k_anchor_bytes + local];
             else
                 ring_v[destination] = block_v[local];
         }
@@ -215,22 +231,28 @@ namespace llaminar2
 
         if (head_dim_ == 64)
         {
-            tq8_block_size_ = sizeof(TQ8Block<64>);
-            v_block_size_ = mode_ == TurboQuantKVMode::TQ8_K_TQ8_V
+            k_block_size_ = sizeof(AttentionKeyQ8Block<64>);
+            v_block_size_ = mode_ == TurboQuantKVMode::AQ8_K_Q8_1_V
+                                ? 2 * sizeof(Q8_1Block)
+                            : mode_ == TurboQuantKVMode::AQ8_K_TQ8_V
                                 ? sizeof(TQ8Block<64>)
                                 : sizeof(TQ4Block<64>);
         }
         else if (head_dim_ == 128)
         {
-            tq8_block_size_ = sizeof(TQ8Block<128>);
-            v_block_size_ = mode_ == TurboQuantKVMode::TQ8_K_TQ8_V
+            k_block_size_ = sizeof(AttentionKeyQ8Block<128>);
+            v_block_size_ = mode_ == TurboQuantKVMode::AQ8_K_Q8_1_V
+                                ? 4 * sizeof(Q8_1Block)
+                            : mode_ == TurboQuantKVMode::AQ8_K_TQ8_V
                                 ? sizeof(TQ8Block<128>)
                                 : sizeof(TQ4Block<128>);
         }
         else if (head_dim_ == 256)
         {
-            tq8_block_size_ = sizeof(TQ8Block<256>);
-            v_block_size_ = mode_ == TurboQuantKVMode::TQ8_K_TQ8_V
+            k_block_size_ = sizeof(AttentionKeyQ8Block<256>);
+            v_block_size_ = mode_ == TurboQuantKVMode::AQ8_K_Q8_1_V
+                                ? 8 * sizeof(Q8_1Block)
+                            : mode_ == TurboQuantKVMode::AQ8_K_TQ8_V
                                 ? sizeof(TQ8Block<256>)
                                 : sizeof(TQ4Block<256>);
         }
@@ -240,26 +262,30 @@ namespace llaminar2
                 "ROCmRingKVCacheTQ: head_dim must be 64, 128, or 256");
         }
 
-        if (!tq_ctx)
-        {
-            throw std::runtime_error(
-                "ROCmRingKVCacheTQ requires TurboQuantContext");
-        }
-        const uint64_t rotation_seed = tq_ctx->rotation().seed;
-
         hipStream_t init_stream = static_cast<hipStream_t>(
             GPUDeviceContextPool::instance().getAMDContext(device_id_).defaultStream());
         if (!init_stream)
             throw std::runtime_error("ROCmRingKVCacheTQ: explicit initialization stream unavailable");
 
-        if (!hip_tq_upload_codebooks(init_stream))
-            throw std::runtime_error(
-                "ROCmRingKVCacheTQ: failed to enqueue constant codebook publication");
-        rotations_ = hip_tq_create_rotations(n_layers_, local_n_kv_heads_, head_dim_,
-                                              rotation_seed, device_id_, init_stream, kv_head_start_);
+        // Only TurboQuant values require model-lifetime codebooks and
+        // rotations. AQ8 keys and Q8_1 values carry their own scale metadata.
+        if (turboQuantValueUsesRotation(mode_))
+        {
+            if (!tq_ctx)
+                throw std::runtime_error(
+                    "ROCmRingKVCacheTQ: TQ value storage requires TurboQuantContext");
+            if (!hip_tq_upload_codebooks(init_stream))
+                throw std::runtime_error(
+                    "ROCmRingKVCacheTQ: failed to enqueue constant codebook publication");
+            rotations_ = hip_tq_create_rotations(
+                n_layers_, local_n_kv_heads_, head_dim_,
+                tq_ctx->rotation().seed, device_id_, init_stream,
+                kv_head_start_);
+        }
 
-        const size_t k_entry_bytes = static_cast<size_t>(max_seq_len_) * local_n_kv_heads_ * tq8_block_size_;
+        const size_t k_entry_bytes = static_cast<size_t>(max_seq_len_) * local_n_kv_heads_ * k_block_size_;
         const size_t v_entry_bytes = static_cast<size_t>(max_seq_len_) * local_n_kv_heads_ * v_block_size_;
+        const size_t anchor_bytes = static_cast<size_t>(kv_dim_) * sizeof(float);
         auto *const backend = getROCmBackend();
         if (!backend)
         {
@@ -278,9 +304,12 @@ namespace llaminar2
                 auto &entry = entries_[l][s];
                 entry.d_K = backend->allocate(k_entry_bytes, device_id_);
                 entry.d_V = backend->allocate(v_entry_bytes, device_id_);
-                if (!entry.d_K || !entry.d_V ||
+                entry.d_K_anchor = static_cast<float *>(
+                    backend->allocate(anchor_bytes, device_id_));
+                if (!entry.d_K || !entry.d_V || !entry.d_K_anchor ||
                     hipMemsetAsync(entry.d_K, 0, k_entry_bytes, init_stream) != hipSuccess ||
-                    hipMemsetAsync(entry.d_V, 0, v_entry_bytes, init_stream) != hipSuccess)
+                    hipMemsetAsync(entry.d_V, 0, v_entry_bytes, init_stream) != hipSuccess ||
+                    hipMemsetAsync(entry.d_K_anchor, 0, anchor_bytes, init_stream) != hipSuccess)
                 {
                     throw std::runtime_error(
                         "ROCmRingKVCacheTQ: failed to allocate or initialize compressed entry storage");
@@ -328,10 +357,12 @@ namespace llaminar2
         auto *const backend = getROCmBackend();
         bool owns_device_storage =
             d_batched_k_entry_table_ || d_batched_v_entry_table_ ||
+            d_batched_k_anchor_table_ ||
             rotations_.d_rotations || rotations_.d_rotations_t;
         for (const auto &layer : entries_)
             for (const auto &entry : layer)
-                owns_device_storage = owns_device_storage || entry.d_K || entry.d_V;
+                owns_device_storage = owns_device_storage || entry.d_K ||
+                                      entry.d_V || entry.d_K_anchor;
         if (owns_device_storage && !backend)
         {
             LOG_ERROR("[ROCmRingKVCacheTQ] ROCm backend unavailable during cache teardown");
@@ -346,8 +377,11 @@ namespace llaminar2
                 backend->free(d_batched_k_entry_table_, device_id_);
             if (d_batched_v_entry_table_)
                 backend->free(d_batched_v_entry_table_, device_id_);
+            if (d_batched_k_anchor_table_)
+                backend->free(d_batched_k_anchor_table_, device_id_);
             d_batched_k_entry_table_ = nullptr;
             d_batched_v_entry_table_ = nullptr;
+            d_batched_k_anchor_table_ = nullptr;
 
             for (auto &layer : entries_)
             {
@@ -357,8 +391,11 @@ namespace llaminar2
                         backend->free(entry.d_K, device_id_);
                     if (entry.d_V)
                         backend->free(entry.d_V, device_id_);
+                    if (entry.d_K_anchor)
+                        backend->free(entry.d_K_anchor, device_id_);
                     entry.d_K = nullptr;
                     entry.d_V = nullptr;
+                    entry.d_K_anchor = nullptr;
                 }
             }
 
@@ -471,6 +508,7 @@ namespace llaminar2
         const size_t table_bytes = entry_count * sizeof(void *);
         std::vector<void *> host_k(entry_count);
         std::vector<void *> host_v(entry_count);
+        std::vector<void *> host_k_anchor(entry_count);
         for (int layer = 0; layer < n_layers_; ++layer)
         {
             for (int request = 0; request < batch_size_; ++request)
@@ -479,6 +517,7 @@ namespace llaminar2
                     static_cast<size_t>(layer) * batch_size_ + request;
                 host_k[index] = entries_[layer][request].d_K;
                 host_v[index] = entries_[layer][request].d_V;
+                host_k_anchor[index] = entries_[layer][request].d_K_anchor;
             }
         }
 
@@ -490,13 +529,19 @@ namespace llaminar2
             backend->allocate(table_bytes, device_id_));
         d_batched_v_entry_table_ = static_cast<void **>(
             backend->allocate(table_bytes, device_id_));
+        d_batched_k_anchor_table_ = static_cast<void **>(
+            backend->allocate(table_bytes, device_id_));
         if (!d_batched_k_entry_table_ ||
             !d_batched_v_entry_table_ ||
+            !d_batched_k_anchor_table_ ||
             !backend->hostToDevice(
                 d_batched_k_entry_table_, host_k.data(),
                 table_bytes, device_id_, stream) ||
             !backend->hostToDevice(
                 d_batched_v_entry_table_, host_v.data(),
+                table_bytes, device_id_, stream) ||
+            !backend->hostToDevice(
+                d_batched_k_anchor_table_, host_k_anchor.data(),
                 table_bytes, device_id_, stream))
         {
             LOG_ERROR("[ROCmRingKVCacheTQ] Resident entry-table publication failed");
@@ -504,8 +549,11 @@ namespace llaminar2
                 backend->free(d_batched_k_entry_table_, device_id_);
             if (d_batched_v_entry_table_)
                 backend->free(d_batched_v_entry_table_, device_id_);
+            if (d_batched_k_anchor_table_)
+                backend->free(d_batched_k_anchor_table_, device_id_);
             d_batched_k_entry_table_ = nullptr;
             d_batched_v_entry_table_ = nullptr;
+            d_batched_k_anchor_table_ = nullptr;
             return false;
         }
         return true;
@@ -549,42 +597,6 @@ namespace llaminar2
         if (!d_head_params_ || !d_count_params_)
             return false;
 
-        const bool prepared_tq =
-            k->native_type() == TensorType::TQ8 &&
-            v->native_type() ==
-                (mode_ == TurboQuantKVMode::TQ8_K_TQ8_V
-                     ? TensorType::TQ8
-                     : TensorType::TQ4);
-        if (prepared_tq)
-        {
-            if (!k->gpu_data_ptr() || !v->gpu_data_ptr() ||
-                k->shape().empty() || v->shape().empty() ||
-                k->shape()[0] < static_cast<size_t>(num_tokens) ||
-                v->shape()[0] < static_cast<size_t>(num_tokens))
-            {
-                LOG_ERROR("[ROCmRingKVCacheTQ::appendWithStream] Prepared TQ rows must already be device resident");
-                return false;
-            }
-
-            const size_t k_row_bytes = static_cast<size_t>(local_n_kv_heads_) * tq8_block_size_;
-            const size_t v_row_bytes = static_cast<size_t>(local_n_kv_heads_) * v_block_size_;
-            const bool copy_ok = hip_tq_copy_prepared_rows_ring_dynamic(
-                k->gpu_data_ptr(), v->gpu_data_ptr(), entry.d_K, entry.d_V,
-                &d_head_params_[index], d_append_count,
-                max_seq_len_, num_tokens,
-                k_row_bytes, v_row_bytes, false, false,
-                local_n_kv_heads_, hip_stream);
-            if (copy_ok)
-            {
-                hip_kv_sequence_state_advance_dynamic(
-                    &d_head_params_[index], &d_count_params_[index],
-                    d_append_count, num_tokens, max_seq_len_, hip_stream);
-            }
-            if (!copy_ok)
-                return false;
-            return true;
-        }
-
         if (k->native_type() != TensorType::FP32 || v->native_type() != TensorType::FP32 ||
             !k->gpu_data_ptr() || !v->gpu_data_ptr())
         {
@@ -605,12 +617,16 @@ namespace llaminar2
         const auto *d_v = static_cast<const float *>(v->gpu_data_ptr());
         const size_t rotation_offset = static_cast<size_t>(layer) *
                                        local_n_kv_heads_ * head_dim_ * head_dim_;
-        const float *d_rotations = rotations_.d_rotations + rotation_offset;
+        const float *d_rotations = rotations_.d_rotations
+                                       ? rotations_.d_rotations + rotation_offset
+                                       : nullptr;
         const bool ok = hip_tq_quantize_grouped_ring_dynamic(
             d_k, d_v, d_rotations, entry.d_K, entry.d_V,
-            &d_head_params_[index], d_append_count,
+            entry.d_K_anchor, &d_head_params_[index],
+            &d_count_params_[index], d_append_count,
             max_seq_len_, num_tokens,
-            local_n_kv_heads_, head_dim_, false, false, mode_, hip_stream);
+            local_n_kv_heads_, head_dim_, false, false, mode_,
+            AttentionKeyAnchorPolicy::MeanRetained, hip_stream);
         if (ok)
         {
             hip_kv_sequence_state_advance_dynamic(
@@ -640,18 +656,10 @@ namespace llaminar2
             LOG_ERROR("[ROCmRingKVCacheTQ] Invalid grouped verifier append request");
             return false;
         }
-        const bool fp32_sources =
-            K->native_type() == TensorType::FP32 &&
-            V->native_type() == TensorType::FP32;
-        const bool prepared_tq_sources =
-            K->native_type() == TensorType::TQ8 &&
-            V->native_type() ==
-                (mode_ == TurboQuantKVMode::TQ8_K_TQ8_V
-                     ? TensorType::TQ8
-                     : TensorType::TQ4);
-        if (!fp32_sources && !prepared_tq_sources)
+        if (K->native_type() != TensorType::FP32 ||
+            V->native_type() != TensorType::FP32)
         {
-            LOG_ERROR("[ROCmRingKVCacheTQ] Grouped verifier publication requires device-resident FP32/FP32 or prepared TQ8/TQ4 K/V; got K="
+            LOG_ERROR("[ROCmRingKVCacheTQ] Grouped verifier publication requires device-resident FP32 K/V so the cache can construct its request anchor; got K="
                       << K->dtype_name() << " V=" << V->dtype_name());
             return false;
         }
@@ -705,38 +713,26 @@ namespace llaminar2
         const bool capture_active = isGraphCaptureActive();
         const size_t rotation_offset = static_cast<size_t>(layer) *
                                        local_n_kv_heads_ * head_dim_ * head_dim_;
-        const float *d_rotations = rotations_.d_rotations + rotation_offset;
+        const float *d_rotations = rotations_.d_rotations
+                                       ? rotations_.d_rotations + rotation_offset
+                                       : nullptr;
 
         if (!d_head_params_ || !d_count_params_)
         {
             LOG_ERROR("[ROCmRingKVCacheTQ] Grouped verifier requires canonical device sequence state");
             return false;
         }
-        bool ok = false;
         const int index = layer * batch_size_ + seq_idx;
         const int *d_append_count =
             deviceDynamicAppendCountPtr(layer, seq_idx);
-        if (prepared_tq_sources)
-        {
-            ok = hip_tq_copy_prepared_rows_ring_dynamic(
-                d_k, d_v, entry.d_K, entry.d_V,
-                &d_head_params_[index], d_append_count,
-                max_seq_len_, verifier_rows,
-                static_cast<size_t>(local_n_kv_heads_) * tq8_block_size_,
-                static_cast<size_t>(local_n_kv_heads_) * v_block_size_,
-                k_head_major, v_head_major, local_n_kv_heads_, stream);
-        }
-        else
-        {
-            ok = hip_tq_quantize_grouped_ring_dynamic(
-                static_cast<const float *>(d_k),
-                static_cast<const float *>(d_v),
-                d_rotations, entry.d_K, entry.d_V,
-                &d_head_params_[index], d_append_count,
-                max_seq_len_, verifier_rows,
-                local_n_kv_heads_, head_dim_, k_head_major, v_head_major,
-                mode_, stream);
-        }
+        const bool ok = hip_tq_quantize_grouped_ring_dynamic(
+            static_cast<const float *>(d_k),
+            static_cast<const float *>(d_v),
+            d_rotations, entry.d_K, entry.d_V, entry.d_K_anchor,
+            &d_head_params_[index], &d_count_params_[index], d_append_count,
+            max_seq_len_, verifier_rows,
+            local_n_kv_heads_, head_dim_, k_head_major, v_head_major,
+            mode_, AttentionKeyAnchorPolicy::FirstRetained, stream);
         if (ok)
         {
             hip_kv_sequence_state_advance_dynamic(
@@ -775,8 +771,8 @@ namespace llaminar2
     ROCmRingKVCacheTQ::logicalBlockLayout(int global_layer, int token_count) const
     {
         KVCacheLogicalBlockLayout layout{
-            .k_precision = ActivationPrecision::TQ8,
-            .v_precision = ActivationPrecision::TQ4,
+            .k_precision = ActivationPrecision::AQ8,
+            .v_precision = turboQuantValuePrecision(mode_),
             .layout = TensorLayout::KV_POS_HEAD_DIM,
             .local_kv_heads = local_n_kv_heads_,
             .kv_head_start = kv_head_start_,
@@ -785,7 +781,9 @@ namespace llaminar2
         };
         if (remapLayerIndex(global_layer) < 0 || token_count <= 0)
             return layout;
-        layout.k_bytes = static_cast<size_t>(token_count) * local_n_kv_heads_ * tq8_block_size_;
+        layout.k_bytes = static_cast<size_t>(kv_dim_) * sizeof(float) +
+                         static_cast<size_t>(token_count) *
+                             local_n_kv_heads_ * k_block_size_;
         layout.v_bytes = static_cast<size_t>(token_count) * local_n_kv_heads_ * v_block_size_;
         return layout;
     }
@@ -825,7 +823,8 @@ namespace llaminar2
             return observeDeviceSequenceState(layer, desc.seq_idx, &state) &&
                    desc.logical_token_start <= state.cached_tokens;
         }
-        if (!dst_k || !dst_v || !entry.d_K || !entry.d_V)
+        if (!dst_k || !dst_v || !entry.d_K || !entry.d_V ||
+            !entry.d_K_anchor)
         {
             LOG_ERROR("[ROCmRingKVCacheTQ::exportLogicalBlock] Non-empty export requires destinations and an explicit stream");
             return false;
@@ -843,11 +842,13 @@ namespace llaminar2
                 layer * batch_size_ + desc.seq_idx;
             constexpr int threads = 256;
             const size_t k_row_bytes =
-                static_cast<size_t>(local_n_kv_heads_) * tq8_block_size_;
+                static_cast<size_t>(local_n_kv_heads_) * k_block_size_;
             const size_t v_row_bytes =
                 static_cast<size_t>(local_n_kv_heads_) * v_block_size_;
+            const size_t k_anchor_bytes =
+                static_cast<size_t>(kv_dim_) * sizeof(float);
             const size_t bytes =
-                static_cast<size_t>(desc.token_count) *
+                k_anchor_bytes + static_cast<size_t>(desc.token_count) *
                 (k_row_bytes + v_row_bytes);
             const int blocks = std::max(
                 1,
@@ -862,6 +863,7 @@ namespace llaminar2
                 stream,
                 static_cast<const uint8_t *>(entry.d_K),
                 static_cast<const uint8_t *>(entry.d_V),
+                reinterpret_cast<const uint8_t *>(entry.d_K_anchor),
                 static_cast<uint8_t *>(dst_k),
                 static_cast<uint8_t *>(dst_v),
                 &d_head_params_[entry_index],
@@ -870,7 +872,8 @@ namespace llaminar2
                 desc.token_count,
                 max_seq_len_,
                 k_row_bytes,
-                v_row_bytes);
+                v_row_bytes,
+                k_anchor_bytes);
             const hipError_t launch_error = hipGetLastError();
             if (launch_error != hipSuccess)
             {
@@ -903,17 +906,26 @@ namespace llaminar2
         int tail = (export_head - export_count) % max_seq_len_;
         if (tail < 0)
             tail += max_seq_len_;
-        const size_t k_row_bytes = static_cast<size_t>(local_n_kv_heads_) * tq8_block_size_;
+        const size_t k_row_bytes = static_cast<size_t>(local_n_kv_heads_) * k_block_size_;
         const size_t v_row_bytes = static_cast<size_t>(local_n_kv_heads_) * v_block_size_;
         auto *out_k = static_cast<uint8_t *>(dst_k);
         auto *out_v = static_cast<uint8_t *>(dst_v);
         const auto *ring_k = static_cast<const uint8_t *>(entry.d_K);
         const auto *ring_v = static_cast<const uint8_t *>(entry.d_V);
+        const size_t k_anchor_bytes =
+            static_cast<size_t>(kv_dim_) * sizeof(float);
+        if (hipMemcpyAsync(
+                out_k, entry.d_K_anchor, k_anchor_bytes,
+                hipMemcpyDeviceToHost, stream) != hipSuccess)
+        {
+            return false;
+        }
         for (int row = 0; row < desc.token_count; ++row)
         {
             const int logical_row = desc.logical_token_start + row;
             const int physical_row = (tail + logical_row) % max_seq_len_;
-            if (hipMemcpyAsync(out_k + static_cast<size_t>(row) * k_row_bytes,
+            if (hipMemcpyAsync(out_k + k_anchor_bytes +
+                                   static_cast<size_t>(row) * k_row_bytes,
                                ring_k + static_cast<size_t>(physical_row) * k_row_bytes,
                                k_row_bytes, hipMemcpyDeviceToHost, stream) != hipSuccess ||
                 hipMemcpyAsync(out_v + static_cast<size_t>(row) * v_row_bytes,
@@ -957,6 +969,7 @@ namespace llaminar2
                     layer, desc.seq_idx, 0, 0, stream);
             }
             if (!src_k || !src_v || !entry.d_K || !entry.d_V ||
+                !entry.d_K_anchor ||
                 !d_head_params_ || !d_count_params_)
             {
                 return false;
@@ -966,11 +979,13 @@ namespace llaminar2
                 layer * batch_size_ + desc.seq_idx;
             constexpr int threads = 256;
             const size_t k_row_bytes =
-                static_cast<size_t>(local_n_kv_heads_) * tq8_block_size_;
+                static_cast<size_t>(local_n_kv_heads_) * k_block_size_;
             const size_t v_row_bytes =
                 static_cast<size_t>(local_n_kv_heads_) * v_block_size_;
+            const size_t k_anchor_bytes =
+                static_cast<size_t>(kv_dim_) * sizeof(float);
             const size_t bytes =
-                static_cast<size_t>(desc.token_count) *
+                k_anchor_bytes + static_cast<size_t>(desc.token_count) *
                 (k_row_bytes + v_row_bytes);
             const int blocks = std::max(
                 1,
@@ -985,6 +1000,7 @@ namespace llaminar2
                 stream,
                 static_cast<uint8_t *>(entry.d_K),
                 static_cast<uint8_t *>(entry.d_V),
+                reinterpret_cast<uint8_t *>(entry.d_K_anchor),
                 static_cast<const uint8_t *>(src_k),
                 static_cast<const uint8_t *>(src_v),
                 &d_head_params_[entry_index],
@@ -993,7 +1009,8 @@ namespace llaminar2
                 desc.token_count,
                 max_seq_len_,
                 k_row_bytes,
-                v_row_bytes);
+                v_row_bytes,
+                k_anchor_bytes);
             hipLaunchKernelGGL(
                 rocm_tq_ring_logical_block_import_publish_kernel,
                 dim3(1),
@@ -1031,20 +1048,26 @@ namespace llaminar2
             return setDeviceSequenceState(
                 layer, desc.seq_idx, 0, 0, stream);
         }
-        if (!src_k || !src_v || !entry.d_K || !entry.d_V)
+        if (!src_k || !src_v || !entry.d_K || !entry.d_V ||
+            !entry.d_K_anchor)
         {
             return false;
         }
 
         (void)hipSetDevice(device_id_);
-        const size_t k_row_bytes = static_cast<size_t>(local_n_kv_heads_) * tq8_block_size_;
+        const size_t k_row_bytes = static_cast<size_t>(local_n_kv_heads_) * k_block_size_;
         const size_t v_row_bytes = static_cast<size_t>(local_n_kv_heads_) * v_block_size_;
         const size_t k_bytes = static_cast<size_t>(desc.token_count) * k_row_bytes;
         const size_t v_bytes = static_cast<size_t>(desc.token_count) * v_row_bytes;
+        const size_t k_anchor_bytes =
+            static_cast<size_t>(kv_dim_) * sizeof(float);
         auto *ring_k = static_cast<uint8_t *>(entry.d_K);
         auto *ring_v = static_cast<uint8_t *>(entry.d_V);
-        if (hipMemcpyAsync(ring_k + static_cast<size_t>(desc.logical_token_start) * k_row_bytes,
-                           src_k, k_bytes, hipMemcpyHostToDevice, stream) != hipSuccess ||
+        if (hipMemcpyAsync(entry.d_K_anchor, src_k, k_anchor_bytes,
+                           hipMemcpyHostToDevice, stream) != hipSuccess ||
+            hipMemcpyAsync(ring_k + static_cast<size_t>(desc.logical_token_start) * k_row_bytes,
+                           static_cast<const uint8_t *>(src_k) + k_anchor_bytes,
+                           k_bytes, hipMemcpyHostToDevice, stream) != hipSuccess ||
             hipMemcpyAsync(ring_v + static_cast<size_t>(desc.logical_token_start) * v_row_bytes,
                            src_v, v_bytes, hipMemcpyHostToDevice, stream) != hipSuccess)
         {
@@ -1098,14 +1121,19 @@ namespace llaminar2
             max_seq_len_;
         const int D = head_dim_;
         const size_t layer_rot_offset = static_cast<size_t>(layer) * local_n_kv_heads_ * D * D;
-        const float *d_K_rot_t = rotations_.d_rotations_t + layer_rot_offset;
+        const float *d_K_rot_t = rotations_.d_rotations_t
+                                     ? rotations_.d_rotations_t + layer_rot_offset
+                                     : nullptr;
         const float *d_V_rot_t = d_K_rot_t;
-        const float *d_K_rot = rotations_.d_rotations + layer_rot_offset;
+        const float *d_K_rot = rotations_.d_rotations
+                                   ? rotations_.d_rotations + layer_rot_offset
+                                   : nullptr;
         const float *d_V_rot = d_K_rot;
 
         return hip_tq_ring_linearize_dequant_fp16(
             scratch.d_K, scratch.d_V,
             entry.d_K, entry.d_V,
+            entry.d_K_anchor,
             d_K_rot_t, d_V_rot_t,
             d_K_rot, d_V_rot,
             tail, state.cached_tokens, max_seq_len_,
@@ -1231,7 +1259,9 @@ namespace llaminar2
             first_seq_idx > batch_size_ - request_count ||
             !d_head_params_ || !d_count_params_ ||
             !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
-            !rotations_.d_rotations || !workspace_ ||
+            !d_batched_k_anchor_table_ ||
+            (turboQuantValueUsesRotation(mode_) && !rotations_.d_rotations) ||
+            !workspace_ ||
             scratch_capacity_bytes_ <
                 static_cast<size_t>(request_count) * max_seq_len_ * kv_dim_ *
                     sizeof(_Float16))
@@ -1255,9 +1285,12 @@ namespace llaminar2
                 scratch.d_V,
                 const_cast<const void *const *>(d_batched_k_entry_table_),
                 const_cast<const void *const *>(d_batched_v_entry_table_),
+                const_cast<const void *const *>(d_batched_k_anchor_table_),
                 d_head_params_,
                 d_count_params_,
-                rotations_.d_rotations + rotation_offset,
+                rotations_.d_rotations
+                    ? rotations_.d_rotations + rotation_offset
+                    : nullptr,
                 entry_offset,
                 request_count,
                 max_seq_len_,
@@ -1332,7 +1365,9 @@ namespace llaminar2
             (effective_rope_dim % 2) != 0 ||
             !d_head_params_ || !d_count_params_ ||
             !d_batched_k_entry_table_ || !d_batched_v_entry_table_ ||
-            !rotations_.d_rotations || !workspace_ ||
+            !d_batched_k_anchor_table_ ||
+            (turboQuantValueUsesRotation(mode_) && !rotations_.d_rotations) ||
+            !workspace_ ||
             scratch_capacity_bytes_ <
                 static_cast<size_t>(request_count) * max_seq_len_ * kv_dim_ *
                     sizeof(_Float16))
@@ -1360,9 +1395,12 @@ namespace llaminar2
                 scratch.d_V,
                 const_cast<const void *const *>(d_batched_k_entry_table_),
                 const_cast<const void *const *>(d_batched_v_entry_table_),
+                const_cast<const void *const *>(d_batched_k_anchor_table_),
                 d_head_params_,
                 d_count_params_,
-                rotations_.d_rotations + rotation_offset,
+                rotations_.d_rotations
+                    ? rotations_.d_rotations + rotation_offset
+                    : nullptr,
                 entry_offset,
                 request_count,
                 max_seq_len_,

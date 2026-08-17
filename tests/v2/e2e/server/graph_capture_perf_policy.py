@@ -145,11 +145,11 @@ def _has_segmented_execution(records: Iterable[Mapping[str, Any]]) -> bool:
     for record in records:
         name = str(record.get("name", ""))
         tags = record.get("tags") or {}
-        if tags.get("collective_segmented") == "true":
+        if tags.get("heterogeneous_segmented") == "true":
             return True
         if (
             tags.get("replay_plan_policy")
-            == "allow_heterogeneous_collective_segmentation"
+            == "allow_heterogeneous_boundary_segmentation"
         ):
             return True
         if tags.get("heterogeneous_segmentation_admitted") == "true":

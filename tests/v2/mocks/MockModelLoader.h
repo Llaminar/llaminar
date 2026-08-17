@@ -144,6 +144,12 @@ namespace llaminar2::test
             DeviceId device = DeviceId::cpu(),
             WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
 
+        std::shared_ptr<TensorBase> loadTensorExpertSelection(
+            const std::string &name,
+            const std::vector<size_t> &expert_ids,
+            DeviceId device = DeviceId::cpu(),
+            WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
+
         bool hasTensor(const std::string &name) const override;
         std::optional<std::vector<size_t>> getTensorShape(const std::string &name) const override;
         std::vector<std::string> tensorNames() const override;
@@ -859,6 +865,56 @@ namespace llaminar2::test
             source->data() + expert_start * values_per_expert,
             selected_experts * values_per_expert * sizeof(float));
         return slice;
+    }
+
+    /**
+     * @brief Pack an exact non-contiguous expert selection for loader tests.
+     *
+     * The mock mirrors GGUF's expert-major 3D storage and preserves the supplied
+     * strictly increasing global-ID order. This lets device-free ownership
+     * regressions exercise the same physical selection contract as real model
+     * loading instead of weakening random ownership to a contiguous range.
+     */
+    inline std::shared_ptr<TensorBase> MockModelLoader::loadTensorExpertSelection(
+        const std::string &name,
+        const std::vector<size_t> &expert_ids,
+        DeviceId /*device*/,
+        WeightPrecision /*weight_precision*/)
+    {
+        ++load_tensor_calls_;
+
+        auto tensor_it = tensors_.find(name);
+        auto shape_it = tensor_shapes_.find(name);
+        if (tensor_it == tensors_.end() || shape_it == tensor_shapes_.end())
+        {
+            missing_requests_.push_back(name);
+            return nullptr;
+        }
+
+        const auto &shape = shape_it->second;
+        auto *source = dynamic_cast<FP32Tensor *>(tensor_it->second.get());
+        if (!source || shape.size() != 3u || expert_ids.empty())
+            return nullptr;
+        for (size_t index = 0; index < expert_ids.size(); ++index)
+        {
+            if (expert_ids[index] >= shape[2] ||
+                (index > 0u && expert_ids[index] <= expert_ids[index - 1u]))
+            {
+                return nullptr;
+            }
+        }
+
+        const size_t values_per_expert = shape[0] * shape[1];
+        auto selection = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{shape[0], shape[1], expert_ids.size()});
+        for (size_t packed_index = 0; packed_index < expert_ids.size(); ++packed_index)
+        {
+            std::memcpy(
+                selection->mutable_data() + packed_index * values_per_expert,
+                source->data() + expert_ids[packed_index] * values_per_expert,
+                values_per_expert * sizeof(float));
+        }
+        return selection;
     }
 
     inline std::shared_ptr<TensorBase> MockModelLoader::createRowSlice(

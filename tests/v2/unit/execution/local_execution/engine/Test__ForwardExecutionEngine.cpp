@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -98,6 +99,77 @@ namespace
     };
 
     /**
+     * @brief Probe lease that proves one chunk authority spans graph submission.
+     *
+     * The counters are owned by MockForwardExecutionHost.  Destruction without
+     * finish records an abandoned transaction, mirroring the fatal RAII
+     * behavior of the production ExpertOverlay participant scope without
+     * requiring a device or MPI endpoint in this unit suite.
+     */
+    class RecordingPrefillChunkSubmissionLease final
+        : public IPrefillChunkGraphSubmissionLease
+    {
+    public:
+        /** @brief Open one tracked lease. */
+        RecordingPrefillChunkSubmissionLease(
+            int *active,
+            int *finishes,
+            int *abandoned,
+            std::vector<bool> *execution_results,
+            bool finish_should_fail)
+            : active_(active),
+              finishes_(finishes),
+              abandoned_(abandoned),
+              execution_results_(execution_results),
+              finish_should_fail_(finish_should_fail)
+        {
+            ++*active_;
+        }
+
+        /** @brief Record an abandoned scope on an exceptional engine exit. */
+        ~RecordingPrefillChunkSubmissionLease() override
+        {
+            if (!finished_)
+            {
+                ++*abandoned_;
+                --*active_;
+            }
+        }
+
+        /** @copydoc IPrefillChunkGraphSubmissionLease::finish */
+        bool finish(
+            bool execution_succeeded,
+            std::string *error) override
+        {
+            if (finished_)
+            {
+                if (error)
+                    *error = "recording lease was finished twice";
+                return false;
+            }
+            finished_ = true;
+            ++*finishes_;
+            --*active_;
+            execution_results_->push_back(execution_succeeded);
+            if (finish_should_fail_)
+            {
+                if (error)
+                    *error = "configured recording lease terminal failure";
+                return false;
+            }
+            return true;
+        }
+
+    private:
+        int *active_ = nullptr;                    ///< Number of currently live leases.
+        int *finishes_ = nullptr;                  ///< Successful finish invocations.
+        int *abandoned_ = nullptr;                 ///< Destructors reached before finish.
+        std::vector<bool> *execution_results_ = nullptr; ///< Results published by the engine.
+        bool finish_should_fail_ = false;          ///< Reject the terminal for a negative test.
+        bool finished_ = false;                    ///< Enforces exactly-once closure.
+    };
+
+    /**
      * @brief Minimal mock for IForwardExecutionHost.
      *
      * Tracks which callbacks are invoked and returns configurable results.
@@ -137,11 +209,19 @@ namespace
         std::vector<int> last_position_ids;
         std::vector<int> forward_token_offsets;
         std::vector<int> forward_real_seq_lens;
+        std::vector<uint64_t> forward_overlay_steps;
         std::vector<std::vector<int>> forward_token_batches;
         int prefill_chunk_maintenance_state_calls = 0;
         int prefill_chunk_maintenance_calls = 0;
         PrefillChunkPlan last_maintenance_chunk{};
         PrefillChunkMaintenanceDecision last_maintenance_decision{};
+        int prefill_chunk_submission_begin_calls = 0;
+        int prefill_chunk_submission_finish_calls = 0;
+        int active_prefill_chunk_submission_leases = 0;
+        int abandoned_prefill_chunk_submission_leases = 0;
+        std::vector<int> prefill_chunk_submission_indices;
+        std::vector<int> active_submission_leases_during_build;
+        std::vector<bool> prefill_chunk_submission_execution_results;
 
         // ----- Configurable Results -----
         bool build_should_fail = false;
@@ -163,6 +243,9 @@ namespace
         PrefillChunkMaintenanceState mock_maintenance_state{};
         bool mock_maintenance_state_configured = false;
         bool maintenance_should_fail = false;
+        bool use_prefill_chunk_submission_leases = false;
+        int prefill_chunk_submission_fail_begin_call = -1;
+        bool prefill_chunk_submission_finish_should_fail = false;
         ForwardExecutionEngine *engine_to_clear_on_maintenance = nullptr;
         bool bump_epoch_on_maintenance = false;
         uint64_t placement_epoch = 0;
@@ -191,7 +274,11 @@ namespace
                 last_position_ids.assign(input.position_ids, input.position_ids + total_tokens);
             forward_token_offsets.push_back(input.token_offset);
             forward_real_seq_lens.push_back(input.real_seq_len);
+            forward_overlay_steps.push_back(
+                input.moe_overlay_collective_step_id);
             forward_token_batches.push_back(last_token_ids);
+            active_submission_leases_during_build.push_back(
+                active_prefill_chunk_submission_leases);
 
             if (build_should_fail)
                 return GraphBuildResult(build_error_message);
@@ -282,14 +369,12 @@ namespace
             return mock_resident_graph_rows;
         }
 
-        bool publishLogitsAtBoundary(
-            TensorBase *logits,
-            IDeviceContext *ctx,
-            void *producer_stream) override
+        bool publishForwardResultAtBoundary(
+            const ForwardOutput &output,
+            IDeviceContext *ctx) override
         {
-            last_published_logits = logits;
+            last_published_logits = output.logits;
             (void)ctx;
-            (void)producer_stream;
             sync_logits_calls++;
             return true;
         }
@@ -401,6 +486,48 @@ namespace
                 ++placement_epoch;
             if (engine_to_clear_on_maintenance)
                 engine_to_clear_on_maintenance->discardAllCachedGraphs();
+            return true;
+        }
+
+        bool beginPrefillChunkGraphSubmission(
+            ForwardInput &chunk_input,
+            const PrefillChunkPlan &chunk,
+            std::unique_ptr<IPrefillChunkGraphSubmissionLease> *lease,
+            std::string *error) override
+        {
+            ++prefill_chunk_submission_begin_calls;
+            prefill_chunk_submission_indices.push_back(chunk.chunk_index);
+            if (lease)
+                lease->reset();
+            if (error)
+                error->clear();
+            if (prefill_chunk_submission_fail_begin_call ==
+                prefill_chunk_submission_begin_calls)
+            {
+                if (error)
+                    *error = "configured chunk submission admission failure";
+                return false;
+            }
+            if (!use_prefill_chunk_submission_leases)
+                return true;
+            if (!lease)
+            {
+                if (error)
+                    *error = "mock chunk submission requires a lease output";
+                return false;
+            }
+
+            // Prove that authority-owned identity mutation reaches the exact
+            // input later consumed by buildForwardGraph()/cached replay.
+            chunk_input.moe_overlay_collective_step_id =
+                1000u + static_cast<uint64_t>(chunk.chunk_index);
+            *lease = std::make_unique<
+                RecordingPrefillChunkSubmissionLease>(
+                &active_prefill_chunk_submission_leases,
+                &prefill_chunk_submission_finish_calls,
+                &abandoned_prefill_chunk_submission_leases,
+                &prefill_chunk_submission_execution_results,
+                prefill_chunk_submission_finish_should_fail);
             return true;
         }
 
@@ -609,6 +736,77 @@ TEST(ForwardExecutionEngineSourceScan, WorkerGPUContextIsHostOwned)
         << "ForwardExecutionEngine must not bypass its host and initialize a physical GPU context.";
     EXPECT_NE(source.find("ScopedWorkerGPUContextResolver"), std::string::npos);
     EXPECT_NE(source.find("host.getWorkerGPUContext("), std::string::npos);
+}
+
+/**
+ * @brief Independent LocalTP devices may build cache misses concurrently.
+ *
+ * A process-wide graph-materialization mutex serializes participant zero and
+ * participant one before either reaches a symmetric capture collective. The
+ * collective then waits forever for the child excluded by that mutex. Shared
+ * stores own their own narrow synchronization; the forward engine must not
+ * impose a process-wide cache-miss critical section.
+ */
+TEST(ForwardExecutionEngineSourceScan,
+     CacheMissConstructionHasNoProcessWideMaterializationMutex)
+{
+    const std::string source =
+        readTextFile(LLAMINAR_FORWARD_EXECUTION_ENGINE_SOURCE);
+    ASSERT_FALSE(source.empty());
+    EXPECT_EQ(
+        source.find("gpuCacheMissGraphMaterializationMutex"),
+        std::string::npos);
+    EXPECT_EQ(
+        source.find("graph_materialization_lock"),
+        std::string::npos);
+}
+
+/**
+ * @brief Setup-only shifted-prefill bindings can describe but never execute a graph.
+ *
+ * Workspace preflight must construct the exact graph-integrated MTP topology
+ * before the first workspace generation exists. This regression locks down the
+ * typed separation between that complete declaration and a runtime binding.
+ */
+TEST(ForwardExecutionEngineSourceScan,
+     ShiftedMTPWorkspaceDeclarationCannotEnterExecution)
+{
+    auto address = [](std::uintptr_t value)
+    {
+        return reinterpret_cast<int32_t *>(value);
+    };
+
+    ShiftedMTPPrefillGraphBinding binding;
+    binding.kv_cache = reinterpret_cast<IKVCache *>(std::uintptr_t{0x1000});
+    binding.terminal_hidden_archive =
+        reinterpret_cast<TensorBase *>(std::uintptr_t{0x2000});
+    binding.request_token_ids_device = address(0x3000);
+    binding.request_position_ids_device = address(0x4000);
+    binding.shifted_token_ids_device = address(0x5000);
+    binding.shifted_position_ids_device = address(0x6000);
+    binding.append_lengths_device = address(0x7000);
+    binding.request_row_stride_device = address(0x8000);
+    binding.main_cached_tokens_device = {address(0x9000)};
+    binding.shifted_cached_tokens_device = {address(0xa000)};
+    binding.capture_identity = UINT64_MAX;
+    binding.purpose =
+        ShiftedMTPPrefillGraphBinding::Purpose::
+            WorkspaceFamilyDeclaration;
+
+    ASSERT_TRUE(binding.validForRequestCount(1));
+    EXPECT_FALSE(binding.executableForRequestCount(1));
+    binding.purpose =
+        ShiftedMTPPrefillGraphBinding::Purpose::RuntimeExecution;
+    EXPECT_TRUE(binding.executableForRequestCount(1));
+
+    const std::string source =
+        readTextFile(LLAMINAR_FORWARD_EXECUTION_ENGINE_SOURCE);
+    ASSERT_FALSE(source.empty());
+    EXPECT_NE(
+        source.find(
+            "input.shifted_mtp_prefill->executableForRequestCount("),
+        std::string::npos)
+        << "ForwardExecutionEngine must enforce the typed execution gate.";
 }
 
 // =========================================================================
@@ -1235,6 +1433,88 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_ExecutesChunksInOrd
     EXPECT_TRUE(host.last_maintenance_decision.required);
 }
 
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_HoldsDistinctAuthorityLeaseAcrossEverySubmission)
+{
+    auto engine = makeEngine(/*cache_enabled=*/false);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+    host.use_prefill_chunk_submission_leases = true;
+
+    const std::vector<int> tokens = {10, 11, 12, 13, 14, 15, 16, 17};
+    auto input = makeTestInput(
+        static_cast<int>(tokens.size()),
+        1,
+        DeviceId::cpu(),
+        tokens.data(),
+        nullptr);
+
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {4};
+    policy.fixed_chunk_real_tokens = 4;
+    policy.real_token_count = static_cast<int>(tokens.size());
+    auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+        input,
+        policy,
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/false);
+    ASSERT_TRUE(schedule) << schedule.error;
+    ASSERT_EQ(schedule.chunks.size(), 2u);
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.runPrefillChunkSchedule(input, schedule, output, host));
+
+    EXPECT_EQ(host.prefill_chunk_submission_begin_calls, 2);
+    EXPECT_EQ(host.prefill_chunk_submission_finish_calls, 2);
+    EXPECT_EQ(host.prefill_chunk_submission_indices, (std::vector<int>{0, 1}));
+    EXPECT_EQ(host.active_submission_leases_during_build,
+              (std::vector<int>{1, 1}))
+        << "Each graph must execute while its own authority lease is live.";
+    EXPECT_EQ(host.forward_overlay_steps,
+              (std::vector<uint64_t>{1000u, 1001u}))
+        << "Per-chunk authority identity must reach the submitted graph input.";
+    EXPECT_EQ(host.prefill_chunk_submission_execution_results,
+              (std::vector<bool>{true, true}));
+    EXPECT_EQ(host.active_prefill_chunk_submission_leases, 0);
+    EXPECT_EQ(host.abandoned_prefill_chunk_submission_leases, 0);
+}
+
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_AdmissionFailureCannotReusePriorChunkLease)
+{
+    auto engine = makeEngine(/*cache_enabled=*/false);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+    host.use_prefill_chunk_submission_leases = true;
+    host.prefill_chunk_submission_fail_begin_call = 2;
+
+    const std::vector<int> tokens = {10, 11, 12, 13, 14, 15, 16, 17};
+    auto input = makeTestInput(
+        static_cast<int>(tokens.size()),
+        1,
+        DeviceId::cpu(),
+        tokens.data(),
+        nullptr);
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {4};
+    policy.fixed_chunk_real_tokens = 4;
+    policy.real_token_count = static_cast<int>(tokens.size());
+    auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+        input,
+        policy,
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/false);
+    ASSERT_TRUE(schedule) << schedule.error;
+
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.runPrefillChunkSchedule(input, schedule, output, host));
+
+    EXPECT_EQ(host.prefill_chunk_submission_begin_calls, 2);
+    EXPECT_EQ(host.prefill_chunk_submission_finish_calls, 1);
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+    EXPECT_EQ(host.forward_overlay_steps, (std::vector<uint64_t>{1000u}));
+    EXPECT_EQ(host.active_prefill_chunk_submission_leases, 0);
+    EXPECT_EQ(host.abandoned_prefill_chunk_submission_leases, 0);
+}
+
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_PlacementChangingMaintenanceClearsCachedBucketGraph)
 {
     ScopedDebugEnv env({
@@ -1446,6 +1726,18 @@ TEST_F(Test__ForwardExecutionEngine,
     EXPECT_EQ(host.last_forward_input.real_seq_len, 1);
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, 4);
     EXPECT_EQ(host.last_workspace_seq_len, 4);
+
+    /*
+     * The second/terminal chunk of a prompt starts beyond position zero.  Its
+     * captured physical width is also short enough to resemble an MTP decode
+     * continuation, so this assertion protects the typed prefill-bucket
+     * contract from being overridden by the historical position heuristic.
+     */
+    const auto last_graph = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(last_graph.has_value());
+    EXPECT_FALSE(last_graph->is_decode)
+        << "A typed padded prefill tail must not be reclassified as decode";
+    EXPECT_TRUE(last_graph->signature.is_bucketed_prefill);
 }
 
 TEST_F(Test__ForwardExecutionEngine,
@@ -1696,6 +1988,44 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawBucketedPrefillPadsBeforeBuild)
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, 4);
     EXPECT_EQ(host.last_forward_input.token_offset, 200);
     EXPECT_EQ(host.last_forward_input.position_offset, 200);
+    EXPECT_EQ(host.last_workspace_seq_len, 4);
+}
+
+TEST_F(Test__ForwardExecutionEngine,
+       Execute_RawBucketFloorClampsToResidentGraphCapacity)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "8"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "8"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+    host.mock_resident_graph_rows = 4;
+
+    const std::vector<int> tokens = {80, 81, 82};
+    const std::vector<int> positions = {0, 1, 2};
+    auto input = makeTestInput(
+        3,
+        1,
+        DeviceId::cuda(0),
+        tokens.data(),
+        positions.data());
+
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(input, output, host));
+    ASSERT_TRUE(host.has_last_forward_input);
+    EXPECT_EQ(host.last_forward_input.real_seq_len, 3);
+    EXPECT_EQ(host.last_forward_input.bucket_seq_len, 4);
     EXPECT_EQ(host.last_workspace_seq_len, 4);
 }
 
@@ -2358,9 +2688,9 @@ TEST_F(Test__ForwardExecutionEngine, Execute_NonExactBucketGpuWithoutGpuGraphs_F
 
 TEST_F(Test__ForwardExecutionEngine, Execute_NonExactBucketOnCpu_FallsThrough)
 {
-    // When the device is CPU, non-exact auto-bucket selection should gracefully
-    // skip bucketing and proceed with unbucketed prefill execution. This is the
-    // fix for CPU benchmarks failing when prefill_graph_buckets is enabled globally.
+    // CPU prefill never borrows a GPU padding bucket. It keeps an exact-shape
+    // topology entry instead, so globally enabled GPU bucket policy cannot
+    // change CPU arithmetic or execution geometry.
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
@@ -2386,6 +2716,179 @@ TEST_F(Test__ForwardExecutionEngine, Execute_NonExactBucketOnCpu_FallsThrough)
         << "Unbucketed fallthrough should use the original seq_len, not the bucket size.";
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, 0)
         << "No bucket should be applied in the fallthrough path.";
+}
+
+/**
+ * @brief Exact CPU prefill must retain graph topology and refresh stable rows.
+ *
+ * The stage captures the stable token pointer installed during first graph
+ * construction. A second invocation changes the caller-owned rows. Observing
+ * the new first token through the same stage proves the engine copied request
+ * data into persistent storage instead of rebuilding or retaining a stale
+ * caller pointer.
+ */
+TEST_F(
+    Test__ForwardExecutionEngine,
+    Execute_CPUExactPrefillReusesTopologyAndRefreshesStableInputs)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS", "4"},
+    });
+    PerfStatsCollector::reset();
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    MockForwardExecutionHost host(&mock_ctx_);
+    std::vector<int> observed_first_tokens;
+    host.graph_stage_factories.push_back(
+        [&](const std::string &name, DeviceId device)
+        {
+            const int *const stable_tokens = host.last_token_ids_pointer;
+            auto stage =
+                std::make_unique<llaminar2::testing::MockComputeStage>(
+                    ComputeStageType::GEMM,
+                    name,
+                    device);
+            stage->setOnExecute(
+                [stable_tokens, &observed_first_tokens](IDeviceContext *)
+                {
+                    ASSERT_NE(stable_tokens, nullptr);
+                    observed_first_tokens.push_back(stable_tokens[0]);
+                });
+            return stage;
+        });
+
+    std::array<int, 3> tokens = {101, 102, 103};
+    std::array<int, 3> positions = {0, 1, 2};
+    auto input = makeTestInput(
+        /*seq_len=*/3,
+        /*batch_size=*/1,
+        DeviceId::cpu(),
+        tokens.data(),
+        positions.data());
+    input.position_offset = 0;
+
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(input, output, host));
+
+    tokens = {201, 202, 203};
+    positions = {0, 1, 2};
+    ASSERT_TRUE(engine.execute(input, output, host));
+
+    EXPECT_EQ(host.build_forward_graph_calls, 1)
+        << "A matching CPU prefill geometry must keep one materialized graph.";
+    EXPECT_EQ(observed_first_tokens, (std::vector<int>{101, 201}));
+    const auto snapshots = engine.prefillGraphCacheSnapshots();
+    ASSERT_EQ(snapshots.size(), 1u);
+    EXPECT_TRUE(snapshots.front().forward_cache_valid);
+    EXPECT_EQ(snapshots.front().bucket_seq_len, 3);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags miss_tags = {
+        {"all_position_logits", "false"},
+        {"context", "prefill"},
+        {"decode_has_history", "false"},
+        {"live_mtp_request_batch_condition", "false"},
+        {"all_position_logit_rows", "0"},
+        {"moe_placement_epoch", "0"},
+        {"result", "miss"},
+        {"uses_device_token_ids", "false"},
+        {"uses_device_position_ids", "false"},
+        {"uses_device_sequence_lengths", "false"},
+        {"seq_len", "3"}};
+    const PerfStatsCollector::Tags hit_tags = {
+        {"all_position_logits", "false"},
+        {"context", "prefill"},
+        {"decode_has_history", "false"},
+        {"live_mtp_request_batch_condition", "false"},
+        {"all_position_logit_rows", "0"},
+        {"moe_placement_epoch", "0"},
+        {"result", "hit"},
+        {"uses_device_token_ids", "false"},
+        {"uses_device_position_ids", "false"},
+        {"uses_device_sequence_lengths", "false"},
+        {"seq_len", "3"}};
+    EXPECT_DOUBLE_EQ(
+        findForwardGraphCounterValue(
+            records,
+            "forward_cache_lookup",
+            miss_tags),
+        1.0);
+    EXPECT_DOUBLE_EQ(
+        findForwardGraphCounterValue(
+            records,
+            "forward_cache_lookup",
+            hit_tags),
+        1.0);
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @brief CPU prefill cache identity is exact in M and survives request reset.
+ */
+TEST_F(
+    Test__ForwardExecutionEngine,
+    Execute_CPUExactPrefillSeparatesShapesAndSurvivesRequestReset)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS", "4"},
+    });
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    std::array<int, 4> tokens = {11, 12, 13, 14};
+    std::array<int, 4> positions = {0, 1, 2, 3};
+    auto m3 = makeTestInput(3, 1, DeviceId::cpu(), tokens.data(), positions.data());
+    auto m4 = makeTestInput(4, 1, DeviceId::cpu(), tokens.data(), positions.data());
+    ForwardOutput output{};
+
+    ASSERT_TRUE(engine.execute(m3, output, host));
+    ASSERT_TRUE(engine.execute(m4, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 2);
+    ASSERT_EQ(engine.prefillGraphCacheSnapshots().size(), 2u);
+
+    const auto reset = engine.resetSessionReplayState(
+        /*preserve_replay_safe_graphs=*/true);
+    EXPECT_EQ(reset.reset_replay_state, 0u);
+    EXPECT_EQ(reset.preserved_for_stream_rebind, 2u);
+
+    tokens[0] = 91;
+    positions[0] = 0;
+    ASSERT_TRUE(engine.execute(m3, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 2)
+        << "Request reset must clear data state, not exact CPU graph topology.";
+}
+
+/**
+ * @brief The configured prefill cap bounds exact CPU topology entries too.
+ */
+TEST_F(Test__ForwardExecutionEngine, Execute_CPUExactPrefillUsesBoundedLRU)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS", "1"},
+    });
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    std::array<int, 4> tokens = {31, 32, 33, 34};
+    std::array<int, 4> positions = {0, 1, 2, 3};
+    auto m3 = makeTestInput(3, 1, DeviceId::cpu(), tokens.data(), positions.data());
+    auto m4 = makeTestInput(4, 1, DeviceId::cpu(), tokens.data(), positions.data());
+    ForwardOutput output{};
+
+    ASSERT_TRUE(engine.execute(m3, output, host));
+    ASSERT_TRUE(engine.execute(m4, output, host));
+    ASSERT_EQ(engine.prefillGraphCacheSnapshots().size(), 1u);
+    ASSERT_TRUE(engine.execute(m3, output, host));
+
+    EXPECT_EQ(host.build_forward_graph_calls, 3)
+        << "The first M=3 entry must be rebuilt after M=4 evicts it.";
+    const auto snapshots = engine.prefillGraphCacheSnapshots();
+    ASSERT_EQ(snapshots.size(), 1u);
+    EXPECT_EQ(snapshots.front().bucket_seq_len, 3);
+    EXPECT_EQ(snapshots.front().eviction_count, 2u);
 }
 
 // =========================================================================
@@ -2945,11 +3448,12 @@ TEST_F(Test__ForwardExecutionEngine, CapturedCollectiveOptInRequestsDeferredMain
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags tags = {
         {"allow_graph_replay", "true"},
-        {"collective_segmented", "false"},
+        {"heterogeneous_segmented", "false"},
         {"collectives_graph_capturable", "true"},
         {"context", "main_decode"},
         {"defer_final_sync", "true"},
         {"has_collectives", "true"},
+        {"retained_sparse_parent", "false"},
         {"replay_plan_policy", "require_full_graph"}};
     EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "decode_capture_policy", tags), 2.0)
         << "First-use materialization and steady-state replay must both ask the "

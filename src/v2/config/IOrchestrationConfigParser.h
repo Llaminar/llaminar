@@ -85,7 +85,7 @@ namespace llaminar2
          * ```yaml
          * orchestration:
          *   tp_degree: 2
-         *   tp_scope: local
+         *   tp_scope: rank_local
          *   domains:
          *     - name: gpu_tp
          *       devices: [cuda:0, cuda:1]
@@ -103,7 +103,7 @@ namespace llaminar2
          *   base_model_domain: rocm_hot
          *   shared_expert_domain: rocm_hot
          *   domains:
-         *     - "rocm_hot=0:rocm:0,0:rocm:1;scope=local;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident"
+         *     - "rocm_hot=0:rocm:0,0:rocm:1;scope=rank_local;routed_compute=apportioned;routed_phase=uniform;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident"
          *   routed_tiers:
          *     - "hot@rocm_hot;priority=0"
          * ```

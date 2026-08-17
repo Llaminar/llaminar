@@ -1,9 +1,14 @@
 /**
  * @file HeterogeneousBackend.cpp
- * @brief Implementation of HeterogeneousBackend for mixed CUDA+ROCm collectives
+ * @brief Persistent event/ticket bridge for mixed CUDA+ROCm collectives.
  *
- * This file implements device grouping logic and sub-backend management.
- * The actual collective operations (allreduce, etc.) are stubs for Phase 1.
+ * This file owns device grouping, sub-backend lifetime, graph-lifecycle events,
+ * and the allocation-free explicit-stream progress engine. Participant compute
+ * streams publish exact producer events. A fixed background worker advances
+ * D2H, deterministic host reduction, and H2D work on backend-owned transfer
+ * streams, then completes an authenticated host-observed ticket only after all
+ * terminal destination events are ready. Ordinary inference threads never
+ * guess a stream or treat submission as output completion.
  *
  * @author David Sanftenberg
  * @date January 2026
@@ -14,10 +19,16 @@
 #include "RCCLBackend.h"
 #include "HostBackend.h"
 #include "../../utils/Logger.h"
+#include "../../utils/PerfStatsCollector.h"
 #include "../../backends/rocm/ROCmBackend.h" // For ROCmBackend::deviceToDevice
 #include "../../backends/BackendManager.h"   // For getBackend()
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <exception>
+#include <limits>
+#include <sstream>
 #include <thread>
 
 #if defined(HAVE_CUDA)
@@ -134,6 +145,12 @@ namespace llaminar2
         }
 
         initialized_ = true;
+        if (!initializeGraphCaptureLifecycleTickets())
+        {
+            LOG_ERROR("HeterogeneousBackend: graph-capture lifecycle ticket initialization failed");
+            shutdown();
+            return false;
+        }
         LOG_DEBUG("HeterogeneousBackend: Initialization complete");
         return true;
     }
@@ -146,6 +163,16 @@ namespace llaminar2
         }
 
         LOG_DEBUG("HeterogeneousBackend: Shutting down");
+
+        // Stop the progress engine while the DeviceGroup and process backends
+        // are still valid. It drains every queued transaction before releasing
+        // its exact streams, events, signals, and runtime-pinned host buffers.
+        releaseAsyncBridgeResources();
+
+        // Ticket events use the process compute backends rather than a
+        // collective sub-backend, but their device provenance depends on the
+        // still-live DeviceGroup. Release them before clearing either.
+        releaseGraphCaptureLifecycleTickets();
 
         // Shutdown sub-backends in reverse order
         if (bridge_backend_)
@@ -178,6 +205,13 @@ namespace llaminar2
 
     bool HeterogeneousBackend::reserveTempBufferBytes(size_t bytes)
     {
+        if (!initialized_ || bytes == 0)
+        {
+            last_error_ = "HeterogeneousBackend::reserveTempBufferBytes requires an initialized backend and non-zero capacity";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
         bool success = true;
 
         // Reserve in all sub-backends
@@ -196,7 +230,414 @@ namespace llaminar2
             success &= bridge_backend_->reserveTempBufferBytes(bytes);
         }
 
-        return success;
+        if (!success)
+            return false;
+
+        // The asynchronous bridge streams payloads through fixed-size chunks;
+        // bytes is a capacity contract, not a request for a payload-sized host
+        // allocation. Re-reservation is idempotent and may only grow the bound.
+        if (async_bridge_ready_)
+        {
+            std::lock_guard<std::mutex> lock(async_mutex_);
+            async_max_payload_bytes_ = std::max(async_max_payload_bytes_, bytes);
+            return true;
+        }
+        return initializeAsyncBridgeResources(bytes);
+    }
+
+    bool HeterogeneousBackend::initializeAsyncBridgeResources(
+        size_t maximum_payload_bytes)
+    {
+        if (!initialized_ || maximum_payload_bytes == 0 || async_bridge_ready_)
+            return async_bridge_ready_;
+
+        releaseAsyncBridgeResources();
+        async_max_payload_bytes_ = maximum_payload_bytes;
+        async_stop_requested_ = false;
+        async_pending_head_ = 0;
+        async_pending_tail_ = 0;
+        async_pending_count_ = 0;
+        async_submission_cursor_ = 0;
+        async_next_generation_ = 1;
+        if (async_lifecycle_epoch_ == std::numeric_limits<uint64_t>::max())
+        {
+            last_error_ = "HeterogeneousBackend asynchronous bridge lifecycle epoch exhausted";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+        ++async_lifecycle_epoch_;
+
+        async_participants_.reserve(device_group_.devices.size());
+        for (const DeviceId &device : device_group_.devices)
+        {
+            AsyncBridgeParticipant participant;
+            participant.device = device;
+            participant.backend = getBackendFor(device);
+            async_participants_.push_back(participant);
+            AsyncBridgeParticipant &owned = async_participants_.back();
+
+            const int ordinal = device.gpu_ordinal();
+            if (!owned.backend || !device.is_gpu())
+            {
+                last_error_ = "HeterogeneousBackend: asynchronous bridge requires a GPU backend for " +
+                              device.toString();
+                LOG_ERROR(last_error_);
+                releaseAsyncBridgeResources();
+                return false;
+            }
+
+            owned.transfer_stream = owned.backend->createStream(ordinal);
+            if (!owned.transfer_stream)
+            {
+                last_error_ = "HeterogeneousBackend: failed to allocate asynchronous bridge transfer stream for " +
+                              device.toString();
+                LOG_ERROR(last_error_);
+                releaseAsyncBridgeResources();
+                return false;
+            }
+
+            for (size_t slot = 0;
+                 slot < ASYNC_BRIDGE_HOST_BUFFER_SLOTS;
+                 ++slot)
+            {
+                owned.host_buffers[slot] = owned.backend->allocatePinned(
+                    ASYNC_BRIDGE_CHUNK_BYTES,
+                    ordinal);
+                owned.input_ready_events[slot] =
+                    owned.backend->createEvent(ordinal);
+                owned.output_consumed_events[slot] =
+                    owned.backend->createEvent(ordinal);
+                if (!owned.host_buffers[slot] ||
+                    !owned.input_ready_events[slot] ||
+                    !owned.output_consumed_events[slot])
+                {
+                    last_error_ = "HeterogeneousBackend: failed to allocate pinned chunk resources for " +
+                                  device.toString();
+                    LOG_ERROR(last_error_);
+                    releaseAsyncBridgeResources();
+                    return false;
+                }
+            }
+
+        }
+
+        async_transactions_.resize(ASYNC_BRIDGE_TRANSACTION_DEPTH);
+        for (auto &transaction : async_transactions_)
+        {
+            const size_t participant_count = async_participants_.size();
+            transaction.buffers.assign(participant_count, nullptr);
+            transaction.producer_streams.assign(participant_count, nullptr);
+            transaction.producer_events.assign(participant_count, nullptr);
+            for (size_t participant_index = 0;
+                 participant_index < participant_count;
+                 ++participant_index)
+            {
+                const auto &participant = async_participants_[participant_index];
+                transaction.producer_events[participant_index] =
+                    participant.backend->createEvent(
+                        participant.device.gpu_ordinal());
+                if (!transaction.producer_events[participant_index])
+                {
+                    last_error_ = "HeterogeneousBackend: failed to allocate producer event ring";
+                    LOG_ERROR(last_error_);
+                    releaseAsyncBridgeResources();
+                    return false;
+                }
+            }
+        }
+
+        async_bridge_ready_ = true;
+        try
+        {
+            async_worker_ = std::thread(
+                &HeterogeneousBackend::asyncBridgeWorkerMain,
+                this);
+        }
+        catch (const std::exception &error)
+        {
+            last_error_ = std::string("HeterogeneousBackend: failed to start async bridge worker: ") +
+                          error.what();
+            LOG_ERROR(last_error_);
+            async_bridge_ready_ = false;
+            releaseAsyncBridgeResources();
+            return false;
+        }
+
+        LOG_INFO("HeterogeneousBackend: exact-stream asynchronous bridge ready"
+                 << " participants=" << async_participants_.size()
+                 << " transaction_depth=" << ASYNC_BRIDGE_TRANSACTION_DEPTH
+                 << " host_buffer_slots=" << ASYNC_BRIDGE_HOST_BUFFER_SLOTS
+                 << " chunk_bytes=" << ASYNC_BRIDGE_CHUNK_BYTES
+                 << " max_payload_bytes=" << async_max_payload_bytes_);
+        return true;
+    }
+
+    void HeterogeneousBackend::releaseAsyncBridgeResources() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> lock(async_mutex_);
+            async_stop_requested_ = true;
+        }
+        async_cv_.notify_all();
+        if (async_worker_.joinable())
+            async_worker_.join();
+
+        // Every completed ticket already proved its terminal H2D events. Record
+        // one final event for pending shutdown work before destroying resources.
+        for (auto &participant : async_participants_)
+        {
+            if (participant.backend && participant.transfer_stream &&
+                participant.input_ready_events[0])
+            {
+                const int ordinal = participant.device.gpu_ordinal();
+                if (!participant.backend->recordEvent(
+                        participant.input_ready_events[0],
+                        ordinal,
+                        participant.transfer_stream) ||
+                    !awaitAsyncBridgeEvent(
+                        participant,
+                        participant.input_ready_events[0],
+                        "shutdown drain"))
+                {
+                    failAsyncBridge(
+                        "cannot safely drain participant resources during shutdown: " +
+                        participant.device.toString());
+                }
+            }
+        }
+
+        for (auto &transaction : async_transactions_)
+        {
+            for (size_t participant_index = 0;
+                 participant_index < transaction.producer_events.size() &&
+                 participant_index < async_participants_.size();
+                 ++participant_index)
+            {
+                auto &participant = async_participants_[participant_index];
+                void *event = transaction.producer_events[participant_index];
+                if (participant.backend && event)
+                {
+                    participant.backend->destroyEvent(
+                        event,
+                        participant.device.gpu_ordinal());
+                }
+            }
+            transaction.producer_events.clear();
+            transaction.buffers.clear();
+            transaction.producer_streams.clear();
+            transaction.state = AsyncTransactionState::Free;
+        }
+        async_transactions_.clear();
+
+        for (auto &participant : async_participants_)
+        {
+            if (!participant.backend)
+                continue;
+            const int ordinal = participant.device.gpu_ordinal();
+            for (size_t slot = 0;
+                 slot < ASYNC_BRIDGE_HOST_BUFFER_SLOTS;
+                 ++slot)
+            {
+                if (participant.input_ready_events[slot])
+                    participant.backend->destroyEvent(
+                        participant.input_ready_events[slot], ordinal);
+                if (participant.output_consumed_events[slot])
+                    participant.backend->destroyEvent(
+                        participant.output_consumed_events[slot], ordinal);
+                if (participant.host_buffers[slot])
+                    participant.backend->freePinned(
+                        participant.host_buffers[slot], ordinal);
+                participant.input_ready_events[slot] = nullptr;
+                participant.output_consumed_events[slot] = nullptr;
+                participant.host_buffers[slot] = nullptr;
+                participant.output_pending[slot] = false;
+            }
+            if (participant.transfer_stream)
+                participant.backend->destroyStream(
+                    participant.transfer_stream, ordinal);
+            participant.transfer_stream = nullptr;
+            participant.backend = nullptr;
+            participant.device = DeviceId::invalid();
+        }
+        async_participants_.clear();
+
+        async_pending_head_ = 0;
+        async_pending_tail_ = 0;
+        async_pending_count_ = 0;
+        async_submission_cursor_ = 0;
+        async_max_payload_bytes_ = 0;
+        async_next_generation_ = 1;
+        async_bridge_ready_ = false;
+        async_stop_requested_ = false;
+    }
+
+    bool HeterogeneousBackend::awaitAsyncBridgeEvent(
+        const AsyncBridgeParticipant &participant,
+        void *event,
+        const char *operation) const
+    {
+        if (!participant.backend || !event || !participant.device.is_gpu())
+            return false;
+
+        constexpr auto timeout = std::chrono::seconds(30);
+        const auto started = std::chrono::steady_clock::now();
+        size_t polls = 0;
+        while (std::chrono::steady_clock::now() - started < timeout)
+        {
+            bool ready = false;
+            if (!participant.backend->queryEvent(
+                    event,
+                    participant.device.gpu_ordinal(),
+                    &ready))
+            {
+                LOG_ERROR("HeterogeneousBackend: event query failed"
+                          << " operation=" << (operation ? operation : "unknown")
+                          << " device=" << participant.device.toString());
+                return false;
+            }
+            if (ready)
+                return true;
+
+            // Yield first for short DMA operations, then back off so a large
+            // prefill chunk cannot burn an entire CPU core while it transfers.
+            if (++polls < 64)
+                std::this_thread::yield();
+            else
+                std::this_thread::sleep_for(std::chrono::microseconds(25));
+        }
+
+        LOG_ERROR("HeterogeneousBackend: event observation timed out"
+                  << " operation=" << (operation ? operation : "unknown")
+                  << " device=" << participant.device.toString()
+                  << " timeout_ms=30000");
+        return false;
+    }
+
+    bool HeterogeneousBackend::initializeGraphCaptureLifecycleTickets()
+    {
+        releaseGraphCaptureLifecycleTickets();
+        graph_capture_lifecycle_tickets_.reserve(device_group_.devices.size());
+
+        for (const DeviceId &device : device_group_.devices)
+        {
+            IBackend *const backend = getBackendFor(device);
+            void *const event = backend
+                                    ? backend->createEvent(device.gpu_ordinal())
+                                    : nullptr;
+            if (!backend || !event)
+            {
+                LOG_ERROR("HeterogeneousBackend: failed to allocate graph-capture "
+                          "lifecycle ticket for "
+                          << device.toString());
+                releaseGraphCaptureLifecycleTickets();
+                return false;
+            }
+
+            graph_capture_lifecycle_tickets_.push_back(
+                GraphCaptureLifecycleTicket{
+                    .device = device,
+                    .backend = backend,
+                    .event = event});
+        }
+
+        return graph_capture_lifecycle_tickets_.size() ==
+               device_group_.devices.size();
+    }
+
+    void HeterogeneousBackend::releaseGraphCaptureLifecycleTickets() noexcept
+    {
+        for (auto &ticket : graph_capture_lifecycle_tickets_)
+        {
+            if (ticket.backend && ticket.event && ticket.device.is_gpu())
+            {
+                ticket.backend->destroyEvent(
+                    ticket.event,
+                    ticket.device.gpu_ordinal());
+            }
+            ticket.event = nullptr;
+            ticket.backend = nullptr;
+            ticket.device = DeviceId::invalid();
+        }
+        graph_capture_lifecycle_tickets_.clear();
+    }
+
+    bool HeterogeneousBackend::recordGraphCaptureLifecycleTicket(
+        int device_idx,
+        void *stream)
+    {
+        if (!stream || !supportsGraphCaptureLifecycleTickets() ||
+            device_idx < 0 ||
+            device_idx >= static_cast<int>(graph_capture_lifecycle_tickets_.size()))
+        {
+            LOG_ERROR("HeterogeneousBackend: invalid graph-capture lifecycle "
+                      "ticket publication slot="
+                      << device_idx << " stream=" << stream);
+            return false;
+        }
+
+        const auto &ticket =
+            graph_capture_lifecycle_tickets_[static_cast<size_t>(device_idx)];
+        if (!ticket.backend || !ticket.event || !ticket.device.is_gpu())
+            return false;
+
+        return ticket.backend->recordEvent(
+            ticket.event,
+            ticket.device.gpu_ordinal(),
+            stream);
+    }
+
+    bool HeterogeneousBackend::awaitGraphCaptureLifecycleTicket(
+        int device_idx,
+        int timeout_ms)
+    {
+        if (!supportsGraphCaptureLifecycleTickets() || device_idx < 0 ||
+            device_idx >= static_cast<int>(graph_capture_lifecycle_tickets_.size()))
+        {
+            LOG_ERROR("HeterogeneousBackend: invalid graph-capture lifecycle "
+                      "ticket observation slot="
+                      << device_idx);
+            return false;
+        }
+
+        const auto &ticket =
+            graph_capture_lifecycle_tickets_[static_cast<size_t>(device_idx)];
+        if (!ticket.backend || !ticket.event || !ticket.device.is_gpu())
+            return false;
+
+        const auto started = std::chrono::steady_clock::now();
+        while (true)
+        {
+            bool ready = false;
+            if (!ticket.backend->queryEvent(
+                    ticket.event,
+                    ticket.device.gpu_ordinal(),
+                    &ready))
+            {
+                LOG_ERROR("HeterogeneousBackend: lifecycle ticket query failed "
+                          "for slot="
+                          << device_idx << " device=" << ticket.device.toString());
+                return false;
+            }
+            if (ready)
+                return true;
+
+            if (timeout_ms > 0 &&
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started)
+                        .count() >= timeout_ms)
+            {
+                LOG_ERROR("HeterogeneousBackend: lifecycle ticket observation "
+                          "timed out for slot="
+                          << device_idx << " device=" << ticket.device.toString()
+                          << " timeout_ms=" << timeout_ms);
+                return false;
+            }
+
+            // The worker yields rather than spin-burning a physical core while
+            // its exact GPU event advances. This loop exists only during first
+            // segment materialization or explicit re-capture, never replay.
+            std::this_thread::yield();
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -221,7 +662,8 @@ namespace llaminar2
         return false;
     }
 
-    // Helper function to compute element size for collective data types
+    // Helper function to compute element size for collective data types.
+    // Zero is the fail-closed result for an invalid enum value.
     static size_t collectiveDataTypeSize(CollectiveDataType dtype)
     {
         switch (dtype)
@@ -236,7 +678,7 @@ namespace llaminar2
         case CollectiveDataType::INT8:
             return 1;
         default:
-            return 4; // Default to float32 size
+            return 0;
         }
     }
 
@@ -407,6 +849,655 @@ namespace llaminar2
 
         LOG_DEBUG("HeterogeneousBackend::allreduceMulti: 3-phase allreduce complete");
         return true;
+    }
+
+    bool HeterogeneousBackend::allreduceMultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        const std::vector<void *> &streams)
+    {
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)streams;
+        last_error_ =
+            "HeterogeneousBackend::allreduceMultiOnStreams is not a safe "
+            "mixed-vendor completion contract; use the host-completion-ticket API";
+        LOG_ERROR(last_error_);
+        return false;
+    }
+
+    std::optional<CollectiveCompletionTicket>
+    HeterogeneousBackend::allreduceMultiOnStreamsWithHostCompletionTicket(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        const std::vector<void *> &streams)
+    {
+        const size_t element_bytes = collectiveDataTypeSize(dtype);
+        if (!initialized_ || !async_bridge_ready_)
+        {
+            last_error_ = "HeterogeneousBackend::allreduceMultiOnStreamsWithHostCompletionTicket requires reserved asynchronous bridge resources";
+            LOG_ERROR(last_error_);
+            return std::nullopt;
+        }
+        if (buffers.size() != async_participants_.size() ||
+            streams.size() != async_participants_.size() ||
+            buffers.empty() || count == 0 || element_bytes == 0)
+        {
+            last_error_ = "HeterogeneousBackend::allreduceMultiOnStreamsWithHostCompletionTicket received an invalid participant/count/dtype contract";
+            LOG_ERROR(last_error_);
+            return std::nullopt;
+        }
+        if (op != CollectiveOp::ALLREDUCE_SUM &&
+            op != CollectiveOp::ALLREDUCE_MAX &&
+            op != CollectiveOp::ALLREDUCE_MIN)
+        {
+            last_error_ = "HeterogeneousBackend::allreduceMultiOnStreamsWithHostCompletionTicket requires SUM, MAX, or MIN";
+            LOG_ERROR(last_error_);
+            return std::nullopt;
+        }
+        if (count > std::numeric_limits<size_t>::max() / element_bytes)
+        {
+            last_error_ = "HeterogeneousBackend::allreduceMultiOnStreamsWithHostCompletionTicket payload size overflow";
+            LOG_ERROR(last_error_);
+            return std::nullopt;
+        }
+        const size_t payload_bytes = count * element_bytes;
+        if (payload_bytes > async_max_payload_bytes_)
+        {
+            last_error_ = "HeterogeneousBackend::allreduceMultiOnStreamsWithHostCompletionTicket payload exceeds setup reservation: requested=" +
+                          std::to_string(payload_bytes) + " reserved=" +
+                          std::to_string(async_max_payload_bytes_);
+            LOG_ERROR(last_error_);
+            return std::nullopt;
+        }
+        for (size_t participant_index = 0;
+             participant_index < buffers.size();
+             ++participant_index)
+        {
+            if (!buffers[participant_index] || !streams[participant_index])
+            {
+                last_error_ = "HeterogeneousBackend::allreduceMultiOnStreamsWithHostCompletionTicket requires non-null buffer and exact stream for slot=" +
+                              std::to_string(participant_index);
+                LOG_ERROR(last_error_);
+                return std::nullopt;
+            }
+        }
+
+        // One submission owner installs generations in FIFO order. This lock is
+        // never held by the progress worker and therefore cannot serialize DMA
+        // or CPU reduction work.
+        std::lock_guard<std::mutex> submission_guard(async_submission_mutex_);
+        const auto wait_started = std::chrono::steady_clock::now();
+        size_t transaction_index = ASYNC_BRIDGE_TRANSACTION_DEPTH;
+        uint64_t generation = 0;
+        {
+            std::unique_lock<std::mutex> lock(async_mutex_);
+            auto locate_free_transaction = [&]() -> bool
+            {
+                for (size_t offset = 0;
+                     offset < async_transactions_.size();
+                     ++offset)
+                {
+                    const size_t candidate =
+                        (async_submission_cursor_ + offset) %
+                        async_transactions_.size();
+                    if (async_transactions_[candidate].state ==
+                        AsyncTransactionState::Free)
+                    {
+                        transaction_index = candidate;
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            const bool available = async_cv_.wait_for(
+                lock,
+                std::chrono::seconds(30),
+                [&]()
+                {
+                    return async_stop_requested_ ||
+                           locate_free_transaction();
+                });
+            if (!available || async_stop_requested_ ||
+                transaction_index >= async_transactions_.size())
+            {
+                last_error_ = "HeterogeneousBackend::allreduceMultiOnStreamsWithHostCompletionTicket timed out waiting for a free asynchronous transaction descriptor";
+                LOG_ERROR(last_error_);
+                return std::nullopt;
+            }
+            if (async_next_generation_ ==
+                std::numeric_limits<uint64_t>::max())
+            {
+                last_error_ = "HeterogeneousBackend asynchronous ticket generation exhausted; context recreation is required";
+                LOG_ERROR(last_error_);
+                return std::nullopt;
+            }
+
+            AsyncBridgeTransaction &transaction =
+                async_transactions_[transaction_index];
+            transaction.state = AsyncTransactionState::Filling;
+            transaction.count = count;
+            transaction.dtype = dtype;
+            transaction.op = op;
+            transaction.generation = async_next_generation_++;
+            generation = transaction.generation;
+            for (size_t participant_index = 0;
+                 participant_index < buffers.size();
+                 ++participant_index)
+            {
+                transaction.buffers[participant_index] =
+                    buffers[participant_index];
+                transaction.producer_streams[participant_index] =
+                    streams[participant_index];
+            }
+            async_submission_cursor_ =
+                (transaction_index + 1) % async_transactions_.size();
+        }
+
+        AsyncBridgeTransaction &transaction =
+            async_transactions_[transaction_index];
+        for (size_t participant_index = 0;
+             participant_index < async_participants_.size();
+             ++participant_index)
+        {
+            const auto &participant = async_participants_[participant_index];
+            if (!participant.backend->recordEvent(
+                    transaction.producer_events[participant_index],
+                    participant.device.gpu_ordinal(),
+                    streams[participant_index]))
+            {
+                std::lock_guard<std::mutex> lock(async_mutex_);
+                transaction.state = AsyncTransactionState::Free;
+                async_cv_.notify_all();
+                last_error_ = "HeterogeneousBackend: producer event publication failed for slot=" +
+                              std::to_string(participant_index);
+                LOG_ERROR(last_error_);
+                return std::nullopt;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(async_mutex_);
+            if (async_stop_requested_ ||
+                async_pending_count_ >= ASYNC_BRIDGE_TRANSACTION_DEPTH)
+            {
+                failAsyncBridge(
+                    "transaction publication raced shutdown or overflowed the fixed FIFO");
+            }
+            transaction.state = AsyncTransactionState::Pending;
+            async_pending_fifo_[async_pending_tail_] = transaction_index;
+            async_pending_tail_ =
+                (async_pending_tail_ + 1) % ASYNC_BRIDGE_TRANSACTION_DEPTH;
+            ++async_pending_count_;
+        }
+        async_cv_.notify_one();
+
+        if (PerfStatsCollector::isEnabled())
+        {
+            const auto wait_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_started)
+                    .count();
+            PerfStatsCollector::Tags tags{
+                {"backend", "heterogeneous"},
+                {"path", "async_chunked_host_bridge"},
+                {"completion", "host_observed_ticket"},
+                {"participants", std::to_string(async_participants_.size())}};
+            PerfStatsCollector::addCounter(
+                "heterogeneous_collective",
+                "async_submissions",
+                1.0,
+                {},
+                {},
+                tags);
+            PerfStatsCollector::addCounter(
+                "heterogeneous_collective",
+                "submission_descriptor_wait_ns",
+                static_cast<double>(wait_ns),
+                {},
+                {},
+                std::move(tags));
+        }
+        return CollectiveCompletionTicket::hostObservedBackgroundTransfer(
+            this,
+            async_lifecycle_epoch_,
+            generation,
+            transaction_index);
+    }
+
+    bool HeterogeneousBackend::awaitHostCompletionTicket(
+        const CollectiveCompletionTicket &ticket,
+        int timeout_ms)
+    {
+        if (timeout_ms <= 0)
+        {
+            last_error_ =
+                "HeterogeneousBackend::awaitHostCompletionTicket requires a positive bounded timeout";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        const auto wait_started = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lock(async_mutex_);
+        if (!initialized_ || !async_bridge_ready_ ||
+            ticket.owner() != this ||
+            ticket.lifecycleEpoch() != async_lifecycle_epoch_ ||
+            ticket.descriptorIndex() >= async_transactions_.size())
+        {
+            last_error_ =
+                "HeterogeneousBackend::awaitHostCompletionTicket rejected a foreign, stale, or out-of-range ticket";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        AsyncBridgeTransaction &transaction =
+            async_transactions_[ticket.descriptorIndex()];
+        if (transaction.generation != ticket.generation() ||
+            transaction.state == AsyncTransactionState::Free)
+        {
+            last_error_ =
+                "HeterogeneousBackend::awaitHostCompletionTicket generation does not own the named descriptor";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        const bool completed = async_cv_.wait_for(
+            lock,
+            std::chrono::milliseconds(timeout_ms),
+            [&]()
+            {
+                return async_stop_requested_ ||
+                       transaction.state == AsyncTransactionState::Completed ||
+                       transaction.generation != ticket.generation();
+            });
+        if (!completed || async_stop_requested_ ||
+            transaction.state != AsyncTransactionState::Completed ||
+            transaction.generation != ticket.generation())
+        {
+            last_error_ =
+                "HeterogeneousBackend::awaitHostCompletionTicket timed out or lost transaction authority"
+                " generation=" +
+                std::to_string(ticket.generation()) +
+                " descriptor=" +
+                std::to_string(ticket.descriptorIndex()) +
+                " timeout_ms=" + std::to_string(timeout_ms);
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        // Ticket observation is the sole descriptor-release authority. Clear
+        // borrowed pointers before waking a later submission that may reuse the
+        // ring slot for unrelated tensors and streams.
+        transaction.state = AsyncTransactionState::Free;
+        transaction.count = 0;
+        transaction.generation = 0;
+        std::fill(transaction.buffers.begin(), transaction.buffers.end(), nullptr);
+        std::fill(
+            transaction.producer_streams.begin(),
+            transaction.producer_streams.end(),
+            nullptr);
+        lock.unlock();
+        async_cv_.notify_all();
+
+        if (PerfStatsCollector::isEnabled())
+        {
+            const auto wait_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_started)
+                    .count();
+            PerfStatsCollector::Tags tags{
+                {"backend", "heterogeneous"},
+                {"path", "async_chunked_host_bridge"},
+                {"completion", "host_observed_ticket"},
+                {"authority", "terminal_h2d_events"},
+                {"participants", std::to_string(async_participants_.size())}};
+            PerfStatsCollector::addCounter(
+                "heterogeneous_collective",
+                "completion_tickets_observed",
+                1.0,
+                {},
+                {},
+                tags);
+            PerfStatsCollector::addCounter(
+                "heterogeneous_collective",
+                "completion_ticket_wait_ns",
+                static_cast<double>(wait_ns),
+                {},
+                {},
+                std::move(tags));
+        }
+        return true;
+    }
+
+    void HeterogeneousBackend::asyncBridgeWorkerMain()
+    {
+        try
+        {
+            while (true)
+            {
+                size_t transaction_index = ASYNC_BRIDGE_TRANSACTION_DEPTH;
+                {
+                    std::unique_lock<std::mutex> lock(async_mutex_);
+                    async_cv_.wait(
+                        lock,
+                        [&]()
+                        {
+                            return async_stop_requested_ ||
+                                   async_pending_count_ > 0;
+                        });
+                    if (async_pending_count_ == 0 && async_stop_requested_)
+                        return;
+
+                    transaction_index =
+                        async_pending_fifo_[async_pending_head_];
+                    async_pending_head_ =
+                        (async_pending_head_ + 1) %
+                        ASYNC_BRIDGE_TRANSACTION_DEPTH;
+                    --async_pending_count_;
+                    if (transaction_index >= async_transactions_.size() ||
+                        async_transactions_[transaction_index].state !=
+                            AsyncTransactionState::Pending)
+                    {
+                        failAsyncBridge(
+                            "background FIFO contained an invalid transaction descriptor");
+                    }
+                    async_transactions_[transaction_index].state =
+                        AsyncTransactionState::Processing;
+                }
+
+                processAsyncBridgeTransaction(transaction_index);
+
+                {
+                    std::lock_guard<std::mutex> lock(async_mutex_);
+                    AsyncBridgeTransaction &transaction =
+                        async_transactions_[transaction_index];
+                    if (transaction.state != AsyncTransactionState::Processing)
+                    {
+                        failAsyncBridge(
+                            "background worker lost transaction ownership before completion publication");
+                    }
+                    // The descriptor remains immutable until the ticket owner
+                    // authenticates this exact generation and releases it.
+                    transaction.state = AsyncTransactionState::Completed;
+                }
+                async_cv_.notify_all();
+            }
+        }
+        catch (const std::exception &error)
+        {
+            failAsyncBridge(
+                std::string("background worker exception: ") + error.what());
+        }
+        catch (...)
+        {
+            failAsyncBridge("background worker raised an unknown exception");
+        }
+    }
+
+    void HeterogeneousBackend::processAsyncBridgeTransaction(
+        size_t transaction_index)
+    {
+        AsyncBridgeTransaction &transaction =
+            async_transactions_[transaction_index];
+        const size_t element_bytes =
+            collectiveDataTypeSize(transaction.dtype);
+        const size_t payload_bytes = transaction.count * element_bytes;
+        const size_t chunk_elements =
+            ASYNC_BRIDGE_CHUNK_BYTES / element_bytes;
+        const size_t chunk_count =
+            (transaction.count + chunk_elements - 1) / chunk_elements;
+
+        // Each transfer stream first observes the exact producer event. There
+        // is intentionally no reverse future-wait edge on the compute stream:
+        // ROCm stream pools can map both streams to one HSA hardware queue and
+        // deadlock that cycle before the transfer can begin.
+        for (size_t participant_index = 0;
+             participant_index < async_participants_.size();
+             ++participant_index)
+        {
+            const auto &participant = async_participants_[participant_index];
+            if (!participant.backend->streamWaitEvent(
+                    participant.transfer_stream,
+                    transaction.producer_events[participant_index],
+                    participant.device.gpu_ordinal()))
+            {
+                failAsyncBridge(
+                    "transfer stream could not consume producer event for " +
+                    participant.device.toString());
+            }
+        }
+
+        for (size_t chunk_index = 0;
+             chunk_index < chunk_count;
+             ++chunk_index)
+        {
+            const size_t host_slot =
+                chunk_index % ASYNC_BRIDGE_HOST_BUFFER_SLOTS;
+            const size_t element_offset = chunk_index * chunk_elements;
+            const size_t elements = std::min(
+                chunk_elements,
+                transaction.count - element_offset);
+            const size_t bytes = elements * element_bytes;
+            const size_t byte_offset = element_offset * element_bytes;
+
+            // A host slot may be reused only after every vendor DMA engine has
+            // consumed its previous H2D source bytes.
+            for (auto &participant : async_participants_)
+            {
+                if (participant.output_pending[host_slot] &&
+                    !awaitAsyncBridgeEvent(
+                        participant,
+                        participant.output_consumed_events[host_slot],
+                        "pinned output consumption"))
+                {
+                    failAsyncBridge(
+                        "timed out waiting to reuse pinned output for " +
+                        participant.device.toString());
+                }
+                participant.output_pending[host_slot] = false;
+            }
+
+            // All inputs move concurrently into memory allocated by their own
+            // runtime. No CUDA page is registered with HIP and vice versa.
+            for (size_t participant_index = 0;
+                 participant_index < async_participants_.size();
+                 ++participant_index)
+            {
+                auto &participant = async_participants_[participant_index];
+                const auto *device_source =
+                    static_cast<const std::byte *>(
+                        transaction.buffers[participant_index]) +
+                    byte_offset;
+                if (!participant.backend->deviceToHostOnStream(
+                        participant.host_buffers[host_slot],
+                        device_source,
+                        bytes,
+                        participant.device.gpu_ordinal(),
+                        participant.transfer_stream) ||
+                    !participant.backend->recordEvent(
+                        participant.input_ready_events[host_slot],
+                        participant.device.gpu_ordinal(),
+                        participant.transfer_stream))
+                {
+                    failAsyncBridge(
+                        "failed to enqueue D2H chunk for " +
+                        participant.device.toString());
+                }
+            }
+            for (const auto &participant : async_participants_)
+            {
+                if (!awaitAsyncBridgeEvent(
+                        participant,
+                        participant.input_ready_events[host_slot],
+                        "D2H chunk completion"))
+                {
+                    failAsyncBridge(
+                        "D2H chunk did not complete for " +
+                        participant.device.toString());
+                }
+            }
+
+            // Participant zero is the accumulator. Applying sources in exact
+            // DeviceGroup order fixes floating-point arithmetic independently
+            // of DMA completion order.
+            void *const accumulator =
+                async_participants_[0].host_buffers[host_slot];
+            for (size_t participant_index = 1;
+                 participant_index < async_participants_.size();
+                 ++participant_index)
+            {
+                HostBackend::reduceOnHost(
+                    accumulator,
+                    async_participants_[participant_index]
+                        .host_buffers[host_slot],
+                    elements,
+                    transaction.dtype,
+                    transaction.op);
+            }
+            for (size_t participant_index = 1;
+                 participant_index < async_participants_.size();
+                 ++participant_index)
+            {
+                std::memcpy(
+                    async_participants_[participant_index]
+                        .host_buffers[host_slot],
+                    accumulator,
+                    bytes);
+            }
+
+            for (size_t participant_index = 0;
+                 participant_index < async_participants_.size();
+                 ++participant_index)
+            {
+                auto &participant = async_participants_[participant_index];
+                auto *device_destination =
+                    static_cast<std::byte *>(
+                        transaction.buffers[participant_index]) +
+                    byte_offset;
+                if (!participant.backend->hostToDeviceOnStream(
+                        device_destination,
+                        participant.host_buffers[host_slot],
+                        bytes,
+                        participant.device.gpu_ordinal(),
+                        participant.transfer_stream) ||
+                    !participant.backend->recordEvent(
+                        participant.output_consumed_events[host_slot],
+                        participant.device.gpu_ordinal(),
+                        participant.transfer_stream))
+                {
+                    failAsyncBridge(
+                        "failed to enqueue reduced H2D chunk for " +
+                        participant.device.toString());
+                }
+                participant.output_pending[host_slot] = true;
+            }
+        }
+
+        // A completed ticket means bytes, not merely commands, reached every
+        // destination. Observe both reusable host slots on every participant
+        // before publishing Completed to the host-side ticket waiter.
+        for (auto &participant : async_participants_)
+        {
+            for (size_t host_slot = 0;
+                 host_slot < ASYNC_BRIDGE_HOST_BUFFER_SLOTS;
+                 ++host_slot)
+            {
+                if (participant.output_pending[host_slot] &&
+                    !awaitAsyncBridgeEvent(
+                        participant,
+                        participant.output_consumed_events[host_slot],
+                        "terminal H2D completion"))
+                {
+                    failAsyncBridge(
+                        "terminal H2D did not complete for " +
+                        participant.device.toString() +
+                        " slot=" + std::to_string(host_slot));
+                }
+                participant.output_pending[host_slot] = false;
+            }
+        }
+
+        recordAsyncBridgePerfStats(transaction, chunk_count);
+        (void)payload_bytes;
+    }
+
+    void HeterogeneousBackend::recordAsyncBridgePerfStats(
+        const AsyncBridgeTransaction &transaction,
+        size_t chunks) const
+    {
+        if (!PerfStatsCollector::isEnabled())
+            return;
+        const size_t payload_bytes =
+            transaction.count * collectiveDataTypeSize(transaction.dtype);
+        PerfStatsCollector::Tags tags{
+            {"backend", "heterogeneous"},
+            {"path", "async_chunked_host_bridge"},
+            {"worker", "background"},
+            {"reduction_order", "device_group"},
+            {"completion", "host_observed_ticket"},
+            {"participants", std::to_string(async_participants_.size())}};
+        PerfStatsCollector::addCounter(
+            "heterogeneous_collective",
+            "async_transactions_handed_off",
+            1.0,
+            {},
+            {},
+            tags);
+        PerfStatsCollector::addCounter(
+            "heterogeneous_collective",
+            "streamed_chunks",
+            static_cast<double>(chunks),
+            {},
+            {},
+            tags);
+        PerfStatsCollector::addCounter(
+            "heterogeneous_collective",
+            "d2h_bytes",
+            static_cast<double>(
+                payload_bytes * async_participants_.size()),
+            {},
+            {},
+            tags);
+        PerfStatsCollector::addCounter(
+            "heterogeneous_collective",
+            "h2d_bytes",
+            static_cast<double>(
+                payload_bytes * async_participants_.size()),
+            {},
+            {},
+            tags);
+        PerfStatsCollector::addCounter(
+            "heterogeneous_collective",
+            "terminal_h2d_participants_observed",
+            static_cast<double>(async_participants_.size()),
+            {},
+            {},
+            tags);
+        PerfStatsCollector::addCounter(
+            "heterogeneous_collective",
+            "fixed_order_reductions",
+            static_cast<double>(
+                async_participants_.size() > 0
+                    ? async_participants_.size() - 1
+                    : 0),
+            {},
+            {},
+            std::move(tags));
+    }
+
+    [[noreturn]] void HeterogeneousBackend::failAsyncBridge(
+        const std::string &message)
+    {
+        LOG_ERROR("HeterogeneousBackend asynchronous bridge fatal error: "
+                  << message);
+        std::terminate();
     }
 
     bool HeterogeneousBackend::allgather(

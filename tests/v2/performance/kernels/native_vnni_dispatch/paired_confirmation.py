@@ -4,9 +4,11 @@ Broad NativeVNNI sweeps identify a provisional policy candidate and the
 runtime-representable exact reference. They do not, by themselves, establish a
 sub-five-percent performance difference: hundreds of candidates, device clock
 drift, and winner selection all bias an unpaired minimum. This module consumes
-the second-stage timing protocol where selected and exact candidates alternate
-inside deterministic pairs, then bootstraps the maximum regret across every
-required cell with one simultaneous one-sided confidence bound.
+the second-stage two-period crossover protocol where selected and exact
+candidates alternate order inside deterministic pairs. It first removes the
+first/second invocation effect with equal-weight order-stratified medians, then
+bootstraps the maximum regret across every required cell with one simultaneous
+one-sided confidence bound.
 
 Paired evidence is deliberately not a ``NativeVNNIObservation`` corpus. During
 development it may replace biased broad timing ratios and trigger a fresh
@@ -37,6 +39,9 @@ from .schema import P95_REGRET_BUDGET
 LEGACY_PAIRED_PROTOCOL_VERSION = "cuda-paired-interleaved-v1"
 CUDA_PAIRED_PROTOCOL_VERSION = "cuda-paired-interleaved-v2"
 PAIRED_PROTOCOL_VERSION = "native-vnni-paired-interleaved-v3"
+CPU_ISOLATED_PAIRED_PROTOCOL_VERSION = "native-vnni-cpu-paired-isolated-v4"
+CPU_PROCESS_ISOLATED_TIMING_SCOPE = "process-isolated-v1"
+LEGACY_UNSPECIFIED_TIMING_SCOPE = "legacy-unspecified"
 DEFAULT_BOOTSTRAP_REPLICATES = 20_000
 DEFAULT_FAMILYWISE_ALPHA = 0.05
 DEFAULT_MAX_REGRET = P95_REGRET_BUDGET
@@ -91,6 +96,10 @@ COMMON_REQUIRED_COLUMNS = frozenset({
 REQUIRED_COLUMNS_V1 = COMMON_REQUIRED_COLUMNS
 REQUIRED_COLUMNS_V2 = COMMON_REQUIRED_COLUMNS | {"request_id"}
 REQUIRED_COLUMNS_V3 = REQUIRED_COLUMNS_V2 | {"architecture_class"}
+REQUIRED_COLUMNS_V4 = REQUIRED_COLUMNS_V3 | {
+    "timing_scope",
+    "mpi_world_size",
+}
 # Latest-schema compatibility name used by strict producer tests.
 REQUIRED_COLUMNS = REQUIRED_COLUMNS_V3
 
@@ -143,9 +152,72 @@ class PairedCellEvidence:
     exact_latency_us: tuple[float, ...]
     selected_first_count: int
     exact_first_count: int
+    selected_ran_first: tuple[bool, ...]
     request_id: str = ""
     observed_path: str = ""
     exact_observed_path: str = ""
+    timing_scope: str = LEGACY_UNSPECIFIED_TIMING_SCOPE
+    mpi_world_size: int = 0
+
+    def __post_init__(self) -> None:
+        """Reject incomplete crossover evidence at its typed boundary."""
+
+        pair_count = len(self.selected_latency_us)
+        if pair_count == 0 or len(self.exact_latency_us) != pair_count:
+            raise ValueError(
+                f"{self.key}: paired evidence requires equal nonempty "
+                "selected/reference latency vectors"
+            )
+        if len(self.selected_ran_first) != pair_count:
+            raise ValueError(
+                f"{self.key}: paired evidence lost invocation-order identity"
+            )
+        if any(
+            not math.isfinite(latency) or latency <= 0.0
+            for latency in self.selected_latency_us + self.exact_latency_us
+        ):
+            raise ValueError(
+                f"{self.key}: paired evidence contains a non-positive or "
+                "non-finite latency"
+            )
+
+        selected_first_count = sum(self.selected_ran_first)
+        exact_first_count = pair_count - selected_first_count
+        if (
+            self.selected_first_count != selected_first_count
+            or self.exact_first_count != exact_first_count
+        ):
+            raise ValueError(
+                f"{self.key}: crossover counts disagree with per-pair order"
+            )
+        if selected_first_count == 0 or exact_first_count == 0:
+            raise ValueError(
+                f"{self.key}: paired evidence lacks one crossover order"
+            )
+        if self.mpi_world_size < 0:
+            raise ValueError(f"{self.key}: MPI world size cannot be negative")
+        if self.timing_scope == CPU_PROCESS_ISOLATED_TIMING_SCOPE:
+            if self.key.backend != "cpu" or self.mpi_world_size != 1:
+                raise ValueError(
+                    f"{self.key}: process-isolated CPU evidence requires "
+                    "backend=cpu and mpi_world_size=1"
+                )
+        elif self.timing_scope != LEGACY_UNSPECIFIED_TIMING_SCOPE:
+            raise ValueError(
+                f"{self.key}: unknown paired timing scope {self.timing_scope!r}"
+            )
+
+    @property
+    def promotion_eligible_timing(self) -> bool:
+        """Return whether the timing environment is admissible for promotion."""
+
+        return (
+            self.key.backend != "cpu"
+            or (
+                self.timing_scope == CPU_PROCESS_ISOLATED_TIMING_SCOPE
+                and self.mpi_world_size == 1
+            )
+        )
 
     @property
     def pair_count(self) -> int:
@@ -167,10 +239,51 @@ class PairedCellEvidence:
         )
 
     @property
-    def observed_regret(self) -> float:
-        """Return the robust median paired latency ratio minus one."""
+    def crossover_log_latency_ratio(self) -> float:
+        """Return the order-corrected selected/reference log-latency ratio.
 
-        return math.exp(statistics.median(self.log_latency_ratios)) - 1.0
+        A paired launch is a two-period crossover experiment: one stratum runs
+        selected then exact (``AB``), while the other runs exact then selected
+        (``BA``).  CPU frequency droop, shared-cache displacement, and similar
+        period effects can make the first or second launch systematically
+        faster without saying anything about either candidate.  Pooling the
+        two deliberately bimodal ratio populations and taking one median does
+        not cancel that effect; the middle observations can both come from the
+        tails of opposite strata.
+
+        Take one robust median inside each order stratum and average them in
+        log space.  A multiplicative first/second-period effect then appears
+        once with each sign and cancels exactly.  Equal stratum weight is
+        intentional even when the deterministic order sequence is slightly
+        imbalanced: invocation position, not sample count, is the nuisance
+        factor being removed.
+        """
+
+        ratios = self.log_latency_ratios
+        selected_first = tuple(
+            ratio
+            for ratio, ran_first in zip(
+                ratios, self.selected_ran_first, strict=True
+            )
+            if ran_first
+        )
+        exact_first = tuple(
+            ratio
+            for ratio, ran_first in zip(
+                ratios, self.selected_ran_first, strict=True
+            )
+            if not ran_first
+        )
+        return 0.5 * (
+            statistics.median(selected_first)
+            + statistics.median(exact_first)
+        )
+
+    @property
+    def observed_regret(self) -> float:
+        """Return the robust order-corrected latency ratio minus one."""
+
+        return math.expm1(self.crossover_log_latency_ratio)
 
 
 @dataclass(frozen=True)
@@ -182,6 +295,20 @@ class PairedTimingComparison:
     exact_effective_candidate_id: str
     selected_to_exact_median_ratio: float
     pair_count: int
+    timing_scope: str = LEGACY_UNSPECIFIED_TIMING_SCOPE
+    mpi_world_size: int = 0
+
+    @property
+    def promotion_eligible_timing(self) -> bool:
+        """Return whether this edge came from a certifiable timing context."""
+
+        return (
+            self.key.backend != "cpu"
+            or (
+                self.timing_scope == CPU_PROCESS_ISOLATED_TIMING_SCOPE
+                and self.mpi_world_size == 1
+            )
+        )
 
 
 def paired_timing_comparisons(
@@ -201,9 +328,11 @@ def paired_timing_comparisons(
             selected_effective_candidate_id=cell.selected_candidate_id,
             exact_effective_candidate_id=cell.exact_candidate_id,
             selected_to_exact_median_ratio=math.exp(
-                statistics.median(cell.log_latency_ratios)
+                cell.crossover_log_latency_ratio
             ),
             pair_count=cell.pair_count,
+            timing_scope=cell.timing_scope,
+            mpi_world_size=cell.mpi_world_size,
         )
         if comparison.selected_to_exact_median_ratio <= 0.0 or not math.isfinite(
             comparison.selected_to_exact_median_ratio
@@ -219,9 +348,53 @@ def paired_timing_comparisons(
             key=lambda item: (
                 item.selected_effective_candidate_id,
                 item.exact_effective_candidate_id,
+                item.timing_scope,
+                item.mpi_world_size,
             ),
         ))
     return result
+
+
+def prefer_promotion_eligible_comparisons(
+    comparisons: Iterable[PairedTimingComparison],
+) -> tuple[PairedTimingComparison, ...]:
+    """Prefer isolated CPU evidence for each physical candidate edge.
+
+    Historical CPU v3 evidence omitted its co-run environment. It remains useful
+    as a development prior, but it must not dilute a newly measured isolated edge.
+    GPU protocols are already device-isolated, so all of their retained edges are
+    promotion eligible and pass through unchanged.
+    """
+
+    grouped: dict[frozenset[str], list[PairedTimingComparison]] = defaultdict(list)
+    for comparison in comparisons:
+        grouped[frozenset((
+            comparison.selected_effective_candidate_id,
+            comparison.exact_effective_candidate_id,
+        ))].append(comparison)
+
+    preferred = []
+    for edge in sorted(grouped, key=lambda item: tuple(sorted(item))):
+        candidates = grouped[edge]
+        promotion_eligible = [
+            comparison
+            for comparison in candidates
+            if comparison.promotion_eligible_timing
+        ]
+        preferred.extend(promotion_eligible or candidates)
+    return tuple(preferred)
+
+
+def promotion_eligible_comparisons(
+    comparisons: Iterable[PairedTimingComparison],
+) -> tuple[PairedTimingComparison, ...]:
+    """Return only edges allowed to directly confirm a production policy."""
+
+    return tuple(
+        comparison
+        for comparison in comparisons
+        if comparison.promotion_eligible_timing
+    )
 
 
 @dataclass(frozen=True)
@@ -295,6 +468,8 @@ class _RawPairRow:
     candidate_id: str
     latency_us: float
     observed_path: str
+    timing_scope: str
+    mpi_world_size: int
 
 
 def _parse_row(
@@ -311,6 +486,7 @@ def _parse_row(
         LEGACY_PAIRED_PROTOCOL_VERSION,
         CUDA_PAIRED_PROTOCOL_VERSION,
         PAIRED_PROTOCOL_VERSION,
+        CPU_ISOLATED_PAIRED_PROTOCOL_VERSION,
     }:
         raise ValueError(f"{prefix}: unsupported paired protocol version")
     backend = raw["backend"].strip().lower()
@@ -343,6 +519,7 @@ def _parse_row(
     if protocol_version in {
         CUDA_PAIRED_PROTOCOL_VERSION,
         PAIRED_PROTOCOL_VERSION,
+        CPU_ISOLATED_PAIRED_PROTOCOL_VERSION,
     }:
         request_id = raw["request_id"].strip()
         if not request_id:
@@ -413,6 +590,19 @@ def _parse_row(
     # backend-specific certificate validates it against its frozen contract.
     observed_path = raw["observed_path"].strip().lower()
 
+    if protocol_version == CPU_ISOLATED_PAIRED_PROTOCOL_VERSION:
+        if backend != "cpu":
+            raise ValueError(f"{prefix}: CPU isolated protocol has non-CPU backend")
+        timing_scope = raw["timing_scope"].strip().lower()
+        mpi_world_size = int(raw["mpi_world_size"])
+        if timing_scope != CPU_PROCESS_ISOLATED_TIMING_SCOPE:
+            raise ValueError(f"{prefix}: CPU timing is not process isolated")
+        if mpi_world_size != 1:
+            raise ValueError(f"{prefix}: CPU paired timing used an MPI peer")
+    else:
+        timing_scope = LEGACY_UNSPECIFIED_TIMING_SCOPE
+        mpi_world_size = 0
+
     key = PairedCellKey(
         backend=backend,
         source_format=raw["source_format"].strip().upper(),
@@ -425,7 +615,10 @@ def _parse_row(
         k=int(raw["k"]),
         architecture_class=(
             raw["architecture_class"].strip()
-            if protocol_version == PAIRED_PROTOCOL_VERSION
+            if protocol_version in {
+                PAIRED_PROTOCOL_VERSION,
+                CPU_ISOLATED_PAIRED_PROTOCOL_VERSION,
+            }
             else ""
         ),
     )
@@ -436,7 +629,10 @@ def _parse_row(
         or key.n <= 0
         or key.k <= 0
         or (
-            protocol_version == PAIRED_PROTOCOL_VERSION
+            protocol_version in {
+                PAIRED_PROTOCOL_VERSION,
+                CPU_ISOLATED_PAIRED_PROTOCOL_VERSION,
+            }
             and not key.architecture_class
         )
     ):
@@ -453,6 +649,8 @@ def _parse_row(
         candidate_id=candidate_id,
         latency_us=latency,
         observed_path=observed_path,
+        timing_scope=timing_scope,
+        mpi_world_size=mpi_world_size,
     )
 
 
@@ -488,6 +686,8 @@ def read_paired_confirmation_csv(
                 expected = REQUIRED_COLUMNS_V2
             elif fields == REQUIRED_COLUMNS_V3:
                 expected = REQUIRED_COLUMNS_V3
+            elif fields == REQUIRED_COLUMNS_V4:
+                expected = REQUIRED_COLUMNS_V4
             else:
                 expected = REQUIRED_COLUMNS_V3
             missing = expected - fields
@@ -522,15 +722,28 @@ def read_paired_confirmation_csv(
                     raise ValueError(
                         f"{path}:{row_number}: v3 header requires generic v3 protocol"
                     )
+                if fields == REQUIRED_COLUMNS_V4 and raw[
+                    "protocol_version"
+                ].strip() != CPU_ISOLATED_PAIRED_PROTOCOL_VERSION:
+                    raise ValueError(
+                        f"{path}:{row_number}: v4 header requires isolated CPU v4 protocol"
+                    )
                 rows_by_cell[(parsed.key, parsed.request_id)].append(parsed)
 
     cells = []
     for (key, request_id), rows in sorted(rows_by_cell.items()):
         configured_counts = {row.configured_pair_count for row in rows}
         cell_seeds = {row.cell_order_seed for row in rows}
-        if len(configured_counts) != 1 or len(cell_seeds) != 1:
+        timing_scopes = {row.timing_scope for row in rows}
+        mpi_world_sizes = {row.mpi_world_size for row in rows}
+        if (
+            len(configured_counts) != 1
+            or len(cell_seeds) != 1
+            or len(timing_scopes) != 1
+            or len(mpi_world_sizes) != 1
+        ):
             raise ValueError(
-                f"{key}/{request_id}: paired count or cell seed changed"
+                f"{key}/{request_id}: paired count, seed, or timing scope changed"
             )
         pair_count = next(iter(configured_counts))
         if pair_count < minimum_pairs:
@@ -555,6 +768,7 @@ def read_paired_confirmation_csv(
             raise ValueError(f"{key}: paired arithmetic path changed within a role")
         selected = []
         exact = []
+        selected_ran_first = []
         first_counts = {"selected": 0, "exact": 0}
         for pair_index in range(pair_count):
             pair = by_pair[pair_index]
@@ -573,6 +787,7 @@ def read_paired_confirmation_csv(
             exact.append(by_role["exact"].latency_us)
             first = min(pair, key=lambda row: row.within_pair_order)
             first_counts[first.candidate_role] += 1
+            selected_ran_first.append(first.candidate_role == "selected")
 
         if any(len(candidates) != 1 for candidates in role_candidates.values()):
             raise ValueError(f"{key}: candidate identity changed across pairs")
@@ -597,9 +812,12 @@ def read_paired_confirmation_csv(
             exact_latency_us=tuple(exact),
             selected_first_count=first_counts["selected"],
             exact_first_count=first_counts["exact"],
+            selected_ran_first=tuple(selected_ran_first),
             request_id=request_id,
             observed_path=next(iter(paths_by_role["selected"])),
             exact_observed_path=next(iter(paths_by_role["exact"])),
+            timing_scope=next(iter(timing_scopes)),
+            mpi_world_size=next(iter(mpi_world_sizes)),
         ))
     if not cells:
         raise ValueError("paired confirmation corpus contains no cells")
@@ -618,6 +836,10 @@ def _bootstrap_seed(cells: Iterable[PairedCellEvidence], seed: str) -> int:
         digest.update(cell.exact_candidate_id.encode())
         digest.update(b"\0")
         digest.update(cell.request_id.encode())
+        digest.update(b"\0")
+        digest.update(cell.timing_scope.encode())
+        digest.update(b"\0")
+        digest.update(str(cell.mpi_world_size).encode())
         digest.update(b"\0")
     return int.from_bytes(digest.digest()[:8], "little")
 
@@ -669,25 +891,46 @@ def _bootstrap_partition_maximum(
 
     Each cell owns an independent deterministic PCG64 stream. Consequently,
     changing the worker count or partition order cannot change the generated
-    resamples. Replicates are generated in bounded batches so every worker uses
-    a small persistent high-water allocation even for a large evidence set.
+    resamples. Each invocation-order stratum is resampled independently and
+    receives equal weight in the crossover estimate, preserving cancellation
+    of first/second-period effects in every bootstrap replicate. Replicates are
+    generated in bounded batches so every worker uses a small persistent
+    high-water allocation even for a large evidence set.
     """
 
     cells, bootstrap_replicates, seed = arguments
     partition_maxima = np.full(bootstrap_replicates, -np.inf, dtype=np.float64)
     for cell in cells:
         values = np.asarray(cell.log_latency_ratios, dtype=np.float64)
+        order = np.asarray(cell.selected_ran_first, dtype=np.bool_)
+        if order.size != values.size or not np.any(order) or np.all(order):
+            raise ValueError(
+                f"{cell.key}: paired bootstrap lacks a complete crossover"
+            )
+        selected_first_values = values[order]
+        exact_first_values = values[~order]
         rng = np.random.Generator(np.random.PCG64(_cell_bootstrap_seed(cell, seed)))
         for begin in range(0, bootstrap_replicates, BOOTSTRAP_REPLICATE_BATCH):
             end = min(begin + BOOTSTRAP_REPLICATE_BATCH, bootstrap_replicates)
-            indices = rng.integers(
+            selected_first_indices = rng.integers(
                 0,
-                values.size,
-                size=(end - begin, values.size),
+                selected_first_values.size,
+                size=(end - begin, selected_first_values.size),
                 dtype=np.int32,
             )
-            sampled_medians = np.median(values[indices], axis=1)
-            regrets = np.expm1(sampled_medians)
+            exact_first_indices = rng.integers(
+                0,
+                exact_first_values.size,
+                size=(end - begin, exact_first_values.size),
+                dtype=np.int32,
+            )
+            sampled_log_ratios = 0.5 * (
+                np.median(
+                    selected_first_values[selected_first_indices], axis=1
+                )
+                + np.median(exact_first_values[exact_first_indices], axis=1)
+            )
+            regrets = np.expm1(sampled_log_ratios)
             np.maximum(
                 partition_maxima[begin:end],
                 regrets,
@@ -706,11 +949,12 @@ def certify_paired_confirmation(
 ) -> PairedConfirmationReport:
     """Bootstrap one simultaneous upper bound for maximum paired regret.
 
-    Every replicate independently resamples complete selected/reference ratios
-    within each cell and then takes the maximum cell median. The final quantile
-    is therefore a confidence bound on the familywise maximum itself, not a
-    collection of invalid independent per-cell intervals. Cell-specific random
-    streams make the result invariant to physical-core worker scheduling.
+    Every replicate independently resamples the ``AB`` and ``BA`` crossover
+    strata within each cell, removes invocation-position bias in log space,
+    and then takes the maximum cell estimate. The final quantile is therefore
+    a confidence bound on the familywise maximum itself, not a collection of
+    invalid independent per-cell intervals. Cell-specific random streams make
+    the result invariant to physical-core worker scheduling.
     """
 
     ordered = tuple(sorted(cells, key=lambda cell: cell.key))
@@ -766,7 +1010,10 @@ def certify_paired_confirmation(
     )
     return PairedConfirmationReport(
         protocol_version=PAIRED_PROTOCOL_VERSION,
-        bootstrap_method="paired-cell-median maximum bootstrap v2 vectorized",
+        bootstrap_method=(
+            "order-stratified paired-cell crossover maximum bootstrap v3 "
+            "vectorized"
+        ),
         bootstrap_replicates=bootstrap_replicates,
         familywise_alpha=familywise_alpha,
         cells=results,

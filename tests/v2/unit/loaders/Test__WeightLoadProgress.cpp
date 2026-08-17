@@ -358,6 +358,31 @@ TEST_F(Test__WeightLoadProgress, SetAggregatorIsRecoverable)
     EXPECT_EQ(progress.aggregator(), mock2);
 }
 
+/**
+ * @brief The renderer must never prolong the publisher or its polling thread.
+ *
+ * Production rank 0 gives the aggregator a strong renderer reference while
+ * polling. The renderer therefore keeps only a weak publication edge. This
+ * regression models failed initialization: once the setup scope drops the
+ * publisher, progress callbacks become inert instead of retaining an MPI
+ * resource cycle beyond teardown.
+ */
+TEST_F(Test__WeightLoadProgress, RendererDoesNotOwnPublisherPastSetupScope)
+{
+    WeightLoadProgress progress(/*rank=*/1, /*world_size=*/2);
+    auto publisher = std::make_shared<MockProgressPublisher>();
+    std::weak_ptr<MockProgressPublisher> lifetime = publisher;
+
+    progress.setAggregator(publisher);
+    EXPECT_EQ(progress.aggregator(), publisher);
+
+    publisher.reset();
+
+    EXPECT_TRUE(lifetime.expired());
+    EXPECT_EQ(progress.aggregator(), nullptr);
+    EXPECT_EQ(progress.makeCallback(/*device_idx=*/0), nullptr);
+}
+
 TEST_F(Test__WeightLoadProgress, NullAggregatorIsValid)
 {
     WeightLoadProgress progress(0, 1);

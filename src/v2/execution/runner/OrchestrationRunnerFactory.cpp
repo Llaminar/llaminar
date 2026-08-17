@@ -19,6 +19,13 @@
 
 namespace llaminar2
 {
+    RunnerModelAuthorityScope resolveRunnerModelAuthorityScope(
+        const OrchestrationConfig &config)
+    {
+        if (config.topology_tree || NamedDomainGlobalRunner::shouldUse(config))
+            return RunnerModelAuthorityScope::MultiRankSet;
+        return RunnerModelAuthorityScope::RankLocal;
+    }
 
     /**
      * @brief Concrete implementation of IOrchestrationRunnerFactory
@@ -137,6 +144,64 @@ namespace llaminar2
         std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
             OrchestrationConfig config) override
         {
+            return createFromOrchestrationConfigImpl(
+                std::move(config),
+                nullptr,
+                std::nullopt);
+        }
+
+        std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
+            OrchestrationConfig config,
+            std::shared_ptr<ModelContext> model_context) override
+        {
+            if (!model_context)
+            {
+                LOG_ERROR(
+                    "Preloaded ModelContext runner construction requires a "
+                    "non-null model authority");
+                return nullptr;
+            }
+            return createFromOrchestrationConfigImpl(
+                std::move(config),
+                std::move(model_context),
+                std::nullopt);
+        }
+
+        std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
+            OrchestrationConfig config,
+            ModelContextReuseContract reuse_contract) override
+        {
+            if (!reuse_contract.context)
+            {
+                LOG_ERROR(
+                    "Retained ModelContext runner construction requires a "
+                    "non-null model authority");
+                return nullptr;
+            }
+            auto model_context = std::move(reuse_contract.context);
+            auto prepared_weight_plan =
+                std::move(reuse_contract.prepared_weight_plan);
+            return createFromOrchestrationConfigImpl(
+                std::move(config),
+                std::move(model_context),
+                std::move(prepared_weight_plan));
+        }
+
+    private:
+        /**
+         * @brief Normalize configuration and construct the selected runner.
+         *
+         * A retained ModelContext is a rank-local OrchestrationRunner contract.
+         * Legacy cross-rank TP/PP still constructs one such runner per MPI rank;
+         * named-domain and topology-tree runners compose multiple rank-specific
+         * authorities and reject this overload until their builders accept a
+         * typed context set.
+         */
+        std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfigImpl(
+            OrchestrationConfig config,
+            std::shared_ptr<ModelContext> model_context,
+            std::optional<RankExecutionPlan> prepared_weight_plan)
+        {
             auto normalize_errors = normalizeMoERoutedExpertPlacementDomains(config);
             if (!normalize_errors.empty())
             {
@@ -145,6 +210,16 @@ namespace llaminar2
                 {
                     LOG_ERROR("  - " << error);
                 }
+                return nullptr;
+            }
+
+            if (model_context &&
+                resolveRunnerModelAuthorityScope(config) ==
+                    RunnerModelAuthorityScope::MultiRankSet)
+            {
+                LOG_ERROR(
+                    "A rank-local ModelContext cannot construct a runner that "
+                    "owns a multi-rank model-authority set");
                 return nullptr;
             }
 
@@ -209,8 +284,16 @@ namespace llaminar2
                              << "world_size=" << world_size
                              << ", pp_degree=" << config.pp_degree
                              << ", tp_scope=" << tpScopeToString(config.tp_scope) << ")");
-                    LOG_DEBUG("Note: Non-named-domain global orchestration is not yet supported. "
-                             "Use --define-domain + --pp-stage with scope=node_local or scope=global.");
+                    LOG_DEBUG(
+                        "Selecting one ordinary OrchestrationRunner per MPI "
+                        "rank; its RankExecutionPlan owns the cross-rank "
+                        "collective edges");
+                    if (model_context)
+                    {
+                        LOG_DEBUG(
+                            "Using the calling MPI rank's ModelContext in the "
+                            "rank-local OrchestrationRunner");
+                    }
                 }
             }
 
@@ -219,12 +302,30 @@ namespace llaminar2
             // (each runner needs its own instance)
             auto runner_plan_builder = createExecutionPlanBuilder();
 
-            auto runner = std::make_unique<OrchestrationRunner>(
+            if (prepared_weight_plan)
+            {
+                return std::make_unique<OrchestrationRunner>(
+                    std::move(config),
+                    std::move(runner_plan_builder),
+                    ModelContextReuseContract{
+                        .context = std::move(model_context),
+                        .prepared_weight_plan =
+                            std::move(*prepared_weight_plan),
+                    });
+            }
+            if (model_context)
+            {
+                return std::make_unique<OrchestrationRunner>(
+                    std::move(config),
+                    std::move(runner_plan_builder),
+                    std::move(model_context));
+            }
+            return std::make_unique<OrchestrationRunner>(
                 std::move(config),
                 std::move(runner_plan_builder));
-
-            return runner;
         }
+
+    public:
 
         std::unique_ptr<IOrchestrationRunner> createSimple(
             const std::string &model_path,

@@ -271,6 +271,10 @@ namespace llaminar2::test::moe_graph_native_routed_tier
             params.top_k = kTopK;
             params.d_model = kDModel;
             params.tier_dispatch = participant == kRootParticipant ? &dispatch.tiers[static_cast<size_t>(tier_idx)] : nullptr;
+            params.fixed_residency_epoch =
+                participant == kRootParticipant
+                    ? dispatch.residency_epoch
+                    : 0;
             params.inbound_rows = &inbound;
             MoESparseDispatchStage stage(std::move(params));
             ASSERT_TRUE(stage.execute(ctx));

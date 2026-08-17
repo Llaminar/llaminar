@@ -34,8 +34,20 @@ namespace llaminar2::least_loaded_ep
         uint32_t lambda_denominator = 10;
         uint64_t min_spread_improvement = 0;
         uint32_t min_spread_improvement_divisor = 0;
-        uint64_t min_spread_improvement_per_transfer = 0;
-        uint64_t min_foreign_rows_per_transfer = 0;
+        /**
+         * Additional spread improvement required for each serialized payload
+         * slot on the transfer wave's busiest participant lane.
+         *
+         * Reciprocal transfers use opposite full-duplex lanes and therefore
+         * contribute one critical-path slot, not two. Multiple payloads sent
+         * or received by the same participant remain additive.
+         */
+        uint64_t min_spread_improvement_per_critical_path_slot = 0;
+        /**
+         * Minimum useful foreign rows required for each serialized payload
+         * slot on the transfer wave's busiest participant lane.
+         */
+        uint64_t min_foreign_rows_per_critical_path_slot = 0;
         /// Optional hard cap on missing expert-weight arrivals the assignment
         /// may request. Zero means use the caller-provided transfer buffer
         /// capacity. When the cap is exhausted, remaining rows stay on a
@@ -91,6 +103,15 @@ namespace llaminar2::least_loaded_ep
         uint32_t expert = 0;
         uint32_t source_participant = 0;
         uint32_t destination_participant = 0;
+        /**
+         * Explicitly owned vector-lane tail.
+         *
+         * The transfer is copied and compared as one 16-byte device ABI
+         * record. Naming the final word keeps aggregate assignment from
+         * publishing indeterminate C++ padding bytes, so independently built
+         * but logically identical plans remain byte deterministic.
+         */
+        uint32_t reserved = 0;
     };
 
     struct LeastLoadedExpertAssignmentStatus
@@ -111,6 +132,14 @@ namespace llaminar2::least_loaded_ep
         uint64_t spilled_rows = 0;
         uint32_t span_count = 0;
         uint32_t weight_transfer_count = 0;
+        /**
+         * Serialized payload width of the busiest source or destination lane.
+         *
+         * This is the transfer-cost multiplier. It can be smaller than
+         * `weight_transfer_count` when independent or reciprocal edges run in
+         * parallel.
+         */
+        uint32_t critical_path_transfer_slots = 0;
         uint32_t min_chunk_skips = 0;
         uint32_t forced_spills = 0;
         uint32_t overflow = 0;
@@ -168,6 +197,71 @@ namespace llaminar2::least_loaded_ep
         return lhs * rhs;
     }
 
+    /**
+     * @brief Compute the serialized payload width of one transfer wave.
+     *
+     * Every participant can issue and receive on its own transport lane while
+     * the wave is in flight. Transfers incident to the same source or the same
+     * destination serialize on that participant's lane; independent edges and
+     * the two directions of a reciprocal pair overlap. The economic multiplier
+     * is consequently the maximum outgoing or incoming edge count of any
+     * participant, rather than the global number of logical transfers.
+     *
+     * A malformed or unavailable manifest returns the conservative global
+     * count. Callers still validate the manifest separately before publishing
+     * it; this fallback only prevents an invalid diagnostic input from
+     * understating cost.
+     *
+     * @param transfers Canonical logical payload-transfer manifest.
+     * @param transfer_count Number of readable manifest entries.
+     * @param participant_count Number of participants in the transfer domain.
+     * @return Maximum serialized outgoing or incoming payload slots.
+     */
+    LLAMINAR_LLEP_HD uint32_t transferCriticalPathSlotCount(
+        const LeastLoadedExpertWeightTransfer *transfers,
+        uint32_t transfer_count,
+        uint32_t participant_count) noexcept
+    {
+        if (transfer_count == 0u)
+            return 0u;
+        if (transfers == nullptr || participant_count == 0u ||
+            participant_count > 64u)
+        {
+            return transfer_count;
+        }
+
+        uint32_t critical_path_slots = 0u;
+        for (uint32_t participant = 0u;
+             participant < participant_count;
+             ++participant)
+        {
+            uint32_t outgoing = 0u;
+            uint32_t incoming = 0u;
+            for (uint32_t transfer_index = 0u;
+                 transfer_index < transfer_count;
+                 ++transfer_index)
+            {
+                const auto &transfer = transfers[transfer_index];
+                if (transfer.source_participant >= participant_count ||
+                    transfer.destination_participant >= participant_count ||
+                    transfer.source_participant ==
+                        transfer.destination_participant)
+                {
+                    return transfer_count;
+                }
+                if (transfer.source_participant == participant)
+                    ++outgoing;
+                if (transfer.destination_participant == participant)
+                    ++incoming;
+            }
+            if (outgoing > critical_path_slots)
+                critical_path_slots = outgoing;
+            if (incoming > critical_path_slots)
+                critical_path_slots = incoming;
+        }
+        return critical_path_slots;
+    }
+
     LLAMINAR_LLEP_HD uint64_t ceilDiv(uint64_t numerator, uint64_t denominator) noexcept
     {
         if (denominator == 0ULL)
@@ -175,22 +269,46 @@ namespace llaminar2::least_loaded_ep
         return numerator / denominator + ((numerator % denominator) != 0ULL ? 1ULL : 0ULL);
     }
 
-    LLAMINAR_LLEP_HD bool isBalancedEnoughToUseStandardEP(
+    /**
+     * @brief Decide whether static-owner participant work is already balanced.
+     *
+     * LLEP changes which participant executes routed rows, so its admission
+     * decision must compare participant loads.  Comparing the hottest expert
+     * with the mean expert load answers a different question: an individual
+     * expert can be very popular while ordinal ownership still distributes
+     * total work evenly, and many individually ordinary experts can accumulate
+     * on one participant.  Either mismatch can make an otherwise correct LLEP
+     * plan slower than static-owner execution.
+     *
+     * The comparison is `max_participant_load / mean_participant_load <
+     * lambda`, expressed with saturating integer products so CPU, CUDA, and
+     * ROCm take exactly the same branch.
+     *
+     * @param total_load Total routed rows in the current assignment window.
+     * @param max_participant_load Static-owner load on the busiest participant.
+     * @param participant_count Number of participants in the execution domain.
+     * @param lambda_numerator Numerator of the accepted imbalance ratio.
+     * @param lambda_denominator Denominator of the accepted imbalance ratio.
+     * @return `true` when transport-backed redistribution should be skipped.
+     */
+    LLAMINAR_LLEP_HD bool isStaticOwnerParticipantLoadBalancedEnough(
         uint64_t total_load,
-        uint64_t max_expert_load,
-        uint32_t expert_count,
+        uint64_t max_participant_load,
+        uint32_t participant_count,
         uint32_t lambda_numerator,
         uint32_t lambda_denominator) noexcept
     {
-        if (total_load == 0ULL || expert_count == 0u)
+        if (total_load == 0ULL || participant_count == 0u)
             return true;
         if (lambda_denominator == 0u || lambda_numerator == 0u)
             return false;
 
-        // max(l) / mean(l) < lambda, rewritten without floating point:
-        // max(l) * expert_count * lambda_denominator < total * lambda_numerator.
+        // max(load) / mean(load) < lambda, rewritten without floating point:
+        // max * participants * denominator < total * numerator.
         const uint64_t lhs = saturatedMul(
-            saturatedMul(max_expert_load, static_cast<uint64_t>(expert_count)),
+            saturatedMul(
+                max_participant_load,
+                static_cast<uint64_t>(participant_count)),
             static_cast<uint64_t>(lambda_denominator));
         const uint64_t rhs = saturatedMul(
             total_load,
@@ -248,11 +366,11 @@ namespace llaminar2::least_loaded_ep
     LLAMINAR_LLEP_HD uint64_t requiredSpreadImprovement(
         const LeastLoadedExpertAssignmentConfig &config,
         uint64_t total_load,
-        uint32_t transfer_count) noexcept
+        uint32_t critical_path_transfer_slots) noexcept
     {
         const uint64_t transfer_component = saturatedMul(
-            static_cast<uint64_t>(transfer_count),
-            config.min_spread_improvement_per_transfer);
+            static_cast<uint64_t>(critical_path_transfer_slots),
+            config.min_spread_improvement_per_critical_path_slot);
         uint64_t base = config.min_spread_improvement;
         if (config.min_spread_improvement_divisor > 0u)
         {
@@ -268,11 +386,11 @@ namespace llaminar2::least_loaded_ep
 
     LLAMINAR_LLEP_HD uint64_t requiredForeignRows(
         const LeastLoadedExpertAssignmentConfig &config,
-        uint32_t transfer_count) noexcept
+        uint32_t critical_path_transfer_slots) noexcept
     {
         return saturatedMul(
-            static_cast<uint64_t>(transfer_count),
-            config.min_foreign_rows_per_transfer);
+            static_cast<uint64_t>(critical_path_transfer_slots),
+            config.min_foreign_rows_per_critical_path_slot);
     }
 
     LLAMINAR_LLEP_HD void selectStandardEP(
@@ -1247,10 +1365,10 @@ namespace llaminar2::least_loaded_ep
             &status.standard_load_spread);
 
         if (config.enable_balanced_skip &&
-            isBalancedEnoughToUseStandardEP(
+            isStaticOwnerParticipantLoadBalancedEnough(
                 status.total_load,
-                status.max_expert_load,
-                config.expert_count,
+                status.standard_load_max,
+                config.participant_count,
                 config.lambda_numerator,
                 config.lambda_denominator))
         {
@@ -1399,8 +1517,16 @@ namespace llaminar2::least_loaded_ep
         status.assigned_load_spread_improvement =
             spreadImprovement(status.standard_load_spread, status.assigned_load_spread);
 
+        status.critical_path_transfer_slots =
+            transferCriticalPathSlotCount(
+                transfers,
+                status.weight_transfer_count,
+                config.participant_count);
         const uint64_t required_improvement =
-            requiredSpreadImprovement(config, status.total_load, status.weight_transfer_count);
+            requiredSpreadImprovement(
+                config,
+                status.total_load,
+                status.critical_path_transfer_slots);
         status.required_spread_improvement = required_improvement;
         if (required_improvement > 0ULL &&
             status.assigned_load_spread_improvement < required_improvement)
@@ -1410,7 +1536,9 @@ namespace llaminar2::least_loaded_ep
         }
 
         const uint64_t required_rows =
-            requiredForeignRows(config, status.weight_transfer_count);
+            requiredForeignRows(
+                config,
+                status.critical_path_transfer_slots);
         status.required_foreign_rows = required_rows;
         if (required_rows > 0ULL && status.spilled_rows < required_rows)
         {
@@ -1479,10 +1607,10 @@ namespace llaminar2::least_loaded_ep
             &status.standard_load_spread);
 
         if (config.enable_balanced_skip &&
-            isBalancedEnoughToUseStandardEP(
+            isStaticOwnerParticipantLoadBalancedEnough(
                 status.total_load,
-                status.max_expert_load,
-                config.expert_count,
+                status.standard_load_max,
+                config.participant_count,
                 config.lambda_numerator,
                 config.lambda_denominator))
         {
@@ -1770,8 +1898,16 @@ namespace llaminar2::least_loaded_ep
         status.assigned_load_spread_improvement =
             spreadImprovement(status.standard_load_spread, status.assigned_load_spread);
 
+        status.critical_path_transfer_slots =
+            transferCriticalPathSlotCount(
+                transfers,
+                status.weight_transfer_count,
+                config.participant_count);
         const uint64_t required_improvement =
-            requiredSpreadImprovement(config, status.total_load, status.weight_transfer_count);
+            requiredSpreadImprovement(
+                config,
+                status.total_load,
+                status.critical_path_transfer_slots);
         status.required_spread_improvement = required_improvement;
         if (required_improvement > 0ULL &&
             status.assigned_load_spread_improvement < required_improvement)
@@ -1781,7 +1917,9 @@ namespace llaminar2::least_loaded_ep
         }
 
         const uint64_t required_rows =
-            requiredForeignRows(config, status.weight_transfer_count);
+            requiredForeignRows(
+                config,
+                status.critical_path_transfer_slots);
         status.required_foreign_rows = required_rows;
         if (required_rows > 0ULL && status.spilled_rows < required_rows)
         {

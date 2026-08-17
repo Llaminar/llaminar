@@ -38,6 +38,21 @@ bool launchVnniRepackCUDA(
     int output_N,
     int output_row_offset,
     int packed_group_rows,
+    int allocation_payload_bytes_per_block,
+    void* stream);
+
+/// Compatibility overload using the compact payload width as allocation width.
+bool launchVnniRepackCUDA(
+    RepackFormat format,
+    const void* d_raw_blocks,
+    uint8_t* d_payload,
+    uint16_t* d_scales,
+    uint16_t* d_mins,
+    uint32_t* d_emins,
+    int N, int K,
+    int output_N,
+    int output_row_offset,
+    int packed_group_rows,
     void* stream);
 
 /// Row-chunk compatibility overload selecting one ordinary packed matrix.

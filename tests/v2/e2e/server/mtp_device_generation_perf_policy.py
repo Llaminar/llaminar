@@ -339,7 +339,7 @@ def validate_rocm_host_scheduled_mtp_device_generation_policy(
 ) -> MTPDeviceGenerationValidation:
     """Require authenticated ticket-selected captured graphs on every ROCm GPU.
 
-    The host-visible ticket is a 48-byte immutable graph-branch decision, not a
+    The host-visible ticket is a 60-byte immutable graph-branch decision, not a
     generation-state payload. This proof couples each ticket to exactly one
     device-controller transaction and exactly one captured transaction or
     terminal submission. A pinned dynamic range is valid and useful for fixed

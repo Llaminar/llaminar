@@ -180,6 +180,48 @@ TEST(Test__LeastLoadedExpertAssignment, BalancedRoutingSelectsStandardEP)
     EXPECT_EQ(fixture.status.weight_transfer_count, 0u);
 }
 
+TEST(Test__LeastLoadedExpertAssignment,
+     PopularExpertDoesNotForceMovementWhenParticipantLoadsAreBalanced)
+{
+    // Expert 0 is far above the mean expert load, but each participant owns
+    // exactly 100 routed rows. Transport cannot shorten the critical path.
+    std::vector<uint64_t> loads{80, 20, 50, 50};
+    std::vector<uint32_t> owners{0, 0, 1, 1};
+    auto config = configFor(4, 2);
+
+    PlannerFixture fixture(config.expert_count, config.participant_count);
+    ASSERT_TRUE(fixture.plan(loads, owners, config));
+
+    EXPECT_EQ(fixture.status.max_expert_load, 80u);
+    EXPECT_EQ(fixture.status.standard_load_min, 100u);
+    EXPECT_EQ(fixture.status.standard_load_max, 100u);
+    EXPECT_EQ(fixture.status.skipped_balanced, 1u);
+    EXPECT_EQ(fixture.status.standard_ep_selected, 1u);
+    EXPECT_EQ(fixture.status.weight_transfer_count, 0u);
+}
+
+TEST(Test__LeastLoadedExpertAssignment,
+     OrdinaryExpertsStillRebalanceWhenParticipantOwnershipIsSkewed)
+{
+    // No expert exceeds the old 1.3x expert-mean threshold, but three equal
+    // experts are owned by participant 0. Participant load, not expert skew,
+    // is the economy signal that must admit LLEP here.
+    std::vector<uint64_t> loads{10, 10, 10, 10};
+    std::vector<uint32_t> owners{0, 0, 0, 1};
+    auto config = configFor(4, 2);
+
+    PlannerFixture fixture(config.expert_count, config.participant_count);
+    ASSERT_TRUE(fixture.plan(loads, owners, config));
+
+    EXPECT_EQ(fixture.status.max_expert_load, 10u);
+    EXPECT_EQ(fixture.status.standard_load_min, 10u);
+    EXPECT_EQ(fixture.status.standard_load_max, 30u);
+    EXPECT_EQ(fixture.status.skipped_balanced, 0u);
+    EXPECT_EQ(fixture.status.standard_ep_selected, 0u);
+    EXPECT_GT(fixture.status.assigned_load_spread_improvement, 0u);
+    EXPECT_GT(fixture.status.weight_transfer_count, 0u);
+}
+
 TEST(Test__LeastLoadedExpertAssignment, PolicyDispatcherTreatsStaticOwnerAsFirstClassPolicy)
 {
     std::vector<uint64_t> loads{80, 20, 0, 5};
@@ -628,12 +670,12 @@ TEST(Test__LeastLoadedExpertAssignment, SpreadImprovementGateFallsBackWhenTransf
     EXPECT_EQ(fixture.status.spilled_rows, 0u);
 }
 
-TEST(Test__LeastLoadedExpertAssignment, SpreadImprovementGateCanPriceEachForeignTransfer)
+TEST(Test__LeastLoadedExpertAssignment, SpreadImprovementGatePricesSerializedCriticalPathSlots)
 {
     std::vector<uint64_t> loads{80, 20, 0, 0};
     std::vector<uint32_t> owners{0, 0, 1, 1};
     auto config = configFor(4, 2);
-    config.min_spread_improvement_per_transfer = 64;
+    config.min_spread_improvement_per_critical_path_slot = 64;
 
     PlannerFixture accepted(config.expert_count, config.participant_count);
     ASSERT_TRUE(accepted.plan(loads, owners, config));
@@ -642,7 +684,7 @@ TEST(Test__LeastLoadedExpertAssignment, SpreadImprovementGateCanPriceEachForeign
     EXPECT_EQ(accepted.status.skipped_insufficient_spread_improvement, 0u);
     EXPECT_EQ(accepted.status.weight_transfer_count, 1u);
 
-    config.min_spread_improvement_per_transfer = 128;
+    config.min_spread_improvement_per_critical_path_slot = 128;
     PlannerFixture rejected(config.expert_count, config.participant_count);
     ASSERT_TRUE(rejected.plan(loads, owners, config));
     EXPECT_EQ(rejected.status.required_spread_improvement, 128u);
@@ -651,12 +693,82 @@ TEST(Test__LeastLoadedExpertAssignment, SpreadImprovementGateCanPriceEachForeign
     EXPECT_EQ(rejected.status.weight_transfer_count, 0u);
 }
 
+TEST(Test__LeastLoadedExpertAssignment, TransferWaveCriticalPathOverlapsIndependentAndReciprocalEdges)
+{
+    const std::array<LeastLoadedExpertWeightTransfer, 2> reciprocal{{
+        {.expert = 0u, .source_participant = 0u, .destination_participant = 1u},
+        {.expert = 1u, .source_participant = 1u, .destination_participant = 0u},
+    }};
+    EXPECT_EQ(
+        transferCriticalPathSlotCount(
+            reciprocal.data(), reciprocal.size(), 2u),
+        1u)
+        << "A reciprocal pair occupies opposite full-duplex lanes in one wave.";
+
+    const std::array<LeastLoadedExpertWeightTransfer, 2> independent{{
+        {.expert = 0u, .source_participant = 0u, .destination_participant = 1u},
+        {.expert = 1u, .source_participant = 2u, .destination_participant = 3u},
+    }};
+    EXPECT_EQ(
+        transferCriticalPathSlotCount(
+            independent.data(), independent.size(), 4u),
+        1u)
+        << "Disjoint participant lanes make progress concurrently.";
+
+    const std::array<LeastLoadedExpertWeightTransfer, 2> shared_source{{
+        {.expert = 0u, .source_participant = 0u, .destination_participant = 1u},
+        {.expert = 1u, .source_participant = 0u, .destination_participant = 2u},
+    }};
+    EXPECT_EQ(
+        transferCriticalPathSlotCount(
+            shared_source.data(), shared_source.size(), 3u),
+        2u)
+        << "Two payloads on one source lane remain serialized.";
+
+    const std::array<LeastLoadedExpertWeightTransfer, 2> shared_destination{{
+        {.expert = 0u, .source_participant = 0u, .destination_participant = 2u},
+        {.expert = 1u, .source_participant = 1u, .destination_participant = 2u},
+    }};
+    EXPECT_EQ(
+        transferCriticalPathSlotCount(
+            shared_destination.data(), shared_destination.size(), 3u),
+        2u)
+        << "Two payloads on one destination lane remain serialized.";
+}
+
+TEST(Test__LeastLoadedExpertAssignment, ReciprocalLLEPWaveUsesOneCostSlotInsteadOfTwoEdges)
+{
+    std::vector<uint64_t> loads{5, 15, 20, 20};
+    std::vector<uint32_t> owners{0, 0, 1, 1};
+    auto config = configFor(4, 2);
+    config.alpha_numerator = 3;
+    config.alpha_denominator = 4;
+    config.enable_balanced_skip = false;
+    config.min_spread_improvement_per_critical_path_slot = 5;
+
+    PlannerFixture fixture(config.expert_count, config.participant_count);
+    ASSERT_TRUE(fixture.plan(loads, owners, config));
+
+    ASSERT_EQ(fixture.status.weight_transfer_count, 2u);
+    EXPECT_EQ(fixture.status.critical_path_transfer_slots, 1u);
+    EXPECT_EQ(fixture.status.standard_load_spread, 20u);
+    EXPECT_EQ(fixture.status.assigned_load_spread, 14u);
+    EXPECT_EQ(fixture.status.assigned_load_spread_improvement, 6u);
+    EXPECT_EQ(fixture.status.required_spread_improvement, 5u);
+    EXPECT_EQ(fixture.status.skipped_insufficient_spread_improvement, 0u);
+    EXPECT_EQ(fixture.status.standard_ep_selected, 0u);
+    EXPECT_EQ(fixture.transfers[0].source_participant, 1u);
+    EXPECT_EQ(fixture.transfers[0].destination_participant, 0u);
+    EXPECT_EQ(fixture.transfers[1].source_participant, 0u);
+    EXPECT_EQ(fixture.transfers[1].destination_participant, 1u);
+}
+
 TEST(Test__LeastLoadedExpertAssignment, ForeignRowsGatePricesUsefulRowsPerTransfer)
 {
     std::vector<uint64_t> loads{80, 20, 0, 0};
     std::vector<uint32_t> owners{0, 0, 1, 1};
     auto config = configFor(4, 2);
-    config.min_foreign_rows_per_transfer = 50;
+    config.min_foreign_rows_per_critical_path_slot = 50;
 
     PlannerFixture accepted(config.expert_count, config.participant_count);
     ASSERT_TRUE(accepted.plan(loads, owners, config));
@@ -665,7 +777,7 @@ TEST(Test__LeastLoadedExpertAssignment, ForeignRowsGatePricesUsefulRowsPerTransf
     EXPECT_EQ(accepted.status.skipped_insufficient_foreign_rows, 0u);
     EXPECT_EQ(accepted.status.weight_transfer_count, 1u);
 
-    config.min_foreign_rows_per_transfer = 51;
+    config.min_foreign_rows_per_critical_path_slot = 51;
     PlannerFixture rejected(config.expert_count, config.participant_count);
     ASSERT_TRUE(rejected.plan(loads, owners, config));
     EXPECT_EQ(rejected.status.required_foreign_rows, 51u);
@@ -680,6 +792,8 @@ TEST(Test__LeastLoadedExpertAssignment, RelativeSpreadImprovementGatePricesTotal
     std::vector<uint64_t> loads{70, 30, 30, 30};
     std::vector<uint32_t> owners{0, 0, 1, 1};
     auto config = configFor(4, 2);
+    // This test isolates the post-plan relative economy floor.
+    config.enable_balanced_skip = false;
     config.min_spread_improvement_divisor = 4;
 
     PlannerFixture accepted(config.expert_count, config.participant_count);
@@ -707,6 +821,8 @@ TEST(Test__LeastLoadedExpertAssignment, TransferOnlyPlannerHonorsRelativeSpreadI
     std::vector<uint64_t> loads{70, 30, 30, 30};
     std::vector<uint32_t> owners{0, 0, 1, 1};
     auto config = configFor(4, 2);
+    // This test isolates the post-plan relative economy floor.
+    config.enable_balanced_skip = false;
     config.min_spread_improvement_divisor = 4;
 
     PlannerFixture accepted(config.expert_count, config.participant_count);
@@ -729,7 +845,7 @@ TEST(Test__LeastLoadedExpertAssignment, TransferOnlyPlannerHonorsForeignRowsGate
     std::vector<uint64_t> loads{80, 20, 0, 0};
     std::vector<uint32_t> owners{0, 0, 1, 1};
     auto config = configFor(4, 2);
-    config.min_foreign_rows_per_transfer = 50;
+    config.min_foreign_rows_per_critical_path_slot = 50;
 
     PlannerFixture accepted(config.expert_count, config.participant_count);
     ASSERT_TRUE(accepted.planTransfersOnly(loads, owners, config));
@@ -737,7 +853,7 @@ TEST(Test__LeastLoadedExpertAssignment, TransferOnlyPlannerHonorsForeignRowsGate
     EXPECT_EQ(accepted.status.required_foreign_rows, 50u);
     EXPECT_EQ(accepted.status.weight_transfer_count, 1u);
 
-    config.min_foreign_rows_per_transfer = 51;
+    config.min_foreign_rows_per_critical_path_slot = 51;
     PlannerFixture rejected(config.expert_count, config.participant_count);
     ASSERT_TRUE(rejected.planTransfersOnly(loads, owners, config));
     EXPECT_EQ(rejected.status.required_foreign_rows, 51u);

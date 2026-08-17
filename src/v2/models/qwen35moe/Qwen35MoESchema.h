@@ -119,7 +119,7 @@ namespace llaminar2
              * group because it coexists with the compact final outputs.
              */
             schema.layer_buffers.push_back(
-                {"moe_canonical_route_contributions", {"moe_activation_rows", "moe_canonical_publication_slots", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_canonical_route_scratch", 10, "Original top-k route slots followed by rank-addressed shared-expert publication banks"});
+                {"moe_canonical_route_contributions", {"moe_activation_rows", "moe_canonical_publication_slots", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_canonical_route_scratch", 10, "Canonical route evidence: dense GPU slots/rank banks or packed indexed CPU rows plus a count trailer"});
 
             // Shared expert output
             schema.layer_buffers.push_back(
@@ -213,6 +213,36 @@ namespace llaminar2
             config["MOE_COMBINED_OUTPUT"] = SnapshotShardingMode::REPLICATED;
             config["MOE_EXPERT_OUTPUT_ALLREDUCED"] = SnapshotShardingMode::REPLICATED;
             config["MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"] = SnapshotShardingMode::REPLICATED;
+
+            /*
+             * Before the publication collective, every original router slot
+             * has exactly one participant owner and all non-owners publish
+             * zero for that slot. Elementwise addition reconstructs the
+             * complete canonical route tensor without changing its fixed
+             * router-slot arithmetic order.
+             */
+            config["MOE_CANONICAL_ROUTE_CONTRIBUTIONS"] =
+                SnapshotShardingMode::ROW_PARALLEL;
+
+            /*
+             * Canonical rank-bank publication is an explicit three-edge TP
+             * protocol. Each publish checkpoint contains disjoint routed and
+             * shared banks, so it combines additively. The reduction exposes a
+             * complete output on exactly its declared root. The subsequent
+             * broadcast makes the finalized MoE row replicated again.
+             * Packed CPU publication and the route-only rooted GPU lowering
+             * share the same root-only snapshot ownership contract.
+             */
+            config["MOE_SHARED_RANK_BANK_PUBLISH"] =
+                SnapshotShardingMode::ROW_PARALLEL;
+            config["MOE_CANONICAL_PUBLICATION_REDUCE_TO_ROOT"] =
+                SnapshotShardingMode::ROOT_ONLY;
+            config["MOE_CANONICAL_ROUTES_GATHER_TO_ROOT"] =
+                SnapshotShardingMode::ROOT_ONLY;
+            config["MOE_CANONICAL_ROUTES_REDUCE_TO_ROOT"] =
+                SnapshotShardingMode::ROOT_ONLY;
+            config["MOE_CANONICAL_PUBLICATION_BROADCAST"] =
+                SnapshotShardingMode::REPLICATED;
 
             return config;
         }

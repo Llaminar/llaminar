@@ -34,6 +34,7 @@ from native_vnni_dispatch.candidate_observation import (  # noqa: E402
 )
 from native_vnni_dispatch.candidate_registry import (  # noqa: E402
     candidate_registry_digest,
+    cpu_native_vnni_decode_physical_candidate_ids,
     cpu_native_vnni_decode_registry,
 )
 from native_vnni_dispatch.certification import CertificationReport  # noqa: E402
@@ -104,7 +105,9 @@ from native_vnni_dispatch.schema import (  # noqa: E402
 )
 from native_vnni_dispatch.segmented_policy import (  # noqa: E402
     CandidatePointCost,
+    DEFAULT_TREE_LEAVES,
     GenericDispatchRule,
+    MAX_TREE_LEAVES,
     PolicyFitCache,
     fit_generic_policy,
     validate_generic_rule_partition,
@@ -247,10 +250,16 @@ def select_entries(corpus: ObservationCorpus) -> list[DecodePolicyEntry]:
     return entries
 
 
-def select_generic_rules(corpus: ObservationCorpus) -> list[CPUDecodeGenericRule]:
+def select_generic_rules(
+    corpus: ObservationCorpus,
+    max_leaves: int = DEFAULT_TREE_LEAVES,
+) -> list[CPUDecodeGenericRule]:
     """Fit generic geometry rules with the shared bounded-regret learner."""
 
-    generic = fit_generic_policy(corpus.with_collapsed_aspect_domains())
+    generic = fit_generic_policy(
+        corpus.with_collapsed_aspect_domains(),
+        max_leaves=max_leaves,
+    )
     return _emit_generic_rules(generic.rules)
 
 
@@ -304,6 +313,14 @@ def validate_complete(
     require_registry_candidate_coverage(
         corpus,
         cpu_native_vnni_decode_registry(),
+        candidate_ids_for_runtime_key=lambda key: (
+            cpu_native_vnni_decode_physical_candidate_ids(
+                n=key.aggregate_n,
+                k=key.k,
+                k_tiles=key.launch_k_tiles,
+                threads=_cpu_runtime_surface(key.architecture_class)[2],
+            )
+        ),
     )
     observed_names = {row.shape_name for row in corpus}
     disallowed = sorted(
@@ -386,6 +403,7 @@ def _freeze_prepared_cpu_decode_policy(
         GenericDomain, tuple[CandidatePointCost, ...]
     ] | None = None,
     burned_seal_evidence_digests: tuple[str, ...] = (),
+    max_leaves: int = DEFAULT_TREE_LEAVES,
 ) -> FrozenPolicy:
     """Fit generic Fast-M1 rules from one validated cross-aspect corpus."""
 
@@ -404,6 +422,7 @@ def _freeze_prepared_cpu_decode_policy(
         supplemental_development_costs=supplemental_development_costs,
         profiler_feature_catalog=profiler_feature_catalog,
         fit_cache=fit_cache,
+        max_leaves=max_leaves,
         metadata={
             "backend": "cpu",
             "semantic_contract": SemanticContract.FAST.value,
@@ -411,6 +430,7 @@ def _freeze_prepared_cpu_decode_policy(
             "shape_manifest_digest": manifest.digest(),
             "split_surface": "cpu_decode_fast_m1",
             "arithmetic_policy": "frozen_serial_full_k_or_ordered_kpart",
+            "generic_max_leaves": max_leaves,
             "paired_development_evidence_digest": paired_comparison_digest(
                 paired_development_comparisons or {}
             ),
@@ -433,6 +453,7 @@ def freeze_cpu_decode_policy(
         GenericDomain, tuple[CandidatePointCost, ...]
     ] | None = None,
     burned_seal_evidence_digests: tuple[str, ...] = (),
+    max_leaves: int = DEFAULT_TREE_LEAVES,
 ) -> FrozenPolicy:
     """Validate, project, and fit generic Fast-M1 development evidence."""
 
@@ -444,6 +465,7 @@ def freeze_cpu_decode_policy(
         paired_development_comparisons,
         supplemental_development_costs,
         burned_seal_evidence_digests,
+        max_leaves,
     )
 
 
@@ -1042,6 +1064,15 @@ def main() -> int:
         type=Path,
         help="Persistent content-addressed candidate-cost and CV cache",
     )
+    parser.add_argument(
+        "--generic-max-leaves",
+        type=int,
+        default=DEFAULT_TREE_LEAVES,
+        help=(
+            "Maximum generic CPU M=1 tree leaves; smaller promotable cached "
+            "trees remain reusable"
+        ),
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--summary", type=Path)
     parser.add_argument("--common-observations", type=Path)
@@ -1106,6 +1137,10 @@ def main() -> int:
     )
     parser.add_argument("--shape-manifest", type=Path, default=MANIFEST_PATH)
     args = parser.parse_args()
+    if not 1 <= args.generic_max_leaves <= MAX_TREE_LEAVES:
+        parser.error(
+            f"--generic-max-leaves must be in [1, {MAX_TREE_LEAVES}]"
+        )
     sealed_paired_csvs: tuple[Path, ...] = ()
     if args.certify_generic:
         try:
@@ -1270,6 +1305,7 @@ def main() -> int:
             paired_development_comparisons,
             supplemental_costs,
             burned_digests,
+            args.generic_max_leaves,
         )
         validate_frozen_policy_file(args.frozen_policy_json, frozen)
         frozen_development = _require_partition(
@@ -1342,6 +1378,7 @@ def main() -> int:
             paired_development_comparisons,
             supplemental_costs,
             burned_digests,
+            args.generic_max_leaves,
         )
         validate_frozen_policy_file(args.frozen_policy_json, frozen)
         compiled = certify_cpu_decode_policy(
@@ -1451,6 +1488,7 @@ def main() -> int:
             paired_development_comparisons,
             supplemental_costs,
             burned_digests,
+            args.generic_max_leaves,
         )
         entries = select_entries(corpus)
         rules = _emit_generic_rules(frozen.policy_ir.generic_rules)
@@ -1489,7 +1527,7 @@ def main() -> int:
     elif args.require_isa_matrix:
         validate_isa_regime_matrix(corpus)
     entries = select_entries(corpus)
-    rules = select_generic_rules(corpus)
+    rules = select_generic_rules(corpus, args.generic_max_leaves)
     _write_outputs(args, corpus, entries, rules)
     print(
         f"adapted {len(corpus)} CPU decode observations; generated "

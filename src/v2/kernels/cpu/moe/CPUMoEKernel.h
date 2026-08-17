@@ -22,7 +22,7 @@ namespace llaminar2
      * @brief CPU implementation of MoE kernel operations
      *
      * Uses ISA-dispatched vector primitives for:
-     * - Router: vec_dot for gate logits, scalar softmax + partial_sort top-k
+     * - Router: socket-wide row/expert dot products, SIMD softmax, partial-sort top-k
      * - Gather: memcpy-based token collection
      * - Scatter: vec_axpy for weighted accumulation
      * - Shared expert gate: vec_dot + sigmoid + vec_scale
@@ -38,6 +38,25 @@ namespace llaminar2
         // IMoEKernel interface
         // =================================================================
 
+        /**
+         * @brief Route one or more hidden rows with serial-decode arithmetic.
+         *
+         * Independent row/expert dot products occupy the complete OpenMP team.
+         * Each row is then finalized by one worker using the same softmax,
+         * top-k ordering, summation, and normalization as M=1 decode. The
+         * method also publishes canonical Q8_1 hidden rows for the paired
+         * NativeVNNI expert consumer.
+         *
+         * @param hidden Contiguous FP32 hidden rows `[seq_len, d_model]`.
+         * @param gate_weights FP32 router matrix `[num_experts, d_model]`.
+         * @param seq_len Positive runtime row count.
+         * @param d_model Hidden width shared by inputs and gate rows.
+         * @param num_experts Number of router output columns.
+         * @param top_k Number of unique winning experts retained per row.
+         * @param normalize_weights Whether selected probabilities sum to one.
+         * @param result Persistent host-owned output storage.
+         * @return True after every route and Q8 publication is complete.
+         */
         bool route(
             const float *hidden,
             const float *gate_weights,
@@ -59,6 +78,55 @@ namespace llaminar2
             bool normalize_weights,
             ITensor *output_indices, ITensor *output_weights,
             MoERoutingResult &host_result) override;
+
+        /** @brief Acquire the current CPU-owned ExpertOverlay placement epoch. */
+        bool acquireMoEOverlayEpoch(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            DeviceMoEOverlayEpochTicket *ticket,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @brief Release and clear one CPU ExpertOverlay placement ticket. */
+        bool releaseMoEOverlayEpoch(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            DeviceMoEOverlayEpochTicket *ticket,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @brief Reserve the CPU control block's reusable placement bank. */
+        bool reserveMoEOverlayEpochCandidate(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @brief Mark a CPU placement candidate ready for publication. */
+        bool markMoEOverlayEpochCandidateReady(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @brief Publish a ready CPU placement candidate without waiting on readers. */
+        bool publishMoEOverlayEpochCandidate(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @brief Abort an unpublished CPU placement candidate. */
+        bool abortMoEOverlayEpochCandidate(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @brief Reclaim a CPU placement bank after its complete grace period. */
+        bool retireMoEOverlayEpoch(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *retiring_epoch,
+            DeviceMoEOverlayEpochStatus *status) override;
 
         void gatherTokenBatch(
             const float *hidden,
@@ -102,6 +170,26 @@ namespace llaminar2
             const float *source,
             int rows,
             int d_model) const noexcept;
+
+        /**
+         * @brief Publish canonical Q8_1 rows received across a host boundary.
+         *
+         * ExpertOverlay routing may execute on a GPU while a participant-local
+         * NativeVNNI expert executes on CPU. The fixed-capacity ticket carries
+         * the authoritative FP32 rows, so the CPU boundary must perform the
+         * same one-time canonical transform normally owned by CPU route(). This
+         * is an explicit transport adaptation, not a missing-publication
+         * recovery path; callers select it through a typed stage policy.
+         *
+         * @param source Authoritative transported FP32 row base.
+         * @param rows Number of contiguous transported rows.
+         * @param d_model Logical values per row.
+         * @return true after publishing byte-identical canonical Q8_1 blocks.
+         */
+        bool publishTransportedRouterQ8Hidden(
+            const float *source,
+            int rows,
+            int d_model);
 
         // =================================================================
         // ITensorKernel interface

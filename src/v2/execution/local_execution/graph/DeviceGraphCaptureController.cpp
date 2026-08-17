@@ -20,6 +20,7 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 namespace llaminar2
@@ -231,6 +232,75 @@ namespace llaminar2
             return out.str();
         }
 
+        bool manualSegmentRequiresHostTicketFence(
+            ComputeGraph &graph,
+            const DeviceGraphExecutor::GraphSegment &segment,
+            std::string *consumer_stage)
+        {
+            if (consumer_stage)
+                consumer_stage->clear();
+            if (segment.capturable)
+                return false;
+            for (const auto &stage_name : segment.stage_names)
+            {
+                const auto *node = graph.getNode(stage_name);
+                if (!node || !node->stage ||
+                    !node->stage->requiresHostGraphTicketFence())
+                {
+                    continue;
+                }
+                if (!node->stage->isManualGraphBoundary())
+                {
+                    throw std::logic_error(
+                        "Stage '" + stage_name +
+                        "' requests a host graph-ticket fence without declaring a manual graph boundary");
+                }
+                if (consumer_stage)
+                    *consumer_stage = stage_name;
+                return true;
+            }
+            return false;
+        }
+
+        void awaitManualHostTicketBoundary(
+            ComputeGraph &graph,
+            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+            size_t segment_index,
+            const char *phase,
+            const DeviceId &device)
+        {
+            if (segment_index >= segment_cache.segments.size())
+                throw std::out_of_range("Host ticket boundary segment index is invalid");
+
+            std::string consumer_stage;
+            const auto &segment = segment_cache.segments[segment_index];
+            if (!manualSegmentRequiresHostTicketFence(
+                    graph,
+                    segment,
+                    &consumer_stage))
+            {
+                return;
+            }
+            if (segment_index == 0 ||
+                !segment_cache.segments[segment_index - 1].capturable)
+            {
+                throw std::runtime_error(
+                    "Manual host ticket consumer '" + consumer_stage +
+                    "' is not immediately preceded by a captured producer segment");
+            }
+
+            segment_cache.waitForManualHostTicketFence();
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "heterogeneous_host_ticket_fences",
+                1.0,
+                phase,
+                device.toString(),
+                {{"consumer_stage", consumer_stage},
+                 {"context", segment_cache.perf_context},
+                 {"authority", "captured_pinned_ticket"}});
+        }
+
         /**
          * @brief Materialize one frozen stage-order ledger before beginCapture().
          *
@@ -272,28 +342,150 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Return the strict cross-participant name for one capture wave.
+         *
+         * Raw replay-segment indexes are intentionally absent. A heterogeneous
+         * root owns manual sparse segments that its sibling device graphs do not
+         * contain. Capture-wave ordinals count only native-capture lifecycle
+         * participation and therefore remain symmetric. Explicit identities
+         * admit deliberately different stage ranges; implicit waves retain the
+         * old first/last-stage structural check.
+         */
         std::string graphCaptureBoundaryName(
             const char *phase,
             uint64_t current_step,
-            int segment_index,
-            const DeviceGraphExecutor::GraphSegment &segment,
+            size_t capture_wave_ordinal,
+            const std::string &capture_wave_identity,
+            const DeviceGraphExecutor::GraphSegment *active_segment,
             const std::string &perf_context)
         {
-            const std::string first_stage =
-                segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front();
-            const std::string last_stage =
-                segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.back();
             std::ostringstream out;
             out << "before_begin:"
                 << "phase=" << phase
                 << ":step=" << current_step
-                << ":segment=" << segment_index
-                << ":type=" << segmentTypeName(segment)
-                << ":first=" << first_stage
-                << ":last=" << last_stage;
+                << ":wave=" << capture_wave_ordinal;
+            if (!capture_wave_identity.empty())
+            {
+                out << ":identity=explicit:" << capture_wave_identity;
+            }
+            else if (active_segment)
+            {
+                const std::string first_stage =
+                    active_segment->stage_names.empty()
+                        ? std::string("<empty>")
+                        : active_segment->stage_names.front();
+                const std::string last_stage =
+                    active_segment->stage_names.empty()
+                        ? std::string("<empty>")
+                        : active_segment->stage_names.back();
+                out << ":identity=implicit:"
+                    << first_stage << ".." << last_stage;
+            }
+            else
+            {
+                throw std::logic_error(
+                    "Passive capture wave requires an explicit identity");
+            }
             if (!perf_context.empty())
                 out << ":context=" << perf_context;
             return out.str();
+        }
+
+        /**
+         * @brief Join sibling-only capture waves after the anchor segment completes.
+         *
+         * The anchor may be a launched graph or a completed manual collective.
+         * The begin rendezvous holds this participant while a sibling performs
+         * intervening heterogeneous work. The immediate end rendezvous then
+         * holds it until that sibling has finished recording and launching its
+         * native graph. No empty graph, dummy transfer, device allocation, or
+         * kernel is introduced on the passive participant.
+         */
+        bool joinPassiveCaptureWaves(
+            ComputeGraph &graph,
+            const DeviceGraphExecutor::GraphSegment &segment,
+            const char *phase_prefix,
+            uint64_t current_step,
+            const std::string &perf_context,
+            const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary,
+            void *capture_stream,
+            const DeviceId &device)
+        {
+            if (segment.passive_capture_waves_after.empty())
+                return true;
+            if (!capture_boundary || !capture_stream)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Passive capture waves require "
+                    "a domain boundary hook and exact non-null stream");
+                return false;
+            }
+
+            for (const auto &passive_wave :
+                 segment.passive_capture_waves_after)
+            {
+                const std::string begin_phase =
+                    std::string(phase_prefix) + "_begin";
+                const std::string begin_boundary =
+                    graphCaptureBoundaryName(
+                        begin_phase.c_str(),
+                        current_step,
+                        passive_wave.ordinal,
+                        passive_wave.identity,
+                        nullptr,
+                        perf_context);
+                if (!capture_boundary(begin_boundary, capture_stream))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphCaptureController] Passive capture-wave begin "
+                        "rendezvous failed boundary="
+                        << begin_boundary);
+                    return false;
+                }
+
+                const std::string end_phase =
+                    std::string(phase_prefix) + "_end";
+                const std::string end_boundary =
+                    graphCaptureBoundaryName(
+                        end_phase.c_str(),
+                        current_step,
+                        passive_wave.ordinal,
+                        passive_wave.identity,
+                        nullptr,
+                        perf_context);
+                if (!capture_boundary(end_boundary, capture_stream))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphCaptureController] Passive capture-wave end "
+                        "rendezvous failed boundary="
+                        << end_boundary);
+                    return false;
+                }
+
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "passive_capture_wave_joins",
+                    1.0,
+                    phase_prefix,
+                    device.toString(),
+                    {{"identity", passive_wave.identity},
+                     {"wave", std::to_string(passive_wave.ordinal)},
+                     {"context", perf_context}});
+
+                /*
+                 * These graph nodes are immutable no-ops on this participant.
+                 * Mark them complete only after the sibling's active wave has
+                 * both launched and left capture, which is their declarative
+                 * position in the shared execution schedule.
+                 */
+                for (const auto &stage_name :
+                     passive_wave.declarative_noop_stage_names)
+                {
+                    graph.markCompleted(stage_name);
+                }
+            }
+            return true;
         }
 
         void addContextTag(PerfStatsCollector::Tags &tags, const std::string &perf_context)
@@ -841,8 +1033,19 @@ namespace llaminar2
         DeviceGraphExecutor::GraphReplayPlanPolicy plan_policy)
     {
         segment_cache.segments.clear();
+        segment_cache.graph_replay_plan_policy = plan_policy;
 
         const auto &order = graph.getExecutionOrder();
+        const bool device_owned_timeline_transaction =
+            graph.nativeCaptureEnvelope() ==
+            GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction;
+        if (device_owned_timeline_transaction &&
+            plan_policy !=
+                DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph)
+        {
+            throw std::logic_error(
+                "A device-owned timeline transaction requires the full-graph replay policy");
+        }
         const auto &segmented_collective_capture_allow =
             debugEnv().execution.gpu_graph_collective_segmented_capture_allow;
 
@@ -874,6 +1077,81 @@ namespace llaminar2
                 continue;
             }
 
+            const auto *const wave_contract =
+                !device_owned_timeline_transaction &&
+                        node->graph_capture_wave
+                    ? &*node->graph_capture_wave
+                    : nullptr;
+            if (wave_contract &&
+                wave_contract->participation ==
+                    GraphCaptureWaveParticipation::Passive)
+            {
+                if (!node->stage->isPassiveGraphCaptureNoOp())
+                {
+                    throw std::logic_error(
+                        "Graph node '" + name + "' declares passive capture "
+                        "participation, but its stage no longer certifies an "
+                        "immutable no-op role");
+                }
+                if (first || segment_cache.segments.empty() ||
+                    segment_cache.segments.back().stage_names.empty())
+                {
+                    throw std::logic_error(
+                        "Passive capture node '" + name + "' has no preceding "
+                        "execution segment to anchor its rendezvous");
+                }
+
+                auto &anchor = segment_cache.segments.back();
+                const auto append_passive_wave =
+                    [&](const std::string &identity,
+                        const std::string *declarative_noop_stage)
+                {
+                    const auto duplicate = std::find_if(
+                        anchor.passive_capture_waves_after.begin(),
+                        anchor.passive_capture_waves_after.end(),
+                        [&](const DeviceGraphExecutor::GraphSegment::
+                                PassiveCaptureWave &wave)
+                        {
+                            return wave.identity == identity;
+                        });
+                    if (duplicate !=
+                        anchor.passive_capture_waves_after.end())
+                    {
+                        throw std::logic_error(
+                            "Captured segment repeats passive wave identity '" +
+                            identity + "'");
+                    }
+
+                    DeviceGraphExecutor::GraphSegment::PassiveCaptureWave wave{
+                        .ordinal = 0,
+                        .identity = identity,
+                    };
+                    if (declarative_noop_stage)
+                    {
+                        wave.declarative_noop_stage_names.push_back(
+                            *declarative_noop_stage);
+                    }
+                    anchor.passive_capture_waves_after.push_back(
+                        std::move(wave));
+                };
+
+                append_passive_wave(wave_contract->identity, &name);
+                for (const auto &following_identity :
+                     wave_contract->passive_following_identities)
+                {
+                    append_passive_wave(following_identity, nullptr);
+                }
+
+                /*
+                 * A passive wave is an intervening domain lifecycle boundary.
+                 * The next local device operation must start a new executable;
+                 * fusing it into the anchor would move that work ahead of the
+                 * sibling wave this participant just joined.
+                 */
+                force_new_segment = true;
+                continue;
+            }
+
             // Start from stage capability, then layer on safety gates.
             bool stage_capturable = node->stage->isGraphCapturable();
             const bool preparation_dependent_capture =
@@ -882,6 +1160,7 @@ namespace llaminar2
             {
                 stage_capturable = true;
             }
+            const bool stage_capture_capable = stage_capturable;
             const bool collective_by_stage = node->stage->isCollectiveStage();
             const bool collective_by_name = (collective_nodes && collective_nodes->count(name));
 
@@ -897,11 +1176,33 @@ namespace llaminar2
                 stage_capturable =
                     stage_capturable && collectives_graph_capturable;
             }
+            const bool capture_wave_dormant_by_collective_policy =
+                wave_contract &&
+                wave_contract->participation ==
+                    GraphCaptureWaveParticipation::Active &&
+                stage_capture_capable &&
+                (collective_by_stage || collective_by_name) &&
+                !collectives_graph_capturable;
 
             if (has_collective_nodes && !segmented_collective_capture_allow.empty())
             {
                 // Explicit allowlist mode: only allowlisted stages are capturable
                 stage_capturable = stage_in_collective_allowlist(name);
+            }
+            if (node->stage->requiresHostGraphTicketFence())
+            {
+                if (!node->stage->isManualGraphBoundary())
+                {
+                    throw std::logic_error(
+                        "Stage '" + name +
+                        "' requests a host graph-ticket fence without declaring a manual graph boundary");
+                }
+                if (stage_capturable)
+                {
+                    throw std::logic_error(
+                        "Stage '" + name +
+                        "' requests a host graph-ticket fence but was classified as capturable");
+                }
             }
             // Otherwise: trust each stage's isGraphCapturable() declaration.
             // Stages that need per-step updates either return false or report
@@ -917,6 +1218,25 @@ namespace llaminar2
                 !segment_cache.segments.back().stage_names.empty();
             force_new_segment = force_new_segment || boundary_before;
 
+            /*
+             * An explicit identity is a logical capture-unit boundary. Two
+             * adjacent captured nodes with different identities cannot share a
+             * native executable because sibling graphs may participate in only
+             * one of those waves. An unannotated prefix may join the first
+             * explicit identity in its segment; that is how the continuation
+             * compute and root-only ticket publication form one active wave.
+             */
+            if (stage_capturable && wave_contract &&
+                !segment_cache.segments.empty() &&
+                segment_cache.segments.back().capturable &&
+                !segment_cache.segments.back().stage_names.empty() &&
+                !segment_cache.segments.back().capture_wave_identity.empty() &&
+                segment_cache.segments.back().capture_wave_identity !=
+                    wave_contract->identity)
+            {
+                force_new_segment = true;
+            }
+
             if (first || force_new_segment || stage_capturable != current_capturable)
             {
                 // Create a new segment whenever capturable/manual mode changes
@@ -929,6 +1249,65 @@ namespace llaminar2
             }
 
             segment_cache.segments.back().stage_names.push_back(name);
+            if (wave_contract)
+            {
+                if (!stage_capturable)
+                {
+                    /*
+                     * An active collective wave can be declared once in the
+                     * model graph even when an explicit diagnostic policy runs
+                     * collectives as manual heterogeneous segments.  In that
+                     * mode the wave is dormant: the manual collective remains
+                     * in the plan and consumes no native-capture ordinal. A
+                     * stage that is intrinsically incapable of capture still
+                     * fails, so this cannot hide stale preparation or geometry.
+                     */
+                    if (capture_wave_dormant_by_collective_policy)
+                    {
+                        force_new_segment = false;
+                        continue;
+                    }
+                    throw std::logic_error(
+                        "Graph node '" + name + "' declares capture wave '" +
+                        wave_contract->identity +
+                        "' but is not graph-capturable");
+                }
+
+                auto &segment = segment_cache.segments.back();
+                if (segment.capture_wave_identity.empty())
+                {
+                    segment.capture_wave_identity =
+                        wave_contract->identity;
+                }
+                else if (segment.capture_wave_identity !=
+                         wave_contract->identity)
+                {
+                    throw std::logic_error(
+                        "Captured segment combines incompatible wave identities '" +
+                        segment.capture_wave_identity + "' and '" +
+                        wave_contract->identity + "'");
+                }
+
+                for (const auto &passive_identity :
+                     wave_contract->passive_following_identities)
+                {
+                    const auto duplicate = std::find_if(
+                        segment.passive_capture_waves_after.begin(),
+                        segment.passive_capture_waves_after.end(),
+                        [&](const DeviceGraphExecutor::GraphSegment::PassiveCaptureWave &wave)
+                        {
+                            return wave.identity == passive_identity;
+                        });
+                    if (duplicate != segment.passive_capture_waves_after.end())
+                    {
+                        throw std::logic_error(
+                            "Captured segment repeats passive wave identity '" +
+                            passive_identity + "'");
+                    }
+                    segment.passive_capture_waves_after.push_back(
+                        {.ordinal = 0, .identity = passive_identity});
+                }
+            }
             force_new_segment =
                 stage_capturable &&
                 node->stage->requiresGraphCaptureSegmentBoundaryAfter();
@@ -942,6 +1321,21 @@ namespace llaminar2
             {
                 if (seg.capturable && static_cast<int>(seg.stage_names.size()) > max_stages)
                 {
+                    if (device_owned_timeline_transaction)
+                    {
+                        throw std::runtime_error(
+                            "gpu_graph_max_stages cannot split a device-owned timeline transaction");
+                    }
+                    if (!seg.capture_wave_identity.empty() ||
+                        !seg.passive_capture_waves_after.empty())
+                    {
+                        throw std::runtime_error(
+                            "gpu_graph_max_stages would split explicit capture wave '" +
+                            (seg.capture_wave_identity.empty()
+                                 ? std::string("<implicit>")
+                                 : seg.capture_wave_identity) +
+                            "'; synchronized role-asymmetric LocalTP waves may not be split independently");
+                    }
                     for (size_t i = 0; i < seg.stage_names.size(); i += max_stages)
                     {
                         DeviceGraphExecutor::GraphSegment sub;
@@ -960,6 +1354,103 @@ namespace llaminar2
                 }
             }
             segment_cache.segments = std::move(split_segments);
+        }
+
+        if (plan_policy ==
+            DeviceGraphExecutor::GraphReplayPlanPolicy::
+                RequireRetainedParentComposition)
+        {
+            /*
+             * Child captures share stable arena storage but do not execute
+             * while they are recorded. A read crossing a child boundary is
+             * therefore neither globally authoritative nor graph-internal to
+             * the child. Freeze the exact BufferId proof here, while the whole
+             * retained-parent topology is still visible. The composer later
+             * clones these children in this same order and supplies the actual
+             * device-side producer/consumer edge.
+             *
+             * Writes become eligible only after the complete current segment,
+             * so an ordinary producer within this child remains an internal
+             * dependency rather than masquerading as a parent import.
+             */
+            std::unordered_set<BufferId> prior_child_writes;
+            for (auto &segment : segment_cache.segments)
+            {
+                if (!segment.capturable)
+                {
+                    throw std::runtime_error(
+                        "Retained parent composition forbids manual replay units");
+                }
+
+                std::unordered_set<BufferId> segment_parent_inputs;
+                std::unordered_set<BufferId> segment_writes;
+                for (const std::string &stage_name : segment.stage_names)
+                {
+                    const ComputeNode *const node = graph.getNode(stage_name);
+                    if (!node || !node->stage)
+                    {
+                        throw std::runtime_error(
+                            "Retained parent dependency planning cannot resolve stage '" +
+                            stage_name + "'");
+                    }
+
+                    const StageBufferContract contract =
+                        node->stage->bufferContract();
+                    for (const auto &binding : contract.allArenaReads())
+                    {
+                        if (prior_child_writes.contains(binding.id))
+                            segment_parent_inputs.insert(binding.id);
+                    }
+                    for (const auto &binding : contract.allWrites())
+                        segment_writes.insert(binding.id);
+                }
+
+                segment.retained_parent_input_ids.assign(
+                    segment_parent_inputs.begin(),
+                    segment_parent_inputs.end());
+                std::sort(
+                    segment.retained_parent_input_ids.begin(),
+                    segment.retained_parent_input_ids.end());
+                prior_child_writes.insert(
+                    segment_writes.begin(), segment_writes.end());
+            }
+        }
+
+        /*
+         * Ordinals count domain lifecycle waves, not local replay segments.
+         * Manual sparse work exists only on the continuation root and therefore
+         * must not perturb the number used by the strict LocalTP rendezvous.
+         * A passive follower consumes one ordinal exactly as an active sibling
+         * segment does, keeping every later common capture wave aligned.
+         */
+        size_t next_capture_wave_ordinal = 0;
+        for (auto &segment : segment_cache.segments)
+        {
+            if (segment.capturable)
+                segment.capture_wave_ordinal = next_capture_wave_ordinal++;
+            for (auto &passive_wave : segment.passive_capture_waves_after)
+                passive_wave.ordinal = next_capture_wave_ordinal++;
+        }
+
+        for (size_t segment_index = 0;
+             segment_index < segment_cache.segments.size();
+             ++segment_index)
+        {
+            std::string consumer_stage;
+            if (!manualSegmentRequiresHostTicketFence(
+                    graph,
+                    segment_cache.segments[segment_index],
+                    &consumer_stage))
+            {
+                continue;
+            }
+            if (segment_index == 0 ||
+                !segment_cache.segments[segment_index - 1].capturable)
+            {
+                throw std::runtime_error(
+                    "Manual host ticket consumer '" + consumer_stage +
+                    "' is not immediately preceded by a captured producer segment");
+            }
         }
 
         size_t capturable_segments = 0, manual_segments = 0;
@@ -997,6 +1488,41 @@ namespace llaminar2
             }
         }
 
+        if (device_owned_timeline_transaction &&
+            (capturable_segments != 1u || manual_segments != 0u ||
+             segment_cache.segments.size() != 1u ||
+             !segment_cache.segments.front().passive_capture_waves_after.empty()))
+        {
+            throw std::runtime_error(
+                "Device-owned timeline capture did not lower to exactly one native executable");
+        }
+
+        if (plan_policy ==
+            DeviceGraphExecutor::GraphReplayPlanPolicy::
+                RequireRetainedParentComposition)
+        {
+            if (manual_segments != 0u || capturable_segments == 0u)
+            {
+                throw std::runtime_error(
+                    "Retained parent composition requires one or more native child graphs and forbids manual replay units");
+            }
+            for (const auto &segment : segment_cache.segments)
+            {
+                for (const std::string &stage_name : segment.stage_names)
+                {
+                    const ComputeNode *const node = graph.getNode(stage_name);
+                    if (!node || !node->stage ||
+                        node->stage->graphLaunchPreparationPolicy() ==
+                            GraphLaunchPreparationPolicy::CaptureAndReplay)
+                    {
+                        throw std::runtime_error(
+                            "Retained parent composition requires immutable replay metadata for stage '" +
+                            stage_name + "'");
+                    }
+                }
+            }
+        }
+
         const GraphReplayCaptureMode plan_mode =
             captureModeForPlan(segment_cache.segments.size(), capturable_segments, manual_segments);
 
@@ -1014,7 +1540,7 @@ namespace llaminar2
                       << manual_stages << " stages)");
         }
 
-        if (PerfStatsCollector::isEnabled())
+        if (PerfStatsCollector::isDomainEnabled("forward_graph"))
         {
             PerfStatsCollector::addCounter(
                 "forward_graph",
@@ -1142,13 +1668,36 @@ namespace llaminar2
 
         if (plan_mode == GraphReplayCaptureMode::Segmented)
         {
-            const bool heterogeneous_collective_segmentation_admitted =
+            std::vector<std::string> undeclared_manual_boundaries;
+            for (const auto &segment : segment_cache.segments)
+            {
+                if (segment.capturable)
+                    continue;
+                for (const auto &stage_name : segment.stage_names)
+                {
+                    const auto *node = graph.getNode(stage_name);
+                    if (!node || !node->stage ||
+                        (!node->stage->isCollectiveStage() &&
+                         !node->stage->isManualGraphBoundary()))
+                    {
+                        undeclared_manual_boundaries.push_back(stage_name);
+                    }
+                }
+            }
+
+            const bool heterogeneous_boundary_segmentation_admitted =
                 plan_policy ==
                     DeviceGraphExecutor::GraphReplayPlanPolicy::
-                        AllowHeterogeneousCollectiveSegmentation &&
-                has_collective_nodes;
+                        AllowHeterogeneousBoundarySegmentation &&
+                undeclared_manual_boundaries.empty();
+            const bool retained_parent_composition_admitted =
+                plan_policy ==
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::
+                        RequireRetainedParentComposition &&
+                manual_segments == 0u;
 
-            if (!heterogeneous_collective_segmentation_admitted)
+            if (!heterogeneous_boundary_segmentation_admitted &&
+                !retained_parent_composition_admitted)
             {
                 std::ostringstream detail;
                 detail
@@ -1156,11 +1705,27 @@ namespace llaminar2
                     << capturable_segments << " capturable segment(s) and "
                     << manual_segments << " manual segment(s), but this "
                        "execution domain requires one fully captured graph";
-                if (!has_collective_nodes)
+                if (plan_policy ==
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph)
                 {
                     detail
-                        << "; segmented execution is never admitted for a "
-                           "graph without collectives";
+                        << "; the execution topology did not admit a "
+                           "heterogeneous manual boundary";
+                }
+                else if (plan_policy ==
+                         DeviceGraphExecutor::GraphReplayPlanPolicy::
+                             RequireRetainedParentComposition)
+                {
+                    detail
+                        << "; retained parent composition admits native child "
+                           "graphs only and cannot contain a manual unit";
+                }
+                if (!undeclared_manual_boundaries.empty())
+                {
+                    detail << "; uncapturable stages without an explicit "
+                              "collective/manual-boundary contract:";
+                    for (const auto &stage_name : undeclared_manual_boundaries)
+                        detail << ' ' << stage_name;
                 }
                 detail << ". Manual stage types:";
                 if (manual_stage_types.empty())
@@ -1423,23 +1988,13 @@ namespace llaminar2
                                                << " COLLECTIVE done: " << stage_name);
                 }
             }
-            else if (has_collective_nodes)
-            {
-                // Non-collective stages in a collective graph's manual segment
-                // (e.g., embedding, attention, KV cache, RoPE). These run on
-                // the capture stream for GPU-side ordering. No host sync needed
-                // between non-collective stages — the GPU stream provides ordering.
-                node->stage->setGPUStream(capture_stream);
-                if (!execute_node_cb(*node))
-                {
-                    LOG_ERROR("[DeviceGraphCaptureController] Manual stage failed on replay (collective graph): " << stage_name);
-                    return false;
-                }
-            }
             else
             {
                 node->stage->setGPUStream(capture_stream);
-                if (!node->stage->execute(ctx))
+                const bool stage_ok = execute_node_cb
+                                          ? execute_node_cb(*node)
+                                          : node->stage->execute(ctx);
+                if (!stage_ok)
                 {
                     LOG_ERROR("[DeviceGraphCaptureController] Manual stage failed on replay: " << stage_name);
                     return false;
@@ -1531,7 +2086,9 @@ namespace llaminar2
             return false;
         }
 
-        const bool profiling = KernelProfiler::isEnabled();
+        const bool profiling =
+            KernelProfiler::isEnabled() ||
+            PerfStatsCollector::isDomainEnabled("forward_pass");
         const GraphReplayCaptureMode replay_mode = full_graph_replay
                                                        ? GraphReplayCaptureMode::FullGraph
                                                        : GraphReplayCaptureMode::Segmented;
@@ -1557,7 +2114,7 @@ namespace llaminar2
             ForwardPassProfiler::addReplayLaunchNs(
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(launch_t1 - launch_t0).count()));
         }
-        if (PerfStatsCollector::isEnabled())
+        if (PerfStatsCollector::isDomainEnabled("forward_graph"))
         {
             auto launch_t1 = std::chrono::high_resolution_clock::now();
             PerfStatsCollector::recordTimingNs(
@@ -1578,7 +2135,7 @@ namespace llaminar2
             ForwardPassProfiler::addReplayPostLaunchNs(
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(post_t1 - post_t0).count()));
         }
-        if (PerfStatsCollector::isEnabled())
+        if (PerfStatsCollector::isDomainEnabled("forward_graph"))
         {
             auto post_t1 = std::chrono::high_resolution_clock::now();
             PerfStatsCollector::recordTimingNs(
@@ -1697,8 +2254,9 @@ namespace llaminar2
                     graphCaptureBoundaryName(
                         "recapture_begin",
                         current_step,
-                        segment_index,
-                        segment,
+                        segment.capture_wave_ordinal,
+                        segment.capture_wave_identity,
+                        &segment,
                         perf_context);
                 if (!capture_boundary_cb(boundary_name, capture_stream))
                 {
@@ -1756,8 +2314,9 @@ namespace llaminar2
                 graphCaptureBoundaryName(
                     exec_ok ? "recapture_end" : "recapture_end_failed",
                     current_step,
-                    segment_index,
-                    segment,
+                    segment.capture_wave_ordinal,
+                    segment.capture_wave_identity,
+                    &segment,
                     perf_context);
             if (!capture_boundary_cb(boundary_name, capture_stream))
             {
@@ -2097,7 +2656,8 @@ namespace llaminar2
         const std::string &perf_context,
         uint64_t current_step,
         const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
-        const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
+        const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb,
+        CapturedUnitFinalization finalization)
     {
         if (!ctx || !gpu_ctx)
         {
@@ -2132,7 +2692,18 @@ namespace llaminar2
             return false;
         }
 
-        if (!segment.capture->instantiate())
+        const bool graph_only_child =
+            finalization == CapturedUnitFinalization::RetainGraphOnly;
+        const bool instantiate_without_launch =
+            finalization ==
+            CapturedUnitFinalization::InstantiateWithoutLaunch;
+        if (graph_only_child && segment.capture->hasExecutable())
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Retained parent child unexpectedly owns an executable before composition");
+            return false;
+        }
+        if (!graph_only_child && !segment.capture->instantiate())
         {
             LOG_ERROR("[DeviceGraphCaptureController] Segment instantiation failed ("
                       << segment.capture->nodeCount() << " nodes)");
@@ -2145,12 +2716,19 @@ namespace llaminar2
                 : GraphReplayCaptureMode::Segmented;
         auto executable_tags = replaySegmentTags(segment, perf_context);
         executable_tags["backend"] = segment.capture->backendName();
-        executable_tags["type"] = "captured_executable";
+        executable_tags["type"] =
+            graph_only_child
+                ? "captured_child_template"
+                : instantiate_without_launch
+                      ? "materialized_unlaunched_executable"
+                      : "captured_executable";
         PerfStatsCollector::addCounter(
             "forward_graph",
-            full_graph_capture
-                ? "full_graph_capture_executable_nodes"
-                : "segmented_graph_capture_executable_nodes",
+            graph_only_child
+                ? "retained_parent_child_graph_nodes"
+                : (full_graph_capture
+                       ? "full_graph_capture_executable_nodes"
+                       : "segmented_graph_capture_executable_nodes"),
             static_cast<double>(segment.capture->nodeCount()),
             "decode",
             ctx->deviceId().toString(),
@@ -2193,9 +2771,36 @@ namespace llaminar2
                 ctx->deviceId().toString(),
                 graphReplayMetadataTags(
                     {{"stage_type", stage_type},
-                     {"type", "captured_executable"}},
+                     {"type", graph_only_child
+                                  ? "captured_child_template"
+                                  : "captured_executable"}},
                     perf_context,
                 capture_mode));
+        }
+
+        if (graph_only_child)
+        {
+            LOG_DEBUG(
+                "[DeviceGraphCaptureController] Retained graph-only child captured: "
+                << segment.capture->nodeCount() << " nodes, "
+                << segment.stage_names.size() << " stages");
+            return true;
+        }
+
+        if (instantiate_without_launch)
+        {
+            /*
+             * Native capture and instantiation are complete, but setup has not
+             * acquired an inference epoch and therefore cannot publish writes or
+             * submit arithmetic. Freeze only the host-side publication manifest;
+             * the first authenticated launch will apply it exactly once.
+             */
+            cacheCapturedSegmentArenaWrites(graph, segment);
+            LOG_DEBUG(
+                "[DeviceGraphCaptureController] Segment materialized without launch: "
+                << segment.capture->nodeCount() << " nodes, "
+                << segment.stage_names.size() << " stages");
+            return true;
         }
 
         /*
@@ -2222,6 +2827,151 @@ namespace llaminar2
         post_launch_cb(segment, capture_stream);
         LOG_DEBUG("[DeviceGraphCaptureController] Segment captured+launched: "
                   << segment.capture->nodeCount() << " nodes, " << segment.stage_names.size() << " stages");
+        return true;
+    }
+
+    bool DeviceGraphCaptureController::finalizeRetainedParentTransaction(
+        ComputeGraph &graph,
+        DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+        IDeviceContext *ctx,
+        IWorkerGPUContext *gpu_ctx,
+        uint64_t current_step,
+        const ReplayHooks &hooks,
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy initial_submission)
+    {
+        if (!ctx || !gpu_ctx || !segment_cache.capture_stream ||
+            !hooks.retained_parent_composer ||
+            segment_cache.retained_parent_capture)
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Retained parent finalization has incomplete context, composer, stream, or ownership");
+            return false;
+        }
+
+        std::string child_error;
+        auto child_units =
+            segment_cache.retainedCaptureUnitTemplatesForParentComposition(
+                graph, &child_error);
+        if (!child_units)
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Retained parent child export failed: "
+                << child_error);
+            return false;
+        }
+
+        std::unique_ptr<IGPUGraphCapture> parent =
+            gpu_ctx->createGraphCapture(segment_cache.capture_stream);
+        if (!parent ||
+            parent->executionStream() != segment_cache.capture_stream ||
+            parent->nodeCount() != 0u || parent->hasExecutable())
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Retained parent factory did not return one empty graph owner on the exact cache stream");
+            return false;
+        }
+
+        bool composition_ok = false;
+        try
+        {
+            composition_ok = hooks.retained_parent_composer(
+                *parent, graph, *child_units);
+        }
+        catch (const std::exception &ex)
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Retained parent composition rejected its typed topology: "
+                << ex.what());
+            return false;
+        }
+        if (!composition_ok || parent->nodeCount() == 0u ||
+            parent->hasExecutable() ||
+            parent->executionStream() != segment_cache.capture_stream)
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Retained parent composer did not produce one non-empty, uninstantiated graph on the exact stream");
+            return false;
+        }
+        if (!parent->instantiate())
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Retained parent instantiation failed");
+            return false;
+        }
+
+        const bool materialize_without_launch =
+            initial_submission ==
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+                MaterializeWithoutLaunch;
+        if (materialize_without_launch)
+        {
+            /*
+             * The child contracts already describe every write performed by the
+             * composed parent. Cache those manifests now without advancing arena
+             * authority: no device node has run yet. Ownership moves into the
+             * cache only after the executable is fully instantiated.
+             */
+            for (auto &segment : segment_cache.segments)
+                cacheCapturedSegmentArenaWrites(graph, segment);
+            segment_cache.retained_parent_capture = std::move(parent);
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "retained_parent_materialized_without_launch",
+                1.0,
+                "setup",
+                ctx->deviceId().toString(),
+                {{"context", segment_cache.perf_context},
+                 {"child_units", std::to_string(child_units->size())},
+                 {"parent_nodes",
+                  std::to_string(
+                      segment_cache.retained_parent_capture->nodeCount())}});
+            LOG_DEBUG(
+                "[DeviceGraphCaptureController] Retained parent composed and "
+                "instantiated without launch: "
+                << segment_cache.retained_parent_capture->nodeCount()
+                << " nodes from " << child_units->size()
+                << " graph-only children");
+            return true;
+        }
+        if (!applyGraphLaunchDependency(
+                hooks.launch_dependency,
+                DeviceGraphExecutor::GraphExecutableLaunchPhase::
+                    InitialTransaction,
+                segment_cache.capture_stream))
+        {
+            return false;
+        }
+        if (!parent->launch())
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Retained parent transaction-zero launch failed");
+            return false;
+        }
+
+        /*
+         * Child graphs were never submitted. Their buffer contracts still form
+         * the complete parent publication manifest, so cache each segment's
+         * writes only after the one parent launch has been accepted by the
+         * backend. This is host-side authority bookkeeping, not child replay.
+         */
+        for (auto &segment : segment_cache.segments)
+            hooks.post_launch(segment, segment_cache.capture_stream);
+
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "retained_parent_transaction_zero_launches",
+            1.0,
+            "decode",
+            ctx->deviceId().toString(),
+            {{"context", segment_cache.perf_context},
+             {"child_units", std::to_string(child_units->size())},
+             {"parent_nodes", std::to_string(parent->nodeCount())}});
+        segment_cache.retained_parent_capture = std::move(parent);
+        LOG_DEBUG(
+            "[DeviceGraphCaptureController] Retained parent composed+launched: "
+            << segment_cache.retained_parent_capture->nodeCount()
+            << " nodes from " << child_units->size() << " graph-only children"
+            << " step=" << current_step);
         return true;
     }
 
@@ -2283,14 +3033,19 @@ namespace llaminar2
 
             node->stage->setGPUStream(stage_stream);
 
-            const bool needs_execute_node = has_collective_nodes || is_collective;
-            if (needs_execute_node)
+            if (execute_node_cb)
             {
                 if (!execute_node_cb(*node))
                 {
                     LOG_ERROR("[DeviceGraphCaptureController] Capture manual stage failed: " << stage_name);
                     return false;
                 }
+            }
+            else if (is_collective)
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Capture manual collective stage has no canonical executor hook: "
+                          << stage_name);
+                return false;
             }
             else if (!node->stage->execute(ctx))
             {
@@ -2372,6 +3127,7 @@ namespace llaminar2
         bool needs_segment_sync,
         bool verify_mode,
         bool recapture_mode,
+        bool require_input_preflight,
         bool full_graph_replay,
         int segment_index,
         uint64_t current_step,
@@ -2401,12 +3157,15 @@ namespace llaminar2
         // dynamic_cast + virtual getDumpInfo) is pure CPU overhead.
         //
         // Coherence IS needed for verify/recapture modes since they may re-execute
-        // stages in a different order or on different streams. Recapture owns
+        // stages in a different order or on different streams. It is also
+        // mandatory for transaction zero of a setup-materialized executable:
+        // setup bound addresses without publishing request bytes. Recapture owns
         // the preflight internally so it runs after launch-metadata preparation.
-        const bool prepare_verify_inputs = verify_mode && !recapture_mode;
+        const bool prepare_replay_inputs =
+            (verify_mode || require_input_preflight) && !recapture_mode;
         const std::string device_name = ctx->deviceId().toString();
 
-        if (prepare_verify_inputs &&
+        if (prepare_replay_inputs &&
             (!cohere_inputs_cb || !cohere_inputs_cb(segment)))
         {
             return result;
@@ -2441,7 +3200,17 @@ namespace llaminar2
                 record_snapshot_copies_cb,
                 launch_dependency_cb,
                 post_launch_cb);
-            result.success = recapture_ok;
+            result.success =
+                recapture_ok &&
+                joinPassiveCaptureWaves(
+                    graph,
+                    segment,
+                    "recapture",
+                    current_step,
+                    perf_context,
+                    capture_boundary_cb,
+                    capture_stream,
+                    ctx->deviceId());
             return result;
         }
 
@@ -2486,6 +3255,7 @@ namespace llaminar2
         bool needs_segment_sync,
         bool verify_mode,
         bool recapture_mode,
+        bool require_input_preflight,
         bool full_graph_replay,
         uint64_t current_step,
         int segment_index,
@@ -2512,6 +3282,7 @@ namespace llaminar2
                 needs_segment_sync,
                 verify_mode,
                 recapture_mode,
+                require_input_preflight,
                 full_graph_replay,
                 segment_index,
                 current_step,
@@ -2550,7 +3321,8 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         bool has_collective_nodes,
         uint64_t current_step,
-        const ReplayHooks &hooks)
+        const ReplayHooks &hooks,
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy initial_submission)
     {
         CapturePhaseResult result{};
 
@@ -2571,6 +3343,37 @@ namespace llaminar2
 
         const bool full_graph_capture =
             captureModeForCache(segment_cache) == GraphReplayCaptureMode::FullGraph;
+        const bool retained_parent_composition =
+            segment_cache.graph_replay_plan_policy ==
+            DeviceGraphExecutor::GraphReplayPlanPolicy::
+                RequireRetainedParentComposition;
+        const bool materialize_without_launch =
+            initial_submission ==
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+                MaterializeWithoutLaunch;
+
+        if (retained_parent_composition !=
+            static_cast<bool>(hooks.retained_parent_composer))
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Retained parent policy and topology composer must be selected together");
+            result.reset_cache = true;
+            return result;
+        }
+        if (retained_parent_composition &&
+            std::any_of(
+                segment_cache.segments.begin(),
+                segment_cache.segments.end(),
+                [](const DeviceGraphExecutor::GraphSegment &segment)
+                {
+                    return !segment.capturable;
+                }))
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Retained parent capture plan contains a manual replay unit");
+            result.reset_cache = true;
+            return result;
+        }
 
         /*
          * A cross-lifetime dependency has exactly one legal placement: directly
@@ -2580,15 +3383,53 @@ namespace llaminar2
          * the controller boundary instead of relying on caller discipline.
          */
         if (hooks.launch_dependency &&
-            (!full_graph_capture ||
+            (!retained_parent_composition &&
+             (!full_graph_capture ||
              segment_cache.segments.size() != 1u ||
-             !segment_cache.segments.front().capturable))
+             !segment_cache.segments.front().capturable)))
         {
             LOG_ERROR(
                 "[DeviceGraphCaptureController] A captured executable launch "
                 "dependency requires exactly one complete capturable graph");
             result.reset_cache = true;
             return result;
+        }
+
+        /*
+         * Establish all arena addresses before any stage builds persistent
+         * launch descriptors. This pass is deliberately allocation-only: a
+         * later segment may consume bytes produced by an intervening manual
+         * heterogeneous boundary, so importing input data or producer events
+         * here would violate topological execution order.
+         */
+        const bool has_capturable_segment = std::any_of(
+            segment_cache.segments.begin(),
+            segment_cache.segments.end(),
+            [](const DeviceGraphExecutor::GraphSegment &segment)
+            {
+                return segment.capturable;
+            });
+        if (has_capturable_segment && !hooks.prebind_storage)
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] Native graph capture requires "
+                "an allocation-only arena prebind hook");
+            result.reset_cache = true;
+            return result;
+        }
+        for (const auto &seg : segment_cache.segments)
+        {
+            if (seg.capturable && !hooks.prebind_storage(seg))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphCaptureController] Arena storage prebind failed "
+                    "for segment starting at "
+                    << (seg.stage_names.empty()
+                            ? std::string("<empty>")
+                            : seg.stage_names.front()));
+                result.reset_cache = true;
+                return result;
+            }
         }
 
         /*
@@ -2739,8 +3580,9 @@ namespace llaminar2
                         graphCaptureBoundaryName(
                             "capture_begin",
                             current_step,
-                            static_cast<int>(segment_index),
-                            seg,
+                            seg.capture_wave_ordinal,
+                            seg.capture_wave_identity,
+                            &seg,
                             segment_cache.perf_context);
                     if (!hooks.capture_boundary(boundary_name, capture_stream))
                     {
@@ -2839,8 +3681,9 @@ namespace llaminar2
                         graphCaptureBoundaryName(
                             exec_ok ? "capture_end" : "capture_end_failed",
                             current_step,
-                            static_cast<int>(segment_index),
-                            seg,
+                            seg.capture_wave_ordinal,
+                            seg.capture_wave_identity,
+                            &seg,
                             segment_cache.perf_context);
                     if (!hooks.capture_boundary(boundary_name, capture_stream))
                     {
@@ -2868,6 +3711,14 @@ namespace llaminar2
                     return result;
                 }
 
+                const CapturedUnitFinalization finalization =
+                    retained_parent_composition
+                        ? CapturedUnitFinalization::RetainGraphOnly
+                        : (materialize_without_launch
+                               ? CapturedUnitFinalization::
+                                     InstantiateWithoutLaunch
+                               : CapturedUnitFinalization::
+                                     InstantiateAndLaunch);
                 const bool capture_finalize_ok = finalizeCapturePhaseCapturableSegment(
                     graph,
                     seg,
@@ -2877,9 +3728,31 @@ namespace llaminar2
                     full_graph_capture,
                     segment_cache.perf_context,
                     current_step,
-                    hooks.launch_dependency,
-                    hooks.post_launch);
+                    retained_parent_composition
+                        ? DeviceGraphExecutor::GraphLaunchDependencyHook{}
+                        : hooks.launch_dependency,
+                    hooks.post_launch,
+                    finalization);
                 if (!capture_finalize_ok)
+                {
+                    result.reset_cache = true;
+                    return result;
+                }
+                /*
+                 * Ordinary segmented execution launches its unit before joining
+                 * following passive waves. Parent composition deliberately does
+                 * not: every sibling first finishes the same graph-only capture
+                 * wave, and only the fully composed endpoint graph may launch.
+                 */
+                if (!joinPassiveCaptureWaves(
+                        graph,
+                        seg,
+                        "capture",
+                        current_step,
+                        segment_cache.perf_context,
+                        hooks.capture_boundary,
+                        capture_stream,
+                        ctx->deviceId()))
                 {
                     result.reset_cache = true;
                     return result;
@@ -2890,24 +3763,65 @@ namespace llaminar2
                 /*
                  * Manual segments are declarative members of the segmented
                  * plan, not a recovery path. They execute exactly once in the
-                 * same position during capture and replay.
+                 * same position during capture and replay. Setup-only native
+                 * materialization is the one intentional exception: it records
+                 * every neighbouring executable but cannot submit manual model
+                 * arithmetic before request admission. The first ordinary replay
+                 * executes this unit in its declared position.
                  */
-                const bool manual_capture_ok = executeCapturePhaseManualSegment(
-                    graph,
-                    seg,
-                    ctx,
-                    gpu_ctx,
-                    capture_stream,
-                    has_collective_nodes,
-                    current_step,
-                    hooks.execute_node,
-                    hooks.record_snapshot_copies);
-                if (!manual_capture_ok)
+                if (!materialize_without_launch)
+                {
+                    awaitManualHostTicketBoundary(
+                        graph,
+                        segment_cache,
+                        segment_index,
+                        "capture",
+                        ctx->deviceId());
+                    const bool manual_capture_ok =
+                        executeCapturePhaseManualSegment(
+                            graph,
+                            seg,
+                            ctx,
+                            gpu_ctx,
+                            capture_stream,
+                            has_collective_nodes,
+                            current_step,
+                            hooks.execute_node,
+                            hooks.record_snapshot_copies);
+                    if (!manual_capture_ok)
+                    {
+                        result.reset_cache = true;
+                        return result;
+                    }
+                }
+                if (!joinPassiveCaptureWaves(
+                        graph,
+                        seg,
+                        "capture",
+                        current_step,
+                        segment_cache.perf_context,
+                        hooks.capture_boundary,
+                        capture_stream,
+                        ctx->deviceId()))
                 {
                     result.reset_cache = true;
                     return result;
                 }
             }
+        }
+
+        if (retained_parent_composition &&
+            !finalizeRetainedParentTransaction(
+                graph,
+                segment_cache,
+                ctx,
+                gpu_ctx,
+                current_step,
+                hooks,
+                initial_submission))
+        {
+            result.reset_cache = true;
+            return result;
         }
 
         result.success = true;
@@ -2935,7 +3849,9 @@ namespace llaminar2
         }
 
         // Reset thread-local replay profiling state for this iteration
-        const bool profiling = KernelProfiler::isEnabled();
+        const bool profiling =
+            KernelProfiler::isEnabled() ||
+            PerfStatsCollector::isDomainEnabled("forward_pass");
         if (profiling)
         {
             ForwardPassProfiler::resetReplayTimings();
@@ -2998,19 +3914,35 @@ namespace llaminar2
                             return segment.capturable;
                         });
         const bool trace_replay = exec_cfg.gpu_graph_trace_replay;
+        const bool forward_graph_stats_enabled =
+            PerfStatsCollector::isDomainEnabled("forward_graph");
         const auto &device_id = ctx->deviceId();
-        const std::string device_name = device_id.toString();
+        const std::string device_name =
+            forward_graph_stats_enabled || trace_replay
+                ? device_id.toString()
+                : std::string{};
         const int total_segments = static_cast<int>(segment_cache.segments.size());
-        auto replay_total_tags = replayCacheTags(segment_cache, replay_mode);
-        replay_total_tags.emplace(
-            "sync_scope",
-            can_defer_final_sync ? "launch_only_deferred" : "stream_synchronized");
-        PerfStatsCollector::ScopedTimer replay_timer(
-            "forward_graph",
-            replayMetricName(replay_mode, "total"),
-            "decode",
-            device_name,
-            graphReplayHostTimingTags(std::move(replay_total_tags), "total_replay_host_wall", replay_mode));
+        std::optional<PerfStatsCollector::ScopedTimer> replay_timer;
+        if (forward_graph_stats_enabled)
+        {
+            auto replay_total_tags = replayCacheTags(
+                segment_cache,
+                replay_mode);
+            replay_total_tags.emplace(
+                "sync_scope",
+                can_defer_final_sync
+                    ? "launch_only_deferred"
+                    : "stream_synchronized");
+            replay_timer.emplace(
+                "forward_graph",
+                replayMetricName(replay_mode, "total"),
+                "decode",
+                device_name,
+                graphReplayHostTimingTags(
+                    std::move(replay_total_tags),
+                    "total_replay_host_wall",
+                    replay_mode));
+        }
 
         size_t total_replay_timing_slot = kInvalidReplayGpuTimingSlot;
         if (!beginReplayGpuTiming(
@@ -3027,10 +3959,14 @@ namespace llaminar2
         int seg_idx = 0;
         for (auto &seg : segment_cache.segments)
         {
-            const auto seg_tags = replaySegmentTags(
-                seg,
-                segment_cache.perf_context,
-                &segment_cache.replay_workload);
+            PerfStatsCollector::Tags seg_tags;
+            if (forward_graph_stats_enabled)
+            {
+                seg_tags = replaySegmentTags(
+                    seg,
+                    segment_cache.perf_context,
+                    &segment_cache.replay_workload);
+            }
             if (trace_replay)
             {
                 const char *seg_display_type = seg.capturable ? "GRAPH" : "MANUAL";
@@ -3043,13 +3979,16 @@ namespace llaminar2
                                            << " first=" << first_name);
             }
 
-            PerfStatsCollector::addCounter(
-                "forward_graph",
-                replayUnitCounterName(replay_mode),
-                1.0,
-                "decode",
-                device_name,
-                seg_tags);
+            if (forward_graph_stats_enabled)
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    replayUnitCounterName(replay_mode),
+                    1.0,
+                    "decode",
+                    device_name,
+                    seg_tags);
+            }
 
             size_t replay_unit_timing_slot = kInvalidReplayGpuTimingSlot;
             if (!full_graph_replay &&
@@ -3069,6 +4008,29 @@ namespace llaminar2
             }
 
             const auto segment_t0 = std::chrono::high_resolution_clock::now();
+            uint64_t manual_ticket_wait_ns = 0;
+            if (!seg.capturable)
+            {
+                const auto ticket_wait_t0 =
+                    std::chrono::high_resolution_clock::now();
+                awaitManualHostTicketBoundary(
+                    graph,
+                    segment_cache,
+                    static_cast<size_t>(seg_idx),
+                    "replay",
+                    ctx->deviceId());
+                if (profiling)
+                {
+                    const auto ticket_wait_t1 =
+                        std::chrono::high_resolution_clock::now();
+                    manual_ticket_wait_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            ticket_wait_t1 - ticket_wait_t0)
+                            .count());
+                    ForwardPassProfiler::addReplayManualHostTicketWaitNs(
+                        manual_ticket_wait_ns);
+                }
+            }
             // Segment execution picks capturable or manual behavior based on
             // segment metadata prepared during capture setup.
             const auto replay_result = executeReplaySegment(
@@ -3081,6 +4043,7 @@ namespace llaminar2
                 needs_segment_sync,
                 verify_mode,
                 recapture_mode,
+                hooks.require_replay_input_preflight,
                 full_graph_replay,
                 current_step,
                 seg_idx,
@@ -3092,7 +4055,58 @@ namespace llaminar2
                 hooks.record_snapshot_copies,
                 hooks.launch_dependency,
                 hooks.post_launch);
-            if (PerfStatsCollector::isEnabled())
+            if (profiling && !seg.capturable)
+            {
+                const auto manual_segment_t1 =
+                    std::chrono::high_resolution_clock::now();
+                const uint64_t manual_segment_total_ns =
+                    static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            manual_segment_t1 - segment_t0)
+                            .count());
+                const uint64_t manual_execution_ns =
+                    manual_segment_total_ns >= manual_ticket_wait_ns
+                        ? manual_segment_total_ns - manual_ticket_wait_ns
+                        : 0;
+
+                bool has_dispatch_descriptor = false;
+                bool has_sparse_rank_protocol = false;
+                for (const auto &stage_name : seg.stage_names)
+                {
+                    const auto *node = graph.getNode(stage_name);
+                    if (!node || !node->stage)
+                        continue;
+                    switch (node->stage->type())
+                    {
+                    case ComputeStageType::MOE_EXPERT_DISPATCH:
+                        has_dispatch_descriptor = true;
+                        break;
+                    case ComputeStageType::MOE_RANK_BATCH_DISPATCH:
+                    case ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE:
+                        has_sparse_rank_protocol = true;
+                        break;
+                    default:
+                        break;
+                    }
+                }
+
+                if (has_sparse_rank_protocol)
+                {
+                    ForwardPassProfiler::addReplayManualSparseProtocolNs(
+                        manual_execution_ns);
+                }
+                else if (has_dispatch_descriptor)
+                {
+                    ForwardPassProfiler::addReplayManualDispatchNs(
+                        manual_execution_ns);
+                }
+                else
+                {
+                    ForwardPassProfiler::addReplayManualOtherNs(
+                        manual_execution_ns);
+                }
+            }
+            if (forward_graph_stats_enabled)
             {
                 const auto segment_t1 = std::chrono::high_resolution_clock::now();
                 const auto segment_ns =
@@ -3111,6 +4125,28 @@ namespace llaminar2
             }
 
             if (!replay_result.success)
+            {
+                (void)finishReplayGpuTiming(
+                    segment_cache,
+                    gpu_ctx,
+                    replay_unit_timing_slot);
+                (void)finishReplayGpuTiming(
+                    segment_cache,
+                    gpu_ctx,
+                    total_replay_timing_slot);
+                return result;
+            }
+
+            if (recapture_mode && !seg.capturable &&
+                !joinPassiveCaptureWaves(
+                    graph,
+                    seg,
+                    "recapture",
+                    current_step,
+                    segment_cache.perf_context,
+                    hooks.capture_boundary,
+                    capture_stream,
+                    ctx->deviceId()))
             {
                 (void)finishReplayGpuTiming(
                     segment_cache,
@@ -3166,7 +4202,7 @@ namespace llaminar2
         // the complete replay DAG, including work submitted on collective streams.
         if (can_defer_final_sync)
         {
-            if (PerfStatsCollector::isEnabled())
+            if (forward_graph_stats_enabled)
             {
                 PerfStatsCollector::addCounter(
                     "forward_graph",
@@ -3195,7 +4231,7 @@ namespace llaminar2
                 ForwardPassProfiler::addReplayStreamSyncNs(
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_t1 - sync_t0).count()));
             }
-            if (PerfStatsCollector::isEnabled())
+            if (forward_graph_stats_enabled)
             {
                 auto capture_tags = replayCacheTags(segment_cache, replay_mode);
                 capture_tags.emplace("stream", "capture_event");
@@ -3271,6 +4307,60 @@ namespace llaminar2
         return true;
     }
 
+    void DeviceGraphCaptureController::cacheCapturedSegmentArenaWrites(
+        ComputeGraph &graph,
+        DeviceGraphExecutor::GraphSegment &segment)
+    {
+        if (segment.arena_writes_cached)
+            return;
+
+        segment.cached_arena_writes.clear();
+
+        auto add_write = [&](BufferId id, DeviceId device)
+        {
+            for (const auto &existing : segment.cached_arena_writes)
+            {
+                if (existing.id == id && existing.device == device)
+                {
+                    return;
+                }
+            }
+            segment.cached_arena_writes.push_back({id, device});
+        };
+
+        for (const auto &stage_name : segment.stage_names)
+        {
+            auto *node = graph.getNode(stage_name);
+            if (!node || !node->stage)
+            {
+                continue;
+            }
+
+            const StageBufferContract contract = node->stage->bufferContract();
+            if (contract.empty())
+            {
+                continue;
+            }
+
+            const DeviceId target_device =
+                node->device.is_valid() ? node->device : node->stage->device();
+            for (const auto &binding : contract.outputs)
+            {
+                add_write(binding.id, target_device);
+            }
+            for (const auto &binding : contract.inouts)
+            {
+                add_write(binding.id, target_device);
+            }
+        }
+
+        segment.arena_writes_cached = true;
+        LOG_DEBUG("[DeviceGraphCaptureController] Cached "
+                  << segment.cached_arena_writes.size()
+                  << " unique arena writes for " << segment.stage_names.size()
+                  << " replay stages");
+    }
+
     void DeviceGraphCaptureController::postCapturedSegmentLaunch(
         ComputeGraph &graph,
         DeviceGraphExecutor::GraphSegment &segment,
@@ -3278,53 +4368,7 @@ namespace llaminar2
         void * /*stream*/,
         const std::function<void(BufferId, DeviceId)> &mark_arena_write_dirty_cb)
     {
-        if (!segment.arena_writes_cached)
-        {
-            segment.cached_arena_writes.clear();
-
-            auto add_write = [&](BufferId id, DeviceId device)
-            {
-                for (const auto &existing : segment.cached_arena_writes)
-                {
-                    if (existing.id == id && existing.device == device)
-                    {
-                        return;
-                    }
-                }
-                segment.cached_arena_writes.push_back({id, device});
-            };
-
-            for (const auto &stage_name : segment.stage_names)
-            {
-                auto *node = graph.getNode(stage_name);
-                if (!node || !node->stage)
-                {
-                    continue;
-                }
-
-                const StageBufferContract contract = node->stage->bufferContract();
-                if (contract.empty())
-                {
-                    continue;
-                }
-
-                const DeviceId target_device = node->device.is_valid() ? node->device : node->stage->device();
-                for (const auto &binding : contract.outputs)
-                {
-                    add_write(binding.id, target_device);
-                }
-                for (const auto &binding : contract.inouts)
-                {
-                    add_write(binding.id, target_device);
-                }
-            }
-
-            segment.arena_writes_cached = true;
-            LOG_DEBUG("[DeviceGraphCaptureController] Cached "
-                      << segment.cached_arena_writes.size()
-                      << " unique arena writes for " << segment.stage_names.size()
-                      << " replay stages");
-        }
+        cacheCapturedSegmentArenaWrites(graph, segment);
 
         // Use arena ids instead of retaining raw TensorBase* pointers. Prefix
         // restore, rollback, and request clears may preserve graph topology

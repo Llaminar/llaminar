@@ -453,10 +453,9 @@ namespace
         bool workerGPUContextUsesProcessPool(DeviceId) const override { return false; }
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override { return {}; }
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int) override { return true; }
-        bool publishLogitsAtBoundary(
-            TensorBase *,
-            IDeviceContext *,
-            void *) override
+        bool publishForwardResultAtBoundary(
+            const ForwardOutput &,
+            IDeviceContext *) override
         {
             return true;
         }

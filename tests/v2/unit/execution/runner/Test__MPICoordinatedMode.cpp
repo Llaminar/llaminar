@@ -143,6 +143,12 @@ namespace
             if (r)
                 *r = MPI_REQUEST_NULL;
         }
+        bool test(MPI_Request *r, MPI_Status *) const override
+        {
+            if (r)
+                *r = MPI_REQUEST_NULL;
+            return r != nullptr;
+        }
         void waitAll(std::vector<MPI_Request> &reqs) const override
         {
             for (auto &r : reqs)
@@ -452,7 +458,7 @@ namespace
         EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(3));
     }
 
-    TEST_F(Test__MPICoordinatedMode, DecodeStepSkipsDeviceSamplerWhenCoordinatedSamplingDisabled)
+    TEST_F(Test__MPICoordinatedMode, RootDecodeSamplesWhenWorkerSamplingCollectiveIsDisabled)
     {
         auto [runner, mock, mpi] = createRunner(0, 2);
         runner->setMPICoordinatedMode(true);
@@ -465,13 +471,15 @@ namespace
         GenerationResult result = runner->decodeStep();
 
         ASSERT_TRUE(result.success()) << result.error;
-        EXPECT_THAT(result.tokens, ElementsAre(3));
-        EXPECT_EQ(mock->sampleGreedyOnDeviceCount(), 0);
+        // The flag describes worker participation in a sharded sampler; rank
+        // zero remains the authoritative sampler for every coordinated decode.
+        EXPECT_THAT(result.tokens, ElementsAre(7));
+        EXPECT_EQ(mock->sampleGreedyOnDeviceCount(), 1);
         ASSERT_EQ(mpi->broadcastCount(), 3u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
         EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
-        EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(3));
+        EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(7));
     }
 
     TEST_F(Test__MPICoordinatedMode, DecodeStepUsesDeviceSamplerWhenCoordinatedSamplingEnabled)
@@ -687,6 +695,22 @@ namespace
         runner->shutdownMPIWorkers();
 
         EXPECT_EQ(mpi->broadcastCount(), 0u);
+    }
+
+    TEST_F(Test__MPICoordinatedMode, ShutdownMPIWorkersIsIdempotent)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        // A fixture may close workers explicitly before its runner is
+        // destroyed.  The lifecycle-owned shutdown must not send a second
+        // command after those workers have already left their receive loop.
+        runner->shutdownMPIWorkers();
+        runner->shutdownMPIWorkers();
+
+        ASSERT_EQ(mpi->broadcastCount(), 1u);
+        EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
+                  static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN));
     }
 
     // =========================================================================
@@ -955,6 +979,12 @@ namespace
             if (r)
                 *r = MPI_REQUEST_NULL;
         }
+        bool test(MPI_Request *r, MPI_Status *) const override
+        {
+            if (r)
+                *r = MPI_REQUEST_NULL;
+            return r != nullptr;
+        }
         void waitAll(std::vector<MPI_Request> &reqs) const override
         {
             for (auto &r : reqs)
@@ -1198,7 +1228,7 @@ namespace
         EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize()); // All script entries consumed
     }
 
-    TEST_F(Test__MPICoordinatedMode, WorkerLoopHandlesUnknownCommand)
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopAbortsOnUnknownCommand)
     {
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32({999}); // Unknown command
@@ -1206,13 +1236,15 @@ namespace
 
         auto [runner, mock, mpi] = createWorkerRunner(scripted);
 
-        // Should not crash — unknown command is logged and skipped
-        EXPECT_NO_THROW(runner->runMPIWorkerLoop());
-        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
+        // A command tag disagreement means rank schedules can no longer be
+        // proven equivalent. The test communicator throws instead of aborting
+        // a process, and the following SHUTDOWN must remain unread.
+        EXPECT_THROW(runner->runMPIWorkerLoop(), std::runtime_error);
+        EXPECT_EQ(mpi->scriptPosition(), 1u);
     }
 
     // =========================================================================
-    // Error / Exception Handling — Rank Desync Prevention
+    // Error / Exception Handling — Fail Fast Before Rank Desynchronization
     // =========================================================================
 
     TEST_F(Test__MPICoordinatedMode, PrefillFailureStillCompletesProtocol)
@@ -1260,37 +1292,36 @@ namespace
         EXPECT_EQ(mpi->broadcastCount(), 3u);
     }
 
-    TEST_F(Test__MPICoordinatedMode, WorkerLoopContinuesAfterPrefillFailure)
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopAbortsBeforeNextCommandAfterPrefillFailure)
     {
         // Scenario: Worker receives PREFILL, its forward() fails.
-        // The worker loop should NOT exit — it should continue to the next
-        // command. Otherwise rank 0 sends the next command and the worker
-        // misses it → deadlock.
+        // It must not return to the command loop: rank 0 may already be
+        // blocked in a sparse collective that this worker will not enter.
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
         scripted->scriptInt32({2}); // token count
         scripted->scriptInt32({10, 20}); // tokens
-        // After failed prefill, worker continues and receives next command
+        // This command must remain unread after the failure.
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
 
         auto [runner, mock, mpi] = createWorkerRunner(scripted);
         mock->setForwardSuccess(false);
 
-        // Worker loop should complete without hanging
-        EXPECT_NO_THROW(runner->runMPIWorkerLoop());
+        // Scripted MPI has no live communicator, so the production abort edge
+        // is represented as a deterministic exception.
+        EXPECT_THROW(runner->runMPIWorkerLoop(), std::runtime_error);
 
-        // Both prefill (failed) and clear_cache were processed
         EXPECT_EQ(mock->forwardCallCount(), 1); // prefill called forward
-        EXPECT_EQ(mock->clearCacheCount(), 1);  // continued to clear_cache
-        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize()); // All consumed
+        EXPECT_EQ(mock->clearCacheCount(), 0);  // no later command is allowed
+        EXPECT_EQ(mpi->scriptPosition(), 3u);
     }
 
-    TEST_F(Test__MPICoordinatedMode, WorkerLoopContinuesAfterPrefillException)
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopAbortsBeforeNextCommandAfterPrefillException)
     {
         // Scenario: Worker's forward() throws during PREFILL.
-        // OrchestrationRunner::prefill() catches std::exception internally,
-        // so the worker loop should survive and process the next command.
+        // prefill() converts it into a failure; that failure still must stop
+        // this worker before it consumes a later coordinated command.
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
         scripted->scriptInt32({2}); // token count
@@ -1301,19 +1332,17 @@ namespace
         auto [runner, mock, mpi] = createWorkerRunner(scripted);
         mock->setThrowOnForward(true);
 
-        // Worker loop should complete — prefill() catches the exception
-        EXPECT_NO_THROW(runner->runMPIWorkerLoop());
+        EXPECT_THROW(runner->runMPIWorkerLoop(), std::runtime_error);
 
-        // Worker continued past the failed prefill
-        EXPECT_EQ(mock->clearCacheCount(), 1);
-        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
+        EXPECT_EQ(mock->clearCacheCount(), 0);
+        EXPECT_EQ(mpi->scriptPosition(), 3u);
     }
 
-    TEST_F(Test__MPICoordinatedMode, WorkerLoopContinuesAfterDecodeStepFailure)
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopAbortsBeforeNextCommandAfterDecodeStepFailure)
     {
         // Scenario: Worker's forward() fails during DECODE_STEP.
-        // decodeStep() returns an error result but does not throw.
-        // The worker loop should continue to the next command.
+        // decodeStep() returns an error result, which must terminate the real
+        // MPI job rather than let the worker drift to the next command.
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         // Prefill to set up state (1st forward call — succeeds)
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
@@ -1326,7 +1355,7 @@ namespace
         // Second decode calls forward — the 2nd forward call — which we fail
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
         scripted->scriptInt32({0}); // decode token budget
-        // Should still continue past the failed decode
+        // This command must remain unread after the failed decode.
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
 
@@ -1334,14 +1363,12 @@ namespace
         // Let prefill's forward succeed, then fail on the 2nd forward (decode)
         mock->setFailAfterNForwards(1);
 
-        runner->runMPIWorkerLoop();
+        EXPECT_THROW(runner->runMPIWorkerLoop(), std::runtime_error);
 
         // 2 forward calls total: prefill (success) + decode (failure)
         EXPECT_EQ(mock->forwardCallCount(), 2);
-        // Loop continued past decode failure to process clear_cache
-        EXPECT_EQ(mock->clearCacheCount(), 1);
-        // All script entries consumed (no hang)
-        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
+        EXPECT_EQ(mock->clearCacheCount(), 0);
+        EXPECT_EQ(mpi->scriptPosition(), 8u);
     }
 
     TEST_F(Test__MPICoordinatedMode, EmptyPrefillDoesNotBroadcast)

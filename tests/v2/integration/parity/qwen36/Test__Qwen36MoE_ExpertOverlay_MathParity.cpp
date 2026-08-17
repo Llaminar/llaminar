@@ -4,10 +4,12 @@
  *
  * These tests are the quality gate for the GPU MoE rebalancing sprint target:
  * one LocalTP routed expert domain with two CUDA/NCCL or ROCm/RCCL
- * participants in the current fixtures, dense tensor parallelism in both
- * phases, apportioned routed experts, explicit assignment policies, and fp16
- * TP allreduce transport. The runner path is generic for LocalTP domains with
- * two or more participants.
+ * participants in the current fixtures, tensor-parallel prefill and replicated
+ * decode dense execution, apportioned routed experts, explicit assignment
+ * policies, and schema-selected TP transport. Every model-bearing case enters
+ * through the production orchestration factory so the ExpertOverlay residency
+ * authority, LocalTP graph, and movement controller have their serving
+ * lifetimes rather than test-owned substitutes.
  */
 
 #include <gtest/gtest.h>
@@ -16,28 +18,18 @@
 
 #include "../qwen35moe/Qwen35MoEParityTestBase.h"
 #include "Qwen36MoEParityTestBase.h"
-#include "backends/DeviceAddressAdapter.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
-#include "collective/LocalTPContext.h"
 #include "execution/config/RuntimeConfig.h"
-#include "execution/moe/MoERoutedExpertPlacementPlanner.h"
-#include "execution/mtp/MTPWeightManifest.h"
-#include "kernels/KernelFactory.h"
 #include "utils/Logger.h"
 
 #include <algorithm>
 #include <array>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <functional>
-#include <iomanip>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
-#include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -100,6 +92,7 @@ namespace
 
     enum class ExpertOverlayPolicyScenario
     {
+        StaticOwnership,
         DynamicResidencyMaintenance,
         CurrentBatchLLEP,
     };
@@ -107,18 +100,18 @@ namespace
     struct ExpertOverlayParityConfig : TestConfig
     {
         ExpertOverlayPolicyScenario policy_scenario =
-            ExpertOverlayPolicyScenario::DynamicResidencyMaintenance;
-        /** Typed replica policy copied into both direct and rank runners. */
+            ExpertOverlayPolicyScenario::StaticOwnership;
+        /** Physical deterministic owner order used by loading and graph maps. */
+        RoutedExpertOwnerOrder owner_order = RoutedExpertOwnerOrder::Ordinal;
+        /** Typed replica policy supplied to the production runner. */
         MoEHotExpertCacheConfig moe_hot_expert_cache;
         RoutedExpertPrefillRuntimeConfig moe_routed_prefill;
         MoERebalanceRuntimeConfig moe_rebalance;
         int max_seq_len = 4096;
-        bool decode_snapshots_only = false;
-        bool require_prompt_metadata_match = false;
     };
 
     /**
-     * @brief Require long-context parity to exercise its named overlay policy.
+     * @brief Require parity to exercise its named movement-positive policy.
      *
      * Token parity alone cannot distinguish a healthy Dynamic-maintenance or
      * current-batch LLEP lane from a graph that never planned its named work.
@@ -129,19 +122,21 @@ namespace
      *
      * @param config Concrete backend and MoE runtime policy under test.
      * @param records Request-local overlay records collected during the
-     *        prefill plus 32 committed decode steps.
+     *        authenticated prefill and incremental decode transaction.
      */
-    void expectLongContextExpertOverlayPerfPath(
+    void expectMovementPositiveExpertOverlayPerfPath(
         const ExpertOverlayParityConfig &config,
         const std::vector<PerfStatRecord> &records)
     {
         const std::string context =
-            config.name + " long-context expert overlay";
+            config.name + " movement-positive expert overlay";
 
         if (config.policy_scenario ==
             ExpertOverlayPolicyScenario::CurrentBatchLLEP)
         {
             expectLLEPPrefillWorkRedistributionPositive(records, context);
+            expectLLEPExpertPayloadMovementPositive(records, context);
+            expectMoEExpertMovementPositive(records, context);
             for (const char *error_counter : {
                      "device_rebalance_copy_missing_source_descriptors",
                      "device_rebalance_apply_missing_source_descriptors",
@@ -206,6 +201,7 @@ namespace
             context);
 
         expectDynamicRebalancePlacementPositive(records, context);
+        expectMoEExpertMovementPositive(records, context);
 
         for (const char *error_counter : {
                  "device_rebalance_copy_missing_source_descriptors",
@@ -226,12 +222,80 @@ namespace
         }
     }
 
+    /**
+     * @brief Prove that real routed weights were loaded in the requested order.
+     *
+     * Graph parity alone can miss a configuration axis if both the loader and
+     * graph accidentally retain the same default.  This assertion consumes the
+     * loader's setup-only evidence and requires both physical LocalTP
+     * participants to report the selected order and its characteristic packed
+     * layout.  The subsequent checkpoint comparison independently proves that
+     * the graph owner map agrees with those physical selections.
+     */
+    void expectRoutedExpertOwnerSelectionPerfPath(
+        const ExpertOverlayParityConfig &config,
+        const std::vector<PerfStatRecord> &records,
+        size_t expected_layer_count)
+    {
+        const std::string requested_order =
+            routedExpertOwnerOrderToString(config.owner_order);
+        const std::string requested_layout =
+            config.owner_order == RoutedExpertOwnerOrder::Random
+                ? "noncontiguous"
+                : "contiguous";
+        std::set<std::string> participants;
+        std::set<std::string> layers;
+        size_t matching_records = 0;
+
+        for (const auto &record : records)
+        {
+            if (record.kind != PerfStatRecord::Kind::Counter ||
+                record.domain != "moe_placement" ||
+                record.name != "routed_expert_weight_selection")
+            {
+                continue;
+            }
+
+            const auto order = record.tags.find("owner_order");
+            ASSERT_NE(order, record.tags.end());
+            EXPECT_EQ(order->second, requested_order)
+                << "Physical routed-weight loading used the wrong owner order";
+            if (order->second != requested_order)
+                continue;
+
+            const auto layout = record.tags.find("selection_layout");
+            ASSERT_NE(layout, record.tags.end());
+            EXPECT_EQ(layout->second, requested_layout)
+                << "Physical routed-weight IDs do not match the requested "
+                   "ownership policy";
+
+            const auto participant = record.tags.find("participant");
+            const auto layer = record.tags.find("layer");
+            ASSERT_NE(participant, record.tags.end());
+            ASSERT_NE(layer, record.tags.end());
+            participants.insert(participant->second);
+            layers.insert(layer->second);
+            EXPECT_GT(record.count, 0u);
+            EXPECT_GT(record.value, 0.0);
+            ++matching_records;
+        }
+
+        EXPECT_GT(matching_records, 0u)
+            << "No physical routed-expert weight-selection evidence was published\n"
+            << PerfStatsCollector::summaryString({"moe_placement"});
+        EXPECT_EQ(participants.size(), config.devices.size())
+            << "Weight-selection evidence did not cover every LocalTP participant";
+        EXPECT_EQ(layers.size(), expected_layer_count)
+            << "Weight-selection evidence did not cover every routed MoE layer";
+    }
+
     ExpertOverlayParityConfig baseConfig(
         const std::string &name,
         std::vector<ParityDeviceType> devices,
         Collective backend,
         const std::string &snapshot_dir,
-        ExpertOverlayPolicyScenario policy_scenario)
+        ExpertOverlayPolicyScenario policy_scenario,
+        RoutedExpertOwnerOrder owner_order = RoutedExpertOwnerOrder::Ordinal)
     {
         ExpertOverlayParityConfig config;
         config.name = name;
@@ -245,6 +309,7 @@ namespace
         config.kv_cache_precision = KVCachePrecision::FP16;
         config.decode_steps = 3;
         config.policy_scenario = policy_scenario;
+        config.owner_order = owner_order;
         config.moe_hot_expert_cache.kind =
             MoEHotExpertCacheConfig::Kind::Off;
         config.moe_rebalance.mode =
@@ -254,8 +319,14 @@ namespace
                 : MoERebalanceRuntimeMode::Off;
         if (config.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
         {
-            config.moe_rebalance.window_size = 4;
-            config.moe_rebalance.max_window_size = 4;
+            /*
+             * The campaign is a path proof, not a throughput soak. A one-row
+             * production routing window makes the first committed decode row
+             * eligible for maintenance, preserving real planner/copy/apply
+             * arithmetic while avoiding a 32-token diagnostic tail.
+             */
+            config.moe_rebalance.window_size = 1;
+            config.moe_rebalance.max_window_size = 1;
             config.moe_rebalance.window_growth_factor = 1.0f;
             config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 0;
             config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
@@ -265,23 +336,32 @@ namespace
             config.moe_rebalance.device_min_load_spread_improvement = 0;
             config.moe_rebalance.device_min_load_spread_improvement_divisor = 0;
             config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot = 0;
-            config.moe_rebalance.device_min_foreign_rows_per_transfer = 0;
+            config.moe_rebalance
+                .device_min_foreign_rows_per_critical_path_payload_slot = 0;
             config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot = 0;
             config.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
             config.moe_rebalance.device_maintenance_slack_tokens = 0;
-            config.moe_rebalance.device_min_maintenance_period_tokens = 4;
-            config.moe_rebalance.device_initial_maintenance_period_tokens = 4;
+            config.moe_rebalance.device_min_maintenance_period_tokens = 1;
+            config.moe_rebalance.device_initial_maintenance_period_tokens = 1;
+            config.moe_rebalance_exercise = {
+                .enabled = true,
+                .require_production_overlay_authority = true,
+                .request_every_decode_steps = 1,
+                .min_decode_steps = 2,
+                .require_movement_epoch_advance = true,
+                .min_movement_epoch_delta = 1,
+            };
         }
         if (policy_scenario == ExpertOverlayPolicyScenario::CurrentBatchLLEP)
         {
             config.moe_routed_prefill = RoutedExpertPrefillRuntimeConfig{
                 .assignment_window_tokens = 0,
                 .least_loaded_min_routed_rows = 0,
-                .llep_alpha_numerator = 1,
-                .llep_alpha_denominator = 1,
+                .llep_alpha_numerator = 9,
+                .llep_alpha_denominator = 10,
                 .llep_lambda_numerator = 13,
                 .llep_lambda_denominator = 10,
-                .llep_enable_balanced_skip = true,
+                .llep_enable_balanced_skip = false,
             };
         }
         config.moe_rebalance.release_raw_expert_weights = true;
@@ -301,108 +381,77 @@ namespace
         return config;
     }
 
-    ExpertOverlayParityConfig longContextConfig(
-        const ExpertOverlayParityConfig &base,
-        const std::string &name,
-        const std::string &snapshot_dir)
+    /**
+     * @brief Build the complete GPU policy-by-owner-order parity matrix.
+     *
+     * Every cell compares all prefill/decode checkpoints and requires its
+     * named movement policy to become physically observable. The production
+     * windows are deliberately minimal so the complete cross-backend matrix
+     * proves the path without retaining the old long-context soak runtime.
+     */
+    std::vector<ExpertOverlayParityConfig> makeExpertOverlayConfigs()
     {
-        ExpertOverlayParityConfig config = base;
-        config.name = name;
-        config.prompt = qwen36MoELongNeedleParityPrompt();
-        config.snapshot_dir = snapshot_dir;
-        config.decode_steps = 32;
-        config.max_seq_len = 4096;
-        config.decode_snapshots_only = true;
-        config.require_prompt_metadata_match = true;
-        if (config.policy_scenario ==
-            ExpertOverlayPolicyScenario::CurrentBatchLLEP)
+        std::vector<ExpertOverlayParityConfig> configs;
+        struct BackendFixture
         {
-            /*
-             * This is the movement-positive production-path regression, not a
-             * policy eligibility smoke. A naturally balanced router histogram
-             * must not let the fixture silently execute StaticOwner while its
-             * name and assertions claim transfer-backed CurrentBatchLLEP.
-             * Match the canonical E2E movement probe's half-capacity target and
-             * require the planner to publish the best available LLEP assignment.
-             */
-            config.moe_routed_prefill.llep_alpha_denominator = 2;
-            config.moe_routed_prefill.llep_enable_balanced_skip = false;
-        }
-        if (config.policy_scenario ==
-            ExpertOverlayPolicyScenario::DynamicResidencyMaintenance)
+            std::string name;
+            std::vector<ParityDeviceType> devices;
+            Collective collective;
+            std::string short_snapshots;
+        };
+        const std::array<BackendFixture, 2> backends = {{
+            {
+                "CUDA2TP",
+                {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
+                Collective::NCCL,
+                "pytorch_qwen36_moe_singledevice_cuda_snapshots",
+            },
+            {
+                "ROCm2TP",
+                {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
+                Collective::RCCL,
+                "pytorch_qwen36_moe_singledevice_rocm_snapshots",
+            },
+        }};
+
+        for (const auto &backend : backends)
         {
-            config.moe_rebalance_exercise.enabled = true;
-            config.moe_rebalance_exercise.require_device_side_controller = true;
-            config.moe_rebalance_exercise.request_every_decode_steps = 4;
-            config.moe_rebalance_exercise.min_decode_steps = 8;
-            config.moe_rebalance_exercise.require_movement_epoch_advance = true;
-            config.moe_rebalance_exercise.min_movement_epoch_delta = 1;
+            for (const auto owner_order : {
+                     RoutedExpertOwnerOrder::Ordinal,
+                     RoutedExpertOwnerOrder::Random})
+            {
+                const std::string order_name =
+                    owner_order == RoutedExpertOwnerOrder::Ordinal
+                        ? "OrdinalOwners"
+                        : "RandomOwners";
+                const auto add_short = [&](const std::string &policy_name,
+                                           ExpertOverlayPolicyScenario scenario)
+                {
+                    configs.push_back(baseConfig(
+                        "Qwen36MoE_ExpertOverlay_" + backend.name + "_" +
+                            policy_name + "_" + order_name +
+                            "_DenseTP_FP16Transport",
+                        backend.devices,
+                        backend.collective,
+                        backend.short_snapshots,
+                        scenario,
+                        owner_order));
+                };
+
+                add_short("Static", ExpertOverlayPolicyScenario::StaticOwnership);
+                add_short(
+                    "DynamicMaintenance",
+                    ExpertOverlayPolicyScenario::DynamicResidencyMaintenance);
+                add_short(
+                    "CurrentBatchLLEP",
+                    ExpertOverlayPolicyScenario::CurrentBatchLLEP);
+            }
         }
-        return config;
+        return configs;
     }
 
-    const std::vector<ExpertOverlayParityConfig> kQwen36MoEExpertOverlayConfigs = {
-        baseConfig(
-            "Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport",
-            {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-            Collective::NCCL,
-            "pytorch_qwen36_moe_singledevice_cuda_snapshots",
-            ExpertOverlayPolicyScenario::DynamicResidencyMaintenance),
-        baseConfig(
-            "Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport",
-            {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-            Collective::RCCL,
-            "pytorch_qwen36_moe_singledevice_rocm_snapshots",
-            ExpertOverlayPolicyScenario::DynamicResidencyMaintenance),
-        baseConfig(
-            "Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport",
-            {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-            Collective::NCCL,
-            "pytorch_qwen36_moe_singledevice_cuda_snapshots",
-            ExpertOverlayPolicyScenario::CurrentBatchLLEP),
-        baseConfig(
-            "Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport",
-            {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-            Collective::RCCL,
-            "pytorch_qwen36_moe_singledevice_rocm_snapshots",
-            ExpertOverlayPolicyScenario::CurrentBatchLLEP),
-        longContextConfig(
-            baseConfig(
-                "Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport",
-                {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-                Collective::NCCL,
-                "pytorch_qwen36_moe_expert_overlay_cuda2_dynamic_maintenance_dense_tp_long_decode_snapshots",
-                ExpertOverlayPolicyScenario::DynamicResidencyMaintenance),
-            "Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport",
-            "pytorch_qwen36_moe_expert_overlay_cuda2_dynamic_maintenance_dense_tp_long_decode_snapshots"),
-        longContextConfig(
-            baseConfig(
-                "Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport",
-                {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-                Collective::RCCL,
-                "pytorch_qwen36_moe_expert_overlay_rocm2_dynamic_maintenance_dense_tp_long_decode_snapshots",
-                ExpertOverlayPolicyScenario::DynamicResidencyMaintenance),
-            "Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport",
-            "pytorch_qwen36_moe_expert_overlay_rocm2_dynamic_maintenance_dense_tp_long_decode_snapshots"),
-        longContextConfig(
-            baseConfig(
-                "Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport",
-                {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-                Collective::NCCL,
-                "pytorch_qwen36_moe_expert_overlay_cuda2_current_batch_llep_dense_tp_long_decode_snapshots",
-                ExpertOverlayPolicyScenario::CurrentBatchLLEP),
-            "Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport",
-            "pytorch_qwen36_moe_expert_overlay_cuda2_current_batch_llep_dense_tp_long_decode_snapshots"),
-        longContextConfig(
-            baseConfig(
-                "Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport",
-                {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-                Collective::RCCL,
-                "pytorch_qwen36_moe_expert_overlay_rocm2_current_batch_llep_dense_tp_long_decode_snapshots",
-                ExpertOverlayPolicyScenario::CurrentBatchLLEP),
-            "Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport",
-            "pytorch_qwen36_moe_expert_overlay_rocm2_current_batch_llep_dense_tp_long_decode_snapshots"),
-    };
+    const std::vector<ExpertOverlayParityConfig> kQwen36MoEExpertOverlayConfigs =
+        makeExpertOverlayConfigs();
 
     PlanFactory planFactoryForConfig(const TestConfig &config)
     {
@@ -430,47 +479,24 @@ namespace
         return std::nullopt;
     }
 
-    MoERoutedExpertModelMetadata metadataFromModel(const ModelContext &ctx)
+    /**
+     * @brief Build only the declarative placement request consumed by production.
+     *
+     * Model dimensions, capacity admission, concrete per-layer ownership, and
+     * the immutable initial epoch are deliberately absent here. The production
+     * `OrchestrationRunner` resolves those values from the live GGUF before it
+     * creates the sole ExpertOverlay residency authority.
+     *
+     * @param config Policy and physical-owner axis for this campaign cell.
+     * @return Declarative routed-expert plan for production orchestration.
+     */
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makeRequestedOverlayPlan(
+        const ExpertOverlayParityConfig &config)
     {
-        const auto &loader = ctx.concreteLoader();
-        const std::string &arch = ctx.architecture();
-
-        MoERoutedExpertModelMetadata metadata;
-        metadata.num_layers = mainLayerCountExcludingMTP(
-            loader,
-            arch,
-            ctx.blockCount());
-        metadata.num_experts = loader.getInt(arch + ".expert_count", 0);
-        metadata.d_model = ctx.embeddingLength();
-        metadata.routed_intermediate_size =
-            loader.getInt(arch + ".expert_feed_forward_length", 0);
-        if (metadata.routed_intermediate_size == 0)
-            metadata.routed_intermediate_size = ctx.feedForwardLength();
-        metadata.has_shared_expert = loader.getInt(arch + ".expert_shared_count", 0) > 0;
-        metadata.shared_intermediate_size = metadata.has_shared_expert
-                                                ? metadata.routed_intermediate_size
-                                                : 0;
-        metadata.routed_quant_type = "IQ3";
-        metadata.shared_quant_type = "IQ3";
-        return metadata;
-    }
-
-    std::string validationErrors(const MoERoutedExpertPlacementValidationResult &validation)
-    {
-        std::ostringstream message;
-        for (const auto &error : validation.errors)
-            message << "\n - " << error;
-        return message.str();
-    }
-
-    std::shared_ptr<MoERoutedExpertPlacementPlan> makePlannedOverlayPlan(
-        const ExpertOverlayParityConfig &config,
-        const ModelContext &ctx)
-    {
-        const auto metadata = metadataFromModel(ctx);
         auto requested = planFactoryForConfig(config)();
         if (!requested)
             throw std::invalid_argument("overlay parity plan factory returned null");
+        requested->owner_order = config.owner_order;
 
         for (auto &domain : requested->domains)
         {
@@ -482,279 +508,9 @@ namespace
                     ? RoutedExpertAssignmentPolicy::LeastLoadedResident
                     : RoutedExpertAssignmentPolicy::StaticOwner;
         }
-
-        auto planned = MoERoutedExpertPlacementPlanner::plan(*requested, metadata).planned_plan;
-
-        MoERoutedExpertPlacementValidationOptions options;
-        options.layer_count = metadata.num_layers;
-        options.routed_expert_count = metadata.num_experts;
-        auto validation = validateMoERoutedExpertPlacementPlan(planned, options);
-        if (!validation.ok())
-        {
-            throw std::invalid_argument(
-                "invalid planned Qwen3.6 MoE expert overlay:" +
-                validationErrors(validation));
-        }
-
-        return std::make_shared<MoERoutedExpertPlacementPlan>(std::move(planned));
+        return requested;
     }
 
-    DeviceId continuationRootDevice(const MoERoutedExpertPlacementPlan &plan)
-    {
-        for (const auto &domain : plan.domains)
-        {
-            if (domain.name != plan.continuation_domain)
-                continue;
-            if (domain.participants.empty())
-            {
-                throw std::runtime_error(
-                    "continuation domain '" + plan.continuation_domain +
-                    "' has no participants");
-            }
-
-            const int root = std::clamp(
-                plan.continuation_domain_spec.logical_root_participant,
-                0,
-                static_cast<int>(domain.participants.size()) - 1);
-            return DeviceAddressAdapter::toDeviceId(
-                domain.participants[static_cast<size_t>(root)]);
-        }
-
-        throw std::runtime_error(
-            "continuation domain '" + plan.continuation_domain +
-            "' was not found in overlay plan");
-    }
-
-    const RoutedExpertDomain &continuationDomain(const MoERoutedExpertPlacementPlan &plan)
-    {
-        for (const auto &domain : plan.domains)
-        {
-            if (domain.name == plan.continuation_domain)
-                return domain;
-        }
-
-        throw std::runtime_error(
-            "continuation domain '" + plan.continuation_domain +
-            "' was not found in overlay plan");
-    }
-
-    std::vector<float> equalWeights(size_t count)
-    {
-        if (count == 0)
-            return {};
-        return std::vector<float>(count, 1.0f / static_cast<float>(count));
-    }
-
-    struct CachedExpertOverlayPipeline
-    {
-        std::shared_ptr<ModelContext> model_ctx;
-        std::shared_ptr<MoERoutedExpertPlacementPlan> overlay_plan;
-        std::unique_ptr<IInferenceRunner> runner;
-        std::string key;
-    };
-
-    std::mutex &overlayPipelineCacheMutex()
-    {
-        static std::mutex mutex;
-        return mutex;
-    }
-
-    std::map<std::string, std::shared_ptr<ModelContext>> &overlayModelContextCache()
-    {
-        static std::map<std::string, std::shared_ptr<ModelContext>> cache;
-        return cache;
-    }
-
-    std::map<std::string, std::unique_ptr<CachedExpertOverlayPipeline>> &overlayPipelineCache()
-    {
-        static std::map<std::string, std::unique_ptr<CachedExpertOverlayPipeline>> cache;
-        return cache;
-    }
-
-    int overlayPipelineCacheMaxEntries()
-    {
-        const char *raw = std::getenv("LLAMINAR_PARITY_PIPELINE_CACHE_MAX");
-        if (!raw || !*raw)
-            return 0;
-        char *end = nullptr;
-        const long parsed = std::strtol(raw, &end, 10);
-        if (end == raw || parsed < 0)
-            return 0;
-        return static_cast<int>(parsed);
-    }
-
-    bool overlayModelContextCanSeedNewRunner(
-        const ExpertOverlayParityConfig &config)
-    {
-        return !config.moe_rebalance.release_raw_expert_weights;
-    }
-
-    bool overlayPipelineCanKeepDistinctRunnerEntries(
-        const ExpertOverlayParityConfig &config)
-    {
-        /*
-         * A release-raw expert-overlay runner owns the only valid prepared expert
-         * payloads and the resident multi-participant Qwen3.6 overlay footprint
-         * is too large to keep side-by-side variants alive while constructing the
-         * next runner.
-         * Cache hits may reuse the exact runner; cache misses must evict first.
-         */
-        return overlayModelContextCanSeedNewRunner(config);
-    }
-
-    std::string graphCaptureBucketKeyFragment()
-    {
-        const auto &exec = debugEnv().execution;
-        std::ostringstream key;
-        key << "|gpu_graphs=" << (exec.gpu_graphs ? 1 : 0)
-            << "|prefill_min=" << exec.prefill_graph_min_seq
-            << "|prefill_buckets=" << (exec.prefill_graph_buckets ? 1 : 0)
-            << "|prefill_bucket_sizes=";
-        for (size_t i = 0; i < exec.prefill_graph_bucket_sizes.size(); ++i)
-        {
-            if (i > 0)
-                key << ',';
-            key << exec.prefill_graph_bucket_sizes[i];
-        }
-        return key.str();
-    }
-
-    std::string overlayPipelineCacheKey(
-        const ExpertOverlayParityConfig &config,
-        const ParityConfig &resolved_config)
-    {
-        std::ostringstream key;
-        key << config.name
-            << "|model=" << config.model_path
-            << "|max_seq=" << config.max_seq_len
-            << "|decode_steps=" << config.decode_steps
-            << "|resolved_snapshot_dir=" << resolved_config.snapshot_dir
-            << "|resolved_prefill_tokens=" << resolved_config.token_ids.size()
-            << "|rebalance=" << static_cast<int>(config.moe_rebalance.mode)
-            << "|policy_scenario=" << static_cast<int>(config.policy_scenario)
-            << "|backend=" << static_cast<int>(config.collective)
-            << "|activation=" << static_cast<int>(config.activation_precision)
-            << "|kv=" << static_cast<int>(config.kv_cache_precision)
-            << graphCaptureBucketKeyFragment();
-        return key.str();
-    }
-
-    void clearOverlayPipelineRunnerCache()
-    {
-        auto &pipeline_cache = overlayPipelineCache();
-        for (auto &[key, entry] : pipeline_cache)
-        {
-            (void)key;
-            if (entry && entry->runner)
-            {
-                entry->runner->clearSnapshots();
-                entry->runner->clear_cache();
-                entry->runner.reset();
-            }
-        }
-        llaminar::v2::kernels::KernelFactory::clearCache();
-        pipeline_cache.clear();
-
-        /*
-         * Expert-overlay parity enables release_raw_expert_weights to match the
-         * production GPU memory profile. Once a runner has consumed and released
-         * those raw payloads, the owning ModelContext is no longer a valid source
-         * for constructing a different runner shape. Drop it with the runner cache
-         * rather than preserving a context whose expert payloads may now be empty.
-         */
-        overlayModelContextCache().clear();
-    }
-
-    std::shared_ptr<ModelContext> getOrCreateOverlayModelContext(
-        const ExpertOverlayParityConfig &config,
-        const std::shared_ptr<IMPIContext> &mpi_ctx,
-        const std::function<void(const std::shared_ptr<ModelContext> &)> &configure)
-    {
-        auto &cache = overlayModelContextCache();
-        const bool can_seed_new_runner =
-            overlayModelContextCanSeedNewRunner(config);
-        if (can_seed_new_runner)
-        {
-            if (auto it = cache.find(config.model_path); it != cache.end())
-                return it->second;
-        }
-        else if (!cache.empty())
-        {
-            cache.clear();
-        }
-
-        if (cache.empty() && overlayPipelineCache().empty())
-        {
-            llaminar::v2::kernels::KernelFactory::clearCache();
-        }
-
-        const bool gpu_only = std::all_of(
-            config.devices.begin(),
-            config.devices.end(),
-            [](ParityDeviceType device)
-            {
-                return device == ParityDeviceType::CUDA ||
-                       device == ParityDeviceType::ROCm;
-            });
-        if (!gpu_only)
-        {
-            throw std::invalid_argument(
-                "expert-overlay parity model context requires GPU-only participants");
-        }
-
-        /*
-         * The legacy ModelContext::create overload defaults to a CPU target. That
-         * makes ModelLoader NUMA-bind and first-touch every page in the GGUF
-         * before the bounded GPU upload ring can consume its first weight. Use
-         * the explicit configuration so GPU-only parity follows production's
-         * demand-paged mmap path and keeps host staging within its configured
-         * budget.
-         */
-        const ModelContextConfig model_config{
-            .mpi_ctx = mpi_ctx,
-            .strategy = WeightDistributionStrategy::SHARDED,
-            .use_mmap = true,
-            .target_is_gpu = true,
-        };
-        auto model_ctx = ModelContext::create(config.model_path, model_config);
-        if (model_ctx)
-        {
-            configure(model_ctx);
-            if (can_seed_new_runner)
-                cache.emplace(config.model_path, model_ctx);
-        }
-        return model_ctx;
-    }
-
-    void evictOverlayPipelineCacheIfNeeded(const std::string &protected_key)
-    {
-        const int max_entries = overlayPipelineCacheMaxEntries();
-        auto &cache = overlayPipelineCache();
-        if (max_entries <= 0)
-        {
-            cache.clear();
-            return;
-        }
-        while (static_cast<int>(cache.size()) > max_entries)
-        {
-            auto victim = std::find_if(
-                cache.begin(),
-                cache.end(),
-                [&protected_key](const auto &entry)
-                {
-                    return entry.first != protected_key;
-                });
-            if (victim == cache.end())
-                break;
-            cache.erase(victim);
-        }
-    }
-
-    void clearExpertOverlayPipelineCache()
-    {
-        std::lock_guard<std::mutex> lock(overlayPipelineCacheMutex());
-        clearOverlayPipelineRunnerCache();
-    }
 } // namespace
 
 class Qwen36MoEExpertOverlayParityTest
@@ -770,7 +526,14 @@ protected:
     void SetUp() override
     {
         if (auto blocker = expertOverlayHardwareBlocker(GetParam()))
+        {
+            if (productionParityCampaignEnabled())
+            {
+                FAIL() << "Production Qwen3.6 ExpertOverlay prerequisite failed: "
+                       << *blocker;
+            }
             GTEST_SKIP() << GetParam().name << " " << *blocker;
+        }
 
         int rank = 0;
         int world_size = 1;
@@ -778,14 +541,24 @@ protected:
         MPI_Comm_size(MPI_COMM_WORLD, &world_size);
         if (world_size != 1)
         {
+            if (productionParityCampaignEnabled())
+            {
+                FAIL() << "Production Qwen3.6 homogeneous LocalTP ExpertOverlay parity "
+                          "requires -np 1 (got "
+                       << world_size << ")";
+            }
             GTEST_SKIP() << "Qwen3.6 homogeneous LocalTP expert overlay parity "
                          << "must run with -np 1 (got " << world_size << ")";
         }
         if (GetParam().policy_scenario ==
             ExpertOverlayPolicyScenario::CurrentBatchLLEP)
         {
-            setScopedParityEnvOverride("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS", "32");
-            setScopedParityEnvOverride("LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS", "32");
+            setScopedParityEnvOverride(
+                "LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS",
+                "4");
+            setScopedParityEnvOverride(
+                "LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS",
+                "4");
         }
         setScopedParityEnvOverride(
             "LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER",
@@ -795,17 +568,11 @@ protected:
         Base::SetUp();
     }
 
-    bool preserveParityPipelineCachesBetweenTests() const override
-    {
-        return overlayPipelineCacheMaxEntries() > 0;
-    }
-
     ParityGraphSnapshotPolicy parityGraphSnapshotPolicy(
         ParityForwardPhase phase) const override
     {
         auto policy = Base::parityGraphSnapshotPolicy(phase);
-        if (phase == ParityForwardPhase::Prefill &&
-            !GetParam().decode_snapshots_only)
+        if (phase == ParityForwardPhase::Prefill)
         {
             /*
              * Final MoE publication is the only routed/shared arithmetic
@@ -827,250 +594,97 @@ protected:
                 }
             }
         }
-        if (GetParam().decode_snapshots_only && phase == ParityForwardPhase::Prefill)
-        {
-            policy.required_prefill_snapshot_keys = {
-                "layer0_MOE_COMBINED_OUTPUT",
-                "layer1_MOE_COMBINED_OUTPUT",
-            };
-            policy.prefill_snapshot_capture_filter = policy.required_prefill_snapshot_keys;
-        }
         return policy;
     }
 
-    void applyModelOverrides() override
+    bool productionParityRequiresPrefillSnapshots() const override
     {
-        Base::applyModelOverrides();
-
-        if (!GetParam().require_prompt_metadata_match)
-            return;
-
-        const auto metadata_path =
-            std::filesystem::path(config_.snapshot_dir) / "metadata.txt";
-        if (metadataLooksUsable(
-                metadata_path,
-                config_.prompt,
-                config_.decode_steps))
-        {
-            return;
-        }
-
-        if (!std::filesystem::exists(config_.model_path))
-            return;
-
-        LOG_INFO("[Qwen3.6 MoE ExpertOverlay MathParity] Regenerating snapshots for prompt/decode-matched metadata: "
-                 << config_.snapshot_dir);
-        if (!regeneratePyTorchSnapshots())
-        {
-            ADD_FAILURE() << "Qwen3.6 MoE expert overlay snapshot regeneration failed";
-            return;
-        }
-
-        auto prefill_tokens = readPrefillTokensFromMetadata();
-        if (!prefill_tokens.empty())
-        {
-            config_.token_ids = std::move(prefill_tokens);
-            LOG_INFO("[Qwen3.6 MoE ExpertOverlay MathParity] Loaded "
-                     << config_.token_ids.size()
-                     << " prompt token IDs from regenerated metadata");
-        }
+        return true;
     }
 
-    bool regeneratePyTorchSnapshots() override
+    /**
+     * @brief Construct this parity cell through the live production lifecycle.
+     *
+     * ExpertOverlay authority, model-aware capacity admission, initial epoch,
+     * participant prepared banks, LocalTP contexts, graph lowering, and capture
+     * are all owned by `OrchestrationRunner`. The fixture supplies only the same
+     * declarative policy a CLI/config caller would supply, then enables the
+     * ordinary diagnostic snapshot boundary after successful initialization.
+     *
+     * @return `true` after one complete production runner is initialized.
+     */
+    bool setupProductionOverlayRunner()
     {
-        if (!GetParam().decode_snapshots_only)
-            return Base::regeneratePyTorchSnapshots();
-
-        std::string output;
-        const auto metadata_path =
-            std::filesystem::path(config_.snapshot_dir) / "metadata.txt";
-        const bool ok = regenerateQwen36MoEDecodeSnapshots(
-            config_.model_path,
-            metadata_path,
-            config_.prompt,
-            config_.decode_steps,
-            false,
-            &output);
-        if (!ok)
-        {
-            LOG_ERROR("[Qwen3.6 MoE ExpertOverlay MathParity] decode-only PyTorch snapshot generation failed:\n"
-                      << output);
-        }
-        return ok;
-    }
-
-    bool setupPipeline()
-    {
-        const std::string cache_key = overlayPipelineCacheKey(GetParam(), config_);
-        {
-            auto scope = profileParityScope("expert_overlay.setup.pipeline_cache_lookup");
-            std::lock_guard<std::mutex> lock(overlayPipelineCacheMutex());
-            auto &cache = overlayPipelineCache();
-            if (auto it = cache.find(cache_key); it != cache.end() &&
-                it->second && it->second->runner)
-            {
-                model_ctx_ = it->second->model_ctx;
-                overlay_plan_ = it->second->overlay_plan;
-                borrowParityPipeline(model_ctx_, it->second->runner.get());
-                activeClearSnapshots();
-                activeClearCache();
-                return true;
-            }
-            const int max_entries = overlayPipelineCacheMaxEntries();
-            if (max_entries <= 0 ||
-                static_cast<int>(cache.size()) >= max_entries ||
-                (!cache.empty() &&
-                 !overlayPipelineCanKeepDistinctRunnerEntries(GetParam())))
-            {
-                clearOverlayPipelineRunnerCache();
-            }
-        }
-
-        {
-            auto scope = profileParityScope("expert_overlay.setup.device_manager_initialize");
-            DeviceManager::instance().initialize(-1);
-        }
-
-        {
-            auto scope = profileParityScope("expert_overlay.setup.model_context_create");
-            std::lock_guard<std::mutex> lock(overlayPipelineCacheMutex());
-            model_ctx_ = getOrCreateOverlayModelContext(
-                GetParam(),
-                mpi_ctx_,
-                [this](const std::shared_ptr<ModelContext> &ctx)
-                {
-                    configureModel(ctx);
-                });
-        }
-        if (!model_ctx_)
-        {
-            LOG_ERROR("[Qwen3.6 MoE ExpertOverlay MathParity] Failed to load model");
-            return false;
-        }
-
         try
         {
-            auto scope = profileParityScope("expert_overlay.setup.plan_overlay");
-            overlay_plan_ = makePlannedOverlayPlan(GetParam(), *model_ctx_);
+            overlay_plan_ = makeRequestedOverlayPlan(GetParam());
         }
-        catch (const std::exception &e)
+        catch (const std::exception &error)
         {
-            LOG_ERROR("[Qwen3.6 MoE ExpertOverlay MathParity] " << e.what());
+            LOG_ERROR(
+                "[Qwen3.6 MoE ExpertOverlay MathParity] " << error.what());
             return false;
         }
 
-        InferenceRunnerConfig inf_config;
-        inf_config.max_seq_len = GetParam().max_seq_len;
-        inf_config.batch_size = 1;
-        inf_config.force_graph = true;
-        inf_config.activation_precision = GetParam().activation_precision;
-        inf_config.kv_cache_precision = GetParam().kv_cache_precision;
-        // Preserve Qwen35Graph's hybrid schema policy: early GDN layers and all
-        // FA layers use FP32 allreduce, later GDN layers use FP16 transport.
-        inf_config.tp_allreduce_precision_override = "schema";
-        inf_config.use_mapped_memory = true;
-        inf_config.moe_routed_expert_plan = overlay_plan_;
-        inf_config.moe_expert_overlay_mpi_ctx = mpi_ctx_;
-        inf_config.moe_hot_expert_cache = GetParam().moe_hot_expert_cache;
-        inf_config.moe_routed_prefill = GetParam().moe_routed_prefill;
-        inf_config.moe_rebalance = GetParam().moe_rebalance;
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = config_.model_path;
+        config.max_seq_len = GetParam().max_seq_len;
+        config.batch_size = 1;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.activation_precision =
+            Base::orchestrationActivationPrecisionValue(
+                GetParam().activation_precision);
+        config.kv_cache_precision =
+            Base::orchestrationKVCachePrecisionValue(
+                GetParam().kv_cache_precision);
+        config.tp_allreduce_precision_override = "schema";
+        config.routed_expert_owner_order = GetParam().owner_order;
+        config.moe_hot_expert_cache = GetParam().moe_hot_expert_cache;
+        config.moe_routed_prefill = GetParam().moe_routed_prefill;
+        config.moe_rebalance = GetParam().moe_rebalance;
+        config.moe_routed_expert_plan = overlay_plan_;
 
-        const RoutedExpertDomain *domain = nullptr;
-        try
+        // Retire every legacy owner before installing the sole production
+        // runner. A model context may only be reached through that runner.
+        runner_.reset();
+        borrowed_runner_ = nullptr;
+        model_ctx_.reset();
+        orch_runner_.reset();
+
+        auto factory = createOrchestrationRunnerFactory();
+        orch_runner_ = factory->createFromOrchestrationConfig(
+            std::move(config));
+        if (!orch_runner_)
         {
-            (void)continuationRootDevice(*overlay_plan_);
-            domain = &continuationDomain(*overlay_plan_);
+            LOG_ERROR(
+                "[Qwen3.6 MoE ExpertOverlay MathParity] Production factory "
+                "did not create an OrchestrationRunner");
+            return false;
         }
-        catch (const std::exception &e)
+        if (!orch_runner_->initialize())
         {
-            LOG_ERROR("[Qwen3.6 MoE ExpertOverlay MathParity] " << e.what());
+            LOG_ERROR(
+                "[Qwen3.6 MoE ExpertOverlay MathParity] Production runner "
+                "initialization failed: "
+                << orch_runner_->lastError());
+            orch_runner_.reset();
             return false;
         }
 
-        if (!domain || domain->scope != ExecutionDomainScope::LOCAL || domain->participants.size() < 2)
-        {
-            LOG_ERROR("[Qwen3.6 MoE ExpertOverlay MathParity] continuation domain must be a multi-device LocalTP domain");
-            return false;
-        }
-
-        const std::vector<float> weights =
-            domain->weights.empty() ? equalWeights(domain->participants.size()) : domain->weights;
-        std::unique_ptr<ILocalTPContext> tp_ctx;
-        {
-            auto scope = profileParityScope("expert_overlay.setup.create_local_tp_context");
-            tp_ctx = createLocalTPContext(
-                domain->participants,
-                weights,
-                domain->backend);
-        }
-        if (!tp_ctx)
-        {
-            LOG_ERROR("[Qwen3.6 MoE ExpertOverlay MathParity] Failed to create LocalTP context");
-            return false;
-        }
-
-        RankOrchestrator::Config rank_config;
-        rank_config.devices = domain->participants;
-        rank_config.weights = weights;
-        rank_config.backend = domain->backend;
-        rank_config.max_seq_len = inf_config.max_seq_len;
-        rank_config.batch_size = inf_config.batch_size;
-        rank_config.activation_precision = inf_config.activation_precision;
-        rank_config.kv_cache_precision = inf_config.kv_cache_precision;
-        rank_config.tp_allreduce_precision_override = inf_config.tp_allreduce_precision_override;
-        rank_config.use_mapped_memory = inf_config.use_mapped_memory;
-        rank_config.moe_routed_expert_plan = overlay_plan_;
-        rank_config.moe_expert_overlay_mpi_ctx = mpi_ctx_;
-        rank_config.moe_hot_expert_cache = GetParam().moe_hot_expert_cache;
-        rank_config.moe_routed_prefill = GetParam().moe_routed_prefill;
-        rank_config.moe_rebalance = GetParam().moe_rebalance;
-
-        {
-            auto scope = profileParityScope("expert_overlay.setup.create_rank_orchestrator");
-            runner_ = createRankOrchestrator(
-                model_ctx_,
-                std::move(tp_ctx),
-                rank_config);
-        }
-        if (!runner_)
-        {
-            LOG_ERROR("[Qwen3.6 MoE ExpertOverlay MathParity] Failed to create runner");
-            return false;
-        }
-
-        {
-            auto scope = profileParityScope("expert_overlay.setup.enable_snapshot_capture");
-            runner_->enableSnapshotCapture();
-        }
-
-        if (overlayPipelineCacheMaxEntries() <= 0)
-            return true;
-
-        {
-            auto scope = profileParityScope("expert_overlay.setup.pipeline_cache_store");
-            auto entry = std::make_unique<CachedExpertOverlayPipeline>();
-            entry->model_ctx = model_ctx_;
-            entry->overlay_plan = overlay_plan_;
-            entry->runner = std::move(runner_);
-            entry->key = cache_key;
-            IInferenceRunner *borrowed = entry->runner.get();
-
-            std::lock_guard<std::mutex> lock(overlayPipelineCacheMutex());
-            auto &cache = overlayPipelineCache();
-            cache[cache_key] = std::move(entry);
-            evictOverlayPipelineCacheIfNeeded(cache_key);
-            auto it = cache.find(cache_key);
-            if (it == cache.end() || !it->second || !it->second->runner)
-            {
-                LOG_ERROR("[Qwen3.6 MoE ExpertOverlay MathParity] Cached pipeline was evicted immediately; "
-                          "increase LLAMINAR_PARITY_PIPELINE_CACHE_MAX or set it to at least 1");
-                return false;
-            }
-            borrowed = it->second->runner.get();
-            borrowParityPipeline(model_ctx_, borrowed);
-        }
-        activeClearSnapshots();
-        activeClearCache();
+        /*
+         * The authenticated Hugging Face pack advances decode with greedy
+         * tokens.  Declare that serving policy on the production runner so the
+         * prefill-boundary sample and every subsequent decode transaction are
+         * the exact operations certified by the reference.  Leaving the model
+         * recommendation active would ask the GPU stochastic sampler to prove
+         * a different token trajectory (and Qwen3.6's open-ended top-k=0
+         * recommendation is intentionally not interpreted as greedy).
+         */
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        orch_runner_->setSamplingParams(greedy);
+        orch_runner_->enableSnapshotCapture();
         return true;
     }
 
@@ -1119,233 +733,64 @@ TEST(Qwen36MoEExpertOverlayPerfStats, DynamicMovementAcceptsEitherProductionDeci
         0.0);
 }
 
-TEST(Qwen36MoEExpertOverlayPipelineCacheKey, IncludesResolvedPrefillShapeAndGraphBucketPolicy)
+TEST_P(Qwen36MoEExpertOverlayParityTest, ProductionParity)
 {
-    auto config = baseConfig(
-        "Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport",
-        {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-        Collective::NCCL,
-        "snapshots_a",
-        ExpertOverlayPolicyScenario::DynamicResidencyMaintenance);
-
-    ParityConfig short_prompt;
-    short_prompt.snapshot_dir = "snapshots_a";
-    short_prompt.token_ids.assign(9, 1);
-
-    ParityConfig long_prompt = short_prompt;
-    long_prompt.token_ids.assign(64, 1);
-
-    const std::string short_key = overlayPipelineCacheKey(config, short_prompt);
-    const std::string long_key = overlayPipelineCacheKey(config, long_prompt);
-    EXPECT_NE(short_key, long_key)
-        << "A borrowed parity runner with request-shaped activation graph state "
-           "must not survive into a different prefill shape.";
-
-    auto save_env = [](const char *name) -> std::optional<std::string>
+    beginProductionParityEvidence();
     {
-        const char *value = std::getenv(name);
-        if (!value)
-            return std::nullopt;
-        return std::string(value);
-    };
-    auto restore_env = [](const char *name, const std::optional<std::string> &value)
-    {
-        if (value)
-            setenv(name, value->c_str(), 1);
-        else
-            unsetenv(name);
-    };
-
-    const auto old_min_seq = save_env("LLAMINAR_PREFILL_GRAPH_MIN_SEQ");
-    const auto old_buckets_enabled = save_env("LLAMINAR_PREFILL_GRAPH_BUCKETS");
-    const auto old_bucket_sizes = save_env("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES");
-
-    setenv("LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "9", 1);
-    setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1", 1);
-    setenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "9", 1);
-    mutableDebugEnv().reload();
-    const std::string exact_short_bucket_key = overlayPipelineCacheKey(config, short_prompt);
-
-    setenv("LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "64", 1);
-    setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1", 1);
-    setenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64", 1);
-    mutableDebugEnv().reload();
-    const std::string exact_long_bucket_key = overlayPipelineCacheKey(config, short_prompt);
-
-    restore_env("LLAMINAR_PREFILL_GRAPH_MIN_SEQ", old_min_seq);
-    restore_env("LLAMINAR_PREFILL_GRAPH_BUCKETS", old_buckets_enabled);
-    restore_env("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", old_bucket_sizes);
-    mutableDebugEnv().reload();
-
-    EXPECT_NE(exact_short_bucket_key, exact_long_bucket_key)
-        << "The borrowed pipeline key must include the graph-capture bucket "
-           "contract because it controls activation arena sizing.";
-}
-
-TEST(Qwen36MoEExpertOverlayPipelineCacheKey, RunnerCacheClearDropsPotentiallyStrippedModelContext)
-{
-    {
-        std::lock_guard<std::mutex> lock(overlayPipelineCacheMutex());
-        overlayModelContextCache()["dummy-model"] = std::shared_ptr<ModelContext>{};
-        ASSERT_FALSE(overlayModelContextCache().empty());
-        clearOverlayPipelineRunnerCache();
-        EXPECT_TRUE(overlayModelContextCache().empty())
-            << "release_raw_expert_weights can strip raw expert payloads from "
-               "the cached ModelContext, so runner-cache eviction must drop "
-               "the model context as well.";
+        auto scope =
+            profileParityScope("expert_overlay.setup_production_runner");
+        ASSERT_TRUE(setupProductionOverlayRunner())
+            << "Production ExpertOverlay runner setup failed";
     }
-}
 
-TEST(Qwen36MoEExpertOverlayPipelineCacheKey, RawExpertReleaseForbidsModelContextReuseForNewRunner)
-{
-    auto config = baseConfig(
-        "Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport",
-        {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-        Collective::NCCL,
-        "snapshots_a",
-        ExpertOverlayPolicyScenario::DynamicResidencyMaintenance);
+    ASSERT_TRUE(decodeWorkAvailable())
+        << "Production parity requires incremental-decode snapshots and metadata";
 
-    config.moe_rebalance.release_raw_expert_weights = true;
-    EXPECT_FALSE(overlayModelContextCanSeedNewRunner(config))
-        << "A consumed ModelContext cannot seed another runner after raw "
-           "expert payload release.";
-    EXPECT_FALSE(overlayPipelineCanKeepDistinctRunnerEntries(config))
-        << "Release-raw GPU overlay runners may only be reused on exact cache "
-           "hits; cache misses must evict before constructing another runner.";
-
-    config.moe_rebalance.release_raw_expert_weights = false;
-    EXPECT_TRUE(overlayModelContextCanSeedNewRunner(config))
-        << "ModelContext reuse is only valid when raw expert payloads remain "
-           "available for subsequent runner construction.";
-    EXPECT_TRUE(overlayPipelineCanKeepDistinctRunnerEntries(config));
-}
-
-TEST_P(Qwen36MoEExpertOverlayParityTest, PrefillParity)
-{
-    if (GetParam().decode_snapshots_only)
-        GTEST_SKIP() << "decode-only long-context config";
-    {
-        auto scope = profileParityScope("expert_overlay.setup_pipeline");
-        ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    }
-    ParityTestSummary summary;
+    ParityTestSummary prefill;
     {
         auto scope = profileParityScope("expert_overlay.run_prefill_parity");
-        summary = runPrefillParity();
+        prefill = runPrefillParity();
     }
     {
         auto scope = profileParityScope("expert_overlay.assert_prefill_parity");
-        assertParity(summary);
+        assertParity(prefill);
     }
-}
+    assertProductionParitySnapshotInfrastructure();
+    activeClearSnapshots();
+    activeClearCache();
 
-TEST_P(Qwen36MoEExpertOverlayParityTest, DecodeParity)
-{
-    if (GetParam().decode_snapshots_only)
-        GTEST_SKIP() << "decode-only long-context config";
-    {
-        auto scope = profileParityScope("expert_overlay.setup_pipeline");
-        ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    }
-    if (!decodeWorkAvailable())
-        GTEST_SKIP() << "Decode snapshots or decode token metadata are unavailable";
-    DecodeParitySummary summary;
-    {
-        auto scope = profileParityScope("expert_overlay.run_decode_parity");
-        summary = runDecodeParity();
-    }
-    {
-        auto scope = profileParityScope("expert_overlay.assert_decode_parity");
-        assertDecodeParity(summary);
-    }
-}
-
-TEST_P(Qwen36MoEExpertOverlayParityTest, LongContextDecodeParity)
-{
-    if (!GetParam().decode_snapshots_only)
-        GTEST_SKIP() << "short-context config";
-    {
-        auto scope = profileParityScope("expert_overlay.setup_pipeline");
-        ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    }
-    if (!decodeWorkAvailable())
-        GTEST_SKIP() << "Decode snapshots or decode token metadata are unavailable";
     ASSERT_TRUE(PerfStatsCollector::isEnabled())
-        << "Long-context ExpertOverlay parity requires PerfStats counter "
-           "collection so Dynamic/LLEP planner, movement, and health paths "
-           "are certified.";
-    PerfStatsCollector::reset();
-    DecodeParitySummary summary;
+        << "ExpertOverlay production parity requires structured graph evidence";
+    DecodeParitySummary decode;
     {
         auto scope = profileParityScope("expert_overlay.run_decode_parity");
-        summary = runDecodeParity();
+        decode = runDecodeParity();
     }
+    expectRoutedExpertOwnerSelectionPerfPath(
+        GetParam(),
+        PerfStatsCollector::snapshot({"moe_placement"}),
+        static_cast<size_t>(parityLayerCount()));
     const auto rebalance_records =
         PerfStatsCollector::snapshot({"moe_rebalance"});
-    expectLongContextExpertOverlayPerfPath(
-        GetParam(),
-        rebalance_records);
+    if (GetParam().policy_scenario ==
+        ExpertOverlayPolicyScenario::StaticOwnership)
+    {
+        expectNoMoEExpertMovement(
+            rebalance_records,
+            GetParam().name + " static expert overlay");
+    }
+    if (GetParam().policy_scenario !=
+        ExpertOverlayPolicyScenario::StaticOwnership)
+    {
+        expectMovementPositiveExpertOverlayPerfPath(
+            GetParam(),
+            rebalance_records);
+    }
     {
         auto scope = profileParityScope("expert_overlay.assert_decode_parity");
-        assertDecodeParity(summary);
+        assertDecodeParity(decode);
     }
-}
-
-TEST_P(Qwen36MoEExpertOverlayParityTest, SnapshotInfrastructure)
-{
-    if (GetParam().decode_snapshots_only)
-        GTEST_SKIP() << "decode-only long-context config";
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    auto embedding = loadPyTorchSnapshot("EMBEDDING");
-    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
-
-    auto policy = parityGraphSnapshotPolicy(ParityForwardPhase::Prefill);
-    const int terminal_layer = std::max(0, parityLayerCount() - 1);
-    policy.required_prefill_snapshot_keys = {
-        "EMBEDDING",
-        "LM_HEAD",
-        "layer" + std::to_string(terminal_layer) + "_FFN_RESIDUAL",
-    };
-    policy.prefill_snapshot_capture_filter = policy.required_prefill_snapshot_keys;
-
-    std::vector<int> snapshot_tokens;
-    try
-    {
-        snapshot_tokens = makeBoundedPrefillTokens(
-            config_.token_ids,
-            GetParam().max_seq_len);
-    }
-    catch (const std::exception &e)
-    {
-        FAIL() << e.what();
-    }
-    ASSERT_FALSE(snapshot_tokens.empty());
-
-    ASSERT_TRUE(runParityForwardWithPolicy(
-        ParityForwardPhase::Prefill,
-        snapshot_tokens.data(),
-        static_cast<int>(snapshot_tokens.size()),
-        policy));
-
-    auto keys = activeSnapshotKeys();
-    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
-
-    EXPECT_NE(std::find(keys.begin(), keys.end(), "EMBEDDING"), keys.end())
-        << "Missing EMBEDDING snapshot";
-    EXPECT_NE(std::find(keys.begin(), keys.end(), "LM_HEAD"), keys.end())
-        << "Missing LM_HEAD snapshot";
-
-    bool has_ffn_residual = false;
-    for (const auto &key : keys)
-    {
-        if (key.find("FFN_RESIDUAL") != std::string::npos)
-        {
-            has_ffn_residual = true;
-            break;
-        }
-    }
-    EXPECT_TRUE(has_ffn_residual) << "Missing FFN_RESIDUAL snapshot";
+    finishProductionParityEvidence();
 }
 
 /**
@@ -1409,7 +854,6 @@ int main(int argc, char **argv)
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
 
-    clearExpertOverlayPipelineCache();
     GlobalBackendRouter::shutdown();
     GPUDeviceContextPool::instance().shutdown();
 

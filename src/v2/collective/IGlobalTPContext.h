@@ -142,6 +142,63 @@ namespace llaminar2
         }
 
         /**
+         * @brief Gather variable-count fixed-width FP32 records to one root.
+         *
+         * Every participant contributes `local_record_count` contiguous records
+         * of `record_width_elements` floats. The root-local block appears first;
+         * remote participant blocks may follow in arrival order. Callers must
+         * therefore carry an explicit record identity and must not infer semantic
+         * order from packed position. Non-root receive storage is ignored.
+         * Implementations must use preallocated protocol metadata and must not
+         * emulate this transaction with a dense allreduce or a preliminary count
+         * collective.
+         *
+         * This operation is intentionally rooted: canonical CPU MoE publication
+         * performs its ordered arithmetic once, then broadcasts a compact final
+         * row. Replicating sparse records to every participant would restore the
+         * avoidable `top_k`-scaled communication cost.
+         *
+         * @param local_records Contiguous local record payload.
+         * @param local_record_count Number of records contributed locally.
+         * @param root_records Root receive storage; may alias `local_records`.
+         * @param root_record_capacity Capacity of root storage in records.
+         * @param record_width_elements Width of one record in FP32 elements.
+         * @param root_index Fixed root participant index.
+         * @param gathered_record_count Total records received on root; zero on
+         *        non-root participants.
+         * @param stage_name Stable graph-stage identity for diagnostics.
+         * @return true only after the complete rooted gather finishes.
+         */
+        virtual bool gatherVariableFloatRecordsToRoot(
+            const float *local_records,
+            size_t local_record_count,
+            float *root_records,
+            size_t root_record_capacity,
+            size_t record_width_elements,
+            int root_index,
+            size_t &gathered_record_count,
+            const std::string &stage_name) = 0;
+
+        /**
+         * @brief Broadcast an exact FP32 tensor prefix from one root.
+         *
+         * Unlike `broadcast(TensorBase*)`, this method carries the active
+         * element count explicitly. Bucket-capacity padding and unrelated arena
+         * tail storage must not become collective payload by accident.
+         *
+         * @param tensor Preallocated host tensor on every participant.
+         * @param element_count Number of leading FP32 elements to broadcast.
+         * @param root_index Fixed source participant index.
+         * @param stage_name Stable graph-stage identity for diagnostics.
+         * @return true only when the backend completes the broadcast.
+         */
+        virtual bool broadcastFloatElements(
+            TensorBase *tensor,
+            size_t element_count,
+            int root_index,
+            const std::string &stage_name) = 0;
+
+        /**
          * @brief Point-to-point send to another rank in domain
          *
          * Blocking send of tensor data to another participant in this domain.

@@ -16,6 +16,7 @@
  */
 
 #include "ROCmFloatingPointGemmKernel.h"
+#include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "HipBLASGemmKernel.h"
 #include "backends/ComputeBackend.h"   // DeviceManager
 #include "backends/DeviceId.h"         // DeviceId for cache lookup
@@ -85,7 +86,6 @@ namespace llaminar2
     {
         namespace
         {
-            constexpr size_t MAX_FP32_BATCHED_PROJECTIONS = 8;
             std::atomic<uint32_t> g_rocm_fp32_gemm_workspace_slice_counter{0};
         }
 
@@ -127,13 +127,6 @@ namespace llaminar2
                 LOG_WARN("[ROCmFloatingPointGemmKernel] Precision mismatch: requested "
                          << static_cast<int>(precision) << " but tensor is "
                          << static_cast<int>(wt));
-            }
-
-            // Warn about BF16 emulation on MI50
-            if (precision == Precision::BF16 || wt == TensorType::BF16)
-            {
-                LOG_WARN("[ROCmFloatingPointGemmKernel] BF16 will be emulated via FP32 - "
-                         "MI50 (gfx906) has no native BF16 support");
             }
 
             // Get dimensions
@@ -178,13 +171,6 @@ namespace llaminar2
                 throw std::runtime_error("[ROCmFloatingPointGemmKernel] Null device weight pointer");
             }
 
-            // Warn about BF16 emulation on MI50
-            if (precision == Precision::BF16)
-            {
-                LOG_WARN("[ROCmFloatingPointGemmKernel] BF16 will be emulated via FP32 - "
-                         "MI50 (gfx906) has no native BF16 support");
-            }
-
             // Get shared hipBLAS kernel from DeviceKernelCache
             DeviceId device = DeviceId::rocm(rocm_device_id_);
             hipblas_kernel_ = DeviceKernelCache::getKernel<HipBLASGemmKernel>(device, KernelType::BLAS_GEMM);
@@ -199,6 +185,34 @@ namespace llaminar2
             d_batch_A_ptrs_ = nullptr;
             d_batch_B_ptrs_ = nullptr;
             d_batch_C_ptrs_ = nullptr;
+        }
+
+        bool ROCmFloatingPointGemmKernel::exportContiguousFloatingPointWeights(
+            ContiguousFloatingPointWeightDescriptor &out) const
+        {
+            TensorType type = TensorType::FP32;
+            std::size_t element_bytes = sizeof(float);
+            switch (precision_)
+            {
+            case Precision::FP16:
+                type = TensorType::FP16;
+                element_bytes = sizeof(std::uint16_t);
+                break;
+            case Precision::BF16:
+                type = TensorType::BF16;
+                element_bytes = sizeof(std::uint16_t);
+                break;
+            case Precision::FP32:
+                break;
+            }
+            out = {
+                .data = d_weights_,
+                .type = type,
+                .n = static_cast<int>(N_),
+                .k = static_cast<int>(K_),
+                .bytes = N_ * K_ * element_bytes,
+            };
+            return out.valid();
         }
 
         ROCmFloatingPointGemmKernel::ROCmFloatingPointGemmKernel(ROCmFloatingPointGemmKernel &&other) noexcept
@@ -273,6 +287,11 @@ namespace llaminar2
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Null input or output tensor");
                 return false;
             }
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] No explicit HIP stream is bound");
+                return false;
+            }
 
             // Get dimensions from tensors
             int m = static_cast<int>(A->rows());
@@ -293,12 +312,19 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
         {
-            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_ROCBLAS, static_cast<hipStream_t>(gpu_stream_));
             if (!A || !C)
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Null input or output tensor");
                 return false;
             }
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] No explicit HIP stream is bound");
+                return false;
+            }
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(
+                ROCmKernelType::GEMM_ROCBLAS,
+                static_cast<hipStream_t>(gpu_stream_));
 
             // For now, only support FP32 I/O
             // TODO: Add BF16/FP16 activation support
@@ -563,7 +589,8 @@ namespace llaminar2
             // Use fused GEMM+bias when bias is provided, otherwise use regular GEMM
             if (d_bias)
             {
-                bool success = hipblas_kernel_->execute_with_bias(
+                bool success = hipblas_kernel_->executeWithBiasOnStream(
+                    ExplicitGPUStream{gpu_stream_},
                     d_A,                                    // d_A
                     static_cast<const float *>(d_weights_), // d_B
                     d_C,                                    // d_C
@@ -584,7 +611,8 @@ namespace llaminar2
             }
             else
             {
-                bool success = hipblas_kernel_->execute(
+                bool success = hipblas_kernel_->executeOnStream(
+                    ExplicitGPUStream{gpu_stream_},
                     d_A,                                    // d_A
                     static_cast<const float *>(d_weights_), // d_B
                     d_C,                                    // d_C
@@ -660,10 +688,11 @@ namespace llaminar2
             const size_t count = a_ptrs.size();
             if (count == 0 || b_ptrs.size() != count || c_ptrs.size() != count)
                 return false;
-            if (count > MAX_FP32_BATCHED_PROJECTIONS)
+            if (count > floating_gemm_abi::kMaxBatchedProjections)
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel] Batched FP32 projection group exceeds workspace capacity: "
-                          << count << " > " << MAX_FP32_BATCHED_PROJECTIONS);
+                          << count << " > "
+                          << floating_gemm_abi::kMaxBatchedProjections);
                 return false;
             }
             if (!validateBatchedPointerWorkspace(workspace, count))
@@ -824,7 +853,8 @@ namespace llaminar2
                     seed.n > 0 && seed.n <= 64 &&
                     k > 0 &&
                     batch_count > 0 &&
-                    batch_count <= static_cast<int>(MAX_FP32_BATCHED_PROJECTIONS);
+                    batch_count <= static_cast<int>(
+                        floating_gemm_abi::kMaxBatchedProjections);
 
                 if (use_small_n_fp32)
                 {
@@ -862,7 +892,8 @@ namespace llaminar2
                 }
                 else
                 {
-                    if (!hipblas_kernel_->execute_batched(
+                    if (!hipblas_kernel_->executeBatchedOnStream(
+                            ExplicitGPUStream{gpu_stream_},
                             d_batch_A_ptrs_,
                             d_batch_B_ptrs_,
                             d_batch_C_ptrs_,
@@ -1021,7 +1052,9 @@ namespace llaminar2
                 while (group_offset < group_indices.size())
                 {
                     const size_t group_count =
-                        std::min(MAX_FP32_BATCHED_PROJECTIONS, group_indices.size() - group_offset);
+                        std::min(
+                            floating_gemm_abi::kMaxBatchedProjections,
+                            group_indices.size() - group_offset);
                     std::vector<const float *> a_ptrs(group_count, d_input);
                     std::vector<const float *> b_ptrs;
                     std::vector<float *> c_ptrs;
@@ -1343,19 +1376,12 @@ namespace llaminar2
         void ROCmFloatingPointGemmKernel::bindGPUStream(ExplicitGPUStream stream)
         {
             gpu_stream_ = stream.get();
-            if (hipblas_kernel_)
-            {
-                hipblas_kernel_->bindStream(stream);
-            }
+            /* The shared hipBLAS handle is bound atomically with each launch. */
         }
 
         void ROCmFloatingPointGemmKernel::clearGPUStreamBinding()
         {
             gpu_stream_ = nullptr;
-            if (hipblas_kernel_)
-            {
-                hipblas_kernel_->clearStreamBinding();
-            }
         }
 
         // =====================================================================
@@ -1369,7 +1395,9 @@ namespace llaminar2
         {
             WorkspaceRequirements reqs;
 
-            const size_t pointer_array_bytes = MAX_FP32_BATCHED_PROJECTIONS * sizeof(float *);
+            const size_t pointer_array_bytes =
+                floating_gemm_abi::kMaxBatchedProjections *
+                sizeof(float *);
             reqs.buffers.push_back({batchAPtrsBufferName(), pointer_array_bytes, 256, true});
             reqs.buffers.push_back({batchBPtrsBufferName(), pointer_array_bytes, 256, true});
             reqs.buffers.push_back({batchCPtrsBufferName(), pointer_array_bytes, 256, true});

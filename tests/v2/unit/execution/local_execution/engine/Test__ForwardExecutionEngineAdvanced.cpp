@@ -61,6 +61,7 @@ namespace
         uint64_t workspace_generation = 0;
         int sync_logits_calls = 0;
         TensorBase *last_published_logits = nullptr;
+        TensorBase *last_published_hidden = nullptr;
         int committed_forward_output_calls = 0;
         int build_decode_policy_calls = 0;
         int resolve_pp_copy_calls = 0;
@@ -73,6 +74,8 @@ namespace
         int graph_node_count = 3; // Stages in built graph (0 = empty)
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
+        TensorBase *graph_output_logits = nullptr;
+        TensorBase *graph_output_hidden = nullptr;
 
         // ----- Captured Input -----
         int last_build_seq_len = -1;
@@ -93,6 +96,8 @@ namespace
 
             ComputeGraph graph;
             ForwardOutput output{};
+            output.logits = graph_output_logits;
+            output.hidden = graph_output_hidden;
 
             // Build a graph with actual mock stages so it's non-empty
             for (int i = 0; i < graph_node_count; ++i)
@@ -147,14 +152,13 @@ namespace
             return workspace_generation;
         }
 
-        bool publishLogitsAtBoundary(
-            TensorBase *logits,
-            IDeviceContext *ctx,
-            void *producer_stream) override
+        bool publishForwardResultAtBoundary(
+            const ForwardOutput &output,
+            IDeviceContext *ctx) override
         {
-            last_published_logits = logits;
+            last_published_logits = output.logits;
+            last_published_hidden = output.hidden;
             (void)ctx;
-            (void)producer_stream;
             sync_logits_calls++;
             call_sequence.push_back("syncLogits");
             return true;
@@ -719,6 +723,33 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PPStageConfig_BuildReceivesInput)
     // The host receives the input; it's the host's responsibility to use
     // pp_stage_config from its own state
     EXPECT_EQ(host.last_build_seq_len, 1);
+}
+
+/**
+ * @brief A non-head PP graph publishes its declared hidden output, not logits.
+ */
+TEST_F(Test__ForwardExecutionEngineAdvanced,
+       PPNonTerminalStagePublishesHiddenForwardResult)
+{
+    FactoryPPStageConfig pp{
+        .first_layer = 0,
+        .last_layer = 12,
+        .has_embedding = true,
+        .has_lm_head = false};
+    auto engine = makeEngine(/*cache_enabled=*/false, /*has_pp=*/false, pp);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 1;
+    FP32Tensor hidden(std::vector<size_t>{1, 8}, DeviceId::cpu());
+    host.graph_output_hidden = &hidden;
+
+    TestInput prefill(2);
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(prefill.input, output, host));
+
+    EXPECT_EQ(host.sync_logits_calls, 1);
+    EXPECT_EQ(host.last_published_logits, nullptr);
+    EXPECT_EQ(host.last_published_hidden, &hidden);
+    EXPECT_EQ(output.hidden, &hidden);
 }
 
 // =========================================================================

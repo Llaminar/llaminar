@@ -479,13 +479,17 @@ namespace
                 return it != record.tags.end() && it->second == std::to_string(expected);
             };
             const auto policy = record.tags.find("execution_policy");
+            const auto materialization =
+                record.tags.find("snapshot_materialization");
             found = found ||
                     (tag_equals("verifier_rows", verifier_rows) &&
                      tag_equals("n_heads", n_heads) &&
                      tag_equals("d_k", d_k) &&
                      tag_equals("d_v", d_v) &&
                      policy != record.tags.end() &&
-                     policy->second == "head_grouped_recurrence");
+                     policy->second == "head_grouped_recurrence" &&
+                     materialization != record.tags.end() &&
+                     materialization->second == "direct_row_destination");
         }
         EXPECT_TRUE(found)
             << "CPU grouped verifier recurrence did not publish its production route counter\n"
@@ -899,14 +903,43 @@ public:
 class MockGatedDeltaNet : public ITensorGatedDeltaNet
 {
 public:
+    bool merged_qkv_result = true;
+    int merged_qkv_calls = 0;
+    int last_merged_qkv_stride = 0;
+    int last_merged_seq_len = 0;
+    int last_merged_n_k_heads = 0;
+    int last_merged_n_heads = 0;
+    int last_merged_d_k = 0;
+    int last_merged_d_v = 0;
+    int last_merged_global_v_head_offset = 0;
+
     MOCK_METHOD(bool, chunk_forward,
                 (const float *Q, const float *K, const float *V,
                  const float *alpha, const float *beta_raw,
                  const float *A_log, const float *dt_bias,
                  float *output, float *state,
                  int seq_len, int n_heads, int d_k, int d_v,
-                 int chunk_size, bool use_qk_l2norm),
+                int chunk_size, bool use_qk_l2norm),
                 (override));
+
+    bool chunkForwardMergedQKV(
+        const float *, int qkv_stride,
+        const float *, const float *,
+        const float *, const float *,
+        float *, float *,
+        int seq_len, int n_k_heads, int n_heads, int d_k, int d_v,
+        int global_v_head_offset, int, bool) override
+    {
+        ++merged_qkv_calls;
+        last_merged_qkv_stride = qkv_stride;
+        last_merged_seq_len = seq_len;
+        last_merged_n_k_heads = n_k_heads;
+        last_merged_n_heads = n_heads;
+        last_merged_d_k = d_k;
+        last_merged_d_v = d_v;
+        last_merged_global_v_head_offset = global_v_head_offset;
+        return merged_qkv_result;
+    }
 
     MOCK_METHOD(bool, recurrent_step,
                 (const float *q, const float *k, const float *v,
@@ -1040,6 +1073,17 @@ public:
         float *, float *,
         int, int, int, int,
         int, bool) override
+    {
+        return true;
+    }
+
+    bool chunkForwardMergedQKV(
+        const float *, int,
+        const float *, const float *,
+        const float *, const float *,
+        float *, float *,
+        int, int, int, int, int,
+        int, int, bool) override
     {
         return true;
     }
@@ -2165,6 +2209,303 @@ TEST(Test__GDNKernels, CPUGatedDeltaNetLongPrefillMTotalityMatchesSerialDecodeBy
         {1, 2, 4, 8, 9, 16});
 }
 
+/**
+ * @brief Proves direct merged-QKV recurrence is serial-row byte equivalent.
+ *
+ * The ordinary CPU graph path consumes fused projection rows without
+ * materializing separate Q, K, and V matrices. This regression independently
+ * expands those rows into the exact local-head view and advances a serial
+ * `recurrent_step()` oracle. Identity, GQA expansion, and TP head-selection
+ * geometries cover every modular mapping regime; non-compact source strides
+ * prove that row padding cannot leak into recurrence arithmetic.
+ */
+TEST(Test__GDNKernels, CPUMergedQKVOrdinaryPathMatchesSerialDecodeByteExact)
+{
+    llaminar::v2::ThreadCountGuard worker_count(4);
+
+    struct Geometry
+    {
+        int n_k_heads;
+        int n_heads;
+        int d_k;
+        int d_v;
+        int global_v_head_offset;
+        int row_padding;
+        const char *name;
+    };
+
+    const std::array<Geometry, 3> geometries{{
+        {.n_k_heads = 4,
+         .n_heads = 4,
+         .d_k = 16,
+         .d_v = 32,
+         .global_v_head_offset = 0,
+         .row_padding = 0,
+         .name = "identity"},
+        {.n_k_heads = 2,
+         .n_heads = 4,
+         .d_k = 16,
+         .d_v = 32,
+         .global_v_head_offset = 1,
+         .row_padding = 3,
+         .name = "gqa_expansion"},
+        {.n_k_heads = 8,
+         .n_heads = 4,
+         .d_k = 16,
+         .d_v = 32,
+         .global_v_head_offset = 5,
+         .row_padding = 7,
+         .name = "tp_selection"},
+    }};
+
+    for (const Geometry &geometry : geometries)
+    {
+        const int q_src_dim = geometry.n_k_heads * geometry.d_k;
+        const int k_src_dim = geometry.n_k_heads * geometry.d_k;
+        const int v_stride = geometry.n_heads * geometry.d_v;
+        const int compact_stride = q_src_dim + k_src_dim + v_stride;
+        const int qkv_stride = compact_stride + geometry.row_padding;
+        const int local_qk_stride = geometry.n_heads * geometry.d_k;
+        const int state_floats =
+            geometry.n_heads * geometry.d_k * geometry.d_v;
+
+        for (const int rows : {1, 2, 9, 64})
+        {
+            std::vector<float> merged(
+                static_cast<size_t>(rows) * qkv_stride,
+                9876.0f);
+            std::vector<float> expanded_q(
+                static_cast<size_t>(rows) * local_qk_stride);
+            std::vector<float> expanded_k(expanded_q.size());
+            std::vector<float> expanded_v(
+                static_cast<size_t>(rows) * v_stride);
+            std::vector<float> alpha(
+                static_cast<size_t>(rows) * geometry.n_heads);
+            std::vector<float> beta(alpha.size());
+            std::vector<float> a_log(
+                static_cast<size_t>(geometry.n_heads));
+            std::vector<float> dt_bias(
+                static_cast<size_t>(geometry.n_heads));
+            std::vector<float> initial_state(
+                static_cast<size_t>(state_floats));
+
+            for (int row = 0; row < rows; ++row)
+            {
+                float *const merged_row =
+                    merged.data() + static_cast<size_t>(row) * qkv_stride;
+                for (int column = 0; column < compact_stride; ++column)
+                {
+                    const int ordinal = row * compact_stride + column;
+                    merged_row[column] =
+                        0.0023f * static_cast<float>((ordinal % 53) - 26);
+                }
+
+                for (int head = 0; head < geometry.n_heads; ++head)
+                {
+                    const int qk_head =
+                        (head + geometry.global_v_head_offset) %
+                        geometry.n_k_heads;
+                    std::copy_n(
+                        merged_row + qk_head * geometry.d_k,
+                        geometry.d_k,
+                        expanded_q.data() +
+                            static_cast<size_t>(row) * local_qk_stride +
+                            head * geometry.d_k);
+                    std::copy_n(
+                        merged_row + q_src_dim + qk_head * geometry.d_k,
+                        geometry.d_k,
+                        expanded_k.data() +
+                            static_cast<size_t>(row) * local_qk_stride +
+                            head * geometry.d_k);
+                    std::copy_n(
+                        merged_row + q_src_dim + k_src_dim +
+                            head * geometry.d_v,
+                        geometry.d_v,
+                        expanded_v.data() +
+                            static_cast<size_t>(row) * v_stride +
+                            head * geometry.d_v);
+                }
+            }
+            for (size_t i = 0; i < alpha.size(); ++i)
+            {
+                alpha[i] = -0.19f + 0.0037f * static_cast<float>(i % 31);
+                beta[i] = 0.13f - 0.0029f * static_cast<float>(i % 37);
+            }
+            for (int head = 0; head < geometry.n_heads; ++head)
+            {
+                a_log[static_cast<size_t>(head)] =
+                    -0.41f - 0.011f * static_cast<float>(head);
+                dt_bias[static_cast<size_t>(head)] =
+                    0.017f * static_cast<float>(head - 2);
+            }
+            for (int i = 0; i < state_floats; ++i)
+            {
+                initial_state[static_cast<size_t>(i)] =
+                    0.00017f * static_cast<float>((i % 47) - 23);
+            }
+
+            for (const bool use_qk_l2norm : {false, true})
+            {
+                CPUGatedDeltaNet merged_kernel;
+                CPUGatedDeltaNet serial_kernel;
+                std::vector<float> merged_state = initial_state;
+                std::vector<float> serial_state = initial_state;
+                std::vector<float> merged_output(
+                    static_cast<size_t>(rows) * v_stride,
+                    0.0f);
+                std::vector<float> serial_output(merged_output.size(), 0.0f);
+
+                ASSERT_TRUE(merged_kernel.chunkForwardMergedQKV(
+                    merged.data(), qkv_stride,
+                    alpha.data(), beta.data(), a_log.data(), dt_bias.data(),
+                    merged_output.data(), merged_state.data(),
+                    rows, geometry.n_k_heads, geometry.n_heads,
+                    geometry.d_k, geometry.d_v,
+                    geometry.global_v_head_offset,
+                    /*chunk_size=*/64,
+                    use_qk_l2norm));
+
+                for (int row = 0; row < rows; ++row)
+                {
+                    ASSERT_TRUE(serial_kernel.recurrent_step(
+                        expanded_q.data() +
+                            static_cast<size_t>(row) * local_qk_stride,
+                        expanded_k.data() +
+                            static_cast<size_t>(row) * local_qk_stride,
+                        expanded_v.data() +
+                            static_cast<size_t>(row) * v_stride,
+                        alpha.data() +
+                            static_cast<size_t>(row) * geometry.n_heads,
+                        beta.data() +
+                            static_cast<size_t>(row) * geometry.n_heads,
+                        a_log.data(), dt_bias.data(),
+                        serial_output.data() +
+                            static_cast<size_t>(row) * v_stride,
+                        serial_state.data(),
+                        geometry.n_heads, geometry.d_k, geometry.d_v,
+                        use_qk_l2norm));
+                }
+
+                const std::string context =
+                    std::string("CPU direct merged QKV ") + geometry.name +
+                    " M=" + std::to_string(rows) +
+                    " l2=" + (use_qk_l2norm ? "true" : "false");
+                expectByteExactFP32(
+                    merged_output.data(),
+                    serial_output.data(),
+                    serial_output.size(),
+                    context + " output");
+                expectByteExactFP32(
+                    merged_state.data(),
+                    serial_state.data(),
+                    serial_state.size(),
+                    context + " terminal state");
+            }
+        }
+    }
+}
+
+/**
+ * @brief Proves CPU GDN prefill is total and byte-stable across thread counts.
+ *
+ * A recurrence head is the smallest economical work item: token order cannot
+ * be parallelized, while splitting value columns duplicates Q/K traffic. The
+ * production scheduler therefore uses every configured worker up to the local
+ * head count and saturates beyond it. This regression exercises counts below,
+ * equal to, and above that boundary, including non-powers of two, and requires
+ * exactly the same output and terminal state as one-worker execution.
+ */
+TEST(Test__GDNKernels, CPUGatedDeltaNetPrefillIsByteExactAcrossPositiveThreadCounts)
+{
+    static constexpr int rows = 9;
+    static constexpr int n_heads = 4;
+    static constexpr int d_k = 32;
+    static constexpr int d_v = 128;
+    static constexpr int qk_stride = n_heads * d_k;
+    static constexpr int v_stride = n_heads * d_v;
+    static constexpr int state_floats = n_heads * d_k * d_v;
+
+    std::vector<float> q(static_cast<size_t>(rows) * qk_stride);
+    std::vector<float> k(q.size());
+    std::vector<float> v(static_cast<size_t>(rows) * v_stride);
+    std::vector<float> alpha(static_cast<size_t>(rows) * n_heads);
+    std::vector<float> beta(alpha.size());
+    std::vector<float> a_log(static_cast<size_t>(n_heads));
+    std::vector<float> dt_bias(static_cast<size_t>(n_heads));
+    std::vector<float> initial_state(static_cast<size_t>(state_floats));
+
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        q[i] = 0.0019f * static_cast<float>(static_cast<int>(i % 31) - 15);
+        k[i] = -0.0023f * static_cast<float>(static_cast<int>(i % 37) - 18);
+    }
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = 0.0027f * static_cast<float>(static_cast<int>(i % 29) - 14);
+    for (size_t i = 0; i < alpha.size(); ++i)
+    {
+        alpha[i] = -0.13f + 0.0021f * static_cast<float>(i % 41);
+        beta[i] = 0.09f - 0.0017f * static_cast<float>(i % 43);
+    }
+    for (int head = 0; head < n_heads; ++head)
+    {
+        a_log[static_cast<size_t>(head)] = -0.31f - 0.007f * head;
+        dt_bias[static_cast<size_t>(head)] = 0.012f * (head - 2);
+    }
+    for (int i = 0; i < state_floats; ++i)
+    {
+        initial_state[static_cast<size_t>(i)] =
+            0.00013f * static_cast<float>((i % 47) - 23);
+    }
+
+    for (const bool use_qk_l2norm : {false, true})
+    {
+        std::vector<float> reference_state = initial_state;
+        std::vector<float> reference_output(
+            static_cast<size_t>(rows) * v_stride,
+            0.0f);
+        {
+            llaminar::v2::ThreadCountGuard one_worker(1);
+            CPUGatedDeltaNet reference_kernel;
+            ASSERT_TRUE(reference_kernel.chunk_forward(
+                q.data(), k.data(), v.data(),
+                alpha.data(), beta.data(), a_log.data(), dt_bias.data(),
+                reference_output.data(), reference_state.data(),
+                rows, n_heads, d_k, d_v,
+                /*chunk_size=*/64, use_qk_l2norm));
+        }
+
+        for (const int thread_count : {2, 3, 4, 5, 7, 8, 16, 31})
+        {
+            std::vector<float> candidate_state = initial_state;
+            std::vector<float> candidate_output(reference_output.size(), 0.0f);
+            {
+                llaminar::v2::ThreadCountGuard workers(thread_count);
+                CPUGatedDeltaNet candidate_kernel;
+                ASSERT_TRUE(candidate_kernel.chunk_forward(
+                    q.data(), k.data(), v.data(),
+                    alpha.data(), beta.data(), a_log.data(), dt_bias.data(),
+                    candidate_output.data(), candidate_state.data(),
+                    rows, n_heads, d_k, d_v,
+                    /*chunk_size=*/64, use_qk_l2norm));
+            }
+
+            const std::string context =
+                "CPU GDN threads=" + std::to_string(thread_count) +
+                " l2=" + (use_qk_l2norm ? "true" : "false");
+            expectByteExactFP32(
+                candidate_output.data(),
+                reference_output.data(),
+                reference_output.size(),
+                context + " output");
+            expectByteExactFP32(
+                candidate_state.data(),
+                reference_state.data(),
+                reference_state.size(),
+                context + " terminal state");
+        }
+    }
+}
+
 TEST(Test__GDNKernels, CPURecurrenceStageMergedQKVVerifierCaptureMatchesSerialDecode)
 {
     ensureCPUBackendForWorkspace();
@@ -2298,28 +2639,77 @@ TEST(Test__GDNKernels, CPURecurrenceStageMergedQKVVerifierCaptureMatchesSerialDe
                     serial_output.data() + static_cast<size_t>(row) * output_stride);
     }
 
-    double max_state_diff = 0.0;
-    for (int i = 0; i < state_floats; ++i)
-    {
-        max_state_diff = std::max(
-            max_state_diff,
-            static_cast<double>(std::abs(
-                verifier_state[static_cast<size_t>(i)] -
-                serial_state[static_cast<size_t>(i)])));
-    }
-    EXPECT_LE(max_state_diff, 1e-7)
-        << "Restored verifier capture row must equal serial row-1 state";
-
+    expectByteExactFP32(
+        verifier_state.data(),
+        serial_state.data(),
+        serial_state.size(),
+        "CPU merged-QKV restored verifier state");
     const float *verifier_out = verifier_output->data();
-    double max_output_diff = 0.0;
-    for (size_t i = 0; i < serial_output.size(); ++i)
-    {
-        max_output_diff = std::max(
-            max_output_diff,
-            static_cast<double>(std::abs(verifier_out[i] - serial_output[i])));
-    }
-    EXPECT_LE(max_output_diff, 1e-7)
-        << "Two-row verifier outputs must match serial decode-stage outputs";
+    expectByteExactFP32(
+        verifier_out,
+        serial_output.data(),
+        serial_output.size(),
+        "CPU merged-QKV verifier output");
+}
+
+/**
+ * @brief Live recurrence state may never alias immutable verifier snapshots.
+ *
+ * Direct snapshot materialization relies on the previous row remaining intact
+ * while the next row is produced. Rejecting overlap at the kernel boundary
+ * makes accidental live-state mutation and snapshot self-overwrite impossible.
+ */
+TEST(Test__GDNKernels, CPUMergedQKVVerifierRejectsOverlappingStateAndSnapshots)
+{
+    static constexpr int seq_len = 2;
+    static constexpr int n_heads = 2;
+    static constexpr int d_k = 8;
+    static constexpr int d_v = 8;
+    static constexpr int qkv_stride =
+        2 * n_heads * d_k + n_heads * d_v;
+    static constexpr int state_floats = n_heads * d_k * d_v;
+
+    std::vector<float> merged_qkv(
+        static_cast<size_t>(seq_len) * qkv_stride,
+        0.01f);
+    std::vector<float> alpha(
+        static_cast<size_t>(seq_len) * n_heads,
+        -0.2f);
+    std::vector<float> beta(
+        static_cast<size_t>(seq_len) * n_heads,
+        0.1f);
+    std::vector<float> a_log(n_heads, -0.4f);
+    std::vector<float> dt_bias(n_heads, 0.0f);
+    std::vector<float> output(
+        static_cast<size_t>(seq_len) * n_heads * d_v,
+        0.0f);
+    std::vector<float> state_and_snapshot_capacity(
+        static_cast<size_t>(seq_len) * state_floats,
+        0.005f);
+    const std::vector<float> original = state_and_snapshot_capacity;
+
+    CPUGatedDeltaNet kernel;
+    EXPECT_FALSE(kernel.chunkForwardMergedQKVWithStateSnapshots(
+        merged_qkv.data(),
+        qkv_stride,
+        alpha.data(),
+        beta.data(),
+        a_log.data(),
+        dt_bias.data(),
+        output.data(),
+        state_and_snapshot_capacity.data(),
+        seq_len,
+        n_heads,
+        n_heads,
+        d_k,
+        d_v,
+        /*global_v_head_offset=*/0,
+        /*chunk_size=*/64,
+        /*use_qk_l2norm=*/true,
+        state_and_snapshot_capacity.data(),
+        state_floats,
+        seq_len));
+    EXPECT_EQ(state_and_snapshot_capacity, original);
 }
 
 TEST(Test__GDNKernels, Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKernelDispatch)
@@ -2383,11 +2773,13 @@ public:
     explicit CountingProjectionGemm(float fill_value,
                                     bool supports_fused = false,
                                     bool fused_success = false,
-                                    std::optional<uint8_t> native_codebook = std::nullopt)
+                                    std::optional<uint8_t> native_codebook = std::nullopt,
+                                    std::optional<TensorType> floating_type = std::nullopt)
         : fill_value_(fill_value),
           supports_fused_(supports_fused),
           fused_success_(fused_success),
-          native_codebook_(native_codebook)
+          native_codebook_(native_codebook),
+          floating_type_(floating_type)
     {
     }
 
@@ -2405,6 +2797,25 @@ public:
         out.k = 32;
         out.blocks_per_row = 1;
         out.codebook_id = native_codebook_.value();
+        return out.valid();
+    }
+
+    bool exportContiguousFloatingPointWeights(
+        ContiguousFloatingPointWeightDescriptor &out) const override
+    {
+        out = {};
+        if (!floating_type_.has_value())
+            return false;
+
+        const TensorType type = floating_type_.value();
+        const size_t element_bytes = type == TensorType::FP32
+                                         ? sizeof(float)
+                                         : sizeof(uint16_t);
+        out.data = this;
+        out.type = type;
+        out.n = 1;
+        out.k = 1;
+        out.bytes = element_bytes;
         return out.valid();
     }
 
@@ -2470,6 +2881,7 @@ private:
     bool supports_fused_ = false;
     bool fused_success_ = false;
     std::optional<uint8_t> native_codebook_;
+    std::optional<TensorType> floating_type_;
 };
 
 // ============================================================================
@@ -2562,7 +2974,7 @@ TEST(Test__GDNKernels, Projection_BufferContract)
     SUCCEED(); // Contract creation doesn't crash
 }
 
-TEST(Test__GDNKernels, Projection_MixedKernelTypesUsePerProjectionFallback)
+TEST(Test__GDNKernels, Projection_MixedKernelTypesRejectMissingFusedContracts)
 {
     auto ctx = makeCPUContext();
 
@@ -2603,21 +3015,16 @@ TEST(Test__GDNKernels, Projection_MixedKernelTypesUsePerProjectionFallback)
     p.gemm_b = &b_gemm;
 
     GDNProjectionStage stage(p);
-    EXPECT_TRUE(stage.execute(ctx.get()));
+    EXPECT_FALSE(stage.execute(ctx.get()));
 
     EXPECT_EQ(qkv_gemm.fused_calls, 0);
     EXPECT_EQ(z_gemm.fused_calls, 0);
     EXPECT_EQ(a_gemm.fused_calls, 0);
     EXPECT_EQ(b_gemm.fused_calls, 0);
-    EXPECT_EQ(qkv_gemm.multiply_calls, 1);
-    EXPECT_EQ(z_gemm.multiply_calls, 1);
-    EXPECT_EQ(a_gemm.multiply_calls, 1);
-    EXPECT_EQ(b_gemm.multiply_calls, 1);
-
-    EXPECT_FLOAT_EQ(out_qkv->data()[0], 1.0f);
-    EXPECT_FLOAT_EQ(out_z->data()[0], 2.0f);
-    EXPECT_FLOAT_EQ(out_a->data()[0], 3.0f);
-    EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
+    EXPECT_EQ(qkv_gemm.multiply_calls, 0);
+    EXPECT_EQ(z_gemm.multiply_calls, 0);
+    EXPECT_EQ(a_gemm.multiply_calls, 0);
+    EXPECT_EQ(b_gemm.multiply_calls, 0);
 }
 
 TEST(Test__GDNKernels, Projection_MixedKernelTypesFuseSupportedSubgroups)
@@ -2636,8 +3043,8 @@ TEST(Test__GDNKernels, Projection_MixedKernelTypesFuseSupportedSubgroups)
 
     CountingProjectionGemm<0> qkv_gemm(1.0f, true, true);
     CountingProjectionGemm<0> z_gemm(2.0f, true, true);
-    CountingProjectionGemm<1> a_gemm(3.0f);
-    CountingProjectionGemm<1> b_gemm(4.0f);
+    CountingProjectionGemm<1> a_gemm(3.0f, true, true);
+    CountingProjectionGemm<1> b_gemm(4.0f, true, true);
 
     GDNProjectionStage::Params p;
     p.input = input.get();
@@ -2668,8 +3075,11 @@ TEST(Test__GDNKernels, Projection_MixedKernelTypesFuseSupportedSubgroups)
     EXPECT_EQ(z_gemm.fused_calls, 0);
     EXPECT_EQ(qkv_gemm.multiply_calls, 0);
     EXPECT_EQ(z_gemm.multiply_calls, 0);
-    EXPECT_EQ(a_gemm.multiply_calls, 1);
-    EXPECT_EQ(b_gemm.multiply_calls, 1);
+    EXPECT_EQ(a_gemm.fused_calls, 1);
+    EXPECT_EQ(a_gemm.fused_projection_count, 2);
+    EXPECT_EQ(b_gemm.fused_calls, 0);
+    EXPECT_EQ(a_gemm.multiply_calls, 0);
+    EXPECT_EQ(b_gemm.multiply_calls, 0);
 
     EXPECT_FLOAT_EQ(out_qkv->data()[0], 1.0f);
     EXPECT_FLOAT_EQ(out_z->data()[0], 2.0f);
@@ -2737,6 +3147,77 @@ TEST(Test__GDNKernels, Projection_SplitsNativeVNNIGroupsByCodebook)
     EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
 }
 
+TEST(Test__GDNKernels, Projection_SplitsOneFloatingKernelClassByPhysicalWeightType)
+{
+    auto ctx = makeCPUContext();
+
+    auto input = makeFP32Seq({2, 3});
+    auto w_qkv = makeFP32({3, 4});
+    auto out_qkv = makeFP32({2, 4});
+    auto w_z = makeFP32({3, 2});
+    auto out_z = makeFP32({2, 2});
+    auto w_a = makeFP32({3, 1});
+    auto out_a = makeFP32({2, 1});
+    auto w_b = makeFP32({3, 1});
+    auto out_b = makeFP32({2, 1});
+
+    /*
+     * CUDA and ROCm deliberately use one implementation class for all three
+     * floating weight types.  This fixture mirrors the real Qwen3.5 layout:
+     * BF16 qkv/z weights followed by FP32 alpha/beta weights.  The stage must
+     * dispatch two fused groups even though every engine has the same dynamic
+     * C++ type.
+     */
+    CountingProjectionGemm<0> qkv_gemm(
+        1.0f, true, true, std::nullopt, TensorType::BF16);
+    CountingProjectionGemm<0> z_gemm(
+        2.0f, true, true, std::nullopt, TensorType::BF16);
+    CountingProjectionGemm<0> a_gemm(
+        3.0f, true, true, std::nullopt, TensorType::FP32);
+    CountingProjectionGemm<0> b_gemm(
+        4.0f, true, true, std::nullopt, TensorType::FP32);
+
+    GDNProjectionStage::Params p;
+    p.input = input.get();
+    p.m = 2;
+    p.k = 3;
+    p.w_qkv = w_qkv.get();
+    p.output_qkv = out_qkv.get();
+    p.n_qkv = 4;
+    p.w_z = w_z.get();
+    p.output_z = out_z.get();
+    p.n_z = 2;
+    p.w_a = w_a.get();
+    p.output_a = out_a.get();
+    p.n_a = 1;
+    p.w_b = w_b.get();
+    p.output_b = out_b.get();
+    p.n_b = 1;
+    p.gemm_qkv = &qkv_gemm;
+    p.gemm_z = &z_gemm;
+    p.gemm_a = &a_gemm;
+    p.gemm_b = &b_gemm;
+
+    GDNProjectionStage stage(p);
+    ASSERT_TRUE(stage.execute(ctx.get()));
+
+    EXPECT_EQ(qkv_gemm.fused_calls, 1);
+    EXPECT_EQ(qkv_gemm.fused_projection_count, 2);
+    EXPECT_EQ(z_gemm.fused_calls, 0);
+    EXPECT_EQ(a_gemm.fused_calls, 1);
+    EXPECT_EQ(a_gemm.fused_projection_count, 2);
+    EXPECT_EQ(b_gemm.fused_calls, 0);
+    EXPECT_EQ(qkv_gemm.multiply_calls, 0);
+    EXPECT_EQ(z_gemm.multiply_calls, 0);
+    EXPECT_EQ(a_gemm.multiply_calls, 0);
+    EXPECT_EQ(b_gemm.multiply_calls, 0);
+
+    EXPECT_FLOAT_EQ(out_qkv->data()[0], 1.0f);
+    EXPECT_FLOAT_EQ(out_z->data()[0], 2.0f);
+    EXPECT_FLOAT_EQ(out_a->data()[0], 3.0f);
+    EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
+}
+
 TEST(Test__GDNKernels, Projection_FusedSubgroupFailureHardFails)
 {
     auto ctx = makeCPUContext();
@@ -2788,7 +3269,7 @@ TEST(Test__GDNKernels, Projection_FusedSubgroupFailureHardFails)
     EXPECT_EQ(b_gemm.multiply_calls, 0);
 }
 
-TEST(Test__GDNKernels, Projection_Qwen36NodeLocalTPPrefillShapeResolvesPreparedMixedFallback)
+TEST(Test__GDNKernels, Projection_Qwen36NodeTPPrefillShapeResolvesPreparedMixedFusedGroups)
 {
     auto ctx = makeCPUContext();
 
@@ -5714,6 +6195,79 @@ TEST(Test__GDNKernels, Recurrence_Prefill_DelegatesToChunkForward)
 
     GDNRecurrenceStage stage(p);
     EXPECT_TRUE(stage.execute(ctx.get()));
+}
+
+/**
+ * @brief A merged CPU graph input must use the mandatory direct-layout API.
+ *
+ * This is the stage-level architecture regression for the removed host
+ * materialization path. It verifies the complete TP mapping geometry passed to
+ * the backend and requires PerfStats to identify the production route.
+ */
+TEST(Test__GDNKernels, Recurrence_CPUMergedQKVUsesMandatoryDirectKernel)
+{
+    ScopedPerfStatsEnv perfstats;
+    static constexpr int rows = 4;
+    static constexpr int n_k_heads = 2;
+    static constexpr int n_heads = 4;
+    static constexpr int d_k = 4;
+    static constexpr int d_v = 4;
+    static constexpr int global_v_head_offset = 1;
+    static constexpr int qkv_stride =
+        2 * n_k_heads * d_k + n_heads * d_v;
+
+    auto merged = makeFP32Random(
+        {rows, qkv_stride}, 0.0f, 0.3f, 42);
+    auto alpha = makeFP32Const({rows, n_heads}, 0.0f);
+    auto beta = makeFP32Const({rows, n_heads}, 0.0f);
+    auto a_log = makeFP32Const({n_heads}, -0.5f);
+    auto dt_bias = makeFP32Const({n_heads}, 0.0f);
+    auto output = makeFP32({rows, n_heads * d_v});
+    std::vector<float> state(n_heads * d_k * d_v, 0.0f);
+    auto ctx = makeCPUContext();
+
+    MockGatedDeltaNet mock;
+    EXPECT_CALL(mock, chunk_forward(_, _, _, _, _, _, _, _, _, _, _, _, _, _, _))
+        .Times(0);
+    EXPECT_CALL(mock, recurrent_step(_, _, _, _, _, _, _, _, _, _, _, _, _))
+        .Times(0);
+
+    GDNRecurrenceStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.kernel = &mock;
+    params.Q = merged.get();
+    params.K = merged.get();
+    params.V = merged.get();
+    params.alpha = alpha.get();
+    params.beta = beta.get();
+    params.A_log = a_log.get();
+    params.dt_bias = dt_bias.get();
+    params.output = output.get();
+    params.recurrence_state = state.data();
+    params.seq_len = rows;
+    params.n_k_heads = n_k_heads;
+    params.n_heads = n_heads;
+    params.d_k = d_k;
+    params.d_v = d_v;
+    params.global_v_head_offset = global_v_head_offset;
+
+    GDNRecurrenceStage stage(params);
+    ASSERT_TRUE(stage.execute(ctx.get()));
+    EXPECT_EQ(mock.merged_qkv_calls, 1);
+    EXPECT_EQ(mock.last_merged_qkv_stride, qkv_stride);
+    EXPECT_EQ(mock.last_merged_seq_len, rows);
+    EXPECT_EQ(mock.last_merged_n_k_heads, n_k_heads);
+    EXPECT_EQ(mock.last_merged_n_heads, n_heads);
+    EXPECT_EQ(mock.last_merged_d_k, d_k);
+    EXPECT_EQ(mock.last_merged_d_v, d_v);
+    EXPECT_EQ(
+        mock.last_merged_global_v_head_offset,
+        global_v_head_offset);
+
+    const auto records = PerfStatsCollector::snapshot(
+        {"gdn_recurrence_cpu_detail.direct_merged_prefill"});
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records.front().count, 1u);
 }
 
 TEST(Test__GDNKernels, Recurrence_KernelFailurePropagates)

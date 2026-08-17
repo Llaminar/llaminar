@@ -13,36 +13,57 @@
 
 #pragma once
 
+#include "MoELayeredExpertOwnership.h"
 #include "../../kernels/IPackedWeights.h"
 #include "../../kernels/PackedWeightsSerialization.h"
+#include "../../memory/NUMAAllocator.h"
+#include "../../tensors/AlignedVector.h"
 #include "../../utils/Logger.h"
 #include "../../utils/MPITags.h"
 
 #include <mpi.h>
+#include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace llaminar2
 {
 
-    /// A single expert migration: expert moves from src_rank to dst_rank.
+    class ITensorGemm;
+
+    /// One exact layer/expert migration between ownership participants.
     struct ExpertMigration
     {
+        int layer_idx;
         int expert_id;
         int src_rank;
         int dst_rank;
+
+        bool operator==(const ExpertMigration &) const = default;
     };
+
+    /**
+     * @brief Uninitialized, cache-line-aligned wire storage for one projection.
+     *
+     * MPI writes every logical byte, so zero-initializing these buffers would
+     * consume memory bandwidth and establish the wrong first-touch policy just
+     * before the receive overwrites them.
+     */
+    using ExpertTransferBuffer = AlignedVector<uint8_t>;
 
     /// Serialized weight blobs for one expert's 3 projections.
     struct ExpertWeightBlobs
     {
-        std::vector<uint8_t> gate;
-        std::vector<uint8_t> up;
-        std::vector<uint8_t> down;
+        ExpertTransferBuffer gate;
+        ExpertTransferBuffer up;
+        ExpertTransferBuffer down;
 
         bool empty() const { return gate.empty() && up.empty() && down.empty(); }
         size_t totalBytes() const { return gate.size() + up.size() + down.size(); }
@@ -52,13 +73,104 @@ namespace llaminar2
     using ReceivedWeightsMap = std::unordered_map<int, std::unordered_map<int, ExpertWeightBlobs>>;
 
     /**
+     * @brief Three already-prepared projection objects detached from one expert.
+     *
+     * Ownership migration moves these objects out of the source GEMM engines in
+     * O(1). Replica publication may instead populate them with explicit clones.
+     * Neither operation constructs a concatenated wire-format byte vector.
+     */
+    struct ExpertPackedWeights
+    {
+        std::unique_ptr<IPackedWeights> gate;
+        std::unique_ptr<IPackedWeights> up;
+        std::unique_ptr<IPackedWeights> down;
+
+        bool complete() const noexcept
+        {
+            return gate != nullptr && up != nullptr && down != nullptr;
+        }
+
+        size_t totalBytes() const noexcept
+        {
+            return (gate ? gate->sizeBytes() : 0) +
+                   (up ? up->sizeBytes() : 0) +
+                   (down ? down->sizeBytes() : 0);
+        }
+    };
+
+    /**
+     * @brief Final shared CPU GEMM engines published for one arriving expert.
+     *
+     * Multiple cached graph stages for the same layer adopt these exact shared
+     * engines. This prevents every graph instance from deserializing another
+     * private copy and gives PreparedWeightStore one canonical arrival lifetime.
+     */
+    struct PreparedExpertEngines
+    {
+        std::shared_ptr<ITensorGemm> gate;
+        std::shared_ptr<ITensorGemm> up;
+        std::shared_ptr<ITensorGemm> down;
+        size_t packed_bytes = 0;
+
+        bool complete() const noexcept
+        {
+            return gate != nullptr && up != nullptr && down != nullptr;
+        }
+    };
+
+    /// Final direct CPU arrivals keyed by exact layer and expert identity.
+    using ReceivedPreparedExpertsMap =
+        std::unordered_map<int, std::unordered_map<int, PreparedExpertEngines>>;
+
+    /**
+     * @brief Backend-explicit arrivals produced by one migration wave.
+     *
+     * Homogeneous CPU movement fills `prepared`; cross-backend conversion paths
+     * fill `serialized`. A single migration must never populate both forms for
+     * the same layer/expert, which keeps arrival ownership unambiguous.
+     */
+    struct ExpertTransferResult
+    {
+        ReceivedWeightsMap serialized;
+        ReceivedPreparedExpertsMap prepared;
+
+        bool empty() const noexcept
+        {
+            return serialized.empty() && prepared.empty();
+        }
+    };
+
+    /**
+     * @brief Exact phase and payload evidence for one rank's migration wave.
+     *
+     * Dynamic CPU expert movement is intentionally an amortized operation, but
+     * it still has to be economical.  This record separates packed-weight
+     * extraction, metadata exchange, destination allocation, payload exchange,
+     * and result publication so end-to-end PerfStats can identify the expensive
+     * phase without relying on noisy log timestamps.
+     */
+    struct ExpertTransferEvidence
+    {
+        size_t manifest_entries = 0;
+        size_t outgoing_entries = 0;
+        size_t incoming_entries = 0;
+        size_t outgoing_bytes = 0;
+        size_t incoming_bytes = 0;
+        uint64_t payload_prepare_ns = 0;
+        uint64_t metadata_exchange_ns = 0;
+        uint64_t receive_allocation_ns = 0;
+        uint64_t payload_exchange_ns = 0;
+        uint64_t result_publication_ns = 0;
+        uint64_t total_ns = 0;
+    };
+
+    /**
      * @brief Coordinates MPI transfer of pre-packed GEMM weights between ranks.
      *
      * All methods are static. Pure-logic helpers (buildManifest, departingExperts,
-     * arrivingExperts) require no MPI. transferAllLayers() performs the actual
-     * cross-rank communication and returns an empty map on failure so the caller
-     * can fail before execution. Raw expert repacking after host release is not
-     * a supported recovery path.
+     * arrivingMigrations) require no MPI. `transferLayered()` performs the
+     * exact cross-rank communication and throws on protocol failure. Raw expert
+     * repacking after host release is not a supported recovery path.
      */
     class ExpertWeightTransfer
     {
@@ -70,17 +182,18 @@ namespace llaminar2
          * @return Entries for experts that changed rank.
          */
         static inline std::vector<ExpertMigration> buildManifest(
-            const std::vector<int> &old_placement,
-            const std::vector<int> &new_placement)
+            const MoELayeredExpertOwnership &old_ownership,
+            const MoELayeredExpertOwnership &new_ownership)
         {
             std::vector<ExpertMigration> manifest;
-            const size_t n = std::min(old_placement.size(), new_placement.size());
-            for (size_t i = 0; i < n; ++i)
+            for (const auto &change : new_ownership.changesFrom(old_ownership))
             {
-                if (old_placement[i] != new_placement[i])
-                {
-                    manifest.push_back({static_cast<int>(i), old_placement[i], new_placement[i]});
-                }
+                manifest.push_back({
+                    .layer_idx = change.layer_idx,
+                    .expert_id = change.expert_id,
+                    .src_rank = change.previous_participant,
+                    .dst_rank = change.current_participant,
+                });
             }
             return manifest;
         }
@@ -88,15 +201,15 @@ namespace llaminar2
         /**
          * @brief Get expert IDs this rank is sending (departing experts).
          */
-        static inline std::vector<int> departingExperts(
+        static inline std::vector<ExpertMigration> departingMigrations(
             const std::vector<ExpertMigration> &manifest,
             int my_rank)
         {
-            std::vector<int> result;
+            std::vector<ExpertMigration> result;
             for (const auto &m : manifest)
             {
                 if (m.src_rank == my_rank)
-                    result.push_back(m.expert_id);
+                    result.push_back(m);
             }
             return result;
         }
@@ -104,15 +217,15 @@ namespace llaminar2
         /**
          * @brief Get expert IDs this rank is receiving (arriving experts).
          */
-        static inline std::vector<int> arrivingExperts(
+        static inline std::vector<ExpertMigration> arrivingMigrations(
             const std::vector<ExpertMigration> &manifest,
             int my_rank)
         {
-            std::vector<int> result;
+            std::vector<ExpertMigration> result;
             for (const auto &m : manifest)
             {
                 if (m.dst_rank == my_rank)
-                    result.push_back(m.expert_id);
+                    result.push_back(m);
             }
             return result;
         }
@@ -120,266 +233,762 @@ namespace llaminar2
         // ── MPI Transfer ────────────────────────────────────────────────
 
         /**
-         * @brief Execute cross-rank weight transfer for all layers.
+         * @brief Move CPU packed sections directly into final destination engines.
+         *
+         * This is the homogeneous CPU ownership/replica protocol. The source
+         * callback returns native packed objects; metadata is exchanged in one
+         * non-blocking wave; MPI then writes every data section directly into
+         * its final NUMA-local allocation. The engine factory consumes those
+         * allocations without serialization or deserialization copies.
+         *
+         * @param manifest Exact layer/expert migration records.
+         * @param get_weights Destructive detach or explicit clone callback for
+         *        locally sourced experts.
+         * @param make_engine Factory that consumes one final packed projection.
+         * @param my_rank Calling MPI rank.
+         * @param target_numa_node Exact NUMA node that owns final receive pages.
+         * @param comm Communicator shared by every manifest participant.
+         * @param evidence Optional exact phase evidence destination.
+         * @return Shared prepared engines for this rank's arrivals.
+         * @throws std::runtime_error or std::invalid_argument on any malformed
+         *         payload, unsupported packed representation, or MPI failure.
+         */
+        static inline ReceivedPreparedExpertsMap transferLayeredPreparedCPU(
+            const std::vector<ExpertMigration> &manifest,
+            std::function<ExpertPackedWeights(int layer_idx, int expert_id)>
+                get_weights,
+            std::function<std::shared_ptr<ITensorGemm>(
+                std::unique_ptr<IPackedWeights>)>
+                make_engine,
+            int my_rank,
+            int target_numa_node,
+            MPI_Comm comm,
+            ExpertTransferEvidence *evidence = nullptr)
+        {
+            if (evidence)
+                *evidence = ExpertTransferEvidence{};
+            if (manifest.empty())
+                return {};
+            if (!get_weights || !make_engine)
+            {
+                throw std::invalid_argument(
+                    "Direct CPU expert transfer requires source and engine factories");
+            }
+            if (target_numa_node < 0)
+            {
+                throw std::invalid_argument(
+                    "Direct CPU expert transfer requires one exact destination NUMA node");
+            }
+
+            using Clock = std::chrono::steady_clock;
+            using Descriptor = packed_weights_serialization::
+                PackedWeightsTransferDescriptor;
+            using ConstViews = packed_weights_serialization::
+                PackedWeightsConstSectionViews;
+            using ReceiveTarget = packed_weights_serialization::
+                PackedWeightsReceiveTarget;
+            constexpr size_t projection_count = 3;
+            constexpr size_t section_count = packed_weights_serialization::
+                PACKED_WEIGHT_SECTION_COUNT;
+
+            const auto t0 = Clock::now();
+            if (evidence)
+                evidence->manifest_entries = manifest.size();
+
+            auto require_mpi_success = [](int rc, const char *operation)
+            {
+                if (rc == MPI_SUCCESS)
+                    return;
+                throw std::runtime_error(
+                    std::string("ExpertWeightTransfer ") + operation +
+                    " failed with MPI error " + std::to_string(rc));
+            };
+
+            for (const auto &migration : manifest)
+            {
+                if (migration.layer_idx < 0 || migration.expert_id < 0 ||
+                    migration.src_rank < 0 || migration.dst_rank < 0 ||
+                    migration.src_rank == migration.dst_rank)
+                {
+                    throw std::invalid_argument(
+                        "Direct CPU expert transfer manifest contains an invalid layered migration");
+                }
+            }
+
+            struct SendEntry
+            {
+                int layer = -1;
+                int expert_id = -1;
+                ExpertPackedWeights weights;
+                std::array<Descriptor, projection_count> descriptors{};
+                std::array<ConstViews, projection_count> views{};
+            };
+            std::vector<SendEntry> send_entries;
+
+            auto find_send_entry = [&](int layer, int expert_id) -> SendEntry *
+            {
+                auto it = std::find_if(
+                    send_entries.begin(),
+                    send_entries.end(),
+                    [&](const SendEntry &entry)
+                    {
+                        return entry.layer == layer &&
+                               entry.expert_id == expert_id;
+                    });
+                return it == send_entries.end() ? nullptr : &*it;
+            };
+
+            for (const auto &migration : manifest)
+            {
+                if (migration.src_rank != my_rank ||
+                    find_send_entry(
+                        migration.layer_idx, migration.expert_id) != nullptr)
+                {
+                    continue;
+                }
+
+                ExpertPackedWeights weights = get_weights(
+                    migration.layer_idx, migration.expert_id);
+                if (!weights.complete())
+                {
+                    throw std::runtime_error(
+                        "Direct CPU expert transfer source returned an incomplete prepared expert");
+                }
+
+                send_entries.push_back({
+                    .layer = migration.layer_idx,
+                    .expert_id = migration.expert_id,
+                    .weights = std::move(weights),
+                });
+                auto &entry = send_entries.back();
+                std::array<IPackedWeights *, projection_count> projections{
+                    entry.weights.gate.get(),
+                    entry.weights.up.get(),
+                    entry.weights.down.get(),
+                };
+                for (size_t projection = 0;
+                     projection < projection_count;
+                     ++projection)
+                {
+                    if (!packed_weights_serialization::describeTransfer(
+                            *projections[projection],
+                            entry.descriptors[projection],
+                            entry.views[projection]))
+                    {
+                        throw std::runtime_error(
+                            "Direct CPU expert transfer cannot describe a source projection");
+                    }
+                    if (entry.descriptors[projection].header.has_native_blocks)
+                    {
+                        throw std::runtime_error(
+                            "Direct CPU expert transfer requires eager interleaved weights, not deferred native blocks");
+                    }
+                }
+                if (evidence)
+                {
+                    ++evidence->outgoing_entries;
+                    evidence->outgoing_bytes += entry.weights.totalBytes();
+                }
+            }
+
+            const auto payload_prepare_end = Clock::now();
+            if (evidence)
+            {
+                evidence->payload_prepare_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        payload_prepare_end - t0)
+                        .count());
+            }
+
+            struct ReceiveEntry
+            {
+                int layer = -1;
+                int expert_id = -1;
+                int src_rank = -1;
+                std::array<Descriptor, projection_count> descriptors{};
+                std::array<ReceiveTarget, projection_count> targets{};
+            };
+            std::vector<ReceiveEntry> receive_entries;
+            receive_entries.reserve(static_cast<size_t>(std::count_if(
+                manifest.begin(),
+                manifest.end(),
+                [&](const ExpertMigration &migration)
+                {
+                    return migration.dst_rank == my_rank;
+                })));
+            for (const auto &migration : manifest)
+            {
+                if (migration.dst_rank != my_rank)
+                    continue;
+                receive_entries.push_back({
+                    .layer = migration.layer_idx,
+                    .expert_id = migration.expert_id,
+                    .src_rank = migration.src_rank,
+                });
+                if (evidence)
+                    ++evidence->incoming_entries;
+            }
+
+            std::vector<MPI_Request> metadata_requests;
+            metadata_requests.reserve(
+                receive_entries.size() + manifest.size());
+            for (auto &entry : receive_entries)
+            {
+                MPI_Request request;
+                require_mpi_success(
+                    MPI_Irecv(
+                        entry.descriptors.data(),
+                        static_cast<int>(sizeof(entry.descriptors)),
+                        MPI_BYTE,
+                        entry.src_rank,
+                        mpi_tags::weightTransferSizeTag(
+                            entry.layer, entry.expert_id),
+                        comm,
+                        &request),
+                    "direct metadata receive");
+                metadata_requests.push_back(request);
+            }
+            for (const auto &migration : manifest)
+            {
+                if (migration.src_rank != my_rank)
+                    continue;
+                auto *entry = find_send_entry(
+                    migration.layer_idx, migration.expert_id);
+                if (!entry)
+                {
+                    throw std::logic_error(
+                        "Direct CPU expert transfer lost source metadata");
+                }
+                MPI_Request request;
+                require_mpi_success(
+                    MPI_Isend(
+                        entry->descriptors.data(),
+                        static_cast<int>(sizeof(entry->descriptors)),
+                        MPI_BYTE,
+                        migration.dst_rank,
+                        mpi_tags::weightTransferSizeTag(
+                            migration.layer_idx, migration.expert_id),
+                        comm,
+                        &request),
+                    "direct metadata send");
+                metadata_requests.push_back(request);
+            }
+            if (!metadata_requests.empty())
+            {
+                std::vector<MPI_Status> statuses(metadata_requests.size());
+                require_mpi_success(
+                    MPI_Waitall(
+                        static_cast<int>(metadata_requests.size()),
+                        metadata_requests.data(),
+                        statuses.data()),
+                    "direct metadata waitall");
+            }
+
+            const auto metadata_exchange_end = Clock::now();
+            if (evidence)
+            {
+                evidence->metadata_exchange_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        metadata_exchange_end - payload_prepare_end)
+                        .count());
+            }
+
+            std::vector<MPI_Request> payload_requests;
+            for (auto &entry : receive_entries)
+            {
+                for (size_t projection = 0;
+                     projection < projection_count;
+                     ++projection)
+                {
+                    if (entry.descriptors[projection].header.has_native_blocks)
+                    {
+                        throw std::runtime_error(
+                            "Direct CPU expert receive rejects deferred native-block weights");
+                    }
+                    entry.targets[projection] =
+                        packed_weights_serialization::allocateTransferTarget(
+                            entry.descriptors[projection]);
+                    for (size_t section = 0; section < section_count; ++section)
+                    {
+                        const size_t bytes =
+                            entry.targets[projection].sizes[section];
+                        if (bytes == 0)
+                            continue;
+                        if (!NUMAAllocator::instance().
+                                bindUntouchedExternalRangeToNode(
+                                    entry.targets[projection].data[section],
+                                    bytes,
+                                    target_numa_node))
+                        {
+                            throw std::runtime_error(
+                                "Direct CPU expert transfer could not bind final receive storage to its rank-local NUMA node");
+                        }
+                        if (bytes > static_cast<size_t>(INT_MAX))
+                        {
+                            throw std::length_error(
+                                "Direct CPU expert receive section exceeds the MPI int limit");
+                        }
+                        MPI_Request request;
+                        require_mpi_success(
+                            MPI_Irecv(
+                                entry.targets[projection].data[section],
+                                static_cast<int>(bytes),
+                                MPI_BYTE,
+                                entry.src_rank,
+                                mpi_tags::weightTransferDataTag(
+                                    entry.layer,
+                                    entry.expert_id,
+                                    static_cast<int>(projection)),
+                                comm,
+                                &request),
+                            "direct payload receive");
+                        payload_requests.push_back(request);
+                    }
+                }
+            }
+
+            const auto receive_allocation_end = Clock::now();
+            if (evidence)
+            {
+                evidence->receive_allocation_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        receive_allocation_end - metadata_exchange_end)
+                        .count());
+            }
+
+            for (const auto &migration : manifest)
+            {
+                if (migration.src_rank != my_rank)
+                    continue;
+                auto *entry = find_send_entry(
+                    migration.layer_idx, migration.expert_id);
+                if (!entry)
+                {
+                    throw std::logic_error(
+                        "Direct CPU expert transfer lost source payload");
+                }
+                for (size_t projection = 0;
+                     projection < projection_count;
+                     ++projection)
+                {
+                    for (size_t section = 0; section < section_count; ++section)
+                    {
+                        const size_t bytes =
+                            entry->views[projection].sizes[section];
+                        if (bytes == 0)
+                            continue;
+                        if (bytes > static_cast<size_t>(INT_MAX))
+                        {
+                            throw std::length_error(
+                                "Direct CPU expert send section exceeds the MPI int limit");
+                        }
+                        MPI_Request request;
+                        require_mpi_success(
+                            MPI_Isend(
+                                entry->views[projection].data[section],
+                                static_cast<int>(bytes),
+                                MPI_BYTE,
+                                migration.dst_rank,
+                                mpi_tags::weightTransferDataTag(
+                                    migration.layer_idx,
+                                    migration.expert_id,
+                                    static_cast<int>(projection)),
+                                comm,
+                                &request),
+                            "direct payload send");
+                        payload_requests.push_back(request);
+                    }
+                }
+            }
+            if (!payload_requests.empty())
+            {
+                std::vector<MPI_Status> statuses(payload_requests.size());
+                require_mpi_success(
+                    MPI_Waitall(
+                        static_cast<int>(payload_requests.size()),
+                        payload_requests.data(),
+                        statuses.data()),
+                    "direct payload waitall");
+            }
+
+            const auto payload_exchange_end = Clock::now();
+            if (evidence)
+            {
+                evidence->payload_exchange_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        payload_exchange_end - receive_allocation_end)
+                        .count());
+            }
+
+            ReceivedPreparedExpertsMap result;
+            size_t incoming_bytes = 0;
+            for (auto &entry : receive_entries)
+            {
+                PreparedExpertEngines prepared;
+                std::array<std::shared_ptr<ITensorGemm> *, projection_count>
+                    engines{&prepared.gate, &prepared.up, &prepared.down};
+                for (size_t projection = 0;
+                     projection < projection_count;
+                     ++projection)
+                {
+                    for (size_t section = 0; section < section_count; ++section)
+                        prepared.packed_bytes +=
+                            entry.targets[projection].sizes[section];
+                    *engines[projection] = make_engine(
+                        std::move(entry.targets[projection].weights));
+                    if (!*engines[projection])
+                    {
+                        throw std::runtime_error(
+                            "Direct CPU expert transfer could not construct a destination GEMM engine");
+                    }
+                }
+                incoming_bytes += prepared.packed_bytes;
+                auto [it, inserted] = result[entry.layer].emplace(
+                    entry.expert_id, std::move(prepared));
+                (void)it;
+                if (!inserted)
+                {
+                    throw std::runtime_error(
+                        "Direct CPU expert transfer received duplicate layer/expert ownership");
+                }
+            }
+
+            const auto t1 = Clock::now();
+            if (evidence)
+            {
+                evidence->incoming_bytes = incoming_bytes;
+                evidence->result_publication_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t1 - payload_exchange_end)
+                        .count());
+                evidence->total_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t1 - t0)
+                        .count());
+            }
+            return result;
+        }
+
+        /**
+         * @brief Execute exact layer/expert cross-rank weight transfers.
          *
          * Two-phase protocol:
-         *   Phase A: Blocking size exchange (24 bytes per migration × layer).
+         *   Phase A: Blocking size exchange (24 bytes per migration).
          *   Phase B: Non-blocking bulk data transfer with MPI_Waitall.
          *
          * @param manifest     Migration entries (from buildManifest).
-         * @param num_layers   Number of MoE layers.
          * @param get_blobs    Callback: (layer_idx, expert_id) → serialized blobs.
          *                     Called only for experts this rank is SENDING.
          * @param my_rank      This rank's ID.
          * @param comm         MPI communicator.
+         * @param evidence     Optional caller-owned phase evidence destination.
          * @return Map of received weights: [layer_idx][expert_id] → blobs.
-         *         Empty map on failure (caller should fall back to repack).
+         * @throws std::runtime_error when the MPI protocol or source payload
+         *         fails. There is no repack or replay recovery path.
          */
-        static inline ReceivedWeightsMap transferAllLayers(
+        static inline ReceivedWeightsMap transferLayered(
             const std::vector<ExpertMigration> &manifest,
-            int num_layers,
             std::function<ExpertWeightBlobs(int layer_idx, int expert_id)> get_blobs,
             int my_rank,
-            MPI_Comm comm)
+            MPI_Comm comm,
+            ExpertTransferEvidence *evidence = nullptr)
         {
-            if (manifest.empty() || num_layers <= 0)
+            if (evidence)
+                *evidence = ExpertTransferEvidence{};
+            if (manifest.empty())
                 return {};
 
-            auto t0 = std::chrono::steady_clock::now();
+            using Clock = std::chrono::steady_clock;
+            const auto t0 = Clock::now();
+            if (evidence)
+                evidence->manifest_entries = manifest.size();
 
-            try
+            auto require_mpi_success = [](int rc, const char *operation)
             {
-                // ── Phase A: Blocking size exchange ─────────────────────
-                // For each (migration, layer), sender sends uint64_t[3] sizes,
-                // receiver receives them. This is fast: 24 bytes per message.
+                if (rc == MPI_SUCCESS)
+                    return;
+                throw std::runtime_error(
+                    std::string("ExpertWeightTransfer ") + operation +
+                    " failed with MPI error " + std::to_string(rc));
+            };
 
-                // Collect all send blobs upfront (sender side) so we can extract sizes.
-                // Key: (expert_id, layer) → blobs
-                struct BlobKey
-                {
-                    int expert_id;
-                    int layer;
-                };
-                std::vector<BlobKey> send_keys;
-                std::vector<ExpertWeightBlobs> send_blobs_store;
+            // Collect each distinct local layer/expert payload once. Replica
+            // manifests may send the same resident payload to several targets.
+            struct BlobKey
+            {
+                int layer = -1;
+                int expert_id = -1;
+            };
+            std::vector<BlobKey> send_keys;
+            std::vector<ExpertWeightBlobs> send_blobs_store;
 
-                for (const auto &m : manifest)
+            auto find_send_index = [&](int layer, int expert_id) -> int
+            {
+                for (size_t index = 0; index < send_keys.size(); ++index)
                 {
-                    if (m.src_rank == my_rank)
+                    if (send_keys[index].layer == layer &&
+                        send_keys[index].expert_id == expert_id)
                     {
-                        for (int layer = 0; layer < num_layers; ++layer)
-                        {
-                            auto blobs = get_blobs(layer, m.expert_id);
-                            send_keys.push_back({m.expert_id, layer});
-                            send_blobs_store.push_back(std::move(blobs));
-                        }
+                        return static_cast<int>(index);
                     }
                 }
+                return -1;
+            };
 
-                // Build lookup for send blobs: (expert_id, layer) → index
-                auto findSendIdx = [&](int expert_id, int layer) -> int
+            for (const auto &migration : manifest)
+            {
+                if (migration.layer_idx < 0 || migration.expert_id < 0 ||
+                    migration.src_rank < 0 || migration.dst_rank < 0 ||
+                    migration.src_rank == migration.dst_rank)
                 {
-                    for (size_t i = 0; i < send_keys.size(); ++i)
-                    {
-                        if (send_keys[i].expert_id == expert_id && send_keys[i].layer == layer)
-                            return static_cast<int>(i);
-                    }
-                    return -1;
-                };
-
-                // Size exchange structures for receivers
-                struct RecvSizeEntry
+                    throw std::invalid_argument(
+                        "ExpertWeightTransfer manifest contains an invalid layered migration");
+                }
+                if (migration.src_rank != my_rank ||
+                    find_send_index(migration.layer_idx, migration.expert_id) >= 0)
                 {
-                    int expert_id;
-                    int layer;
-                    int src_rank;
-                    uint64_t sizes[3]; // gate, up, down
-                };
-                std::vector<RecvSizeEntry> recv_size_entries;
-
-                // Phase A: Exchange sizes — ordered by manifest then layer
-                for (const auto &m : manifest)
-                {
-                    for (int layer = 0; layer < num_layers; ++layer)
-                    {
-                        int tag = mpi_tags::weightTransferSizeTag(layer, m.expert_id);
-
-                        if (m.src_rank == my_rank)
-                        {
-                            int idx = findSendIdx(m.expert_id, layer);
-                            if (idx < 0)
-                            {
-                                LOG_ERROR("[ExpertWeightTransfer] Missing send blob for expert "
-                                          << m.expert_id << " layer " << layer);
-                                return {};
-                            }
-                            uint64_t sizes[3] = {
-                                send_blobs_store[idx].gate.size(),
-                                send_blobs_store[idx].up.size(),
-                                send_blobs_store[idx].down.size()};
-                            int rc = MPI_Send(sizes, 3, MPI_UINT64_T, m.dst_rank, tag, comm);
-                            if (rc != MPI_SUCCESS)
-                            {
-                                LOG_ERROR("[ExpertWeightTransfer] MPI_Send sizes failed: rc=" << rc);
-                                return {};
-                            }
-                        }
-                        else if (m.dst_rank == my_rank)
-                        {
-                            RecvSizeEntry entry;
-                            entry.expert_id = m.expert_id;
-                            entry.layer = layer;
-                            entry.src_rank = m.src_rank;
-                            int rc = MPI_Recv(entry.sizes, 3, MPI_UINT64_T,
-                                              m.src_rank, tag, comm, MPI_STATUS_IGNORE);
-                            if (rc != MPI_SUCCESS)
-                            {
-                                LOG_ERROR("[ExpertWeightTransfer] MPI_Recv sizes failed: rc=" << rc);
-                                return {};
-                            }
-                            recv_size_entries.push_back(entry);
-                        }
-                    }
+                    continue;
                 }
 
-                // ── Phase B: Non-blocking data exchange ─────────────────
-                std::vector<MPI_Request> requests;
-
-                // Allocate receive buffers
-                struct RecvBufEntry
+                auto blobs = get_blobs(
+                    migration.layer_idx, migration.expert_id);
+                if (blobs.empty())
                 {
-                    int expert_id;
-                    int layer;
-                    std::vector<uint8_t> gate;
-                    std::vector<uint8_t> up;
-                    std::vector<uint8_t> down;
-                };
-                std::vector<RecvBufEntry> recv_bufs;
-                recv_bufs.reserve(recv_size_entries.size());
-
-                // Post receives
-                for (const auto &entry : recv_size_entries)
-                {
-                    RecvBufEntry buf;
-                    buf.expert_id = entry.expert_id;
-                    buf.layer = entry.layer;
-                    buf.gate.resize(entry.sizes[0]);
-                    buf.up.resize(entry.sizes[1]);
-                    buf.down.resize(entry.sizes[2]);
-
-                    const std::vector<uint8_t> *proj_bufs[3] = {&buf.gate, &buf.up, &buf.down};
-                    for (int proj = 0; proj < 3; ++proj)
-                    {
-                        if (entry.sizes[proj] == 0)
-                            continue;
-                        if (entry.sizes[proj] > static_cast<uint64_t>(INT_MAX))
-                        {
-                            LOG_ERROR("[ExpertWeightTransfer] Expert " << entry.expert_id
-                                                                       << " layer " << entry.layer << " proj " << proj
-                                                                       << " exceeds MPI int limit: " << entry.sizes[proj] << " bytes");
-                            return {};
-                        }
-                        int tag = mpi_tags::weightTransferDataTag(entry.layer, entry.expert_id, proj);
-                        MPI_Request req;
-                        int rc = MPI_Irecv(
-                            const_cast<uint8_t *>(proj_bufs[proj]->data()),
-                            static_cast<int>(entry.sizes[proj]),
-                            MPI_BYTE, entry.src_rank, tag, comm, &req);
-                        if (rc != MPI_SUCCESS)
-                        {
-                            LOG_ERROR("[ExpertWeightTransfer] MPI_Irecv failed: rc=" << rc);
-                            return {};
-                        }
-                        requests.push_back(req);
-                    }
-                    recv_bufs.push_back(std::move(buf));
+                    throw std::runtime_error(
+                        "ExpertWeightTransfer source returned an empty prepared expert payload");
                 }
-
-                // Post sends
-                for (const auto &m : manifest)
+                send_keys.push_back({migration.layer_idx, migration.expert_id});
+                if (evidence)
                 {
-                    if (m.src_rank != my_rank)
+                    ++evidence->outgoing_entries;
+                    evidence->outgoing_bytes += blobs.totalBytes();
+                }
+                send_blobs_store.push_back(std::move(blobs));
+            }
+
+            const auto payload_prepare_end = Clock::now();
+            if (evidence)
+            {
+                evidence->payload_prepare_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        payload_prepare_end - t0)
+                        .count());
+            }
+
+            struct RecvSizeEntry
+            {
+                int expert_id = -1;
+                int layer = -1;
+                int src_rank = -1;
+                uint64_t sizes[3]{};
+            };
+            std::vector<RecvSizeEntry> recv_size_entries;
+
+            // Phase A exchanges exactly one size record per layered migration.
+            // Every rank walks the same manifest order, keeping reciprocal
+            // ownership swap pairs deterministic without a global barrier.
+            for (const auto &migration : manifest)
+            {
+                const int tag = mpi_tags::weightTransferSizeTag(
+                    migration.layer_idx, migration.expert_id);
+                if (migration.src_rank == my_rank)
+                {
+                    const int index = find_send_index(
+                        migration.layer_idx, migration.expert_id);
+                    if (index < 0)
+                    {
+                        throw std::logic_error(
+                            "ExpertWeightTransfer lost a source payload before size exchange");
+                    }
+                    const auto &blobs = send_blobs_store[static_cast<size_t>(index)];
+                    uint64_t sizes[3] = {
+                        blobs.gate.size(), blobs.up.size(), blobs.down.size()};
+                    require_mpi_success(
+                        MPI_Send(
+                            sizes, 3, MPI_UINT64_T, migration.dst_rank, tag, comm),
+                        "size send");
+                }
+                else if (migration.dst_rank == my_rank)
+                {
+                    RecvSizeEntry entry;
+                    entry.expert_id = migration.expert_id;
+                    entry.layer = migration.layer_idx;
+                    entry.src_rank = migration.src_rank;
+                    require_mpi_success(
+                        MPI_Recv(
+                            entry.sizes,
+                            3,
+                            MPI_UINT64_T,
+                            migration.src_rank,
+                            tag,
+                            comm,
+                            MPI_STATUS_IGNORE),
+                        "size receive");
+                    recv_size_entries.push_back(entry);
+                    if (evidence)
+                        ++evidence->incoming_entries;
+                }
+            }
+
+            const auto metadata_exchange_end = Clock::now();
+            if (evidence)
+            {
+                evidence->metadata_exchange_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        metadata_exchange_end - payload_prepare_end)
+                        .count());
+            }
+
+            std::vector<MPI_Request> requests;
+            struct RecvBufEntry
+            {
+                int expert_id = -1;
+                int layer = -1;
+                ExpertTransferBuffer gate;
+                ExpertTransferBuffer up;
+                ExpertTransferBuffer down;
+            };
+            std::vector<RecvBufEntry> recv_bufs;
+            recv_bufs.reserve(recv_size_entries.size());
+
+            for (const auto &entry : recv_size_entries)
+            {
+                RecvBufEntry buf;
+                buf.expert_id = entry.expert_id;
+                buf.layer = entry.layer;
+                buf.gate.resize_uninitialized(entry.sizes[0]);
+                buf.up.resize_uninitialized(entry.sizes[1]);
+                buf.down.resize_uninitialized(entry.sizes[2]);
+
+                const ExpertTransferBuffer *projection_buffers[3] = {
+                    &buf.gate, &buf.up, &buf.down};
+                for (int projection = 0; projection < 3; ++projection)
+                {
+                    if (entry.sizes[projection] == 0)
                         continue;
-                    for (int layer = 0; layer < num_layers; ++layer)
+                    if (entry.sizes[projection] > static_cast<uint64_t>(INT_MAX))
                     {
-                        int idx = findSendIdx(m.expert_id, layer);
-                        if (idx < 0)
-                            continue;
-                        const auto &blobs = send_blobs_store[idx];
-                        const std::vector<uint8_t> *proj_data[3] = {&blobs.gate, &blobs.up, &blobs.down};
-                        for (int proj = 0; proj < 3; ++proj)
-                        {
-                            if (proj_data[proj]->empty())
-                                continue;
-                            if (proj_data[proj]->size() > static_cast<size_t>(INT_MAX))
-                            {
-                                LOG_ERROR("[ExpertWeightTransfer] Send blob for expert " << m.expert_id
-                                                                                         << " layer " << layer << " proj " << proj
-                                                                                         << " exceeds MPI int limit: " << proj_data[proj]->size() << " bytes");
-                                return {};
-                            }
-                            int tag = mpi_tags::weightTransferDataTag(layer, m.expert_id, proj);
-                            MPI_Request req;
-                            int rc = MPI_Isend(
-                                proj_data[proj]->data(),
-                                static_cast<int>(proj_data[proj]->size()),
-                                MPI_BYTE, m.dst_rank, tag, comm, &req);
-                            if (rc != MPI_SUCCESS)
-                            {
-                                LOG_ERROR("[ExpertWeightTransfer] MPI_Isend failed: rc=" << rc);
-                                return {};
-                            }
-                            requests.push_back(req);
-                        }
+                        throw std::length_error(
+                            "ExpertWeightTransfer receive payload exceeds the MPI int limit");
                     }
+                    MPI_Request request;
+                    require_mpi_success(
+                        MPI_Irecv(
+                            const_cast<uint8_t *>(projection_buffers[projection]->data()),
+                            static_cast<int>(entry.sizes[projection]),
+                            MPI_BYTE,
+                            entry.src_rank,
+                            mpi_tags::weightTransferDataTag(
+                                entry.layer, entry.expert_id, projection),
+                            comm,
+                            &request),
+                        "payload receive");
+                    requests.push_back(request);
                 }
+                recv_bufs.push_back(std::move(buf));
+            }
 
-                // Wait for all non-blocking operations
-                if (!requests.empty())
+            const auto receive_allocation_end = Clock::now();
+            if (evidence)
+            {
+                evidence->receive_allocation_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        receive_allocation_end - metadata_exchange_end)
+                        .count());
+            }
+
+            for (const auto &migration : manifest)
+            {
+                if (migration.src_rank != my_rank)
+                    continue;
+                const int index = find_send_index(
+                    migration.layer_idx, migration.expert_id);
+                if (index < 0)
                 {
-                    std::vector<MPI_Status> statuses(requests.size());
-                    int rc = MPI_Waitall(
+                    throw std::logic_error(
+                        "ExpertWeightTransfer lost a source payload before data exchange");
+                }
+                const auto &blobs = send_blobs_store[static_cast<size_t>(index)];
+                const ExpertTransferBuffer *projection_data[3] = {
+                    &blobs.gate, &blobs.up, &blobs.down};
+                for (int projection = 0; projection < 3; ++projection)
+                {
+                    if (projection_data[projection]->empty())
+                        continue;
+                    if (projection_data[projection]->size() > static_cast<size_t>(INT_MAX))
+                    {
+                        throw std::length_error(
+                            "ExpertWeightTransfer send payload exceeds the MPI int limit");
+                    }
+                    MPI_Request request;
+                    require_mpi_success(
+                        MPI_Isend(
+                            projection_data[projection]->data(),
+                            static_cast<int>(projection_data[projection]->size()),
+                            MPI_BYTE,
+                            migration.dst_rank,
+                            mpi_tags::weightTransferDataTag(
+                                migration.layer_idx,
+                                migration.expert_id,
+                                projection),
+                            comm,
+                            &request),
+                        "payload send");
+                    requests.push_back(request);
+                }
+            }
+
+            if (!requests.empty())
+            {
+                std::vector<MPI_Status> statuses(requests.size());
+                require_mpi_success(
+                    MPI_Waitall(
                         static_cast<int>(requests.size()),
-                        requests.data(), statuses.data());
-                    if (rc != MPI_SUCCESS)
-                    {
-                        LOG_ERROR("[ExpertWeightTransfer] MPI_Waitall failed: rc=" << rc);
-                        return {};
-                    }
-                }
-
-                // ── Build result map ────────────────────────────────────
-                ReceivedWeightsMap result;
-                size_t total_bytes = 0;
-                for (auto &buf : recv_bufs)
-                {
-                    ExpertWeightBlobs blobs;
-                    blobs.gate = std::move(buf.gate);
-                    blobs.up = std::move(buf.up);
-                    blobs.down = std::move(buf.down);
-                    total_bytes += blobs.totalBytes();
-                    result[buf.layer][buf.expert_id] = std::move(blobs);
-                }
-
-                auto t1 = std::chrono::steady_clock::now();
-                double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                LOG_DEBUG("[ExpertWeightTransfer] Transferred " << manifest.size()
-                                                               << " experts × " << num_layers << " layers, "
-                                                               << (total_bytes / (1024.0 * 1024.0)) << " MB received in "
-                                                               << ms << " ms");
-
-                return result;
+                        requests.data(),
+                        statuses.data()),
+                    "payload waitall");
             }
-            catch (const std::exception &e)
+
+            const auto payload_exchange_end = Clock::now();
+            if (evidence)
             {
-                LOG_ERROR("[ExpertWeightTransfer] Exception during transfer: " << e.what());
-                return {};
+                evidence->payload_exchange_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        payload_exchange_end - receive_allocation_end)
+                        .count());
             }
-            catch (...)
+
+            ReceivedWeightsMap result;
+            size_t total_bytes = 0;
+            for (auto &buf : recv_bufs)
             {
-                LOG_ERROR("[ExpertWeightTransfer] Unknown exception during transfer");
-                return {};
+                ExpertWeightBlobs blobs;
+                blobs.gate = std::move(buf.gate);
+                blobs.up = std::move(buf.up);
+                blobs.down = std::move(buf.down);
+                total_bytes += blobs.totalBytes();
+                result[buf.layer][buf.expert_id] = std::move(blobs);
             }
+
+            const auto t1 = Clock::now();
+            if (evidence)
+            {
+                evidence->incoming_bytes = total_bytes;
+                evidence->result_publication_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t1 - payload_exchange_end)
+                        .count());
+                evidence->total_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+                        .count());
+            }
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            LOG_DEBUG("[ExpertWeightTransfer] Transferred " << manifest.size()
+                                                             << " exact layer/expert payloads, "
+                                                             << (total_bytes / (1024.0 * 1024.0)) << " MB received in "
+                                                             << ms << " ms");
+
+            return result;
         }
     };
 

@@ -26,6 +26,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace llaminar2
 {
@@ -164,7 +165,8 @@ namespace llaminar2
         Hybrid,    ///< Mixed precision: FP32 residual, BF16 KV cache, Q8_1 QKV activations
         HybridQ16, ///< Mixed precision: Q16_1 residual, Q8_1 activations (62% memory savings)
         TQ4,       ///< TurboQuant 4-bit KV cache (7.5× compression vs FP32)
-        TQ8        ///< TurboQuant 8-bit (K-projection cache, SQNR 38.79 dB)
+        TQ8,       ///< TurboQuant 8-bit value storage
+        AQ8        ///< Cubic-companded int8 attention-key storage
     };
 
     /**
@@ -192,6 +194,8 @@ namespace llaminar2
             return "TQ4";
         case ActivationPrecision::TQ8:
             return "TQ8";
+        case ActivationPrecision::AQ8:
+            return "AQ8";
         default:
             return "Unknown";
         }
@@ -603,13 +607,19 @@ namespace llaminar2
      */
     enum class MTPTerminalHeadPolicy
     {
-        /** Keep the model's vocabulary-sharded final norm and LM-head layout. */
+        /**
+         * Keep the model's vocabulary-sharded final norm and LM-head layout.
+         *
+         * This is an explicit diagnostic/economy policy. It is never selected
+         * implicitly from the TP scope when mirrored ownership was requested.
+         */
         VocabularySharded,
 
         /**
          * Mirror the complete final norm and full-vocabulary LM head on every
-         * LocalTP participant so verifier sampling needs no tiny logits
-         * collective.
+         * TP participant so verifier sampling needs no tiny logits collective.
+         * A participant may be an intra-rank device, a node-local MPI rank, or
+         * a global MPI rank; scope does not alter the ownership policy.
          */
         MirroredFullVocabulary,
     };
@@ -660,6 +670,94 @@ namespace llaminar2
     }
 
     /**
+     * @enum MTPTerminalLogitsLayout
+     * @brief Resolved vocabulary ownership of one participant's MTP logits.
+     *
+     * The configured terminal-head policy and the model's primary LM-head
+     * sharding bit jointly determine the tensor written by an MTP projection.
+     * Keeping that resolution in one typed value prevents graph builders,
+     * orchestrators, and samplers from independently guessing whether
+     * `MTP_LOGITS` contains a complete distribution or only one vocabulary
+     * shard.
+     */
+    enum class MTPTerminalLogitsLayout
+    {
+        /** Every participant writes the complete vocabulary locally. */
+        FullVocabularyPerParticipant,
+
+        /** Every participant writes only its assigned vocabulary columns. */
+        VocabularyShardPerParticipant,
+    };
+
+    /**
+     * @brief Resolve the physical MTP logits layout from declarative policy.
+     * @param primary_lm_head_column_parallel Whether the model's primary
+     *        terminal projection is vocabulary-column sharded.
+     * @param policy Explicit MTP terminal-head ownership policy.
+     * @return The exact tensor ownership produced by every participant.
+     *
+     * A model without a column-parallel primary head already owns a complete
+     * vocabulary projection, irrespective of the requested MTP policy. When
+     * the primary head is column parallel, only the explicit mirrored policy
+     * authorizes use of the replicated full-vocabulary weight binding.
+     */
+    inline MTPTerminalLogitsLayout resolveMTPTerminalLogitsLayout(
+        bool primary_lm_head_column_parallel,
+        MTPTerminalHeadPolicy policy) noexcept
+    {
+        return primary_lm_head_column_parallel &&
+                       !mtpTerminalHeadIsMirrored(policy)
+                   ? MTPTerminalLogitsLayout::VocabularyShardPerParticipant
+                   : MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+    }
+
+    /**
+     * @enum MTPTerminalLogitsCollective
+     * @brief Collective, if any, owned by an MTP terminal projection.
+     */
+    enum class MTPTerminalLogitsCollective
+    {
+        /** Participant output is already complete or the graph emits no logits. */
+        None,
+
+        /** A multi-rank GlobalTP domain must assemble vocabulary shards. */
+        GlobalVocabularyAllGather,
+    };
+
+    /**
+     * @struct MTPTerminalLogitsCollectiveRequest
+     * @brief Complete declarative input to MTP terminal collective planning.
+     */
+    struct MTPTerminalLogitsCollectiveRequest
+    {
+        MTPTerminalLogitsLayout layout =
+            MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+        bool sidecar_produces_logits = false;
+        bool spans_multiple_global_ranks = false;
+    };
+
+    /**
+     * @brief Resolve the terminal logits collective from complete typed policy.
+     * @param request Output ownership and execution-topology facts.
+     * @return `GlobalVocabularyAllGather` only when every prerequisite is true.
+     *
+     * KV-only shifted-prefill graphs set `sidecar_produces_logits=false` and
+     * therefore never acquire a dummy terminal collective. Mirrored heads set
+     * a full-vocabulary participant layout and likewise resolve to `None` for
+     * local, node-local, and global TP.
+     */
+    inline MTPTerminalLogitsCollective resolveMTPTerminalLogitsCollective(
+        const MTPTerminalLogitsCollectiveRequest &request) noexcept
+    {
+        return request.sidecar_produces_logits &&
+                       request.spans_multiple_global_ranks &&
+                       request.layout ==
+                           MTPTerminalLogitsLayout::VocabularyShardPerParticipant
+                   ? MTPTerminalLogitsCollective::GlobalVocabularyAllGather
+                   : MTPTerminalLogitsCollective::None;
+    }
+
+    /**
      * @struct MTPRuntimeConfig
      * @brief Runtime and graph-layout policy for speculative MTP execution.
      */
@@ -683,10 +781,10 @@ namespace llaminar2
         /**
          * @brief Placement of the verifier's final norm and LM-head weights.
          *
-         * LocalTP defaults to a complete mirrored terminal head because a tiny
-         * vocabulary collective is generally less economical than duplicating
-         * this narrow projection. GlobalTP validates its own cross-rank
-         * vocabulary ownership and rejects an inapplicable LocalTP policy.
+         * Tensor-parallel MTP defaults to a complete mirrored terminal head
+         * because a tiny per-draft vocabulary collective is generally less
+         * economical than duplicating this terminal projection. The policy has
+         * identical meaning for local, node-local, and global TP scopes.
          */
         MTPTerminalHeadPolicy terminal_head_policy =
             MTPTerminalHeadPolicy::MirroredFullVocabulary;
@@ -1182,6 +1280,23 @@ namespace llaminar2
         int assignment_window_tokens = 0;
 
         /**
+         * @brief Maximum live token rows in one ExpertOverlay prefill segment.
+         *
+         * Heterogeneous overlay endpoints retain captured compact-route tensor
+         * families.  Bounding a segment prevents a short or moderately sized
+         * prompt from selecting the full-context family merely because the KV
+         * cache admits a long context.  The continuation authority publishes
+         * the resolved value to every rank before graph construction; longer
+         * prompts run as ordered captured segments.  This transport/capture
+         * boundary is independent of current-batch LLEP assignment windows.
+         * The default is derived from the canonical bucket inventory and
+         * retained-topology budget so setup leaves capacity for live request
+         * and prefix-runtime graph identities.
+         */
+        int overlay_segment_rows =
+            kDefaultExpertOverlayPrefillSegmentRows;
+
+        /**
          * @brief Minimum routed rows required for least-loaded prefill.
          *
          * Ordinary prefill contributes `M * top_k` routed rows. Below this
@@ -1211,8 +1326,11 @@ namespace llaminar2
         /**
          * @brief Numerator of the balanced-static-owner skip threshold.
          *
-         * This ratio defines when current owner load is already economical
-         * enough that transport cannot repay its cost for the current batch.
+         * This ratio defines when the busiest static-owner participant is
+         * already close enough to the mean participant load that transport
+         * cannot repay its cost for the current batch. It deliberately does
+         * not compare individual expert popularity: LLEP changes participant
+         * execution load, not the router's expert-frequency distribution.
          */
         uint32_t llep_lambda_numerator = 13;
         /**
@@ -1290,6 +1408,25 @@ namespace llaminar2
         int window_size = 256;
         int max_window_size = 4096;
         float window_growth_factor = 1.5f;
+        /**
+         * @brief Expected routed-token lifetime available to repay one move.
+         *
+         * This is deliberately independent of histogram cadence. A deployment
+         * with stable traffic may amortize a measured transfer over many short
+         * observation windows, while a rapidly changing workload can choose a
+         * smaller lifetime without changing when maintenance is polled.
+         */
+        uint64_t migration_payoff_horizon_tokens =
+            moe_rebalance_policy::kDefaultMigrationPayoffHorizonTokens;
+        /**
+         * @brief Maximum closed residency cycles staged in one async wave.
+         *
+         * One is the conservative production default. Larger values allow the
+         * planner to fill independent endpoint/layer shadow capacity in one
+         * publication epoch; the physical capacity and staging BOM remain
+         * hard upper bounds and may admit fewer cycles.
+         */
+        uint32_t migration_max_cycles_per_wave = 1;
         uint32_t dynamic_imbalance_threshold_per_mille =
             moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille;
         uint32_t dynamic_min_improvement_per_mille =
@@ -1304,7 +1441,7 @@ namespace llaminar2
         uint32_t device_min_load_spread_improvement_divisor =
             moe_rebalance_policy::kDefaultDeviceMinLoadSpreadImprovementDivisor;
         uint32_t device_min_wave_spread_improvement_per_payload_slot = 256;
-        uint32_t device_min_foreign_rows_per_transfer = 0;
+        uint32_t device_min_foreign_rows_per_critical_path_payload_slot = 0;
         uint32_t device_min_router_spread_improvement_per_payload_slot = 128;
         uint32_t device_max_post_wave_load_spread_per_mille = 100;
         /**
@@ -1335,6 +1472,37 @@ namespace llaminar2
     };
 
     /**
+     * @brief Immutable prefill schedule shared by an ExpertOverlay world.
+     *
+     * A heterogeneous routed-expert request crosses every participant in one
+     * ordered sparse-collective protocol.  Captured prefill chunks therefore
+     * need one globally agreed physical-bucket ladder and one maximum logical
+     * row count.  The continuation root publishes the bucket ladder during
+     * initialization and, when distributed, all ranks contribute their
+     * planner-admitted local capacity; @ref graph_row_capacity is their
+     * minimum.  This makes it
+     * impossible for the root to launch a segment a remote expert endpoint
+     * cannot hold in its immutable compact-route arena.
+     *
+     * An empty contract denotes non-overlay execution. It is immutable after
+     * runner construction and is request control-plane state, never a hot-path
+     * allocation policy.
+     */
+    struct OverlayPrefillScheduleContract
+    {
+        /** @brief Common live-row segment capacity across all participants. */
+        int graph_row_capacity = 0;
+        /** @brief Root-authoritative fixed capture buckets, sorted and unique. */
+        std::vector<int> bucket_rows;
+
+        /** @brief Return true only for a complete executable overlay contract. */
+        bool enabled() const noexcept
+        {
+            return graph_row_capacity > 0 && !bucket_rows.empty();
+        }
+    };
+
+    /**
      * @brief Canonical runtime configuration carried through the config chain
      *
      * RuntimeConfig holds pre-parsed runtime parameters that flow from
@@ -1362,6 +1530,16 @@ namespace llaminar2
          */
         int resident_graph_rows = 0;
 
+        /**
+         * @brief ExpertOverlay prefill authority, when one is required.
+         *
+         * Local graph sizing remains in @ref resident_graph_rows.  This
+         * contract constrains request segmentation to a shape every sparse
+         * endpoint can execute, whether participants are process-local or
+         * distributed.
+         */
+        OverlayPrefillScheduleContract overlay_prefill_schedule;
+
         /// Maximum active request batch size for runner-owned state.
         int batch_size = 1;
 
@@ -1383,6 +1561,10 @@ namespace llaminar2
 
         /// Routed MoE expert execution mode.
         RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
+
+        /// Static whole-expert ownership ordering for apportioned execution.
+        RoutedExpertOwnerOrder routed_expert_owner_order =
+            RoutedExpertOwnerOrder::Ordinal;
 
         /// Bounded remote-expert cache for dynamic routed-row assignment.
         MoEHotExpertCacheConfig moe_hot_expert_cache;

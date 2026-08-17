@@ -23,6 +23,7 @@
 #include <cstdio>
 #include "../../common/SamplingMath.h"
 #include "../../../execution/mtp/MTPVerifierOutcomeGraph.h"
+#include "../../../execution/moe/DeviceMoERebalanceABI.h"
 
 // Maximum k supported by the top-k kernel
 constexpr int TOPK_MAX_K = 256;
@@ -4519,6 +4520,165 @@ __global__ void cuda_advance_speculative_commit_boundary_kernel(
 }
 
 /**
+ * @brief Publish one ordinary serial decode boundary into the shared clock.
+ *
+ * A pre-existing marker means grouped MTP already published this exact edge;
+ * the kernel then validates the pair and returns without advancing again.
+ */
+__global__ void cuda_publish_serial_decode_commit_boundary_kernel(
+    uint32_t *__restrict__ decode_rounds_committed,
+    uint32_t *__restrict__ decode_rounds_until_maintenance,
+    uint32_t *__restrict__ maintenance_due,
+    uint32_t *__restrict__ decode_boundary_advanced)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    if (!decode_rounds_committed ||
+        !decode_rounds_until_maintenance || !maintenance_due ||
+        !decode_boundary_advanced)
+    {
+        if (maintenance_due)
+            *maintenance_due = 2u;
+        return;
+    }
+
+    const uint32_t due = *maintenance_due;
+    const uint32_t advanced = *decode_boundary_advanced;
+    const uint32_t remaining = *decode_rounds_until_maintenance;
+    if (advanced > 1u || due > 1u)
+    {
+        *maintenance_due = 2u;
+        return;
+    }
+    if (advanced == 1u)
+    {
+        const bool valid_existing_edge =
+            (due == 0u && remaining > 0u) ||
+            (due == 1u && remaining == 0u);
+        if (!valid_existing_edge)
+            *maintenance_due = 2u;
+        return;
+    }
+    if (due != 0u || remaining == 0u ||
+        *decode_rounds_committed == 0xffffffffu)
+    {
+        *maintenance_due = 2u;
+        return;
+    }
+
+    ++(*decode_rounds_committed);
+    *decode_rounds_until_maintenance = remaining - 1u;
+    if (remaining == 1u)
+        *maintenance_due = 1u;
+    *decode_boundary_advanced = 1u;
+}
+
+/** Retire only a non-due published edge after the conditional child. */
+__global__ void cuda_acknowledge_decode_commit_boundary_kernel(
+    uint32_t *__restrict__ decode_rounds_until_maintenance,
+    uint32_t *__restrict__ maintenance_due,
+    uint32_t *__restrict__ decode_boundary_advanced)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    if (!decode_rounds_until_maintenance || !maintenance_due ||
+        !decode_boundary_advanced)
+    {
+        if (maintenance_due)
+            *maintenance_due = 2u;
+        return;
+    }
+    const uint32_t due = *maintenance_due;
+    const uint32_t advanced = *decode_boundary_advanced;
+    const uint32_t remaining = *decode_rounds_until_maintenance;
+    if (due == 0u && remaining > 0u && advanced <= 1u)
+    {
+        *decode_boundary_advanced = 0u;
+        return;
+    }
+    if (due == 1u && remaining == 0u && advanced == 1u)
+        return;
+    *maintenance_due = 2u;
+}
+
+/** Bind one persistent MoE scheduler ticket to the active request lifecycle. */
+__global__ void cuda_initialize_device_moe_rebalance_dispatch_ticket_kernel(
+    uint64_t session_epoch,
+    uint64_t workspace_generation,
+    uint32_t participant_id,
+    uint32_t participant_count,
+    llaminar2::DeviceMoERebalanceDispatchTicket *__restrict__ ticket)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0 || !ticket)
+        return;
+
+    llaminar2::DeviceMoERebalanceDispatchTicket initialized{};
+    initialized.magic =
+        llaminar2::DeviceMoERebalanceDispatchTicket::kMagic;
+    initialized.abi_version =
+        llaminar2::DeviceMoERebalanceDispatchTicket::kABIVersion;
+    initialized.session_epoch_low = static_cast<uint32_t>(session_epoch);
+    initialized.session_epoch_high =
+        static_cast<uint32_t>(session_epoch >> 32u);
+    initialized.workspace_generation_low =
+        static_cast<uint32_t>(workspace_generation);
+    initialized.workspace_generation_high =
+        static_cast<uint32_t>(workspace_generation >> 32u);
+    initialized.participant_id = participant_id;
+    initialized.participant_count = participant_count;
+    *ticket = initialized;
+}
+
+/** Pack only the cadence decision consumed by HIP's rank scheduler. */
+__global__ void cuda_publish_device_moe_rebalance_dispatch_ticket_kernel(
+    const uint32_t *__restrict__ controller_magic,
+    const uint32_t *__restrict__ controller_version,
+    const uint32_t *__restrict__ controller_error,
+    const uint32_t *__restrict__ decode_rounds_committed,
+    const uint32_t *__restrict__ decode_rounds_until_maintenance,
+    const uint32_t *__restrict__ maintenance_due,
+    const uint32_t *__restrict__ decode_boundary_advanced,
+    llaminar2::DeviceMoERebalanceDispatchTicket *__restrict__ ticket)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0 || !ticket)
+        return;
+
+    const bool pointers_valid = controller_magic && controller_version &&
+                                controller_error && decode_rounds_committed &&
+                                decode_rounds_until_maintenance &&
+                                maintenance_due && decode_boundary_advanced;
+    const uint32_t version =
+        pointers_valid ? *controller_version : 0u;
+    const uint32_t error = pointers_valid ? *controller_error : 0xffffffffu;
+    const uint32_t committed =
+        pointers_valid ? *decode_rounds_committed : 0u;
+    const uint32_t remaining =
+        pointers_valid ? *decode_rounds_until_maintenance : 0u;
+    const uint32_t due = pointers_valid ? *maintenance_due : 2u;
+    const uint32_t advanced =
+        pointers_valid ? *decode_boundary_advanced : 2u;
+    /* Keep the ticket ABI backend-symmetric even though CUDA normally consumes
+     * this state through a native conditional graph.  A non-due boundary may
+     * already have been acknowledged when a diagnostic ticket is published. */
+    const bool boundary_valid =
+        pointers_valid &&
+        *controller_magic == 0x4d4f4552u &&
+        version == llaminar2::moe_rebalance_abi::kVersion && error == 0u &&
+        due <= 1u && advanced <= 1u &&
+        ((due != 0u && advanced == 1u && remaining == 0u) ||
+         (due == 0u && remaining > 0u));
+
+    ticket->healthy = boundary_valid ? 1u : 0u;
+    ticket->controller_version = version;
+    ticket->decode_rounds_committed = committed;
+    ticket->decode_rounds_until_maintenance = remaining;
+    ticket->maintenance_due = due <= 1u ? due : 0u;
+    ticket->decode_boundary_advanced = advanced <= 1u ? advanced : 0u;
+    ticket->error_code = error;
+    __threadfence_system();
+}
+
+/**
  * @brief Publish one request's immutable grouped-greedy controls on device.
  */
 __global__ void cuda_configure_mtp_greedy_penalty_policy_kernel(
@@ -8186,6 +8346,156 @@ extern "C"
             fprintf(
                 stderr,
                 "CUDA speculative commit-boundary advance launch failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_publish_serial_decode_commit_boundary(
+        uint32_t *decode_rounds_committed,
+        uint32_t *decode_rounds_until_maintenance,
+        uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream)
+    {
+        if (!decode_rounds_committed ||
+            !decode_rounds_until_maintenance || !maintenance_due ||
+            !decode_boundary_advanced || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_publish_serial_decode_commit_boundary_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            decode_rounds_committed,
+            decode_rounds_until_maintenance,
+            maintenance_due,
+            decode_boundary_advanced);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA serial decode commit-boundary publication failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_acknowledge_decode_commit_boundary(
+        uint32_t *decode_rounds_until_maintenance,
+        uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream)
+    {
+        if (!decode_rounds_until_maintenance || !maintenance_due ||
+            !decode_boundary_advanced || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_acknowledge_decode_commit_boundary_kernel<<<
+            1,
+            1,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            decode_rounds_until_maintenance,
+            maintenance_due,
+            decode_boundary_advanced);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA decode commit-boundary acknowledgement failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_initialize_device_moe_rebalance_dispatch_ticket(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        uint32_t participant_id,
+        uint32_t participant_count,
+        llaminar2::DeviceMoERebalanceDispatchTicket *ticket,
+        int device_idx,
+        void *stream)
+    {
+        if (session_epoch == 0u || workspace_generation == 0u ||
+            participant_count == 0u || participant_id >= participant_count ||
+            !ticket || !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_initialize_device_moe_rebalance_dispatch_ticket_kernel<<<
+            1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            session_epoch,
+            workspace_generation,
+            participant_id,
+            participant_count,
+            ticket);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA MoE dispatch-ticket initialization failed: %s\n",
+                cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_publish_device_moe_rebalance_dispatch_ticket(
+        const uint32_t *controller_magic,
+        const uint32_t *controller_version,
+        const uint32_t *controller_error,
+        const uint32_t *decode_rounds_committed,
+        const uint32_t *decode_rounds_until_maintenance,
+        const uint32_t *maintenance_due,
+        const uint32_t *decode_boundary_advanced,
+        llaminar2::DeviceMoERebalanceDispatchTicket *ticket,
+        int device_idx,
+        void *stream)
+    {
+        if (!controller_magic || !controller_version || !controller_error ||
+            !decode_rounds_committed || !decode_rounds_until_maintenance ||
+            !maintenance_due || !decode_boundary_advanced || !ticket ||
+            !stream)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cuda_publish_device_moe_rebalance_dispatch_ticket_kernel<<<
+            1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            controller_magic,
+            controller_version,
+            controller_error,
+            decode_rounds_committed,
+            decode_rounds_until_maintenance,
+            maintenance_due,
+            decode_boundary_advanced,
+            ticket);
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(
+                stderr,
+                "CUDA MoE dispatch-ticket publication failed: %s\n",
                 cudaGetErrorString(err));
             return false;
         }

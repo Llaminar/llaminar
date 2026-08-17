@@ -22,6 +22,7 @@
 
 #include <mutex>
 #include <atomic>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -29,26 +30,15 @@ namespace llaminar2
     namespace
     {
         // Phase 6: Support CPU, CUDA, and ROCm backends simultaneously
-        IBackend *g_cpu_backend = nullptr;
+        std::atomic<IBackend *> g_cpu_backend{nullptr};
         IBackend *g_cuda_backend = nullptr;
         IBackend *g_rocm_backend = nullptr;
 
-        std::once_flag g_cpu_init_flag;
         std::once_flag g_cuda_init_flag;
         std::once_flag g_rocm_init_flag;
 
-        // CPU backend requires explicit initialization with NUMA node
-        std::atomic<int> g_cpu_numa_node{-1};
-        std::atomic<bool> g_cpu_init_requested{false};
-
-        void initCPUBackendImpl()
-        {
-            int numa_node = g_cpu_numa_node.load();
-            g_cpu_backend = new CPUBackend(numa_node);
-            LOG_DEBUG("[BackendManager] Initialized CPU backend (NUMA node: "
-                      << numa_node << ", memory: "
-                      << (g_cpu_backend->deviceMemoryTotal(0) / (1024 * 1024)) << " MB)");
-        }
+        // Each MPI process owns one immutable rank-local CPU backend identity.
+        std::mutex g_cpu_init_mutex;
 
         void initCUDABackend()
         {
@@ -131,24 +121,47 @@ namespace llaminar2
 
     void initCPUBackend(int local_numa_node)
     {
-        g_cpu_numa_node.store(local_numa_node);
-        g_cpu_init_requested.store(true);
-        std::call_once(g_cpu_init_flag, initCPUBackendImpl);
+        if (local_numa_node < -1)
+        {
+            throw std::invalid_argument(
+                "CPU backend NUMA node must be -1 (aggregate) or non-negative");
+        }
+
+        std::lock_guard<std::mutex> lock(g_cpu_init_mutex);
+        if (IBackend *existing = g_cpu_backend.load(std::memory_order_acquire))
+        {
+            auto *cpu = dynamic_cast<CPUBackend *>(existing);
+            if (!cpu || cpu->numaNode() != local_numa_node)
+            {
+                throw std::logic_error(
+                    "CPU backend was already initialized for a different NUMA domain");
+            }
+            return;
+        }
+
+        auto *backend = new CPUBackend(local_numa_node);
+        g_cpu_backend.store(backend, std::memory_order_release);
+        LOG_DEBUG("[BackendManager] Initialized CPU backend (NUMA node: "
+                  << local_numa_node << ", memory: "
+                  << (backend->deviceMemoryTotal(0) / (1024 * 1024)) << " MB)");
     }
 
     IBackend *getCPUBackend()
     {
-        if (!g_cpu_init_requested.load())
-        {
-            // Auto-initialize with NUMA node -1 (system-wide) if not explicitly initialized
-            initCPUBackend(-1);
-        }
-        return g_cpu_backend;
+        return g_cpu_backend.load(std::memory_order_acquire);
+    }
+
+    int cpuBackendNUMANode()
+    {
+        auto *backend = dynamic_cast<CPUBackend *>(getCPUBackend());
+        if (!backend)
+            return -1;
+        return backend->numaNode();
     }
 
     bool hasCPUBackend()
     {
-        return getCPUBackend() != nullptr;
+        return g_cpu_backend.load(std::memory_order_acquire) != nullptr;
     }
 
     // ====================================================================

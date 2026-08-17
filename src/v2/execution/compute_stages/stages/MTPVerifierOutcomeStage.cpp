@@ -84,7 +84,7 @@ namespace llaminar2
 
         /*
          * ParticipantLocal ownership makes this terminal transaction complete
-         * on every graph participant. Mirrored LocalTP guarantees that logits,
+         * on every graph participant. Mirrored TP guarantees that logits,
          * verifier inputs, stop controls, and penalty history are byte-identical
          * at this point, so identical deterministic kernels produce identical
          * compact mailboxes without a rank authority transfer.
@@ -183,8 +183,8 @@ namespace llaminar2
             "decode",
             params_.device_id.toString(),
             {{"rows", std::to_string(params_.verifier_row_count)},
-             {"mirrored_local_tp",
-              params_.mirrored_local_tp ? "true" : "false"},
+             {"participant_full_vocabulary",
+              params_.participant_full_vocabulary ? "true" : "false"},
              {"ownership", "participant_local"},
              {"collective", "none"}});
         return true;
@@ -218,8 +218,8 @@ namespace llaminar2
         info.addScalarInt("verifier_rows", params_.verifier_row_count);
         info.addScalarInt("vocab_size", params_.vocab_size);
         info.addScalarBool(
-            "mirrored_local_tp",
-            params_.mirrored_local_tp);
+            "participant_full_vocabulary",
+            params_.participant_full_vocabulary);
         return info;
     }
 

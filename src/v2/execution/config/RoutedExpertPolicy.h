@@ -15,7 +15,8 @@
  * 1. RoutedExpertComputePolicy says where an expert's weights and GEMMs live.
  * 2. RoutedExpertPhasePolicy says whether a phase executes one assigned copy
  *    or every complete local replica.
- * 3. RoutedExpertWorkloadAssignmentPolicy says which eligible complete
+ * 3. RoutedExpertOwnerOrder says how static whole-expert owners are selected.
+ * 4. RoutedExpertWorkloadAssignmentPolicy says which eligible complete
  *    resident executes a row independently for decode and prefill work.
  *
  * Dense/shared-model tensor parallelism is intentionally not represented here;
@@ -89,6 +90,23 @@ namespace llaminar2
          * work sharing while removing tiny routed collectives from decode.
          */
         PrefillApportionedDecodeReplicated,
+    };
+
+    /**
+     * @enum RoutedExpertOwnerOrder
+     * @brief Stable ordering used to apportion complete experts to participants.
+     *
+     * This is an ownership policy, not a route-aware load balancer. `Ordinal`
+     * assigns contiguous expert-id intervals and is useful when physical weight
+     * layout locality dominates. `Random` applies a model-independent,
+     * deterministic per-layer permutation before assigning equally sized
+     * intervals. The latter breaks persistent correlations between neighboring
+     * expert IDs without learning from one model's router histogram.
+     */
+    enum class RoutedExpertOwnerOrder : uint8_t
+    {
+        Ordinal = 0,
+        Random,
     };
 
     /**
@@ -191,11 +209,76 @@ namespace llaminar2
         IndependentBranchCollectives = 0,
 
         /**
+         * CPU participants publish only their locally computed raw expert rows
+         * as indexed packed records. One fixed root gathers those records,
+         * performs the original increasing-slot weighted FMA fold, and
+         * broadcasts only the compact `[M, d_model]` result.
+         *
+         * The route index carried by every record makes arithmetic independent
+         * of static or Dynamic expert ownership. Gathering sparse rows avoids
+         * the `top_k`-scaled zero traffic of a dense route-slot allreduce.
+         */
+        CanonicalRootedPackedRouteRows,
+
+        /**
+         * Routed slots use one rooted reduction, one ordered root fold, and one
+         * compact final-row broadcast.  This is the homogeneous GPU policy when
+         * the shared branch retains its own independent collective.
+         */
+        CanonicalRootedRouteSlots,
+
+        /**
          * Routed slots and rank-addressed shared banks use one rooted reduction.
          * The root folds both banks in fixed order, applies the shared gate, and
          * broadcasts only the final combined row.
          */
         CanonicalRootedRankBanks,
+    };
+
+    /**
+     * @enum MoECanonicalRouteArithmeticPolicy
+     * @brief Arithmetic represented by one canonical routed-expert slot.
+     *
+     * The policy is part of the graph contract because CPU serial decode uses
+     * an ordered FMA (`sum = fma(weight, expert, sum)`), while current GPU
+     * grouped kernels publish a rounded weighted contribution and then perform
+     * ordered FP32 additions.  Making that distinction explicit prevents a
+     * backend from silently inserting an extra rounding point when ownership
+     * becomes distributed.
+     */
+    enum class MoECanonicalRouteArithmeticPolicy : uint8_t
+    {
+        /** No canonical route publication is bound. */
+        Unspecified = 0,
+
+        /** Slots contain `weight * expert`; reduction performs ordered adds. */
+        PreweightedContributionThenOrderedAdd,
+
+        /** Slots contain raw expert rows; reduction performs ordered weighted FMAs. */
+        UnweightedExpertRowThenOrderedFMA,
+    };
+
+    /**
+     * @enum MoECanonicalRoutePublicationLayout
+     * @brief Physical representation of canonical routed-expert evidence.
+     *
+     * Arithmetic and storage are separate policy axes. GPU route kernels use a
+     * dense original-slot layout because their native rooted reduction sums
+     * equal-sized device buffers. CPU expert parallelism instead uses indexed
+     * packed rows so only locally computed expert outputs cross the UPI domain.
+     * Making the layout explicit prevents a reducer or collective from
+     * interpreting the same bytes through an incompatible wire contract.
+     */
+    enum class MoECanonicalRoutePublicationLayout : uint8_t
+    {
+        /** No canonical publication tensor is bound. */
+        Unspecified = 0,
+
+        /** One fixed-width `d_model` row for every original router slot. */
+        DenseOriginalRouteSlots,
+
+        /** Contiguous `(raw expert row, original slot id)` records plus count. */
+        PackedIndexedRouteRows,
     };
 
     /**
@@ -320,6 +403,24 @@ namespace llaminar2
     }
 
     /**
+     * @brief Return the canonical configuration spelling for owner ordering.
+     * @param order Typed static whole-expert owner ordering.
+     * @return Stable lowercase spelling used by CLI, YAML, and diagnostics.
+     */
+    inline const char *routedExpertOwnerOrderToString(
+        RoutedExpertOwnerOrder order)
+    {
+        switch (order)
+        {
+        case RoutedExpertOwnerOrder::Ordinal:
+            return "ordinal";
+        case RoutedExpertOwnerOrder::Random:
+            return "random";
+        }
+        return "unknown";
+    }
+
+    /**
      * @brief Return the canonical configuration spelling for an assignment policy.
      * @param policy Typed routed-row scheduling value to render.
      * @return Stable lowercase spelling used by CLI, YAML, and diagnostics.
@@ -369,8 +470,54 @@ namespace llaminar2
         {
         case MoEParticipantPublicationPolicy::IndependentBranchCollectives:
             return "independent-branch-collectives";
+        case MoEParticipantPublicationPolicy::CanonicalRootedPackedRouteRows:
+            return "canonical-rooted-packed-route-rows";
+        case MoEParticipantPublicationPolicy::CanonicalRootedRouteSlots:
+            return "canonical-rooted-route-slots";
         case MoEParticipantPublicationPolicy::CanonicalRootedRankBanks:
             return "canonical-rooted-rank-banks";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Return the stable diagnostic spelling for canonical slot math.
+     * @param policy Arithmetic contract represented by each route slot.
+     * @return Lowercase spelling used by graph diagnostics and PerfStats.
+     */
+    inline const char *moeCanonicalRouteArithmeticPolicyToString(
+        MoECanonicalRouteArithmeticPolicy policy)
+    {
+        switch (policy)
+        {
+        case MoECanonicalRouteArithmeticPolicy::Unspecified:
+            return "unspecified";
+        case MoECanonicalRouteArithmeticPolicy::
+            PreweightedContributionThenOrderedAdd:
+            return "preweighted-contribution-then-ordered-add";
+        case MoECanonicalRouteArithmeticPolicy::
+            UnweightedExpertRowThenOrderedFMA:
+            return "unweighted-expert-row-then-ordered-fma";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Return the stable diagnostic spelling for canonical wire layout.
+     * @param layout Physical representation of canonical route evidence.
+     * @return Lowercase spelling used by graph diagnostics and PerfStats.
+     */
+    inline const char *moeCanonicalRoutePublicationLayoutToString(
+        MoECanonicalRoutePublicationLayout layout)
+    {
+        switch (layout)
+        {
+        case MoECanonicalRoutePublicationLayout::Unspecified:
+            return "unspecified";
+        case MoECanonicalRoutePublicationLayout::DenseOriginalRouteSlots:
+            return "dense-original-route-slots";
+        case MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows:
+            return "packed-indexed-route-rows";
         }
         return "unknown";
     }
@@ -448,6 +595,22 @@ namespace llaminar2
             return RoutedExpertPhasePolicy::Uniform;
         if (normalized == "prefill-apportioned-decode-replicated")
             return RoutedExpertPhasePolicy::PrefillApportionedDecodeReplicated;
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Parse a canonical static whole-expert owner ordering.
+     * @param value CLI or YAML value naming the owner order.
+     * @return Typed order, or `std::nullopt` for an unknown spelling.
+     */
+    inline std::optional<RoutedExpertOwnerOrder> parseRoutedExpertOwnerOrder(
+        const std::string &value)
+    {
+        const std::string normalized = normalizeRoutedExpertPolicyToken(value);
+        if (normalized == "ordinal")
+            return RoutedExpertOwnerOrder::Ordinal;
+        if (normalized == "random")
+            return RoutedExpertOwnerOrder::Random;
         return std::nullopt;
     }
 

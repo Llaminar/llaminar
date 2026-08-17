@@ -38,6 +38,49 @@ namespace llaminar2
     };
 
     /**
+     * @brief Default number of resident prefill forward-graph identities.
+     *
+     * The outer forward cache owns complete graph topology and stage-persistent
+     * buffers, so this is an admission budget rather than an arbitrary LRU
+     * tuning constant. Environment configuration may override it explicitly.
+     */
+    inline constexpr size_t kDefaultPrefillGraphMaxCachedEntries = 10;
+
+    /**
+     * @brief Cache identities reserved beyond the materialized bucket ladder.
+     *
+     * ExpertOverlay setup materializes every admitted physical row bucket. A
+     * live request can additionally bind a request-specific captured identity,
+     * while prefix-runtime rehydration may own a second topology. Reserving both
+     * keeps ordinary serving from immediately evicting the smallest retained
+     * buckets after an otherwise successful setup pass.
+     */
+    inline constexpr size_t kExpertOverlayPrefillGraphIdentityReserve = 2;
+
+    static_assert(
+        kDefaultPrefillGraphMaxCachedEntries >
+            kExpertOverlayPrefillGraphIdentityReserve,
+        "The default prefill cache must retain at least one overlay bucket");
+    static_assert(
+        kDefaultPrefillGraphMaxCachedEntries -
+                kExpertOverlayPrefillGraphIdentityReserve <=
+            kDefaultPrefillGraphBucketCount,
+        "The default overlay segment requires enough canonical buckets");
+
+    /**
+     * @brief Default maximum physical rows in one ExpertOverlay prefill segment.
+     *
+     * Select the largest canonical bucket whose complete lower bucket ladder
+     * fits beside the reserved runtime identities. This couples the default
+     * segment envelope to the cache and bucket sources of truth instead of a
+     * duplicated row literal. Users may still tune the limit explicitly.
+     */
+    inline constexpr int kDefaultExpertOverlayPrefillSegmentRows =
+        kDefaultPrefillGraphBucketSizes
+            [kDefaultPrefillGraphMaxCachedEntries -
+             kExpertOverlayPrefillGraphIdentityReserve - size_t{1}];
+
+    /**
      * @brief Runtime verifier depths certified by the default NativeVNNI sweep.
      *
      * The grouped kernels are runtime-M implementations and do not use this

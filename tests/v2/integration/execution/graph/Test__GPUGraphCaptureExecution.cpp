@@ -6,8 +6,9 @@
  *   1. Build ComputeGraph with real stages (RMSNorm, ResidualAdd)
  *   2. Execute via executeWithGraphCapture() with a real IGPUGraphCapture
  *   3. Verify output correctness
- *   4. Test backend-specific executable publication after re-capture
- *   5. Prove invalid capture ownership fails closed
+ *   4. Record a production child graph without launching it
+ *   5. Test backend-specific executable publication after re-capture
+ *   6. Prove invalid capture ownership fails closed
  *
  * IMPORTANT: No <hip/hip_runtime.h> or <cuda_runtime.h> includes.
  * All GPU interaction goes through the backend interfaces.
@@ -688,7 +689,50 @@ TEST_F(GPUGraphCaptureExecutionTest, EmptyCollectiveSet_DoesNotFallBack)
 }
 
 // ===========================================================================
-// 8. Graph capture reset and re-capture
+// 8. Retained composition records a child graph without launching it
+// ===========================================================================
+
+TEST_F(GPUGraphCaptureExecutionTest,
+       RetainedGraphFragmentIsRecordedButNotInstantiated)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(capture_, nullptr);
+
+    FP32Tensor *norm_input = nullptr;
+    FP32Tensor *residual = nullptr;
+    FP32Tensor *result = nullptr;
+    auto graph = buildNormResidualGraph(
+        2,
+        32,
+        norm_input,
+        residual,
+        result);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+    executor.setArena(&arena_);
+
+    ASSERT_TRUE(executor.captureRetainedGraphFragment(
+        graph,
+        device_ctx_.get(),
+        capture_.get(),
+        "integration_retained_child"));
+    EXPECT_GT(capture_->nodeCount(), 0u);
+    EXPECT_FALSE(capture_->hasExecutable())
+        << "A retained child must remain an uninstantiated native graph for its parent to import";
+
+    graph.reset();
+    EXPECT_FALSE(executor.captureRetainedGraphFragment(
+        graph,
+        device_ctx_.get(),
+        capture_.get(),
+        "integration_reused_retained_child"))
+        << "Retained composition must reject an owner that already contains graph topology";
+}
+
+// ===========================================================================
+// 9. Graph capture reset and re-capture
 // ===========================================================================
 
 TEST_F(GPUGraphCaptureExecutionTest, ResetAndRecapture_Works)

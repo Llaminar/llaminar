@@ -15,6 +15,7 @@
 #include "ExpertWeightTransfer.h"    // ExpertWeightBlobs
 #include "GPUExpertTransfer.h"
 #include "MoERebalanceController.h"  // ExpertReplicaSet
+#include "../../backends/BackendManager.h"
 #include "../../backends/DeviceId.h"
 #include "../../loaders/ExpertSlabTypes.h"
 
@@ -22,6 +23,7 @@
 #include <optional>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -34,6 +36,87 @@ class PreparedWeightStore;
 class ExpertGemmRegistry;
 class GpuExpertSlotPool;
 class GpuExpertTransferStagingPool;
+
+/**
+ * @brief Typed NUMA ownership policy for persistent CPU expert weights.
+ *
+ * A weight context must state whether CPU placement is irrelevant, spans an
+ * aggregate CPU domain, or belongs to one exact NUMA node. The deleted default
+ * constructor makes adding a new context construction site without making that
+ * decision a compile-time error.
+ */
+class CPUExpertNUMAPlacement
+{
+public:
+    enum class Scope
+    {
+        NotApplicable,
+        AggregateDomain,
+        BoundNode,
+    };
+
+    CPUExpertNUMAPlacement() = delete;
+
+    /** @brief Construct policy for a non-CPU weight context. */
+    static CPUExpertNUMAPlacement notApplicable()
+    {
+        return CPUExpertNUMAPlacement(Scope::NotApplicable, -1);
+    }
+
+    /** @brief Construct policy for one process spanning the aggregate CPU domain. */
+    static CPUExpertNUMAPlacement aggregateDomain()
+    {
+        return CPUExpertNUMAPlacement(Scope::AggregateDomain, -1);
+    }
+
+    /**
+     * @brief Construct strict ownership by one exact NUMA node.
+     * @throws std::invalid_argument when @p node is negative.
+     */
+    static CPUExpertNUMAPlacement boundNode(int node)
+    {
+        if (node < 0)
+            throw std::invalid_argument(
+                "Bound CPU expert NUMA placement requires a non-negative node");
+        return CPUExpertNUMAPlacement(Scope::BoundNode, node);
+    }
+
+    /**
+     * @brief Resolve policy from the rank-local backend declaration.
+     *
+     * GPU contexts are explicitly not applicable. CPU contexts use the NUMA
+     * node captured when the rank's `CPUBackend` was initialized; an aggregate
+     * backend remains explicit rather than guessing from the current thread.
+     */
+    static CPUExpertNUMAPlacement forDevice(DeviceId device)
+    {
+        if (!device.is_cpu())
+            return notApplicable();
+        const int node = cpuBackendNUMANode();
+        return node >= 0 ? boundNode(node) : aggregateDomain();
+    }
+
+    /** @brief Return the declared placement scope. */
+    Scope scope() const noexcept { return scope_; }
+
+    /** @brief Return whether every persistent packed page must reside on one node. */
+    bool requiresNodeBinding() const noexcept
+    {
+        return scope_ == Scope::BoundNode;
+    }
+
+    /** @brief Return the exact node, or `-1` when no single node is declared. */
+    int node() const noexcept { return node_; }
+
+private:
+    CPUExpertNUMAPlacement(Scope scope, int node) noexcept
+        : scope_(scope), node_(node)
+    {
+    }
+
+    Scope scope_;
+    int node_;
+};
 
 /// Lightweight reference struct pointing to the MoEExpertComputeStage::Params fields
 /// that the weight service operates on. Avoids coupling the service to the
@@ -97,10 +180,9 @@ struct MoEWeightContext {
     // fresh VRAM allocation for every rebalanced expert.
     std::shared_ptr<GpuExpertSlotPool>* gpu_direct_slot_pool = nullptr;
 
-    // CPU NUMA node for strict packed-weight placement. A negative value means
-    // the CPU domain spans the process's allowed sockets, so expert packing must
-    // not bind all grouped CPU verifier weights to an incidental current CPU.
-    int cpu_numa_node = -1;
+    // Required typed policy: omission at a new construction site is a compile
+    // error instead of silently disabling strict arrival placement.
+    CPUExpertNUMAPlacement cpu_numa_placement;
 
 };
 
@@ -160,6 +242,7 @@ struct GpuDirectTransferSlotProjection
     bool is_asymmetric = false;
     bool has_emins = false;
     uint8_t codebook_id = 0;
+    NativeVnniSourceIdentity source_identity;
     std::shared_ptr<void> transfer_slot_lifetime;
 
     bool valid() const;
@@ -210,10 +293,28 @@ public:
     /// Returns bytes freed.
     static size_t releaseRawWeights(MoEWeightContext& ctx);
 
-    // ── Weight serialization (for MPI transfer) ──────────────────────
+    // ── Prepared-weight movement and serialization ───────────────────
 
-    /// Detach and serialize packed weights for a departing expert (destructive).
-    static ExpertWeightBlobs detachAndSerializeExpert(MoEWeightContext& ctx, int expert_id);
+    /**
+     * @brief Detach the three final packed CPU projections for ownership movement.
+     *
+     * This is O(1): the packed allocations move out of their source engines and
+     * are subsequently consumed by direct MPI section transfer.
+     */
+    static ExpertPackedWeights detachPreparedExpert(
+        MoEWeightContext& ctx,
+        int expert_id);
+
+    /**
+     * @brief Clone the three final packed CPU projections for replication.
+     *
+     * The source engines remain resident. The explicit clone is the ownership
+     * cost required by a replica; it is not followed by another serialization
+     * copy on the homogeneous CPU transfer path.
+     */
+    static ExpertPackedWeights clonePreparedExpert(
+        const MoEWeightContext& ctx,
+        int expert_id);
 
     /// Serialize packed weights for an expert without detaching (non-destructive).
     static ExpertWeightBlobs serializeExpert(const MoEWeightContext& ctx, int expert_id);
@@ -228,7 +329,9 @@ public:
     static bool registerAndPrepareNewExperts(
         MoEWeightContext& ctx,
         const std::vector<bool>& new_mask,
-        const std::unordered_map<int, ExpertWeightBlobs>* received_weights);
+        const std::unordered_map<int, ExpertWeightBlobs>* received_weights,
+        const std::unordered_map<int, PreparedExpertEngines>*
+            received_prepared_experts = nullptr);
 
     // ── GPU-direct transfer ──────────────────────────────────────────
 

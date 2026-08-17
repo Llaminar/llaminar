@@ -130,6 +130,13 @@ namespace llaminar2
         // GDN projection uses standard GEMM path — graph-capturable
         bool isGraphCapturable() const override { return true; }
 
+        /** @brief Provision all four projection engines before graph capture. */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return GraphLaunchPreparationPolicy::CaptureOnly;
+        }
+
     private:
         /// Lazily resolve a GEMM kernel from a prepared weight ref.
         /// Caches the result in @p cached for subsequent calls (like GEMMStage).

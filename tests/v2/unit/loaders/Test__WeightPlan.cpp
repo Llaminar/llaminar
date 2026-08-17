@@ -103,6 +103,68 @@ TEST(Test__FrozenModelWeightSet, LooksUpGlobalAndLayerBindings)
     EXPECT_EQ(rocm1_bindings[0]->identity.canonical_name, "blk.2.ffn_down.weight");
 }
 
+TEST(Test__FrozenModelWeightSet,
+     DeviceQualifiedLookupKeepsHeterogeneousExpertSlicesIndependent)
+{
+    auto cuda_expert_parent =
+        std::make_shared<FP32Tensor>(std::vector<size_t>{4, 8, 2});
+    auto cpu_expert_parent =
+        std::make_shared<FP32Tensor>(std::vector<size_t>{4, 8, 2});
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::ExpertOverlayRank;
+    strategy.model_id = ModelContextId{701};
+    strategy.devices = {DeviceId::cuda(0), DeviceId::cpu()};
+
+    ModelWeightSetBuilder builder(strategy);
+    auto cuda_binding = makeBinding(
+        "blk.3.ffn_gate_exps.weight",
+        DeviceId::cuda(0),
+        PreparedWeightKind::MoeExpertSlab,
+        cuda_expert_parent.get());
+    cuda_binding.identity.role = WeightRole::MoEExpertGate;
+    cuda_binding.identity.derivation = WeightDerivationKind::ExpertSlice;
+    cuda_binding.identity.overlay_domain = "cuda_hot";
+    cuda_binding.slice.expert_ids = {0, 1};
+
+    auto cpu_binding = makeBinding(
+        "blk.3.ffn_gate_exps.weight",
+        DeviceId::cpu(),
+        PreparedWeightKind::MoeExpertSlab,
+        cpu_expert_parent.get());
+    cpu_binding.identity.role = WeightRole::MoEExpertGate;
+    cpu_binding.identity.derivation = WeightDerivationKind::ExpertSlice;
+    cpu_binding.identity.overlay_domain = "cpu_cold";
+    cpu_binding.slice.expert_ids = {2, 3};
+
+    builder.addBinding(std::move(cuda_binding));
+    builder.addBinding(std::move(cpu_binding));
+    FrozenModelWeightSet frozen(strategy, builder.freezeBindings());
+
+    /* The legacy unqualified accessor observes last-write indexing. */
+    ASSERT_NE(frozen.optionalLayer(3, "ffn_gate_exps.weight"), nullptr);
+    EXPECT_EQ(
+        frozen.optionalLayer(3, "ffn_gate_exps.weight")->tensor,
+        cpu_expert_parent.get());
+
+    const WeightBinding *cuda = frozen.optionalLayerForDevice(
+        3, "ffn_gate_exps.weight", DeviceId::cuda(0));
+    const WeightBinding *cpu = frozen.optionalLayerForDevice(
+        3, "ffn_gate_exps.weight", DeviceId::cpu());
+    ASSERT_NE(cuda, nullptr);
+    ASSERT_NE(cpu, nullptr);
+    EXPECT_EQ(cuda->tensor, cuda_expert_parent.get());
+    EXPECT_EQ(cpu->tensor, cpu_expert_parent.get());
+    EXPECT_EQ(cuda->slice.expert_ids, (std::vector<int>{0, 1}));
+    EXPECT_EQ(cpu->slice.expert_ids, (std::vector<int>{2, 3}));
+
+    const auto cuda_bindings =
+        makeModelWeightBindings(frozen, DeviceId::cuda(0));
+    const auto cuda_layer = cuda_bindings.get_layer_weights(3);
+    ASSERT_NE(cuda_layer.moe_gate_exps, nullptr);
+    EXPECT_EQ(cuda_layer.moe_gate_exps->tensor, cuda_expert_parent.get());
+}
+
 TEST(Test__FrozenModelWeightSet, ValidatesPreparedBindingIds)
 {
     InferenceStrategy strategy;
@@ -756,7 +818,17 @@ TEST(Test__WeightManagerMaterialize, FrozenBindingsRetainMaterializedTPSlices)
     FrozenModelWeightSet second_frozen = manager.materialize(plan);
     const auto &second_binding = second_frozen.layer(0, "ssm_a");
     ASSERT_NE(second_binding.tensor, nullptr);
-    EXPECT_NE(second_binding.tensor, first_binding.tensor);
+    ASSERT_TRUE(second_binding.tensor_owner);
+
+    /*
+     * Immutable TP slices are cached by their source/device/assignment tuple.
+     * Re-materializing the same declarative plan must therefore retain one
+     * authoritative slice instead of allocating a competing host shadow. Both
+     * frozen sets hold shared ownership, so the first binding remains valid
+     * while the second view is constructed.
+     */
+    EXPECT_EQ(second_binding.tensor, first_binding.tensor);
+    EXPECT_EQ(second_binding.tensor_owner.get(), first_binding.tensor_owner.get());
 
     ASSERT_EQ(first_binding.tensor->shape().size(), 1u);
     EXPECT_EQ(first_binding.tensor->shape()[0], 16u);

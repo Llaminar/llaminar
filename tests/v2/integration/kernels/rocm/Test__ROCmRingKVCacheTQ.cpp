@@ -2,9 +2,9 @@
  * @file Test__ROCmRingKVCacheTQ.cpp
  * @brief Comprehensive unit tests for ROCm TurboQuant KV Cache
  *
- * Ports the CUDA TQ KV cache test suite (Test__CUDARingKVCacheTQ.cpp)
- * to ROCm/HIP. Tests the ROCmRingKVCacheTQ class which stores K in TQ8
- * (8-bit, 256 centroids) and V in TQ4 (4-bit, 16 centroids).
+ * Ports the CUDA compressed KV cache suite to ROCm/HIP. The production cache
+ * stores attention-preserving AQ8 keys and an immutable Q8_1, TQ8, or TQ4
+ * value representation selected before graph capture.
  *
  * Tests:
  * 1.  Basic append + retrieve roundtrip (TQ8-K/TQ4-V)
@@ -35,6 +35,7 @@
 #include <iomanip>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 #ifdef HAVE_ROCM
@@ -43,6 +44,8 @@
 #include "kernels/rocm/kvcache/ROCmRingKVCacheTQ.h"
 #include "kernels/rocm/kvcache/ROCmRingKVCacheTQFactory.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
+#include "kernels/cpu/turboquant/TurboQuantDequantizeTQ8.h"
+#include "kernels/cpu/turboquant/TurboQuantQuantizeTQ8.h"
 #include "kernels/IKVCache.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -145,6 +148,14 @@ namespace
             sum += diff * diff;
         }
         return static_cast<float>(sum / n);
+    }
+
+    /** @brief Map IEEE FP16 bits to adjacent monotonic integer codes. */
+    int fp16OrderedCode(uint16_t bits)
+    {
+        return (bits & 0x8000U) != 0
+                   ? 0x8000 - static_cast<int>(bits & 0x7fffU)
+                   : 0x8000 + static_cast<int>(bits);
     }
 
     // Upload FP32 host vector to GPU, returning device pointer
@@ -1198,9 +1209,132 @@ TEST(Test__ROCmRingKVCacheTQ, MetadataAccessors)
 
     EXPECT_EQ(cache_ptr->n_layers(), n_layers);
     EXPECT_EQ(cache_ptr->max_seq_len(), max_seq_len);
-    EXPECT_EQ(cache_ptr->k_precision(), ActivationPrecision::TQ8);
+    EXPECT_EQ(cache_ptr->k_precision(), ActivationPrecision::AQ8);
     EXPECT_EQ(cache_ptr->v_precision(), ActivationPrecision::TQ4);
     EXPECT_FALSE(cache_ptr->is_sharded());
+}
+
+/**
+ * @brief Compare production fused TQ8-value append bytes with the scalar codec.
+ *
+ * Grouped cache tests compare one HIP path with another HIP path and cannot
+ * expose a backend-wide encoding error. This regression reads the physical
+ * value blocks written by the real ring append, checks every Lloyd-Max index
+ * against the scalar mathematical oracle, and verifies that the production
+ * decoder differs by at most one representable FP16 value after backend-local
+ * floating-point reduction.
+ */
+TEST(Test__ROCmRingKVCacheTQ, TQ8ValuePhysicalCodecMatchesScalarOracle)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    constexpr int num_tokens = 7;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 128;
+    constexpr int kv_dim = n_kv_heads * head_dim;
+
+    TurboQuantContext tq_ctx(head_dim, 42);
+    auto cache_owner = createROCmRingKVCacheTQ(
+        /*n_layers=*/1, /*batch_size=*/1, /*max_seq_len=*/16,
+        n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0,
+        TurboQuantKVMode::AQ8_K_TQ8_V);
+    auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_owner.get());
+    ASSERT_NE(cache, nullptr);
+    KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
+    ScopedHipStream stream;
+
+    const auto host_k = generateRandomFP32(num_tokens * kv_dim, 771);
+    const auto host_v = generateRandomFP32(num_tokens * kv_dim, 772);
+    float *device_k = uploadToGPU(host_k);
+    float *device_v = uploadToGPU(host_v);
+    GpuTensorView k_view(
+        device_k, num_tokens, kv_dim, TensorType::FP32, DeviceId::rocm(0));
+    GpuTensorView v_view(
+        device_v, num_tokens, kv_dim, TensorType::FP32, DeviceId::rocm(0));
+    ASSERT_TRUE(appendWithTestStream(
+        *cache, /*layer=*/0, /*seq_idx=*/0,
+        &k_view, &v_view, num_tokens, stream));
+    stream.synchronize();
+
+    std::vector<TQ8Block_128> actual(num_tokens * n_kv_heads);
+    ASSERT_EQ(
+        hipMemcpy(actual.data(), cache->raw_v_cache(/*layer=*/0),
+                  actual.size() * sizeof(TQ8Block_128),
+                  hipMemcpyDeviceToHost),
+        hipSuccess);
+
+    const ITensor *decoded_v = cache->get_v(/*layer=*/0, /*seq_idx=*/0);
+    ASSERT_NE(decoded_v, nullptr);
+    stream.synchronize();
+    std::vector<uint16_t> decoded_v_bits(num_tokens * kv_dim);
+    ASSERT_EQ(
+        hipMemcpy(decoded_v_bits.data(), decoded_v->gpu_data_ptr(),
+                  decoded_v_bits.size() * sizeof(uint16_t),
+                  hipMemcpyDeviceToHost),
+        hipSuccess);
+
+    alignas(64) float scratch0[head_dim];
+    alignas(64) float scratch1[head_dim];
+    for (int token = 0; token < num_tokens; ++token)
+    {
+        for (int head = 0; head < n_kv_heads; ++head)
+        {
+            const auto &head_ctx =
+                tq_ctx.for_layer(/*layer=*/0).for_layer(head);
+            TQ8Block_128 expected{};
+            turboquant_quantize_tq8_scalar<head_dim>(
+                host_v.data() +
+                    (static_cast<size_t>(token) * n_kv_heads + head) * head_dim,
+                head_ctx, expected, scratch0, scratch1);
+            const auto &observed =
+                actual[static_cast<size_t>(token) * n_kv_heads + head];
+            EXPECT_NEAR(observed.norm, expected.norm, 2.0e-6f)
+                << "token=" << token << " head=" << head;
+            // The HIP encoder uses a fixed wavefront reduction tree while the
+            // scalar oracle accumulates coordinates in index order. Bound the
+            // permitted roundoff by four FP32 relative epsilons; the indices
+            // remain exact and the decoded output below remains within one
+            // representable FP16 value.
+            const float reconstruction_norm_error = std::fabs(
+                observed.reconstruction_norm - expected.reconstruction_norm);
+            const float reconstruction_norm_roundoff =
+                4.0f * std::numeric_limits<float>::epsilon() *
+                std::max(1.0f, std::fabs(expected.reconstruction_norm));
+            EXPECT_LE(
+                reconstruction_norm_error,
+                reconstruction_norm_roundoff)
+                << "token=" << token << " head=" << head;
+            for (int coordinate = 0; coordinate < head_dim; ++coordinate)
+            {
+                EXPECT_EQ(observed.indices[coordinate], expected.indices[coordinate])
+                    << "token=" << token << " head=" << head
+                    << " coordinate=" << coordinate;
+            }
+
+            alignas(64) float expected_decoded[head_dim];
+            turboquant_dequantize_tq8_scalar<head_dim>(
+                observed, head_ctx, expected_decoded, scratch0);
+            for (int coordinate = 0; coordinate < head_dim; ++coordinate)
+            {
+                const uint16_t expected_bits =
+                    fp32_to_fp16(expected_decoded[coordinate]);
+                const size_t output_index =
+                    (static_cast<size_t>(token) * n_kv_heads + head) *
+                        head_dim +
+                    coordinate;
+                const int fp16_ulp_distance = std::abs(
+                    fp16OrderedCode(decoded_v_bits[output_index]) -
+                    fp16OrderedCode(expected_bits));
+                EXPECT_LE(fp16_ulp_distance, 1)
+                    << "decoded token=" << token << " head=" << head
+                    << " coordinate=" << coordinate;
+            }
+        }
+    }
+
+    ASSERT_EQ(hipFree(device_k), hipSuccess);
+    ASSERT_EQ(hipFree(device_v), hipSuccess);
 }
 
 /**
@@ -1223,14 +1357,23 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBy
     constexpr int n_kv_heads = 2;
     constexpr std::array<int, batch_size> expected_counts{6, 4};
 
-    for (const int head_dim : {64, 128})
+    for (const TurboQuantKVMode mode : {
+             TurboQuantKVMode::AQ8_K_Q8_1_V,
+             TurboQuantKVMode::AQ8_K_TQ8_V,
+             TurboQuantKVMode::AQ8_K_TQ4_V})
     {
-        SCOPED_TRACE("head_dim=" + std::to_string(head_dim));
+      for (const int head_dim : {64, 128})
+      {
+        SCOPED_TRACE(
+            std::string("mode=") + turboQuantKVModeName(mode) +
+            " head_dim=" + std::to_string(head_dim));
         const int kv_dim = n_kv_heads * head_dim;
         TurboQuantContext tq_ctx(head_dim, 42);
         auto cache_owner = createROCmRingKVCacheTQ(
             /*n_layers=*/1, batch_size, max_seq_len,
-            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+            n_kv_heads, head_dim,
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
+            /*device_id=*/0, mode);
         auto *cache = dynamic_cast<ROCmRingKVCacheTQ *>(cache_owner.get());
         ASSERT_NE(cache, nullptr);
         KVCacheTestWorkspaceBinding workspace(*cache, DeviceId::rocm(0));
@@ -1371,13 +1514,15 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBy
                     << std::dec;
             };
             expectWordsEqual(
-                actual_k.data() + request_offset, scalar_k[request], "TQ8 K");
+                actual_k.data() + request_offset, scalar_k[request], "AQ8 K");
             expectWordsEqual(
-                actual_v.data() + request_offset, scalar_v[request], "TQ4 V");
+                actual_v.data() + request_offset, scalar_v[request],
+                turboQuantKVModeName(mode));
         }
 
         ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
         ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+      }
     }
 }
 
@@ -1403,9 +1548,16 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
     constexpr std::array<int, batch_size> initial_counts{captured_rows, 5};
     constexpr std::array<int, batch_size> final_counts{captured_rows + 1, 6};
 
-    for (const int head_dim : {64, 128})
+    for (const TurboQuantKVMode mode : {
+             TurboQuantKVMode::AQ8_K_Q8_1_V,
+             TurboQuantKVMode::AQ8_K_TQ8_V,
+             TurboQuantKVMode::AQ8_K_TQ4_V})
     {
-        SCOPED_TRACE("head_dim=" + std::to_string(head_dim));
+      for (const int head_dim : {64, 128})
+      {
+        SCOPED_TRACE(
+            std::string("mode=") + turboQuantKVModeName(mode) +
+            " head_dim=" + std::to_string(head_dim));
         const int kv_dim = n_kv_heads * head_dim;
         const size_t source_elements =
             static_cast<size_t>(batch_size) * captured_rows * kv_dim;
@@ -1435,10 +1587,14 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
         ScopedHipStream stream;
         ROCmRingKVCacheTQ actual(
             /*n_layers=*/1, batch_size, max_seq_len,
-            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+            n_kv_heads, head_dim,
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
+            /*device_id=*/0, mode);
         ROCmRingKVCacheTQ reference(
             /*n_layers=*/1, batch_size, max_seq_len,
-            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+            n_kv_heads, head_dim,
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
+            /*device_id=*/0, mode);
         KVCacheTestWorkspaceBinding actual_workspace(
             actual, DeviceId::rocm(0));
         KVCacheTestWorkspaceBinding reference_workspace(
@@ -1473,7 +1629,8 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
             .seq_len = captured_rows,
             .request_sequence_lengths_device = device_lengths,
             .head_dim = head_dim,
-            .turboquant_ctx = &tq_ctx,
+            .turboquant_ctx =
+                turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
         });
         append_stage.setGPUStream(stream.opaque());
         append_stage.updateDynamicParams(/*pos_offset=*/0, captured_rows);
@@ -1624,17 +1781,19 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
                 std::memcmp(
                     actual_k_bytes.data(), reference_k_bytes.data(), bytes),
                 0)
-                << "captured TQ8 K continuation changed live bytes";
+                << "captured AQ8 K continuation changed live bytes";
             EXPECT_EQ(
                 std::memcmp(
                     actual_v_bytes.data(), reference_v_bytes.data(), bytes),
                 0)
-                << "captured TQ4 V continuation changed live bytes";
+                << "captured " << turboQuantKVModeName(mode)
+                << " V continuation changed live bytes";
         }
 
         ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
         ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
         ASSERT_EQ(hipFree(device_lengths), hipSuccess);
+      }
     }
 }
 
@@ -1659,9 +1818,16 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
     constexpr float rope_theta = 10000.0f;
     constexpr int position_start = 3;
 
-    for (const int head_dim : {64, 128})
+    for (const TurboQuantKVMode mode : {
+             TurboQuantKVMode::AQ8_K_Q8_1_V,
+             TurboQuantKVMode::AQ8_K_TQ8_V,
+             TurboQuantKVMode::AQ8_K_TQ4_V})
     {
-        SCOPED_TRACE("head_dim=" + std::to_string(head_dim));
+      for (const int head_dim : {64, 128})
+      {
+        SCOPED_TRACE(
+            std::string("mode=") + turboQuantKVModeName(mode) +
+            " head_dim=" + std::to_string(head_dim));
         const int kv_dim = n_kv_heads * head_dim;
         auto history_k_values = generateRandomFP32(
             static_cast<size_t>(history_rows) * kv_dim, 2701 + head_dim);
@@ -1682,10 +1848,14 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
         ScopedHipStream stream;
         ROCmRingKVCacheTQ actual(
             /*n_layers=*/1, /*batch_size=*/1, max_seq_len,
-            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+            n_kv_heads, head_dim,
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
+            /*device_id=*/0, mode);
         ROCmRingKVCacheTQ reference(
             /*n_layers=*/1, /*batch_size=*/1, max_seq_len,
-            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+            n_kv_heads, head_dim,
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
+            /*device_id=*/0, mode);
         KVCacheTestWorkspaceBinding actual_workspace(
             actual, DeviceId::rocm(0));
         KVCacheTestWorkspaceBinding reference_workspace(
@@ -1706,7 +1876,8 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
         read_params.n_kv_heads = n_kv_heads;
         read_params.head_dim = head_dim;
         read_params.rope_dim = head_dim;
-        read_params.turboquant_ctx = &tq_ctx;
+        read_params.turboquant_ctx =
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr;
         read_params.gpu_stream = stream.opaque();
 
         KVCacheAppendStage append_stage({
@@ -1720,7 +1891,8 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
             .batch_size = 1,
             .seq_len = 1,
             .head_dim = head_dim,
-            .turboquant_ctx = &tq_ctx,
+            .turboquant_ctx =
+                turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
         });
         append_stage.setGPUStream(stream.opaque());
         append_stage.updateDynamicDevicePositionIds(
@@ -1825,16 +1997,18 @@ TEST(Test__ROCmRingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
         EXPECT_EQ(
             std::memcmp(actual_k_bytes.data(), reference_k_bytes.data(), bytes),
             0)
-            << "captured device-owned TQ8 K dequant differs from exact continuation";
+            << "captured device-owned AQ8 K dequant differs from exact continuation";
         EXPECT_EQ(
             std::memcmp(actual_v_bytes.data(), reference_v_bytes.data(), bytes),
             0)
-            << "captured device-owned TQ4 V dequant differs from exact continuation";
+            << "captured device-owned " << turboQuantKVModeName(mode)
+            << " V dequant differs from exact continuation";
 
         EXPECT_EQ(actual.get_cached_tokens(0, 0), final_rows);
         EXPECT_EQ(actual.ring_head(0, 0), final_rows);
         ASSERT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
         ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+      }
     }
 }
 

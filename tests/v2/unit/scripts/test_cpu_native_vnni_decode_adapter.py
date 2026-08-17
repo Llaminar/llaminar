@@ -32,6 +32,7 @@ from native_vnni_dispatch.adapters.cpu_decode import (  # noqa: E402
 )
 from native_vnni_dispatch.adapters.evidence import (  # noqa: E402
     native_double_digest,
+    raw_corpus_id,
 )
 from native_vnni_dispatch.candidate_observation import (  # noqa: E402
     write_observation_csv,
@@ -110,6 +111,24 @@ def raw_row() -> dict[str, str]:
 
 class CPUDecodeAdapterTest(unittest.TestCase):
     """Protect byte, route, ISA, and arithmetic-bundle admission gates."""
+
+    def test_corpus_identity_canonicalizes_relative_path_aliases(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            evidence = Path(directory) / "evidence.csv"
+            evidence.write_bytes(b"candidate,timing\nnbc4,1.0\n")
+            relative = evidence.relative_to(Path.cwd())
+
+            self.assertEqual(
+                raw_corpus_id((relative,)),
+                raw_corpus_id((evidence.resolve(),)),
+            )
+
+            moved = evidence.with_name("moved.csv")
+            moved.write_bytes(evidence.read_bytes())
+            self.assertNotEqual(
+                raw_corpus_id((relative,)),
+                raw_corpus_id((moved,)),
+            )
 
     def test_adapts_forceable_byte_exact_candidate(self) -> None:
         observation = adapt_cpu_decode_row(raw_row(), context())

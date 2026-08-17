@@ -34,6 +34,109 @@ CPU_NATIVE_VNNI_DECODE = "cpu_native_vnni_decode"
 CPU_NATIVE_VNNI_VERIFIER_ROWS = "cpu_native_vnni_verifier_rows"
 CPU_NATIVE_VNNI_PREFILL_GEMM = "cpu_native_vnni_prefill_gemm"
 
+# Keep this measured boundary equal to
+# kDecodeScheduleUnderfillCrossoverElements in CPUNativeVNNIGemv.h. The
+# candidate-registry regression reads both definitions so corpus tooling cannot
+# silently diverge from the production resolver.
+CPU_DECODE_UNDERFILL_CROSSOVER_ELEMENTS = 32 * 1024 * 1024
+CPU_DECODE_N_BLOCK_CHUNKS = (1, 2, 4, 8, 16)
+
+
+def resolve_cpu_native_vnni_decode_n_block_chunks(
+    requested_n_block_chunks: int,
+    *,
+    n: int,
+    k: int,
+    k_tiles: int,
+    threads: int,
+) -> int:
+    """Resolve one nominal CPU M=1 schedule to its physical task width.
+
+    This is the corpus-side form of ``resolveDecodeSchedulePolicy()``. Widths
+    that cover the complete N inventory collapse to one physical power-of-two
+    route. Above the measured 32-Mi-element crossover, a coarse width is then
+    narrowed until its ``(N block, K tile)`` producer grid exposes every worker
+    that NBC1 could use. The operation is deterministic and total: NBC1 is
+    always a physical identity, while small underfilled shapes retain the
+    measured task-overhead tradeoff.
+    """
+
+    if requested_n_block_chunks not in CPU_DECODE_N_BLOCK_CHUNKS:
+        raise ValueError("unsupported CPU decode N-block width")
+    if n <= 0 or k <= 0 or k_tiles < 0 or threads <= 0:
+        raise ValueError(
+            "CPU decode schedule requires positive N, K, and threads plus "
+            "non-negative K tiles"
+        )
+
+    n_chunks = (n + 63) // 64
+    if n_chunks <= 1:
+        effective = 1
+    elif requested_n_block_chunks < n_chunks:
+        effective = requested_n_block_chunks
+    elif n_chunks <= 2:
+        effective = 2
+    elif n_chunks <= 4:
+        effective = 4
+    elif n_chunks <= 8:
+        effective = 8
+    else:
+        effective = 16
+
+    physical_k_tiles = max(1, k_tiles)
+    target_tasks = min(threads, n_chunks * physical_k_tiles)
+
+    def producer_tasks(width: int) -> int:
+        return ((n_chunks + width - 1) // width) * physical_k_tiles
+
+    if n * k > CPU_DECODE_UNDERFILL_CROSSOVER_ELEMENTS:
+        while producer_tasks(effective) < target_tasks and effective > 1:
+            effective //= 2
+    return effective
+
+
+def cpu_native_vnni_decode_physical_candidate_ids(
+    *,
+    n: int,
+    k: int,
+    k_tiles: int,
+    threads: int,
+) -> frozenset[str]:
+    """Return every distinct forceable M=1 schedule for one geometry.
+
+    Registry entries describe the union of launch schedules that can exist
+    across the complete geometry domain. At one concrete geometry, multiple
+    nominal widths can resolve to the same physical OpenMP task grid. Timing or
+    requiring those aliases as separate candidates would give one launch
+    several identities and distort both coverage and fit weights. Resolve the
+    complete registry axis first, then retain exactly one canonical candidate
+    ID for each distinct physical width.
+
+    Args:
+        n: Physical output-column count.
+        k: Physical reduction dimension.
+        k_tiles: Frozen serial-M1 K-partition count, where zero means full-K.
+        threads: Positive OpenMP worker count for the runtime surface.
+
+    Returns:
+        The complete set of physically distinct candidate IDs for this key.
+    """
+
+    physical_widths = {
+        resolve_cpu_native_vnni_decode_n_block_chunks(
+            width,
+            n=n,
+            k=k,
+            k_tiles=k_tiles,
+            threads=threads,
+        )
+        for width in CPU_DECODE_N_BLOCK_CHUNKS
+    }
+    return frozenset(
+        f"cpu.nvnni.decode.n_chunk_grid.nbc{width}"
+        for width in physical_widths
+    )
+
 
 def _sha256_json(value: Any) -> str:
     """Return a stable SHA-256 identity for one JSON-compatible value."""
@@ -405,10 +508,10 @@ def cpu_native_vnni_decode_registry() -> CandidateRegistry:
             },
             schedule=(
                 "cpu-native-vnni-m1-n-chunk-grid-"
-                f"nbc{n_block_chunks}-v1"
+                f"nbc{n_block_chunks}-underfill-resolved-v2"
             ),
         )
-        for n_block_chunks in (1, 2, 4, 8, 16)
+        for n_block_chunks in CPU_DECODE_N_BLOCK_CHUNKS
     )
 
 

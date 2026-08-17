@@ -6,6 +6,7 @@
 #pragma once
 
 #include "backends/DeviceId.h"
+#include "DecodeExpertHistogram.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -13,13 +14,135 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
 namespace llaminar2
 {
+    class IBackend;
     class IDeviceContext;
     class IMPIContext;
+
+    /**
+     * @brief Fixed ABI header for one captured heterogeneous MoE dispatch.
+     *
+     * The fixed geometry and source-device fields are immutable capture
+     * identity established when the model graph is built.  Live publication
+     * fields are @ref logical_row_count, the exact @ref residency_epoch used by
+     * that replay, and @ref return_logical_row_count.  The current segmented
+     * producer copies the logical count first and the host admission boundary
+     * fills the epoch before any sparse packet is emitted.  The device-local
+     * continuation path copies both values from its captured epoch ticket.
+     * Consumers may inspect the record only after the producer's exact event;
+     * they never infer an epoch by consulting a newer global publication.
+     */
+    struct MoEOverlayDispatchTicketHeader
+    {
+        static constexpr uint32_t kMagic = 0x54454F4Du; // "MOET"
+        static constexpr uint32_t kABIVersion = 3u;
+
+        uint32_t magic = kMagic;
+        uint32_t abi_version = kABIVersion;
+        uint64_t workspace_generation = 0;
+        /** Exact immutable owner/weight generation used by this packet. */
+        uint64_t residency_epoch = 0;
+        int32_t layer_idx = -1;
+        int32_t bucket_row_capacity = 0;
+        int32_t route_capacity = 0;
+        int32_t top_k = 0;
+        int32_t d_model = 0;
+        int32_t logical_row_count = 0;
+        int32_t return_logical_row_count = 0;
+        int32_t source_device_kind = -1;
+        int32_t source_device_ordinal = -1;
+
+        /** @brief Validate ABI identity, fixed geometry, and live row counts. */
+        bool isValid() const noexcept;
+    };
+
+    static_assert(std::is_trivially_copyable_v<MoEOverlayDispatchTicketHeader>);
+
+    /**
+     * @brief Stable host-visible view populated by a captured GPU segment.
+     *
+     * Arrays always have physical bucket capacity.  Consumers process only the
+     * leading `header->logical_row_count` rows, so two prompt lengths can reuse
+     * one captured bucket without routing, transferring, or executing padding.
+     */
+    struct MoEOverlayDispatchTicket
+    {
+        MoEOverlayDispatchTicketHeader *header = nullptr;
+        float *routing_indices_fp32 = nullptr;
+        float *routing_weights_fp32 = nullptr;
+        float *hidden_rows_fp32 = nullptr;
+        float *return_rows_fp32 = nullptr;
+
+        bool isValid() const noexcept;
+        bool returnPayloadReady() const noexcept;
+    };
+
+    /**
+     * @brief Model-lifetime owner for one immutable-address dispatch ticket.
+     *
+     * GPU sources require backend-pinned storage because native graph replay
+     * records fixed asynchronous D2H destinations.  CPU sources use ordinary
+     * aligned storage as their first-class implementation.  Capacity is bound
+     * exactly once; rebinding a live ticket is a fatal topology error.
+     */
+    class MoEOverlayDispatchTicketStorage final
+    {
+    public:
+        MoEOverlayDispatchTicketStorage() = default;
+        ~MoEOverlayDispatchTicketStorage();
+
+        MoEOverlayDispatchTicketStorage(
+            const MoEOverlayDispatchTicketStorage &) = delete;
+        MoEOverlayDispatchTicketStorage &operator=(
+            const MoEOverlayDispatchTicketStorage &) = delete;
+        MoEOverlayDispatchTicketStorage(
+            MoEOverlayDispatchTicketStorage &&) = delete;
+        MoEOverlayDispatchTicketStorage &operator=(
+            MoEOverlayDispatchTicketStorage &&) = delete;
+
+        /**
+         * @brief Bind the ticket's complete fixed-capacity capture identity.
+         * @throws std::invalid_argument for invalid geometry.
+         * @throws std::logic_error when an existing ticket is rebound.
+         * @throws std::runtime_error when pinned allocation fails.
+         */
+        void bindFixedCapacity(
+            int layer_idx,
+            int bucket_rows,
+            int top_k,
+            int d_model,
+            DeviceId source_device,
+            uint64_t workspace_generation);
+
+        bool isBound() const noexcept { return allocation_ != nullptr; }
+        const DeviceId &sourceDevice() const noexcept { return source_device_; }
+        size_t allocationBytes() const noexcept { return allocation_bytes_; }
+        MoEOverlayDispatchTicket &ticket() noexcept { return ticket_; }
+        const MoEOverlayDispatchTicket &ticket() const noexcept { return ticket_; }
+        /** @brief Validate mutable host memory against the separately retained binding identity. */
+        bool hasValidBoundIdentity() const noexcept;
+
+    private:
+        void release() noexcept;
+
+        void *allocation_ = nullptr;
+        size_t allocation_bytes_ = 0;
+        IBackend *backend_ = nullptr;
+        bool backend_pinned_ = false;
+        DeviceId source_device_ = DeviceId::cpu();
+        int layer_idx_ = -1;
+        int bucket_rows_ = 0;
+        int top_k_ = 0;
+        int d_model_ = 0;
+        uint64_t workspace_generation_ = 0;
+        std::vector<std::max_align_t> cpu_storage_;
+        MoEOverlayDispatchTicket ticket_;
+    };
 
     enum class MoEOverlayCollectiveDirection : uint8_t
     {
@@ -41,6 +164,9 @@ namespace llaminar2
         uint64_t generation_id = 0;
         uint64_t step_id = 0;
         MoEOverlayCollectiveNamespace key_namespace = MoEOverlayCollectiveNamespace::Main;
+        /** Exact mathematical phase; part of cross-rank protocol identity. */
+        ExpertHistogramSource histogram_source =
+            ExpertHistogramSource::DecodeToken;
         int32_t mtp_depth = -1;
         int32_t layer_idx = -1;
         int32_t tier_idx = -1;
@@ -79,6 +205,15 @@ namespace llaminar2
     struct MoEOverlaySparseRows
     {
         MoEOverlayCollectiveKey key;
+        /**
+         * Residency snapshot that routed this packet.
+         *
+         * The value is copied from the root dispatch lease and remains
+         * unchanged through participant-local execution and return/reduce.
+         * Epoch zero is reserved for an empty protocol contribution that does
+         * not carry routed work; every non-empty packet must name an epoch.
+         */
+        uint64_t residency_epoch = 0;
         int32_t source_participant = -1;
         int32_t target_participant = -1;
         int32_t d_model = 0;
@@ -98,6 +233,8 @@ namespace llaminar2
     struct MoEOverlayReturnRows
     {
         MoEOverlayCollectiveKey key;
+        /** Exact residency snapshot used to compute these returned rows. */
+        uint64_t residency_epoch = 0;
         int32_t source_participant = -1;
         int32_t target_participant = -1;
         int32_t d_model = 0;
@@ -138,26 +275,91 @@ namespace llaminar2
         const MoEOverlaySparseRows *dispatch_rows,
         const MoEOverlayReturnRows *return_rows);
 
+    /**
+     * @brief Host-visible packet storage for one sparse collective graph family.
+     *
+     * The default workspace keeps separate backing arrays for every
+     * `(layer, tier)` key and remains useful for graphs whose protocol nodes
+     * can overlap. A participant-only graph is strictly serial, so it may
+     * explicitly select @ref StorageReusePolicy::SerialGraphFamily and bind
+     * every key to one fixed packet slot. That policy is what makes a
+     * capacity-wide decode/prefill graph economical without weakening pointer
+     * stability or allocating a packet per transformer layer.
+     */
     class MoEOverlayCollectiveWorkspace
     {
     public:
+        /** @brief Backing-storage lifetime selected when the workspace is built. */
+        enum class StorageReusePolicy : uint8_t
+        {
+            DistinctLayerTier, ///< Independent arrays for potentially overlapping protocol keys.
+            SerialGraphFamily, ///< One array family reused by graph-ordered protocol keys.
+        };
+
+        /** @brief Complete immutable-capacity contract for a production workspace. */
+        struct FixedCapacityConfig
+        {
+            size_t max_rows = 0;    ///< Maximum live rows in one sparse packet.
+            size_t max_entries = 0; ///< Maximum routed entries in one packet.
+            int d_model = 0;        ///< Hidden width copied per live row.
+            int top_k = 0;          ///< Maximum routing entries per token row.
+            DeviceId device = DeviceId::invalid(); ///< Host/device placement identity.
+            StorageReusePolicy reuse_policy =
+                StorageReusePolicy::DistinctLayerTier; ///< Array aliasing contract.
+        };
+
+        /** @brief Construct a growable workspace for isolated fixtures and builders. */
+        MoEOverlayCollectiveWorkspace() = default;
+
+        /**
+         * @brief Construct a workspace whose capacity can never be rebound.
+         *
+         * Arrays are materialized lazily when graph nodes request their views,
+         * but every resulting size and address is derived from this setup-time
+         * contract. Calls to @ref ensureCapacity may verify the exact geometry
+         * but cannot grow or change it.
+         *
+         * @throws std::invalid_argument when geometry or placement is invalid.
+         */
+        explicit MoEOverlayCollectiveWorkspace(FixedCapacityConfig config);
+
+        /**
+         * @brief Grow a non-fixed workspace or verify an exact fixed contract.
+         * @throws std::logic_error if a fixed workspace would be rebound.
+         */
         void ensureCapacity(size_t max_rows,
                             size_t max_entries,
                             int d_model,
                             int top_k,
                             DeviceId device);
 
+        /** @brief Clear per-step live metadata without changing any allocation. */
         void resetForStep(uint64_t generation_id, uint64_t step_id);
 
+        /** @brief Return the dispatch-receive view for one ordered protocol key. */
         MoEOverlaySparseRows dispatchReceive(int layer_idx, int tier_idx);
+        /** @brief Return the locally produced dispatch view for one protocol key. */
         MoEOverlaySparseRows localExpertInput(int layer_idx, int tier_idx);
+        /** @brief Return the participant-local expert result view. */
         MoEOverlayReturnRows localExpertOutput(int layer_idx, int tier_idx);
+        /** @brief Return the continuation-bound collective result view. */
         MoEOverlayReturnRows returnReceive(int layer_idx, int tier_idx);
 
-        size_t maxRows() const { return max_rows_; }
-        size_t maxEntries() const { return max_entries_; }
-        int dModel() const { return d_model_; }
-        int topK() const { return top_k_; }
+        /** @return Maximum live sparse rows retained by this workspace. */
+        size_t maxRows() const noexcept { return max_rows_; }
+        /** @return Maximum routed entries retained by this workspace. */
+        size_t maxEntries() const noexcept { return max_entries_; }
+        /** @return Hidden width of every sparse row. */
+        int dModel() const noexcept { return d_model_; }
+        /** @return Maximum routing width represented by one token row. */
+        int topK() const noexcept { return top_k_; }
+        /** @return Whether construction froze the complete capacity contract. */
+        bool hasFixedCapacity() const noexcept { return fixed_capacity_; }
+        /** @return Backing-array reuse policy selected at construction. */
+        StorageReusePolicy storageReusePolicy() const noexcept
+        {
+            return reuse_policy_;
+        }
 
     private:
         struct SparseStorage
@@ -192,6 +394,9 @@ namespace llaminar2
         int d_model_ = 0;
         int top_k_ = 0;
         DeviceId device_ = DeviceId::cpu();
+        StorageReusePolicy reuse_policy_ =
+            StorageReusePolicy::DistinctLayerTier;
+        bool fixed_capacity_ = false;
         uint64_t generation_id_ = 0;
         uint64_t step_id_ = 0;
         std::map<std::pair<int, int>, LayerTierBuffers> buffers_by_layer_tier_;
@@ -269,12 +474,27 @@ namespace llaminar2
     class MoEOverlayMPISparseCollectiveContext final : public IMoEOverlaySparseCollectiveContext
     {
     public:
+        /**
+         * @brief Rank-local membership for one MPI sparse transport endpoint.
+         *
+         * MPI collectives execute once per rank for each protocol key, while a
+         * rank may own any number of CUDA, ROCm, or CPU expert participants.
+         * The membership set determines which addressed packets this rank may
+         * consume; it is deliberately independent of MPI rank numbering.
+         */
         struct Config
         {
+            /** Rank communicator used by every matched protocol boundary. */
             std::shared_ptr<IMPIContext> mpi_ctx;
-            int local_participant_id = -1;
+            /** Stable global participant ids physically owned by this rank. */
+            std::vector<int> local_participant_ids;
         };
 
+        /**
+         * @brief Construct a rank transport with immutable local membership.
+         * @throws std::invalid_argument for a null communicator, negative id,
+         *         or duplicate local participant id.
+         */
         explicit MoEOverlayMPISparseCollectiveContext(Config config);
         ~MoEOverlayMPISparseCollectiveContext() override;
 
@@ -290,16 +510,25 @@ namespace llaminar2
 
         void abort(const MoEOverlayCollectiveKey &key, int reason_code) override;
 
+        /** @return Whether this MPI rank owns @p participant_id. */
+        bool ownsLocalParticipant(int participant_id) const noexcept;
+
+        /** @return Immutable rank-local participant membership. */
+        const std::vector<int> &localParticipantIds() const noexcept
+        {
+            return config_.local_participant_ids;
+        }
+
     private:
         struct DispatchPacket;
         struct ReturnPacket;
 
-        int localParticipantId() const;
-
+        /** Perform one compact host-staged dispatch all-gather. */
         MoEOverlayCollectiveResult dispatchHostStaged(const MoEOverlayCollectiveKey &key,
                                                       const MoEOverlaySparseRows &outbound,
                                                       MoEOverlaySparseRows *inbound);
 
+        /** Perform one compact host-staged return all-gather. */
         MoEOverlayCollectiveResult returnHostStaged(const MoEOverlayCollectiveKey &key,
                                                     const MoEOverlayReturnRows &outbound,
                                                     MoEOverlayReturnRows *inbound);

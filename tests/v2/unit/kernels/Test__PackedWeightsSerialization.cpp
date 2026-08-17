@@ -45,7 +45,9 @@ CPUNativeVNNIPackedWeights buildTestPacked(
     packed.blocks_per_row           = blocks_per_row;
     packed.codebook_id              = codebook_id;
     packed.payload_bytes            = payload_bytes_val;
-    packed.is_nibble_lut            = is_nibble_lut;
+    packed.encoding = is_nibble_lut
+                          ? CPUNativeVNNIEncoding::NibbleLUT
+                          : CPUNativeVNNIEncoding::ExpandedInt8;
     packed.is_asymmetric            = is_asymmetric;
     packed.is_superblock            = is_superblock;
     packed.data_stride              = data_stride;
@@ -101,7 +103,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_BasicQ4_0)
     EXPECT_EQ(p.blocks_per_row, 8);
     EXPECT_EQ(p.codebook_id, 0);
     EXPECT_EQ(p.payload_bytes, 16);
-    EXPECT_TRUE(p.is_nibble_lut);
+    EXPECT_TRUE(p.usesNibbleLUT());
     EXPECT_FALSE(p.is_asymmetric);
     EXPECT_FALSE(p.is_superblock);
     EXPECT_EQ(p.data_stride, 1024);
@@ -151,7 +153,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_AsymmetricQ4_1)
     EXPECT_EQ(p.codebook_id, 5);
     EXPECT_EQ(p.payload_bytes, 20);
     EXPECT_TRUE(p.is_asymmetric);
-    EXPECT_TRUE(p.is_nibble_lut);
+    EXPECT_TRUE(p.usesNibbleLUT());
     EXPECT_FALSE(p.is_superblock);
     EXPECT_EQ(p.interleaved_block_stride, 1408);
 }
@@ -385,7 +387,7 @@ TEST(Test__PackedWeightsSerialization, SerializeDeserialize_WithInt8Flat)
     EXPECT_EQ(p.codebook_id, 19);
     EXPECT_EQ(p.data_stride, 2048);
     EXPECT_EQ(p.interleaved_block_stride, 2304);
-    EXPECT_FALSE(p.is_nibble_lut);
+    EXPECT_TRUE(p.usesExpandedInt8());
 
     ASSERT_EQ(p.int8_flat.size(), static_cast<size_t>(1 * 4 * 64 * 32));
     for (size_t i = 0; i < p.int8_flat.size(); ++i)

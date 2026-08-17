@@ -592,8 +592,8 @@ twocard_overlay_args() {
     --moe-routed-expert-base-model-domain "${domain}" \
     --moe-routed-expert-shared-domain "${domain}" \
     --moe-routed-expert-residency static-by-id \
-    --moe-routed-expert-domain "${domain}=${devices};scope=local;backend=${collective};routed_compute=${routed_compute};routed_phase=${routed_phase};routed_decode_assignment=${routed_decode_assignment};routed_prefill_assignment=${routed_prefill_assignment};owner=0" \
-    --moe-routed-expert-tier "hot@${domain};priority=0;max-experts-per-layer=256;memory-mb=8192"
+    --moe-routed-expert-domain "${domain}=${devices};scope=rank_local;backend=${collective};routed_compute=${routed_compute};routed_phase=${routed_phase};routed_decode_assignment=${routed_decode_assignment};routed_prefill_assignment=${routed_prefill_assignment};owner=0" \
+    --moe-routed-expert-tier "hot@${domain};priority=0;max-experts-per-layer=256;memory-mb=8192;fallback=true"
 }
 
 run_one() {
@@ -685,7 +685,7 @@ run_one() {
   inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT
   inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR
   inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT
-  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT
   inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT
   inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE
   inherit_env_if_set LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE

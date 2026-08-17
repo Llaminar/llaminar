@@ -26,6 +26,7 @@
 
 #include "IModelLoader.h" // Interface
 #include "MmapRegion.h"   // RAII mmap wrapper for zero-copy loading
+#include "ModelPayloadAccessPattern.h"
 #include "../backends/DeviceId.h"
 #include "../execution/config/RuntimeConfig.h" // for WeightPrecision
 #include "../tensors/TensorFactory.h"          // for owned_factory_
@@ -257,15 +258,18 @@ namespace llaminar2
         void setSkipMmapCacheEviction(bool skip) { skip_mmap_cache_eviction_ = skip; }
 
         /**
-         * @brief Indicate target device is GPU — skip NUMA mmap binding
+         * @brief Declare how the caller will consume GGUF tensor payloads.
          *
-         * When enabled, mmap is demand-paged instead of NUMA-bound/prefaulted. For
-         * GPU inference, weights are uploaded to VRAM, so NUMA placement of the host
-         * staging mapping does not justify touching the whole model up front.
+         * Dense CPU inference receives NUMA-bound eager residency. Device
+         * staging and sparse selection remain demand-paged so initialization
+         * never reads unrelated model bytes. Must be called before loadModel().
          *
-         * Must be called BEFORE loadModel().
+         * @param pattern Payload lifetime and access-density contract.
          */
-        void setTargetIsGpu(bool is_gpu) { target_is_gpu_ = is_gpu; }
+        void setPayloadAccessPattern(ModelPayloadAccessPattern pattern)
+        {
+            payload_access_pattern_ = pattern;
+        }
 
         /**
          * @brief Check if mmap is active (file successfully memory-mapped)
@@ -416,6 +420,19 @@ namespace llaminar2
                                                           DeviceId device = DeviceId::cpu(),
                                                           WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
 
+        /**
+         * @brief Pack an explicit sorted expert-ID selection from a 3D GGUF tensor.
+         *
+         * Contiguous selections retain the zero-copy slice path. Discontiguous
+         * selections coalesce adjacent source IDs and copy those spans into one
+         * NUMA-local packed tensor whose slot order matches @p expert_ids.
+         */
+        std::shared_ptr<TensorBase> loadTensorExpertSelection(
+            const std::string &tensor_name,
+            const std::vector<size_t> &expert_ids,
+            DeviceId device = DeviceId::cpu(),
+            WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
+
         // =========================================================================
         // IModelLoader - Metadata Accessors
         // =========================================================================
@@ -558,7 +575,8 @@ namespace llaminar2
         // mmap state (when use_mmap_ is true)
         bool use_mmap_ = true;
         bool skip_mmap_cache_eviction_ = false;
-        bool target_is_gpu_ = false;
+        ModelPayloadAccessPattern payload_access_pattern_ =
+            ModelPayloadAccessPattern::DenseCpuResident;
         std::shared_ptr<MmapRegion> mmap_region_;                     // Main file mmap (shared for zero-copy tensors)
         std::vector<std::shared_ptr<MmapRegion>> split_mmap_regions_; // Split file mmaps
 

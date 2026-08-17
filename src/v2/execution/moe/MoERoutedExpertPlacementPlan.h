@@ -12,9 +12,11 @@
 
 #include "config/ExecutionDomainDefinition.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/moe/MoEOverlayAuthorityExecution.h"
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -73,6 +75,10 @@ namespace llaminar2
         ExecutionDomainScope scope = ExecutionDomainScope::SINGLE;
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
         std::vector<GlobalDeviceAddress> participants;
+        /**
+         * Participant-indexed MPI owner map; repeated ranks mean one process
+         * owns multiple devices in this domain.
+         */
         std::vector<int> world_ranks;
         int owner_rank = -1;
         RoutedExpertComputePolicy routed_compute_policy =
@@ -116,11 +122,13 @@ namespace llaminar2
             result.world_ranks = domain.ranks;
             result.owner_rank = domain.owner_rank.value_or(-1);
             result.weights = domain.weights;
-            result.scope = domain.scope == ExecutionDomainScope::AUTO
-                               ? (domain.participants.size() > 1
-                                      ? ExecutionDomainScope::LOCAL
-                                      : ExecutionDomainScope::SINGLE)
-                               : domain.scope;
+            /*
+             * Preserve AUTO as topology intent. Participant count alone cannot
+             * distinguish several devices on one MPI rank from a NodeTP pool;
+             * inventory binding owns that decision once physical locality is
+             * known.
+             */
+            result.scope = domain.scope;
             result.routed_compute_policy =
                 domain.routed_compute_policy == RoutedExpertComputePolicy::Unspecified
                     ? RoutedExpertComputePolicy::Apportioned
@@ -141,7 +149,7 @@ namespace llaminar2
 
         bool isCollectiveDomain() const
         {
-            return scope == ExecutionDomainScope::LOCAL ||
+            return scope == ExecutionDomainScope::RANK_LOCAL ||
                    scope == ExecutionDomainScope::NODE_LOCAL ||
                    scope == ExecutionDomainScope::GLOBAL;
         }
@@ -189,6 +197,18 @@ namespace llaminar2
 
     };
 
+    /**
+     * @brief One named residency tier with an explicit integer preference.
+     *
+     * `name` is an opaque user-facing identity used for configuration joins,
+     * diagnostics, and distributed-plan hashing. It has no placement meaning:
+     * production code must never infer a device class or preference from it.
+     * Smaller `priority` values are preferred, priorities are unique within a
+     * plan, and neither declaration order nor tier index participates in that
+     * ordering. `fallback` is only a complete-coverage responsibility. When
+     * present it must belong to the greatest numeric priority and does not
+     * imply CPU placement, unbounded capacity, or any thermal tier category.
+     */
     struct RoutedExpertTier
     {
         std::string name;
@@ -197,6 +217,16 @@ namespace llaminar2
         int max_experts_per_layer = 0;
         size_t memory_budget_bytes = 0;
         bool fallback = false;
+        /**
+         * Exact setup-resolved live quota for every model layer.
+         *
+         * This vector is empty in user configuration. Once the physical BOM
+         * resolver installs it, its values are authoritative rather than
+         * hints: placement must assign exactly this many experts to the tier
+         * in each layer. It is indexed by model layer, never by declaration
+         * order or tier priority.
+         */
+        std::vector<int> resolved_live_experts_per_layer;
     };
 
     struct MoEContinuationDomainSpec
@@ -255,6 +285,19 @@ namespace llaminar2
         RoutedExpertResidencyPolicy residency_policy =
             RoutedExpertResidencyPolicy::Disabled;
 
+        /**
+         * Topology-frozen execution location for the sole residency authority.
+         *
+         * User configuration leaves this unresolved. Model-aware freezing
+         * derives it from tier cardinality and participant device types; a
+         * caller-provided non-matching value is invalid rather than a hint.
+         */
+        MoEOverlayAuthorityExecutionKind authority_execution =
+            MoEOverlayAuthorityExecutionKind::Unresolved;
+
+        /** Static whole-expert owner ordering within each routed tier. */
+        RoutedExpertOwnerOrder owner_order = RoutedExpertOwnerOrder::Ordinal;
+
         /// Generic dense execution domains for continuation/base/shared model flow.
         /// These may use SINGLE, LOCAL, NODE_LOCAL, or GLOBAL scope and are
         /// validated separately from routed whole-expert ownership domains.
@@ -269,11 +312,148 @@ namespace llaminar2
             return enabled && topology == RoutedExpertPlacementTopology::TieredOverlay;
         }
 
+        /**
+         * @brief Return whether this plan selects the ExpertOverlay authority.
+         *
+         * `SingleDomain` and `TieredOverlay` describe placement cardinality,
+         * not competing runtime implementations. Every enabled routed-expert
+         * placement plan is therefore consumed by the same epoch, owner-map,
+         * preparation, and sparse-collective authority. A one-domain plan has
+         * one integer-priority tier and cannot promote or demote experts, but
+         * it may still change exact same-tier participants to correct skew.
+         */
+        bool usesExpertOverlayAuthority() const
+        {
+            return enabled;
+        }
+
+        /**
+         * @brief Return storage capacity for every declared routed layer.
+         *
+         * Runtime placement banks are indexed by the model-global layer id.
+         * Qwen NextN/MTP weights may occupy routed layers after the ordinary
+         * transformer interval, so sizing a canonical authority from only the
+         * main graph's layer count would make its child sidecar table depend on
+         * graph-construction order. The returned capacity covers the caller's
+         * minimum and the greatest explicit placement index.
+         *
+         * @param minimum_layers Minimum graph-family layer capacity.
+         * @return Number of addressable layer slots required by the plan.
+         * @throws std::invalid_argument for a negative minimum or placement.
+         * @throws std::overflow_error when a placement cannot be represented
+         *         as an `int` slot count.
+         */
+        [[nodiscard]] int placementLayerCapacity(
+            int minimum_layers = 0) const
+        {
+            if (minimum_layers < 0)
+            {
+                throw std::invalid_argument(
+                    "routed expert placement layer capacity cannot use a "
+                    "negative minimum");
+            }
+
+            int capacity = minimum_layers;
+            for (const auto &placement : placements)
+            {
+                if (placement.layer < 0)
+                {
+                    throw std::invalid_argument(
+                        "routed expert placement layer capacity cannot include "
+                        "a negative layer index");
+                }
+                if (placement.layer == std::numeric_limits<int>::max())
+                {
+                    throw std::overflow_error(
+                        "routed expert placement layer capacity overflows int");
+                }
+                capacity = std::max(capacity, placement.layer + 1);
+            }
+            return capacity;
+        }
+
         std::string effectiveBaseModelDomain() const
         {
             return base_model_domain.empty() ? continuation_domain : base_model_domain;
         }
     };
+
+    /**
+     * @brief Derive the only valid authority execution backend for a plan.
+     *
+     * One routed tier can keep its complete control plane on participant
+     * devices only when every participant has the same device type and the
+     * selected collective does not explicitly request host staging or a
+     * heterogeneous backend. Multiple tiers always require host coordination,
+     * even when two tiers happen to use the same accelerator vendor, because
+     * capacity arbitration and promotion/demotion span distinct priorities.
+     * CPU participants are considered device-resident: their participant
+     * device is host memory, so no additional control-plane transfer exists.
+     *
+     * @param plan Declarative or model-frozen ExpertOverlay plan.
+     * @return Topology-required execution kind.
+     * @throws std::invalid_argument when the sole tier cannot resolve a domain
+     *         or the domain has no participants.
+     */
+    [[nodiscard]] inline MoEOverlayAuthorityExecutionKind
+    resolveMoEOverlayAuthorityExecutionKind(
+        const MoERoutedExpertPlacementPlan &plan)
+    {
+        if (!plan.usesExpertOverlayAuthority())
+            return MoEOverlayAuthorityExecutionKind::Unresolved;
+        if (plan.routed_tiers.size() != 1u)
+            return MoEOverlayAuthorityExecutionKind::HostCoordinated;
+
+        const RoutedExpertTier &tier = plan.routed_tiers.front();
+        const auto domain_it = std::find_if(
+            plan.domains.begin(),
+            plan.domains.end(),
+            [&](const RoutedExpertDomain &domain)
+            {
+                return domain.name == tier.domain;
+            });
+        if (domain_it == plan.domains.end())
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay authority execution cannot resolve routed tier '" +
+                tier.name + "' domain '" + tier.domain + "'");
+        }
+        if (domain_it->participants.empty())
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay authority execution requires at least one participant in domain '" +
+                domain_it->name + "'");
+        }
+
+        const DeviceType device_type =
+            domain_it->participants.front().device_type;
+        const bool homogeneous = std::all_of(
+            domain_it->participants.begin(),
+            domain_it->participants.end(),
+            [&](const GlobalDeviceAddress &participant)
+            {
+                return participant.device_type == device_type;
+            });
+        if (!homogeneous ||
+            domain_it->backend == CollectiveBackendType::HETEROGENEOUS ||
+            domain_it->backend == CollectiveBackendType::HOST)
+        {
+            return MoEOverlayAuthorityExecutionKind::HostCoordinated;
+        }
+
+        const bool device_native_collective =
+            domain_it->backend == CollectiveBackendType::AUTO ||
+            (device_type == DeviceType::CUDA &&
+             domain_it->backend == CollectiveBackendType::NCCL) ||
+            (device_type == DeviceType::ROCm &&
+             domain_it->backend == CollectiveBackendType::RCCL) ||
+            (device_type == DeviceType::CPU &&
+             (domain_it->backend == CollectiveBackendType::UPI ||
+              domain_it->backend == CollectiveBackendType::MPI));
+        return device_native_collective
+                   ? MoEOverlayAuthorityExecutionKind::HomogeneousDeviceResident
+                   : MoEOverlayAuthorityExecutionKind::HostCoordinated;
+    }
 
     struct MoERoutedExpertPlacementValidationOptions
     {
@@ -408,6 +588,10 @@ namespace llaminar2
 
         out << "    topology: graph-native " << toString(plan.topology) << "\n";
         out << "    residency_policy: " << toString(plan.residency_policy) << "\n";
+        out << "    authority_execution: "
+            << toString(plan.authority_execution) << "\n";
+        out << "    owner_order: "
+            << routedExpertOwnerOrderToString(plan.owner_order) << "\n";
         out << "    continuation_domain: " << plan.continuation_domain
             << " root_participant=" << plan.continuation_domain_spec.logical_root_participant
             << " dense_policy=" << denseParallelPolicyToString(plan.continuation_domain_spec.effectiveDensePolicy())
@@ -478,7 +662,20 @@ namespace llaminar2
                     << " priority=" << tier.priority
                     << " capacity=";
 
-                if (tier.max_experts_per_layer > 0)
+                if (!tier.resolved_live_experts_per_layer.empty())
+                {
+                    out << "resolved[";
+                    for (size_t layer = 0;
+                         layer < tier.resolved_live_experts_per_layer.size();
+                         ++layer)
+                    {
+                        if (layer != 0)
+                            out << ',';
+                        out << tier.resolved_live_experts_per_layer[layer];
+                    }
+                    out << "] experts/layer";
+                }
+                else if (tier.max_experts_per_layer > 0)
                     out << tier.max_experts_per_layer << " experts/layer";
                 else
                     out << "model-dependent";
@@ -598,12 +795,11 @@ namespace llaminar2
         switch (scope)
         {
         case ExecutionDomainScope::SINGLE:
-        case ExecutionDomainScope::LOCAL:
+        case ExecutionDomainScope::RANK_LOCAL:
         case ExecutionDomainScope::NODE_LOCAL:
         case ExecutionDomainScope::GLOBAL:
-            return true;
         case ExecutionDomainScope::AUTO:
-            return false;
+            return true;
         }
         return false;
     }
@@ -631,7 +827,7 @@ namespace llaminar2
         if (!isAllowedMoEContinuationDenseScope(domain.scope))
         {
             addError(role_name + " dense domain '" + domain.name +
-                     "' must use scope=single, local, node_local, or global; got scope=" +
+                     "' must use scope=auto, single, local, node_local, or global; got scope=" +
                      executionDomainScopeToString(domain.scope));
         }
 
@@ -724,21 +920,20 @@ namespace llaminar2
                              " participants");
                 }
 
-                std::unordered_set<int> seen_ranks;
+                std::unordered_set<int> participating_ranks;
                 for (int rank : domain.world_ranks)
                 {
                     if (rank < 0)
                     {
                         addError("expert compute domain '" + domain.name + "' has a negative world rank");
                     }
-                    else if (!seen_ranks.insert(rank).second)
-                    {
-                        addError("expert compute domain '" + domain.name + "' has duplicate world rank " +
-                                 std::to_string(rank));
-                    }
+                    else
+                        participating_ranks.insert(rank);
                 }
 
-                if (domain.owner_rank >= 0 && seen_ranks.find(domain.owner_rank) == seen_ranks.end())
+                if (domain.owner_rank >= 0 &&
+                    participating_ranks.find(domain.owner_rank) ==
+                        participating_ranks.end())
                 {
                     addError("expert compute domain '" + domain.name + "' owner rank " +
                              std::to_string(domain.owner_rank) + " is not in its world rank list");
@@ -895,8 +1090,11 @@ namespace llaminar2
         }
 
         std::unordered_map<std::string, size_t> tiers_by_name;
+        std::unordered_map<int, size_t> tiers_by_priority;
         std::unordered_set<std::string> routed_domain_names;
         int fallback_count = 0;
+        int fallback_priority = 0;
+        bool any_resolved_quota = false;
         for (size_t tier_idx = 0; tier_idx < plan.routed_tiers.size(); ++tier_idx)
         {
             const auto &tier = plan.routed_tiers[tier_idx];
@@ -910,6 +1108,54 @@ namespace llaminar2
                 if (!inserted)
                 {
                     addError("duplicate routed tier name: " + tier.name);
+                }
+            }
+
+            const auto priority_inserted =
+                tiers_by_priority.emplace(tier.priority, tier_idx).second;
+            if (!priority_inserted)
+            {
+                addError(
+                    "duplicate routed tier priority " +
+                    std::to_string(tier.priority) +
+                    "; priorities must be unique because tier names and "
+                    "declaration order carry no preference semantics");
+            }
+
+            if (!tier.resolved_live_experts_per_layer.empty())
+            {
+                any_resolved_quota = true;
+                if (options.layer_count > 0 &&
+                    tier.resolved_live_experts_per_layer.size() !=
+                        static_cast<size_t>(options.layer_count))
+                {
+                    addError(
+                        "routed tier '" + tier.name +
+                        "' resolved live quota does not cover every model layer");
+                }
+                for (size_t layer = 0;
+                     layer < tier.resolved_live_experts_per_layer.size();
+                     ++layer)
+                {
+                    const int quota =
+                        tier.resolved_live_experts_per_layer[layer];
+                    if (quota < 0 ||
+                        (options.routed_expert_count > 0 &&
+                         quota > options.routed_expert_count))
+                    {
+                        addError(
+                            "routed tier '" + tier.name +
+                            "' has invalid resolved live quota at layer " +
+                            std::to_string(layer));
+                    }
+                    if (tier.max_experts_per_layer > 0 &&
+                        quota > tier.max_experts_per_layer)
+                    {
+                        addError(
+                            "routed tier '" + tier.name +
+                            "' resolved live quota exceeds max_experts_per_layer at layer " +
+                            std::to_string(layer));
+                    }
                 }
             }
 
@@ -928,12 +1174,69 @@ namespace llaminar2
             }
 
             if (tier.fallback)
+            {
                 ++fallback_count;
+                fallback_priority = tier.priority;
+            }
         }
 
         if (fallback_count > 1)
         {
             addError("enabled routed-expert placement plan must declare at most one fallback tier");
+        }
+
+        if (fallback_count == 1)
+        {
+            for (const auto &tier : plan.routed_tiers)
+            {
+                if (!tier.fallback && tier.priority >= fallback_priority)
+                {
+                    addError(
+                        "fallback tier must have the greatest numeric priority; "
+                        "integer priority is the sole tier preference ordering");
+                    break;
+                }
+            }
+        }
+
+        if (any_resolved_quota)
+        {
+            const size_t resolved_layer_count =
+                plan.routed_tiers.empty()
+                    ? 0u
+                    : plan.routed_tiers.front()
+                          .resolved_live_experts_per_layer.size();
+            for (const auto &tier : plan.routed_tiers)
+            {
+                if (tier.resolved_live_experts_per_layer.size() !=
+                    resolved_layer_count)
+                {
+                    addError(
+                        "every routed tier must carry the same complete resolved live-quota geometry");
+                    break;
+                }
+            }
+            if (options.routed_expert_count > 0)
+            {
+                for (size_t layer = 0; layer < resolved_layer_count; ++layer)
+                {
+                    size_t total = 0;
+                    for (const auto &tier : plan.routed_tiers)
+                    {
+                        const int quota =
+                            tier.resolved_live_experts_per_layer[layer];
+                        if (quota >= 0)
+                            total += static_cast<size_t>(quota);
+                    }
+                    if (total != static_cast<size_t>(
+                                     options.routed_expert_count))
+                    {
+                        addError(
+                            "resolved routed tier quotas do not cover every expert at layer " +
+                            std::to_string(layer));
+                    }
+                }
+            }
         }
 
         if (fallback_count == 0 && options.routed_expert_count > 0 && !plan.routed_tiers.empty())
@@ -1020,6 +1323,25 @@ namespace llaminar2
                 for (size_t tier_idx = 0; tier_idx < plan.routed_tiers.size(); ++tier_idx)
                 {
                     const auto &tier = plan.routed_tiers[tier_idx];
+                    if (!tier.resolved_live_experts_per_layer.empty() &&
+                        placement.layer >= 0 &&
+                        static_cast<size_t>(placement.layer) <
+                            tier.resolved_live_experts_per_layer.size() &&
+                        tier_assignment_counts[tier_idx] !=
+                            tier.resolved_live_experts_per_layer[
+                                static_cast<size_t>(placement.layer)])
+                    {
+                        addError(
+                            "expert layer placement for layer " +
+                            std::to_string(placement.layer) +
+                            " assigns " +
+                            std::to_string(tier_assignment_counts[tier_idx]) +
+                            " routed experts to tier '" + tier.name +
+                            "' but its resolved live quota is " +
+                            std::to_string(
+                                tier.resolved_live_experts_per_layer[
+                                    static_cast<size_t>(placement.layer)]));
+                    }
                     if (tier.max_experts_per_layer > 0 &&
                         tier_assignment_counts[tier_idx] > tier.max_experts_per_layer)
                     {
@@ -1056,6 +1378,28 @@ namespace llaminar2
             if (routed_domains.size() > 1)
             {
                 addError("SingleDomain routed-expert plans must use one routed compute domain");
+            }
+        }
+
+        if (plan.authority_execution !=
+            MoEOverlayAuthorityExecutionKind::Unresolved)
+        {
+            try
+            {
+                const auto required =
+                    resolveMoEOverlayAuthorityExecutionKind(plan);
+                if (plan.authority_execution != required)
+                {
+                    addError(
+                        "authority execution '" +
+                        std::string(toString(plan.authority_execution)) +
+                        "' does not match topology-required '" +
+                        std::string(toString(required)) + "'");
+                }
+            }
+            catch (const std::invalid_argument &error)
+            {
+                addError(error.what());
             }
         }
 

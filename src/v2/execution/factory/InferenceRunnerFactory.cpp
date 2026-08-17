@@ -35,11 +35,15 @@
 #include "../../utils/WeightLoadingProfiler.h"
 #include "../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../kernels/cpu/rotation/ActivationRotation.h"
-#include "../../execution/moe/MoERebalanceController.h"
 #include "../../execution/moe/DecodeExpertHistogram.h"
 #include "../../execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "../../execution/moe/MoEExpertOwnerMap.h"
+#include "../../execution/moe/MoEOverlayParticipantGraphRunner.h"
+#include "../../execution/moe/MoEOverlayParticipantResidency.h"
+#include "../../execution/moe/MoEOverlayResidencyAuthority.h"
 #include "../../execution/moe/MoERoutedExpertPlacementPlanner.h"
+#include "../../execution/moe/RoutedExpertOwnerAssignment.h"
 #include "../../execution/mtp/MTPWeightManifest.h"
 #include "../../planning/ActivationBufferSizing.h"
 #include "../../loaders/WeightLoadProgress.h"
@@ -54,6 +58,8 @@
 #include <future>
 #include <functional>
 #include <iomanip>
+#include <limits>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
@@ -83,8 +89,32 @@ namespace llaminar2
         const char *context)
     {
         const ModelContextId model_id = weight_plan.strategy().model_id;
+        const auto installed_store =
+            weight_mgr.preparedWeightStoreIfInitialized();
+
+        /*
+         * One model owns one additive prepared binding namespace. A TP runner
+         * can materialize a primary sharded plan, a mirrored MTP terminal-head
+         * plan, and an expert-residency plan in succession. Replacing the store
+         * between those plans discards already-packed handles after their raw
+         * tensors have been released, making later graph construction observe
+         * an impossible half-prepared model. Reuse the installed authority and
+         * reject any attempt to substitute a second explicit authority.
+         */
+        if (config.prepared_weight_store &&
+            installed_store &&
+            installed_store != config.prepared_weight_store)
+        {
+            LOG_ERROR(context
+                      << " attempted to replace the model-owned prepared "
+                         "weight store while composing weight plans");
+            return nullptr;
+        }
+
         auto store = config.prepared_weight_store
                          ? config.prepared_weight_store
+                     : installed_store
+                         ? installed_store
                          : std::make_shared<PreparedWeightStore>(model_id);
 
         if (!store->bindModelIdIfUnset(model_id))
@@ -95,12 +125,55 @@ namespace llaminar2
             return nullptr;
         }
 
-        weight_mgr.setPreparedWeightStore(store);
+        if (!installed_store)
+            weight_mgr.setPreparedWeightStore(store);
         return store;
     }
 
     namespace
     {
+        /**
+         * @brief Resolve the immutable flattened-row envelope for one graph family.
+         *
+         * `max_seq_len` remains the full KV context horizon.  Captured graph
+         * allocations instead use the resident activation capacity selected by
+         * MemoryPlanner, multiplied by the configured admission batch.  The
+         * model graph receives this exact value so its private graph-stable
+         * scratch cannot disagree with the arena and planner contracts.
+         *
+         * @return A positive flattened row capacity, or `std::nullopt` with a
+         *         diagnostic in @p error when the request cannot be represented
+         *         by the graph ABI.
+         */
+        std::optional<int> resolveMaximumGraphActivationRows(
+            const InferenceRunnerConfig &config,
+            DeviceId device,
+            std::string &error)
+        {
+            const int sequence_rows = config.activation_seq_len > 0
+                                          ? config.activation_seq_len
+                                          : resolveActivationBufferSeqLen(
+                                                config.max_seq_len,
+                                                device);
+            if (sequence_rows <= 0)
+            {
+                error = "graph activation capacity must be positive";
+                return std::nullopt;
+            }
+            if (config.batch_size <= 0)
+            {
+                error = "graph batch capacity must be positive";
+                return std::nullopt;
+            }
+            if (sequence_rows >
+                std::numeric_limits<int>::max() / config.batch_size)
+            {
+                error = "flattened graph activation capacity overflows int";
+                return std::nullopt;
+            }
+            return sequence_rows * config.batch_size;
+        }
+
         void installTPExecutorCancellation(
             GraphConfig &graph_config,
             ITPContext *tp_ctx,
@@ -128,159 +201,13 @@ namespace llaminar2
             }
         }
 
-        MoERoutedExpertModelMetadata moEExpertMetadataForModel(IModelContext &model_ctx)
-        {
-            auto loader = model_ctx.loader();
-            const std::string &arch = model_ctx.architecture();
-
-            MoERoutedExpertModelMetadata metadata;
-            metadata.num_layers = std::max(model_ctx.totalBlockCount(), model_ctx.blockCount());
-            metadata.num_experts = loader ? loader->getInt(arch + ".expert_count", 0) : 0;
-            metadata.d_model = model_ctx.embeddingLength();
-            metadata.routed_intermediate_size = loader ? loader->getInt(arch + ".expert_feed_forward_length", 0) : 0;
-            if (metadata.routed_intermediate_size <= 0)
-                metadata.routed_intermediate_size = model_ctx.feedForwardLength();
-            metadata.shared_intermediate_size = metadata.routed_intermediate_size;
-            metadata.has_shared_expert = loader && loader->getInt(arch + ".expert_shared_count", 0) > 0;
-            return metadata;
-        }
-
         int stableContinuationDomainId(const std::string &domain_name)
         {
             const size_t hashed = std::hash<std::string>{}(domain_name);
             return static_cast<int>(hashed & 0x3fffffffU);
         }
 
-        std::string sanitizeDomainToken(std::string value)
-        {
-            for (char &ch : value)
-            {
-                if (!std::isalnum(static_cast<unsigned char>(ch)))
-                    ch = '_';
-            }
-            return value;
-        }
-
-        std::string localTPRebalanceDomainId(const ILocalTPContext &ctx)
-        {
-            std::ostringstream oss;
-            oss << "local_tp";
-            for (const auto &device : ctx.devices())
-                oss << "_" << sanitizeDomainToken(device.toLocalDeviceId().toString());
-            return oss.str();
-        }
-
-        std::string moeRebalanceDomainIdForTP(
-            const ILocalTPContext *local_tp_ctx,
-            const ITPContext *tp_ctx)
-        {
-            if (local_tp_ctx && local_tp_ctx->degree() > 1)
-                return localTPRebalanceDomainId(*local_tp_ctx);
-
-            if (const auto *global_tp_ctx = dynamic_cast<const IGlobalTPContext *>(tp_ctx))
-            {
-                if (global_tp_ctx->degree() > 1)
-                    return "global_tp_domain_" + std::to_string(global_tp_ctx->domainId());
-            }
-
-            return "single";
-        }
-
-        std::vector<int> initialExpertPlacementForParticipants(
-            int num_experts,
-            int participant_count)
-        {
-            const int safe_participant_count = std::max(1, participant_count);
-            std::vector<int> initial_placement(static_cast<size_t>(std::max(0, num_experts)), 0);
-            const int experts_per_participant =
-                std::max(1, num_experts / safe_participant_count);
-            for (int expert = 0; expert < num_experts; ++expert)
-            {
-                initial_placement[static_cast<size_t>(expert)] =
-                    std::min(expert / experts_per_participant, safe_participant_count - 1);
-            }
-            return initial_placement;
-        }
-
-        std::unique_ptr<MoERebalanceController> createMoERebalanceControllerForDomain(
-            const GraphConfig &graph_config,
-            const MoERebalanceRuntimeConfig &rebalance_config,
-            MoERebalanceMode mode,
-            std::string domain_id,
-            std::vector<DeviceId> participants,
-            int max_replicas)
-        {
-            if (participants.empty())
-                participants.push_back(DeviceId::cpu());
-
-            MoERebalanceController::Config ctrl_config;
-            ctrl_config.domain_id = std::move(domain_id);
-            ctrl_config.mode = mode;
-            ctrl_config.num_layers = graph_config.n_layers;
-            ctrl_config.num_experts = graph_config.moe.num_experts;
-            ctrl_config.top_k = graph_config.moe.top_k;
-            ctrl_config.window_size = rebalance_config.window_size;
-            ctrl_config.token_boundary_layer_idx =
-                graph_config.moe.decode_histogram_token_boundary_layer;
-            ctrl_config.max_window_size = rebalance_config.max_window_size;
-            ctrl_config.window_growth_factor = rebalance_config.window_growth_factor;
-            ctrl_config.max_replicas = max_replicas;
-            ctrl_config.sockets = std::move(participants);
-            ctrl_config.initial_expert_to_socket = initialExpertPlacementForParticipants(
-                graph_config.moe.num_experts,
-                static_cast<int>(ctrl_config.sockets.size()));
-            ctrl_config.rebalance_config = SocketRebalanceConfig{};
-            ctrl_config.rebalance_config.imbalance_threshold =
-                static_cast<float>(rebalance_config.dynamic_imbalance_threshold_per_mille) / 1000.0f;
-            ctrl_config.rebalance_config.min_improvement_ratio =
-                static_cast<float>(rebalance_config.dynamic_min_improvement_per_mille) / 1000.0f;
-            ctrl_config.rebalance_config.max_swaps_per_layer =
-                static_cast<int>(rebalance_config.dynamic_max_swaps_per_layer);
-            ctrl_config.rebalance_config.max_total_swaps =
-                static_cast<int>(rebalance_config.dynamic_max_plan_entries_per_wave);
-            ctrl_config.rebalance_config.min_window_activations =
-                rebalance_config.dynamic_min_window_activations;
-            const bool homogeneous_gpu_domain =
-                ctrl_config.sockets.size() > 1 &&
-                std::all_of(ctrl_config.sockets.begin(),
-                            ctrl_config.sockets.end(),
-                            [](const DeviceId &device)
-                            {
-                                return device.is_gpu();
-                            }) &&
-                std::all_of(ctrl_config.sockets.begin(),
-                            ctrl_config.sockets.end(),
-                            [&](const DeviceId &device)
-                            {
-                                return device.type == ctrl_config.sockets.front().type;
-                            });
-            if (homogeneous_gpu_domain &&
-                ctrl_config.num_layers > 0 &&
-                ctrl_config.num_experts > 0)
-            {
-                /*
-                 * Ownership swaps are global expert moves; each moved expert
-                 * must arrive for every routed MoE layer on its destination.
-                 * Bound a single GPU maintenance window to the first-class
-                 * staging arena instead of silently inflating VRAM. Hot
-                 * replicas remain the higher-bandwidth policy for additive
-                 * per-layer tuning.
-                 */
-                const int max_arrivals_per_destination =
-                    std::max(1, ctrl_config.num_experts);
-                const int max_global_moves =
-                    std::max(2, max_arrivals_per_destination / ctrl_config.num_layers);
-                ctrl_config.rebalance_config.max_total_swaps =
-                    std::min(ctrl_config.rebalance_config.max_total_swaps, max_global_moves);
-                ctrl_config.rebalance_config.max_swaps_per_layer =
-                    std::min(ctrl_config.rebalance_config.max_swaps_per_layer,
-                             std::max(1, ctrl_config.rebalance_config.max_total_swaps / 2));
-            }
-
-            return std::make_unique<MoERebalanceController>(std::move(ctrl_config));
-        }
-
-        std::vector<DeviceId> baseMoERebalanceParticipants(
+        std::vector<DeviceId> resolvedMoEAuthorityParticipants(
             const ILocalTPContext *local_tp_ctx,
             const ITPContext *tp_ctx,
             int fallback_world_size)
@@ -305,21 +232,6 @@ namespace llaminar2
 
             for (int participant = 0; participant < std::max(1, fallback_world_size); ++participant)
                 participants.push_back(DeviceId(DeviceType::CPU, participant));
-            return participants;
-        }
-
-        std::vector<DeviceId> overlayRebalanceParticipants(
-            const MoEOverlayRuntimeDomain &domain)
-        {
-            std::vector<DeviceId> participants;
-            participants.reserve(domain.participants.size());
-            for (const auto &participant : domain.participants)
-            {
-                if (participant.local_device.is_valid())
-                    participants.push_back(participant.local_device);
-                else
-                    participants.push_back(participant.address.toLocalDeviceId());
-            }
             return participants;
         }
 
@@ -518,10 +430,12 @@ namespace llaminar2
             const MoERoutedExpertPlacementPlan &plan,
             std::string *error)
         {
-            if (!plan.isTieredOverlay() || plan.routed_tiers.empty())
+            if (!plan.usesExpertOverlayAuthority() ||
+                plan.routed_tiers.empty())
             {
                 if (error)
-                    *error = "LLEP requires a graph-native tiered routed expert overlay";
+                    *error =
+                        "LLEP requires an enabled graph-native ExpertOverlay plan";
                 return false;
             }
 
@@ -569,10 +483,11 @@ namespace llaminar2
                     if (error)
                     {
                         *error = "domain '" + domain->name +
-                                 "' must be a multi-participant LocalTP/NodeLocalTP expert-ID-apportioned domain for LLEP";
+                                 "' must be a multi-participant LocalTP/NodeTP expert-ID-apportioned domain for LLEP";
                     }
                     return false;
                 }
+
             }
 
             return true;
@@ -580,7 +495,7 @@ namespace llaminar2
 
         bool overlayPlanDisablesDenseTP(const MoERoutedExpertPlacementPlan &plan)
         {
-            return plan.isTieredOverlay() &&
+            return plan.usesExpertOverlayAuthority() &&
                    !plan.continuation_domain_spec.dense_tp_enabled;
         }
 
@@ -642,7 +557,7 @@ namespace llaminar2
             const InferenceRunnerConfig *runner_config)
         {
             const auto &plan = graph_config.moe.routed_expert_plan;
-            if (!plan || !plan->isTieredOverlay())
+            if (!plan || !plan->usesExpertOverlayAuthority())
                 return true;
 
             ITPContext *injected_tp_context = runner_config ? runner_config->tp_ctx : nullptr;
@@ -714,9 +629,91 @@ namespace llaminar2
             }
 
             graph_config.moe.routed_expert_plan = plan;
+            graph_config.moe.authority_execution =
+                plan->authority_execution;
+            if (config.moe_expert_overlay_decode_histogram &&
+                !config.moe_expert_overlay_residency_authority)
+            {
+                LOG_ERROR(log_prefix
+                          << " received an ExpertOverlay histogram without its "
+                             "single residency authority");
+                return false;
+            }
+            if (config.moe_expert_overlay_participant_residency &&
+                !config.moe_expert_overlay_residency_authority)
+            {
+                LOG_ERROR(log_prefix
+                          << " received participant prepared banks without "
+                             "their global ExpertOverlay residency authority");
+                return false;
+            }
+            if (config.moe_expert_overlay_residency_authority)
+            {
+                const auto published =
+                    config.moe_expert_overlay_residency_authority->snapshot();
+                if (!published || !published->valid() ||
+                    !published->placement_plan)
+                {
+                    LOG_ERROR(log_prefix
+                              << " received an invalid ExpertOverlay residency authority");
+                    return false;
+                }
+                if (!config.moe_expert_overlay_participant_residency)
+                {
+                    LOG_ERROR(log_prefix
+                              << " received an ExpertOverlay residency authority "
+                                 "without process-local epoch-indexed prepared banks");
+                    return false;
+                }
+                if (config.moe_expert_overlay_participant_residency
+                        ->initialEpoch() != published->epoch)
+                {
+                    LOG_ERROR(log_prefix
+                              << " ExpertOverlay prepared-bank initial epoch "
+                              << config.moe_expert_overlay_participant_residency
+                                     ->initialEpoch()
+                              << " differs from published owner-map epoch "
+                              << published->epoch);
+                    return false;
+                }
+                if (config.moe_expert_overlay_residency_authority
+                        ->maintenanceMode() !=
+                    graph_config.moe.rebalance_config.mode)
+                {
+                    LOG_ERROR(log_prefix
+                              << " ExpertOverlay authority maintenance mode '"
+                              << moeRebalanceRuntimeModeToString(
+                                     config.moe_expert_overlay_residency_authority
+                                         ->maintenanceMode())
+                              << "' differs from graph runtime mode '"
+                              << moeRebalanceRuntimeModeToString(
+                                     graph_config.moe.rebalance_config.mode)
+                              << "'");
+                    return false;
+                }
+                if (config.moe_expert_overlay_residency_authority
+                        ->observesHistogram() &&
+                    !config.moe_expert_overlay_decode_histogram)
+                {
+                    LOG_ERROR(log_prefix
+                              << " observing ExpertOverlay maintenance has no shared histogram lifetime");
+                    return false;
+                }
+
+                graph_config.moe.expert_overlay_residency_authority =
+                    config.moe_expert_overlay_residency_authority;
+                graph_config.moe.expert_overlay_participant_residency =
+                    config.moe_expert_overlay_participant_residency;
+                graph_config.moe.decode_histogram =
+                    config.moe_expert_overlay_decode_histogram.get();
+                graph_config.moe.durable_residency_authority =
+                    MoEDurableResidencyAuthorityKind::ExpertOverlayRCU;
+            }
             graph_config.moe.overlay_mpi_ctx = config.moe_expert_overlay_mpi_ctx
                                                    ? config.moe_expert_overlay_mpi_ctx
                                                    : runner_mpi_ctx;
+            graph_config.moe.node_local_route_exchange =
+                config.moe_node_local_route_exchange;
             graph_config.dense_tp_enabled = !overlayPlanDisablesDenseTP(*plan);
             graph_config.dense_tp_decode_replicated =
                 graph_config.dense_tp_enabled &&
@@ -775,11 +772,11 @@ namespace llaminar2
                 *prefill_assignment_policy;
             graph_config.refreshMoEExecutionPolicy();
 
-            if (plan->isTieredOverlay())
+            if (plan->usesExpertOverlayAuthority())
             {
                 graph_config.moe.expert_overlay_runtime_plan.reset();
                 graph_config.moe.expert_overlay_execution_plan.reset();
-                LOG_DEBUG(log_prefix << " using graph-native MoE overlay lowering for tiered expert overlay");
+                LOG_DEBUG(log_prefix << " using graph-native MoE ExpertOverlay lowering");
 
                 if (!populateMoEContinuationDomainTPContextsForGraph(
                         graph_config,
@@ -801,20 +798,43 @@ namespace llaminar2
             const std::string &log_prefix)
         {
             auto plan = graph_config.moe.routed_expert_plan;
-            if (!plan || !plan->isTieredOverlay())
+            if (!plan || !plan->usesExpertOverlayAuthority())
                 return nullptr;
 
-            if (graph_config.moe.expert_overlay_runtime_plan)
-                return graph_config.moe.expert_overlay_runtime_plan;
+            auto runtime_plan =
+                graph_config.moe.expert_overlay_runtime_plan;
+            const auto &overlay_ctx = graph_config.moe.overlay_mpi_ctx;
+            if (!runtime_plan)
+            {
+                MoEExpertOverlayRuntimeResolverOptions options;
+                options.current_world_rank = overlayRankFor(
+                    overlay_ctx,
+                    runner_mpi_ctx);
+                /*
+                 * A distributed graph-native overlay deliberately resolves
+                 * the same immutable topology on every rank. Only the
+                 * continuation rank owns the dense graph; auxiliary ranks own
+                 * their exact participant graph.
+                 */
+                options.validate_mvp_root_reachability =
+                    !overlay_ctx || overlay_ctx->world_size() <= 1;
+                runtime_plan =
+                    resolveMoEExpertOverlayRuntimePlan(plan, options);
+                graph_config.moe.expert_overlay_runtime_plan = runtime_plan;
+                LOG_DEBUG(log_prefix
+                          << " resolved MoE overlay runtime plan: "
+                          << runtime_plan->diagnostics());
+            }
 
-            MoEExpertOverlayRuntimeResolverOptions options;
-            options.current_world_rank = overlayRankFor(
-                graph_config.moe.overlay_mpi_ctx,
-                runner_mpi_ctx);
-            auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan, options);
-            graph_config.moe.expert_overlay_runtime_plan = runtime_plan;
-            LOG_DEBUG(log_prefix << " resolved MoE overlay runtime plan: "
-                                 << runtime_plan->diagnostics());
+            if (!graph_config.moe.expert_overlay_execution_plan)
+            {
+                const int world_size =
+                    overlay_ctx ? overlay_ctx->world_size() : 1;
+                graph_config.moe.expert_overlay_execution_plan =
+                    std::make_shared<MoEExpertOverlayExecutionPlan>(
+                        buildMoEExpertOverlayExecutionPlan(
+                            *runtime_plan, world_size));
+            }
             return runtime_plan;
         }
 
@@ -1074,6 +1094,39 @@ namespace llaminar2
             return requested_device;
         }
 
+        /*
+         * Distributed graph-native overlays build one participant-local graph
+         * per MPI rank.  A non-root graph must therefore retain its explicitly
+         * requested local expert device instead of being rewritten to the
+         * continuation device.  The runtime descriptor records both rank and
+         * device ownership, so this admission check cannot accidentally allow
+         * a rank to execute another participant's graph.
+         */
+        const auto &overlay_ctx = graph_config.moe.overlay_mpi_ctx;
+        if (overlay_ctx && overlay_ctx->world_size() > 1)
+        {
+            const int current_rank = overlay_ctx->rank();
+            const bool requested_is_owned_overlay_participant =
+                std::any_of(
+                    runtime_plan->domains().begin(),
+                    runtime_plan->domains().end(),
+                    [&](const MoEOverlayRuntimeDomain &domain)
+                    {
+                        return std::any_of(
+                            domain.participants.begin(),
+                            domain.participants.end(),
+                            [&](const MoEOverlayDomainParticipant &participant)
+                            {
+                                return participant.world_rank_known &&
+                                       participant.world_rank == current_rank &&
+                                       participant.locally_addressable &&
+                                       participant.local_device == requested_device;
+                            });
+                    });
+            if (requested_is_owned_overlay_participant)
+                return requested_device;
+        }
+
         throw std::runtime_error(
             "MoE expert overlay graph runner requested device " +
             requested_device.to_string() +
@@ -1084,19 +1137,64 @@ namespace llaminar2
             ". Refusing to rewrite the graph to a different device.");
     }
 
-    static MoERebalanceMode toControllerRebalanceMode(MoERebalanceRuntimeMode mode);
-
-    std::vector<std::unique_ptr<MoERebalanceController>> createMoERebalanceControllersForGraph(
+    void validateMoEDurableResidencyAuthorityForGraph(
         const GraphConfig &graph_config,
         const ILocalTPContext *local_tp_ctx,
         const ITPContext *tp_ctx)
     {
-        std::vector<std::unique_ptr<MoERebalanceController>> controllers;
-
         const auto rebalance_config = graph_config.moe.rebalance_config;
-        const MoERebalanceMode mode = toControllerRebalanceMode(rebalance_config.mode);
-        if (mode == MoERebalanceMode::OFF || !graph_config.moe.enabled())
-            return controllers;
+        if (graph_config.moe.expert_overlay_residency_authority)
+        {
+            /*
+             * ExpertOverlay has one RCU owner map and histogram regardless of
+             * whether its topology has one or several priority tiers. The
+             * shared authority was installed before any child graph was built.
+             */
+            if (!graph_config.moe.usesExpertOverlayDurableResidencyAuthority())
+            {
+                throw std::logic_error(
+                    "ExpertOverlay residency authority is bound without the "
+                    "typed ExpertOverlayRCU durable authority");
+            }
+            if (!graph_config.moe.routed_expert_plan)
+            {
+                throw std::logic_error(
+                    "ExpertOverlay residency authority is bound without its "
+                    "frozen routed-expert plan");
+            }
+            const auto required_execution =
+                resolveMoEOverlayAuthorityExecutionKind(
+                    *graph_config.moe.routed_expert_plan);
+            if (graph_config.moe.authority_execution != required_execution ||
+                graph_config.moe.routed_expert_plan->authority_execution !=
+                    required_execution)
+            {
+                throw std::logic_error(
+                    "ExpertOverlay graph authority execution is unresolved or "
+                    "does not match the frozen topology");
+            }
+            return;
+        }
+        if (graph_config.moe.usesExpertOverlayDurableResidencyAuthority())
+        {
+            throw std::logic_error(
+                "Typed ExpertOverlayRCU durable authority has no residency "
+                "authority object");
+        }
+        if (graph_config.moe.expert_overlay_runtime_plan ||
+            (graph_config.moe.routed_expert_plan &&
+             graph_config.moe.routed_expert_plan
+                 ->usesExpertOverlayAuthority()))
+        {
+            throw std::logic_error(
+                "Routed ExpertOverlay topology reached graph construction "
+                "without its ExpertOverlayRCU residency authority");
+        }
+        if (rebalance_config.mode == MoERebalanceRuntimeMode::Off ||
+            !graph_config.moe.enabled())
+        {
+            return;
+        }
 
         int fallback_world_size = 1;
         if (local_tp_ctx && local_tp_ctx->degree() > 1)
@@ -1104,61 +1202,18 @@ namespace llaminar2
         else if (const auto *global_tp_ctx = dynamic_cast<const IGlobalTPContext *>(tp_ctx))
             fallback_world_size = std::max(1, global_tp_ctx->degree());
 
-        int effective_replicas = graph_config.moe.hot_expert_cache.resolveCap(
-            graph_config.moe.num_experts,
-            mode == MoERebalanceMode::DYNAMIC);
-        const auto &env = debugEnv();
-        if (env.presence.has("LLAMINAR_MOE_REBALANCE_REPLICAS"))
-            effective_replicas = std::max(0, env.moe_rebalance.max_replicas);
-
-        std::unordered_set<std::string> domain_ids;
-        auto add_controller = [&](std::string domain_id,
-                                  std::vector<DeviceId> participants,
-                                  int max_replicas)
+        const auto participants = resolvedMoEAuthorityParticipants(
+            local_tp_ctx, tp_ctx, fallback_world_size);
+        if (participants.size() > 1u)
         {
-            if (domain_id.empty() || !domain_ids.insert(domain_id).second)
-                return;
-            controllers.push_back(createMoERebalanceControllerForDomain(
-                graph_config,
-                rebalance_config,
-                mode,
-                std::move(domain_id),
-                std::move(participants),
-                max_replicas));
-        };
-
-        add_controller(
-            moeRebalanceDomainIdForTP(local_tp_ctx, tp_ctx),
-            baseMoERebalanceParticipants(local_tp_ctx, tp_ctx, fallback_world_size),
-            effective_replicas);
-
-        if (graph_config.moe.expert_overlay_runtime_plan)
-        {
-            for (const auto &domain : graph_config.moe.expert_overlay_runtime_plan->domains())
-            {
-                if (!domain.routed_rebalance_controller_eligible)
-                    continue;
-                add_controller(
-                    domain.rebalance_domain_id,
-                    overlayRebalanceParticipants(domain),
-                    effective_replicas);
-            }
+            throw std::logic_error(
+                "Multi-participant MoE reached graph construction without "
+                "universal ExpertOverlay authority normalization");
         }
 
-        return controllers;
-    }
-
-    MoERebalanceController *bindActiveMoERebalanceControllerForGraph(
-        GraphConfig &graph_config,
-        const std::vector<std::unique_ptr<MoERebalanceController>> &controllers)
-    {
-        auto *controller = selectActiveMoERebalanceController(controllers);
-        if (!controller)
-            return nullptr;
-
-        graph_config.moe.decode_histogram = controller->histogram();
-        graph_config.moe.rebalance_mode = controller->mode();
-        return controller;
+        /* A single participant cannot improve placement through movement. It
+         * therefore needs neither a durable writer nor a shadow histogram;
+         * the ordinary static graph remains authoritative. */
     }
 
     std::shared_ptr<MoERoutedExpertPlacementPlan> resolveMoERoutedExpertPlacementPlanForModel(
@@ -1168,13 +1223,196 @@ namespace llaminar2
         auto plan = config.moe_routed_expert_plan;
         if (!plan)
             return nullptr;
-        if (!plan->enabled || !plan->isTieredOverlay() || !plan->placements.empty())
+        if (!plan->usesExpertOverlayAuthority())
             return plan;
 
-        auto planner_result = MoERoutedExpertPlacementPlanner::plan(
-            *plan,
-            moEExpertMetadataForModel(model_ctx));
-        return std::make_shared<MoERoutedExpertPlacementPlan>(std::move(planner_result.planned_plan));
+        const auto required_authority_execution =
+            resolveMoEOverlayAuthorityExecutionKind(*plan);
+        if (plan->authority_execution !=
+                MoEOverlayAuthorityExecutionKind::Unresolved &&
+            plan->authority_execution != required_authority_execution)
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay plan authority execution '" +
+                std::string(toString(plan->authority_execution)) +
+                "' conflicts with topology-required '" +
+                std::string(toString(required_authority_execution)) + "'");
+        }
+        const bool needs_frozen_clone =
+            plan->authority_execution != required_authority_execution ||
+            plan->continuation_domain_spec.domain.empty();
+        if (needs_frozen_clone)
+        {
+            plan = std::make_shared<MoERoutedExpertPlacementPlan>(*plan);
+            plan->authority_execution = required_authority_execution;
+
+            /*
+             * The declarative CLI has one canonical continuation-domain
+             * selector.  The nested specification may override it for typed
+             * programmatic plans, but an omitted override must be resolved
+             * while freezing—not independently by graph, capacity, and
+             * orchestration consumers.  A frozen plan is therefore complete
+             * and never asks a downstream caller to reconstruct topology.
+             */
+            if (plan->continuation_domain_spec.domain.empty())
+            {
+                plan->continuation_domain_spec.domain =
+                    plan->continuation_domain;
+            }
+        }
+
+        const auto metadata =
+            resolveMoERoutedExpertModelMetadataForModel(
+                model_ctx,
+                config.mtp);
+
+        if (plan->placements.empty())
+        {
+            auto planner_result = MoERoutedExpertPlacementPlanner::plan(
+                *plan,
+                metadata);
+            auto resolved = std::make_shared<MoERoutedExpertPlacementPlan>(
+                std::move(planner_result.planned_plan));
+            validateMoERoutedExpertPlacementPlanOrThrow(
+                *resolved,
+                MoERoutedExpertPlacementValidationOptions{
+                    .layer_count = metadata.num_layers,
+                    .routed_expert_count = metadata.num_experts,
+                });
+            return resolved;
+        }
+
+        const int raw_layer_count =
+            std::max(model_ctx.totalBlockCount(), model_ctx.blockCount());
+        const bool has_inactive_trailing_sidecar =
+            !config.mtp.enabled && metadata.num_layers < raw_layer_count;
+        bool needs_runtime_view = false;
+        for (const auto &placement : plan->placements)
+        {
+            if (placement.layer < metadata.num_layers)
+                continue;
+
+            if (!has_inactive_trailing_sidecar ||
+                placement.layer >= raw_layer_count)
+            {
+                /*
+                 * Do not discard a malformed or unknown layer merely because
+                 * this runner has MTP disabled. Only the tensor-authenticated
+                 * trailing NextN interval is eligible for projection out of
+                 * the runtime view; every other mismatch must fail validation.
+                 */
+                validateMoERoutedExpertPlacementPlanOrThrow(
+                    *plan,
+                    MoERoutedExpertPlacementValidationOptions{
+                        .layer_count = metadata.num_layers,
+                        .routed_expert_count = metadata.num_experts,
+                    });
+            }
+            needs_runtime_view = true;
+        }
+
+        if (!needs_runtime_view)
+        {
+            validateMoERoutedExpertPlacementPlanOrThrow(
+                *plan,
+                MoERoutedExpertPlacementValidationOptions{
+                    .layer_count = metadata.num_layers,
+                    .routed_expert_count = metadata.num_experts,
+                });
+            return plan;
+        }
+
+        /*
+         * The caller's declarative all-feature plan remains immutable and can
+         * be reused by an MTP-enabled runner. This clone is the exact graph
+         * family's placement authority, containing only banks that can be
+         * constructed and published during this runner's initialization.
+         */
+        auto runtime_plan =
+            std::make_shared<MoERoutedExpertPlacementPlan>(*plan);
+        std::erase_if(
+            runtime_plan->placements,
+            [&](const RoutedExpertLayerPlacement &placement)
+            {
+                return placement.layer >= metadata.num_layers;
+            });
+        validateMoERoutedExpertPlacementPlanOrThrow(
+            *runtime_plan,
+            MoERoutedExpertPlacementValidationOptions{
+                .layer_count = metadata.num_layers,
+                .routed_expert_count = metadata.num_experts,
+            });
+        return runtime_plan;
+    }
+
+    MoERoutedExpertModelMetadata resolveMoERoutedExpertModelMetadataForModel(
+        IModelContext &model_ctx,
+        const MTPRuntimeConfig &mtp)
+    {
+        auto loader = model_ctx.loader();
+        const std::string &arch = model_ctx.architecture();
+
+        MoERoutedExpertModelMetadata metadata;
+        const int raw_layer_count =
+            std::max(model_ctx.totalBlockCount(), model_ctx.blockCount());
+        metadata.num_layers = raw_layer_count;
+        if (loader)
+        {
+            const int main_layer_count = mainLayerCountExcludingMTP(
+                *loader,
+                arch,
+                raw_layer_count);
+            metadata.num_layers = main_layer_count;
+
+            if (mtp.enabled)
+            {
+                const MTPWeightManifest manifest = discoverMTPWeightManifest(
+                    *loader,
+                    arch,
+                    raw_layer_count,
+                    /*explicit_mtp=*/true);
+                if (!manifest.available)
+                {
+                    throw std::invalid_argument(
+                        "MTP-enabled routed-expert placement could not resolve "
+                        "the model's NextN weight manifest: " +
+                        manifest.diagnostic);
+                }
+
+                int next_routed_layer = main_layer_count;
+                for (const auto &depth : manifest.depths)
+                {
+                    if (!depth.moe_ffn_layout)
+                        continue;
+                    if (depth.source_layer_index != next_routed_layer)
+                    {
+                        throw std::invalid_argument(
+                            "MTP routed-expert source layer " +
+                            std::to_string(depth.source_layer_index) +
+                            " is not the next contiguous layer after runtime "
+                            "layer " + std::to_string(next_routed_layer - 1));
+                    }
+                    ++next_routed_layer;
+                }
+                metadata.num_layers = next_routed_layer;
+            }
+        }
+        metadata.num_experts =
+            loader ? loader->getInt(arch + ".expert_count", 0) : 0;
+        metadata.d_model = model_ctx.embeddingLength();
+        metadata.routed_intermediate_size =
+            loader
+                ? loader->getInt(
+                      arch + ".expert_feed_forward_length", 0)
+                : 0;
+        if (metadata.routed_intermediate_size <= 0)
+            metadata.routed_intermediate_size = model_ctx.feedForwardLength();
+        metadata.shared_intermediate_size =
+            metadata.routed_intermediate_size;
+        metadata.has_shared_expert =
+            loader &&
+            loader->getInt(arch + ".expert_shared_count", 0) > 0;
+        return metadata;
     }
 
     static PreparedWeightKind expectedGemmPreparedKind(DeviceId device)
@@ -1253,6 +1491,11 @@ namespace llaminar2
         {
             wm_config.tp_config = graph_config.tp_config;
         }
+        wm_config.routed_expert_assignment = {
+            .owner_order = graph_config.moe.owner_order,
+            .participant_index = graph_config.moe.owner_participant_index,
+            .participant_count = graph_config.moe.owner_participant_count,
+        };
         return wm_config;
     }
 
@@ -1346,20 +1589,17 @@ namespace llaminar2
     }
 
     /**
-     * @brief Return true when LocalTP MTP needs a replicated terminal head.
+     * @brief Return true when TP MTP needs a replicated terminal head.
      *
-     * This is narrower than dense decode replication.  It materializes
+     * This is narrower than dense decode replication. It materializes
      * output_norm/output.weight without cloning the whole dense transformer
-     * stack, allowing the MTP verifier to avoid a tiny logits collective while
-     * keeping ordinary TP prefill/decode sharded.
+     * stack, allowing every TP participant to evaluate verifier logits locally
+     * while ordinary TP prefill/decode transformer work remains sharded. The
+     * ownership rule is identical for local, node-local, and global TP scopes.
      */
-    bool needsLocalTPMirroredMTPHeadWeights(const GraphConfig &graph_config)
+    bool needsMirroredMTPHeadWeights(const GraphConfig &graph_config)
     {
-        return mtpTerminalHeadIsMirrored(graph_config.mtp.terminal_head_policy) &&
-               graph_config.lm_head_column_parallel &&
-               graph_config.tp_config &&
-               graph_config.tp_ctx &&
-               graph_config.tp_ctx->isLocal();
+        return graph_config.mtpUsesMirroredTerminalHeadBinding();
     }
 
     /**
@@ -1627,6 +1867,100 @@ namespace llaminar2
         return plan;
     }
 
+    /**
+     * @brief Replace generic routed parents with exact graph-local ExpertOverlay slices.
+     *
+     * A generic dense continuation plan normally includes every routed-expert
+     * parent for its graph device. That is not valid for an overlay: a
+     * participant-local graph may prepare only the expert IDs owned by logical
+     * participants mapped to that exact physical device. Filtering by both MPI
+     * rank and device is important for LocalTP, where several graphs share one
+     * rank and one additive PreparedWeightStore but retain independent frozen
+     * binding sets and device memory authorities.
+     *
+     * Replace every generic parent with the exact expert-axis requirements
+     * declared by the canonical owner map for this graph. This makes source
+     * page faults, packed GEMM registration, and the graph participant mask
+     * describe the same ownership without causing one graph to materialize a
+     * sibling device's experts.
+     */
+    static WeightPlan includeGraphLocalOverlayParticipantWeights(
+        WeightPlan base_plan,
+        const ModelContext &model_ctx,
+        const GraphConfig &graph_config,
+        DeviceId graph_device)
+    {
+        const auto &placement = graph_config.moe.routed_expert_plan;
+        const auto &execution =
+            graph_config.moe.expert_overlay_execution_plan;
+        if (!placement || !placement->usesExpertOverlayAuthority() || !execution)
+            return base_plan;
+
+        const MoEExpertOwnerMap owner_map =
+            MoEExpertOwnerMap::build(*placement);
+        const int rank = execution->currentRankPlan().world_rank;
+
+        std::vector<const MoEExpertOwnerParticipant *> graph_local;
+        for (const auto &participant : owner_map.participants())
+        {
+            if (!participant.world_rank_known)
+            {
+                throw std::runtime_error(
+                    "Tiered ExpertOverlay weight plan has a participant " +
+                    std::to_string(participant.participant_id) +
+                    " without an owning MPI rank; exact expert residency "
+                    "cannot be materialized");
+            }
+            if (participant.world_rank == rank &&
+                participant.device == graph_device)
+            {
+                graph_local.push_back(&participant);
+            }
+        }
+
+        InferenceStrategy combined_strategy = base_plan.strategy();
+        WeightPlan combined(std::move(combined_strategy));
+        for (const auto &requirement : base_plan.requirements())
+        {
+            const WeightRole role =
+                requirement.role == WeightRole::Other
+                    ? inferWeightRole(requirement.canonical_name)
+                    : requirement.role;
+            if (!isRoutedExpertRole(role))
+                combined.add(requirement);
+        }
+
+        std::sort(
+            graph_local.begin(),
+            graph_local.end(),
+            [](const MoEExpertOwnerParticipant *left,
+               const MoEExpertOwnerParticipant *right)
+            { return left->participant_id < right->participant_id; });
+
+        for (const auto *participant : graph_local)
+        {
+            const WeightPlan participant_plan =
+                buildMoEOverlayParticipantWeightPlan(
+                    model_ctx,
+                    *execution,
+                    owner_map,
+                    *participant);
+            for (const auto &requirement :
+                 participant_plan.requirements())
+            {
+                combined.add(requirement);
+            }
+        }
+
+        LOG_DEBUG(
+            "[InferenceRunner] Replaced generic routed parents with exact "
+            << graph_local.size()
+            << " graph-local ExpertOverlay participant slice(s) on "
+            << graph_device.to_string() << ": requirements="
+            << combined.size());
+        return combined;
+    }
+
     // =========================================================================
     // Helper: Build ClusterInventory for GPU Collective Context
     // =========================================================================
@@ -1726,20 +2060,6 @@ namespace llaminar2
         return requested;
     }
 
-    static MoERebalanceMode toControllerRebalanceMode(MoERebalanceRuntimeMode mode)
-    {
-        switch (mode)
-        {
-        case MoERebalanceRuntimeMode::Observe:
-            return MoERebalanceMode::OBSERVE;
-        case MoERebalanceRuntimeMode::Dynamic:
-            return MoERebalanceMode::DYNAMIC;
-        case MoERebalanceRuntimeMode::Off:
-        default:
-            return MoERebalanceMode::OFF;
-        }
-    }
-
     static MoERebalanceRuntimeConfig effectiveMoERebalanceConfig(
         const InferenceRunnerConfig &config)
     {
@@ -1826,6 +2146,8 @@ namespace llaminar2
     {
         graph_config.moe.local_expert_start = 0;
         graph_config.moe.local_expert_count = -1;
+        graph_config.moe.owner_participant_index = 0;
+        graph_config.moe.owner_participant_count = 1;
 
         if (!graph_config.moe.enabled())
             return true;
@@ -1870,18 +2192,28 @@ namespace llaminar2
             return false;
         }
 
-        const int base = graph_config.moe.num_experts / participants;
-        const int remainder = graph_config.moe.num_experts % participants;
-        const int count = base + (participant_index < remainder ? 1 : 0);
-        const int start = participant_index * base + std::min(participant_index, remainder);
+        const auto [owner_begin, owner_count] =
+            routed_expert_ownership::balancedOwnerSpan(
+                static_cast<size_t>(graph_config.moe.num_experts),
+                participants,
+                participant_index);
+        const int start = static_cast<int>(owner_begin);
+        const int count = static_cast<int>(owner_count);
 
-        graph_config.moe.local_expert_start = start;
+        graph_config.moe.owner_participant_index = participant_index;
+        graph_config.moe.owner_participant_count = participants;
+        graph_config.moe.local_expert_start =
+            graph_config.moe.owner_order == RoutedExpertOwnerOrder::Ordinal
+                ? start
+                : 0;
         graph_config.moe.local_expert_count = count;
 
         LOG_DEBUG("[InferenceRunner] MoE expert mode="
                   << routedExpertComputePolicyToString(graph_config.moe.routed_compute_policy)
                   << " participant=" << participant_index << "/" << participants
-                  << " expert_range=[" << start << ", " << (start + count) << ")"
+                  << " owner_order="
+                  << routedExpertOwnerOrderToString(graph_config.moe.owner_order)
+                  << " ordinal_range=[" << start << ", " << (start + count) << ")"
                   << " count=" << count << "/" << graph_config.moe.num_experts);
         return true;
     }
@@ -2327,6 +2659,7 @@ namespace llaminar2
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
         graph_config.moe.routed_compute_policy = config.routed_expert_compute_policy;
+        graph_config.moe.owner_order = config.routed_expert_owner_order;
         graph_config.moe.hot_expert_cache = config.moe_hot_expert_cache;
         graph_config.moe.routed_prefill_config = config.moe_routed_prefill;
         graph_config.moe.rebalance_config = effectiveMoERebalanceConfig(config);
@@ -2340,6 +2673,53 @@ namespace llaminar2
                 "[InferenceRunner]"))
         {
             return nullptr;
+        }
+        if (graph_config.moe.routed_expert_plan &&
+            graph_config.moe.routed_expert_plan
+                ->usesExpertOverlayAuthority() &&
+            mpi_ctx &&
+            mpi_ctx->world_size() > 1)
+        {
+            const auto &overlay_plan =
+                *graph_config.moe.routed_expert_plan;
+            const auto *dense_domain = findDenseMoEDomain(
+                overlay_plan,
+                overlay_plan.effectiveBaseModelDomain());
+            const bool node_local_dense_tp =
+                dense_domain &&
+                dense_domain->scope ==
+                    ExecutionDomainScope::NODE_LOCAL &&
+                overlay_plan.continuation_domain_spec
+                        .effectiveDensePolicy() ==
+                    DenseParallelPolicy::TensorParallel &&
+                static_cast<int>(dense_domain->ranks.size()) ==
+                    mpi_ctx->world_size();
+            if (!node_local_dense_tp)
+            {
+                LOG_ERROR(
+                    "[InferenceRunner] A participant-local ExpertOverlay dense "
+                    "graph requires a rank-local graph MPI context. Publish "
+                    "cross-rank sparse collectives through "
+                    "moe_expert_overlay_mpi_ctx. The only multi-rank dense "
+                    "exception is an explicit NodeTP continuation domain "
+                    "covering this communicator.");
+                return nullptr;
+            }
+
+            /*
+             * In a NodeTP continuation this communicator is not an
+             * accidental overlay-world leak: it is the ordinary dense shard
+             * collective and every rank builds the same graph. Sparse overlay
+             * stages use the same ordered world through overlay_mpi_ctx.
+             */
+            PerfStatsCollector::addCounter(
+                "moe_overlay",
+                "node_local_dense_continuation_graphs",
+                1.0,
+                "graph_build",
+                device.to_string(),
+                {{"world_size", std::to_string(mpi_ctx->world_size())},
+                 {"domain", dense_domain->name}});
         }
         graph_config.refreshMoEExecutionPolicy();
         LOG_DEBUG("[InferenceRunner] MoE semantic policy="
@@ -2379,6 +2759,20 @@ namespace llaminar2
 
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
+        std::string graph_row_capacity_error;
+        const auto graph_row_capacity = resolveMaximumGraphActivationRows(
+            config,
+            device,
+            graph_row_capacity_error);
+        if (!graph_row_capacity)
+        {
+            LOG_ERROR("[InferenceRunner] Invalid graph activation envelope for "
+                      << device.to_string() << ": "
+                      << graph_row_capacity_error);
+            return nullptr;
+        }
+        graph_config.max_activation_rows = *graph_row_capacity;
+        graph_config.max_request_count = std::max(1, config.batch_size);
         graph_config.executor_config.cancellation_requested = config.cancellation_requested;
         graph_config.executor_config.stage_failure_callback = config.stage_failure_callback;
 
@@ -2412,7 +2806,7 @@ namespace llaminar2
         LOG_DEBUG("[InferenceRunner] KV cache precision mode: "
                   << kvCachePrecisionToString(config.kv_cache_precision));
 
-        // Partial pipeline stages, including global/node-local TP stages built
+        // Partial pipeline stages, including global/NodeTP stages built
         // through the concrete inference path, execute only their assigned layer
         // range and consume external hidden state when they do not own embedding.
         if (config.pp_stage_config.has_value())
@@ -2517,6 +2911,20 @@ namespace llaminar2
         {
             return nullptr;
         }
+        if (weight_mgr)
+        {
+            /*
+             * TP assignment finalizes the routed-expert participant coordinate.
+             * Publish that exact coordinate to physical weight slicing before
+             * any eager source materialization can observe the old contiguous
+             * rank convention.
+             */
+            configureWeightManagerForGraph(
+                *weight_mgr,
+                architecture,
+                graph_config,
+                graph_config.tp_config != nullptr);
+        }
 
         // =====================================================================
         // Create GlobalTPContext for cross-MPI-rank tensor parallelism
@@ -2574,31 +2982,12 @@ namespace llaminar2
                   << ", n_kv_heads=" << graph_config.n_kv_heads
                   << ", d_ff=" << graph_config.d_ff);
 
-        // =====================================================================
-        // MoE Expert Rebalance Controller (Phase 4a)
-        // =====================================================================
-        // Must be set BEFORE graph builder creation so the histogram pointer
-        // propagates into MoEExpertComputeStage params during graph construction.
-        auto moe_controllers = createMoERebalanceControllersForGraph(
+        /* Reject any caller that bypassed universal ExpertOverlay authority
+         * normalization before graph construction. */
+        validateMoEDurableResidencyAuthorityForGraph(
             graph_config,
             local_tp_ctx,
             graph_config.tp_ctx);
-        if (!moe_controllers.empty())
-        {
-            bindActiveMoERebalanceControllerForGraph(graph_config, moe_controllers);
-
-            const auto rebalance_config = graph_config.moe.rebalance_config;
-            for (const auto &controller : moe_controllers)
-            {
-                LOG_DEBUG("[InferenceRunner] MoE rebalance controller: mode="
-                          << moeRebalanceRuntimeModeToString(rebalance_config.mode)
-                          << " max_replicas=" << controller->maxReplicasPerSocket()
-                          << " domain=" << controller->domainId()
-                          << " hot_cache=" << graph_config.moe.hot_expert_cache.toString()
-                          << " window=" << rebalance_config.window_size
-                          << " experts=" << graph_config.moe.num_experts);
-            }
-        }
 
         // Create DeviceGraphOrchestrator with config
         LOG_DEBUG("[InferenceRunner] About to create DeviceGraphOrchestrator with mpi_ctx="
@@ -2635,10 +3024,6 @@ namespace llaminar2
         {
             orchestrator->setKVRotation(std::move(kv_rotation));
         }
-
-        // Transfer MoE rebalance controller ownership to orchestrator
-        for (auto &controller : moe_controllers)
-            orchestrator->addMoERebalanceController(std::move(controller));
 
         // Transfer GlobalTPContext ownership to orchestrator
         if (global_tp_ctx)
@@ -2719,10 +3104,23 @@ namespace llaminar2
                 }
             }
 
-            if (!configureOrchestratorWeightsImpl(orchestrator.get(), model_ctx, device, config, graph_config))
+            bool weights_configured = false;
+            std::exception_ptr weight_configuration_error;
+            try
             {
-                LOG_ERROR("[InferenceRunner] Failed to configure orchestrator weights");
-                return nullptr;
+                weights_configured = configureOrchestratorWeightsImpl(
+                    orchestrator.get(), model_ctx, device, config, graph_config);
+            }
+            catch (...)
+            {
+                /*
+                 * Every rank must leave the progress RMA epoch before an
+                 * initialization error escapes. Capturing the exception here
+                 * keeps successful and failed setup under the same collective
+                 * teardown protocol; it also prevents rank 0's poll thread from
+                 * surviving into MPI/process destruction.
+                 */
+                weight_configuration_error = std::current_exception();
             }
 
             // Finalize progress display
@@ -2745,6 +3143,14 @@ namespace llaminar2
                         weight_mgr->setWeightLoadProgress(nullptr);
                     }
                 }
+            }
+
+            if (weight_configuration_error)
+                std::rethrow_exception(weight_configuration_error);
+            if (!weights_configured)
+            {
+                LOG_ERROR("[InferenceRunner] Failed to configure orchestrator weights");
+                return nullptr;
             }
         }
 
@@ -2856,11 +3262,10 @@ namespace llaminar2
             device.is_cpu() &&
             architecture == "qwen35moe" &&
             graph_config.moe.num_experts > 0;
-        const bool eager_gpu_graph_family_materialization =
-            device.is_gpu() &&
-            graph_config.requiresEagerGPUWorkspaceFamilyManifest();
+        const bool eager_shape_dependent_graph_family_materialization =
+            graph_config.requiresEagerWorkspaceFamilyManifest();
         if (eager_cpu_moe_materialization ||
-            eager_gpu_graph_family_materialization)
+            eager_shape_dependent_graph_family_materialization)
         {
             ScopedWeightLoadDetailTimer timer("graph.build.eager_graph_family_materialization");
             if (!orchestrator->materializeForwardGraphForShape(/*seq_len=*/1, config.batch_size))
@@ -2955,6 +3360,27 @@ namespace llaminar2
         auto &weights_to_load = validation.weights_to_load;
         const auto &gguf_model = model_ctx->model();
 
+        const auto load_graph_participant_weight =
+            [&graph_config, &weight_mgr](const std::string &weight_name)
+            -> std::shared_ptr<TensorBase>
+        {
+            if (!graph_config.tp_config)
+                return weight_mgr->getWeightForDevice(weight_name);
+
+            /*
+             * DeviceId names process-local hardware, not a distributed TP
+             * participant.  In global TP every rank can legitimately call its
+             * local processor cpu:0, so resolving by DeviceId would always pick
+             * the first duplicate assignment.  The graph-owned rank is the
+             * only unambiguous cache identity during eager materialization.
+             */
+            return weight_mgr->getShardedWeightForAssignment(
+                weight_name,
+                DeviceId::cpu(),
+                graph_config.tp_config->forRank(graph_config.local_rank),
+                inferWeightLayer(weight_name));
+        };
+
         // =====================================================================
         // Host RAM preflight check: ensure enough memory before loading
         // =====================================================================
@@ -3025,7 +3451,7 @@ namespace llaminar2
                 }
 
                 const auto &[weight_name, is_optional] = weights_to_load[idx];
-                auto weight = weight_mgr->getWeightForDevice(weight_name);
+                auto weight = load_graph_participant_weight(weight_name);
 
                 if (!weight)
                 {
@@ -3111,14 +3537,14 @@ namespace llaminar2
             // here — passing CUDA:0 would put them in per_device_cache_,
             // which makes packGemmWeightsViaPipeline() think per_device_cache_
             // is the primary source and skip all per-layer weights from cache_.
-            auto lm_head = weight_mgr->getWeightForDevice("output.weight");
+            auto lm_head = load_graph_participant_weight("output.weight");
             if (!lm_head && model_ctx->hasTensor("token_embd.weight"))
             {
                 // Tied embeddings: output.weight absent, token_embd.weight
                 // will be reused as the LM head GEMM weight. Load it now so
                 // packGemmWeightsViaPipeline() can find it in cache_ and
                 // include it in the GPU GEMM pipeline for repacking.
-                weight_mgr->getWeightForDevice("token_embd.weight");
+                load_graph_participant_weight("token_embd.weight");
                 LOG_DEBUG("[InferenceRunner] Tied embeddings: token_embd.weight loaded for GPU GEMM pipeline");
             }
             else if (lm_head)
@@ -3126,12 +3552,12 @@ namespace llaminar2
                 LOG_DEBUG("[InferenceRunner] output.weight loaded into cache for GPU pipeline enrollment");
                 // Also load token_embd.weight for embedding stage
                 if (model_ctx->hasTensor("token_embd.weight"))
-                    weight_mgr->getWeightForDevice("token_embd.weight");
+                    load_graph_participant_weight("token_embd.weight");
             }
 
             // Load output_norm for GPU upload during finalization
             if (model_ctx->hasTensor("output_norm.weight"))
-                weight_mgr->getWeightForDevice("output_norm.weight");
+                load_graph_participant_weight("output_norm.weight");
 
             LOG_DEBUG("[InferenceRunner] Global weights loaded into cache");
 
@@ -3168,6 +3594,11 @@ namespace llaminar2
                 .replicate_routed_experts =
                     needsReplicatedRoutedExpertWeights(graph_config),
             });
+        weight_plan = includeGraphLocalOverlayParticipantWeights(
+            std::move(weight_plan),
+            *model_ctx,
+            graph_config,
+            device);
         if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[InferenceRunner]"))
             return false;
         LOG_DEBUG("[InferenceRunner] SingleDevice WeightPlan built with "
@@ -3184,7 +3615,7 @@ namespace llaminar2
         const auto &env = debugEnv();
 
         FrozenModelWeightSet frozen_weights = weight_mgr->materialize(weight_plan);
-        auto weight_bindings = makeModelWeightBindings(frozen_weights);
+        auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
         auto legacy_weights = toLegacyModelWeights(weight_bindings);
 
         if (!legacy_weights.embedding_table || !legacy_weights.final_norm || !legacy_weights.lm_head)
@@ -3193,13 +3624,14 @@ namespace llaminar2
             return false;
         }
 
-        const bool has_tiered_overlay_plan =
+        const bool has_expert_overlay_plan =
             graph_config.moe.routed_expert_plan &&
-            graph_config.moe.routed_expert_plan->isTieredOverlay();
+            graph_config.moe.routed_expert_plan
+                ->usesExpertOverlayAuthority();
         auto overlay_runtime_plan_for_weight_prep = graph_config.moe.expert_overlay_runtime_plan;
         const MoEExpertOverlayExecutionPlan *overlay_execution_plan_for_weight_prep =
             graph_config.moe.expert_overlay_execution_plan.get();
-        if (has_tiered_overlay_plan && !overlay_runtime_plan_for_weight_prep)
+        if (has_expert_overlay_plan && !overlay_runtime_plan_for_weight_prep)
         {
             overlay_runtime_plan_for_weight_prep = resolveMoEExpertOverlayRuntimePlan(
                 graph_config.moe.routed_expert_plan,
@@ -3226,14 +3658,17 @@ namespace llaminar2
                     &frozen_weights,
                     overlay_execution_plan_for_weight_prep))
             {
-                LOG_ERROR("[InferenceRunner] Failed to prepare MoE expert overlay weights");
+                LOG_ERROR(
+                    "[InferenceRunner] Failed to prepare MoE expert "
+                    "overlay weights on graph device "
+                    << device.to_string());
                 return false;
             }
         }
 
         std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
         const bool needs_mirrored_mtp_head =
-            needsLocalTPMirroredMTPHeadWeights(graph_config);
+            needsMirroredMTPHeadWeights(graph_config);
         if ((graph_config.dense_tp_decode_replicated ||
              graph_config.dense_tp_decode_mirrored_embedding ||
              needs_mirrored_mtp_head) &&
@@ -3477,7 +3912,7 @@ namespace llaminar2
         if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[PPStageRunner]"))
             return false;
         FrozenModelWeightSet frozen_weights = weight_mgr->materialize(weight_plan);
-        auto weight_bindings = makeModelWeightBindings(frozen_weights);
+        auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
         auto legacy_weights = toLegacyModelWeights(weight_bindings);
 
         if (pp_config.has_embedding && !legacy_weights.embedding_table)
@@ -3682,6 +4117,20 @@ namespace llaminar2
         // Primary device is from first PP stage
         DeviceId primary_device = pipeline_config->getDeviceForLayer(0);
         graph_config.default_device = primary_device;
+        std::string graph_row_capacity_error;
+        const auto graph_row_capacity = resolveMaximumGraphActivationRows(
+            config,
+            primary_device,
+            graph_row_capacity_error);
+        if (!graph_row_capacity)
+        {
+            LOG_ERROR("[UnifiedPipeline] Invalid graph activation envelope for "
+                      << primary_device.to_string() << ": "
+                      << graph_row_capacity_error);
+            return nullptr;
+        }
+        graph_config.max_activation_rows = *graph_row_capacity;
+        graph_config.max_request_count = std::max(1, config.batch_size);
 
         LOG_DEBUG("[UnifiedPipeline] GraphConfig: "
                   << "n_layers=" << graph_config.n_layers
@@ -3797,6 +4246,20 @@ namespace llaminar2
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.default_device = device;
+        std::string graph_row_capacity_error;
+        const auto graph_row_capacity = resolveMaximumGraphActivationRows(
+            config,
+            device,
+            graph_row_capacity_error);
+        if (!graph_row_capacity)
+        {
+            LOG_ERROR("[PPStageRunner] Invalid graph activation envelope for "
+                      << device.to_string() << ": "
+                      << graph_row_capacity_error);
+            return nullptr;
+        }
+        graph_config.max_activation_rows = *graph_row_capacity;
+        graph_config.max_request_count = std::max(1, config.batch_size);
         graph_config.activation_precision = config.activation_precision;
 
         graph_config.fused_attention_backend = resolveEffectiveAttentionBackend(
@@ -3966,6 +4429,7 @@ namespace llaminar2
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
         graph_config.moe.routed_compute_policy = config.routed_expert_compute_policy;
+        graph_config.moe.owner_order = config.routed_expert_owner_order;
         graph_config.moe.hot_expert_cache = config.moe_hot_expert_cache;
         graph_config.moe.routed_prefill_config = config.moe_routed_prefill;
         graph_config.moe.rebalance_config = effectiveMoERebalanceConfig(config);
@@ -4012,6 +4476,20 @@ namespace llaminar2
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.default_device = device;
+        std::string graph_row_capacity_error;
+        const auto graph_row_capacity = resolveMaximumGraphActivationRows(
+            config,
+            device,
+            graph_row_capacity_error);
+        if (!graph_row_capacity)
+        {
+            LOG_ERROR("[InferenceRunner] Testable invalid graph activation envelope for "
+                      << device.to_string() << ": "
+                      << graph_row_capacity_error);
+            return nullptr;
+        }
+        graph_config.max_activation_rows = *graph_row_capacity;
+        graph_config.max_request_count = std::max(1, config.batch_size);
         graph_config.activation_precision = config.activation_precision;
         graph_config.fused_attention_backend = config.fused_attention_backend;
         // kv_cache_scale_k/v set by config builder — don't overwrite
@@ -4111,14 +4589,10 @@ namespace llaminar2
                   << ", n_kv_heads=" << graph_config.n_kv_heads
                   << ", d_ff=" << graph_config.d_ff);
 
-        auto moe_controllers = createMoERebalanceControllersForGraph(
+        validateMoEDurableResidencyAuthorityForGraph(
             graph_config,
             local_tp_ctx,
             graph_config.tp_ctx);
-        if (!moe_controllers.empty())
-        {
-            bindActiveMoERebalanceControllerForGraph(graph_config, moe_controllers);
-        }
 
         // Create Dependencies struct
         DeviceGraphOrchestrator::Dependencies deps;
@@ -4137,9 +4611,6 @@ namespace llaminar2
         // Create DeviceGraphOrchestrator with injected dependencies
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             std::move(deps));
-
-        for (auto &controller : moe_controllers)
-            orchestrator->addMoERebalanceController(std::move(controller));
 
         // Initialize graph cache
         orchestrator->initializeGraphCache(graph_config.n_layers);
@@ -4245,7 +4716,7 @@ namespace llaminar2
             if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] PP stage"))
                 return nullptr;
             auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
-            auto weight_bindings = makeModelWeightBindings(frozen_weights);
+            auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
             auto legacy_weights = toLegacyModelWeights(weight_bindings);
 
             if (pp_cfg.has_embedding && !legacy_weights.embedding_table)
@@ -4277,7 +4748,7 @@ namespace llaminar2
 
             std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
             const bool needs_mirrored_mtp_head =
-                needsLocalTPMirroredMTPHeadWeights(graph_config);
+                needsMirroredMTPHeadWeights(graph_config);
             if ((graph_config.dense_tp_decode_replicated ||
                  graph_config.dense_tp_decode_mirrored_embedding ||
                  needs_mirrored_mtp_head) &&
@@ -4404,10 +4875,15 @@ namespace llaminar2
                             .replicate_routed_experts =
                                 needsReplicatedRoutedExpertWeights(graph_config),
                         });
+                    weight_plan = includeGraphLocalOverlayParticipantWeights(
+                        std::move(weight_plan),
+                        *concrete_model_ctx,
+                        graph_config,
+                        device);
                     if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] LocalTP"))
                         return nullptr;
                     auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
-                    auto weight_bindings = makeModelWeightBindings(frozen_weights);
+                    auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
                     auto legacy_weights = toLegacyModelWeights(weight_bindings);
 
                     if (!legacy_weights.embedding_table || !legacy_weights.final_norm || !legacy_weights.lm_head)
@@ -4453,7 +4929,7 @@ namespace llaminar2
 
                     std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
                     const bool needs_mirrored_mtp_head =
-                        needsLocalTPMirroredMTPHeadWeights(graph_config);
+                        needsMirroredMTPHeadWeights(graph_config);
                     if ((graph_config.dense_tp_decode_replicated ||
                          graph_config.dense_tp_decode_mirrored_embedding ||
                          needs_mirrored_mtp_head) &&
@@ -4588,11 +5064,10 @@ namespace llaminar2
             device.is_cpu() &&
             architecture == "qwen35moe" &&
             graph_config.moe.num_experts > 0;
-        const bool eager_gpu_graph_family_materialization =
-            device.is_gpu() &&
-            graph_config.requiresEagerGPUWorkspaceFamilyManifest();
+        const bool eager_shape_dependent_graph_family_materialization =
+            graph_config.requiresEagerWorkspaceFamilyManifest();
         if (eager_cpu_moe_materialization ||
-            eager_gpu_graph_family_materialization)
+            eager_shape_dependent_graph_family_materialization)
         {
             if (!orchestrator->materializeForwardGraphForShape(/*seq_len=*/1, config.batch_size))
             {

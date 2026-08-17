@@ -149,6 +149,20 @@ namespace llaminar2
             const std::string &boundary_name,
             int device_index,
             int timeout_ms) override;
+
+        /**
+         * @brief Establish the backend-specific stream fence for a capture boundary.
+         *
+         * Homogeneous domains use a one-word native collective. Mixed CUDA/ROCm
+         * domains use HeterogeneousBackend's persistent event-ticket protocol.
+         * Both paths are generation checked and bounded by @p timeout_ms.
+         *
+         * @param boundary_name Stable lifecycle generation identity.
+         * @param device_index Calling participant slot.
+         * @param stream Exact stream entering or leaving native capture.
+         * @param timeout_ms Maximum peer/ticket observation interval.
+         * @return true only after every participant reaches the same safe point.
+         */
         bool graphCaptureBoundaryOnStream(
             const std::string &boundary_name,
             int device_index,

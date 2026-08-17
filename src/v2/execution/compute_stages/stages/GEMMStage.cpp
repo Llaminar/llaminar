@@ -388,61 +388,21 @@ namespace llaminar2
             auto *A_base_up = requireTensorBase(params_.A, "input A (up)");
             auto *C_base = asTensorBase(params_.C, "output C");
 
-            if (gemm->multiply_tensor_with_fused_swiglu(
+            if (!gemm->multiply_tensor_with_fused_swiglu(
                     gate_base, A_base_up, C_base,
                     params_.m, effective_n, params_.k,
                     params_.alpha, params_.beta,
                     getWorkspace()))
             {
-                publishStageOutput(C_base);
-                LOG_TRACE("[GEMMStage] Fused SwiGLU+GEMM completed via ITensorGemm");
-                traceOutput("C", params_.C);
-                return true;
-            }
-
-            LOG_DEBUG("[GEMMStage] Fused SwiGLU+GEMM unavailable; falling back to separate SwiGLU + GEMM");
-            auto *swiglu_output = const_cast<TensorBase *>(A_base_up);
-            auto *activation = dynamic_cast<IActivationTensor *>(swiglu_output);
-            if (!activation)
-            {
-                LOG_ERROR("[GEMMStage] Cannot run SwiGLU fallback: up tensor is not an activation tensor");
+                LOG_ERROR("[GEMMStage] Required fused SwiGLU+GEMM contract failed; "
+                          "separate activation/GEMM replay is forbidden");
                 return false;
             }
 
-            auto swiglu = activation->createSwiGLU();
-            if (!swiglu)
-            {
-                LOG_ERROR("[GEMMStage] Cannot run SwiGLU fallback: failed to create SwiGLU kernel");
-                return false;
-            }
-            bindStageStream(swiglu.get());
-
-            if (!swiglu->apply_tensor(
-                    gate_base, A_base_up, swiglu_output,
-                    params_.m, params_.k,
-                    /*add_residual=*/false,
-                    params_.mpi_ctx,
-                    params_.device_id.toKernelDeviceIndex()))
-            {
-                LOG_ERROR("[GEMMStage] SwiGLU fallback activation failed");
-                return false;
-            }
-            publishStageOutput(swiglu_output);
-
-            bool success = gemm->multiply_tensor(
-                swiglu_output, C_base,
-                params_.m, effective_n, params_.k,
-                effective_transpose_B,
-                params_.alpha, params_.beta,
-                nullptr, // bias
-                params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
-                getWorkspace());
-            if (success)
-            {
-                publishStageOutput(C_base);
-                traceOutput("C", params_.C);
-            }
-            return success;
+            publishStageOutput(C_base);
+            LOG_TRACE("[GEMMStage] Fused SwiGLU+GEMM completed via ITensorGemm");
+            traceOutput("C", params_.C);
+            return true;
         }
 
         // Primary path: use tensor-aware multiply_tensor for type-aware dispatch.

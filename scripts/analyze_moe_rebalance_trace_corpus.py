@@ -208,6 +208,9 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
             llep_weight_transfers = parse_int(
                 status.get("llep_weight_transfer_count")
             )
+            llep_critical_path_payload_slots = (
+                payload_requested_slots if llep_weight_transfers > 0 else 0
+            )
             llep_native_rows = parse_int(status.get("llep_native_rows"))
             llep_spilled_rows = parse_int(status.get("llep_spilled_rows"))
             llep_total_rows = llep_native_rows + llep_spilled_rows
@@ -215,10 +218,10 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
                 llep_spilled_rows,
                 llep_total_rows,
             )
-            llep_spilled_rows_per_transfer = (
+            llep_spilled_rows_per_critical_path_payload_slot = (
                 None
-                if llep_weight_transfers <= 0
-                else llep_spilled_rows / llep_weight_transfers
+                if llep_critical_path_payload_slots <= 0
+                else llep_spilled_rows / llep_critical_path_payload_slots
             )
             pre_imbalance_ratio = load_spread_ratio(pre_load_spread, pre_load_total)
             post_imbalance_ratio = load_spread_ratio(post_load_spread, post_load_total)
@@ -268,6 +271,9 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
                 )
                 aggregate["llep_assignment_spans"] += llep_assignment_spans
                 aggregate["llep_weight_transfers"] += llep_weight_transfers
+                aggregate["llep_critical_path_payload_slots"] += (
+                    llep_critical_path_payload_slots
+                )
                 aggregate["llep_native_rows"] += llep_native_rows
                 aggregate["llep_spilled_rows"] += llep_spilled_rows
                 aggregate["llep_standard_ep_selected"] += parse_int(
@@ -426,13 +432,16 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
                     ),
                     "llep_assignment_spans": llep_assignment_spans,
                     "llep_weight_transfers": llep_weight_transfers,
+                    "llep_critical_path_payload_slots": (
+                        llep_critical_path_payload_slots
+                    ),
                     "llep_native_rows": llep_native_rows,
                     "llep_spilled_rows": llep_spilled_rows,
                     "llep_spilled_row_ratio": format_optional_float(
                         llep_spilled_row_ratio
                     ),
-                    "llep_spilled_rows_per_transfer": format_optional_float(
-                        llep_spilled_rows_per_transfer
+                    "llep_spilled_rows_per_critical_path_payload_slot": format_optional_float(
+                        llep_spilled_rows_per_critical_path_payload_slot
                     ),
                     "llep_standard_ep_selected": parse_int(
                         status.get("llep_standard_ep_selected")
@@ -625,15 +634,19 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
             "candidate_below_floor": aggregate["candidate_below_floor"],
             "llep_assignment_spans": aggregate["llep_assignment_spans"],
             "llep_weight_transfers": aggregate["llep_weight_transfers"],
+            "llep_critical_path_payload_slots": aggregate[
+                "llep_critical_path_payload_slots"
+            ],
             "llep_native_rows": aggregate["llep_native_rows"],
             "llep_spilled_rows": aggregate["llep_spilled_rows"],
             "llep_spilled_row_ratio": format_optional_float(
                 load_spread_ratio(aggregate["llep_spilled_rows"], llep_total_rows)
             ),
-            "llep_spilled_rows_per_transfer": format_optional_float(
+            "llep_spilled_rows_per_critical_path_payload_slot": format_optional_float(
                 None
-                if aggregate["llep_weight_transfers"] <= 0
-                else aggregate["llep_spilled_rows"] / aggregate["llep_weight_transfers"]
+                if aggregate["llep_critical_path_payload_slots"] <= 0
+                else aggregate["llep_spilled_rows"]
+                / aggregate["llep_critical_path_payload_slots"]
             ),
             "llep_standard_ep_selected": aggregate["llep_standard_ep_selected"],
             "llep_skipped_balanced": aggregate["llep_skipped_balanced"],
@@ -776,6 +789,9 @@ def grouped_summary(run_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "llep_weight_transfers_total": sum(
                     row["llep_weight_transfers"] for row in rows
                 ),
+                "llep_critical_path_payload_slots_total": sum(
+                    row["llep_critical_path_payload_slots"] for row in rows
+                ),
                 "llep_spilled_rows_total": sum(
                     row["llep_spilled_rows"] for row in rows
                 ),
@@ -783,9 +799,9 @@ def grouped_summary(run_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     rows,
                     "llep_spilled_row_ratio",
                 ),
-                "llep_spilled_rows_per_transfer_avg_mean": average_numeric_field(
+                "llep_spilled_rows_per_critical_path_payload_slot_avg_mean": average_numeric_field(
                     rows,
-                    "llep_spilled_rows_per_transfer",
+                    "llep_spilled_rows_per_critical_path_payload_slot",
                 ),
                 "pre_policy_imbalance_ratio_avg_mean": average_numeric_field(
                     rows,

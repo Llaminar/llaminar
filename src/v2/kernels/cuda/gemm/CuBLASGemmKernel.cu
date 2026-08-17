@@ -306,9 +306,28 @@ namespace llaminar2
                 return false;
             }
 
+            void *exact_stream = nullptr;
+            try
+            {
+                exact_stream = requireStream("CuBLASGemmKernel::execute");
+            }
+            catch (const std::exception &exception)
+            {
+                LOG_ERROR(exception.what());
+                return false;
+            }
+
             // Always set device — stream carries device context but kernel launch
             // uses the runtime's current-device for PTX code lookup.
             CUDA_CHECK(cudaSetDevice(device_id_));
+            const cublasStatus_t stream_status = cublasSetStream(
+                handle_, static_cast<cudaStream_t>(exact_stream));
+            if (stream_status != CUBLAS_STATUS_SUCCESS)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute] cublasSetStream failed: "
+                          << static_cast<int>(stream_status));
+                return false;
+            }
 
             // cuBLAS expects column-major. We have row-major data.
             // To compute C = A @ B in row-major:
@@ -399,6 +418,18 @@ namespace llaminar2
             if (!lt_handle_)
             {
                 LOG_ERROR("[CuBLASGemmKernel::execute_with_bias] cuBLASLt handle is null");
+                return false;
+            }
+
+            void *exact_stream = nullptr;
+            try
+            {
+                exact_stream = requireStream(
+                    "CuBLASGemmKernel::execute_with_bias");
+            }
+            catch (const std::exception &exception)
+            {
+                LOG_ERROR(exception.what());
                 return false;
             }
 
@@ -557,7 +588,7 @@ namespace llaminar2
                                                    d_C, Cdesc, // D (output, same as C)
                                                    &heuristicResult.algo,
                                                    workspace, workspaceSize,
-                                                   static_cast<cudaStream_t>(gpu_stream_)); // Use configured stream
+                                                   static_cast<cudaStream_t>(exact_stream));
 
             // Cleanup
             cublasLtMatmulPreferenceDestroy(preference);
@@ -788,10 +819,7 @@ namespace llaminar2
         void CuBLASGemmKernel::bindStream(ExplicitGPUStream stream)
         {
             CUDAKernelBase::bindGPUStream(stream);
-            if (handle_)
-            {
-                cublasSetStream(handle_, static_cast<cudaStream_t>(stream.get()));
-            }
+            /* The exact handle stream is installed and checked at dispatch. */
         }
 
         void CuBLASGemmKernel::clearStreamBinding() noexcept

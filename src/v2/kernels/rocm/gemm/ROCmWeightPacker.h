@@ -52,9 +52,10 @@ namespace llaminar2
         /**
          * @brief Initialize ROCm IQ-grid constant tables for all native-VNNI TUs.
          *
-         * IQ grid formats need per-device LUTs in the GEMV, GEMM, and MoE prefill
-         * translation units. This is normally reached through packNativeVNNI(), but
-         * GPU-pipeline loading bypasses host packing and must call it directly.
+         * IQ grid formats need per-device LUTs in the GEMV, GEMM, MoE prefill,
+         * and ExpertOverlay tier-stream translation units. This is normally
+         * reached through packNativeVNNI(), but GPU-pipeline loading bypasses
+         * host packing and must call it directly.
          */
         bool ensureIQGridTablesInitialized(int device_id);
 

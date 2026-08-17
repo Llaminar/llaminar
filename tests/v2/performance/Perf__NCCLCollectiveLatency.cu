@@ -20,8 +20,14 @@
  * M*top_k*d_model FP32 values before their canonical local reduction. The
  * latter is eight times larger for Qwen3.6-35B-A3B and is the production
  * transport floor that a plain M*d_model benchmark would hide. The sweep also
- * retains the one-megabyte recurrent-state allgather. Peer-access capability is
- * printed so SHM/proxy measurements are never mistaken for a CUDA P2P floor.
+ * retains the one-megabyte recurrent-state allgather. A separate production
+ * prefill matrix covers the Qwen3.5 canonical publication layout, whose
+ * physical row contains `top_k + continuation_participants` FP32 banks. This
+ * distinction matters at M=600 for Qwen3.5-122B-A10B: the captured rooted
+ * reduction moves 70.31 MiB per layer even though the final replicated hidden
+ * row is only 7.03 MiB.
+ * Peer-access capability is printed so SHM/proxy measurements are never
+ * mistaken for a CUDA P2P floor.
  */
 
 #include "collective/coordinators/NCCLCoordinator.h"
@@ -56,9 +62,20 @@ namespace
     constexpr size_t kQwen36MoEHidden = 2048u;
     constexpr size_t kQwen36MoETopK = 8u;
     constexpr size_t kMaximumVerifierRows = 16u;
-    constexpr size_t kMaximumSendBytes =
+    constexpr size_t kVerifierMaximumSendBytes =
         kMaximumVerifierRows * kQwen36MoEHidden * kQwen36MoETopK *
         sizeof(float);
+    constexpr size_t kQwen35MoEHidden = 3072u;
+    constexpr size_t kQwen35MaximumPrefillRows = 768u;
+    constexpr size_t kQwen35CanonicalPublicationSlots =
+        kQwen36MoETopK + kDeviceCount;
+    constexpr size_t kQwen35MaximumPrefillPublicationBytes =
+        kQwen35MaximumPrefillRows * kQwen35MoEHidden *
+        kQwen35CanonicalPublicationSlots * sizeof(float);
+    constexpr size_t kMaximumSendBytes =
+        std::max(
+            kVerifierMaximumSendBytes,
+            kQwen35MaximumPrefillPublicationBytes);
 
     /**
      * @brief One production-relevant collective message geometry.
@@ -84,6 +101,38 @@ namespace
         {"canonical M=12", 12u * kQwen36MoEHidden * kQwen36MoETopK * sizeof(float), 12u * kQwen36MoEHidden * sizeof(float)},
         {"canonical M=15", 15u * kQwen36MoEHidden * kQwen36MoETopK * sizeof(float), 15u * kQwen36MoEHidden * sizeof(float)},
         {"canonical M=16", 16u * kQwen36MoEHidden * kQwen36MoETopK * sizeof(float), 16u * kQwen36MoEHidden * sizeof(float)},
+    }};
+
+    /**
+     * @brief Qwen3.5 production prefill publication geometries.
+     *
+     * Every physical row retains the eight original router slots followed by
+     * one shared-expert bank per continuation participant. The current graph
+     * reduces that entire fixed representation to its logical root before it
+     * broadcasts one compact hidden row. Keeping this as a separate matrix
+     * prevents verifier-only shapes from concealing the bulk prefill floor.
+     */
+    constexpr std::array<MessageShape, 5> kQwen35PrefillPublicationShapes{{
+        {"Qwen35 publication M=64",
+         64u * kQwen35MoEHidden * kQwen35CanonicalPublicationSlots *
+             sizeof(float),
+         64u * kQwen35MoEHidden * sizeof(float)},
+        {"Qwen35 publication M=256",
+         256u * kQwen35MoEHidden * kQwen35CanonicalPublicationSlots *
+             sizeof(float),
+         256u * kQwen35MoEHidden * sizeof(float)},
+        {"Qwen35 publication M=512",
+         512u * kQwen35MoEHidden * kQwen35CanonicalPublicationSlots *
+             sizeof(float),
+         512u * kQwen35MoEHidden * sizeof(float)},
+        {"Qwen35 publication M=600",
+         600u * kQwen35MoEHidden * kQwen35CanonicalPublicationSlots *
+             sizeof(float),
+         600u * kQwen35MoEHidden * sizeof(float)},
+        {"Qwen35 publication M=768",
+         768u * kQwen35MoEHidden * kQwen35CanonicalPublicationSlots *
+             sizeof(float),
+         768u * kQwen35MoEHidden * sizeof(float)},
     }};
 
     /**
@@ -894,6 +943,71 @@ namespace
     }
 
     /**
+     * @brief Measure the exact bulk rooted publication used by Qwen3.5 prefill.
+     *
+     * Unlike the verifier matrix above, these payloads include both shared
+     * expert participant banks in the reduced physical row. The capture has
+     * the same ReduceSum -> compact Broadcast ordering as the production
+     * continuation graph. No expert compute or remote-tier wait is present,
+     * so the result is the transport floor against which the end-to-end
+     * per-layer collective interval must be compared.
+     */
+    TEST_F(Perf__NCCLCollectiveLatency,
+           GraphCapturedQwen35PrefillPublication)
+    {
+        if (!initialized_)
+            GTEST_SKIP();
+
+        std::cout << "\nCUDA peer access: "
+                  << (bidirectionalPeerAccessAvailable()
+                          ? "bidirectional P2P"
+                          : "unavailable; NCCL will use a non-P2P transport")
+                  << "\n";
+        std::cout << std::left << std::setw(10) << "operation"
+                  << std::setw(30) << "shape"
+                  << std::right << std::setw(12) << "bytes"
+                  << std::setw(12) << "median_us"
+                  << std::setw(12) << "p95_us"
+                  << std::setw(12) << "min_us"
+                  << std::setw(12) << "max_us" << '\n';
+
+        constexpr int root = 0;
+        for (const MessageShape &shape :
+             kQwen35PrefillPublicationShapes)
+        {
+            const size_t publication_count =
+                shape.send_bytes / sizeof(float);
+            const size_t output_count =
+                shape.canonical_output_bytes / sizeof(float);
+            captureCollective(
+                [&](int participant, ParticipantResources &resources)
+                {
+                    if (!coordinator_.reduceSingleDeviceOnStream(
+                            resources.buffer,
+                            resources.buffer,
+                            publication_count,
+                            CollectiveDataType::FLOAT32,
+                            CollectiveOp::ALLREDUCE_SUM,
+                            root,
+                            participant,
+                            resources.stream))
+                    {
+                        return false;
+                    }
+                    return coordinator_.broadcastSingleDeviceOnStream(
+                        resources.buffer,
+                        resources.send_buffer,
+                        output_count,
+                        CollectiveDataType::FLOAT32,
+                        root,
+                        participant,
+                        resources.stream);
+                });
+            printResult("red+bcast", shape, benchmarkCaptured());
+        }
+    }
+
+    /**
      * @brief Compare root-reduce against a directed route-slot gather.
      *
      * Canonical route slots have exactly one producing participant. Therefore
@@ -905,11 +1019,13 @@ namespace
      * order. The compact M*d_model broadcast remains unchanged.
      *
      * This transport benchmark deliberately omits the tiny deterministic merge
-     * kernel, just as GraphCapturedRootReduceBroadcast omits the canonical
+     * kernel, just as GraphCapturedQwen35PrefillPublication omits the canonical
      * reducer. Every participant nevertheless records the exact production
      * ordering on its explicit stream: send/recv, reducer position, then
      * broadcast. No peer memcpy, host staging, allocation, synchronization, or
-     * default-stream operation is introduced by this candidate.
+     * default-stream operation is introduced by this candidate. The exact
+     * Qwen3.5 prefill matrix prevents a verifier-sized result from being used
+     * to justify a bulk production lowering.
      *
      * The current fixture has two participants, so the root receives one full
      * route-slot bank. General degree-N lowering would provide one persistent
@@ -936,7 +1052,8 @@ namespace
 
         constexpr int root = 0;
         constexpr int non_root = 1;
-        for (const MessageShape &shape : kMessageShapes)
+        for (const MessageShape &shape :
+             kQwen35PrefillPublicationShapes)
         {
             if (shape.canonical_output_bytes == 0)
                 continue;

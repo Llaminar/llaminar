@@ -253,10 +253,11 @@ endif()
 # =============================================================================
 # Helper Function: Add V2 Test with Model Dependency and MPI
 # =============================================================================
-# Usage: add_v2_test(TestName COMMAND executable [args...] LABELS label1 label2 [MPI_PROCS n])
+# Usage: add_v2_test(TestName COMMAND executable [args...] LABELS label1 label2
+#                     [MPI_PROCS n] [NO_MODELS] [ENVIRONMENT NAME=value ...])
 # This automatically:
 #   - Wraps the test with mpirun and optimal MPI/OpenMP settings
-#   - Makes the test depend on the V2_Models fixture
+#   - Makes the test depend on the V2_Models fixture unless NO_MODELS is explicit
 #   - Sets environment variables for optimal performance
 
 function(add_v2_test TEST_NAME)
@@ -267,9 +268,9 @@ function(add_v2_test TEST_NAME)
 
     cmake_parse_arguments(
         ARG                             # Prefix for parsed args
-        ""                              # Options (boolean flags)
+        "NO_MODELS"                     # Options (boolean flags)
         "MPI_PROCS;TIMEOUT"             # One-value keywords
-        "COMMAND;LABELS;RESOURCE_LOCK"  # Multi-value keywords
+        "COMMAND;LABELS;RESOURCE_LOCK;ENVIRONMENT"  # Multi-value keywords
         ${ARGN}                         # Arguments to parse
     )
     
@@ -409,16 +410,27 @@ function(add_v2_test TEST_NAME)
     if("${ARG_LABELS}" MATCHES "ROCm")
         list(APPEND TEST_ENV "HSA_OVERRIDE_GFX_VERSION=9.0.6")
     endif()
+
+    # Keep test-local environment attached to the registration operation. A
+    # caller-side set_property(TEST ...) is invalid when Release deliberately
+    # omits a non-performance test, whereas this helper returns before either
+    # the test or its environment is created.
+    if(ARG_ENVIRONMENT)
+        list(APPEND TEST_ENV ${ARG_ENVIRONMENT})
+    endif()
     
     # Set environment variables
     # Working directory: project root (so model paths like "models/..." work)
     # CMAKE_SOURCE_DIR is /workspaces/llaminar/src/v2, so go up two levels to reach project root
     set_tests_properties(${TEST_NAME} PROPERTIES
-        FIXTURES_REQUIRED V2_Models                    # Requires V2_Models fixture
         LABELS "${ARG_LABELS}"
         ENVIRONMENT "${TEST_ENV}"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}/../.."
     )
+    if(NOT ARG_NO_MODELS)
+        set_tests_properties(${TEST_NAME} PROPERTIES
+            FIXTURES_REQUIRED V2_Models)
+    endif()
     
     # =========================================================================
     # PROCESSORS: Tell CTest how many CPU slots each test consumes.
@@ -464,12 +476,16 @@ function(add_v2_test TEST_NAME)
 endfunction()
 
 # =============================================================================
-# discover_v2_parity_tests() — Dynamic GTest discovery with per-test process isolation
+# discover_v2_parity_tests() — Focused isolation plus process-resident campaigns
 #
 # Runs the test binary with --gtest_list_tests at POST_BUILD time (no mpirun),
-# parses discovered test cases, and generates individual CTest entries for each.
-# Each test case runs in its own process, avoiding state accumulation bugs
-# (e.g. ROCm CLR corruption between RCCL init/destroy cycles).
+# parses discovered test cases, and generates isolated CTest entries for focused
+# diagnostics. ProductionParity parameters are grouped by exact backend into a
+# single all-precision process campaign so immutable real weights are amortized;
+# each fixture still rebuilds exact runner, graph, arena, stream, and KV state.
+# PRODUCTION_ISOLATED_TESTS accepts literal GTest-name fragments for cells that
+# must own a fresh MPI application lifetime. Each match remains a production
+# campaign, but receives its own mpirun world instead of sharing a process.
 #
 # Usage:
 #   discover_v2_parity_tests(my_target
@@ -484,7 +500,12 @@ function(discover_v2_parity_tests TARGET)
         return()
     endif()
 
-    cmake_parse_arguments(ARG "" "MPI_PROCS;TEST_PREFIX;TIMEOUT" "LABELS" ${ARGN})
+    cmake_parse_arguments(
+        ARG
+        ""
+        "MPI_PROCS;TEST_PREFIX;TIMEOUT;PRODUCTION_PERF_STATS_FILTER"
+        "LABELS;MODEL_FILES;CPU_MODEL_FILES;CUDA_MODEL_FILES;ROCM_MODEL_FILES;PRODUCTION_ISOLATED_TESTS"
+        ${ARGN})
 
     if(NOT ARG_TEST_PREFIX)
         set(ARG_TEST_PREFIX "${TARGET}")
@@ -492,6 +513,34 @@ function(discover_v2_parity_tests TARGET)
     if(NOT ARG_MPI_PROCS)
         set(ARG_MPI_PROCS 1)
     endif()
+
+    # Serialize the test-owned model manifest through the POST_BUILD script.
+    # A pipe is intentional: semicolons are CMake list separators and would
+    # otherwise be expanded into separate command arguments before discovery.
+    set(_serialized_model_files "")
+    if(ARG_MODEL_FILES)
+        string(JOIN "|" _serialized_model_files ${ARG_MODEL_FILES})
+    endif()
+    set(_serialized_production_isolated_tests "")
+    if(ARG_PRODUCTION_ISOLATED_TESTS)
+        string(JOIN "|" _serialized_production_isolated_tests
+            ${ARG_PRODUCTION_ISOLATED_TESTS})
+    endif()
+    foreach(_backend IN ITEMS CPU CUDA ROCM)
+        set(_backend_model_files "${ARG_${_backend}_MODEL_FILES}")
+        set(_serialized_${_backend}_model_files "")
+        if(_backend_model_files)
+            string(JOIN "|" _serialized_${_backend}_model_files
+                ${_backend_model_files})
+        endif()
+    endforeach()
+
+    # __FILE__ may be emitted as a build-relative path, while discovered tests
+    # execute from the repository root.  Publish one configure-time authority
+    # for diagnostic artifacts so every direct/CTest launch writes into the
+    # canonical parity results tree instead of resolving outside the checkout.
+    target_compile_definitions(${TARGET} PRIVATE
+        LLAMINAR_PARITY_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/integration/parity")
 
     # Paths for generated artifacts
     set(_ctest_file "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_discovered_tests.cmake")
@@ -501,6 +550,38 @@ function(discover_v2_parity_tests TARGET)
     # to the test binary. Make the binary relink when the discovery helper
     # changes so stale "Discovery failed" files do not survive script fixes.
     set_property(TARGET ${TARGET} APPEND PROPERTY LINK_DEPENDS "${_discovery_script}")
+
+    # POST_BUILD command-line changes alone do not make an already-linked
+    # executable stale in every CMake/Ninja version. Persist every registration
+    # input in a content-addressed link dependency so manifest, topology, label,
+    # timeout, and PerfStats changes necessarily relink the target and regenerate
+    # its CTest include. Avoid rewriting an unchanged file: doing so would make
+    # every configure trigger needless parity relinks.
+    set(_discovery_identity_file
+        "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_discovery_identity.txt")
+    string(CONCAT _discovery_identity
+        "target=${TARGET}\n"
+        "test_prefix=${ARG_TEST_PREFIX}\n"
+        "labels=${ARG_LABELS}\n"
+        "mpi_procs=${ARG_MPI_PROCS}\n"
+        "num_sockets=${V2_TEST_SOCKETS}\n"
+        "cores_per_socket=${V2_TEST_CORES_PER_SOCKET}\n"
+        "timeout=${ARG_TIMEOUT}\n"
+        "production_perf_stats_filter=${ARG_PRODUCTION_PERF_STATS_FILTER}\n"
+        "production_isolated_tests=${_serialized_production_isolated_tests}\n"
+        "model_files=${_serialized_model_files}\n"
+        "cpu_model_files=${_serialized_CPU_model_files}\n"
+        "cuda_model_files=${_serialized_CUDA_model_files}\n"
+        "rocm_model_files=${_serialized_ROCM_model_files}\n")
+    set(_existing_discovery_identity "")
+    if(EXISTS "${_discovery_identity_file}")
+        file(READ "${_discovery_identity_file}" _existing_discovery_identity)
+    endif()
+    if(NOT _existing_discovery_identity STREQUAL _discovery_identity)
+        file(WRITE "${_discovery_identity_file}" "${_discovery_identity}")
+    endif()
+    set_property(TARGET ${TARGET} APPEND PROPERTY
+        LINK_DEPENDS "${_discovery_identity_file}")
 
     # Working directory: project root (CMAKE_SOURCE_DIR is src/v2, go up two levels)
     get_filename_component(_working_dir "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
@@ -518,6 +599,12 @@ function(discover_v2_parity_tests TARGET)
             -D "CORES_PER_SOCKET=${V2_TEST_CORES_PER_SOCKET}"
             -D "WORKING_DIR=${_working_dir}"
             -D "TIMEOUT=${ARG_TIMEOUT}"
+            -D "PRODUCTION_PERF_STATS_FILTER=${ARG_PRODUCTION_PERF_STATS_FILTER}"
+            -D "PRODUCTION_ISOLATED_TESTS_SERIALIZED=${_serialized_production_isolated_tests}"
+            -D "MODEL_FILES_SERIALIZED=${_serialized_model_files}"
+            -D "CPU_MODEL_FILES_SERIALIZED=${_serialized_CPU_model_files}"
+            -D "CUDA_MODEL_FILES_SERIALIZED=${_serialized_CUDA_model_files}"
+            -D "ROCM_MODEL_FILES_SERIALIZED=${_serialized_ROCM_model_files}"
             -P "${_discovery_script}"
         BYPRODUCTS "${_ctest_file}"
         COMMENT "Discovering parity tests in ${TARGET}..."
@@ -600,6 +687,22 @@ add_v2_test(V2_Unit_ExpertGemmRegistry
     COMMAND $<TARGET_FILE:v2_unit_expert_gemm_registry>
     LABELS "V2;Unit;Loaders;MoE"
     MPI_PROCS 1
+)
+
+# Test: typed NativeVNNI and floating routed-expert descriptor publication
+add_executable(v2_unit_device_moe_expert_descriptor_builder
+    unit/execution/moe/Test__DeviceMoEExpertDescriptorBuilder.cpp
+)
+target_link_libraries(v2_unit_device_moe_expert_descriptor_builder
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_DeviceMoEExpertDescriptorBuilder
+    COMMAND $<TARGET_FILE:v2_unit_device_moe_expert_descriptor_builder>
+    LABELS "V2;Unit;Execution;MoE;Descriptors;FloatingPoint;NativeVNNI"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Test: Unified Pipeline MoE Collection - MoE expert weight collection in GPU pipeline
@@ -705,6 +808,22 @@ add_v2_test(V2_Unit_MoERoutedExpertPlacementPlanner
     MPI_PROCS 1
 )
 
+# Test: exact device-free ExpertOverlay physical BOM and tier quota resolution
+add_executable(v2_unit_moe_overlay_capacity_resolver
+    unit/execution/moe/Test__MoEOverlayCapacityResolver.cpp
+)
+target_link_libraries(v2_unit_moe_overlay_capacity_resolver
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEOverlayCapacityResolver
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_capacity_resolver>
+    LABELS "V2;Unit;Execution;MoE;ExpertOverlay;Capacity;MemoryBOM;ArbitraryTiers"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
 # Test: MoE graph-native/stage source hygiene guardrails
 add_executable(v2_unit_moe_forbidden_dependency_scan unit/execution/moe/Test__MoEGraphNative_ForbiddenDependencyScan.cpp)
 target_link_libraries(v2_unit_moe_forbidden_dependency_scan
@@ -735,6 +854,7 @@ function(add_v2_routed_expert_policy_unit TARGET_NAME TEST_NAME SOURCE_FILE)
         COMMAND $<TARGET_FILE:${TARGET_NAME}>
         LABELS "V2;Unit;Execution;MoE;RoutedExpertPlacement;Regression"
         MPI_PROCS 1
+        NO_MODELS
     )
 endfunction()
 
@@ -757,6 +877,53 @@ add_v2_routed_expert_policy_unit(
     v2_unit_moe_expert_owner_map
     V2_Unit_MoEExpertOwnerMap
     unit/execution/moe/Test__MoEExpertOwnerMap.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_residency_authority
+    V2_Unit_MoEOverlayResidencyAuthority
+    unit/execution/moe/Test__MoEOverlayResidencyAuthority.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_economy_profile_composer
+    V2_Unit_MoEOverlayEconomyProfileComposer
+    unit/execution/moe/Test__MoEOverlayEconomyProfileComposer.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_migration_measurement_ledger
+    V2_Unit_MoEOverlayMigrationMeasurementLedger
+    unit/execution/moe/Test__MoEOverlayMigrationMeasurementLedger.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_inference_interference_probe
+    V2_Unit_MoEOverlayInferenceInterferenceProbe
+    unit/execution/moe/Test__MoEOverlayInferenceInterferenceProbe.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_economy_calibration_controller
+    V2_Unit_MoEOverlayEconomyCalibrationController
+    unit/execution/moe/Test__MoEOverlayEconomyCalibrationController.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_residency_maintenance_service
+    V2_Unit_MoEOverlayResidencyMaintenanceService
+    unit/execution/moe/Test__MoEOverlayResidencyMaintenanceService.cpp
+)
+
+# Test: CPU-only cross-rank ExpertOverlay prepare/commit consensus protocol
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_distributed_residency_protocol
+    V2_Unit_MoEOverlayDistributedResidencyProtocol
+    unit/execution/moe/Test__MoEOverlayDistributedResidencyProtocol.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_distributed_residency_transport
+    V2_Unit_MoEOverlayDistributedResidencyTransport
+    unit/execution/moe/Test__MoEOverlayDistributedResidencyTransport.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_node_local_rank_batch_transport
+    V2_Unit_MoEOverlayNodeLocalRankBatchTransport
+    unit/execution/moe/Test__MoEOverlayNodeLocalRankBatchTransport.cpp
 )
 add_v2_routed_expert_policy_unit(
     v2_unit_moe_graph_native_production_hardening
@@ -796,6 +963,10 @@ add_executable(v2_unit_moe_overlay_collective_workspace
 target_include_directories(v2_unit_moe_overlay_collective_workspace PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+target_compile_definitions(v2_unit_moe_overlay_collective_workspace PRIVATE
+    LLAMINAR_MOE_OVERLAY_RANK_BATCH_TRANSPORT_SOURCE="${CMAKE_SOURCE_DIR}/execution/moe/MoEOverlayRankBatchTransport.cpp"
+    LLAMINAR_MOE_OVERLAY_TRANSACTION_SERVICE_SOURCE="${CMAKE_SOURCE_DIR}/execution/moe/MoEOverlayInferenceTransactionService.cpp"
+)
 target_link_libraries(v2_unit_moe_overlay_collective_workspace
     llaminar2_core
     GTest::gtest
@@ -806,6 +977,69 @@ add_v2_test(V2_Unit_MoEOverlayCollectiveWorkspace
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_collective_workspace>
     LABELS "V2;Unit;Execution;MoE;Overlay;SparseCollective"
     MPI_PROCS 1
+)
+
+# Test: fixed-slot serial/MTP ExpertOverlay transaction scheduling protocol
+add_executable(v2_unit_moe_overlay_inference_transaction
+    unit/execution/moe/Test__MoEOverlayInferenceTransaction.cpp
+)
+target_link_libraries(v2_unit_moe_overlay_inference_transaction
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEOverlayInferenceTransaction
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
+    LABELS "V2;Unit;Execution;MoE;Overlay;MTP;Transaction;Protocol"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+# Test: device-owned node-local activation epochs across retained CUDA/ROCm graphs
+add_executable(v2_unit_moe_overlay_activation_epoch_protocol
+    unit/execution/moe/Test__MoEOverlayActivationEpochProtocol.cpp
+)
+target_link_libraries(v2_unit_moe_overlay_activation_epoch_protocol
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEOverlayActivationEpochProtocol
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_activation_epoch_protocol>
+    LABELS "V2;Unit;Execution;MoE;Overlay;DeviceEpoch;NodeLocal;Protocol"
+    MPI_PROCS 1
+    NO_MODELS
+)
+
+# Test: participant-local epoch-indexed prepared ExpertOverlay banks
+add_executable(v2_unit_moe_overlay_participant_residency
+    unit/execution/moe/Test__MoEOverlayParticipantResidency.cpp
+)
+target_link_libraries(v2_unit_moe_overlay_participant_residency
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEOverlayParticipantResidency
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_participant_residency>
+    LABELS "V2;Unit;Execution;MoE;Overlay;Residency"
+    MPI_PROCS 1
+)
+
+# Test: concrete process-local ExpertOverlay slot/lane residency fabric
+add_executable(v2_unit_moe_overlay_physical_residency_fabric
+    unit/execution/moe/Test__MoEOverlayPhysicalResidencyFabric.cpp
+)
+target_link_libraries(v2_unit_moe_overlay_physical_residency_fabric
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEOverlayPhysicalResidencyFabric
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_physical_residency_fabric>
+    LABELS "V2;Unit;Execution;MoE;Overlay;Residency;PhysicalFabric"
+    MPI_PROCS 1
+    NO_MODELS
 )
 
 # Test: MoE graph-native profiler rows and machine-readable metrics
@@ -958,6 +1192,19 @@ target_link_libraries(v2_test_logger
 add_v2_test(V2_Unit_Logger
     COMMAND $<TARGET_FILE:v2_test_logger>
     LABELS "V2;Unit;Utils;Logger"
+    MPI_PROCS 1
+)
+
+# Test: SHA-256 streaming and trusted cross-process digest memoization
+add_executable(v2_test_sha256 unit/utils/Test__Sha256.cpp)
+target_link_libraries(v2_test_sha256
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Sha256
+    COMMAND $<TARGET_FILE:v2_test_sha256>
+    LABELS "V2;Unit;Utils;Sha256;Parity"
     MPI_PROCS 1
 )
 
@@ -2088,6 +2335,24 @@ add_test(NAME V2_Unit_MTPIterationBenchmarkMatrix
 )
 set_tests_properties(V2_Unit_MTPIterationBenchmarkMatrix PROPERTIES
     LABELS "V2;Unit;MTP;Benchmark;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_ProductionParityCampaigns
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_parity_campaigns.py
+)
+set_tests_properties(V2_Unit_ProductionParityCampaigns PROPERTIES
+    LABELS "V2;Unit;Parity;ProductionPath;CampaignFramework;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_ParityResultSummary
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_summarize_parity_results.py
+)
+set_tests_properties(V2_Unit_ParityResultSummary PROPERTIES
+    LABELS "V2;Unit;Parity;ProductionPath;Diagnostics;Regression"
     TIMEOUT 30
 )
 
@@ -3956,6 +4221,7 @@ add_v2_test(V2_Unit_BenchmarkRunnerCPU
 # Test: PerfStatsCollector (unified structured perf counter export)
 add_executable(v2_test_perf_stats_collector unit/utils/Test__PerfStatsCollector.cpp)
 target_include_directories(v2_test_perf_stats_collector PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor  # For nlohmann/json.hpp
 )
 target_link_libraries(v2_test_perf_stats_collector
@@ -5015,6 +5281,23 @@ add_v2_test(V2_Unit_TurboQuantRoundtrip
     LABELS "V2;Unit;Quantization;TurboQuant;Roundtrip;MSE;Rotation"
 )
 
+# Attention-key Q8 numerical contract
+# Locks down the blob-transferable physical layout and a deterministic
+# downstream causal-attention regression at real Qwen key/query magnitudes.
+add_executable(v2_test_attention_key_q8
+    unit/kernels/kvcache/Test__AttentionKeyQ8.cpp)
+target_link_libraries(v2_test_attention_key_q8
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AttentionKeyQ8
+    COMMAND $<TARGET_FILE:v2_test_attention_key_q8>
+    MPI_PROCS 1
+    LABELS "V2;Unit;KVCache;Attention;Quantization;Q8;NumericalContract;Regression"
+    NO_MODELS
+)
+
 # Split TQ KV Cache Integration (TQ8-K / TQ4-V)
 # Tests split precision data flowing through the CPURingKVCache:
 # append, gather, ring wrap, incremental decode, multi-layer, clear.
@@ -5879,7 +6162,7 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_LocalTPWo
 )
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_GDNProjection
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
-            --gtest_filter=Test__CUDAGemmParity.Q6_K_Qwen36MoEGDNOutLocalTP_RuntimeMMatchesSerialDecodeGEMVs:Test__CUDAGemmParity.GDNProjectionStage_Qwen36MoEQ6K_RuntimeMMatchesSerialStageRows:Test__CUDAGemmParity.GDNProjectionStage_Qwen36MoELocalTPShardQ6K_RuntimeMMatchesSerialStageRows
+            --gtest_filter=Test__CUDAGemmParity.Q6_K_Qwen36MoEGDNOutLocalTP_RuntimeMMatchesSerialDecodeGEMVs:Test__CUDAGemmParity.GDNProjectionStage_Qwen36MoEQ6K_RuntimeMMatchesSerialStageRows:Test__CUDAGemmParity.GDNProjectionStage_Qwen36MoELocalTPShardQ6K_RuntimeMMatchesSerialStageRows:Test__CUDAGemmParity.GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysicalFormatSubgroups
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;GEMM;GDN;MTP;GroupedVerifierRows;DecodeEquivalent;RuntimeM;LocalTP;Regression"
     MPI_PROCS 1
@@ -5901,6 +6184,14 @@ add_v2_test(V2_Integration_CUDAGemmBatchInvariance
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_batch_invariance>
     LABELS "V2;Integration;CUDA;GEMM;BatchInvariance;ByteExact;Quantized;CanonicalKpart;Concurrency"
     MPI_PROCS 1
+)
+add_v2_test(V2_Integration_CUDAConcurrentPrefillBiasGraphCapture
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_batch_invariance>
+            --gtest_filter=Test__CUDAGemmBatchInvariance.CapturedConcurrentQKVPrefillPrejoinsBiasesOnRootStream
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;GEMM;QKV;Bias;GraphCapture;ExplicitStream;DeviceResident;ByteExact;Regression"
+    MPI_PROCS 1
+    TIMEOUT 30
 )
 add_v2_test(V2_Integration_CUDA_NativeVNNI_PrefillHeuristic
     COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>
@@ -5945,6 +6236,64 @@ add_v2_test(V2_Integration_CUDAMoEKernel
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
     LABELS "V2;Integration;CUDA;MoE;Routing;Gather;Scatter;SwiGLU;KernelFactory"
     MPI_PROCS 1
+)
+add_v2_test(V2_Integration_CUDA_MoEOverlayCPUColdPromotionGroupedParity
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.CPUColdPromotedAsymmetricGroupedDecodeAndPrefillMatchCompactBytes
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;CPU;MoE;ExpertOverlay;CPUCold;Promotion;WeightStreaming;ExpandedInt8;GroupedDecode;GroupedVerifierRows;LongPrefill;Async;PerfStats;ByteExact;NoBlocking"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
+add_v2_test(V2_Integration_CUDA_MoEFloatingSharedExpertTableDecode
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.FloatingSharedExpertTableDecodeAllFormatsCapturesAndMatchesReference
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MoE;SharedExpert;GroupedDecode;GraphCapture;FP16;BF16;FP32;AllFormats;NumericalParity;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
+add_executable(v2_integration_cuda_expert_tier_weight_kernels
+    integration/kernels/cuda/Test__CUDAExpertTierWeightKernels.cpp)
+target_link_libraries(v2_integration_cuda_expert_tier_weight_kernels
+    llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+add_v2_test(V2_Integration_CUDA_ExpertTierWeightKernels
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+    LABELS "V2;Integration;CUDA;MoE;ExpertOverlay;WeightStreaming;Repack;ByteExact;ExplicitStream"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
+add_executable(v2_integration_cuda_moe_overlay_epoch
+    integration/kernels/cuda/Test__CUDAMoEOverlayEpoch.cpp)
+target_link_libraries(v2_integration_cuda_moe_overlay_epoch
+    llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+add_v2_test(V2_Integration_CUDA_MoEOverlayEpoch
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_overlay_epoch>
+    LABELS "V2;Integration;CUDA;MoE;ExpertOverlay;GraphCapture;RCU;Async;ExplicitStream;NoBlocking"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
+add_v2_test(V2_Integration_CUDA_ExpertTierAsyncOverlap
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+            --gtest_filter=CUDAExpertTierWeightKernelsTest.PersistentBackgroundLaneRoundTripsWithoutBlockingSynchronization:CUDAExpertTierWeightKernelsTest.ProductionInferenceCompletesByteExactlyWhileMigrationIsPending
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MoE;ExpertOverlay;WeightStreaming;Async;InferenceOverlap;PerfStats;ByteExact;NoBlocking"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
+add_v2_test(V2_Integration_CUDA_ExpertTierFusedQKVStreamPoolOverlap
+    COMMAND $<TARGET_FILE:v2_integration_cuda_expert_tier_weight_kernels>
+            --gtest_filter=CUDAExpertTierWeightKernelsTest.FusedQKVInternalStreamPoolsRemainByteExactAndNonBlockingDuringMigration
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MoE;ExpertOverlay;FusedQKV;StreamPool;Decode;Prefill;Async;InferenceOverlap;PerfStats;ByteExact;NoBlocking;Adversarial"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
 )
 add_v2_test(V2_Integration_CUDA_MoERowGridMTotality
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
@@ -6169,6 +6518,14 @@ add_v2_test(V2_Integration_CUDAFlashAttentionParity
     LABELS "V2;Integration;CUDA;Parity;Attention;FlashAttention;FlashDecode;GQA;FP32;CosineSimilarity"
     MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
 )
+add_v2_test(V2_Integration_CUDAFlashAttentionQ81Qwen2Prefill
+    COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
+            --gtest_filter=Test__CUDAFlashAttentionParity.FlashAttn2_Q81KV_Qwen2PrefillParity
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;Attention;FlashAttention;Qwen2;Prefill;KVCache;Q8_1;DeviceResident;Parity;Regression"
+    MPI_PROCS 1
+    TIMEOUT 30
+)
 add_v2_test(V2_Integration_CUDAFlashAttentionContextParallelByteExact
     COMMAND $<TARGET_FILE:v2_integration_cuda_flash_attention_parity>
             --gtest_filter=Test__CUDAFlashAttentionParity.FA2FixedContextSequenceAndParallelCapturedTransactionsAreByteExact:Test__CUDAFlashAttentionParity.ComputeTensor_DeviceAdaptiveCapturedReplayCrossesRegimesByteExact
@@ -6390,6 +6747,14 @@ add_v2_test(V2_Integration_CUDARingKVCacheParity
     LABELS "V2;Integration;CUDA;Parity;KVCache;RingBuffer;Eviction;SlidingWindow;FP32;FP16;BF16"
     MPI_PROCS 1  # Tests GPU KV cache locally, no MPI needed
 )
+add_v2_test(V2_Integration_CUDAPaddedQ81KVProductionChain
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_parity>
+            --gtest_filter=Test__CUDARingKVCache.CapturedPaddedFP32ToQ8AppendAndGatherPreservesLiveRows
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;KVCache;Q8_1;Prefill;Padding;GraphCapture;DeviceResident;Parity;Regression"
+    MPI_PROCS 1
+    TIMEOUT 30
+)
 add_v2_test(V2_Integration_CUDARequestBatchUnequalKVContinuation
     COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_parity>
             --gtest_filter=Test__CUDARingKVCache.CapturedUnequalRequestLengthsPreserveContinuationAllFormats
@@ -6415,13 +6780,8 @@ set(V2_GROUPED_KV_RUNTIME_FORMAT_CASES
     FP16_From_BF16
     FP16_From_Q8_1
     Q8_1_From_FP32
-    Q8_1_From_FP16
-    Q8_1_From_BF16
-    Q8_1_From_Q8_1
-    TQ8K_TQ4V_From_FP32
-    TQ8K_TQ4V_From_TQ8_TQ4
-    TQ8K_TQ8V_From_FP32
-    TQ8K_TQ8V_From_TQ8
+    AQ8K_TQ4V_From_FP32
+    AQ8K_TQ8V_From_FP32
 )
 foreach(FORMAT_CASE IN LISTS V2_GROUPED_KV_RUNTIME_FORMAT_CASES)
     add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_KVCache_RuntimePublication_${FORMAT_CASE}
@@ -6504,6 +6864,35 @@ add_v2_test(V2_Integration_CUDADeviceResidentTurboQuantIncrementalDequant
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added CUDA TurboQuant KV Cache integration tests")
+
+# Attention-key Q8 physical-byte and retained-graph conformance.
+add_executable(v2_integration_cuda_attention_key_q8
+    integration/kernels/cuda/Test__CUDAAttentionKeyQ8.cpp)
+target_link_libraries(v2_integration_cuda_attention_key_q8
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDAAttentionKeyQ8
+    COMMAND $<TARGET_FILE:v2_integration_cuda_attention_key_q8>
+    LABELS "V2;Integration;CUDA;KVCache;Attention;Q8;AllHeadDims;ByteExact;GraphCapture;ExplicitStream;Regression"
+    MPI_PROCS 1
+    TIMEOUT 30
+    NO_MODELS
+)
+
+# Production-geometry retained-graph economy plus filterable single-dispatch
+# attachment points for Nsight Compute. Profiler tests remain in the executable
+# but are excluded from the ordinary timing gate by the explicit filter.
+add_executable(v2_perf_cuda_attention_key_q8
+    performance/kernels/cuda/kvcache/Perf__CUDAAttentionKeyQ8.cpp)
+target_link_libraries(v2_perf_cuda_attention_key_q8
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CUDAAttentionKeyQ8
+    COMMAND $<TARGET_FILE:v2_perf_cuda_attention_key_q8>
+            --gtest_filter=AttentionKeyQ8CUDAEconomy.ProductionGeometryRetainedGraphSweep
+    LABELS "V2;Performance;CUDA;KVCache;Attention;Q8;GraphCapture;Decode;MTP;Prefill;Economy"
+    MPI_PROCS 1
+    TIMEOUT 30
+    NO_MODELS
+)
 
 # Test: CUDA Ring Buffer KV Cache RoPE-on-read (FP16, Q8_1, FP32 caches)
 # Tests get_kv_converted() with fused RoPE for existing cache precisions
@@ -6726,6 +7115,33 @@ if(ZLIB_FOUND)
         message(WARNING "V2 Tests: cnpy unavailable; skipping parity test executables")
     else()
 
+    # Real-weight inputs are declared beside parity registration so the
+    # aggregate campaign can stage the exact selected corpus into tmpfs before
+    # any backend starts. Runtime tests validate their configured GGUF against
+    # this manifest, making a stale registration a hard failure.
+    set(V2_PARITY_MODEL_QWEN2_Q4
+        "${WORKSPACE_ROOT_PARITY}/models/qwen2.5-0.5b-instruct-q4_0.gguf")
+    set(V2_PARITY_MODEL_QWEN2_Q8
+        "${WORKSPACE_ROOT_PARITY}/models/qwen2.5-0.5b-instruct-q8_0.gguf")
+    set(V2_PARITY_MODEL_QWEN3_Q8
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3-0.6B-Q8_0.gguf")
+    set(V2_PARITY_MODEL_QWEN35_08B_Q4
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-0.8B-Q4_0.gguf")
+    set(V2_PARITY_MODEL_QWEN35_4B_Q8
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-4B-Q8_0.gguf")
+    set(V2_PARITY_MODEL_QWEN35_27B_Q4
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-27B-Q4_K_M.gguf")
+    set(V2_PARITY_MODEL_QWEN35_27B_Q8
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-27B-Q8_0.gguf")
+    set(V2_PARITY_MODEL_QWEN36_DENSE
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.6-27B-Q4_K_S.gguf")
+    set(V2_PARITY_MODEL_QWEN35_MOE_Q4
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf")
+    set(V2_PARITY_MODEL_QWEN35_MOE_Q3
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-35B-A3B-Q3_K_S.gguf")
+    set(V2_PARITY_MODEL_QWEN36_MOE
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf")
+
     # =========================================================================
     # Qwen2 Parity Test Matrix (integration/parity/qwen2/)
     # =========================================================================
@@ -6749,6 +7165,7 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen2_SingleDevice
         LABELS "V2;Integration;Parity;Qwen2;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN2_Q4} ${V2_PARITY_MODEL_QWEN2_Q8}
     )
 
     # ---- Local Tensor Parallelism (NCCL, RCCL, HOST) ----
@@ -6767,6 +7184,7 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen2_LocalTP
         LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;NCCL;RCCL;LOCAL;TensorParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN2_Q4}
     )
 
     # ---- Local Pipeline Parallelism (NCCL, RCCL, HOST) ----
@@ -6785,6 +7203,7 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen2_LocalPP
         LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;CPU;NCCL;RCCL;HOST;LOCAL;PipelineParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN2_Q4}
     )
 
     # ---- Hybrid PP+TP (nested TP domains within PP stages) ----
@@ -6807,6 +7226,7 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen2_HybridPPTP
         LABELS "V2;Integration;Parity;Qwen2;CUDA;ROCm;CPU;NCCL;RCCL;LOCAL;TensorParallel;PipelineParallel;Hybrid;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN2_Q4}
     )
 
     # =========================================================================
@@ -6832,27 +7252,29 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen3_SingleDevice
         LABELS "V2;Integration;Parity;Qwen3;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN3_Q8}
     )
 
-    # ---- NodeLocalTP Parity (Multi-Socket CPU TP) ----
-    add_executable(v2_integration_parity_qwen3_node_local_tp
-        integration/parity/qwen3/Test__Qwen3_NodeLocalTP_Parity.cpp
+    # ---- NodeTP Parity (Multi-Socket CPU TP) ----
+    add_executable(v2_integration_parity_qwen3_node_tp
+        integration/parity/qwen3/Test__Qwen3_NodeTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen3_node_local_tp
+    target_link_libraries(v2_integration_parity_qwen3_node_tp
         llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen3_node_local_tp PRIVATE
+    target_include_directories(v2_integration_parity_qwen3_node_tp PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen3_node_local_tp
-        TEST_PREFIX V2_Integration_Parity_Qwen3_NodeLocalTP
-        LABELS "V2;Integration;Parity;Qwen3;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank;CPU"
+    discover_v2_parity_tests(v2_integration_parity_qwen3_node_tp
+        TEST_PREFIX V2_Integration_Parity_Qwen3_NodeTP
+        LABELS "V2;Integration;Parity;Qwen3;NodeTP;MPI;TensorParallel;UPI;CrossRank;CPU"
         MPI_PROCS 2
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN3_Q8}
     )
 
-    message(STATUS "V2: Qwen3 NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
+    message(STATUS "V2: Qwen3 NodeTP parity tests enabled (requires mpirun -np 2+)")
 
     # ---- NodeLocalPP Parity (Cross-Rank Pipeline Parallelism via GlobalOrchestrator) ----
     add_executable(v2_integration_parity_qwen3_node_local_pp
@@ -6870,6 +7292,7 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen3_NodeLocalPP
         LABELS "V2;Integration;Parity;Qwen3;NodeLocalPP;MPI;PipelineParallel;CrossRank;CPU;GlobalOrchestrator"
         MPI_PROCS 2
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN3_Q8}
     )
 
     message(STATUS "V2: Qwen3 NodeLocalPP parity tests enabled (requires mpirun -np 2+)")
@@ -6899,6 +7322,11 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen35_SingleDevice
         LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
+        MODEL_FILES
+            ${V2_PARITY_MODEL_QWEN35_08B_Q4}
+            ${V2_PARITY_MODEL_QWEN35_4B_Q8}
+        CPU_MODEL_FILES
+            ${V2_PARITY_MODEL_QWEN35_27B_Q8}
     )
 
     # ---- Local Tensor Parallelism (HOST, NCCL, RCCL) ----
@@ -6917,6 +7345,9 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen35_LocalTP
         LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CUDA;ROCm;NCCL;RCCL;LOCAL;TensorParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
+        MODEL_FILES
+            ${V2_PARITY_MODEL_QWEN35_08B_Q4}
+            ${V2_PARITY_MODEL_QWEN35_4B_Q8}
     )
 
     # ---- Local Pipeline Parallelism (HOST, NCCL, RCCL) ----
@@ -6935,6 +7366,12 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen35_LocalPP
         LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;CPU;CUDA;ROCm;NCCL;RCCL;HOST;LOCAL;PipelineParallel;PyTorch;GoldenReference;MultiDevice"
         MPI_PROCS 1
+        MODEL_FILES
+            ${V2_PARITY_MODEL_QWEN35_08B_Q4}
+            ${V2_PARITY_MODEL_QWEN35_4B_Q8}
+        CUDA_MODEL_FILES ${V2_PARITY_MODEL_QWEN35_27B_Q4}
+        ROCM_MODEL_FILES
+            ${V2_PARITY_MODEL_QWEN35_27B_Q4}
     )
 
     # =========================================================================
@@ -6992,42 +7429,46 @@ if(ZLIB_FOUND)
     message(STATUS "V2: LocalPP layer-partitioned weights test enabled")
 
     # =========================================================================
-    # Test: Qwen3.5 NodeLocalTP Parity (Multi-Socket CPU TP)
+    # Test: Qwen3.5 NodeTP Parity (Multi-Socket CPU TP)
     #
-    # NodeLocalTP parity tests for Qwen3.5 GDN+FA hybrid architecture using MPI
+    # NodeTP parity tests for Qwen3.5 GDN+FA hybrid architecture using MPI
     # for cross-rank tensor parallelism on the same physical node. CPU TP MUST
-    # use NodeLocalTP because DeviceId::cpu() is a singleton — LocalTP cannot
+    # use NodeTP because DeviceId::cpu() is a singleton — LocalTP cannot
     # distinguish CPU sockets.
     #
     # REQUIRES: mpirun -np 2 (or more) to run these tests
     #
     # Test configurations:
-    #   - NodeLocalTP_2xMPI_CPU_08B: 2 MPI ranks, CPU, Qwen3.5-0.8B Q4_0
-    #   - NodeLocalTP_2xMPI_CPU_4B:  2 MPI ranks, CPU, Qwen3.5-4B Q8_0
+    #   - NodeTP_2xMPI_CPU_08B: 2 MPI ranks, CPU, Qwen3.5-0.8B Q4_0
+    #   - NodeTP_2xMPI_CPU_4B:  2 MPI ranks, CPU, Qwen3.5-4B Q8_0
     # =========================================================================
-    add_executable(v2_integration_parity_qwen35_node_local_tp
-        integration/parity/qwen35/Test__Qwen35_NodeLocalTP_Parity.cpp
+    add_executable(v2_integration_parity_qwen35_node_tp
+        integration/parity/qwen35/Test__Qwen35_NodeTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     # Note: No gtest_main - test provides custom main() with MPI_Init
-    target_link_libraries(v2_integration_parity_qwen35_node_local_tp
+    target_link_libraries(v2_integration_parity_qwen35_node_tp
         llaminar2_core
         v2_test_utils
         GTest::gtest
         ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen35_node_local_tp PRIVATE
+    target_include_directories(v2_integration_parity_qwen35_node_tp PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    discover_v2_parity_tests(v2_integration_parity_qwen35_node_local_tp
-        TEST_PREFIX V2_Integration_Parity_Qwen35_NodeLocalTP
-        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank;CPU"
+    discover_v2_parity_tests(v2_integration_parity_qwen35_node_tp
+        TEST_PREFIX V2_Integration_Parity_Qwen35_NodeTP
+        LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;NodeTP;MPI;TensorParallel;UPI;CrossRank;CPU"
         MPI_PROCS 2
+        MODEL_FILES
+            ${V2_PARITY_MODEL_QWEN35_08B_Q4}
+            ${V2_PARITY_MODEL_QWEN35_4B_Q8}
+            ${V2_PARITY_MODEL_QWEN35_27B_Q8}
     )
 
-    message(STATUS "V2: Qwen3.5 NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
+    message(STATUS "V2: Qwen3.5 NodeTP parity tests enabled (requires mpirun -np 2+)")
 
     # ---- NodeLocalPP Parity (Cross-Rank Pipeline Parallelism via GlobalOrchestrator) ----
     add_executable(v2_integration_parity_qwen35_node_local_pp
@@ -7045,6 +7486,7 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen35_NodeLocalPP
         LABELS "V2;Integration;Parity;Qwen35;GatedDeltaNet;NodeLocalPP;MPI;PipelineParallel;CrossRank;CPU;GlobalOrchestrator"
         MPI_PROCS 2
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN35_08B_Q4}
     )
 
     message(STATUS "V2: Qwen3.5 NodeLocalPP parity tests enabled (requires mpirun -np 2+)")
@@ -7068,63 +7510,14 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    set(QWEN36_DENSE_SINGLE_DEVICE_PARITY_LABELS
-        V2 Integration Parity Qwen36 Dense GatedDeltaNet
-        CPU CUDA ROCm SingleDevice PyTorch GoldenReference FullModel
+    discover_v2_parity_tests(v2_integration_parity_qwen36_single_device_math
+        TEST_PREFIX V2_Integration_Parity_Qwen36_SingleDevice_Math
+        LABELS "V2;Integration;Parity;Qwen36;Dense;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
+        MPI_PROCS 1
+        TIMEOUT 3600
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_DENSE}
     )
-    set(QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASES
-        PrefillParity CPU  Qwen36Dense_27B_CPU_KV_FP16
-        PrefillParity CUDA Qwen36Dense_27B_CUDA_KV_FP16
-        PrefillParity ROCm Qwen36Dense_27B_ROCm_KV_FP16
-        DecodeParity  CPU  Qwen36Dense_27B_CPU_KV_FP16
-        DecodeParity  CUDA Qwen36Dense_27B_CUDA_KV_FP16
-        DecodeParity  ROCm Qwen36Dense_27B_ROCm_KV_FP16
-        SnapshotInfrastructure CPU  Qwen36Dense_27B_CPU_KV_FP16
-        SnapshotInfrastructure CUDA Qwen36Dense_27B_CUDA_KV_FP16
-        SnapshotInfrastructure ROCm Qwen36Dense_27B_ROCm_KV_FP16
-    )
-    list(LENGTH QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASES QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASE_COUNT)
-    math(EXPR QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASE_LAST "${QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASE_COUNT} - 1")
-    foreach(CASE_INDEX RANGE 0 ${QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASE_LAST} 3)
-        math(EXPR BACKEND_INDEX "${CASE_INDEX} + 1")
-        math(EXPR CONFIG_INDEX "${CASE_INDEX} + 2")
-        list(GET QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASES ${CASE_INDEX} CASE_NAME)
-        list(GET QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASES ${BACKEND_INDEX} CASE_BACKEND)
-        list(GET QWEN36_DENSE_SINGLE_DEVICE_PARITY_CASES ${CONFIG_INDEX} CASE_CONFIG)
-        add_v2_test(V2_Integration_Parity_Qwen36_SingleDevice_Math_${CASE_NAME}_${CASE_BACKEND}
-            COMMAND $<TARGET_FILE:v2_integration_parity_qwen36_single_device_math>
-                    --gtest_filter=Qwen36Dense/Qwen36DenseSingleDeviceParityTest.${CASE_NAME}/${CASE_CONFIG}
-            LABELS ${QWEN36_DENSE_SINGLE_DEVICE_PARITY_LABELS}
-            MPI_PROCS 1
-            TIMEOUT 3600
-        )
-    endforeach()
 
-    add_executable(v2_integration_parity_qwen36_single_device_prefix_mtp
-        integration/parity/qwen36/Test__Qwen36_SingleDevice_PrefixMTP_Parity.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen36_single_device_prefix_mtp
-        llaminar2_core GTest::gtest ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen36_single_device_prefix_mtp PRIVATE
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    discover_v2_parity_tests(v2_integration_parity_qwen36_single_device_prefix_mtp
-        TEST_PREFIX V2_Integration_Parity_Qwen36_SingleDevice
-        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;ROCm;GPU;SingleDevice;PyTorch"
-        MPI_PROCS 1
-        TIMEOUT 1800
-    )
-    add_v2_test(V2_Integration_Parity_Qwen36_SingleDevice_MTPGreedyDepth3GraphStreamStress
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen36_single_device_prefix_mtp>
-                --gtest_filter=Qwen36SingleDevicePrefixMTPParity.MTPGreedyDepth3MatchesPyTorchDecodeTokens
-                --gtest_repeat=3
-        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;ROCm;GPU;SingleDevice;PyTorch;GraphCapture;Regression"
-        MPI_PROCS 1
-        TIMEOUT 1800
-    )
     add_executable(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_CPU_SingleDevice_PrefixMTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -7141,6 +7534,8 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;CPU;SingleDevice;PyTorch"
         MPI_PROCS 1
         TIMEOUT 2400
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,weight_loading"
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_DENSE}
     )
 
     add_executable(v2_integration_parity_qwen36_rocm_single_device_prefix_mtp
@@ -7159,6 +7554,8 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;ROCm;GPU;SingleDevice;PyTorch"
         MPI_PROCS 1
         TIMEOUT 1800
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,weight_loading"
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_DENSE}
     )
     add_v2_test(V2_Integration_Parity_Qwen36_ROCm_SingleDevice_MTPGreedyDepth3GraphStreamStress
         COMMAND $<TARGET_FILE:v2_integration_parity_qwen36_rocm_single_device_prefix_mtp>
@@ -7194,6 +7591,8 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;CUDA;GPU;SingleDevice;PyTorch"
         MPI_PROCS 1
         TIMEOUT 1800
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,weight_loading"
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_DENSE}
     )
     add_v2_test(V2_Integration_Parity_Qwen36_CUDA_SingleDevice_MTPGreedyDepth3GraphStreamStress
         COMMAND $<TARGET_FILE:v2_integration_parity_qwen36_cuda_single_device_prefix_mtp>
@@ -7336,6 +7735,7 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;ROCm;GPU;LocalTP;RCCL;PyTorch"
         MPI_PROCS 1
         TIMEOUT 1800
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_DENSE}
     )
 
     add_executable(v2_integration_parity_qwen36_local_pp_prefix
@@ -7354,24 +7754,26 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36;PrefixCache;RealModel;ROCm;GPU;LocalPP;PyTorch"
         MPI_PROCS 1
         TIMEOUT 1800
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_DENSE}
     )
 
-    add_executable(v2_integration_parity_qwen36_node_local_tp_prefix
-        integration/parity/qwen36/Test__Qwen36_NodeLocalTP_Prefix_Parity.cpp
+    add_executable(v2_integration_parity_qwen36_node_tp_prefix
+        integration/parity/qwen36/Test__Qwen36_NodeTP_Prefix_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen36_node_local_tp_prefix
+    target_link_libraries(v2_integration_parity_qwen36_node_tp_prefix
         llaminar2_core GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen36_node_local_tp_prefix PRIVATE
+    target_include_directories(v2_integration_parity_qwen36_node_tp_prefix PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen36_node_local_tp_prefix
-        TEST_PREFIX V2_Integration_Parity_Qwen36_NodeLocalTP
-        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;CPU;NodeLocalTP;MPI;PyTorch"
+    discover_v2_parity_tests(v2_integration_parity_qwen36_node_tp_prefix
+        TEST_PREFIX V2_Integration_Parity_Qwen36_NodeTP
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;CPU;NodeTP;MPI;PyTorch"
         MPI_PROCS 2
         TIMEOUT 2400
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_DENSE}
     )
 
     add_executable(v2_integration_parity_qwen36moe_cpu_single_device_prefix_mtp
@@ -7390,6 +7792,8 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;CPU;SingleDevice;PyTorch"
         MPI_PROCS 1
         TIMEOUT 2400
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,weight_loading"
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
 
     add_executable(v2_integration_parity_qwen36moe_rocm_single_device_prefix_mtp
@@ -7408,6 +7812,8 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;ROCm;GPU;SingleDevice;PyTorch"
         MPI_PROCS 1
         TIMEOUT 2400
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,weight_loading"
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
 
     add_executable(v2_integration_parity_qwen36moe_cuda_single_device_prefix_mtp
@@ -7426,24 +7832,27 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;CUDA;GPU;SingleDevice;PyTorch"
         MPI_PROCS 1
         TIMEOUT 2400
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,weight_loading"
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
 
-    add_executable(v2_integration_parity_qwen36moe_node_local_tp_prefix_mtp
-        integration/parity/qwen36/Test__Qwen36MoE_NodeLocalTP_PrefixMTP_Parity.cpp
+    add_executable(v2_integration_parity_qwen36moe_node_tp_prefix_mtp
+        integration/parity/qwen36/Test__Qwen36MoE_NodeTP_PrefixMTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen36moe_node_local_tp_prefix_mtp
+    target_link_libraries(v2_integration_parity_qwen36moe_node_tp_prefix_mtp
         llaminar2_core GTest::gtest ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen36moe_node_local_tp_prefix_mtp PRIVATE
+    target_include_directories(v2_integration_parity_qwen36moe_node_tp_prefix_mtp PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    discover_v2_parity_tests(v2_integration_parity_qwen36moe_node_local_tp_prefix_mtp
-        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_NodeLocalTP
-        LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;CPU;NodeLocalTP;MPI;PyTorch"
+    discover_v2_parity_tests(v2_integration_parity_qwen36moe_node_tp_prefix_mtp
+        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_NodeTP
+        LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;CPU;NodeTP;MPI;PyTorch"
         MPI_PROCS 2
         TIMEOUT 3600
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
 
     add_executable(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp
@@ -7462,6 +7871,8 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;ExpertOverlay;SparseCollectives;CUDA;ROCm;NCCL;RCCL;CPU;LocalTP;PyTorch"
         MPI_PROCS 1
         TIMEOUT 2400
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,weight_loading,moe_rebalance,kernel"
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
 
     add_executable(v2_integration_parity_qwen36moe_expert_overlay_math
@@ -7475,66 +7886,14 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    add_v2_test(V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_MultilineMetadataAuthentication
-        COMMAND $<TARGET_FILE:v2_integration_parity_qwen36moe_expert_overlay_math>
-                --gtest_filter=Qwen36MoEExpertOverlayMetadata.MultilinePromptAuthenticatesWithoutRegeneration
-        LABELS "V2;Integration;Parity;Qwen36MoE;ExpertOverlay;LongContext;Metadata;Regression"
+    discover_v2_parity_tests(v2_integration_parity_qwen36moe_expert_overlay_math
+        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math
+        LABELS "V2;Integration;Parity;Qwen36MoE;MixtureOfExperts;GatedDeltaNet;CPU;CUDA;ROCm;LocalTP;ExpertOverlay;PrefillTensorParallelDecodeReplicated;Dynamic;LLEP;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
-        TIMEOUT 30
+        TIMEOUT 3600
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,moe_rebalance,moe_placement"
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
-    set(QWEN36_MOE_EXPERT_OVERLAY_PARITY_LABELS
-        V2 Integration Parity Qwen36MoE MixtureOfExperts GatedDeltaNet
-        CUDA ROCm NCCL RCCL LocalTP ExpertOverlay PrefillTensorParallelDecodeReplicated
-        Dynamic LLEP PyTorch GoldenReference FullModel
-    )
-    set(QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES
-        PrefillParity          CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
-        PrefillParity          ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
-        DecodeParity           CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
-        DecodeParity           ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
-        PrefillParity          CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport
-        PrefillParity          ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport
-        DecodeParity           CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport
-        DecodeParity           ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_FP16Transport
-        LongContextDecodeParity CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport
-        LongContextDecodeParity ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_LongDecode_FP16Transport
-        LongContextDecodeParity CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport
-        LongContextDecodeParity ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_CurrentBatchLLEP_StaticDecode_DenseTP_LongDecode_FP16Transport
-        SnapshotInfrastructure CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
-        SnapshotInfrastructure ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_DynamicMaintenance_StaticAssignment_DenseTP_FP16Transport
-    )
-    list(LENGTH QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_COUNT)
-    math(EXPR QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_LAST "${QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_COUNT} - 1")
-    foreach(CASE_INDEX RANGE 0 ${QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_LAST} 3)
-        math(EXPR BACKEND_INDEX "${CASE_INDEX} + 1")
-        math(EXPR CONFIG_INDEX "${CASE_INDEX} + 2")
-        list(GET QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES ${CASE_INDEX} CASE_NAME)
-        list(GET QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES ${BACKEND_INDEX} CASE_SUFFIX)
-        list(GET QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES ${CONFIG_INDEX} CASE_CONFIG)
-        add_v2_test(V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_${CASE_NAME}_${CASE_SUFFIX}
-            COMMAND $<TARGET_FILE:v2_integration_parity_qwen36moe_expert_overlay_math>
-                    --gtest_filter=Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.${CASE_NAME}/${CASE_CONFIG}
-            LABELS ${QWEN36_MOE_EXPERT_OVERLAY_PARITY_LABELS}
-            MPI_PROCS 1
-            TIMEOUT 3600
-        )
-        if(CASE_NAME STREQUAL "LongContextDecodeParity")
-            set(_qwen36_moe_long_context_test
-                V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_${CASE_NAME}_${CASE_SUFFIX})
-            # add_v2_test intentionally omits integration-only tests from a
-            # Release build. Property publication must follow that lifecycle:
-            # configuring production binaries must not depend on a test that
-            # was deliberately not registered.
-            if(TEST ${_qwen36_moe_long_context_test})
-                set_tests_properties(
-                    ${_qwen36_moe_long_context_test}
-                    PROPERTIES
-                        ENVIRONMENT
-                            "LLAMINAR_PERF_STATS_JSON=/tmp/llaminar_${CASE_SUFFIX}_perfstats.json;LLAMINAR_PERF_STATS_FILTER=moe_rebalance"
-                )
-            endif()
-        endif()
-    endforeach()
 
     add_executable(v2_integration_parity_qwen36moe_single_device
         integration/parity/qwen36/Test__Qwen36MoE_SingleDevice_Parity.cpp
@@ -7547,37 +7906,13 @@ if(ZLIB_FOUND)
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
-    set(QWEN36_MOE_SINGLE_DEVICE_PARITY_LABELS
-        V2 Integration Parity Qwen36MoE MixtureOfExperts GatedDeltaNet
-        CPU CUDA ROCm SingleDevice PyTorch GoldenReference FullModel
+    discover_v2_parity_tests(v2_integration_parity_qwen36moe_single_device
+        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_SingleDevice_Math
+        LABELS "V2;Integration;Parity;Qwen36MoE;MixtureOfExperts;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
+        MPI_PROCS 1
+        TIMEOUT 3600
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
-    set(QWEN36_MOE_SINGLE_DEVICE_PARITY_CASES
-        PrefillParity CPU  Qwen36MoE_35B_CPU_KV_FP16
-        PrefillParity CUDA Qwen36MoE_35B_CUDA_KV_FP16
-        PrefillParity ROCm Qwen36MoE_35B_ROCm_KV_FP16
-        DecodeParity  CPU  Qwen36MoE_35B_CPU_KV_FP16
-        DecodeParity  CUDA Qwen36MoE_35B_CUDA_KV_FP16
-        DecodeParity  ROCm Qwen36MoE_35B_ROCm_KV_FP16
-        SnapshotInfrastructure CPU  Qwen36MoE_35B_CPU_KV_FP16
-        SnapshotInfrastructure CUDA Qwen36MoE_35B_CUDA_KV_FP16
-        SnapshotInfrastructure ROCm Qwen36MoE_35B_ROCm_KV_FP16
-    )
-    list(LENGTH QWEN36_MOE_SINGLE_DEVICE_PARITY_CASES QWEN36_MOE_SINGLE_DEVICE_PARITY_CASE_COUNT)
-    math(EXPR QWEN36_MOE_SINGLE_DEVICE_PARITY_CASE_LAST "${QWEN36_MOE_SINGLE_DEVICE_PARITY_CASE_COUNT} - 1")
-    foreach(CASE_INDEX RANGE 0 ${QWEN36_MOE_SINGLE_DEVICE_PARITY_CASE_LAST} 3)
-        math(EXPR BACKEND_INDEX "${CASE_INDEX} + 1")
-        math(EXPR CONFIG_INDEX "${CASE_INDEX} + 2")
-        list(GET QWEN36_MOE_SINGLE_DEVICE_PARITY_CASES ${CASE_INDEX} CASE_NAME)
-        list(GET QWEN36_MOE_SINGLE_DEVICE_PARITY_CASES ${BACKEND_INDEX} CASE_BACKEND)
-        list(GET QWEN36_MOE_SINGLE_DEVICE_PARITY_CASES ${CONFIG_INDEX} CASE_CONFIG)
-        add_v2_test(V2_Integration_Parity_Qwen36MoE_SingleDevice_Math_${CASE_NAME}_${CASE_BACKEND}
-            COMMAND $<TARGET_FILE:v2_integration_parity_qwen36moe_single_device>
-                    --gtest_filter=Qwen36MoE/Qwen36MoESingleDeviceParityTest.${CASE_NAME}/${CASE_CONFIG}
-            LABELS ${QWEN36_MOE_SINGLE_DEVICE_PARITY_LABELS}
-            MPI_PROCS 1
-            TIMEOUT 3600
-        )
-    endforeach()
 
     # =========================================================================
     # Test: Qwen3.5 MoE Parity (Mixture-of-Experts variant)
@@ -7614,6 +7949,9 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen35MoE_SingleDevice
         LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;GatedDeltaNet;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
+        CPU_MODEL_FILES ${V2_PARITY_MODEL_QWEN35_MOE_Q4}
+        ROCM_MODEL_FILES ${V2_PARITY_MODEL_QWEN35_MOE_Q4}
+        CUDA_MODEL_FILES ${V2_PARITY_MODEL_QWEN35_MOE_Q3}
     )
 
     message(STATUS "V2: Qwen3.5 MoE SingleDevice parity tests enabled")
@@ -7635,6 +7973,7 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen35MoE;LongContext;CPU;ROCm;SingleDevice;FullModel"
         MPI_PROCS 1
         TIMEOUT 1800
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN35_MOE_Q4}
     )
 
     message(STATUS "V2: Qwen3.5 MoE LongContext CPU-vs-ROCm parity sweep enabled")
@@ -7659,102 +7998,12 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen35MoE_LocalTP
         LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;LocalTP;RCCL;ROCm;TensorParallel;RoutedExpertPlacement"
         MPI_PROCS 1
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN35_MOE_Q4}
     )
 
     message(STATUS "V2: Qwen3.5 MoE LocalTP parity tests enabled")
 
-    # ---- Hybrid PP+TP MoE Parity (ROCm GPU cache + CPU routed expert domain) ----
-    add_executable(v2_integration_parity_qwen35moe_hybrid_pptp
-        integration/parity/qwen35moe/Test__Qwen35MoE_HybridPPTP_Parity.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen35moe_hybrid_pptp
-        llaminar2_core
-        v2_test_utils
-        GTest::gtest
-        ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen35moe_hybrid_pptp PRIVATE
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_hybrid_pptp
-        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_HybridPPTP
-        LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;HybridPPTP;LocalPP;LocalTP;ROCm;CPU;ExpertMigration;GpuExpertCache"
-        MPI_PROCS 2
-    )
-
-    message(STATUS "V2: Qwen3.5 MoE HybridPPTP parity tests enabled")
-
-    # ---- Expert Overlay MoE Parity (same-layer hot/cold expert tiers) ----
-    add_executable(v2_integration_parity_qwen35moe_expert_overlay
-        integration/parity/qwen35moe/Test__Qwen35MoE_ExpertOverlay_Parity.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen35moe_expert_overlay
-        llaminar2_core
-        v2_test_utils
-        GTest::gtest
-        ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen35moe_expert_overlay PRIVATE
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_expert_overlay
-        TEST_PREFIX V2_Integration_Parity_Qwen35MoEExpertOverlay
-        LABELS "V2;Integration;Parity;Qwen35MoE;ExpertOverlay;MixtureOfExperts;MPI;ROCm;CUDA;CPU;NodeLocalTP;RoutedExpertApportioned;ModelLight"
-        MPI_PROCS 2
-        TIMEOUT 600
-    )
-
-    message(STATUS "V2: Qwen3.5 MoE ExpertOverlay parity tests enabled (requires mpirun -np 2+)")
-
-    # ---- Graph-native Expert Overlay parity (sparse collective tiers) ----
-    add_executable(v2_integration_parity_qwen35moe_graphnative_rocm_hot_cpu_cold
-        integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_RocmHotCpuCold_Parity.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen35moe_graphnative_rocm_hot_cpu_cold
-        llaminar2_core
-        v2_test_utils
-        GTest::gtest
-        ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen35moe_graphnative_rocm_hot_cpu_cold PRIVATE
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_graphnative_rocm_hot_cpu_cold
-        TEST_PREFIX V2_Integration_Parity_Qwen35MoEGraphNative_RocmHotCpuCold
-        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;ROCm;CPU;MPI"
-        MPI_PROCS 2
-        TIMEOUT 1200
-    )
-
-    add_executable(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm
-        integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_CudaHotRocmWarm_Parity.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm
-        llaminar2_core
-        v2_test_utils
-        GTest::gtest
-        ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm PRIVATE
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm
-        TEST_PREFIX V2_Integration_Parity_Qwen35MoEGraphNative_CudaHotRocmWarm
-        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;MPI"
-        MPI_PROCS 2
-        TIMEOUT 1200
-    )
-
+    # ---- Production graph-native Expert Overlay parity (sparse collective tiers) ----
     add_executable(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold
         integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -7771,85 +8020,99 @@ if(ZLIB_FOUND)
     )
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold
         TEST_PREFIX V2_Integration_Parity_Qwen35MoEGraphNative_CudaHotRocmWarmCpuCold
-        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;CPU;MPI"
-        MPI_PROCS 3
+        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;CPU;MPI;NodeTP;UPI"
+        MPI_PROCS 2
         TIMEOUT 1800
+        # Keep the ownership proof enabled without rendering every generic
+        # workspace allocation in the production campaign summary. Qualified
+        # metric filters still activate the `memory` producer domain.
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,moe_overlay,moe_overlay_participant_graph,moe_overlay_residency,memory.moe_serial_local_expert_buffer_arena_allocations,memory.moe_serial_local_expert_buffer_arena_bytes"
+        # A production process owns one OrchestrationRunner/MPI application
+        # lifetime. Topology variants and the segmented-prefill proof therefore
+        # each get a fresh world instead of following another complete runner
+        # teardown in-process. StaticRandom changes the initial owner map even
+        # though it deliberately disables runtime movement.
+        PRODUCTION_ISOLATED_TESTS "SegmentedPrefill;DynamicRandom;StaticRandom"
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN35_MOE_Q4}
     )
 
     message(STATUS "V2: Qwen3.5 MoE GraphNative parity tests enabled")
 
-    # ---- NodeLocalTP MoE Parity (cross-socket routed partials + dense TP) ----
+    # ---- One-tier CPU ExpertOverlay parity (cross-socket routed partials + dense TP) ----
     #
-    # Tests Node-Local Tensor Parallelism for MoE models:
+    # Tests the production ExpertOverlay authority on a homogeneous CPU tier:
     #   - Static routed-row assignment: each rank computes a subset of experts
     #   - Shared Expert: Megatron TP (ColumnParallel gate/up, InputParallel down)
     #   - Single allreduce per layer on attn_proj
     #
     # REQUIRES: mpirun -np 2 (or more)
-    add_executable(v2_integration_parity_qwen35moe_node_local_tp
-        integration/parity/qwen35moe/Test__Qwen35MoE_NodeLocalTP_Parity.cpp
+    add_executable(v2_integration_parity_qwen35moe_node_tp
+        integration/parity/qwen35moe/Test__Qwen35MoE_NodeTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
-    target_link_libraries(v2_integration_parity_qwen35moe_node_local_tp
+    target_link_libraries(v2_integration_parity_qwen35moe_node_tp
         llaminar2_core
         v2_test_utils
         GTest::gtest
         ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_parity_qwen35moe_node_local_tp PRIVATE
+    target_include_directories(v2_integration_parity_qwen35moe_node_tp PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_node_local_tp
-        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_NodeLocalTP
-        LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank;CPU;RoutedExpertPlacement"
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_node_tp
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_NodeTP
+        LABELS "V2;Integration;Parity;Qwen35MoE;MixtureOfExperts;ExpertOverlay;NodeTP;MPI;TensorParallel;UPI;CrossRank;CPU;RoutedExpertPlacement"
         MPI_PROCS 2
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,moe_rebalance,moe_placement,moe_overlay_residency"
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN35_MOE_Q4}
     )
 
-    message(STATUS "V2: Qwen3.5 MoE NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
+    message(STATUS "V2: Qwen3.5 MoE NodeTP parity tests enabled (requires mpirun -np 2+)")
 
     # =========================================================================
-    # Test: Qwen2 NodeLocalTP Parity (Multi-Socket CPU TP)
+    # Test: Qwen2 NodeTP Parity (Multi-Socket CPU TP)
     #
-    # NodeLocalTP parity tests using MPI for cross-rank tensor parallelism
+    # NodeTP parity tests using MPI for cross-rank tensor parallelism
     # on the same physical node. Unlike LocalTP (NCCL/RCCL/HOST),
-    # NodeLocalTP uses MPI collectives for CPU sockets connected via UPI.
+    # NodeTP uses MPI collectives for CPU sockets connected via UPI.
     #
     # REQUIRES: mpirun -np 2 (or more) to run these tests
     #
     # Test configurations:
-    #   - NodeLocalTP_2xMPI_CPU: 2 MPI ranks, CPU devices, UPI/MPI backend
-    #   - NodeLocalTP_4xMPI_CPU: 4 MPI ranks, CPU devices, UPI/MPI backend
+    #   - NodeTP_2xMPI_CPU: 2 MPI ranks, CPU devices, UPI/MPI backend
+    #   - NodeTP_4xMPI_CPU: 4 MPI ranks, CPU devices, UPI/MPI backend
     #
     # Validates:
     #   - GlobalTPContext initialization and collective operations
     #   - Cross-rank allreduce, broadcast, barrier
     #   - Prefill and decode parity with sharded weights
     # =========================================================================
-    add_executable(v2_integration_node_local_tp_parity
-        integration/parity/qwen2/Test__Qwen2_NodeLocalTP_Parity.cpp
+    add_executable(v2_integration_node_tp_parity
+        integration/parity/qwen2/Test__Qwen2_NodeTP_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     # Note: No gtest_main - test provides custom main() with MPI_Init
-    target_link_libraries(v2_integration_node_local_tp_parity
+    target_link_libraries(v2_integration_node_tp_parity
         llaminar2_core
         v2_test_utils
         GTest::gtest
         ZLIB::ZLIB
     )
-    target_include_directories(v2_integration_node_local_tp_parity PRIVATE
+    target_include_directories(v2_integration_node_tp_parity PRIVATE
         ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes
     )
 
-    discover_v2_parity_tests(v2_integration_node_local_tp_parity
-        TEST_PREFIX V2_Integration_Parity_NodeLocalTP
-        LABELS "V2;Integration;Parity;Qwen2;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank"
+    discover_v2_parity_tests(v2_integration_node_tp_parity
+        TEST_PREFIX V2_Integration_Parity_NodeTP
+        LABELS "V2;Integration;Parity;Qwen2;NodeTP;MPI;TensorParallel;UPI;CrossRank"
         MPI_PROCS 2
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN2_Q4}
     )
 
-    message(STATUS "V2: NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
+    message(STATUS "V2: NodeTP parity tests enabled (requires mpirun -np 2+)")
 
     endif() # cnpy available
 else()
@@ -8228,7 +8491,7 @@ add_executable(v2_test_prefix_cache_coordinator_mpi
 target_link_libraries(v2_test_prefix_cache_coordinator_mpi llaminar2_core GTest::gtest)
 add_v2_test(V2_Unit_PrefixCacheCoordinatorMPI
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_coordinator_mpi>
-    LABELS "V2;Unit;PrefixCache;Coordination;MPI;GlobalTP;NodeLocalTP"
+    LABELS "V2;Unit;PrefixCache;Coordination;MPI;GlobalTP;NodeTP"
     MPI_PROCS 2
 )
 
@@ -8486,6 +8749,9 @@ add_executable(v2_test_mtp_graph_construction unit/mtp/Test__MTPGraphConstructio
 target_link_libraries(v2_test_mtp_graph_construction llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_mtp_graph_construction PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_compile_definitions(v2_test_mtp_graph_construction PRIVATE
+    LLAMINAR_DEVICE_GRAPH_ORCHESTRATOR_SOURCE="${CMAKE_SOURCE_DIR}/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp"
 )
 add_v2_test(V2_Unit_MTPGraphConstruction
     COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
@@ -9155,6 +9421,19 @@ add_v2_test(V2_Unit_TransferEngine
     MPI_PROCS 1
 )
 
+# Test: mapped external activation channel registration and exact-stream timelines.
+# The backend spies remain device-free while proving arbitrary CUDA/ROCm/CPU
+# endpoint sets, family-level registration, rollback, and no implicit sync.
+add_executable(v2_unit_mapped_host_transfer_region
+    unit/transfer/Test__MappedHostTransferRegion.cpp)
+target_link_libraries(v2_unit_mapped_host_transfer_region
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MappedHostTransferRegion
+    COMMAND $<TARGET_FILE:v2_unit_mapped_host_transfer_region>
+    LABELS "V2;Unit;Transfer;TransferEngine;MappedHost;Timeline;NoSync"
+    MPI_PROCS 1
+)
+
 # Test: QwenStandardGraphBufferManagement (BufferArena integration with DeviceGraphOrchestrator)
 # Tests setTensorFactory/initializeBuffers workflow, buffer allocation/binding,
 # statistics tracking, and release cleanup.
@@ -9563,6 +9842,7 @@ target_compile_definitions(v2_test_local_tp_context PRIVATE
     LLAMINAR_LOCAL_TP_CONTEXT_HEADER="${CMAKE_SOURCE_DIR}/collective/ILocalTPContext.h"
     LLAMINAR_LOCAL_TP_CONTEXT_SOURCE="${CMAKE_SOURCE_DIR}/collective/LocalTPContext.cpp"
     LLAMINAR_COLLECTIVE_BACKEND_HEADER="${CMAKE_SOURCE_DIR}/collective/ICollectiveBackend.h"
+    LLAMINAR_HETEROGENEOUS_BACKEND_SOURCE="${CMAKE_SOURCE_DIR}/collective/backends/HeterogeneousBackend.cpp"
     LLAMINAR_NCCL_COORDINATOR_SOURCE="${CMAKE_SOURCE_DIR}/collective/coordinators/NCCLCoordinator.cu"
     LLAMINAR_NVIDIA_DEVICE_CONTEXT_SOURCE="${CMAKE_SOURCE_DIR}/backends/cuda/NvidiaDeviceContext.cu"
     LLAMINAR_AMD_DEVICE_CONTEXT_SOURCE="${CMAKE_SOURCE_DIR}/backends/rocm/AMDDeviceContext.cpp"
@@ -10563,6 +10843,21 @@ add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillHeuristic
     LABELS "V2;Integration;CPU;GEMM;Prefill;Heuristic;AllFormats;NativeVNNI;DecodeEquivalent;Regression"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX512
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+            --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillCacheKTilesAllFormatsRemainSerialRowByteExact
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;GEMM;Prefill;CacheTiling;AVX512;AllFormats;MTotality;NativeVNNI;ByteExact;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillCacheKTile_AVX2
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+            --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillCacheKTilesAllFormatsRemainSerialRowByteExact
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;GEMM;Prefill;CacheTiling;AVX2;AllFormats;MTotality;NativeVNNI;ByteExact;Regression"
+    MPI_PROCS 1
+    ENVIRONMENT "LLAMINAR_ISA_LEVEL=avx2"
+)
 add_v2_test(V2_Integration_CPU_NativeVNNI_PrefillBucketMInvariantAllFormats
     COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
             --gtest_filter=CPUNativeVNNIGemvTest.NativeVNNIPrefillProductionAutoAllFormatsAllRowsByteExactAcrossMAndBuckets
@@ -10652,6 +10947,18 @@ add_v2_test(V2_Perf_CPUNativeVNNI_GEMV
     COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
     LABELS "V2;Performance;GEMV;NativeVNNI;CPU;Q8_0;Decode;Qwen;Tuning"
     MPI_PROCS 1
+)
+
+# Dispatch corpus collection constructs prepared fixtures directly so setup
+# never serially synthesizes and repacks multi-gigabyte source tensors. This
+# focused integration gate proves every supported source format still receives
+# the exact production prepared geometry before timing or paired certification.
+add_v2_test(V2_Integration_CPUNativeVNNIDispatchEvidencePreparedLayout
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
+            --gtest_filter=*DispatchEvidencePreparedWeights_MatchProductionLayout_AllFormats
+    LABELS "V2;Integration;CPU;NativeVNNI;AllFormats;Dispatch;Regression"
+    MPI_PROCS 1
+    TIMEOUT 30
 )
 
 # Performance Test: CPU NativeVNNI thread scaling across production regimes.
@@ -10765,9 +11072,44 @@ target_link_libraries(v2_perf_cpu_gdn_verifier_rows
     GTest::gtest
     GTest::gtest_main
 )
+target_include_directories(v2_perf_cpu_gdn_verifier_rows PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
 add_v2_test(V2_Perf_CPUGatedDeltaNetVerifierRows
     COMMAND $<TARGET_FILE:v2_perf_cpu_gdn_verifier_rows>
-    LABELS "V2;Performance;GDN;CPU;MTP;VerifierRows;Phase9_8;DecodeEquivalent"
+    LABELS "V2;Performance;GDN;CPU;MTP;VerifierRows;DecodeEquivalent;ByteExact;RuntimeM"
+    MPI_PROCS 1
+    TIMEOUT 120
+)
+
+# Performance Test: production-shaped CPU MoE grouped router
+add_executable(v2_perf_cpu_moe_router_verifier_rows
+    performance/kernels/moe/Perf__CPUMoERouterVerifierRows.cpp)
+target_link_libraries(v2_perf_cpu_moe_router_verifier_rows
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_perf_cpu_moe_router_verifier_rows PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Perf_CPUMoERouterVerifierRows
+    COMMAND $<TARGET_FILE:v2_perf_cpu_moe_router_verifier_rows>
+    LABELS "V2;Performance;MoE;Router;CPU;MTP;VerifierRows;DecodeEquivalent;ByteExact;RuntimeM;Qwen36"
+    MPI_PROCS 1
+    TIMEOUT 120
+)
+
+# Performance Test: byte-exact CPU GDN prefill recurrence at Qwen TP geometries
+add_executable(v2_perf_cpu_gdn_prefill performance/kernels/cpu/gdn/Perf__CPUGatedDeltaNetPrefill.cpp)
+target_link_libraries(v2_perf_cpu_gdn_prefill
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_CPUGatedDeltaNetPrefill
+    COMMAND $<TARGET_FILE:v2_perf_cpu_gdn_prefill>
+    LABELS "V2;Performance;GDN;CPU;Prefill;DecodeEquivalent;Qwen36;TensorParallel"
     MPI_PROCS 1
     TIMEOUT 120
 )
@@ -11073,6 +11415,20 @@ add_v2_test(V2_Perf_CPURMSNormKernelT
     MPI_PROCS 1  # CPU-only perf test, single rank for accurate benchmarking
 )
 
+# Performance Test: residual-add thread crossover for grouped MTP rows.
+add_executable(v2_perf_cpu_residual_add_verifier_rows
+    performance/kernels/cpu/ops/Perf__CPUResidualAddVerifierRows.cpp)
+target_link_libraries(v2_perf_cpu_residual_add_verifier_rows
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_CPUResidualAddVerifierRows
+    COMMAND $<TARGET_FILE:v2_perf_cpu_residual_add_verifier_rows>
+    LABELS "V2;Performance;ResidualAdd;CPU;MTP;VerifierRows;ThreadSweep"
+    MPI_PROCS 1
+)
+
 # Performance Test: CPUSoftmaxKernelT (typed softmax performance)
 add_executable(v2_perf_softmax_typed performance/kernels/cpu/ops/Perf__CPUSoftmaxKernelT.cpp)
 target_link_libraries(v2_perf_softmax_typed 
@@ -11356,8 +11712,27 @@ target_link_libraries(v2_integration_moe_overlay_sparse_transport_mpi
 )
 add_v2_test(V2_Integration_MoEOverlaySparseTransport_MPI
     COMMAND $<TARGET_FILE:v2_integration_moe_overlay_sparse_transport_mpi>
-    LABELS "V2;Integration;MoE;Overlay;SparseCollective;MPI"
+    LABELS "V2;Integration;MoE;Overlay;SparseCollective;MPI;MTP;DynamicDepth;Async;NoBlocking;PerfStats"
     MPI_PROCS 2
+)
+
+# Test: non-blocking two-phase ExpertOverlay residency votes over real MPI
+add_executable(v2_integration_moe_overlay_residency_consensus_mpi
+    integration/moe/Test__MoEOverlayMPIResidencyConsensus.cpp
+    integration/moe/Test__MoEOverlayHeterogeneousResidencyMPI.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_link_libraries(v2_integration_moe_overlay_residency_consensus_mpi
+    llaminar2_core
+    GTest::gtest
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Integration_MoEOverlayResidencyConsensus_MPI
+    COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+    LABELS "V2;Integration;CUDA;ROCm;CPU;MoE;Overlay;Residency;Async;TwoPhase;MPI;NodeTP;TopologyFlexible;PerfStats;ByteExact;NoBlocking"
+    MPI_PROCS 2
+    TIMEOUT 60
+    NO_MODELS
 )
 
 add_executable(v2_integration_moe_graph_native_prepared_expert_weights_mvp
@@ -11376,6 +11751,14 @@ add_v2_test(V2_Integration_MoEGraphNative_PreparedExpertWeights_MVP
     COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_prepared_expert_weights_mvp>
     LABELS "V2;Integration;MoE;Overlay;GraphNative;PreparedWeights"
     MPI_PROCS 1
+)
+add_v2_test(V2_Integration_MoEOverlayTicketProtocol_CPU
+    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_prepared_expert_weights_mvp>
+            --gtest_filter=Test__MoEGraphNative_PreparedExpertWeights_MVP.FixedCapacityTicketProtocolReusesCPUStagesAcrossLogicalPrefixes
+            --gtest_brief=1
+    LABELS "V2;Integration;CPU;MoE;Overlay;GraphNative;TicketProtocol;FixedCapacity;Padding;PreparedWeights;Regression"
+    MPI_PROCS 1
+    TIMEOUT 30
 )
 
 # Test: TPAllreduceStage Local NCCL Integration
@@ -11509,7 +11892,7 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_GDNProjection
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
-                --gtest_filter=Test__ROCmQuantisedGemmSmallM.GDNIQ4XSQwen36MoEQkvZPairRuntimeMMatchesSerialM1DecodeRowsStrict:Test__ROCmQuantisedGemmSmallM.MixedCodebookQwen36GDNQkvZPairRuntimeMMatchesSerialM1DecodeRowsStrict:Test__ROCmQuantisedGemmSmallM.Qwen36MoEGDNProjectionStageQ6KVerifierRowsMatchSerialDecodeStrict
+                --gtest_filter=Test__ROCmQuantisedGemmSmallM.GDNIQ4XSQwen36MoEQkvZPairRuntimeMMatchesSerialM1DecodeRowsStrict:Test__ROCmQuantisedGemmSmallM.MixedCodebookQwen36GDNQkvZPairRuntimeMMatchesSerialM1DecodeRowsStrict:Test__ROCmQuantisedGemmSmallM.Qwen36MoEGDNProjectionStageQ6KVerifierRowsMatchSerialDecodeStrict:Test__ROCmQuantisedGemmSmallM.GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysicalFormatSubgroups
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;GEMM;GDN;MTP;GroupedVerifierRows;DecodeEquivalent;IQ4_XS;NativeVNNI;Regression"
         MPI_PROCS 1
@@ -12307,6 +12690,34 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm TurboQuant KV Cache integration tests")
 
+    # Attention-key Q8 physical-byte and retained-graph conformance.
+    add_executable(v2_integration_rocm_attention_key_q8
+        integration/kernels/rocm/Test__ROCmAttentionKeyQ8.cpp)
+    target_link_libraries(v2_integration_rocm_attention_key_q8
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_ROCmAttentionKeyQ8
+        COMMAND $<TARGET_FILE:v2_integration_rocm_attention_key_q8>
+        LABELS "V2;Integration;ROCm;KVCache;Attention;Q8;AllHeadDims;ByteExact;GraphCapture;ExplicitStream;Regression;gfx906"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+    )
+
+    # Production-geometry retained-graph economy plus filterable single-dispatch
+    # attachment points for rocprof and ISA inspection.
+    add_executable(v2_perf_rocm_attention_key_q8
+        performance/kernels/rocm/kvcache/Perf__ROCmAttentionKeyQ8.cpp)
+    target_link_libraries(v2_perf_rocm_attention_key_q8
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Perf_ROCmAttentionKeyQ8
+        COMMAND $<TARGET_FILE:v2_perf_rocm_attention_key_q8>
+                --gtest_filter=AttentionKeyQ8ROCmEconomy.ProductionGeometryRetainedGraphSweep
+        LABELS "V2;Performance;ROCm;KVCache;Attention;Q8;GraphCapture;Decode;MTP;Prefill;Economy;gfx906"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+    )
+
     # =============================================================================
     # ROCm SwiGLU Parity Tests
     # =============================================================================
@@ -12752,6 +13163,24 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;MoE;Routing;Gather;Scatter;gfx906"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_ROCm_MoEOverlayCPUColdPromotionGroupedParity
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+                --gtest_filter=Test__ROCmMoEKernel.CPUColdPromotedAsymmetricGroupedDecodeAndPrefillMatchCompactBytes
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;CPU;MoE;ExpertOverlay;CPUCold;Promotion;WeightStreaming;ExpandedInt8;GroupedDecode;GroupedVerifierRows;LongPrefill;Async;PerfStats;ByteExact;NoBlocking;PartialColumnTile"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 30
+    )
+    add_v2_test(V2_Integration_ROCm_MoEFloatingSharedExpertTableDecode
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+                --gtest_filter=Test__ROCmMoEKernel.FloatingSharedExpertTableDecodeAllFormatsCapturesAndMatchesReference
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MoE;SharedExpert;GroupedDecode;GraphCapture;FP16;BF16;FP32;AllFormats;NumericalParity;Regression;gfx906"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 30
+    )
     add_v2_test(V2_Integration_ROCm_MoEActiveExpertCompaction
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
                 --gtest_filter=Test__ROCmMoEKernel.ActiveExpertCompactionIsStableTotalAndGraphCapturable:Test__ROCmMoEKernel.RuntimePrefillDescriptorMaterializationUsesActiveRuntimeBank
@@ -12807,6 +13236,8 @@ endif()
 if(HAVE_CUDA OR HAVE_ROCM)
     set(V2_GPU_EXPERT_TRANSFER_TEST_SOURCES
         unit/moe/Test__GPUExpertTransfer.cpp
+        integration/moe/Test__ExpertTierGpuBlobTransferIntegration.cpp
+        integration/moe/Test__MoEOverlayThreeTierMigrationIntegration.cpp
     )
     if(HAVE_CUDA)
         list(APPEND V2_GPU_EXPERT_TRANSFER_TEST_SOURCES
@@ -12831,7 +13262,59 @@ if(HAVE_CUDA OR HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
         LABELS "V2;Integration;MoE;GPUTransfer"
         MPI_PROCS 1
+        NO_MODELS
     )
+    if(HAVE_CUDA)
+        add_v2_test(V2_Integration_ExpertTierGpuPeerTransfer_CUDA
+            COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                    --gtest_filter=Test__ExpertTierGpuPeerTransferCUDA.*
+                    --gtest_brief=1
+            LABELS "V2;Integration;CUDA;CUDA2;MoE;ExpertOverlay;GPUTransfer;Async;PerfStats;ByteExact;NoBlocking"
+            MPI_PROCS 1
+            TIMEOUT 30
+            NO_MODELS
+        )
+    endif()
+    if(HAVE_ROCM)
+        add_v2_test(V2_Integration_ExpertTierGpuPeerTransfer_ROCm
+            COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                    --gtest_filter=Test__ExpertTierGpuPeerTransferROCm.*
+                    --gtest_brief=1
+            LABELS "V2;Integration;ROCm;ROCm2;MoE;ExpertOverlay;GPUTransfer;Async;PerfStats;ByteExact;NoBlocking"
+            MPI_PROCS 1
+            TIMEOUT 30
+            NO_MODELS
+        )
+    endif()
+    add_v2_test(V2_Integration_HeterogeneousGPUExpertBlobTransfer
+        COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                --gtest_filter=ExpertTierGpuBlobTransferIntegration.*
+                --gtest_brief=1
+        LABELS "V2;Integration;CUDA;ROCm;MoE;ExpertOverlay;WeightStreaming;Async;DoubleBuffered;PerfStats;ByteExact;NoBlocking"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+    )
+    add_v2_test(V2_Integration_MoEOverlayThreeTierMigration
+        COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                --gtest_filter=MoEOverlayThreeTierMigrationIntegration.*
+                --gtest_brief=1
+        LABELS "V2;Integration;CUDA;ROCm;CPU;MoE;ExpertOverlay;Histogram;Residency;ArbitraryTiers;Async;PerfStats;ByteExact;NoBlocking"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+    )
+    if(HAVE_CUDA)
+        add_v2_test(V2_Integration_MoEOverlayCudaHotCpuColdMigration
+            COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                    --gtest_filter=MoEOverlayCudaCpuMigrationIntegration.*
+                    --gtest_brief=1
+            LABELS "V2;Integration;CUDA;CPU;MoE;ExpertOverlay;Histogram;Residency;TwoWayTransfer;Async;PerfStats;ByteExact;NoBlocking"
+            MPI_PROCS 1
+            TIMEOUT 30
+            NO_MODELS
+        )
+    endif()
     message(STATUS "V2 Tests: Added GPU Expert Transfer integration tests")
 endif()
 
@@ -13181,6 +13664,78 @@ if(HAVE_CUDA AND HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added CUDA/HIP Kernel Coexistence diagnostic test")
+
+    # Real mixed-vendor graph-lifecycle ticket proof. This is intentionally a
+    # focused no-model test: full production capture/replay is certified by the
+    # CUDA+ROCm LocalTP parity campaigns, while this slice isolates exact-stream
+    # completion, cyclic protocol reuse, and PerfStats evidence.
+    add_executable(v2_integration_local_tp_heterogeneous_graph_ticket
+        integration/collective/Test__LocalTPHeterogeneousGraphCaptureTicket.cpp
+    )
+    target_link_libraries(v2_integration_local_tp_heterogeneous_graph_ticket PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_LocalTP_HeterogeneousGraphCaptureTicket
+        COMMAND $<TARGET_FILE:v2_integration_local_tp_heterogeneous_graph_ticket>
+        LABELS "V2;Integration;LocalTP;CUDA;ROCm;Heterogeneous;GraphCapture;TicketProtocol;ExplicitStream;PerfStats;Regression"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+        ENVIRONMENT
+            "LLAMINAR_PERF_STATS_SUMMARY=1"
+            "LLAMINAR_PERF_STATS_FILTER=graph_capture,heterogeneous_collective"
+    )
+
+    # Real shared-page device-epoch proof. It alternates which backend owns the
+    # continuation role and perturbs both runtimes with persistent side streams;
+    # the ABI and TransferEngine contain no topology-specific backend roles.
+    add_executable(v2_integration_mapped_activation_epoch_cuda_rocm
+        integration/transfer/Test__MappedActivationEpochCUDAAndROCm.cpp
+    )
+    target_link_libraries(v2_integration_mapped_activation_epoch_cuda_rocm PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_MappedActivationEpoch_CUDA_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_mapped_activation_epoch_cuda_rocm>
+        LABELS "V2;Integration;ExpertOverlay;CUDA;ROCm;Heterogeneous;MappedHost;DeviceEpoch;ExplicitStream;PerfStats;Regression"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+        ENVIRONMENT
+            "LLAMINAR_PERF_STATS_SUMMARY=1"
+            "LLAMINAR_PERF_STATS_FILTER=moe_overlay_activation_epoch"
+    )
+
+    # Production packet proof over the topology-resolved node-local transport.
+    # Both tests reverse CUDA/ROCm endpoint roles, inspect the flattened HIP
+    # device-wait DAG, and submit the complete zero-copy sparse round trip before
+    # observing terminal events.
+    add_executable(v2_integration_mapped_activation_packet_cuda_rocm
+        integration/transfer/Test__MappedActivationPacketCUDAAndROCm.cpp
+    )
+    target_include_directories(
+        v2_integration_mapped_activation_packet_cuda_rocm PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(v2_integration_mapped_activation_packet_cuda_rocm PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_MappedActivationPacket_CUDA_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_mapped_activation_packet_cuda_rocm>
+        LABELS "V2;Integration;ExpertOverlay;CUDA;ROCm;Heterogeneous;MappedHost;DeviceEpoch;SparsePacket;ExplicitStream;NumericalParity;PerfStats;Regression"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+        ENVIRONMENT
+            "LLAMINAR_PERF_STATS_SUMMARY=1"
+            "LLAMINAR_PERF_STATS_FILTER=moe_overlay_activation_epoch"
+    )
 endif()
 
 # =============================================================================
@@ -13643,7 +14198,10 @@ endif()
 
 add_executable(v2_test_snapshot_capture
     unit/snapshots/Test__SnapshotCapture.cpp
+    unit/snapshots/Test__ParityGDNHeadPermutation.cpp
     unit/snapshots/Test__ParitySnapshotSelection.cpp
+    unit/snapshots/Test__MTPParitySnapshotContext.cpp
+    unit/snapshots/Test__MoERoutingBoundary.cpp
 )
 target_link_libraries(v2_test_snapshot_capture llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_SnapshotCapture
@@ -13820,6 +14378,46 @@ add_v2_gpu_backend_test(
     V2_Integration_CachedGraphReplayExecution
     V2 Integration Execution GraphCapture CachedReplay
 )
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_MoEOverlayTicketSegments_CUDA
+        COMMAND $<TARGET_FILE:v2_test_cached_graph_replay_execution_cuda>
+                --gtest_filter=CachedGraphReplayExecutionTest.HeterogeneousTicketSegmentsReuseCapturedBucketAcrossLogicalLengths
+                --gtest_brief=1
+        LABELS "V2;Integration;CUDA;Execution;GraphCapture;MoE;Overlay;TicketProtocol;Heterogeneous;FixedCapacity;Padding;Regression"
+        MPI_PROCS 1
+        TIMEOUT 30
+    )
+endif()
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_MoEOverlayTicketSegments_ROCm
+        COMMAND $<TARGET_FILE:v2_test_cached_graph_replay_execution_rocm>
+                --gtest_filter=CachedGraphReplayExecutionTest.HeterogeneousTicketSegmentsReuseCapturedBucketAcrossLogicalLengths
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;Execution;GraphCapture;MoE;Overlay;TicketProtocol;Heterogeneous;FixedCapacity;Padding;Regression;gfx906"
+        MPI_PROCS 1
+        TIMEOUT 30
+    )
+endif()
+if(HAVE_CUDA)
+    add_v2_test(V2_Integration_CUDAGraphSnapshotLogicalRows
+        COMMAND $<TARGET_FILE:v2_test_cached_graph_replay_execution_cuda>
+                --gtest_filter=CachedGraphReplayExecutionTest.CapturedSnapshotsPreservePointInTimeOutputsAcrossBufferReuse
+                --gtest_brief=1
+        LABELS "V2;Integration;CUDA;Execution;GraphCapture;Snapshot;Prefill;Padding;LogicalRows;Regression"
+        MPI_PROCS 1
+        TIMEOUT 30
+    )
+endif()
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCmGraphSnapshotLogicalRows
+        COMMAND $<TARGET_FILE:v2_test_cached_graph_replay_execution_rocm>
+                --gtest_filter=CachedGraphReplayExecutionTest.CapturedSnapshotsPreservePointInTimeOutputsAcrossBufferReuse
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;Execution;GraphCapture;Snapshot;Prefill;Padding;LogicalRows;Regression;gfx906"
+        MPI_PROCS 1
+        TIMEOUT 30
+    )
+endif()
 # This suite explicitly registers one backend per binary and has no static
 # dual-runtime probing. Keep its CUDA lane active even when the broader legacy
 # GPU-context group remains opt-in in heterogeneous builds.
@@ -14109,6 +14707,34 @@ add_v2_test(V2_Unit_ExpertWeightPayloadProvider
     LABELS "V2;Unit;MoE;WeightLifecycle;PayloadProvider"
 )
 
+# Test: heterogeneous ExpertOverlay tier-weight stream ABI and layout maps
+add_executable(v2_test_expert_tier_weight_stream unit/moe/Test__ExpertTierWeightStream.cpp)
+target_link_libraries(v2_test_expert_tier_weight_stream
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ExpertTierWeightStream
+    COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
+    LABELS "V2;Unit;MoE;WeightLifecycle;ExpertOverlay;Streaming"
+    NO_MODELS
+)
+
+# Test: device-free arbitrary-tier composite wave protocol
+add_executable(v2_test_moe_overlay_tier_migration_transport
+    unit/moe/Test__MoEOverlayTierMigrationTransport.cpp
+)
+target_link_libraries(v2_test_moe_overlay_tier_migration_transport
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEOverlayTierMigrationTransport
+    COMMAND $<TARGET_FILE:v2_test_moe_overlay_tier_migration_transport>
+    LABELS "V2;Unit;MoE;ExpertOverlay;Residency;Async;ArbitraryTiers;StateMachine"
+    NO_MODELS
+)
+
 # Test: ExpertRebalancer — histogram-based dynamic weight movement
 add_executable(v2_test_expert_rebalancer unit/moe/Test__ExpertRebalancer.cpp)
 target_link_libraries(v2_test_expert_rebalancer
@@ -14145,6 +14771,19 @@ add_v2_test(V2_Unit_MoERuntimeTable
     LABELS "V2;Unit;MoE;RuntimeTable;GraphCapture;DynamicPlacement"
 )
 
+# Test: device-owned ExpertOverlay epoch publication and RCU bank reuse
+add_executable(v2_test_moe_overlay_device_epoch_protocol
+    unit/execution/moe/Test__MoEOverlayDeviceEpochProtocol.cpp)
+target_link_libraries(v2_test_moe_overlay_device_epoch_protocol
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEOverlayDeviceEpochProtocol
+    COMMAND $<TARGET_FILE:v2_test_moe_overlay_device_epoch_protocol>
+    LABELS "V2;Unit;MoE;ExpertOverlay;GraphCapture;RCU;DynamicPlacement"
+)
+
 # Test: SocketAwareRebalancer — socket-load-aware expert swap proposals
 add_executable(v2_test_socket_aware_rebalancer unit/moe/Test__SocketAwareRebalancer.cpp)
 target_link_libraries(v2_test_socket_aware_rebalancer
@@ -14179,6 +14818,18 @@ target_link_libraries(v2_test_least_loaded_expert_assignment
 add_v2_test(V2_Unit_LeastLoadedExpertAssignment
     COMMAND $<TARGET_FILE:v2_test_least_loaded_expert_assignment>
     LABELS "V2;Unit;MoE;RoutedExpertPlacement;LeastLoadedResident;DynamicPlacement"
+)
+
+# Test: CPU current-batch LLEP — exact graph transaction lifecycle/publication
+add_executable(v2_test_cpu_current_batch_llep unit/moe/Test__CPUCurrentBatchLLEP.cpp)
+target_link_libraries(v2_test_cpu_current_batch_llep
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUCurrentBatchLLEP
+    COMMAND $<TARGET_FILE:v2_test_cpu_current_batch_llep>
+    LABELS "V2;Unit;MoE;CPU;NodeTP;RoutedExpertPlacement;LeastLoadedResident;DynamicPlacement"
 )
 
 # Test: MoEConfig — configuration validation, isMoELayer()
@@ -14333,6 +14984,20 @@ add_v2_test(V2_Unit_GDNPrefillDecodeEquivalence_CPU
             --gtest_filter=Test__GDNKernels.CPUGatedDeltaNetLongPrefillMTotalityMatchesSerialDecodeByteExact
             --gtest_brief=1
     LABELS "V2;Unit;CPU;GatedDeltaNet;Prefill;DecodeEquivalent;ByteExact;MTotality;FP32;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Unit_GDNPrefillThreadTotality_CPU
+    COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
+            --gtest_filter=Test__GDNKernels.CPUGatedDeltaNetPrefillIsByteExactAcrossPositiveThreadCounts
+            --gtest_brief=1
+    LABELS "V2;Unit;CPU;GatedDeltaNet;Prefill;DecodeEquivalent;ByteExact;ThreadTotality;OpenMP;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Unit_GDNMergedQKVDecodeEquivalence_CPU
+    COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
+            --gtest_filter=Test__GDNKernels.CPUMergedQKVOrdinaryPathMatchesSerialDecodeByteExact:Test__GDNKernels.Recurrence_CPUMergedQKVUsesMandatoryDirectKernel
+            --gtest_brief=1
+    LABELS "V2;Unit;CPU;GatedDeltaNet;MergedQKV;Prefill;DecodeEquivalent;ByteExact;MTotality;TensorParallel;Regression"
     MPI_PROCS 1
 )
 if(HAVE_ROCM)
@@ -14717,6 +15382,20 @@ add_v2_test(V2_Integration_GroupedVerifierRows_CPU_MoEExpertPaths
     MPI_PROCS 1
 )
 
+# Performance: production-shaped CPU MoE verifier expert transaction.
+add_executable(v2_perf_cpu_moe_expert_verifier_rows
+    performance/kernels/moe/Perf__CPUMoEExpertVerifierRows.cpp)
+target_include_directories(v2_perf_cpu_moe_expert_verifier_rows PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_perf_cpu_moe_expert_verifier_rows
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CPUMoEExpertVerifierRows
+    COMMAND $<TARGET_FILE:v2_perf_cpu_moe_expert_verifier_rows>
+    LABELS "V2;Performance;CPU;MoE;MTP;GroupedVerifierRows;NativeVNNI;Economy"
+    MPI_PROCS 1
+    TIMEOUT 120
+)
+
 # Test: MoERoutingStage — extracted router stage (softmax top-k → expert indices + weights)
 add_executable(v2_test_moe_routing_stage unit/stages/Test__MoERoutingStage.cpp)
 target_include_directories(v2_test_moe_routing_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -14859,7 +15538,8 @@ add_v2_test(V2_Unit_PrefillGraphCacheIntegration
 
 # Test: ShmemSpinBackend — Shared-memory spin-wait allreduce for 2-rank intra-node CPU TP
 # Single-process: arena layout, fast-path detection, identity checks
-# Two-process: allreduce correctness, repeated allreduce, boundary counts, fallback delegation, stress
+# Two-process: allreduce correctness, native gather/broadcast, mixed-protocol
+# epoch reuse, boundary counts, explicit general-backend delegation, and stress
 add_executable(v2_test_shmem_spin_backend unit/collective/Test__ShmemSpinBackend.cpp)
 target_include_directories(v2_test_shmem_spin_backend PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(v2_test_shmem_spin_backend
@@ -14897,6 +15577,30 @@ if(TEST V2_Unit_ShmemSpinBackend)
             RUN_SERIAL TRUE
     )
 endif()
+
+# Performance: measured latency/bandwidth crossover for exact CPU MoE rooted
+# publication. Kept outside the unit gate because it intentionally performs a
+# sustained two-socket payload sweep.
+add_executable(v2_perf_cpu_rooted_publication_transport
+    performance/moe/Perf__CPURootedPublicationTransport.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_include_directories(v2_perf_cpu_rooted_publication_transport PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_perf_cpu_rooted_publication_transport
+    llaminar2_core
+    GTest::gtest
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Perf_CPURootedPublicationTransport
+    COMMAND $<TARGET_FILE:v2_perf_cpu_rooted_publication_transport>
+    LABELS "V2;Perf;CPU;Collective;ShmemSpin;MoE"
+    MPI_PROCS 2
+    TIMEOUT 120
+    RESOURCE_LOCK "ShmemSpin"
+)
 
 # =============================================================================
 # GPU Weight Loading Pipeline - Phase 1 Foundation
@@ -14962,6 +15666,127 @@ add_v2_test(V2_Integration_ROCm_VnniRepackKernels
     LABELS "V2;Integration;WeightLoading;GpuPipeline;ROCm;HIP"
     MPI_PROCS 1
 )
+
+if(HAVE_ROCM)
+    add_executable(v2_integration_rocm_expert_tier_weight_kernels
+        integration/kernels/rocm/Test__ROCmExpertTierWeightKernels.cpp)
+    target_include_directories(
+        v2_integration_rocm_expert_tier_weight_kernels
+        PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_definitions(
+        v2_integration_rocm_expert_tier_weight_kernels
+        PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(v2_integration_rocm_expert_tier_weight_kernels
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        hip::host)
+    if(NOT LLAMINAR_SHARED_CORE)
+        target_link_libraries(
+            v2_integration_rocm_expert_tier_weight_kernels
+            rocm_backend)
+    endif()
+    add_v2_test(V2_Integration_ROCm_ExpertTierWeightKernels
+        COMMAND $<TARGET_FILE:v2_integration_rocm_expert_tier_weight_kernels>
+        LABELS "V2;Integration;ROCm;MoE;ExpertOverlay;WeightStreaming;Repack;AllCodebooks;ByteExact;ExplicitStream"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 30
+    )
+    add_executable(v2_integration_rocm_moe_overlay_epoch
+        integration/kernels/rocm/Test__ROCmMoEOverlayEpoch.cpp)
+    target_include_directories(
+        v2_integration_rocm_moe_overlay_epoch
+        PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_definitions(
+        v2_integration_rocm_moe_overlay_epoch
+        PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(v2_integration_rocm_moe_overlay_epoch
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        hip::host)
+    if(NOT LLAMINAR_SHARED_CORE)
+        target_link_libraries(
+            v2_integration_rocm_moe_overlay_epoch
+            rocm_backend)
+    endif()
+    add_v2_test(V2_Integration_ROCm_MoEOverlayEpoch
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_overlay_epoch>
+        LABELS "V2;Integration;ROCm;MoE;ExpertOverlay;GraphCapture;RCU;Async;ExplicitStream;NoBlocking"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 30
+    )
+    add_v2_test(V2_Integration_ROCm_ExpertTierAsyncOverlap
+        COMMAND $<TARGET_FILE:v2_integration_rocm_expert_tier_weight_kernels>
+                --gtest_filter=ROCmExpertTierWeightKernelsTest.PersistentBackgroundLaneRoundTripsWithoutBlockingSynchronization:ROCmExpertTierWeightKernelsTest.ProductionInferenceCompletesByteExactlyWhileMigrationIsPending
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MoE;ExpertOverlay;WeightStreaming;Async;InferenceOverlap;PerfStats;ByteExact;NoBlocking"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 30
+    )
+    add_v2_test(V2_Integration_ROCm_ExpertTierFusedQKVStreamPoolOverlap
+        COMMAND $<TARGET_FILE:v2_integration_rocm_expert_tier_weight_kernels>
+                --gtest_filter=ROCmExpertTierWeightKernelsTest.FusedQKVInternalStreamPoolsRemainByteExactAndNonBlockingDuringMigration
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MoE;ExpertOverlay;FusedQKV;StreamPool;Decode;Prefill;Async;InferenceOverlap;PerfStats;ByteExact;NoBlocking;Adversarial"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 30
+    )
+endif()
+
+# Performance: production-shaped heterogeneous ExpertOverlay repack/stream.
+# Keep one executable per GPU runtime so CUDA and HIP device registration never
+# share a process. The source validates byte-exactness before recording any
+# canonical Release timing rows and provides an exact single-kernel profiler
+# mode for Nsight Compute and rocprof.
+if(HAVE_CUDA)
+    add_executable(v2_perf_cuda_expert_tier_weight_streaming
+        performance/moe/Perf__ExpertTierWeightStreaming.cpp)
+    target_include_directories(
+        v2_perf_cuda_expert_tier_weight_streaming
+        PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(
+        v2_perf_cuda_expert_tier_weight_streaming
+        PRIVATE LLAMINAR_EXPERT_TIER_PERF_CUDA=1)
+    target_link_libraries(v2_perf_cuda_expert_tier_weight_streaming
+        llaminar2_core CUDA::cudart ${NUMA_LIBRARY})
+    add_v2_test(V2_Perf_CUDA_ExpertTierWeightStreaming
+        COMMAND $<TARGET_FILE:v2_perf_cuda_expert_tier_weight_streaming>
+        LABELS "V2;Performance;CUDA;MoE;ExpertOverlay;WeightStreaming;Repack;AllCodebooks;RealModelShape;Economy;ByteExact"
+        MPI_PROCS 1
+        NO_MODELS
+        RESOURCE_LOCK cuda_gpu_0
+    )
+endif()
+
+if(HAVE_ROCM)
+    add_executable(v2_perf_rocm_expert_tier_weight_streaming
+        performance/moe/Perf__ExpertTierWeightStreaming.cpp)
+    target_include_directories(
+        v2_perf_rocm_expert_tier_weight_streaming
+        PRIVATE ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(
+        v2_perf_rocm_expert_tier_weight_streaming
+        PRIVATE LLAMINAR_EXPERT_TIER_PERF_ROCM=1 __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(v2_perf_rocm_expert_tier_weight_streaming
+        llaminar2_core hip::host ${NUMA_LIBRARY})
+    if(NOT LLAMINAR_SHARED_CORE)
+        target_link_libraries(
+            v2_perf_rocm_expert_tier_weight_streaming
+            rocm_backend)
+    endif()
+    add_v2_test(V2_Perf_ROCm_ExpertTierWeightStreaming
+        COMMAND $<TARGET_FILE:v2_perf_rocm_expert_tier_weight_streaming>
+        LABELS "V2;Performance;ROCm;MoE;ExpertOverlay;WeightStreaming;Repack;AllCodebooks;RealModelShape;Economy;ByteExact"
+        MPI_PROCS 1
+        NO_MODELS
+        RESOURCE_LOCK rocm_gpu_0
+    )
+endif()
 
 # GPU Weight Loading Pipeline - VNNI Unpack (reverse repack) round-trip tests
 if(HAVE_CUDA OR HAVE_ROCM)

@@ -56,7 +56,7 @@ return tokens
 ```
 
 Keep graphs per-device and symmetric. Do not introduce nested multi-device
-sidecar graphs. LocalTP, LocalPP, NodeLocalTP, and ExpertOverlay must extend the
+sidecar graphs. LocalTP, LocalPP, NodeTP, and ExpertOverlay must extend the
 same transaction semantics with collective coordination, not invent separate
 state machines.
 
@@ -770,7 +770,7 @@ Track these modes in the dashboard even when implementation is pending:
 - SingleDevice CPU/CUDA/ROCm.
 - LocalTP CUDA deg2, ROCm deg2, ROCm deg4.
 - LocalPP CUDA/ROCm.
-- NodeLocalTP CPU sockets.
+- NodeTP CPU sockets.
 - ExpertOverlay cases such as GPU hot plus CPU cold and mixed CUDA/ROCm/CPU.
 
 Multi-device MTP must use common-prefix/common-accepted-count coordination.

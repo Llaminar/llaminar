@@ -12,6 +12,7 @@
 #include <stdexcept>
 
 #include "loaders/WeightSlicer.h"
+#include "config/GDNHeadAssignment.h"
 #include "models/qwen/Qwen2Schema.h"
 #include "models/qwen35/Qwen35Schema.h"
 #include "config/TensorParallelConfig.h"
@@ -188,7 +189,7 @@ TEST_F(Test__WeightSlicer, FusedQKV_GQA_DetectsSubBlocks)
     EXPECT_EQ(result->q_total, Q_DIM);
     EXPECT_EQ(result->k_total, KV_DIM);
     EXPECT_EQ(result->v_total, KV_DIM);
-    EXPECT_FALSE(result->replicate_qk);
+    EXPECT_FALSE(result->modulo_linked_gdn);
 }
 
 TEST_F(Test__WeightSlicer, FusedQKV_GQA_SlicesCorrectly_2Way)
@@ -214,10 +215,12 @@ TEST_F(Test__WeightSlicer, FusedQKV_GQA_SlicesCorrectly_2Way)
     EXPECT_EQ(r1->k.count, KV_DIM / 2);
 
     // V sub-block: same as K
-    EXPECT_EQ(r0->v.start, 0u);
-    EXPECT_EQ(r0->v.count, KV_DIM / 2);
-    EXPECT_EQ(r1->v.start, KV_DIM / 2);
-    EXPECT_EQ(r1->v.count, KV_DIM / 2);
+    ASSERT_EQ(r0->v.size(), 1u);
+    ASSERT_EQ(r1->v.size(), 1u);
+    EXPECT_EQ(r0->v.front().start, 0u);
+    EXPECT_EQ(r0->v.front().count, KV_DIM / 2);
+    EXPECT_EQ(r1->v.front().start, KV_DIM / 2);
+    EXPECT_EQ(r1->v.front().count, KV_DIM / 2);
 }
 
 TEST_F(Test__WeightSlicer, FusedQKV_NonFusedWeight_ReturnsNullopt)
@@ -245,10 +248,10 @@ TEST_F(Test__WeightSlicer, FusedQKV_GDN_Asymmetric_DetectsSubBlocks)
     EXPECT_EQ(result->q_total, 16u);
     EXPECT_EQ(result->k_total, 16u);
     EXPECT_EQ(result->v_total, 32u);
-    EXPECT_TRUE(result->replicate_qk); // GDN with n_v > n_k
+    EXPECT_TRUE(result->modulo_linked_gdn);
 }
 
-TEST_F(Test__WeightSlicer, FusedQKV_GDN_ReplicatesQK_ShardsV)
+TEST_F(Test__WeightSlicer, FusedQKV_GDN_CoShardsQKAndModuloLinkedV)
 {
     auto dims = makeGDNDimensions(4, 8, 4);
     WeightSlicer slicer(dims, qwen35Config());
@@ -259,26 +262,27 @@ TEST_F(Test__WeightSlicer, FusedQKV_GDN_ReplicatesQK_ShardsV)
     ASSERT_TRUE(r0.has_value());
     ASSERT_TRUE(r1.has_value());
 
-    // Q replicated: both ranks get full Q
+    // Q/K are true half-shards, so each participant computes half of the
+    // complete fused projection instead of repeating all Q/K rows.
     EXPECT_EQ(r0->q.start, 0u);
-    EXPECT_EQ(r0->q.count, 16u);
-    EXPECT_EQ(r1->q.start, 0u);
-    EXPECT_EQ(r1->q.count, 16u);
-
-    // K replicated: both ranks get full K
+    EXPECT_EQ(r0->q.count, 8u);
+    EXPECT_EQ(r1->q.start, 8u);
+    EXPECT_EQ(r1->q.count, 8u);
     EXPECT_EQ(r0->k.start, 0u);
-    EXPECT_EQ(r0->k.count, 16u);
-    EXPECT_EQ(r1->k.start, 0u);
-    EXPECT_EQ(r1->k.count, 16u);
+    EXPECT_EQ(r0->k.count, 8u);
+    EXPECT_EQ(r1->k.start, 8u);
+    EXPECT_EQ(r1->k.count, 8u);
 
-    // V sharded: 32 / 2 = 16 per rank
-    EXPECT_EQ(r0->v.start, 0u);
-    EXPECT_EQ(r0->v.count, 16u);
-    EXPECT_EQ(r1->v.start, 16u);
-    EXPECT_EQ(r1->v.count, 16u);
+    // Each repeat contributes the V heads linked to the rank's local K heads.
+    ASSERT_EQ(r0->v.size(), 2u);
+    ASSERT_EQ(r1->v.size(), 2u);
+    EXPECT_EQ(r0->v[0], (SliceSpec{0u, 8u}));
+    EXPECT_EQ(r0->v[1], (SliceSpec{16u, 8u}));
+    EXPECT_EQ(r1->v[0], (SliceSpec{8u, 8u}));
+    EXPECT_EQ(r1->v[1], (SliceSpec{24u, 8u}));
 }
 
-TEST_F(Test__WeightSlicer, FusedQKV_GDN_EqualHeads_NoReplication)
+TEST_F(Test__WeightSlicer, FusedQKV_GDN_EqualHeads_UsesTypedLinkedLayout)
 {
     // When n_k == n_v, no replication needed
     auto dims = makeGDNDimensions(4, 4, 4);
@@ -288,20 +292,91 @@ TEST_F(Test__WeightSlicer, FusedQKV_GDN_EqualHeads_NoReplication)
     auto result = slicer.computeFusedQKVSlice("blk.0.attn_qkv.weight", 48, 0, 2);
     ASSERT_TRUE(result.has_value());
 
-    EXPECT_FALSE(result->replicate_qk); // No replication when n_k == n_v
+    EXPECT_TRUE(result->modulo_linked_gdn);
+    ASSERT_EQ(result->v.size(), 1u);
 }
 
-TEST_F(Test__WeightSlicer, FusedQKV_GDN_IndivisibleV_Throws)
+TEST_F(Test__WeightSlicer, FusedQKV_GDN_NonIntegralRepeat_Throws)
 {
     // n_k=4, n_v=6, d_state=4 → Q=16, K=16, V=24
-    // n_v > n_k → replicate_qk=true (only V checked for divisibility)
-    // V=24 not divisible by 5 → throws
+    // Six value heads cannot express the model's v % n_k modular repeat as
+    // complete rounds, so the typed assignment must reject the geometry.
     auto dims = makeGDNDimensions(4, 6, 4);
     WeightSlicer slicer(dims, qwen35Config());
 
     // Total = 2*16 + 24 = 56
     EXPECT_THROW(
         slicer.computeFusedQKVSlice("blk.0.attn_qkv.weight", 56, 0, 5),
+        std::invalid_argument);
+}
+
+TEST_F(Test__WeightSlicer, GDNHeadAssignment_TotalAndDependencyClosed_TP2TP4TP8)
+{
+    constexpr int KEY_HEADS = 16;
+    constexpr int VALUE_HEADS = 32;
+
+    for (const int degree : {2, 4, 8})
+    {
+        std::vector<int> key_owner(KEY_HEADS, -1);
+        std::vector<int> value_owner(VALUE_HEADS, -1);
+
+        for (int rank = 0; rank < degree; ++rank)
+        {
+            const GDNHeadAssignment assignment =
+                GDNHeadAssignment::forEqualRank(
+                    KEY_HEADS, VALUE_HEADS, rank, degree);
+
+            EXPECT_EQ(assignment.localKeyHeads(), KEY_HEADS / degree);
+            EXPECT_EQ(assignment.localValueHeads(), VALUE_HEADS / degree);
+            EXPECT_EQ(assignment.repeatFactor(), 2);
+
+            for (int local_key = 0; local_key < assignment.localKeyHeads(); ++local_key)
+            {
+                const int global_key = assignment.keyHeads().start + local_key;
+                ASSERT_EQ(key_owner[global_key], -1);
+                key_owner[global_key] = rank;
+            }
+
+            for (int local_value = 0;
+                 local_value < assignment.localValueHeads();
+                 ++local_value)
+            {
+                const int global_value =
+                    assignment.globalValueHead(local_value);
+                const int local_key =
+                    assignment.localKeyHeadForValue(local_value);
+                ASSERT_EQ(value_owner[global_value], -1);
+                value_owner[global_value] = rank;
+                EXPECT_EQ(
+                    global_value % KEY_HEADS,
+                    assignment.keyHeads().start + local_key);
+            }
+        }
+
+        for (const int owner : key_owner)
+            EXPECT_GE(owner, 0) << "degree=" << degree;
+        for (const int owner : value_owner)
+            EXPECT_GE(owner, 0) << "degree=" << degree;
+    }
+}
+
+TEST_F(Test__WeightSlicer, GDNHeadAssignment_ProportionalBoundaryMustBeIntegral)
+{
+    const GDNHeadAssignment quarter = GDNHeadAssignment::fromPartition(
+        /*global_key_heads=*/16,
+        /*global_value_heads=*/48,
+        /*partition_start=*/16,
+        /*partition_count=*/16,
+        /*partition_total=*/64);
+    EXPECT_EQ(quarter.keyHeads(), (GDNHeadSpan{.start = 4, .count = 4}));
+    EXPECT_EQ(quarter.localValueHeads(), 12);
+    ASSERT_EQ(quarter.valueHeadSpans().size(), 3u);
+
+    EXPECT_THROW(
+        GDNHeadAssignment::fromPartition(16, 32, 1, 1, 64),
+        std::invalid_argument);
+    EXPECT_THROW(
+        GDNHeadAssignment::fromPartition(16, 30, 0, 32, 64),
         std::invalid_argument);
 }
 
@@ -475,8 +550,10 @@ TEST_F(Test__WeightSlicer, FusedQKVForAssignment_2Way)
     EXPECT_EQ(r1->q.count, Q_DIM / 2);
     EXPECT_EQ(r0->k.count, KV_DIM / 2);
     EXPECT_EQ(r1->k.count, KV_DIM / 2);
-    EXPECT_EQ(r0->v.count, KV_DIM / 2);
-    EXPECT_EQ(r1->v.count, KV_DIM / 2);
+    ASSERT_EQ(r0->v.size(), 1u);
+    ASSERT_EQ(r1->v.size(), 1u);
+    EXPECT_EQ(r0->v.front().count, KV_DIM / 2);
+    EXPECT_EQ(r1->v.front().count, KV_DIM / 2);
 }
 
 // =============================================================================
@@ -524,7 +601,7 @@ TEST_F(Test__WeightSlicer, FusedQKV_3EqualBlocks_Fallback)
     EXPECT_EQ(result->q_total, 100u);
     EXPECT_EQ(result->k_total, 100u);
     EXPECT_EQ(result->v_total, 100u);
-    EXPECT_FALSE(result->replicate_qk);
+    EXPECT_FALSE(result->modulo_linked_gdn);
 }
 
 // =============================================================================
@@ -741,15 +818,17 @@ TEST_F(Test__WeightSlicer, FusedQKV_GQA_AllDegrees_Llama3)
             EXPECT_EQ(r->q_total, Q_TOTAL);
             EXPECT_EQ(r->k_total, KV_TOTAL);
             EXPECT_EQ(r->v_total, KV_TOTAL);
-            EXPECT_FALSE(r->replicate_qk);
+            EXPECT_FALSE(r->modulo_linked_gdn);
 
             EXPECT_EQ(r->q.count, Q_TOTAL / tp) << "TP=" << tp << " rank=" << rank;
             EXPECT_EQ(r->k.count, KV_TOTAL / tp) << "TP=" << tp << " rank=" << rank;
-            EXPECT_EQ(r->v.count, KV_TOTAL / tp) << "TP=" << tp << " rank=" << rank;
+            ASSERT_EQ(r->v.size(), 1u);
+            EXPECT_EQ(r->v.front().count, KV_TOTAL / tp)
+                << "TP=" << tp << " rank=" << rank;
 
             q_total += r->q.count;
             k_total += r->k.count;
-            v_total += r->v.count;
+            v_total += r->v.front().count;
         }
 
         EXPECT_EQ(q_total, Q_TOTAL) << "TP=" << tp << " Q coverage";
@@ -762,7 +841,7 @@ TEST_F(Test__WeightSlicer, FusedQKV_GDN_AllDegrees_Qwen35_4B)
 {
     // Qwen3.5-4B GDN: n_k=16, n_v=32, d_state=128
     // Q=2048, K=2048, V=4096, total=8192
-    // n_v > n_k → replicate Q/K, shard V only
+    // n_v > n_k: co-shard Q/K and every modulo-linked V repeat.
     constexpr int NK = 16;
     constexpr int NV = 32;
     constexpr int DS = 128;
@@ -773,10 +852,12 @@ TEST_F(Test__WeightSlicer, FusedQKV_GDN_AllDegrees_Qwen35_4B)
 
     auto dims = makeGDNDimensions(NK, NV, DS);
 
-    for (int tp : {2, 4, 8, 16, 32})
+    for (int tp : {2, 4, 8, 16})
     {
         WeightSlicer slicer(dims, qwen35Config());
 
+        size_t q_total = 0;
+        size_t k_total = 0;
         size_t v_total = 0;
 
         for (int rank = 0; rank < tp; rank++)
@@ -784,21 +865,30 @@ TEST_F(Test__WeightSlicer, FusedQKV_GDN_AllDegrees_Qwen35_4B)
             auto r = slicer.computeFusedQKVSlice("blk.0.attn_qkv.weight", TOTAL, rank, tp);
             ASSERT_TRUE(r.has_value()) << "TP=" << tp << " rank=" << rank;
 
-            EXPECT_TRUE(r->replicate_qk) << "TP=" << tp;
+            EXPECT_TRUE(r->modulo_linked_gdn) << "TP=" << tp;
+            EXPECT_EQ(r->q.start, static_cast<size_t>(rank) * Q_ROWS / tp)
+                << "TP=" << tp << " rank=" << rank;
+            EXPECT_EQ(r->q.count, Q_ROWS / tp)
+                << "TP=" << tp << " rank=" << rank;
+            EXPECT_EQ(r->k, r->q) << "TP=" << tp << " rank=" << rank;
+            ASSERT_EQ(r->v.size(), 2u) << "TP=" << tp << " rank=" << rank;
 
-            // Q and K replicated: all ranks get full copy
-            EXPECT_EQ(r->q.start, 0u) << "TP=" << tp << " rank=" << rank;
-            EXPECT_EQ(r->q.count, Q_ROWS) << "TP=" << tp << " rank=" << rank;
-            EXPECT_EQ(r->k.start, 0u) << "TP=" << tp << " rank=" << rank;
-            EXPECT_EQ(r->k.count, K_ROWS) << "TP=" << tp << " rank=" << rank;
-
-            // V sharded
-            EXPECT_EQ(r->v.count, V_ROWS / tp) << "TP=" << tp << " rank=" << rank;
-            v_total += r->v.count;
+            q_total += r->q.count;
+            k_total += r->k.count;
+            for (const SliceSpec span : r->v)
+                v_total += span.count;
         }
 
+        EXPECT_EQ(q_total, Q_ROWS) << "TP=" << tp << " Q coverage";
+        EXPECT_EQ(k_total, K_ROWS) << "TP=" << tp << " K coverage";
         EXPECT_EQ(v_total, V_ROWS) << "TP=" << tp << " V coverage";
     }
+
+    WeightSlicer slicer(dims, qwen35Config());
+    EXPECT_THROW(
+        slicer.computeFusedQKVSlice(
+            "blk.0.attn_qkv.weight", TOTAL, 0, 32),
+        std::invalid_argument);
 }
 
 TEST_F(Test__WeightSlicer, Qwen35GDNValueHeadWeights_4B_TP2_AreDStateAligned)

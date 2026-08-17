@@ -1,12 +1,12 @@
 /**
  * @file MTPVerifierOutcomeStage.h
- * @brief Graph-owned terminal reduction and LocalTP publication for MTP.
+ * @brief Graph-owned participant-local terminal reduction for MTP.
  *
  * The stage is the explicit end of a grouped verifier graph.  Each participant
  * converts its full-vocabulary verifier logits into row-wise greedy tokens,
  * compares those tokens with its device-owned draft row, and writes its compact
- * speculative outcome.  A mirrored LocalTP graph therefore remains completely
- * participant-local and contains no compact control collective.
+ * speculative outcome. A mirrored TP graph therefore remains completely
+ * participant-local at every scope and contains no compact control collective.
  *
  * No allocation, host/device transfer, host scalar outcome, or stream
  * synchronization is permitted in execute().  Every address is a persistent
@@ -31,7 +31,7 @@ namespace llaminar2
      * @brief Capture the complete greedy verifier outcome transaction.
      *
      * In SingleDevice mode the sole participant performs the reduction. In a
-     * homogeneous mirrored LocalTP domain every participant performs identical
+     * homogeneous mirrored TP domain every participant performs identical
      * reduction math against its local full-vocabulary logits. This modest
      * duplicate arithmetic removes latency-dominated tiny collectives and makes
      * each child outcome ready on the stream that actually produced it.
@@ -53,7 +53,8 @@ namespace llaminar2
 
             MTPVerifierOutcomeOwnershipPolicy ownership_policy =
                 MTPVerifierOutcomeOwnershipPolicy::Unspecified;
-            bool mirrored_local_tp = false;
+            /** True when this participant's logits contain the full vocabulary. */
+            bool participant_full_vocabulary = false;
 
             std::string stage_name = "mtp_verifier_outcome";
         };

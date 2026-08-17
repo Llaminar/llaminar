@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include "backends/ComputeBackend.h"
 #include "planning/ClusterInventoryGatherer.h"
 #include "utils/MPIContext.h"
 
@@ -45,6 +46,21 @@ TEST(Test__ClusterInventoryGatherer, SingleRank_WorldSizeOne)
 
     EXPECT_EQ(inventory.world_size, 1);
     EXPECT_EQ(inventory.ranks.size(), 1u);
+}
+
+TEST(Test__ClusterInventoryGatherer, SingleRankOwnsWholeHostDespiteProcessNUMABinding)
+{
+    auto &devices = DeviceManager::instance();
+    devices.initialize(0, false);
+    ASSERT_EQ(devices.local_numa_node(), 0);
+
+    const auto inventory = gatherClusterInventory(nullptr);
+
+    EXPECT_EQ(devices.local_numa_node(), -1)
+        << "A sole MPI rank must not retain a socket-local accelerator filter";
+    EXPECT_EQ(inventory.world_size, 1);
+    EXPECT_EQ(inventory.total_gpus,
+              static_cast<int>(inventory.ranks.front().gpus.size()));
 }
 
 TEST(Test__ClusterInventoryGatherer, ExplicitTPDevices_OverridesDetected)
@@ -151,6 +167,10 @@ TEST(Test__ClusterInventoryGatherer, SingleRank_MemoryIsPerSocket)
     // Memory should be > 0
     EXPECT_GT(rank0.cpu_memory_bytes, 0u)
         << "cpu_memory_bytes should be populated";
+    EXPECT_GT(rank0.cpu.free_memory_bytes, 0u)
+        << "NUMA-local available memory must be an explicit admission authority";
+    EXPECT_LE(rank0.cpu.free_memory_bytes, rank0.cpu_memory_bytes)
+        << "available CPU memory cannot exceed the rank's NUMA-local total";
 
     // For single-rank (local_rank=0 with only 1 socket in fallback path,
     // or the full machine total), memory should not exceed what sysconf reports.

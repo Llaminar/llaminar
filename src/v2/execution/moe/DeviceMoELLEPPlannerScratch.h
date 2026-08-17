@@ -13,6 +13,7 @@
 
 #include "LeastLoadedExpertAssignment.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
@@ -55,6 +56,70 @@ namespace llaminar2
         uint32_t first_invalid_resident_mask = 0;
         int32_t first_invalid_owner = -1;
     };
+
+    /**
+     * @brief Reverse-index entry for one physical transfer-slot allocation.
+     *
+     * Projection needs to answer "does any live runtime descriptor still name
+     * this slot?" while leasing destination storage.  Scanning every
+     * layer/expert descriptor once for every candidate slot makes that query
+     * quadratic in model depth.  A graph-captured preflight instead builds one
+     * entry per slot in parallel, after which the allocator can authenticate a
+     * claim with constant work.
+     *
+     * Flattened claim locations use `layer * num_experts + expert`.  Keeping the
+     * two smallest locations makes duplicate diagnostics deterministic even
+     * though lanes publish claims in an arbitrary execution order.
+     */
+    struct alignas(16) DeviceMoETransferSlotClaimIndexEntry
+    {
+        uint32_t claim_count = 0;
+        uint32_t first_claim_flat = 0xffffffffu;
+        uint32_t second_claim_flat = 0xffffffffu;
+        uint32_t reserved = 0;
+    };
+
+    /**
+     * @brief Header for a stream-ordered reverse transfer-slot claim index.
+     *
+     * The header and its immediately following
+     * `DeviceMoETransferSlotClaimIndexEntry[slot_count]` array occupy one
+     * graph-lifetime workspace allocation.  A backend preflight kernel clears
+     * and rebuilds the complete record from the live runtime table immediately
+     * before command projection on the same non-default stream.  `ready` is
+     * published last; consumers reject stale geometry, invalid runtime layers,
+     * malformed claims, and duplicate physical ownership before leasing bytes.
+     */
+    struct alignas(16) DeviceMoETransferSlotClaimIndex
+    {
+        uint32_t magic = 0;
+        uint32_t version = 0;
+        uint32_t ready = 0;
+        uint32_t participant_id = 0;
+        uint32_t participant_count = 0;
+        uint32_t num_layers = 0;
+        uint32_t num_experts = 0;
+        uint32_t slot_count = 0;
+        uint32_t invalid_runtime_layers = 0;
+        uint32_t first_invalid_runtime_layer = 0xffffffffu;
+        uint32_t first_invalid_claim_flat = 0xffffffffu;
+        uint32_t first_duplicate_claim_flat = 0xffffffffu;
+        DeviceMoETransferSlotClaimSummary summary{};
+    };
+
+    /**
+     * @brief Return the persistent byte capacity required by one claim index.
+     *
+     * @param slot_count Exact physical transfer-directory entry count.
+     * @return Header plus one fixed-size reverse-index record per slot.
+     */
+    constexpr std::size_t deviceMoETransferSlotClaimIndexBytes(
+        uint32_t slot_count) noexcept
+    {
+        return sizeof(DeviceMoETransferSlotClaimIndex) +
+               static_cast<std::size_t>(slot_count) *
+                   sizeof(DeviceMoETransferSlotClaimIndexEntry);
+    }
 
     /**
      * @brief Device-published router economy evidence for one maintenance edge.
@@ -107,6 +172,8 @@ namespace llaminar2
     };
 
     static_assert(std::is_trivially_copyable_v<DeviceMoETransferSlotClaimSummary>);
+    static_assert(std::is_trivially_copyable_v<DeviceMoETransferSlotClaimIndexEntry>);
+    static_assert(std::is_trivially_copyable_v<DeviceMoETransferSlotClaimIndex>);
     static_assert(std::is_trivially_copyable_v<DeviceMoERouterBenefitSummary>);
     static_assert(std::is_trivially_copyable_v<DeviceMoELLEPLayerPlanScratch>);
 } // namespace llaminar2

@@ -20,8 +20,10 @@
 #include <limits>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <system_error>
 #include <tuple>
+#include <utility>
 
 namespace llaminar2
 {
@@ -157,6 +159,31 @@ namespace llaminar2
             return value;
         }
 
+        /**
+         * @brief Expand the explicit MPI-rank token in a diagnostic path.
+         *
+         * A rank-qualified path is an opt-in to per-participant evidence. Plain
+         * paths retain the ordinary rank-zero-only behavior, preventing two MPI
+         * processes from racing to replace the same report.
+         */
+        std::string expandRankToken(std::string path, int rank)
+        {
+            constexpr std::string_view token = "{rank}";
+            const std::string replacement = std::to_string(std::max(rank, 0));
+            size_t position = 0;
+            while ((position = path.find(token, position)) != std::string::npos)
+            {
+                path.replace(position, token.size(), replacement);
+                position += replacement.size();
+            }
+            return path;
+        }
+
+        bool hasRankToken(const std::string &path)
+        {
+            return path.find("{rank}") != std::string::npos;
+        }
+
         bool isExportRequested()
         {
             return exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json").size() > 0 ||
@@ -164,14 +191,24 @@ namespace llaminar2
                    isSummaryRequested();
         }
 
-        std::vector<std::string> filterListFromEnv()
+        const std::vector<std::string> &filterListFromEnv()
         {
-            std::vector<std::string> filters;
+            thread_local bool initialized = false;
+            thread_local std::string cached_value;
+            thread_local std::vector<std::string> filters;
             const char *env = DebugEnv::envValue("LLAMINAR_PERF_STATS_FILTER");
-            if (!env)
+            const std::string_view current = env ? std::string_view(env)
+                                                 : std::string_view{};
+            if (initialized && current == cached_value)
                 return filters;
 
-            std::stringstream stream(env);
+            initialized = true;
+            cached_value.assign(current);
+            filters.clear();
+            if (cached_value.empty())
+                return filters;
+
+            std::stringstream stream(cached_value);
             std::string item;
             while (std::getline(stream, item, ','))
             {
@@ -187,7 +224,7 @@ namespace llaminar2
             if (!isExportRequested())
                 return false;
 
-            const auto filters = filterListFromEnv();
+            const auto &filters = filterListFromEnv();
             return std::any_of(filters.begin(), filters.end(), [](const std::string &filter)
                                {
                                    return filter == "stage_gpu" ||
@@ -197,6 +234,64 @@ namespace llaminar2
                                           filter == "mtp_stage_gpu.*" ||
                                           filter.starts_with("mtp_stage_gpu.");
                                });
+        }
+
+        /**
+         * @brief Return whether the export filter explicitly requests CPU stages.
+         *
+         * Exporting an unrelated PerfStats family must not inject two
+         * clock-and-map operations around every CPU graph node.  Stage timing
+         * is therefore activated by its own domains rather than by the broad
+         * collector enablement gate.
+         */
+        bool filterRequestsStageCpuTiming()
+        {
+            if (!isExportRequested())
+                return false;
+
+            const auto &filters = filterListFromEnv();
+            return std::any_of(filters.begin(), filters.end(), [](const std::string &filter)
+                               {
+                                   return filter == "stage_cpu" ||
+                                          filter == "stage_cpu.*" ||
+                                          filter.starts_with("stage_cpu.") ||
+                                          filter == "stage_cpu_detail" ||
+                                          filter == "stage_cpu_detail.*" ||
+                                          filter.starts_with("stage_cpu_detail.");
+                               });
+        }
+
+        bool perfStatsCpuStageTimingRequested()
+        {
+            return legacyUnifiedProfilingRequested() ||
+                   isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING")) ||
+                   filterRequestsStageCpuTiming();
+        }
+
+        /**
+         * @brief Test whether an export filter can select records in a domain.
+         *
+         * A qualified filter such as `mtp.verifier_forward` necessarily
+         * enables its `mtp` producer even though the final name match happens
+         * when the report is rendered.
+         */
+        bool filterRequestsDomain(std::string_view domain)
+        {
+            const auto &filters = filterListFromEnv();
+            if (filters.empty())
+                return true;
+
+            return std::any_of(
+                filters.begin(),
+                filters.end(),
+                [domain](const std::string &filter)
+                {
+                    return filter == "*" || filter == "all" ||
+                           filter == domain ||
+                           (filter.size() > domain.size() &&
+                            filter.starts_with(domain) &&
+                            filter[domain.size()] == '.');
+                });
         }
 
         bool perfStatsGpuStageTimingRequested()
@@ -222,19 +317,33 @@ namespace llaminar2
                    isTruthyEnvValue(DebugEnv::envValue("LLAMINAR_GPU_STAGE_TIMING_DETAIL"));
         }
 
-        bool recordMatchesFilters(const PerfStatRecord &record, const std::vector<std::string> &filters)
+        /**
+         * @brief Test a retained map key before copying its strings and tags.
+         *
+         * Snapshot polling often asks for one small control-plane domain while
+         * stage diagnostics retain hundreds of thousands of distinct tagged
+         * records. Filtering the immutable key first keeps those unrelated
+         * records out of the collector's critical section copy cost.
+         */
+        bool keyMatchesFilters(
+            const PerfStatKey &key,
+            const std::vector<std::string> &filters)
         {
             if (filters.empty())
                 return true;
-            const std::string qualified = record.domain + "." + record.name;
             for (const auto &filter : filters)
             {
-                if (filter == "*" || filter == "all")
+                if (filter == "*" || filter == "all" ||
+                    key.domain == filter)
+                {
                     return true;
-                if (record.domain == filter || qualified == filter)
+                }
+                const std::string qualified = key.domain + "." + key.name;
+                if (qualified == filter ||
+                    qualified.starts_with(filter + "."))
+                {
                     return true;
-                if (qualified.starts_with(filter + "."))
-                    return true;
+                }
             }
             return false;
         }
@@ -344,11 +453,58 @@ namespace llaminar2
     {
         return debugEnv().profile.enabled ||
                debugEnv().gpu_stage_timing ||
+               perfStatsCpuStageTimingRequested() ||
                gpuStageTimingEnvRequested() ||
                perfStatsGpuStageTimingRequested() ||
                isSummaryRequested() ||
                exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json").size() > 0 ||
                exportPathFromEnv("LLAMINAR_PERF_STATS_CSV", "/tmp/llaminar_perf_stats.csv").size() > 0;
+    }
+
+    bool PerfStatsCollector::isDomainEnabled(std::string_view domain)
+    {
+        if (domain.empty())
+            return false;
+
+        // Explicit legacy profiling asks for the complete historical table.
+        if (debugEnv().profile.enabled || legacyUnifiedProfilingRequested())
+            return true;
+
+        // Family-specific environment switches remain authoritative even when
+        // an export filter is absent or narrower than the requested
+        // instrumentation. Filter-derived family activation is intentionally
+        // handled below, one exact domain at a time: asking for
+        // `stage_cpu_detail` must not also publish the coarse `stage_cpu`
+        // record around every graph node.
+        if ((domain == "stage_cpu" || domain == "stage_cpu_detail") &&
+            isTruthyEnvValue(
+                DebugEnv::envValue("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING")))
+        {
+            return true;
+        }
+        if ((domain == "stage_gpu" || domain == "mtp_stage_gpu") &&
+            (debugEnv().gpu_stage_timing || gpuStageTimingEnvRequested() ||
+             isTruthyEnvValue(
+                 DebugEnv::envValue("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING"))))
+        {
+            return true;
+        }
+
+        /*
+         * Reject an unrequested domain before consulting the broad export
+         * gate. This is the common hot-path case for a focused trace (for
+         * example, `mtp` while GEMM executes) and avoids repeated path parsing
+         * or clock reads in disabled kernel families.
+         */
+        if (!filterRequestsDomain(domain))
+            return false;
+        return isEnabled();
+    }
+
+    bool PerfStatsCollector::cpuStageTimingEnabled()
+    {
+        return debugEnv().profile.enabled ||
+               perfStatsCpuStageTimingRequested();
     }
 
     bool PerfStatsCollector::gpuStageEventTimingEnabled()
@@ -424,7 +580,7 @@ namespace llaminar2
         std::string device,
         Tags tags)
     {
-        if (!isEnabled())
+        if (!isDomainEnabled(domain))
             return;
 
         PerfStatKey key;
@@ -452,7 +608,7 @@ namespace llaminar2
         std::string device,
         Tags tags)
     {
-        if (!isEnabled())
+        if (!isDomainEnabled(domain))
             return;
 
         PerfStatKey key;
@@ -480,8 +636,9 @@ namespace llaminar2
         std::vector<PerfStatRecord> result;
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
-        result.reserve(s.records.size());
-        for (const auto &[key, acc] : s.records)
+        const auto append_record = [&result](
+                                       const PerfStatKey &key,
+                                       const PerfStatAccumulator &acc)
         {
             PerfStatRecord record;
             record.kind = key.kind;
@@ -495,8 +652,45 @@ namespace llaminar2
             record.total_ns = acc.total_ns;
             record.min_ns = acc.min_ns == std::numeric_limits<uint64_t>::max() ? 0 : acc.min_ns;
             record.max_ns = acc.max_ns;
-            if (recordMatchesFilters(record, filters))
-                result.push_back(std::move(record));
+            result.push_back(std::move(record));
+        };
+
+        /*
+         * PerfStatKey is ordered by kind and then domain. A single unqualified
+         * filter therefore has two exact contiguous ranges (counter/timer).
+         * This is the latency-sensitive path used by background-protocol
+         * polling and avoids scanning or copying unrelated stage evidence.
+         */
+        if (filters.size() == 1u && filters.front() != "*" &&
+            filters.front() != "all" &&
+            filters.front().find('.') == std::string::npos)
+        {
+            const std::string &domain = filters.front();
+            for (const auto kind : {
+                     PerfStatRecord::Kind::Counter,
+                     PerfStatRecord::Kind::Timer})
+            {
+                PerfStatKey lower;
+                lower.kind = kind;
+                lower.domain = domain;
+                auto record = s.records.lower_bound(lower);
+                while (record != s.records.end() &&
+                       record->first.kind == kind &&
+                       record->first.domain == domain)
+                {
+                    append_record(record->first, record->second);
+                    ++record;
+                }
+            }
+            return result;
+        }
+
+        result.reserve(s.records.size());
+        for (const auto &[key, acc] : s.records)
+        {
+            if (!keyMatchesFilters(key, filters))
+                continue;
+            append_record(key, acc);
         }
         return result;
     }
@@ -732,8 +926,7 @@ namespace llaminar2
 
     bool PerfStatsCollector::flushFromEnv()
     {
-        if (Logger::getInstance().getRank() > 0)
-            return true;
+        const int rank = Logger::getInstance().getRank();
 
         if (legacyUnifiedProfilingRequested())
         {
@@ -753,15 +946,30 @@ namespace llaminar2
                 });
         }
 
-        const std::string json_path =
+        std::string json_path =
             exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json");
-        const std::string csv_path =
+        std::string csv_path =
             exportPathFromEnv("LLAMINAR_PERF_STATS_CSV", "/tmp/llaminar_perf_stats.csv");
-        const bool summary_requested = isSummaryRequested();
+        const bool json_is_rank_qualified = hasRankToken(json_path);
+        const bool csv_is_rank_qualified = hasRankToken(csv_path);
+        if (rank > 0)
+        {
+            if (!json_is_rank_qualified)
+                json_path.clear();
+            if (!csv_is_rank_qualified)
+                csv_path.clear();
+        }
+        json_path = expandRankToken(std::move(json_path), rank);
+        csv_path = expandRankToken(std::move(csv_path), rank);
+
+        // Human-readable summaries remain a single rank-zero stream. Use a
+        // rank-qualified JSON or CSV path when participant-local evidence is
+        // required for TP/PP imbalance analysis.
+        const bool summary_requested = rank <= 0 && isSummaryRequested();
         if (json_path.empty() && csv_path.empty() && !summary_requested)
             return true;
 
-        const auto filters = filterListFromEnv();
+        const auto &filters = filterListFromEnv();
         auto &s = state();
         size_t version = 0;
         size_t json_version = 0;
@@ -813,13 +1021,13 @@ namespace llaminar2
         std::string phase,
         std::string device,
         Tags tags)
-        : enabled_(PerfStatsCollector::isEnabled()),
-          domain_(std::move(domain)),
+        : domain_(std::move(domain)),
           name_(std::move(name)),
           phase_(std::move(phase)),
           device_(std::move(device)),
           tags_(std::move(tags))
     {
+        enabled_ = PerfStatsCollector::isDomainEnabled(domain_);
         if (device_.empty() && ProfilingContext::hasDeviceContext())
             device_ = ProfilingContext::getCurrentDeviceKey();
         if (enabled_)

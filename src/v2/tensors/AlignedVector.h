@@ -166,7 +166,7 @@ namespace llaminar2
             if (new_capacity <= capacity_)
                 return;
 
-            T *new_data = allocate_raw(new_capacity);
+            T *new_data = allocate_raw(new_capacity, ALIGNMENT);
 
             if (data_)
             {
@@ -183,6 +183,50 @@ namespace llaminar2
 
             data_ = new_data;
             capacity_ = new_capacity;
+        }
+
+        /**
+         * @brief Reserve storage with an explicit minimum address alignment.
+         *
+         * NUMA receive buffers must begin on a page boundary even when their
+         * logical payload is smaller than one page.  Ordinary vectors retain
+         * the cache-line default; infrastructure with a stronger ownership
+         * contract opts in through this method.  Existing elements are copied
+         * if the current allocation does not satisfy @p minimum_alignment.
+         *
+         * @param new_capacity Minimum element capacity after the call.
+         * @param minimum_alignment Power-of-two byte alignment, at least 64.
+         * @throws std::invalid_argument For a non-power-of-two alignment.
+         */
+        void reserve_aligned(
+            size_t new_capacity,
+            size_t minimum_alignment)
+        {
+            minimum_alignment = std::max(minimum_alignment, ALIGNMENT);
+            if ((minimum_alignment & (minimum_alignment - 1)) != 0)
+            {
+                throw std::invalid_argument(
+                    "AlignedVector minimum alignment must be a power of two");
+            }
+            const bool current_alignment_satisfies =
+                !data_ ||
+                (reinterpret_cast<uintptr_t>(data_) % minimum_alignment) == 0;
+            if (new_capacity <= capacity_ && current_alignment_satisfies)
+                return;
+
+            const size_t target_capacity =
+                std::max(new_capacity, capacity_);
+            T *new_data = allocate_raw(
+                target_capacity, minimum_alignment);
+            if (data_)
+            {
+                std::uninitialized_copy_n(data_, size_, new_data);
+                for (size_t i = 0; i < size_; ++i)
+                    data_[i].~T();
+                std::free(data_);
+            }
+            data_ = new_data;
+            capacity_ = target_capacity;
         }
 
         /// Resize vector (may allocate/deallocate)
@@ -256,6 +300,26 @@ namespace llaminar2
             size_ = new_size;
         }
 
+        /**
+         * @brief Resize without first-touch using an explicit allocation alignment.
+         *
+         * This combines @ref reserve_aligned with the uninitialized growth
+         * semantics required by DMA, MPI, and NUMA-bound destination buffers.
+         * The caller must overwrite every new element before reading it.
+         */
+        void resize_uninitialized_aligned(
+            size_t new_size,
+            size_t minimum_alignment)
+        {
+            reserve_aligned(new_size, minimum_alignment);
+            if (new_size < size_)
+            {
+                for (size_t i = new_size; i < size_; ++i)
+                    data_[i].~T();
+            }
+            size_ = new_size;
+        }
+
         /// Clear all elements
         void clear()
         {
@@ -264,6 +328,32 @@ namespace llaminar2
                 data_[i].~T();
             }
             size_ = 0;
+        }
+
+        /**
+         * @brief Release capacity when the vector no longer owns live data.
+         *
+         * Large packed-weight staging arrays call this after their temporary
+         * representation has been consumed.  Matching `std::vector` semantics
+         * keeps aligned storage usable for those arrays without preserving a
+         * second, unexpectedly resident copy of model weights.
+         */
+        void shrink_to_fit()
+        {
+            if (size_ == capacity_)
+                return;
+
+            if (size_ == 0)
+            {
+                AlignedVector empty;
+                swap(empty);
+                return;
+            }
+
+            AlignedVector compact;
+            compact.resize_uninitialized(size_);
+            std::uninitialized_copy_n(data_, size_, compact.data_);
+            swap(compact);
         }
 
         // ========== Element Access ==========
@@ -353,13 +443,21 @@ namespace llaminar2
         /// Get alignment of data pointer
         size_t alignment() const { return ALIGNMENT; }
 
+        /** @return Whether the current address satisfies @p byte_alignment. */
+        bool is_aligned_to(size_t byte_alignment) const
+        {
+            return byte_alignment != 0 &&
+                   (byte_alignment & (byte_alignment - 1)) == 0 &&
+                   (reinterpret_cast<uintptr_t>(data_) % byte_alignment) == 0;
+        }
+
     private:
         T *data_;
         size_t size_;
         size_t capacity_;
 
         /// Allocate aligned memory (raw, uninitialized)
-        T *allocate_raw(size_t n)
+        T *allocate_raw(size_t n, size_t minimum_alignment)
         {
             if (n == 0)
                 return nullptr;
@@ -372,13 +470,16 @@ namespace llaminar2
             // neighboring heap bytes.  Page-aligning large allocations keeps
             // strict mbind()/move_pages() checks scoped to this vector.
             size_t alloc_bytes = n * sizeof(T);
-            size_t allocation_alignment = ALIGNMENT;
+            size_t allocation_alignment =
+                std::max(ALIGNMENT, minimum_alignment);
 #ifdef __linux__
             const long page_size = sysconf(_SC_PAGESIZE);
             if (page_size > static_cast<long>(ALIGNMENT) &&
                 alloc_bytes >= static_cast<size_t>(page_size))
             {
-                allocation_alignment = static_cast<size_t>(page_size);
+                allocation_alignment = std::max(
+                    allocation_alignment,
+                    static_cast<size_t>(page_size));
             }
 #endif
             size_t aligned_bytes = (alloc_bytes + allocation_alignment - 1) &
@@ -405,7 +506,7 @@ namespace llaminar2
         /// Allocate and default-initialize
         void allocate(size_t n)
         {
-            data_ = allocate_raw(n);
+            data_ = allocate_raw(n, ALIGNMENT);
         }
     };
 

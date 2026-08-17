@@ -4,6 +4,11 @@
 #include "tensors/BlockStructures.h"
 #include "tensors/NativeVnniFormatInfo.h"
 
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+
 /**
  * @file WeightMemoryEstimator.cpp
  * @brief Estimates native and prepared weight memory across CPU and GPU devices.
@@ -83,6 +88,67 @@ namespace llaminar2
                    name.find("lm_head") != std::string::npos;
         }
 
+        /**
+         * @brief Identify the three routed-expert parent tensors.
+         *
+         * Shared experts deliberately use the `shexp` spelling and remain part
+         * of the continuation's non-routed model authority. Matching the full
+         * suffix avoids treating ordinary dense FFN tensors as expert slabs.
+         */
+        bool isRoutedExpertTensor(const std::string &name)
+        {
+            return name.ends_with(".ffn_gate_exps.weight") ||
+                   name.ends_with(".ffn_up_exps.weight") ||
+                   name.ends_with(".ffn_down_exps.weight");
+        }
+
+        /** @brief Scale an integral tensor measure by an exact expert fraction. */
+        size_t selectedExpertFraction(
+            size_t complete,
+            int selected,
+            int total)
+        {
+            if (selected == 0 || complete == 0)
+                return 0;
+            if (selected == total)
+                return complete;
+
+            const size_t selected_size = static_cast<size_t>(selected);
+            const size_t total_size = static_cast<size_t>(total);
+            const size_t complete_quotient = complete / total_size;
+            const size_t complete_remainder = complete % total_size;
+            if (complete_quotient >
+                std::numeric_limits<size_t>::max() / selected_size)
+                throw std::overflow_error(
+                    "Routed-expert memory fraction overflows size_t");
+            const size_t quotient_bytes =
+                complete_quotient * selected_size;
+            if (complete_remainder >
+                (std::numeric_limits<size_t>::max() - total_size + 1u) /
+                    selected_size)
+            {
+                throw std::overflow_error(
+                    "Routed-expert memory remainder overflows size_t");
+            }
+            const size_t remainder_bytes =
+                (complete_remainder * selected_size + total_size - 1u) /
+                total_size;
+            if (quotient_bytes >
+                std::numeric_limits<size_t>::max() - remainder_bytes)
+            {
+                throw std::overflow_error(
+                    "Routed-expert memory total overflows size_t");
+            }
+
+            /*
+             * Expert parents are expert-major GGUF tensors, so their byte and
+             * element counts are normally exactly divisible. Round upward for
+             * malformed or future padded layouts: admission may be
+             * conservative, but it must never undercount a resident slice.
+             */
+            return quotient_bytes + remainder_bytes;
+        }
+
         bool isQuantizedFormat(const std::string &quant_type)
         {
             return quant_type != "F32" &&
@@ -122,6 +188,82 @@ namespace llaminar2
             return bytes;
         }
     } // anonymous namespace
+
+    DeviceWeightResidency::DeviceWeightResidency(
+        Kind kind,
+        int model_expert_count,
+        std::vector<int> selected_by_layer)
+        : kind_(kind),
+          model_expert_count_(model_expert_count),
+          selected_by_layer_(std::move(selected_by_layer))
+    {
+        if (kind_ == Kind::FullModel)
+        {
+            if (model_expert_count_ != 0 || !selected_by_layer_.empty())
+                throw std::invalid_argument(
+                    "Full-model weight residency cannot carry routed-expert selections");
+            return;
+        }
+        if (model_expert_count_ <= 0 || selected_by_layer_.empty())
+        {
+            throw std::invalid_argument(
+                "Selected routed-expert residency requires positive model geometry and layer counts");
+        }
+        for (size_t layer = 0; layer < selected_by_layer_.size(); ++layer)
+        {
+            const int count = selected_by_layer_[layer];
+            if (count < 0 || count > model_expert_count_)
+            {
+                throw std::invalid_argument(
+                    "Selected routed-expert count for layer " +
+                    std::to_string(layer) + " is outside [0, " +
+                    std::to_string(model_expert_count_) + "]");
+            }
+        }
+    }
+
+    DeviceWeightResidency
+    DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+        int model_expert_count,
+        std::vector<int> selected_by_layer)
+    {
+        return DeviceWeightResidency(
+            Kind::ContinuationWithSelectedRoutedExperts,
+            model_expert_count,
+            std::move(selected_by_layer));
+    }
+
+    DeviceWeightResidency
+    DeviceWeightResidency::selectedRoutedExpertsOnly(
+        int model_expert_count,
+        std::vector<int> selected_by_layer)
+    {
+        return DeviceWeightResidency(
+            Kind::SelectedRoutedExpertsOnly,
+            model_expert_count,
+            std::move(selected_by_layer));
+    }
+
+    bool DeviceWeightResidency::includesNonRoutedWeights() const noexcept
+    {
+        return kind_ != Kind::SelectedRoutedExpertsOnly;
+    }
+
+    bool DeviceWeightResidency::selectsRoutedExperts() const noexcept
+    {
+        return kind_ != Kind::FullModel;
+    }
+
+    int DeviceWeightResidency::selectedRoutedExpertsForLayer(int layer) const
+    {
+        if (layer < 0 || static_cast<size_t>(layer) >= selected_by_layer_.size())
+        {
+            throw std::out_of_range(
+                "Routed-expert residency has no owner-map entry for layer " +
+                std::to_string(layer));
+        }
+        return selected_by_layer_[static_cast<size_t>(layer)];
+    }
 
     float WeightMemoryEstimator::getNativeBytesPerWeight(const std::string &quant_type)
     {
@@ -189,18 +331,26 @@ namespace llaminar2
         return 1.125f; // Default: assume int8 packing
     }
 
-    bool WeightMemoryEstimator::isShardedTensor(const std::string &name)
+    TensorParallelWeightShardAxis
+    WeightMemoryEstimator::tensorParallelShardAxis(const std::string &name)
     {
-        // Column-parallel: attn_q, attn_k, attn_v, ffn_gate, ffn_up, output (lm_head)
-        // Row-parallel: attn_output (Wo), ffn_down
-        return name.find("attn_q") != std::string::npos ||
-               name.find("attn_k") != std::string::npos ||
-               name.find("attn_v") != std::string::npos ||
-               name.find("attn_output") != std::string::npos ||
-               name.find("ffn_gate") != std::string::npos ||
-               name.find("ffn_up") != std::string::npos ||
-               name.find("ffn_down") != std::string::npos ||
-               name == "output.weight";
+        // Test row-parallel names first: "attn_output" also begins with the
+        // broader attention prefix but retains its full output width.
+        if (name.find("attn_output") != std::string::npos ||
+            name.find("ffn_down") != std::string::npos)
+        {
+            return TensorParallelWeightShardAxis::ReductionDimension;
+        }
+        if (name.find("attn_q") != std::string::npos ||
+            name.find("attn_k") != std::string::npos ||
+            name.find("attn_v") != std::string::npos ||
+            name.find("ffn_gate") != std::string::npos ||
+            name.find("ffn_up") != std::string::npos ||
+            name == "output.weight")
+        {
+            return TensorParallelWeightShardAxis::OutputColumns;
+        }
+        return TensorParallelWeightShardAxis::Replicated;
     }
 
     bool WeightMemoryEstimator::isReplicatedTensor(const std::string &name)
@@ -218,11 +368,27 @@ namespace llaminar2
         int shard_index,
         int total_shards,
         int first_layer,
-        int last_layer)
+        int last_layer,
+        const DeviceWeightResidency &residency)
     {
+        (void)shard_index;
         if (last_layer < 0)
         {
             last_layer = profile.n_layers - 1;
+        }
+
+        if (residency.selectsRoutedExperts())
+        {
+            if (profile.expert_count <= 0)
+            {
+                throw std::invalid_argument(
+                    "Selected routed-expert memory planning requires model expert_count metadata");
+            }
+            if (profile.expert_count != residency.modelExpertCount())
+            {
+                throw std::invalid_argument(
+                    "Routed-expert residency denominator does not match the model profile");
+            }
         }
 
         WeightEstimate est;
@@ -246,10 +412,36 @@ namespace llaminar2
             // In a real PP setup you'd filter embedding to first stage and lm_head to last,
             // but for estimation this is conservative (slight overcount).
 
-            size_t native = t.native_bytes;
+            const bool routed_expert_tensor = isRoutedExpertTensor(t.name);
+            if (!routed_expert_tensor && !residency.includesNonRoutedWeights())
+                continue;
+
+            int selected_routed_experts = profile.expert_count;
+            if (routed_expert_tensor && residency.selectsRoutedExperts())
+            {
+                if (t.layer_index < 0)
+                {
+                    throw std::invalid_argument(
+                        "Routed-expert tensor lacks a model layer index: " + t.name);
+                }
+                selected_routed_experts =
+                    residency.selectedRoutedExpertsForLayer(t.layer_index);
+                if (selected_routed_experts == 0)
+                    continue;
+            }
+
+            size_t native = routed_expert_tensor && residency.selectsRoutedExperts()
+                                ? selectedExpertFraction(
+                                      t.native_bytes,
+                                      selected_routed_experts,
+                                      profile.expert_count)
+                                : t.native_bytes;
 
             // TP sharding: divide shardable weights by shard count
-            if (total_shards > 1 && isShardedTensor(t.name))
+            if (total_shards > 1 &&
+                tensorParallelShardAxis(t.name) !=
+                    TensorParallelWeightShardAxis::Replicated &&
+                !(routed_expert_tensor && residency.selectsRoutedExperts()))
             {
                 native = native / static_cast<size_t>(total_shards);
             }
@@ -303,8 +495,17 @@ namespace llaminar2
                 }
                 else
                 {
-                    size_t elements = t.elements;
-                    if (total_shards > 1 && isShardedTensor(t.name))
+                    size_t elements =
+                        routed_expert_tensor && residency.selectsRoutedExperts()
+                            ? selectedExpertFraction(
+                                  t.elements,
+                                  selected_routed_experts,
+                                  profile.expert_count)
+                            : t.elements;
+                    if (total_shards > 1 &&
+                        tensorParallelShardAxis(t.name) !=
+                            TensorParallelWeightShardAxis::Replicated &&
+                        !(routed_expert_tensor && residency.selectsRoutedExperts()))
                     {
                         elements =
                             elements / static_cast<size_t>(total_shards);
@@ -332,8 +533,17 @@ namespace llaminar2
             {
                 // CPU: VNNI packing
                 float bytes_per_weight = getCPUPackedBytesPerWeight(t.quant_type);
-                size_t elements = t.elements;
-                if (total_shards > 1 && isShardedTensor(t.name))
+                size_t elements =
+                    routed_expert_tensor && residency.selectsRoutedExperts()
+                        ? selectedExpertFraction(
+                              t.elements,
+                              selected_routed_experts,
+                              profile.expert_count)
+                        : t.elements;
+                if (total_shards > 1 &&
+                    tensorParallelShardAxis(t.name) !=
+                        TensorParallelWeightShardAxis::Replicated &&
+                    !(routed_expert_tensor && residency.selectsRoutedExperts()))
                 {
                     elements = elements / static_cast<size_t>(total_shards);
                 }

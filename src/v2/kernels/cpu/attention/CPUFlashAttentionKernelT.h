@@ -4046,7 +4046,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (PerfStatsCollector::isEnabled())
+            if (PerfStatsCollector::isDomainEnabled("kernel"))
             {
                 /*
                  * Report the branch that will actually execute, rather than
@@ -6570,7 +6570,8 @@ namespace llaminar2
         // TurboQuant fused native attention (zero shadow buffers)
         //
         // Exploits the orthogonality of the TQ rotation matrix:
-        //   dot(Q, dequant(K)) = (norm/√D) · dot(Π·Q, centroids(K))
+        //   dot(Q, dequant(K)) = (reconstruction_norm/√D) ·
+        //                           dot(Π·Q, centroids(K))
         // Pre-rotates Q once per head [O(D²)], then per KV position [O(D)].
         //
         // V accumulation in rotated centroid space, one final Πᵀ at end.
@@ -6685,7 +6686,7 @@ namespace llaminar2
                 launch_policy_.explicit_kv_tile);
 
             // V accumulation in rotated space uses 1/√D scaling:
-            // rotated_accum accumulates weight × norm × centroids.
+            // rotated_accum accumulates weight × reconstruction_norm × centroids.
             // The 1/√D from TQ descale is deferred to the final inverse rotation step.
             const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(head_dim));
 

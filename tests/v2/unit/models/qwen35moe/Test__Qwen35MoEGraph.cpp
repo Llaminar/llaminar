@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "collective/IGlobalTPContext.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/compute_stages/stages/GDNLiveStateLocalizeStage.h"
@@ -21,6 +22,8 @@
 #include "execution/local_execution/graph/GraphResolver.h"
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
+#include "loaders/ExpertGemmRegistry.h"
+#include "loaders/ModelContext.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "models/qwen35moe/Qwen35MoESchema.h"
 #include "kernels/KernelFactory.h"
@@ -42,6 +45,134 @@ using namespace llaminar2::test;
 
 namespace
 {
+    /**
+     * @brief Construction-only two-rank TP context for symmetric graph tests.
+     *
+     * The graph test never executes a collective. Returning failure from every
+     * data operation makes an accidental execution immediately visible while
+     * still exposing the exact domain identity consumed during lowering.
+     */
+    class ConstructionGlobalTPContext final : public IGlobalTPContext
+    {
+    public:
+        /** @brief Bind one participant index in a fixed two-rank domain. */
+        explicit ConstructionGlobalTPContext(int participant_index)
+            : participant_index_(participant_index)
+        {
+        }
+
+        int degree() const override { return 2; }
+        int myIndex() const override { return participant_index_; }
+        CollectiveBackendType backend() const override
+        {
+            return CollectiveBackendType::MPI;
+        }
+        MPI_Comm communicator() const override { return MPI_COMM_SELF; }
+        int domainId() const override { return 37; }
+        const std::vector<int> &worldRanks() const override
+        {
+            return world_ranks_;
+        }
+        GlobalDeviceAddress localDevice() const override
+        {
+            return GlobalDeviceAddress::cpu(participant_index_);
+        }
+        void barrier() const override {}
+        bool allreduce(TensorBase *) override { return false; }
+        bool broadcast(TensorBase *, int = 0) override { return false; }
+        bool allgather(const TensorBase *, TensorBase *) override
+        {
+            return false;
+        }
+        bool gatherVariableFloatRecordsToRoot(
+            const float *,
+            size_t,
+            float *,
+            size_t,
+            size_t,
+            int,
+            size_t &,
+            const std::string &) override
+        {
+            return false;
+        }
+        bool broadcastFloatElements(
+            TensorBase *,
+            size_t,
+            int,
+            const std::string &) override
+        {
+            return false;
+        }
+        bool send(const TensorBase *, int) override { return false; }
+        bool recv(TensorBase *, int) override { return false; }
+
+    private:
+        int participant_index_ = 0;
+        std::vector<int> world_ranks_{0, 1};
+    };
+
+    /** @brief Prepared expert engine whose metadata is sufficient for lowering. */
+    class ConstructionExpertGemm final : public ITensorGemm
+    {
+    public:
+        /** @brief Bind the expert weight role represented by this engine. */
+        explicit ConstructionExpertGemm(
+            ExpertGemmRegistry::WeightRole role)
+            : role_(role)
+        {
+            payload_[0] = 1u;
+            scale_[0] = 1.0f;
+        }
+
+        bool supports_device(int) const override { return true; }
+
+        bool multiply_tensor(
+            const TensorBase *,
+            TensorBase *,
+            int,
+            int,
+            int,
+            bool,
+            float,
+            float,
+            const TensorBase *,
+            const IMPIContext *,
+            int,
+            DeviceWorkspaceManager *,
+            int) override
+        {
+            return false;
+        }
+
+        bool exportNativeVNNIMatrixDesc(
+            DeviceNativeVNNIMatrixDesc &out) override
+        {
+            out = {};
+            out.payload = payload_;
+            out.scales = scale_;
+            out.blocks_per_row = 1;
+            out.codebook_id = 4;
+            if (role_ == ExpertGemmRegistry::WeightRole::DOWN)
+            {
+                out.n = 4;
+                out.k = 3;
+            }
+            else
+            {
+                out.n = 3;
+                out.k = 4;
+            }
+            return true;
+        }
+
+    private:
+        ExpertGemmRegistry::WeightRole role_ =
+            ExpertGemmRegistry::WeightRole::GATE;
+        uint8_t payload_[16] = {};
+        float scale_[1] = {};
+    };
+
     bool hasDependency(const ComputeGraph &graph, const std::string &node_name, const std::string &dependency)
     {
         const auto *node = graph.getNode(node_name);
@@ -216,6 +347,111 @@ namespace
         return plan;
     }
 
+    /** @brief Build the production-shaped two-rank CPU NodeTP overlay plan. */
+    std::shared_ptr<MoERoutedExpertPlacementPlan> makeNodeTPOverlayPlan()
+    {
+        constexpr const char *kDomain = "cpu_node_tp";
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+        plan->enabled = true;
+        plan->topology = RoutedExpertPlacementTopology::SingleDomain;
+        plan->continuation_domain = kDomain;
+        plan->base_model_domain = kDomain;
+        plan->shared_expert_domain = kDomain;
+        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+        plan->continuation_domain_spec.domain = kDomain;
+        plan->continuation_domain_spec.logical_root_participant = 0;
+        plan->continuation_domain_spec.setDensePolicy(
+            DenseParallelPolicy::TensorParallel);
+        plan->continuation_domain_spec.hidden_layout =
+            MoEContinuationActivationLayout::ReplicatedHidden;
+
+        auto dense = denseDomain(
+            kDomain,
+            ExecutionDomainScope::NODE_LOCAL,
+            CollectiveBackendType::MPI,
+            {GlobalDeviceAddress::cpu(0, "node0"),
+             GlobalDeviceAddress::cpu(1, "node0")});
+        dense.ranks = {0, 1};
+        plan->dense_domains = {std::move(dense)};
+        plan->domains = {expertDomain(
+            kDomain,
+            ExecutionDomainScope::NODE_LOCAL,
+            CollectiveBackendType::MPI,
+            RoutedExpertComputePolicy::Apportioned,
+            {GlobalDeviceAddress::cpu(0, "node0"),
+             GlobalDeviceAddress::cpu(1, "node0")},
+            {0, 1})};
+        plan->routed_tiers = {{
+            .name = "priority_0",
+            .domain = kDomain,
+            .priority = 0,
+            .max_experts_per_layer = 2,
+            .memory_budget_bytes = 4096,
+            .fallback = true,
+        }};
+        plan->placements = {{
+            .layer = 0,
+            .routed_expert_tier = {0, 0},
+        }};
+        return plan;
+    }
+
+    /**
+     * @brief Build the model-owned prepared registry used by sparse lowering.
+     */
+    std::shared_ptr<ModelContext> makeNodeTPOverlayModelContext(
+        const MoERoutedExpertPlacementPlan &plan)
+    {
+        auto model_ctx = ModelContext::createForTesting(
+            "node_tp_overlay_test.gguf",
+            nullptr,
+            /*block_count=*/2,
+            /*with_weight_manager=*/true);
+        if (!model_ctx || !model_ctx->concreteWeightManager())
+        {
+            throw std::runtime_error(
+                "NodeTP graph test could not create a prepared weight registry");
+        }
+
+        auto &registry =
+            model_ctx->concreteWeightManager()->expertGemmRegistry();
+        const auto owner_map = MoEExpertOwnerMap::build(plan);
+        for (const auto &participant : owner_map.participants())
+        {
+            const auto mask = owner_map.expertMaskForParticipant(
+                /*layer_idx=*/0,
+                participant.participant_id,
+                /*num_experts=*/2);
+            for (int expert = 0; expert < 2; ++expert)
+            {
+                if (!mask[static_cast<size_t>(expert)])
+                    continue;
+                for (const auto role : {
+                         ExpertGemmRegistry::WeightRole::GATE,
+                         ExpertGemmRegistry::WeightRole::UP,
+                         ExpertGemmRegistry::WeightRole::DOWN,
+                     })
+                {
+                    auto engine =
+                        std::make_shared<ConstructionExpertGemm>(role);
+                    registry.registerEngineForParticipant(
+                        participant.domain_name,
+                        participant.device,
+                        participant.world_rank_known
+                            ? participant.world_rank
+                            : -1,
+                        participant.domain_participant_index,
+                        /*layer_idx=*/0,
+                        expert,
+                        role,
+                        engine.get(),
+                        engine);
+                }
+            }
+        }
+        return model_ctx;
+    }
+
     std::shared_ptr<MoERoutedExpertPlacementPlan> makeLocalTPApportionedOverlayPlan(const std::string &domain_name)
     {
         auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
@@ -233,7 +469,7 @@ namespace
 
         plan->domains.push_back(expertDomain(
             domain_name,
-            ExecutionDomainScope::LOCAL,
+            ExecutionDomainScope::RANK_LOCAL,
             CollectiveBackendType::HOST,
             RoutedExpertComputePolicy::Apportioned,
             {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
@@ -426,6 +662,26 @@ namespace
                 std::fill(counts.begin(), counts.end(), 0);
             return true;
         }
+        void enableAsyncDecodeHistogramDrain(
+            RuntimeExpertHistogramSourceMask sources) override
+        {
+            async_sources = sources;
+            async_enabled = true;
+        }
+        RuntimeExpertHistogramDrainResult
+        progressAsyncDecodeHistogramDrain(
+            DecodeExpertHistogram &histogram) override
+        {
+            if (!async_enabled)
+            {
+                return RuntimeExpertHistogramDrainResult::failed(
+                    "fake async drain was not enabled");
+            }
+            return syncDecodeHistogramToHost(histogram)
+                       ? RuntimeExpertHistogramDrainResult::ready()
+                       : RuntimeExpertHistogramDrainResult::failed(
+                             "fake async drain failed");
+        }
         bool captureDecodeHistogramCounts(
             std::vector<uint64_t> &selected_counts,
             std::vector<uint64_t> &local_counts,
@@ -452,6 +708,9 @@ namespace
             std::fill(counts.begin(), counts.end(), 0);
         }
         void resetDecodeRuntimeState(void * = nullptr) override {}
+
+        RuntimeExpertHistogramSourceMask async_sources{};
+        bool async_enabled = false;
 
         void *producer_stream = nullptr;
     };
@@ -695,6 +954,11 @@ namespace
         buffers.extensions[BufferId::MOE_EXPERT_INDICES] = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(top_k)});
         buffers.extensions[BufferId::MOE_EXPERT_WEIGHTS] = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(top_k)});
         buffers.extensions[BufferId::MOE_COMBINED_OUTPUT] = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(d_model)});
+        buffers.extensions[BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS] =
+            arena.fp32(
+                {static_cast<size_t>(tokens),
+                 static_cast<size_t>(top_k),
+                 static_cast<size_t>(d_model)});
         buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(d_model)});
         buffers.extensions[BufferId::MOE_GATE_SCRATCH] = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(num_experts)});
         buffers.extensions[BufferId::MOE_UP_SCRATCH] = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(num_experts)});
@@ -867,6 +1131,87 @@ TEST(Test__Qwen35MoEGraph, ReplicatedLocalTPOverlayUsesFullLocalExpertGraphWitho
         "layer0_moe_expert_ffn_overlay_fast"));
 }
 
+/**
+ * @brief Both NodeTP rank graphs publish routed output before dense reuse.
+ *
+ * The sparse return protocol completes the routed sum only on logical root
+ * participant zero. The production graph must therefore contain one identical
+ * rooted continuation broadcast on root and peer graphs, ordered before both
+ * the shared-expert collective and the final MoE combine.
+ */
+TEST(Test__Qwen35MoEGraph,
+     DistributedNodeTPOverlayBroadcastsRootedRoutedOutputSymmetrically)
+{
+    const auto plan = makeNodeTPOverlayPlan();
+    const auto model_ctx = makeNodeTPOverlayModelContext(*plan);
+    for (int rank = 0; rank < 2; ++rank)
+    {
+        ConstructionGlobalTPContext tp_ctx(rank);
+        GraphConfig config = makeMoEConfig(&tp_ctx);
+        config.tp_device_idx = rank;
+        config.moe.routed_expert_plan = plan;
+        config.moe.overlay_mpi_ctx =
+            std::make_shared<MockMPIContext>(rank, 2);
+        config.moe.expert_overlay_runtime_plan =
+            resolveMoEExpertOverlayRuntimePlan(
+                config.moe.routed_expert_plan,
+                MoEExpertOverlayRuntimeResolverOptions{
+                    .current_world_rank = rank,
+                    .validate_mvp_root_reachability = false,
+                });
+        config.refreshMoEExecutionPolicy();
+
+        Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        TensorArena arena;
+        auto layer = makeMoELayerWeights(arena);
+        auto buffers = makeActivationBuffers(
+            arena,
+            /*tokens=*/2,
+            config.d_model,
+            config.moe.num_experts,
+            config.moe.top_k);
+
+        ComputeGraph graph = graph_builder.buildFFNGraph(
+            layer,
+            buffers,
+            /*layer_idx=*/0,
+            /*seq_len=*/2,
+            /*batch_size=*/1,
+            DeviceId::cpu(),
+            /*device_state_publication_stream=*/nullptr);
+
+        constexpr const char *kPublication =
+            "layer0_moe_overlay_continuation_broadcast";
+        const auto *publication_node = graph.getNode(kPublication);
+        ASSERT_NE(publication_node, nullptr) << "rank=" << rank;
+        const auto *publication_stage =
+            dynamic_cast<const MoECanonicalOutputBroadcastStage *>(
+                publication_node->stage.get());
+        ASSERT_NE(publication_stage, nullptr) << "rank=" << rank;
+        EXPECT_EQ(publication_stage->params().tp_ctx, &tp_ctx);
+        EXPECT_EQ(publication_stage->params().root_participant, 0);
+        EXPECT_EQ(
+            publication_stage->params().output,
+            buffers.get(buffers.idFor(BufferId::MOE_COMBINED_OUTPUT)));
+        EXPECT_TRUE(std::any_of(
+            publication_node->dependencies.begin(),
+            publication_node->dependencies.end(),
+            [](const std::string &dependency)
+            {
+                return dependency.find("moe_sparse_return_reduce") !=
+                       std::string::npos;
+            })) << "rank=" << rank;
+        EXPECT_TRUE(hasDependency(
+            graph,
+            "layer0_shared_expert_allreduce",
+            kPublication)) << "rank=" << rank;
+        EXPECT_TRUE(hasDependency(
+            graph,
+            "layer0_moe_combine",
+            kPublication)) << "rank=" << rank;
+    }
+}
+
 TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifier)
 {
     auto tp_ctx = std::make_unique<MockLocalTPContext>();
@@ -947,6 +1292,8 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
                 ->stage.get());
     ASSERT_NE(prefill_routing_stage, nullptr);
     ASSERT_NE(prefill_expert_stage, nullptr);
+    EXPECT_EQ(prefill_routing_stage->hostLogicalRowCountForTesting(), 4)
+        << "CPU prefill must publish exact host-owned routing evidence geometry";
     EXPECT_EQ(
         prefill_expert_stage->routedExpertRowExecutionPolicyForTesting(),
         RoutedExpertRowExecutionPolicy::ParticipantAssigned);
@@ -954,10 +1301,36 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
         prefill_routing_stage->routedExpertRowExecutionPolicyForTesting(),
         prefill_expert_stage->routedExpertRowExecutionPolicyForTesting())
         << "participant-assigned LLEP routing and expert execution must share one policy";
+    EXPECT_TRUE(
+        prefill_expert_stage->
+            publishesCanonicalRouteContributionsForTesting());
+    EXPECT_EQ(
+        prefill_expert_stage->canonicalRouteArithmeticPolicyForTesting(),
+        MoECanonicalRouteArithmeticPolicy::
+            UnweightedExpertRowThenOrderedFMA);
+    EXPECT_EQ(
+        prefill_expert_stage->canonicalRoutePublicationLayoutForTesting(),
+        MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows);
     ASSERT_NE(
+        prefill_graph.getNode("layer0_moe_canonical_routes_gather_to_root"),
+        nullptr)
+        << "ordinary CPU prefill must gather only locally owned indexed rows";
+    ASSERT_NE(
+        prefill_graph.getNode("layer0_moe_canonical_routes_ordered_fma"),
+        nullptr)
+        << "the fixed root must restore serial router-slot arithmetic";
+    ASSERT_NE(
+        prefill_graph.getNode("layer0_moe_canonical_routes_broadcast"),
+        nullptr)
+        << "all participants must receive the compact canonical result";
+    EXPECT_EQ(
+        prefill_graph.getNode("layer0_moe_canonical_routes_allreduce"),
+        nullptr)
+        << "dense top-k-scaled route-slot allreduce is retired on CPU";
+    EXPECT_EQ(
         prefill_graph.getNode("layer0_moe_expert_overlay_fast_allreduce"),
         nullptr)
-        << "ordinary prefill must publish apportioned routed outputs";
+        << "participant-local compact sums are ownership-dependent and forbidden";
 
     GraphConfig verifier_config = prefill_config;
     verifier_config.compute_all_position_logits = true;
@@ -993,6 +1366,8 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
                 ->stage.get());
     ASSERT_NE(verifier_routing_stage, nullptr);
     ASSERT_NE(verifier_expert_stage, nullptr);
+    EXPECT_EQ(verifier_routing_stage->hostLogicalRowCountForTesting(), 4)
+        << "CPU grouped verification must publish exact host-owned routing evidence geometry";
     EXPECT_EQ(
         verifier_expert_stage->routedExpertRowExecutionPolicyForTesting(),
         RoutedExpertRowExecutionPolicy::FullyReplicatedLocal);
@@ -1017,6 +1392,14 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifi
         verifier_graph.getNode("layer0_moe_canonical_routes_reduce_to_root"),
         nullptr)
         << "replicated verifier execution must not emit routed collectives";
+    EXPECT_EQ(
+        verifier_graph.getNode("layer0_moe_canonical_routes_gather_to_root"),
+        nullptr)
+        << "replicated verifier execution must not gather routed rows";
+    EXPECT_EQ(
+        verifier_graph.getNode("layer0_moe_canonical_routes_broadcast"),
+        nullptr)
+        << "replicated verifier execution already owns its local result";
 }
 
 TEST(Test__Qwen35MoEGraph, ReplicatedOverlayPublishesExplicitRuntimeOwnerMetadata)
@@ -1074,13 +1457,21 @@ TEST(Test__Qwen35MoEGraph, SingleDeviceSharedGateFusesMoECombine)
     EXPECT_TRUE(contractWrites(contract, BufferId::ATTN_PROJ));
 }
 
-TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputAllreducesUnderTP)
+/**
+ * @brief Require canonical route arithmetic in ordinary CPU NodeTP.
+ *
+ * This is deliberately the non-overlay graph branch used by the production
+ * dual-socket benchmark. Moving an expert between participants must change
+ * only which rank publishes a route slot, never the FP32 weighted-add tree.
+ */
+TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputUsesPackedRootedCanonicalPublicationUnderTP)
 {
     auto tp_ctx = std::make_unique<MockLocalTPContext>();
     tp_ctx->setDevices({GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()});
     tp_ctx->setBackend(CollectiveBackendType::HOST);
 
     GraphConfig config = makeMoEConfig(tp_ctx.get());
+    config.moe.top_k = 2;
     config.moe.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
     config.moe.local_expert_start = 0;
     config.moe.local_expert_count = 1;
@@ -1095,25 +1486,91 @@ TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputAllreducesUnderTP)
         DeviceId::cpu(), /*device_state_publication_stream=*/nullptr);
 
     ASSERT_NE(graph.getNode("layer0_moe_expert_ffn"), nullptr);
-    ASSERT_NE(graph.getNode("layer0_moe_expert_allreduce"), nullptr)
-        << "Expert-ID-apportioned MoE owns only a local expert range, so routed output is partial until allreduce";
+    EXPECT_EQ(graph.getNode("layer0_moe_expert_allreduce"), nullptr)
+        << "Participant-local compact output must never be a CPU collective operand";
+    ASSERT_NE(graph.getNode("layer0_moe_canonical_routes_gather_to_root"), nullptr)
+        << "Expert-ID-apportioned CPU MoE must gather sparse indexed route rows";
+    ASSERT_NE(graph.getNode("layer0_moe_canonical_routes_ordered_fma"), nullptr)
+        << "The fixed root must restore serial increasing-slot arithmetic";
+    ASSERT_NE(graph.getNode("layer0_moe_canonical_routes_broadcast"), nullptr)
+        << "The compact canonical output must be broadcast to every participant";
+    EXPECT_EQ(graph.getNode("layer0_moe_canonical_routes_allreduce"), nullptr)
+        << "CPU must not transport dense zero-filled route slots";
     ASSERT_NE(graph.getNode("layer0_moe_combine"), nullptr);
 
-    EXPECT_TRUE(hasDependency(graph, "layer0_moe_expert_allreduce", "layer0_moe_expert_ffn"));
-    EXPECT_TRUE(hasDependency(graph, "layer0_moe_combine", "layer0_moe_expert_allreduce"));
+    EXPECT_TRUE(hasDependency(
+        graph,
+        "layer0_moe_canonical_routes_gather_to_root",
+        "layer0_moe_expert_ffn"));
+    EXPECT_TRUE(hasDependency(
+        graph,
+        "layer0_moe_canonical_routes_ordered_fma",
+        "layer0_moe_canonical_routes_gather_to_root"));
+    EXPECT_TRUE(hasDependency(
+        graph,
+        "layer0_moe_canonical_routes_broadcast",
+        "layer0_moe_canonical_routes_ordered_fma"));
+    EXPECT_TRUE(hasDependency(
+        graph,
+        "layer0_moe_combine",
+        "layer0_moe_canonical_routes_broadcast"));
+
+    const auto *expert_stage = dynamic_cast<const MoEExpertComputeStage *>(
+        graph.getNode("layer0_moe_expert_ffn")->stage.get());
+    const auto *gather_stage =
+        dynamic_cast<const MoECanonicalRouteGatherStage *>(
+            graph.getNode("layer0_moe_canonical_routes_gather_to_root")
+                ->stage.get());
+    const auto *reduce_stage =
+        dynamic_cast<const MoECanonicalRouteReduceStage *>(
+            graph.getNode("layer0_moe_canonical_routes_ordered_fma")
+                ->stage.get());
+    const auto *broadcast_stage =
+        dynamic_cast<const MoECanonicalOutputBroadcastStage *>(
+            graph.getNode("layer0_moe_canonical_routes_broadcast")
+                ->stage.get());
+    ASSERT_NE(expert_stage, nullptr);
+    ASSERT_NE(gather_stage, nullptr);
+    ASSERT_NE(reduce_stage, nullptr);
+    ASSERT_NE(broadcast_stage, nullptr);
+    EXPECT_TRUE(
+        expert_stage->publishesCanonicalRouteContributionsForTesting());
+    EXPECT_EQ(
+        expert_stage->canonicalRouteArithmeticPolicyForTesting(),
+        MoECanonicalRouteArithmeticPolicy::
+            UnweightedExpertRowThenOrderedFMA);
+    EXPECT_EQ(
+        expert_stage->canonicalRoutePublicationLayoutForTesting(),
+        MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows);
+    EXPECT_EQ(gather_stage->params().root_participant, 0);
+    EXPECT_EQ(gather_stage->params().packed_route_records,
+              buffers.get(buffers.idFor(
+                  BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS)));
+    EXPECT_EQ(
+        reduce_stage->params().reduction_role,
+        MoECanonicalRouteReductionRole::RootOwner);
+    EXPECT_EQ(
+        reduce_stage->params().canonical_route_layout,
+        MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows);
+    EXPECT_EQ(
+        reduce_stage->params().routing_weights,
+        buffers.get(buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS)));
+    EXPECT_EQ(broadcast_stage->params().root_participant, 0);
+    EXPECT_EQ(broadcast_stage->params().output,
+              buffers.get(buffers.idFor(BufferId::MOE_COMBINED_OUTPUT)));
 }
 
 /**
  * @brief Keep LocalTP routed and shared reductions serial-decode equivalent.
  *
- * Combining participant-local routed and shared partials before one allreduce
- * changes the FP32 addition tree from
- * `reduce(routed) + gate * reduce(shared)` to
- * `reduce(routed + gate * shared)`. The two expressions are algebraically
- * equal but not bitwise equal. Grouped MTP therefore retains independent
- * reductions and combines only their complete results.
+ * Participant-local routed sums are themselves ownership-dependent: moving an
+ * expert changes which FP32 additions happen before the collective. CPU
+ * LocalTP therefore publishes sparse indexed raw rows, gathers them to one
+ * fixed root, performs the serial increasing-slot weighted FMA fold once, and
+ * broadcasts only the compact result. The shared branch remains separately
+ * reduced so routed and shared arithmetic are not reassociated either.
  */
-TEST(Test__Qwen35MoEGraph, LocalTPApportionedOverlayReducesBranchesBeforeCombining)
+TEST(Test__Qwen35MoEGraph, LocalTPApportionedOverlayUsesPackedRootedCanonicalArithmetic)
 {
     auto tp_ctx = std::make_unique<MockLocalTPContext>();
     tp_ctx->setDevices({GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)});
@@ -1143,24 +1600,81 @@ TEST(Test__Qwen35MoEGraph, LocalTPApportionedOverlayReducesBranchesBeforeCombini
 
     ASSERT_NE(graph.getNode("layer0_moe_expert_ffn_overlay_fast"), nullptr);
     ASSERT_NE(graph.getNode("layer0_shared_expert_gate"), nullptr);
-    ASSERT_NE(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_moe_canonical_routes_gather_to_root"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_moe_canonical_routes_ordered_fma"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_moe_canonical_routes_broadcast"), nullptr);
     ASSERT_NE(graph.getNode("layer0_shared_expert_allreduce"), nullptr);
     ASSERT_NE(graph.getNode("layer0_moe_combine"), nullptr);
+    EXPECT_EQ(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr)
+        << "The graph must never collectively reduce ownership-shaped compact sums";
     EXPECT_EQ(graph.getNode("layer0_moe_combined_allreduce"), nullptr)
         << "A combined-partial collective would reassociate routed and shared FP32 sums";
 
     EXPECT_TRUE(hasDependency(
         graph,
-        "layer0_moe_expert_overlay_fast_allreduce",
+        "layer0_moe_canonical_routes_gather_to_root",
         "layer0_moe_expert_ffn_overlay_fast"));
+    EXPECT_TRUE(hasDependency(
+        graph,
+        "layer0_moe_canonical_routes_ordered_fma",
+        "layer0_moe_canonical_routes_gather_to_root"));
+    EXPECT_TRUE(hasDependency(
+        graph,
+        "layer0_moe_canonical_routes_broadcast",
+        "layer0_moe_canonical_routes_ordered_fma"));
     EXPECT_TRUE(hasDependency(
         graph, "layer0_shared_expert_allreduce", "layer0_shared_expert_ffn"));
     EXPECT_TRUE(hasDependency(
         graph, "layer0_shared_expert_gate", "layer0_shared_expert_allreduce"));
     EXPECT_TRUE(hasDependency(
-        graph, "layer0_moe_combine", "layer0_moe_expert_overlay_fast_allreduce"));
+        graph, "layer0_moe_combine", "layer0_moe_canonical_routes_broadcast"));
     EXPECT_TRUE(hasDependency(
         graph, "layer0_moe_combine", "layer0_shared_expert_gate"));
+
+    const auto *expert_stage = dynamic_cast<const MoEExpertComputeStage *>(
+        graph.getNode("layer0_moe_expert_ffn_overlay_fast")->stage.get());
+    ASSERT_NE(expert_stage, nullptr);
+    EXPECT_TRUE(
+        expert_stage->publishesCanonicalRouteContributionsForTesting());
+    EXPECT_EQ(
+        expert_stage->canonicalRouteArithmeticPolicyForTesting(),
+        MoECanonicalRouteArithmeticPolicy::
+            UnweightedExpertRowThenOrderedFMA);
+    EXPECT_EQ(
+        expert_stage->canonicalRoutePublicationLayoutForTesting(),
+        MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows);
+
+    const auto *route_reduce_stage =
+        dynamic_cast<const MoECanonicalRouteReduceStage *>(
+            graph.getNode("layer0_moe_canonical_routes_ordered_fma")
+                ->stage.get());
+    ASSERT_NE(route_reduce_stage, nullptr);
+    EXPECT_EQ(
+        route_reduce_stage->params().canonical_route_arithmetic,
+        MoECanonicalRouteArithmeticPolicy::
+            UnweightedExpertRowThenOrderedFMA);
+    EXPECT_EQ(
+        route_reduce_stage->params().reduction_role,
+        MoECanonicalRouteReductionRole::RootOwner);
+    EXPECT_EQ(
+        route_reduce_stage->params().canonical_route_layout,
+        MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows);
+    EXPECT_EQ(route_reduce_stage->coherencePolicy(), CoherencePolicy::FULL);
+
+    const auto expert_contract = expert_stage->bufferContract();
+    EXPECT_TRUE(contractWrites(
+        expert_contract,
+        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS));
+    const auto route_reduce_contract = route_reduce_stage->bufferContract();
+    EXPECT_TRUE(contractReads(
+        route_reduce_contract,
+        BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS));
+    EXPECT_TRUE(contractReads(
+        route_reduce_contract,
+        BufferId::MOE_EXPERT_WEIGHTS));
+    EXPECT_TRUE(contractWrites(
+        route_reduce_contract,
+        BufferId::MOE_COMBINED_OUTPUT));
 
     const auto gate_contract = graph.getNode("layer0_shared_expert_gate")->stage->bufferContract();
     EXPECT_TRUE(contractReads(gate_contract, BufferId::MOE_SHARED_EXPERT_OUTPUT));
@@ -1224,8 +1738,18 @@ TEST(Test__Qwen35MoEGraph, DenseTPDisabledKeepsExpertParticipantAllreduceOnly)
             /*device_state_publication_stream=*/nullptr);
 
         ASSERT_NE(graph.getNode("layer0_moe_expert_ffn_overlay_fast"), nullptr);
-        EXPECT_NE(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr)
-            << "MoE expert participant reduction must remain active even when dense TP is disabled";
+        EXPECT_EQ(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr)
+            << "Ownership-shaped compact sums are forbidden even when dense TP is disabled";
+        EXPECT_NE(
+            graph.getNode("layer0_moe_canonical_routes_gather_to_root"),
+            nullptr)
+            << "Sparse MoE route transport must remain active even when dense TP is disabled";
+        EXPECT_NE(graph.getNode("layer0_moe_canonical_routes_ordered_fma"), nullptr)
+            << "The fixed root must reconstruct the serial route arithmetic";
+        EXPECT_NE(
+            graph.getNode("layer0_moe_canonical_routes_broadcast"),
+            nullptr)
+            << "The compact canonical result must reach every participant";
         EXPECT_EQ(graph.getNode("layer0_moe_combined_allreduce"), nullptr)
             << "Dense-TP-disabled overlays keep shared experts replicated; only routed expert partials may be allreduced";
         EXPECT_EQ(graph.getNode("layer0_shared_expert_allreduce"), nullptr)
@@ -1233,7 +1757,7 @@ TEST(Test__Qwen35MoEGraph, DenseTPDisabledKeepsExpertParticipantAllreduceOnly)
         EXPECT_EQ(graph.getNode("layer0_moe_combine"), nullptr)
             << "The local shared gate can combine with the already-reduced routed expert output";
         EXPECT_TRUE(hasDependency(
-            graph, "layer0_shared_expert_gate", "layer0_moe_expert_overlay_fast_allreduce"));
+            graph, "layer0_shared_expert_gate", "layer0_moe_canonical_routes_broadcast"));
         EXPECT_TRUE(hasDependency(
             graph, "layer0_shared_expert_gate", "layer0_shared_expert_ffn"));
 
@@ -2629,9 +3153,52 @@ TEST(Test__Qwen35MoEGraph, SnapshotShardingDeclaresFinalCombinedOutputReplicated
            "collectives and must never be reconstructed from participant partials";
     EXPECT_EQ(sharding.at("MOE_EXPERT_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
     EXPECT_EQ(sharding.at("MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"), SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("MOE_CANONICAL_ROUTE_CONTRIBUTIONS"),
+        SnapshotShardingMode::ROW_PARALLEL);
     EXPECT_EQ(sharding.count("MOE_COMBINED_OUTPUT_ALLREDUCED"), 0u)
         << "The combined-output allreduce was retired when branch-wise reduction "
            "became the byte-stable production topology";
+
+    EXPECT_EQ(
+        sharding.at("MOE_SHARED_RANK_BANK_PUBLISH"),
+        SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(
+        sharding.at("MOE_CANONICAL_PUBLICATION_REDUCE_TO_ROOT"),
+        SnapshotShardingMode::ROOT_ONLY);
+    EXPECT_EQ(
+        sharding.at("MOE_CANONICAL_ROUTES_GATHER_TO_ROOT"),
+        SnapshotShardingMode::ROOT_ONLY);
+    EXPECT_EQ(
+        sharding.at("MOE_CANONICAL_ROUTES_REDUCE_TO_ROOT"),
+        SnapshotShardingMode::ROOT_ONLY);
+    EXPECT_EQ(
+        sharding.at("MOE_CANONICAL_PUBLICATION_BROADCAST"),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("MTP_TERMINAL_HIDDEN_ROW_SELECT"),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("MTP_TERMINAL_HIDDEN_CONTIGUOUS_ROWS_*"),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("MTP_TERMINAL_HIDDEN_DEVICE_ACCEPTED_ROWS_*"),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("MTP_TERMINAL_HIDDEN_REQUEST_ROWS_*"),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("NORM_HIDDEN"),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("NORM_EMBEDDING"),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("CONCAT"),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        sharding.at("FC"),
+        SnapshotShardingMode::REPLICATED);
 }
 
 /**
@@ -3026,6 +3593,8 @@ TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialIncludesExpertOverlayTopolog
 {
     GraphConfig config = makeMoEConfig();
     config.moe.routed_expert_plan = makeOverlayPlan("cold_cpu");
+    config.moe.routed_expert_plan->routed_tiers[0]
+        .resolved_live_experts_per_layer = {2};
     config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
         config.moe.routed_expert_plan,
         MoEExpertOverlayRuntimeResolverOptions{
@@ -3041,6 +3610,14 @@ TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialIncludesExpertOverlayTopolog
     EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.plan.continuation_domain", "continuation"));
     EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.plan.shared_expert_domain", "shared"));
     EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.plan.routed_tier.0.domain", "cold_cpu"));
+    EXPECT_TRUE(hasFingerprintField(
+        material,
+        "expert_overlay.plan.routed_tier.0.resolved_live_experts_per_layer.count",
+        "1"));
+    EXPECT_TRUE(hasFingerprintField(
+        material,
+        "expert_overlay.plan.routed_tier.0.resolved_live_experts_per_layer.0",
+        "2"));
     EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.plan.expert_domain.0.participant.1",
                                     GlobalDeviceAddress::cpu(1, "node0").toString()));
     EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.runtime.enabled", "true"));
@@ -3066,6 +3643,7 @@ TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialIncludesExpertOverlayTopolog
 
     EXPECT_NE(changed_hash, original_hash)
         << "Changing routed expert overlay domains must invalidate MoE prefix-cache payloads";
+
 }
 
 TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialExcludesTransientRuntimeTables)
@@ -3104,7 +3682,8 @@ TEST(Test__Qwen35MoEGraph, ReusedRuntimeTableRegistersDecodeHistogramAfterLateCo
     hist_config.top_k = 2;
     hist_config.window_size = 1;
     hist_config.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
-    hist_config.expert_to_socket = {0, 1, 0, 1};
+    hist_config.ownership = MoELayeredExpertOwnership::uniform(
+        1, 2, {0, 1, 0, 1});
     DecodeExpertHistogram histogram(hist_config);
     graph_builder.setDecodeHistogramForTesting(&histogram);
 
@@ -3138,7 +3717,8 @@ TEST(Test__Qwen35MoEGraph, PrefillRuntimeTableDoesNotRegisterDecodeHistogramSync
     hist_config.top_k = 2;
     hist_config.window_size = 1;
     hist_config.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
-    hist_config.expert_to_socket = {0, 1, 0, 1};
+    hist_config.ownership = MoELayeredExpertOwnership::uniform(
+        1, 2, {0, 1, 0, 1});
     DecodeExpertHistogram histogram(hist_config);
     graph_builder.setDecodeHistogramForTesting(&histogram);
 
@@ -3245,6 +3825,79 @@ TEST(Test__Qwen35MoEGraph, CurrentBatchLLEPPrefillCannotAliasDurableDecodeRuntim
         std::string::npos);
     EXPECT_EQ(source.find("runtime_table_suffix"), std::string::npos)
         << "An untyped empty suffix can alias prefill and decode placement banks";
+}
+
+/**
+ * @brief Keep request reset and prefix restore subordinate to the epoch authority.
+ *
+ * Durable placement and its transfer-slot payloads survive request boundaries.
+ * The CurrentBatchLLEP child retains that exact ticket but owns a private
+ * request-local override bank, so reset restores the child template while
+ * leaving canonical main/MTP banks untouched. Prefix blobs likewise cannot
+ * snapshot or restore placement behind the shared device selector.
+ */
+TEST(Test__Qwen35MoEGraph,
+     DurableOverlayPlacementSurvivesResetAndIsExcludedFromPrefixPayloads)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t reset_begin =
+        source.find("void Qwen35MoEGraph::resetState(void *execution_stream)");
+    const size_t prefix_reset_begin = source.find(
+        "void Qwen35MoEGraph::resetPrefixCacheRuntimeStateWithoutSnapshot(",
+        reset_begin);
+    const size_t prefix_capture_begin = source.find(
+        "bool Qwen35MoEGraph::capturePrefixCacheRuntimeState(",
+        prefix_reset_begin);
+    const size_t prefix_restore_begin = source.find(
+        "Qwen35MoEGraph::restorePrefixCacheRuntimeState(",
+        prefix_capture_begin);
+    ASSERT_NE(reset_begin, std::string::npos);
+    ASSERT_NE(prefix_reset_begin, std::string::npos);
+    ASSERT_NE(prefix_capture_begin, std::string::npos);
+    ASSERT_NE(prefix_restore_begin, std::string::npos);
+
+    const std::string request_reset =
+        source.substr(reset_begin, prefix_reset_begin - reset_begin);
+    EXPECT_NE(
+        request_reset.find("!table->usesOverlayEpochTicket() ||"),
+        std::string::npos)
+        << "Request reset must preserve durable ticketed placement";
+    EXPECT_NE(
+        request_reset.find("table->overlayPlacementSource() != nullptr"),
+        std::string::npos)
+        << "Request reset must restore the ticketed LLEP child's private bank";
+    EXPECT_EQ(
+        request_reset.find("directory->resetRequestPublications"),
+        std::string::npos)
+        << "A shared transfer directory can still back a durable published bank";
+
+    const std::string prefix_reset =
+        source.substr(prefix_reset_begin, prefix_capture_begin - prefix_reset_begin);
+    EXPECT_NE(
+        prefix_reset.find("!table->usesOverlayEpochTicket() ||"),
+        std::string::npos);
+    EXPECT_NE(
+        prefix_reset.find("table->overlayPlacementSource() != nullptr"),
+        std::string::npos);
+    EXPECT_EQ(
+        prefix_reset.find("directory->resetRequestPublications"),
+        std::string::npos);
+
+    const std::string prefix_capture =
+        source.substr(prefix_capture_begin, prefix_restore_begin - prefix_capture_begin);
+    EXPECT_NE(
+        prefix_capture.find("if (table->usesOverlayEpochTicket())"),
+        std::string::npos)
+        << "Main and MTP placement share one live RCU authority, not prefix payloads";
+    EXPECT_NE(
+        source.find("constexpr uint32_t kMoEPrefixRuntimeVersion = 5"),
+        std::string::npos)
+        << "The incompatible ticketed-placement payload schema must be rejected";
 }
 
 TEST(Test__Qwen35MoEGraph, PhaseSplitMTPSidecarDisablesGroupedSharedExpertDecodeShortcut)
@@ -3699,7 +4352,8 @@ TEST(Test__Qwen35MoEGraph,
               std::string::npos);
     EXPECT_NE(current_batch_policy.find(".min_wave_spread_improvement_per_payload_slot = 0u"),
               std::string::npos);
-    EXPECT_NE(current_batch_policy.find(".min_foreign_rows_per_transfer = 0u"),
+    EXPECT_NE(current_batch_policy.find(
+                  ".min_foreign_rows_per_critical_path_payload_slot = 0u"),
               std::string::npos);
 
     EXPECT_NE(config_body.find("if (current_batch_llep_policy)"),

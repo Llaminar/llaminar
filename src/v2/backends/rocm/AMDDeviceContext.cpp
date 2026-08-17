@@ -162,6 +162,13 @@ namespace llaminar2
 
     void AMDDeviceContext::workerLoop()
     {
+        /*
+         * Publish exact ownership before any initialization helper can make a
+         * nested synchronous submission. The constructor observes this write
+         * through the initialized_ release/acquire handoff before exposing the
+         * context to other threads.
+         */
+        worker_thread_id_ = std::this_thread::get_id();
         LOG_TRACE("[AMDDeviceContext] Worker thread starting for device " << device_ordinal_);
 
         // Initialize HIP context on this thread
@@ -402,10 +409,9 @@ namespace llaminar2
     // Work Submission (Thread-Safe)
     // ============================================================================
 
-    void AMDDeviceContext::submitAndWait(std::function<void()> work)
+    bool AMDDeviceContext::ownsCurrentThread() const noexcept
     {
-        auto future = submitAsync(std::move(work));
-        future.wait();
+        return worker_thread_id_ == std::this_thread::get_id();
     }
 
     std::future<void> AMDDeviceContext::submitAsync(std::function<void()> work)

@@ -38,6 +38,10 @@ extern "C" bool cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
     int *uses_ordered_reducer,
     int *k_partitions);
 
+/** @brief Return whether the generated serial policy owns this codebook. */
+extern "C" bool cudaNativeVNNIGemvTuned_supportsCodebook(
+    uint8_t codebook_id);
+
 // =========================================================================
 // Per-device prefill context. Owned by KernelFactory, one per device.
 // =========================================================================
@@ -2210,6 +2214,7 @@ namespace
         case 16:
         case 17:
         case 19:
+        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -3567,6 +3572,8 @@ extern "C"
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(16);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(17);
             QUERY_LAST_DENSE_PREFILL_CODEBOOK(19);
+            QUERY_LAST_DENSE_PREFILL_CODEBOOK(
+                llaminar2::kNativeVnniExpandedInt8MinCodebook);
         default:
             return false;
         }
@@ -3635,6 +3642,8 @@ extern "C"
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(16);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(17);
             QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(19);
+            QUERY_DENSE_PREFILL_CANDIDATE_CODEBOOK(
+                llaminar2::kNativeVnniExpandedInt8MinCodebook);
         default:
             return false;
         }
@@ -3714,8 +3723,17 @@ extern "C"
             canonical_kpart_partials_bytes;
     }
 
-    bool cudaNativeVNNIPrefill_getWorkspacePlan(
+    /**
+     * @brief Plan prefill workspace using distinct decode and arithmetic formats.
+     *
+     * The execution codebook selects the physical decoder and any learned
+     * prefill overlay. The arithmetic-policy codebook selects the serial-M1
+     * reduction tree that every row must reproduce. They differ after a cold
+     * CPU tier promotes a compact asymmetric matrix into codebook 23.
+     */
+    bool cudaNativeVNNIPrefill_getWorkspacePlanWithPolicy(
         uint8_t codebook_id,
+        uint8_t arithmetic_policy_codebook_id,
         int M,
         int N,
         int K,
@@ -3730,6 +3748,9 @@ extern "C"
         if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
             return false;
         if (!isSupportedNativeVNNIPrefillCodebook(codebook_id))
+            return false;
+        if (!cudaNativeVNNIGemvTuned_supportsCodebook(
+                arithmetic_policy_codebook_id))
             return false;
 
         llaminar2::cuda::generated::CUDADensePrefillOverlayConfig
@@ -3746,6 +3767,27 @@ extern "C"
         if (!needs_canonical_kpart)
             return true;
         return queryCanonicalPrefillWorkspaceForRows(
+            arithmetic_policy_codebook_id,
+            M,
+            N,
+            K,
+            cuda_device_id,
+            canonical_kpart_partials_bytes,
+            planned_k_partitions);
+    }
+
+    /** @brief Plan a self-describing matrix whose policy equals its decoder. */
+    bool cudaNativeVNNIPrefill_getWorkspacePlan(
+        uint8_t codebook_id,
+        int M,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *canonical_kpart_partials_bytes,
+        int *planned_k_partitions)
+    {
+        return cudaNativeVNNIPrefill_getWorkspacePlanWithPolicy(
+            codebook_id,
             codebook_id,
             M,
             N,
@@ -3755,8 +3797,10 @@ extern "C"
             planned_k_partitions);
     }
 
-    bool cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+    /** @brief Plan the maximum workspace for an explicit arithmetic policy. */
+    bool cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
         uint8_t codebook_id,
+        uint8_t arithmetic_policy_codebook_id,
         int max_M,
         int N,
         int K,
@@ -3774,6 +3818,9 @@ extern "C"
         if (max_M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
             return false;
         if (!isSupportedNativeVNNIPrefillCodebook(codebook_id))
+            return false;
+        if (!cudaNativeVNNIGemvTuned_supportsCodebook(
+                arithmetic_policy_codebook_id))
             return false;
 
         int canonical_rows = 0;
@@ -3819,7 +3866,7 @@ extern "C"
         if (canonical_rows == 0)
             return true;
         if (!queryCanonicalPrefillWorkspaceForRows(
-                codebook_id,
+                arithmetic_policy_codebook_id,
                 canonical_rows,
                 N,
                 K,
@@ -3833,13 +3880,44 @@ extern "C"
             *planned_rows = canonical_rows;
         return true;
     }
+
+    /** @brief Plan a self-describing matrix whose policy equals its decoder. */
+    bool cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+        uint8_t codebook_id,
+        int max_M,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *canonical_kpart_partials_bytes,
+        int *planned_k_partitions,
+        int *planned_rows)
+    {
+        return cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
+            codebook_id,
+            codebook_id,
+            max_M,
+            N,
+            K,
+            cuda_device_id,
+            canonical_kpart_partials_bytes,
+            planned_k_partitions,
+            planned_rows);
+    }
 } // extern "C"
 
 // Profitability gate removed: NativeVNNI is now the only CUDA GEMM path.
 // TC/CUTLASS expanded fallback has been sunset. All codebooks always use
 // the NativeVNNI prefill kernel regardless of shape.
 
-extern "C" bool cudaNativeVNNIPrefill_fp32(
+/**
+ * @brief Execute NativeVNNI prefill with explicit decoder and arithmetic IDs.
+ *
+ * `codebook_id` describes the bytes read by the templated kernel, while
+ * `arithmetic_policy_codebook_id` owns the serial-M1 split tree. Keeping both
+ * values explicit prevents representation normalization during expert
+ * migration from changing FP32 publication order.
+ */
+extern "C" bool cudaNativeVNNIPrefill_fp32_withPolicy(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
     const uint16_t *d_scales,
@@ -3856,6 +3934,7 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
     const float *d_C_existing,
     const float *d_bias,
     uint8_t codebook_id,
+    uint8_t arithmetic_policy_codebook_id,
     int cuda_device_id,
     void *stream,
     CUDAPrefillContext *prefill_ctx)
@@ -3866,6 +3945,9 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
         return false;
     if (!prefill_ctx)
         return false;
+    if (!cudaNativeVNNIGemvTuned_supportsCodebook(
+            arithmetic_policy_codebook_id))
+        return false;
     if (!isAmperePlus(cuda_device_id))
         return false;
     if (cudaSetDevice(cuda_device_id) != cudaSuccess)
@@ -3875,7 +3957,7 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
     int serial_m1_uses_ordered_reducer = 0;
     int serial_m1_k_partitions = 0;
     if (!cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
-            codebook_id,
+            arithmetic_policy_codebook_id,
             N,
             K,
             querySmCount(prefill_ctx),
@@ -4026,6 +4108,17 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
             cuda_stream, prefill_ctx);
         break;
 
+    case llaminar2::kNativeVnniExpandedInt8MinCodebook:
+        if (!d_mins || !d_sums_A_block)
+            return false;
+        ok = launchGenericPrefillBK64<
+            llaminar2::kNativeVnniExpandedInt8MinCodebook>(
+            d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32,
+            d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta,
+            d_C_existing, d_bias, serial_m1_k_partitions,
+            serial_m1_uses_ordered_reducer, cuda_stream, prefill_ctx);
+        break;
+
     default:
         return false;
     }
@@ -4052,6 +4145,9 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
             "cuda:" + std::to_string(cuda_device_id),
             llaminar2::PerfStatsCollector::Tags{
                 {"codebook", std::to_string(static_cast<int>(codebook_id))},
+                {"arithmetic_policy_codebook",
+                 std::to_string(
+                     static_cast<int>(arithmetic_policy_codebook_id))},
                 {"m", std::to_string(M)},
                 {"n", std::to_string(N)},
                 {"k", std::to_string(K)},
@@ -4063,4 +4159,49 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
                 {"sums_a", d_sums_A_block ? "1" : "0"}});
     }
     return ok;
+}
+
+/** @brief Execute a self-describing matrix with its own arithmetic policy. */
+extern "C" bool cudaNativeVNNIPrefill_fp32(
+    const int8_t *d_A_int8,
+    const uint8_t *d_payload,
+    const uint16_t *d_scales,
+    const uint16_t *d_mins,
+    const uint32_t *d_emins,
+    float *d_C_fp32,
+    const float *d_scales_A_block,
+    const int32_t *d_sums_A_block,
+    int M,
+    int N,
+    int K,
+    float alpha,
+    float beta,
+    const float *d_C_existing,
+    const float *d_bias,
+    uint8_t codebook_id,
+    int cuda_device_id,
+    void *stream,
+    CUDAPrefillContext *prefill_ctx)
+{
+    return cudaNativeVNNIPrefill_fp32_withPolicy(
+        d_A_int8,
+        d_payload,
+        d_scales,
+        d_mins,
+        d_emins,
+        d_C_fp32,
+        d_scales_A_block,
+        d_sums_A_block,
+        M,
+        N,
+        K,
+        alpha,
+        beta,
+        d_C_existing,
+        d_bias,
+        codebook_id,
+        codebook_id,
+        cuda_device_id,
+        stream,
+        prefill_ctx);
 }

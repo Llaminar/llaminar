@@ -12,6 +12,7 @@
 #pragma once
 
 #include "tensors/IQQuantTables.h"
+#include "tensors/NativeVnniFormatInfo.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -70,13 +71,17 @@ namespace llaminar2::cuda_native_vnni
         static constexpr bool is_iq2_grid = (CODEBOOK_ID == 13 || CODEBOOK_ID == 14 || CODEBOOK_ID == 15);
         static constexpr bool is_iq1_grid = (CODEBOOK_ID == 16 || CODEBOOK_ID == 17);
         static constexpr bool is_iq_grid = is_iq3_grid || is_iq2_grid || is_iq1_grid;
-        static constexpr bool is_asymmetric = (CODEBOOK_ID == 5 || CODEBOOK_ID == 7 || CODEBOOK_ID == 16);
+        static constexpr bool is_asymmetric =
+            CODEBOOK_ID == 5 || CODEBOOK_ID == 7 || CODEBOOK_ID == 16 ||
+            CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook;
         static constexpr bool is_dual_scale = (CODEBOOK_ID == 8 || CODEBOOK_ID == 9 || CODEBOOK_ID == 10 ||
                                                CODEBOOK_ID == 13 || CODEBOOK_ID == 14 || CODEBOOK_ID == 17);
         static constexpr bool is_dual_scale_asym = (CODEBOOK_ID == 10);
         static constexpr bool is_iq1_m = (CODEBOOK_ID == 17);
         static constexpr int payload_bytes =
-            (CODEBOOK_ID == 19)                        ? 32
+            (CODEBOOK_ID == 19 ||
+             CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook)
+                                                        ? 32
             : (CODEBOOK_ID == 6 || CODEBOOK_ID == 7)   ? 20
             : (CODEBOOK_ID == 8)                       ? 24
             : (CODEBOOK_ID == 9)                       ? 12
@@ -619,8 +624,12 @@ namespace llaminar2::cuda_native_vnni
             packed_groups[6] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
             packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
         }
-        else if constexpr (CODEBOOK_ID == 19) // Q8_0: 32 raw int8 values → direct copy
+        else if constexpr (
+            CODEBOOK_ID == 19 ||
+            CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook)
         {
+            // Both normalized INT8 formats store 32 signed bytes directly;
+            // codebook 23 adds its minimum only in the contribution helper.
 #pragma unroll
             for (int g = 0; g < 8; ++g)
             {
@@ -684,8 +693,12 @@ namespace llaminar2::cuda_native_vnni
                 decode_groups<CODEBOOK_ID>(payload, packed_groups);
             }
         }
-        else if constexpr (CODEBOOK_ID == 19) // Q8_0: 32 bytes — two 128-bit loads
+        else if constexpr (
+            CODEBOOK_ID == 19 ||
+            CODEBOOK_ID == kNativeVnniExpandedInt8MinCodebook)
         {
+            // Payload layout is identical; asymmetric correction consumes the
+            // separate minimum plane after these vectorized loads.
             const int4 v0 = *reinterpret_cast<const int4 *>(payload);
             const int4 v1 = *reinterpret_cast<const int4 *>(payload + 16);
             packed_groups[0] = v0.x;

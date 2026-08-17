@@ -17,6 +17,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
@@ -138,6 +139,15 @@ namespace llaminar2
         size_t col_count = 0;
         size_t expert_start = 0;
         size_t expert_count = 0;
+        /**
+         * Explicit global expert IDs in packed tensor order.
+         *
+         * Empty means the legacy contiguous interval described by
+         * expert_start/expert_count. A non-empty vector is authoritative and
+         * permits immutable non-contiguous static ownership without losing the
+         * mapping between packed tensor slots and logical router IDs.
+         */
+        std::vector<int> expert_ids;
         bool inner_is_presliced = false;
     };
 

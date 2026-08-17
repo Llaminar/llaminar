@@ -4,11 +4,14 @@
  *
  * ## Key Mathematical Insight
  *
- * TurboQuant dequantization is: dequant(b) = (norm/√D) · Πᵀ · c(b)
+ * TurboQuant value reconstruction is:
+ * dequant(b) = (reconstruction_norm/√D) · Πᵀ · c(b)
  * where c(b) is the centroid vector looked up from block indices.
  *
- * Since Π is orthogonal (Πᵀ = Π⁻¹):
- *   dot(Q, dequant(b)) = (norm/√D) · dot(Π·Q, c(b))
+ * Keys deliberately retain the source norm instead. A least-squares radius
+ * minimizes reconstruction MSE, but it also introduces a data-dependent bias
+ * into QK scores. The source norm preserves TurboQuant's score estimator:
+ *   dot(Q, dequant(K)) = (source_norm/√D) · dot(Π·Q, c(K))
  *
  * This allows us to:
  *   - Pre-rotate Q once per head: Q_rot = Π·Q          [O(D²), amortized]
@@ -20,9 +23,9 @@
  *
  * ## Primitives provided
  *
- * - tq8_dot_rotated_q():   dot(Q_rot, centroids(TQ8_block)) · norm
- * - tq4_accum_weighted():  accum += weight · norm · centroids(TQ4_block)
- * - tq8_accum_weighted():  accum += weight · norm · centroids(TQ8_block)
+ * - tq8_dot_rotated_q():   dot(Q_rot, centroids(TQ8_block)) · source_norm
+ * - tq4_accum_weighted():  accum += weight · reconstruction_norm · centroids(TQ4_block)
+ * - tq8_accum_weighted():  accum += weight · reconstruction_norm · centroids(TQ8_block)
  *
  * Both operate on raw block bytes with runtime head_dim, no templates needed.
  * Attention scale (1/√D) is applied by the caller for flexibility.
@@ -67,22 +70,25 @@ namespace llaminar2
     } // namespace tq_attn_detail
 
     // ========================================================================
-    // TQ8 K dot product: score = dot(Q_rot, centroids) · norm
+    // TQ8 K dot product: score = dot(Q_rot, centroids) · source norm
     // ========================================================================
 
     /**
-     * @brief Compute dot(Q_rot, centroid_vector(K_block)) × norm.
+     * @brief Compute dot(Q_rot, centroid_vector(K_block)) × source norm.
      *
      * The caller provides Q_rot = Π·Q (pre-rotated query). This function
      * gathers TQ8 centroids from block indices and computes the raw dot product
-     * scaled by the block's norm. The caller applies the attention scale (1/D).
+     * scaled by the block's source norm. Using the value-oriented fitted
+     * reconstruction radius here would minimize K-vector MSE but bias the QK
+     * score distribution. The caller applies the combined TurboQuant and
+     * attention scale (1/D).
      *
      * Cost: O(D) — 8 gather+FMA iterations for D=128 on AVX-512.
      *
      * @param Q_rot      Pre-rotated query vector [head_dim], Q_rot = Π·Q
-     * @param tq8_block  Raw TQ8 block bytes: [norm:f32, residual:f32, indices:u8×D]
+     * @param tq8_block  Raw TQ8 block bytes: [norm:f32, reconstruction_norm:f32, indices:u8×D]
      * @param head_dim   Head dimension (64 or 128)
-     * @return dot(Q_rot, centroids) × norm, or 0.0f for zero-norm blocks
+     * @return dot(Q_rot, centroids) × source norm, or 0.0f for zero blocks
      */
     // ========================================================================
     // Named ISA implementations: tq8_dot_rotated_q
@@ -94,15 +100,15 @@ namespace llaminar2
         const uint8_t *__restrict__ tq8_block,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq8_block, sizeof(float));
-        if (norm < 1e-30f)
+        float source_norm;
+        std::memcpy(&source_norm, tq8_block, sizeof(float));
+        if (source_norm < 1e-30f)
             return 0.0f;
         const uint8_t *indices = tq8_block + 8;
         float dot = 0.0f;
         for (int i = 0; i < head_dim; ++i)
             dot += Q_rot[i] * TQ8_CENTROIDS[indices[i]];
-        return dot * norm;
+        return dot * source_norm;
     }
 
 #if defined(__AVX2__)
@@ -112,9 +118,9 @@ namespace llaminar2
         const uint8_t *__restrict__ tq8_block,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq8_block, sizeof(float));
-        if (norm < 1e-30f)
+        float source_norm;
+        std::memcpy(&source_norm, tq8_block, sizeof(float));
+        if (source_norm < 1e-30f)
             return 0.0f;
         const uint8_t *indices = tq8_block + 8;
 
@@ -133,7 +139,7 @@ namespace llaminar2
         float dot = avx2::hsum_ps(acc);
         for (; i < head_dim; ++i)
             dot += Q_rot[i] * TQ8_CENTROIDS[indices[i]];
-        return dot * norm;
+        return dot * source_norm;
     }
 #endif
 
@@ -144,9 +150,9 @@ namespace llaminar2
         const uint8_t *__restrict__ tq8_block,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq8_block, sizeof(float));
-        if (norm < 1e-30f)
+        float source_norm;
+        std::memcpy(&source_norm, tq8_block, sizeof(float));
+        if (source_norm < 1e-30f)
             return 0.0f;
         const uint8_t *indices = tq8_block + 8;
 
@@ -165,7 +171,7 @@ namespace llaminar2
         float dot = _mm512_reduce_add_ps(acc);
         for (; i < head_dim; ++i)
             dot += Q_rot[i] * TQ8_CENTROIDS[indices[i]];
-        return dot * norm;
+        return dot * source_norm;
     }
 #endif
 
@@ -199,7 +205,7 @@ namespace llaminar2
     }
 
     // ========================================================================
-    // TQ4 K dot product: score = dot(Q_rot, centroids) * norm
+    // TQ4 K dot product: score = dot(Q_rot, centroids) * source norm
     // ========================================================================
 
     /**
@@ -214,16 +220,16 @@ namespace llaminar2
      * @param tq4_block Raw TQ4 block bytes for one KV head and position.
      * @param head_dim Number of centroid indices in the block; must be a
      *        positive multiple of eight.
-     * @return `dot(Q_rot, centroid_vector) * norm`.
+     * @return `dot(Q_rot, centroid_vector) * source_norm`.
      */
     inline float tq4_dot_rotated_q_scalar(
         const float *__restrict__ Q_rot,
         const uint8_t *__restrict__ tq4_block,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq4_block, sizeof(float));
-        if (norm < 1e-30f)
+        float source_norm;
+        std::memcpy(&source_norm, tq4_block, sizeof(float));
+        if (source_norm < 1e-30f)
             return 0.0f;
 
         const uint8_t *mse_indices = tq4_block + 8;
@@ -246,7 +252,7 @@ namespace llaminar2
                 dot += Q_rot[i + lane] * TQ4_CENTROIDS[centroid];
             }
         }
-        return dot * norm;
+        return dot * source_norm;
     }
 
 #if defined(__AVX2__)
@@ -256,9 +262,9 @@ namespace llaminar2
         const uint8_t *__restrict__ tq4_block,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq4_block, sizeof(float));
-        if (norm < 1e-30f)
+        float source_norm;
+        std::memcpy(&source_norm, tq4_block, sizeof(float));
+        if (source_norm < 1e-30f)
             return 0.0f;
 
         const uint8_t *mse_indices = tq4_block + 8;
@@ -291,7 +297,7 @@ namespace llaminar2
                 centroids,
                 accumulator);
         }
-        return avx2::hsum_ps(accumulator) * norm;
+        return avx2::hsum_ps(accumulator) * source_norm;
     }
 #endif
 
@@ -302,9 +308,9 @@ namespace llaminar2
         const uint8_t *__restrict__ tq4_block,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq4_block, sizeof(float));
-        if (norm < 1e-30f)
+        float source_norm;
+        std::memcpy(&source_norm, tq4_block, sizeof(float));
+        if (source_norm < 1e-30f)
             return 0.0f;
 
         const uint8_t *mse_indices = tq4_block + 8;
@@ -360,7 +366,7 @@ namespace llaminar2
                 dot += Q_rot[i + lane] * TQ4_CENTROIDS[centroid];
             }
         }
-        return dot * norm;
+        return dot * source_norm;
     }
 #endif
 
@@ -406,12 +412,12 @@ namespace llaminar2
      * Symmetric TQ8-K/TQ8-V caches use exactly the same block encoding for K
      * and V. The attention numerator needs the V centroid vector rather than a
      * dot product, so this primitive gathers each centroid and performs the
-     * fixed-order update `accum[i] += weight * norm * centroid[index[i]]`.
+     * fixed-order update `accum[i] += weight * reconstruction_norm * centroid[index[i]]`.
      * The caller applies the common `1/sqrt(D)` scale and inverse rotation once
      * after the online-softmax reduction.
      *
      * @param accum Rotated-space attention numerator, updated in place.
-     * @param tq8_block Raw `[norm, residual_norm, indices...]` TQ8 block.
+     * @param tq8_block Raw `[norm, reconstruction_norm, indices...]` TQ8 block.
      * @param weight Unnormalized online-softmax probability for this K/V row.
      * @param head_dim Number of elements encoded by the block.
      */
@@ -421,12 +427,12 @@ namespace llaminar2
         float weight,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq8_block, sizeof(float));
-        if (norm < 1e-30f || std::abs(weight) < 1e-30f)
+        float reconstruction_norm;
+        std::memcpy(&reconstruction_norm, tq8_block + sizeof(float), sizeof(float));
+        if (reconstruction_norm < 1e-30f || std::abs(weight) < 1e-30f)
             return;
 
-        const float combined_weight = weight * norm;
+        const float combined_weight = weight * reconstruction_norm;
         const uint8_t *indices = tq8_block + 8;
         for (int i = 0; i < head_dim; ++i)
             accum[i] += combined_weight * TQ8_CENTROIDS[indices[i]];
@@ -440,12 +446,12 @@ namespace llaminar2
         float weight,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq8_block, sizeof(float));
-        if (norm < 1e-30f || std::abs(weight) < 1e-30f)
+        float reconstruction_norm;
+        std::memcpy(&reconstruction_norm, tq8_block + sizeof(float), sizeof(float));
+        if (reconstruction_norm < 1e-30f || std::abs(weight) < 1e-30f)
             return;
 
-        const __m256 weighted_norm = _mm256_set1_ps(weight * norm);
+        const __m256 weighted_norm = _mm256_set1_ps(weight * reconstruction_norm);
         const uint8_t *indices = tq8_block + 8;
         int i = 0;
         for (; i + 8 <= head_dim; i += 8)
@@ -462,7 +468,7 @@ namespace llaminar2
                 _mm256_fmadd_ps(centroids, weighted_norm, previous));
         }
         for (; i < head_dim; ++i)
-            accum[i] += weight * norm * TQ8_CENTROIDS[indices[i]];
+            accum[i] += weight * reconstruction_norm * TQ8_CENTROIDS[indices[i]];
     }
 #endif
 
@@ -474,12 +480,12 @@ namespace llaminar2
         float weight,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq8_block, sizeof(float));
-        if (norm < 1e-30f || std::abs(weight) < 1e-30f)
+        float reconstruction_norm;
+        std::memcpy(&reconstruction_norm, tq8_block + sizeof(float), sizeof(float));
+        if (reconstruction_norm < 1e-30f || std::abs(weight) < 1e-30f)
             return;
 
-        const __m512 weighted_norm = _mm512_set1_ps(weight * norm);
+        const __m512 weighted_norm = _mm512_set1_ps(weight * reconstruction_norm);
         const uint8_t *indices = tq8_block + 8;
         int i = 0;
         for (; i + 16 <= head_dim; i += 16)
@@ -496,7 +502,7 @@ namespace llaminar2
                 _mm512_fmadd_ps(centroids, weighted_norm, previous));
         }
         for (; i < head_dim; ++i)
-            accum[i] += weight * norm * TQ8_CENTROIDS[indices[i]];
+            accum[i] += weight * reconstruction_norm * TQ8_CENTROIDS[indices[i]];
     }
 #endif
 
@@ -538,7 +544,8 @@ namespace llaminar2
     /**
      * @brief Accumulate weighted TQ4 centroid vector into rotated-space accumulator.
      *
-     * Computes: accum[i] += weight × norm × TQ4_CENTROIDS[index(block, i)]
+     * Computes: accum[i] += weight × reconstruction_norm ×
+     * TQ4_CENTROIDS[index(block, i)]
      * for all i in [0, head_dim). This accumulates in the "rotated" centroid
      * space — the caller applies Πᵀ once at the end.
      *
@@ -549,7 +556,7 @@ namespace llaminar2
      * Cost: O(D) — 8 iterations for D=128 on AVX-512, with 3+1 bit unpacking.
      *
      * @param accum      Rotated-space accumulator [head_dim], modified in-place
-     * @param tq4_block  Raw TQ4 block bytes: [norm:f32, residual:f32,
+     * @param tq4_block  Raw TQ4 block bytes: [norm:f32, reconstruction_norm:f32,
      *                   mse_indices:D*3/8 bytes, high_bits:D/8 bytes]
      * @param weight     Softmax attention weight for this position
      * @param head_dim   Head dimension (64 or 128)
@@ -565,11 +572,14 @@ namespace llaminar2
         float weight,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq4_block, sizeof(float));
-        if (norm < 1e-30f || std::abs(weight) < 1e-30f)
+        float reconstruction_norm;
+        std::memcpy(
+            &reconstruction_norm,
+            tq4_block + sizeof(float),
+            sizeof(float));
+        if (reconstruction_norm < 1e-30f || std::abs(weight) < 1e-30f)
             return;
-        const float combined_weight = weight * norm;
+        const float combined_weight = weight * reconstruction_norm;
         const uint8_t *mse_indices = tq4_block + 8;
         const uint8_t *high_bits = tq4_block + 8 + head_dim * 3 / 8;
 
@@ -596,11 +606,14 @@ namespace llaminar2
         float weight,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq4_block, sizeof(float));
-        if (norm < 1e-30f || std::abs(weight) < 1e-30f)
+        float reconstruction_norm;
+        std::memcpy(
+            &reconstruction_norm,
+            tq4_block + sizeof(float),
+            sizeof(float));
+        if (reconstruction_norm < 1e-30f || std::abs(weight) < 1e-30f)
             return;
-        const float combined_weight = weight * norm;
+        const float combined_weight = weight * reconstruction_norm;
         const uint8_t *mse_indices = tq4_block + 8;
         const uint8_t *high_bits = tq4_block + 8 + head_dim * 3 / 8;
 
@@ -635,11 +648,14 @@ namespace llaminar2
         float weight,
         int head_dim)
     {
-        float norm;
-        std::memcpy(&norm, tq4_block, sizeof(float));
-        if (norm < 1e-30f || std::abs(weight) < 1e-30f)
+        float reconstruction_norm;
+        std::memcpy(
+            &reconstruction_norm,
+            tq4_block + sizeof(float),
+            sizeof(float));
+        if (reconstruction_norm < 1e-30f || std::abs(weight) < 1e-30f)
             return;
-        const float combined_weight = weight * norm;
+        const float combined_weight = weight * reconstruction_norm;
         const uint8_t *mse_indices = tq4_block + 8;
         const uint8_t *high_bits = tq4_block + 8 + head_dim * 3 / 8;
 

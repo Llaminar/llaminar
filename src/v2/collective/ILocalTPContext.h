@@ -105,9 +105,9 @@ namespace llaminar2
 
         /**
          * @brief LOCAL TP is always intra-rank
-         * @return Always TPScope::LOCAL for LOCAL TP contexts
+         * @return Always TPScope::RANK_LOCAL for LOCAL TP contexts
          */
-        TPScope scope() const override { return TPScope::LOCAL; }
+        TPScope scope() const override { return TPScope::RANK_LOCAL; }
 
         // =====================================================================
         // Configuration
@@ -496,17 +496,22 @@ namespace llaminar2
          * @brief Establish a device-domain fence before a graph lifecycle transition.
          *
          * A host rendezvous alone cannot order GPU work already queued by sibling
-         * participants. Homogeneous LocalTP implementations must enqueue a tiny
-         * NCCL/RCCL collective on each participant's exact graph stream, then
-         * verify through the named rendezvous that every peer enqueued the same
-         * fence. Returning true guarantees that subsequent work on each stream is
-         * ordered after all device work preceding the fence across the domain.
+         * participants. Homogeneous LocalTP implementations enqueue a tiny
+         * NCCL/RCCL collective on each participant's exact graph stream.
+         * Heterogeneous implementations publish a persistent event ticket on
+         * each CUDA/ROCm stream, observe those tickets with bounded nonblocking
+         * queries, and release the generation only after every ticket completes.
+         * Returning true guarantees that no participant enters or leaves native
+         * capture while a sibling's preceding stream generation remains live.
+         * This method is a graph-materialization lifecycle boundary; ordinary
+         * captured replay must not call it.
          *
          * @param boundary_name Stable lifecycle boundary identifier.
          * @param device_index Participant index in devices().
          * @param stream Exact stream that will begin capture or launch a graph.
          * @param timeout_ms Host contract timeout for matching peer arrivals.
-         * @return true only when the device fence and both contract rendezvous complete.
+         * @return true only when the backend fence/tickets and every contract
+         *         rendezvous complete.
          */
         virtual bool graphCaptureBoundaryOnStream(
             const std::string &boundary_name,

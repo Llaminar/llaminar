@@ -338,7 +338,10 @@ namespace llaminar2
          *
          * Called after the first forward pass completes, when GPU kernels have
          * uploaded their own device copies (e.g., embedding repack+upload to workspace).
-         * At that point, the host data is no longer needed.
+         * At that point, the host data is no longer needed. This phase must not
+         * advise mmap pages itself: a caller follows it with
+         * adviseMmapDontneed(), which first unregisters every surviving mapped
+         * view from the accelerator runtime.
          *
          * @return Number of tensors whose host data was released
          */

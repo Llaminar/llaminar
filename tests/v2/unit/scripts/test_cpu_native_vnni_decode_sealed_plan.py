@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -337,6 +338,116 @@ class CPUDecodeSealedPlanTest(unittest.TestCase):
 
         self.assertTrue(probe.shapes)
         self.assertEqual(development.iterations, 1)
+
+    def test_plan_authenticates_development_corpus_once(self) -> None:
+        """Plan identity must require one whole-corpus digest, not repeated scans."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            routes = Path(temporary) / "routes.csv"
+            self._write_routes(routes, self.probe)
+            with mock.patch.object(
+                self.development,
+                "digest",
+                wraps=self.development.digest,
+            ) as digest:
+                plan = build_cpu_decode_sealed_plan(
+                    self.rules,
+                    FROZEN_DIGEST,
+                    self.development,
+                    self.manifest,
+                    self.probe,
+                    (routes,),
+                    self.sealed_build_id,
+                )
+
+        self.assertTrue(plan.requests)
+        self.assertEqual(digest.call_count, 1)
+
+    def test_parallel_probe_is_byte_identical_to_serial_probe(self) -> None:
+        """Physical-core scheduling cannot change the sealed reserve."""
+
+        rules = tuple(
+            _rule(
+                index,
+                bundle=SERIAL_FULL_K_BUNDLE,
+                candidate="cpu.nvnni.decode.n_chunk_grid.nbc4",
+            )
+            for index in range(8)
+        )
+        development = _Development(tuple(
+            SimpleNamespace(
+                shape_group_id=f"group-{index}",
+                aggregate_n=512 + index * 32,
+                k=512 + index * 32,
+                architecture_class=ARCHITECTURE,
+                runtime_codebook_id=4,
+                bundle_signature=SERIAL_FULL_K_BUNDLE,
+                operation_kind="NativeVNNIFastM1Projection",
+                execution_mode=ExecutionMode.EAGER,
+                m=1,
+                launch_k_tiles=0,
+            )
+            for index in range(8)
+        ))
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+        ):
+            serial = build_cpu_decode_sealed_route_probe(
+                rules,
+                FROZEN_DIGEST,
+                development,
+                self.manifest,
+                self.sealed_build_id,
+            )
+        with mock.patch.dict(
+            os.environ,
+            {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "2"},
+        ):
+            parallel = build_cpu_decode_sealed_route_probe(
+                rules,
+                FROZEN_DIGEST,
+                development,
+                self.manifest,
+                self.sealed_build_id,
+            )
+
+        self.assertEqual(serial.canonical_mapping(), parallel.canonical_mapping())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            route_path = Path(temporary) / "routes.csv"
+            self._write_routes(route_path, serial)
+            with mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "1"},
+            ):
+                serial_plan = build_cpu_decode_sealed_plan(
+                    rules,
+                    FROZEN_DIGEST,
+                    development,
+                    self.manifest,
+                    serial,
+                    (route_path,),
+                    self.sealed_build_id,
+                )
+            with mock.patch.dict(
+                os.environ,
+                {"LLAMINAR_NATIVE_VNNI_POLICY_WORKERS": "2"},
+            ):
+                parallel_plan = build_cpu_decode_sealed_plan(
+                    rules,
+                    FROZEN_DIGEST,
+                    development,
+                    self.manifest,
+                    parallel,
+                    (route_path,),
+                    self.sealed_build_id,
+                )
+
+        self.assertEqual(
+            serial_plan.canonical_mapping(),
+            parallel_plan.canonical_mapping(),
+        )
 
     def test_legacy_plan_recovers_exact_k_tiles_from_authenticated_routes(
         self,

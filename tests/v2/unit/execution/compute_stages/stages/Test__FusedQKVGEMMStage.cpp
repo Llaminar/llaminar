@@ -154,6 +154,14 @@ namespace llaminar2
                 return true;
             }
 
+            bool prepareFusedProjectionGraphCapture(
+                size_t projection_count) override
+            {
+                ++capture_preparation_count;
+                prepared_projection_counts.push_back(projection_count);
+                return capture_preparation_succeeds;
+            }
+
             WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
             {
                 observed_m.push_back(m);
@@ -181,6 +189,9 @@ namespace llaminar2
             std::vector<int> observed_fused_k;
             std::vector<int> observed_fused_projection_count;
             DeviceWorkspaceManager *last_fused_workspace = nullptr;
+            int capture_preparation_count = 0;
+            std::vector<size_t> prepared_projection_counts;
+            bool capture_preparation_succeeds = true;
 
         private:
             std::string name_;
@@ -828,6 +839,49 @@ namespace llaminar2
         EXPECT_EQ(q->observed_fused_projection_count, std::vector<int>({3}));
         EXPECT_EQ(k->getWorkspace(), &workspace);
         EXPECT_EQ(v->getWorkspace(), &workspace);
+    }
+
+    TEST_F(Test__FusedQKVGEMMStage, CapturePreparationProvisionsExactProjectionFanout)
+    {
+        const ModelContextId model_id{9916};
+        PreparedWeightStore store(model_id);
+        auto q = std::make_shared<RecordingWorkspaceGemm>("q");
+        auto k = std::make_shared<RecordingWorkspaceGemm>("k");
+        auto v = std::make_shared<RecordingWorkspaceGemm>("v");
+
+        auto q_ref = registerRecordingGemm(store, q, "blk.0.attn_q.weight", model_id);
+        auto k_ref = registerRecordingGemm(store, k, "blk.0.attn_k.weight", model_id);
+        auto v_ref = registerRecordingGemm(store, v, "blk.0.attn_v.weight", model_id);
+
+        FusedQKVGEMMStage::Params params{
+            .m = 1,
+            .k = 128,
+            .n_q = 96,
+            .n_k = 16,
+            .n_v = 16,
+            .prepared_ref_q = q_ref,
+            .prepared_ref_k = k_ref,
+            .prepared_ref_v = v_ref,
+            .prepared_store = &store};
+        FusedQKVGEMMStage stage(params);
+        void *const capture_stream = reinterpret_cast<void *>(0x1234);
+
+        EXPECT_EQ(
+            stage.graphLaunchPreparationPolicy(),
+            GraphLaunchPreparationPolicy::CaptureOnly);
+        ASSERT_TRUE(stage.prepareGraphLaunch(ctx_.get(), capture_stream));
+        EXPECT_EQ(q->capture_preparation_count, 1);
+        EXPECT_EQ(q->prepared_projection_counts, std::vector<size_t>({3}));
+        EXPECT_EQ(k->capture_preparation_count, 1);
+        EXPECT_EQ(k->prepared_projection_counts, std::vector<size_t>({3}));
+        EXPECT_EQ(v->capture_preparation_count, 1);
+        EXPECT_EQ(v->prepared_projection_counts, std::vector<size_t>({3}));
+
+        q->capture_preparation_succeeds = false;
+        EXPECT_FALSE(stage.prepareGraphLaunch(ctx_.get(), capture_stream));
+        EXPECT_EQ(q->capture_preparation_count, 2);
+        EXPECT_EQ(k->capture_preparation_count, 2);
+        EXPECT_EQ(v->capture_preparation_count, 2);
     }
 
     TEST_F(Test__FusedQKVGEMMStage, DecodeEquivalentVerifierPrefillFailsFastWithoutBackendSupport)

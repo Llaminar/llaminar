@@ -13,6 +13,7 @@
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
+#include "../../../execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../utils/DebugEnv.h"
@@ -281,6 +282,11 @@ namespace llaminar2
     std::string MoEDeviceRebalanceStage::gatheredCommandHeaderBufferName() const
     {
         return std::string(WS_GATHERED_COMMAND_HEADER) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::transferSlotClaimIndexBufferName() const
+    {
+        return std::string(WS_TRANSFER_SLOT_CLAIM_INDEX) + "_" + workspaceSuffix();
     }
 
     std::string MoEDeviceRebalanceStage::waveStateBufferName() const
@@ -748,6 +754,37 @@ namespace llaminar2
                           << " config_top_k=" << params_.config.top_k);
             return false;
         }
+        const bool current_batch_llep =
+            params_.config.routed_assignment_policy ==
+            kDeviceMoERebalanceAssignmentLeastLoadedResident;
+        if (current_batch_llep &&
+            (!device_table->usesOverlayEpochTicket() ||
+             device_table->overlayPlacementSource() == nullptr ||
+             params_.overlay_epoch_arena))
+        {
+            LOG_ERROR("[" << label << "] Current-batch LLEP requires a "
+                              "ticketed request-local child table backed by "
+                              "the canonical ExpertOverlay placement source");
+            return false;
+        }
+        if (params_.overlay_epoch_arena)
+        {
+            if (params_.phase != DeviceMoERebalanceStagePhase::PlanCopyApply ||
+                params_.apply_layer_idx != -1 || !usesReadyWaveApply())
+            {
+                LOG_ERROR("[" << label << "] Durable overlay publication requires one all-layer PlanCopyApply transaction");
+                return false;
+            }
+            if (params_.overlay_epoch_arena->deviceId() != params_.device_id ||
+                device_table->overlayEpochArena() !=
+                    params_.overlay_epoch_arena.get() ||
+                !device_table->usesOverlayEpochTicket() ||
+                device_table->overlayPlacementSource() != nullptr)
+            {
+                LOG_ERROR("[" << label << "] Durable overlay maintenance must own the canonical main table and its exact epoch arena");
+                return false;
+            }
+        }
         if (usesCollectivePayloadLane() && params_.collective_payload_slot_bytes == 0)
         {
             LOG_ERROR("[" << label << "] Transfer-slot apply with a collective payload lane requires non-zero payload slot bytes");
@@ -888,6 +925,7 @@ namespace llaminar2
         DeviceMoERebalancePlanEntry *gathered_plan_entries = nullptr;
         DeviceMoERebalanceCommandBufferHeader *gathered_command_headers = nullptr;
         DeviceMoERebalanceWaveState *gathered_wave_states = nullptr;
+        DeviceMoETransferSlotClaimIndex *transfer_slot_claim_index = nullptr;
         DeviceMoEExpertDirectoryEntry *local_source_descriptors = nullptr;
         uint8_t *local_transfer_payload = nullptr;
         uint8_t *gathered_transfer_payload = nullptr;
@@ -914,18 +952,25 @@ namespace llaminar2
                 bound_workspace_->getBuffer(gatheredCommandHeaderBufferName()));
             gathered_wave_states = static_cast<DeviceMoERebalanceWaveState *>(
                 bound_workspace_->getBuffer(gatheredWaveStateBufferName()));
+            transfer_slot_claim_index =
+                static_cast<DeviceMoETransferSlotClaimIndex *>(
+                    bound_workspace_->getBuffer(
+                        transferSlotClaimIndexBufferName()));
             if (!copy_status ||
                 !gathered_copy_status ||
                 !gathered_plan_entries ||
                 !gathered_command_headers ||
-                !gathered_wave_states)
+                !gathered_wave_states ||
+                !transfer_slot_claim_index)
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Missing transfer-slot metadata workspace buffers"
                           << " copy_status=" << static_cast<void *>(copy_status)
                           << " gathered_copy_status=" << static_cast<void *>(gathered_copy_status)
                           << " gathered_plan_entries=" << static_cast<void *>(gathered_plan_entries)
                           << " gathered_command_headers=" << static_cast<void *>(gathered_command_headers)
-                          << " gathered_wave_states=" << static_cast<void *>(gathered_wave_states));
+                          << " gathered_wave_states=" << static_cast<void *>(gathered_wave_states)
+                          << " transfer_slot_claim_index="
+                          << static_cast<void *>(transfer_slot_claim_index));
                 return false;
             }
             if (usesCompactTransferSlots())
@@ -1119,7 +1164,8 @@ namespace llaminar2
                     wave_state,
                     runtime_layers,
                     params_.local_transfer_slots,
-                    params_.local_transfer_slot_count))
+                    params_.local_transfer_slot_count,
+                    transfer_slot_claim_index))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to project gathered root commands into local apply ABI");
                 return false;
@@ -1183,7 +1229,8 @@ namespace llaminar2
 
         auto apply_published_transfer_wave =
             [&](const MoEKernelLaunchContext &launch,
-                const char *context) -> bool
+                const char *context,
+                int target_layer) -> bool
         {
             if (!usesReadyWaveApply())
                 return true;
@@ -1193,6 +1240,28 @@ namespace llaminar2
                           << " requires ready-wave apply status");
                 return false;
             }
+            DeviceMoEOverlayEpochStatus *overlay_status = nullptr;
+            if (params_.overlay_epoch_arena)
+            {
+                if (target_layer != -1)
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Durable overlay maintenance cannot publish a partial layer family");
+                    return false;
+                }
+                overlay_status =
+                    params_.overlay_epoch_arena->maintenanceStatus();
+                if (!moe_kernel->reserveMoEOverlayEpochCandidate(
+                        launch,
+                        params_.overlay_epoch_arena->control(),
+                        params_.overlay_epoch_arena->maintenanceEpoch(),
+                        overlay_status))
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Failed to enqueue durable overlay candidate reservation before "
+                              << context);
+                    return false;
+                }
+            }
+
             if (!moe_kernel->applyReadyDeviceRebalanceWave(
                     launch,
                     runtime_layers,
@@ -1205,12 +1274,46 @@ namespace llaminar2
                     apply_status,
                     controller_state,
                     command_header,
-                    /*target_layer=*/-1,
-                    static_cast<uint32_t>(commandBufferCount())))
+                    target_layer,
+                    static_cast<uint32_t>(commandBufferCount()),
+                    overlay_status))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to apply ready device rebalance wave after "
                           << context);
                 return false;
+            }
+
+            if (params_.overlay_epoch_arena &&
+                !moe_kernel->finalizeMoEOverlayRebalancePublication(
+                    launch,
+                    runtime_layers,
+                    params_.config.num_layers,
+                    params_.config.num_experts,
+                    params_.overlay_epoch_arena->control(),
+                    params_.overlay_epoch_arena->maintenanceEpoch(),
+                    overlay_status,
+                    apply_status))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to enqueue durable overlay publication finalizer after "
+                          << context);
+                return false;
+            }
+
+            if (params_.overlay_epoch_arena && PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "device_overlay_epoch_maintenance_transaction_enqueued",
+                    1.0,
+                    "decode",
+                    params_.device_id.to_string(),
+                    {{"stage", suffixFor(params_.stage_name)},
+                     {"phase", phaseName(params_.phase)},
+                     {"stream_path",
+                      launch.stream == transfer_stream
+                          ? "auxiliary_transfer"
+                          : "maintenance_compute"},
+                     {"layer_count", std::to_string(params_.config.num_layers)}});
             }
             return true;
         };
@@ -1408,7 +1511,8 @@ namespace llaminar2
 
             if (!apply_published_transfer_wave(
                     transfer_launch,
-                    "prepared payload transfer"))
+                    "prepared payload transfer",
+                    /*target_layer=*/-1))
                 return false;
 
             return join_transfer_stream_to_capture_stream("prepared payload transfer");
@@ -1506,7 +1610,8 @@ namespace llaminar2
 
             if (!apply_published_transfer_wave(
                     transfer_launch,
-                    "sideband collective payload unpack"))
+                    "sideband collective payload unpack",
+                    /*target_layer=*/-1))
                 return false;
 
             if (!gpu_ctx->recordEventChecked(transfer_state->transferDoneEvent(),
@@ -1695,20 +1800,10 @@ namespace llaminar2
             usesReadyWaveApply() &&
             !inline_transfer_already_applied)
         {
-            if (!moe_kernel->applyReadyDeviceRebalanceWave(
+            if (!apply_published_transfer_wave(
                     compute_launch,
-                    runtime_layers,
-                    plan_entries,
-                    plan_count,
-                    static_cast<uint32_t>(transferPlanCapacity()),
-                    params_.local_transfer_slots,
-                    params_.local_transfer_slot_count,
-                    params_.config,
-                    apply_status,
-                    controller_state,
-                    command_header,
-                    params_.apply_layer_idx,
-                    static_cast<uint32_t>(commandBufferCount())))
+                    "compute-stream deferred apply",
+                    params_.apply_layer_idx))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Device rebalance ready-wave apply failed");
                 return false;
@@ -1746,6 +1841,8 @@ namespace llaminar2
             bytes += sizeof(DeviceMoERebalanceApplyStatus);
             bytes += static_cast<size_t>(params_.config.participant_count) *
                      sizeof(DeviceMoERebalanceApplyStatus);
+            bytes += deviceMoETransferSlotClaimIndexBytes(
+                params_.local_transfer_slot_count);
             bytes += transferPlanCapacity() *
                          static_cast<size_t>(params_.config.participant_count) *
                          commandBufferCount() *
@@ -2014,6 +2111,12 @@ namespace llaminar2
                                         sizeof(DeviceMoERebalanceWaveState),
                                     256,
                                     true});
+            reqs.buffers.push_back({
+                transferSlotClaimIndexBufferName(),
+                deviceMoETransferSlotClaimIndexBytes(
+                    params_.local_transfer_slot_count),
+                256,
+                true});
             if (usesCompactTransferSlots())
             {
                 reqs.buffers.push_back({localSourceDescriptorsBufferName(),

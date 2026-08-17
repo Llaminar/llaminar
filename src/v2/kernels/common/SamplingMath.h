@@ -538,11 +538,15 @@ namespace llaminar2::sampling_math
         kDeviceGenerationControlAttemptedDraftTokenCount = 40,
         /** Sum of logical verifier widths, including each condition row. */
         kDeviceGenerationControlVerifierTokenCount = 41,
+        /** Device-selected draft width of the most recently committed transaction. */
+        kDeviceGenerationControlLastTransactionDraftDepth = 42,
+        /** Response tokens appended by the most recently committed transaction. */
+        kDeviceGenerationControlLastTransactionEmittedTokenCount = 43,
         /** Number of MoE layers that moved current-batch LLEP payloads. */
-        kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount = 42,
+        kDeviceGenerationControlCurrentBatchLLEPMovementLayerCount = 44,
         /** Number of MoE layers that executed rows away from their static owner. */
-        kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount = 43,
-        kDeviceGenerationControlCount = 44,
+        kDeviceGenerationControlCurrentBatchLLEPNonOwnerAssignmentLayerCount = 45,
+        kDeviceGenerationControlCount = 46,
     };
 
     /**
@@ -1321,6 +1325,10 @@ namespace llaminar2::sampling_math
             active_depth;
         control[kDeviceGenerationControlVerifierTokenCount] +=
             active_depth + 1;
+        control[kDeviceGenerationControlLastTransactionDraftDepth] =
+            active_depth;
+        control[kDeviceGenerationControlLastTransactionEmittedTokenCount] =
+            newly_emitted_count;
         control[kDeviceGenerationControlErrorCode] =
             static_cast<int>(DeviceGenerationError::None);
         return record_device_generation_depth_observation(

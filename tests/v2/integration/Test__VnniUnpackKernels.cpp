@@ -305,13 +305,18 @@ protected:
                             uint16_t* d_mins, uint32_t* d_emins,
                             int N, int K, int output_N,
                             int output_row_offset,
-                            int packed_group_rows = 0) {
+                            int packed_group_rows = 0,
+                            int allocation_payload_bytes_per_block = 0) {
+        const int payload_capacity =
+            allocation_payload_bytes_per_block > 0
+                ? allocation_payload_bytes_per_block
+                : repackPayloadBytesPerBlock(format);
         if (device_type_ == DeviceType::CUDA) {
 #ifdef HAVE_CUDA
             return launchVnniRepackCUDA(
                 format, d_raw, d_payload, d_scales, d_mins, d_emins,
                 N, K, output_N, output_row_offset,
-                packed_group_rows, stream_);
+                packed_group_rows, payload_capacity, stream_);
 #else
             return false;
 #endif
@@ -321,7 +326,7 @@ protected:
             return launchVnniRepack(
                 format, d_raw, d_payload, d_scales, d_mins, d_emins,
                 N, K, output_N, output_row_offset,
-                packed_group_rows, stream_);
+                packed_group_rows, payload_capacity, stream_);
 #else
             return false;
 #endif
@@ -644,12 +649,14 @@ TEST_P(VnniUnpackTest, RowChunkedRepackMatchesWholeMatrixForEveryFormat) {
  *
  * Production reads one contiguous GGUF parent and packs it into a slab whose
  * expert subregions must remain directly consumable by the existing GEMM and
- * transfer kernels. The bounded chunks below intentionally begin and end
- * inside different seven-row experts. This catches both the historical
- * full-N block-major interleaving bug and chunk-boundary indexing mistakes for
- * every payload/metadata geometry on both GPU backends.
+ * transfer kernels. Every expert is allocated for the union of its compact
+ * source representation and its CPU-promotion representation, while the live
+ * payload stays compact. The bounded chunks below intentionally begin and end
+ * inside different seven-row experts. This catches full-N interleaving,
+ * capacity-stride overwrites, and chunk-boundary mistakes for all source
+ * codebooks on both GPU backends.
  */
-TEST_P(VnniUnpackTest, GroupedExpertRepackMatchesStandaloneForEveryFormat) {
+TEST_P(VnniUnpackTest, GroupedExpertReusableCapacityMatchesStandaloneForEveryFormat) {
     constexpr int kExpertCount = 3;
     constexpr int kRowsPerExpert = 7;
     constexpr int kTotalRows = kExpertCount * kRowsPerExpert;
@@ -678,21 +685,37 @@ TEST_P(VnniUnpackTest, GroupedExpertRepackMatchesStandaloneForEveryFormat) {
             tensor->size_bytes() / static_cast<size_t>(kTotalRows);
         const auto expert_regions = nativeVnniPackedRegionSizes(
             kRowsPerExpert, kColumns, *info);
-        const auto slab_regions = nativeVnniPackedRegionSizes(
+        const auto compact_slab_regions = nativeVnniPackedRegionSizes(
             kTotalRows, kColumns, *info);
+        const auto allocation = reusableDeviceVnniAllocationFormat(*info);
+        const NativeVnniFormatInfo allocation_info{
+            .codebook_id = info->codebook_id,
+            .payload_bytes = allocation.payload_bytes_per_block,
+            .is_asymmetric = allocation.has_mins,
+            .is_superblock = info->is_superblock,
+            .has_emins = allocation.has_emins,
+            .max_abs_factor = info->max_abs_factor,
+        };
+        const auto expert_allocation_regions = nativeVnniPackedRegionSizes(
+            kRowsPerExpert, kColumns, allocation_info);
+        const auto slab_allocation_regions = nativeVnniPackedRegionSizes(
+            kTotalRows, kColumns, allocation_info);
 
         ASSERT_EQ(
-            slab_regions.payload_bytes,
+            compact_slab_regions.payload_bytes,
             kExpertCount * expert_regions.payload_bytes);
         ASSERT_EQ(
-            slab_regions.scales_bytes,
+            compact_slab_regions.scales_bytes,
             kExpertCount * expert_regions.scales_bytes);
         ASSERT_EQ(
-            slab_regions.mins_bytes,
+            compact_slab_regions.mins_bytes,
             kExpertCount * expert_regions.mins_bytes);
         ASSERT_EQ(
-            slab_regions.emins_bytes,
+            compact_slab_regions.emins_bytes,
             kExpertCount * expert_regions.emins_bytes);
+        ASSERT_EQ(
+            slab_allocation_regions.payload_bytes,
+            kExpertCount * expert_allocation_regions.payload_bytes);
 
         GpuMem standalone_raw(
             backend_, device_id_,
@@ -701,21 +724,21 @@ TEST_P(VnniUnpackTest, GroupedExpertRepackMatchesStandaloneForEveryFormat) {
             backend_, device_id_,
             source_row_bytes * static_cast<size_t>(kMaximumChunkRows));
         GpuMem standalone_payload(
-            backend_, device_id_, slab_regions.payload_bytes);
+            backend_, device_id_, slab_allocation_regions.payload_bytes);
         GpuMem standalone_scales(
-            backend_, device_id_, slab_regions.scales_bytes);
+            backend_, device_id_, slab_allocation_regions.scales_bytes);
         GpuMem standalone_mins(
-            backend_, device_id_, slab_regions.mins_bytes);
+            backend_, device_id_, slab_allocation_regions.mins_bytes);
         GpuMem standalone_emins(
-            backend_, device_id_, slab_regions.emins_bytes);
+            backend_, device_id_, slab_allocation_regions.emins_bytes);
         GpuMem grouped_payload(
-            backend_, device_id_, slab_regions.payload_bytes);
+            backend_, device_id_, slab_allocation_regions.payload_bytes);
         GpuMem grouped_scales(
-            backend_, device_id_, slab_regions.scales_bytes);
+            backend_, device_id_, slab_allocation_regions.scales_bytes);
         GpuMem grouped_mins(
-            backend_, device_id_, slab_regions.mins_bytes);
+            backend_, device_id_, slab_allocation_regions.mins_bytes);
         GpuMem grouped_emins(
-            backend_, device_id_, slab_regions.emins_bytes);
+            backend_, device_id_, slab_allocation_regions.emins_bytes);
 
         ASSERT_NE(standalone_raw.ptr, nullptr);
         ASSERT_NE(grouped_raw.ptr, nullptr);
@@ -723,6 +746,21 @@ TEST_P(VnniUnpackTest, GroupedExpertRepackMatchesStandaloneForEveryFormat) {
         ASSERT_NE(standalone_scales.ptr, nullptr);
         ASSERT_NE(grouped_payload.ptr, nullptr);
         ASSERT_NE(grouped_scales.ptr, nullptr);
+
+        const auto initialize_region = [&](GpuMem& memory) {
+            if (memory.bytes == 0)
+                return;
+            ASSERT_TRUE(backend_->memset(
+                memory.ptr, 0xA5, memory.bytes, device_id_, stream_));
+        };
+        initialize_region(standalone_payload);
+        initialize_region(standalone_scales);
+        initialize_region(standalone_mins);
+        initialize_region(standalone_emins);
+        initialize_region(grouped_payload);
+        initialize_region(grouped_scales);
+        initialize_region(grouped_mins);
+        initialize_region(grouped_emins);
 
         const auto* source =
             static_cast<const uint8_t*>(tensor->raw_data());
@@ -738,21 +776,22 @@ TEST_P(VnniUnpackTest, GroupedExpertRepackMatchesStandaloneForEveryFormat) {
 
             auto* payload = standalone_payload.u8() +
                             static_cast<size_t>(expert) *
-                                expert_regions.payload_bytes;
+                                expert_allocation_regions.payload_bytes;
             auto* scales = reinterpret_cast<uint16_t*>(
                 standalone_scales.u8() +
-                static_cast<size_t>(expert) * expert_regions.scales_bytes);
+                static_cast<size_t>(expert) *
+                    expert_allocation_regions.scales_bytes);
             auto* mins = info->is_asymmetric
                              ? reinterpret_cast<uint16_t*>(
                                    standalone_mins.u8() +
                                    static_cast<size_t>(expert) *
-                                       expert_regions.mins_bytes)
+                                       expert_allocation_regions.mins_bytes)
                              : nullptr;
             auto* emins = info->has_emins
                               ? reinterpret_cast<uint32_t*>(
                                     standalone_emins.u8() +
                                     static_cast<size_t>(expert) *
-                                        expert_regions.emins_bytes)
+                                        expert_allocation_regions.emins_bytes)
                               : nullptr;
             ASSERT_TRUE(forwardRepackChunk(
                 *format, standalone_raw.ptr,
@@ -774,7 +813,8 @@ TEST_P(VnniUnpackTest, GroupedExpertRepackMatchesStandaloneForEveryFormat) {
                 info->is_asymmetric ? grouped_mins.u16() : nullptr,
                 info->has_emins ? grouped_emins.u32() : nullptr,
                 chunk_rows, kColumns, kTotalRows, row_offset,
-                kRowsPerExpert));
+                kRowsPerExpert,
+                allocation.payload_bytes_per_block));
             row_offset += chunk_rows;
         }
         ASSERT_EQ(row_offset, kTotalRows);
@@ -802,16 +842,16 @@ TEST_P(VnniUnpackTest, GroupedExpertRepackMatchesStandaloneForEveryFormat) {
 
         expect_device_bytes_equal(
             standalone_payload, grouped_payload,
-            slab_regions.payload_bytes, "payload");
+            slab_allocation_regions.payload_bytes, "payload");
         expect_device_bytes_equal(
             standalone_scales, grouped_scales,
-            slab_regions.scales_bytes, "scales");
+            slab_allocation_regions.scales_bytes, "scales");
         expect_device_bytes_equal(
             standalone_mins, grouped_mins,
-            slab_regions.mins_bytes, "mins");
+            slab_allocation_regions.mins_bytes, "mins");
         expect_device_bytes_equal(
             standalone_emins, grouped_emins,
-            slab_regions.emins_bytes, "emins");
+            slab_allocation_regions.emins_bytes, "emins");
     }
 }
 

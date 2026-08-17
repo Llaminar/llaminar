@@ -167,6 +167,8 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertIn("routed_phase=uniform", result.stdout)
         self.assertIn("routed_decode_assignment=static-owner", result.stdout)
         self.assertIn("routed_prefill_assignment=static-owner", result.stdout)
+        self.assertIn("priority=0", result.stdout)
+        self.assertIn("fallback=true", result.stdout)
 
     def test_twocard_dry_run_can_request_llep_assignment_policy(self) -> None:
         result = self.run_script(
@@ -468,7 +470,7 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS": "128",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS": "65",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT": "4096",
-                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER": "512",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT": "512",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT": "2048",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE": "75",
             }
@@ -496,7 +498,7 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
             result.stdout,
         )
         self.assertIn(
-            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER=512",
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT=512",
             result.stdout,
         )
         self.assertIn(

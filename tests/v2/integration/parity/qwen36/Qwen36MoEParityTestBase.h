@@ -29,11 +29,15 @@
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "execution/mtp/MTPSpecTransactionDriver.h"
 #include "execution/mtp/MTPVerifierPolicy.h"
+#include "execution/mtp/MTPWeightManifest.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "models/IGraphConfigBuilder.h"
 #include "utils/DebugEnv.h"
+#include "utils/MTPParitySnapshotContext.h"
+#include "utils/MoERoutingBoundary.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/Sha256.h"
 #include "utils/Tokenizer.h"
 
 #include <cnpy.h>
@@ -53,6 +57,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -65,7 +70,7 @@ namespace llaminar2::test::parity::qwen36
     enum class MoEPrefixParityTopology
     {
         SingleDevice,
-        NodeLocalTP,
+        NodeTP,
         ExpertOverlayCuda2TPHotOnly,
         ExpertOverlayRocm2TPHotOnly,
         ExpertOverlayRocm2TPHotCpu2LocalTPCold,
@@ -624,10 +629,9 @@ namespace llaminar2::test::parity::qwen36
         return true;
     }
 
-    inline bool applyHostMoERebalanceIfNeeded(IOrchestrationRunner &runner)
+    inline bool applyMoEOverlayMaintenanceIfNeeded(
+        IOrchestrationRunner &runner)
     {
-        if (runner.usesDeviceSideMoERebalanceController())
-            return true;
         return runner.maybeApplyMoERebalance();
     }
 
@@ -638,10 +642,16 @@ namespace llaminar2::test::parity::qwen36
     {
         RoutedExpertDomain domain;
         domain.name = name;
-        domain.scope = ExecutionDomainScope::LOCAL;
+        domain.scope = ExecutionDomainScope::RANK_LOCAL;
         domain.backend = backend;
         domain.participants = std::move(participants);
-        domain.owner_rank = 0;
+        /*
+         * LOCAL means that all participants resolve to one rank; it does not
+         * mean rank zero.  Inventory binding selects the owning rank from the
+         * accelerators' current NUMA placement so moving cards between sockets
+         * never requires changing a model topology fixture.
+         */
+        domain.owner_rank = -1;
         domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         domain.routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
         domain.routed_decode_assignment_policy =
@@ -837,7 +847,7 @@ namespace llaminar2::test::parity::qwen36
                 plan->continuation_domain + "' but no matching domain exists";
             return harness;
         }
-        if (domain_it->scope != ExecutionDomainScope::LOCAL ||
+        if (domain_it->scope != ExecutionDomainScope::RANK_LOCAL ||
             domain_it->participants.size() <= 1)
         {
             return harness;
@@ -869,10 +879,10 @@ namespace llaminar2::test::parity::qwen36
                 domain_it->weights,
                 domain_it->backend);
             /*
-             * Qwen3.5/GDN graph construction asks the TP context for myIndex()
-             * while computing local GDN state offsets. RankOrchestrator sets
-             * this before building per-device runners; direct helpers must do
-             * the same so they exercise the real LocalTP geometry.
+             * Some direct collective-stage helpers query the TP context for
+             * their participant identity. Production graph geometry uses the
+             * immutable per-graph tp_device_idx; this binding remains necessary
+             * for focused helpers that execute without RankOrchestrator.
              */
             context->setCurrentDeviceIndex(participant_index);
             harness.participant_index = participant_index;
@@ -927,7 +937,7 @@ namespace llaminar2::test::parity::qwen36
                     return domain.name == plan->continuation_domain;
                 });
             return domain_it != plan->domains.end() &&
-                   domain_it->scope == ExecutionDomainScope::LOCAL &&
+                   domain_it->scope == ExecutionDomainScope::RANK_LOCAL &&
                    domain_it->participants.size() > 1;
         }();
         const WeightDistributionStrategy weight_strategy =
@@ -1115,7 +1125,13 @@ namespace llaminar2::test::parity::qwen36
                 {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}),
         };
         plan->routed_tiers = {
-            routedTier("hot", kRocmHotDomain, 0, 256, gib(8)),
+            /*
+             * A one-tier overlay is both the most-preferred tier and the
+             * authoritative final coverage owner.  Keep that role explicit so
+             * setup-time BOM admission cannot silently leave experts without
+             * a resident owner when the declared quota is insufficient.
+             */
+            routedTier("hot", kRocmHotDomain, 0, 256, gib(8), true),
         };
         /*
          * The homogeneous target keeps the dense/shared trunk tensor parallel
@@ -1144,7 +1160,8 @@ namespace llaminar2::test::parity::qwen36
                 {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}),
         };
         plan->routed_tiers = {
-            routedTier("hot", kCudaHotDomain, 0, 256, gib(8)),
+            /* See the equivalent ROCm topology above for the coverage role. */
+            routedTier("hot", kCudaHotDomain, 0, 256, gib(8), true),
         };
         /*
          * Match the ROCm and server policy exactly: dense work remains tensor
@@ -1263,6 +1280,17 @@ namespace llaminar2::test::parity::qwen36
             return false;
         }
 
+        /*
+         * Main-model and MTP router hooks must name the same observable
+         * boundary: the complete post-softmax distribution retained by the
+         * production router. Presence checks alone accepted older packs whose
+         * main-model files still held signed pre-softmax logits.
+         */
+        const auto router_schema =
+            readStringFromMetadata(metadata_path, "moe_router_snapshot_schema");
+        if (!router_schema || *router_schema != "1")
+            return false;
+
         const auto dir = metadata_path.parent_path();
         if (decode_steps <= 0)
         {
@@ -1281,13 +1309,13 @@ namespace llaminar2::test::parity::qwen36
         }
 
         /*
-         * Schema 2 changed MOE_ROUTER_OUTPUT from Transformers' misleadingly
-         * named post-softmax probability tensor to the actual pre-softmax
-         * linear projection used by Llaminar's router-logit contract.  Merely
-         * checking that the NPY exists would accept stale fixtures and make a
-         * healthy router look catastrophically wrong.
+         * Schema 5 makes each recursive draft consume the preceding
+         * predictor's shared-head-normalized hidden result. Schema 4 added the
+         * depth-one and depth-two checkpoint surfaces but incorrectly chained
+         * their pre-normalized FFN residual. Schema 3 established the full
+         * post-softmax MOE_ROUTER_OUTPUT boundary used by production.
          */
-        constexpr int kMTPSidecarSnapshotSchema = 2;
+        constexpr int kMTPSidecarSnapshotSchema = 5;
         std::ifstream schema_file(
             dir / "mtp_sidecar_snapshot_schema.txt");
         int observed_schema = 0;
@@ -1297,7 +1325,7 @@ namespace llaminar2::test::parity::qwen36
             return false;
         }
 
-        const std::vector<std::string> required_mtp_sidecar_files = {
+        std::vector<std::string> required_mtp_sidecar_files = {
             "decode_step0_MTP_TERMINAL_HIDDEN_ROW_SELECT.npy",
             "decode_step0_MTP0_EMBEDDING.npy",
             "decode_step0_MTP0_NORM_HIDDEN.npy",
@@ -1325,6 +1353,46 @@ namespace llaminar2::test::parity::qwen36
             "decode_step0_MTP0_FINAL_NORM.npy",
             "decode_step0_MTP0_LM_HEAD.npy",
         };
+        const std::vector<std::string_view> recursive_stage_suffixes = {
+            "TERMINAL_HIDDEN_ROW_SELECT",
+            "EMBEDDING",
+            "NORM_HIDDEN",
+            "NORM_EMBEDDING",
+            "CONCAT",
+            "FC",
+            "ATTENTION_NORM",
+            "Q_PROJECTION",
+            "Q_NORM",
+            "K_PROJECTION",
+            "K_NORM",
+            "V_PROJECTION",
+            "ATTENTION_CONTEXT",
+            "ATTENTION_CONTEXT_GATED",
+            "ATTENTION_OUTPUT",
+            "FFN_NORM",
+            "MOE_ROUTER_OUTPUT",
+            "MOE_ROUTING_INDICES",
+            "MOE_ROUTING_WEIGHTS",
+            "MOE_EXPERT_OUTPUT",
+            "MOE_SHARED_EXPERT_OUTPUT",
+            "MOE_SHARED_GATE_OUTPUT",
+            "MOE_COMBINED_OUTPUT",
+            "FFN_RESIDUAL",
+            "FINAL_NORM",
+            "LM_HEAD",
+        };
+        for (int depth = 1; depth <= 2; ++depth)
+        {
+            for (const std::string_view suffix : recursive_stage_suffixes)
+            {
+                required_mtp_sidecar_files.push_back(
+                    "decode_step0_MTP" + std::to_string(depth) + "_" +
+                    std::string(suffix) + ".npy");
+            }
+        }
+        required_mtp_sidecar_files.push_back(
+            "decode_step" + std::to_string(decode_steps - 1) +
+            "_MTP2_LM_HEAD.npy");
         return std::all_of(
             required_mtp_sidecar_files.begin(),
             required_mtp_sidecar_files.end(),
@@ -1334,17 +1402,110 @@ namespace llaminar2::test::parity::qwen36
             });
     }
 
+    /**
+     * @brief Authenticate a reusable MoE reference pack against live inputs.
+     *
+     * MTP references are generated by CPU/FP32 PyTorch and are intentionally
+     * shared by CPU, CUDA, and ROCm production cells.  Reuse is legal only when
+     * the pack proves its exact GGUF bytes, prompt bytes, tokenizer output, and
+     * reference engine.  Directory names and model path strings are not
+     * identity authorities.
+     */
+    inline bool qwen36MoEReferenceIdentityMatches(
+        const std::filesystem::path &metadata_path,
+        const std::string &model_path,
+        const std::string &prompt,
+        std::string *reason = nullptr)
+    {
+        const auto fail = [reason](std::string message)
+        {
+            if (reason)
+                *reason = std::move(message);
+            return false;
+        };
+        const auto expect = [&](const char *key, const char *value) -> bool
+        {
+            const auto observed = readStringFromMetadata(metadata_path, key);
+            return observed.has_value() && *observed == value;
+        };
+        if (!expect("reference_identity_version", "1") ||
+            !expect("reference_engine", "pytorch") ||
+            !expect("reference_device", "cpu") ||
+            !expect("reference_dtype", "float32"))
+        {
+            return fail("missing or incompatible CPU/FP32 PyTorch identity");
+        }
+
+        std::string digest_error;
+        const auto digest_cache =
+            productionParityDigestCacheFromEnvironment();
+        const auto model_digest = digest_cache
+                                      ? sha256FileHexShared(
+                                            model_path,
+                                            *digest_cache,
+                                            &digest_error)
+                                      : sha256FileHex(
+                                            model_path,
+                                            &digest_error);
+        if (!model_digest)
+            return fail("could not hash live GGUF: " + digest_error);
+        const auto observed_model_digest =
+            readStringFromMetadata(metadata_path, "model_sha256");
+        if (!observed_model_digest || *observed_model_digest != *model_digest)
+            return fail("model_sha256 does not match the live GGUF bytes");
+
+        const auto prompt_digest = sha256BytesHex(prompt, &digest_error);
+        const auto observed_prompt_digest =
+            readStringFromMetadata(metadata_path, "prompt_sha256");
+        if (!prompt_digest || !observed_prompt_digest ||
+            *observed_prompt_digest != *prompt_digest)
+        {
+            return fail("prompt_sha256 does not match the configured prompt");
+        }
+
+        const auto token_ids =
+            readTokenListFromMetadata(metadata_path, "token_ids");
+        if (token_ids.empty())
+            return fail("token_ids is missing or malformed");
+        std::ostringstream canonical_tokens;
+        for (size_t index = 0; index < token_ids.size(); ++index)
+        {
+            if (index != 0)
+                canonical_tokens << ',';
+            canonical_tokens << token_ids[index];
+        }
+        const auto token_digest =
+            sha256BytesHex(canonical_tokens.str(), &digest_error);
+        const auto observed_token_digest =
+            readStringFromMetadata(metadata_path, "token_ids_sha256");
+        if (!token_digest || !observed_token_digest ||
+            *observed_token_digest != *token_digest)
+        {
+            return fail("token_ids_sha256 does not authenticate token_ids");
+        }
+
+        if (reason)
+            reason->clear();
+        return true;
+    }
+
     inline void ensurePyTorchMoEDecodeSnapshots(
         const MoEPrefixRestoreParityCase &test_case,
         const std::string &model_path,
         const std::filesystem::path &metadata_path,
         bool require_mtp_sidecar_snapshots = false)
     {
+        std::string identity_error;
         if (qwen36MoEDecodeSnapshotsLookUsable(
                 metadata_path,
                 test_case.prompt,
                 test_case.decode_steps,
-                require_mtp_sidecar_snapshots))
+                require_mtp_sidecar_snapshots) &&
+            qwen36MoEReferenceIdentityMatches(
+                metadata_path,
+                model_path,
+                test_case.prompt,
+                &identity_error))
         {
             return;
         }
@@ -1361,13 +1522,22 @@ namespace llaminar2::test::parity::qwen36
             << metadata_path.parent_path() << "\n"
             << output;
 
-        ASSERT_TRUE(qwen36MoEDecodeSnapshotsLookUsable(
-            metadata_path,
-            test_case.prompt,
-            test_case.decode_steps,
-            require_mtp_sidecar_snapshots))
-            << test_case.name << " regenerated MoE decode snapshots are incomplete at "
+        ASSERT_TRUE(
+            qwen36MoEDecodeSnapshotsLookUsable(
+                metadata_path,
+                test_case.prompt,
+                test_case.decode_steps,
+                require_mtp_sidecar_snapshots) &&
+            qwen36MoEReferenceIdentityMatches(
+                metadata_path,
+                model_path,
+                test_case.prompt,
+                &identity_error))
+            << test_case.name
+            << " regenerated MoE decode snapshots are incomplete or "
+               "unauthenticated at "
             << metadata_path.parent_path() << "\n"
+            << identity_error << "\n"
             << output;
     }
 
@@ -1425,7 +1595,7 @@ namespace llaminar2::test::parity::qwen36
         const MoEPrefixRestoreParityCase &test_case)
     {
         const int world_size = mpiWorldSize();
-        if (test_case.topology == MoEPrefixParityTopology::NodeLocalTP)
+        if (test_case.topology == MoEPrefixParityTopology::NodeTP)
         {
             if (world_size != test_case.mpi_ranks)
             {
@@ -1551,7 +1721,7 @@ namespace llaminar2::test::parity::qwen36
                                               ? GlobalDeviceAddress::cpu()
                                               : test_case.devices.front();
             break;
-        case MoEPrefixParityTopology::NodeLocalTP:
+        case MoEPrefixParityTopology::NodeTP:
             config.tp_degree = test_case.mpi_ranks;
             config.tp_scope = TPScope::NODE_LOCAL;
             config.pp_degree = 1;
@@ -1643,7 +1813,7 @@ namespace llaminar2::test::parity::qwen36
             test_case.devices = {GlobalDeviceAddress::rocm(0)};
             test_case.required_rocm_devices = 1;
             break;
-        case MoEPrefixParityTopology::NodeLocalTP:
+        case MoEPrefixParityTopology::NodeTP:
             test_case.devices = {
                 GlobalDeviceAddress::cpu(0),
                 GlobalDeviceAddress::cpu(1),
@@ -1699,7 +1869,7 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << *skip_reason;
         }
 
-        *model_path = firstEnvOrDefault(
+        *model_path = firstModelEnvOrDefault(
             test_case.model_envs,
             test_case.default_model_path);
         if (!std::filesystem::exists(*model_path))
@@ -1720,7 +1890,8 @@ namespace llaminar2::test::parity::qwen36
             const ModelContextConfig tokenizer_context_config{
                 .strategy = WeightDistributionStrategy::REPLICATED,
                 .use_mmap = true,
-                .target_is_gpu = true,
+                .payload_access_pattern =
+                    ModelPayloadAccessPattern::DeviceStaging,
             };
             auto tokenizer_context =
                 ModelContext::create(*model_path, tokenizer_context_config);
@@ -2261,6 +2432,193 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
+     * @brief Require physical expert payload movement from current-batch LLEP.
+     *
+     * A resident non-owner assignment proves work redistribution but does not
+     * prove that an expert payload moved. Movement-positive production parity
+     * therefore requires the sticky applied-layer marker and useful payload
+     * bytes from the live transfer graph. The shared physical-movement gate
+     * separately requires copied and applied arrival counters; the planner's
+     * ideal transfer count is deliberately not treated as apply evidence.
+     */
+    inline void expectLLEPExpertPayloadMovementPositive(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context)
+    {
+        expectPerfCounterPositive(
+            records,
+            "moe_rebalance",
+            "device_rebalance_prefill_current_batch_movement_layers",
+            context);
+        expectPerfCounterPositive(
+            records,
+            "moe_rebalance",
+            "device_rebalance_request_useful_payload_bytes_lower_bound",
+            context);
+    }
+
+    /**
+     * @brief Prove that a StaticOwner request performed no expert movement.
+     *
+     * Setup-time physical placement records are intentionally excluded: they
+     * prove the requested ordinal/random layout was loaded. These counters are
+     * the request-time planner, copy, transport, and apply authorities shared
+     * by CPU, CUDA, and ROCm movement paths.
+     */
+    inline void expectNoMoEExpertMovement(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context)
+    {
+        for (const char *counter : {
+                 "cpu_llep_weight_transfers",
+                 "cpu_llep_weight_transfer_total",
+                 "cpu_llep_weight_transfer_incoming_bytes",
+                 "cpu_llep_weight_transfer_outgoing_bytes",
+                 "cpu_llep_non_owner_rows",
+                 "ownership_change_entries",
+                 "replica_arrivals",
+                 "weight_transfer_manifest_entries",
+                 "weight_transfer_outgoing_entries",
+                 "weight_transfer_incoming_entries",
+                 "weight_transfer_incoming_bytes",
+                 "weight_transfer_outgoing_bytes",
+                 "mask_apply_received_entries",
+                 "mask_apply_received_bytes",
+                 "device_rebalance_prefill_current_batch_movement_layers",
+                 "device_rebalance_llep_weight_transfer_count",
+                 "device_rebalance_dynamic_ownership_swap_accepts",
+                 "device_rebalance_selected_replicas",
+                 "device_rebalance_copy_copied_arrivals",
+                 "device_rebalance_apply_applied_arrivals",
+                 "device_rebalance_transfer_current_copied_arrivals",
+                 "device_rebalance_transfer_current_applied_arrivals",
+                 "device_rebalance_wave_copied_arrivals_total",
+                 "device_rebalance_wave_applied_arrivals_total",
+                 "device_rebalance_transfer_useful_payload_bytes",
+                 "device_rebalance_request_copied_payload_lower_bound",
+                 "device_rebalance_request_applied_payload_lower_bound",
+                 "device_rebalance_request_useful_payload_bytes_lower_bound"})
+        {
+            EXPECT_EQ(
+                perfCounterSum(records, "moe_rebalance", counter),
+                0.0)
+                << context << " unexpectedly published movement counter "
+                << "moe_rebalance." << counter << ".\n"
+                << PerfStatsCollector::summaryString({"moe_rebalance"});
+        }
+    }
+
+    /**
+     * @brief Require a planned expert payload to be copied and applied.
+     *
+     * The sums span the host CPU transfer service and the device-owned
+     * CUDA/ROCm transfer graph. Requiring count, bytes, and applied placement
+     * evidence prevents a planner-only proposal or resident-row reassignment
+     * from being reported as expert movement.
+     */
+    inline void expectMoEExpertMovementPositive(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &context)
+    {
+        const double copied_payloads =
+            perfCounterSum(records, "moe_rebalance", "cpu_llep_weight_transfers") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "weight_transfer_outgoing_entries") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "weight_transfer_incoming_entries") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "mask_apply_received_entries") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "device_rebalance_copy_copied_arrivals") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "device_rebalance_transfer_current_copied_arrivals") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "device_rebalance_wave_copied_arrivals_total") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "device_rebalance_request_copied_payload_lower_bound");
+        const double payload_bytes =
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "cpu_llep_weight_transfer_incoming_bytes") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "cpu_llep_weight_transfer_outgoing_bytes") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "weight_transfer_incoming_bytes") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "weight_transfer_outgoing_bytes") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "mask_apply_received_bytes") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "device_rebalance_transfer_useful_payload_bytes") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "device_rebalance_request_useful_payload_bytes_lower_bound");
+        const double applied_payloads =
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "cpu_llep_weight_transfers") +
+            perfCounterSum(records, "moe_rebalance", "ownership_change_entries") +
+            perfCounterSum(records, "moe_rebalance", "replica_arrivals") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "mask_apply_received_entries") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "device_rebalance_apply_applied_arrivals") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "device_rebalance_transfer_current_applied_arrivals") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "device_rebalance_wave_applied_arrivals_total") +
+            perfCounterSum(
+                records,
+                "moe_rebalance",
+                "device_rebalance_request_applied_payload_lower_bound");
+
+        EXPECT_GT(copied_payloads, 0.0)
+            << context << " copied no expert payload.\n"
+            << PerfStatsCollector::summaryString({"moe_rebalance"});
+        EXPECT_GT(payload_bytes, 0.0)
+            << context << " transferred no expert payload bytes.\n"
+            << PerfStatsCollector::summaryString({"moe_rebalance"});
+        EXPECT_GT(applied_payloads, 0.0)
+            << context << " applied no moved expert placement.\n"
+            << PerfStatsCollector::summaryString({"moe_rebalance"});
+    }
+
+    /**
      * @brief Assert that prefix-cache restore counters prove a full-block hit.
      *
      * The prefix-state probe verifies restored tensor ownership.  These
@@ -2319,12 +2677,21 @@ namespace llaminar2::test::parity::qwen36
         const std::string &context,
         bool require_fresh_movement = true)
     {
-        if (!test_case.moe_rebalance)
-            return;
-
-        if (require_fresh_movement && usesCurrentBatchLLEP(test_case))
+        const bool static_owner =
+            !test_case.moe_rebalance ||
+            (test_case.moe_rebalance->mode ==
+                 MoERebalanceRuntimeMode::Off &&
+             !usesCurrentBatchLLEP(test_case));
+        if (static_owner)
+        {
+            expectNoMoEExpertMovement(records, context);
+        }
+        else if (require_fresh_movement && usesCurrentBatchLLEP(test_case))
         {
             expectLLEPPrefillWorkRedistributionPositive(records, context);
+            if (moEPrefixCaseUsesGPU(test_case))
+                expectLLEPExpertPayloadMovementPositive(records, context);
+            expectMoEExpertMovementPositive(records, context);
             expectPerfCounterPositive(
                 records,
                 "moe_rebalance",
@@ -2336,6 +2703,7 @@ namespace llaminar2::test::parity::qwen36
                      MoERebalanceRuntimeMode::Dynamic)
         {
             expectDynamicRebalancePlacementPositive(records, context);
+            expectMoEExpertMovementPositive(records, context);
         }
 
         for (const char *error_counter : {
@@ -2485,11 +2853,11 @@ namespace llaminar2::test::parity::qwen36
     /**
      * @brief Prove the topology-specific MTP-head ownership policy at runtime.
      *
-     * CPU NodeLocalTP deliberately keeps the very large MTP head column-sharded
+     * CPU NodeTP deliberately keeps the very large MTP head column-sharded
      * and graph-allgathers only the compact verifier-row logits.  GPU LocalTP
      * mirrors the head on every child, while single-device execution already
      * owns the full vocabulary.  This assertion prevents token parity from
-     * passing if NodeLocalTP silently skips its required gather, and also guards
+     * passing if NodeTP silently skips its required gather, and also guards
      * against reintroducing a tiny collective into the mirrored ownership modes.
      */
     inline void expectMoEMTPHeadOwnershipPerfPath(
@@ -2499,7 +2867,7 @@ namespace llaminar2::test::parity::qwen36
     {
         constexpr const char *counter_name =
             "global_tp_sidecar_logit_allgathers";
-        if (test_case.topology == MoEPrefixParityTopology::NodeLocalTP)
+        if (test_case.topology == MoEPrefixParityTopology::NodeTP)
         {
             expectPerfCounterPositive(records, "mtp", counter_name, context);
             return;
@@ -2783,7 +3151,7 @@ namespace llaminar2::test::parity::qwen36
                 EXPECT_TRUE(hasMTPPerfRecordTag(
                     records,
                     "graph_owned_greedy_outcome_stage_enqueues",
-                    "mirrored_local_tp",
+                    "participant_full_vocabulary",
                     "true"))
                     << context << " must enter the captured NCCL/RCCL outcome "
                        "broadcast on every mirrored participant.\n"
@@ -4093,6 +4461,111 @@ namespace llaminar2::test::parity::qwen36
         PerfStatsCollector::reset();
     }
 
+    /**
+     * @brief Resolve the backend-matched short Hugging Face checkpoint pack.
+     *
+     * The definition lives beside the comprehensive MTP checkpoint campaign
+     * below.  Stochastic verifier tests also use the same pack so their exact
+     * token oracle is accompanied by the canonical per-stage CSV evidence.
+     */
+    inline std::filesystem::path qwen36MoEFullCheckpointReferenceDir(
+        const MoEPrefixRestoreParityCase &test_case);
+
+    /**
+     * @brief Record one serial decode checkpoint from a production MoE runner.
+     *
+     * The first output after prefill is sampled from the terminal prefill
+     * logits.  The second one owns `decode_step0_*`, so callers invoke this
+     * helper only after that second one-token decode.  Snapshot keys without a
+     * matching authenticated Hugging Face tensor are diagnostic aliases and
+     * are deliberately ignored; every matched tensor is routed through the
+     * same numerical comparator and CSV authority as the canonical suite.
+     *
+     * @param recorder Canonical parity artifact accumulator.
+     * @param runner Live production runner whose snapshots own decode step 0.
+     * @param reference_dir Authenticated short-prompt checkpoint directory.
+     * @param reference_step Hugging Face decode-step index to load.
+     * @param gdn_config Model-derived unequal-head permutation contract.
+     */
+    inline void recordQwen36MoESerialDecodeArtifacts(
+        Qwen36CheckpointArtifactRecorder &recorder,
+        IOrchestrationRunner &runner,
+        const std::filesystem::path &reference_dir,
+        int reference_step,
+        const ParityGDNHeadConfig &gdn_config)
+    {
+        ASSERT_GE(reference_step, 0);
+        const std::string reference_prefix =
+            "decode_step" + std::to_string(reference_step) + "_";
+        size_t comparable = 0;
+        auto keys = runner.getSnapshotKeys();
+        std::sort(keys.begin(), keys.end());
+        for (const std::string &key : keys)
+        {
+            const std::vector<float> expected = loadDensePyTorchSnapshot(
+                reference_dir,
+                reference_prefix + key);
+            if (expected.empty())
+                continue;
+
+            size_t actual_size = 0;
+            const float *actual_data = runner.getSnapshot(key, actual_size);
+            if (!actual_data || actual_size == 0)
+            {
+                ADD_FAILURE()
+                    << "Production decode advertised an empty checkpoint "
+                    << key;
+                continue;
+            }
+
+            /*
+             * Captured graphs may retain a fixed physical row capacity even
+             * for serial M=1 decode.  The active row is the leading row by the
+             * graph contract, exactly as for a one-row captured prefill.
+             */
+            auto projected = qwen36ProjectCapturedPrefillRows(
+                key,
+                actual_data,
+                actual_size,
+                expected,
+                /*logical_rows=*/1);
+            if (!projected)
+                continue;
+
+            const auto [layer, stage] =
+                qwen36CheckpointLayerAndStage(key);
+            auto permuted = applyParityGDNHeadPermutation(
+                projected->data(),
+                projected->size(),
+                stage,
+                gdn_config);
+            const std::vector<float> &production =
+                permuted.empty() ? *projected : permuted;
+            recorder.recordDecode(
+                reference_step,
+                layer,
+                stage,
+                production,
+                expected,
+                qwen36CheckpointKind(stage));
+            if (stage == "LM_HEAD")
+            {
+                recorder.recordDecodeToken(
+                    reference_step,
+                    denseArgmaxToken(
+                        production.data(),
+                        static_cast<int>(production.size())),
+                    denseArgmaxToken(
+                        expected.data(),
+                        static_cast<int>(expected.size())));
+            }
+            ++comparable;
+        }
+        EXPECT_GT(comparable, 0u)
+            << "No production decode checkpoints matched references in "
+            << reference_dir << " at step " << reference_step;
+    }
+
     inline void runMoEStochasticMTPVerifierParity(
         const MoEPrefixRestoreParityCase &test_case,
         int draft_depth = 1,
@@ -4106,8 +4579,10 @@ namespace llaminar2::test::parity::qwen36
         std::optional<SamplingParams> sampling_params = std::nullopt,
         int prefix_block_size = 0,
         MoEDeviceMaintenanceCoverage maintenance_coverage =
-            MoEDeviceMaintenanceCoverage::NotRequired)
+            MoEDeviceMaintenanceCoverage::NotRequired,
+        bool emit_canonical_artifacts = false)
     {
+        const auto campaign_started_at = std::chrono::steady_clock::now();
         if (maintenance_coverage != MoEDeviceMaintenanceCoverage::NotRequired)
         {
             ASSERT_TRUE(test_case.moe_rebalance.has_value())
@@ -4128,13 +4603,13 @@ namespace llaminar2::test::parity::qwen36
             shouldForceMoEParityProductionMode(test_case));
         ScopedMoEPrefixCaseEnvironment case_env(test_case.env_overrides);
         ASSERT_TRUE(test_case.topology == MoEPrefixParityTopology::SingleDevice ||
-                    test_case.topology == MoEPrefixParityTopology::NodeLocalTP ||
+                    test_case.topology == MoEPrefixParityTopology::NodeTP ||
                     test_case.topology ==
                         MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly ||
                     test_case.topology ==
                         MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly)
             << "MoE stochastic MTP verifier parity requires a full local owner, "
-               "NodeLocalTP CPU domain, or homogeneous GPU expert-overlay TP domain";
+               "NodeTP CPU domain, or homogeneous GPU expert-overlay TP domain";
 
         ScopedEnvironmentValues graph_env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -4194,6 +4669,66 @@ namespace llaminar2::test::parity::qwen36
             sampling_params.value_or(
                 qwen36MoEStochasticVerifierSamplingParams());
 
+        /*
+         * Token equality is the strongest end-to-end stochastic oracle, but it
+         * does not identify the first drifting layer.  Reuse the already loaded
+         * serial production runner for one short, greedy, HF-authenticated
+         * checkpoint request and feed every matched tensor through the standard
+         * CSV recorder.  The subsequent stochastic request and MTP runner remain
+         * unchanged and continue to prove the live speculative path.
+         */
+        std::filesystem::path full_reference_dir;
+        std::vector<int32_t> artifact_prefill_tokens;
+        ParityGDNHeadConfig gdn_config;
+        std::string artifact_backend;
+        std::unique_ptr<Qwen36CheckpointArtifactRecorder> artifact_recorder;
+        if (emit_canonical_artifacts)
+        {
+            full_reference_dir =
+                qwen36MoEFullCheckpointReferenceDir(test_case);
+            const std::filesystem::path full_reference_metadata =
+                full_reference_dir / "metadata.txt";
+            ASSERT_TRUE(std::filesystem::exists(full_reference_metadata))
+                << "Full checkpoint pack not found: "
+                << full_reference_metadata;
+            artifact_prefill_tokens = readTokenListFromMetadata(
+                full_reference_metadata,
+                "token_ids");
+            ASSERT_FALSE(artifact_prefill_tokens.empty())
+                << "Full checkpoint pack has no token_ids: "
+                << full_reference_metadata;
+
+            const ModelContextConfig metadata_context_config{
+                .strategy = WeightDistributionStrategy::REPLICATED,
+                .use_mmap = true,
+                .payload_access_pattern =
+                    ModelPayloadAccessPattern::DeviceStaging,
+            };
+            auto metadata_context =
+                ModelContext::create(model_path, metadata_context_config);
+            ASSERT_NE(metadata_context, nullptr)
+                << "Could not inspect GDN checkpoint geometry in "
+                << model_path;
+            gdn_config =
+                parityGDNHeadConfigFromModel(metadata_context.get());
+            ASSERT_TRUE(gdn_config.needsPermutation())
+                << "Qwen3.6 MoE stochastic parity requires model-derived unequal-head GDN geometry";
+            metadata_context.reset();
+
+            artifact_backend =
+                test_case.name + "_STOCHASTIC_" +
+                (dynamic_depth
+                     ? std::string("MTP_DYNAMIC")
+                     : "MTP_DEPTH" +
+                           std::to_string(requested_draft_depth));
+            artifact_recorder =
+                std::make_unique<Qwen36CheckpointArtifactRecorder>(
+                    artifact_backend,
+                    /*prefill_cosine_threshold=*/0.96f,
+                    /*decode_cosine_threshold=*/0.98f,
+                    /*logit_kl_threshold=*/0.03f);
+        }
+
         auto baseline_config =
             makeMoEPrefixRestoreConfig(test_case, model_path, false, block_size, false);
         auto baseline = factory->createFromOrchestrationConfig(baseline_config);
@@ -4201,6 +4736,53 @@ namespace llaminar2::test::parity::qwen36
         phase_start = parityPhaseStart();
         ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
         logMoEParityPhase(test_case, "stochastic-baseline.initialize", phase_start);
+
+        if (artifact_recorder)
+        {
+            SamplingParams greedy;
+            greedy.temperature = 0.0f;
+            baseline->setSamplingParams(greedy);
+            baseline->setSkipLogitsGatherPrefill(false);
+            baseline->setSkipLogitsGatherDecode(false);
+            baseline->enableSnapshotCapture();
+            ASSERT_TRUE(baseline->prefill(artifact_prefill_tokens))
+                << baseline->lastError();
+            recordQwen36PrefillArtifacts(
+                *artifact_recorder,
+                *baseline,
+                full_reference_dir,
+                artifact_prefill_tokens.size(),
+                gdn_config);
+
+            /*
+             * Output one owns terminal-prefill logits. Output two executes the
+             * first incremental model row and therefore owns decode_step0_*.
+             */
+            for (int artifact_output = 1;
+                 artifact_output <= 2;
+                 ++artifact_output)
+            {
+                baseline->clearSnapshots();
+                baseline->setDecodeStepTokenBudget(1);
+                const GenerationResult artifact_step = baseline->decodeStep();
+                baseline->setDecodeStepTokenBudget(0);
+                ASSERT_TRUE(artifact_step.error.empty())
+                    << artifact_step.error;
+                ASSERT_EQ(artifact_step.tokens.size(), 1u);
+                if (artifact_output == 2)
+                {
+                    recordQwen36MoESerialDecodeArtifacts(
+                        *artifact_recorder,
+                        *baseline,
+                        full_reference_dir,
+                        /*reference_step=*/0,
+                        gdn_config);
+                }
+            }
+            baseline->disableSnapshotCapture();
+            baseline->clearCache();
+        }
+
         phase_start = parityPhaseStart();
         auto baseline_result =
             baseline->generate(prompt_tokens, stochastic_decode_steps, stochastic);
@@ -4355,7 +4937,7 @@ namespace llaminar2::test::parity::qwen36
             expectMoEPrefixCachePerfPath(
                 restored_records,
                 test_case.name + " stochastic restored-prefix request");
-            if (test_case.topology == MoEPrefixParityTopology::NodeLocalTP &&
+            if (test_case.topology == MoEPrefixParityTopology::NodeTP &&
                 !moEPrefixCaseUsesGPU(test_case))
             {
                 expectPerfCounterPositive(
@@ -4510,7 +5092,7 @@ namespace llaminar2::test::parity::qwen36
                 test_case.name + " stochastic post-clearCache request");
         }
         if (enable_prefix_cache &&
-            test_case.topology == MoEPrefixParityTopology::NodeLocalTP &&
+            test_case.topology == MoEPrefixParityTopology::NodeTP &&
             !moEPrefixCaseUsesGPU(test_case))
         {
             expectPerfCounterPositive(
@@ -4800,7 +5382,61 @@ namespace llaminar2::test::parity::qwen36
             }
         }
 
+        const bool graph_execution = mtp->executorStats() != nullptr;
+        const std::string production_device =
+            mtp->primaryDeviceId().toString();
+        std::vector<PerfStatRecord> production_records = first_mtp_records;
+        production_records.insert(
+            production_records.end(),
+            phase138_records.begin(),
+            phase138_records.end());
         mtp->shutdown();
+
+        if (artifact_recorder)
+        {
+            artifact_recorder->finalize();
+            const bool homogeneous_gpu =
+                test_case.topology ==
+                    MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly ||
+                test_case.topology ==
+                    MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly ||
+                (test_case.topology ==
+                     MoEPrefixParityTopology::SingleDevice &&
+                 moEPrefixCaseUsesGPU(test_case));
+            const ProductionParityEvidence production_evidence =
+                collectProductionParityEvidence(
+                    production_records,
+                    graph_execution,
+                    homogeneous_gpu,
+                    /*model_context_reused=*/false,
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() - campaign_started_at)
+                        .count());
+            EXPECT_TRUE(production_evidence.graph_execution)
+                << "Stochastic MTP parity did not execute the production graph runner";
+            if (homogeneous_gpu)
+            {
+                EXPECT_TRUE(production_evidence.device_generation_controller)
+                    << "Stochastic MTP parity published no device-generation controller evidence";
+                EXPECT_TRUE(production_evidence.generation_loop_certified)
+                    << "Stochastic MTP parity used outer-loop policy '"
+                    << productionDeviceGenerationPolicyName(
+                           production_evidence.generation_execution_policy)
+                    << "' without satisfying its backend-specific authority and dispatch proof: "
+                    << production_evidence.generation_certification_detail;
+                EXPECT_TRUE(
+                    productionParityHasRequiredGenerationGraph(
+                        production_evidence))
+                    << "Stochastic MTP parity did not certify the captured graph body required by its generation policy";
+            }
+            EXPECT_TRUE(ParityCSVArtifactWriter::writeProductionPath(
+                ParityCSVArtifactWriter::resultsDir(),
+                artifact_backend,
+                production_device,
+                production_evidence))
+                << "Failed to write stochastic MTP production_path.csv";
+        }
+        PerfStatsCollector::reset();
     }
 
     inline void runMoEGreedyFreshRunnerDeterminism(
@@ -5308,65 +5944,9 @@ namespace llaminar2::test::parity::qwen36
         return oss.str();
     }
 
-    inline std::string currentGitHashMoEDiagnostic()
-    {
-        std::string hash = "unknown";
-        FILE *pipe = popen("git rev-parse --short HEAD 2>/dev/null", "r");
-        if (!pipe)
-        {
-            return hash;
-        }
-
-        char buf[64];
-        if (fgets(buf, sizeof(buf), pipe))
-        {
-            hash = buf;
-            while (!hash.empty() && (hash.back() == '\n' || hash.back() == '\r'))
-            {
-                hash.pop_back();
-            }
-        }
-        pclose(pipe);
-        return hash;
-    }
-
     inline std::filesystem::path moeDiagnosticResultsDir()
     {
-        const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
-        std::string test_name = "unknown";
-        if (info)
-        {
-            test_name = std::string(info->test_suite_name() ? info->test_suite_name() : "suite") +
-                        "_" +
-                        std::string(info->name() ? info->name() : "test");
-        }
-
-        std::string safe_name;
-        safe_name.reserve(test_name.size());
-        for (char c : test_name)
-        {
-            switch (c)
-            {
-            case '/':
-            case '\\':
-            case ':':
-            case '*':
-            case '?':
-            case '"':
-            case '<':
-            case '>':
-            case '|':
-                safe_name.push_back('_');
-                break;
-            default:
-                safe_name.push_back(c);
-                break;
-            }
-        }
-
-        std::filesystem::path this_file(__FILE__);
-        const auto parity_dir = this_file.parent_path().parent_path();
-        const auto dir = parity_dir / "results" / currentGitHashMoEDiagnostic() / safe_name;
+        const auto dir = ParityCSVArtifactWriter::resultsDir();
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         return dir;
@@ -5392,6 +5972,16 @@ namespace llaminar2::test::parity::qwen36
         std::string right_label = "mtp";
         bool present_in_baseline = false;
         bool present_in_mtp = false;
+        double routing_set_overlap =
+            std::numeric_limits<double>::quiet_NaN();
+        double routing_top1_match =
+            std::numeric_limits<double>::quiet_NaN();
+        double routing_boundary_equivalent =
+            std::numeric_limits<double>::quiet_NaN();
+        double routing_boundary_gap =
+            std::numeric_limits<double>::quiet_NaN();
+        double routing_boundary_error_limit =
+            std::numeric_limits<double>::quiet_NaN();
         bool byte_identical = false;
         size_t first_mismatch_index = std::numeric_limits<size_t>::max();
         uint32_t first_left_bits = 0;
@@ -5449,6 +6039,103 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
+     * @brief Record the established order-independent expert-index metrics.
+     *
+     * Top-k expert pairs are semantically a sparse vector. Equal expert sets
+     * may be emitted in a different order when two non-leading router scores
+     * are nearly tied; the paired routing-weight comparison remains indexed by
+     * expert ID. This first records literal set overlap and top-1 identity. The
+     * router-distribution-aware authority below separately decides whether any
+     * boundary substitution is mathematically unresolved at the measured
+     * componentwise error.
+     */
+    inline void recordMoERoutingIndexComparison(
+        MoESnapshotCompareRow *row,
+        const std::string &key,
+        const float *left,
+        const float *right,
+        size_t size,
+        size_t top_k = 8)
+    {
+        if (!row || !left || !right || top_k == 0 || size == 0 ||
+            size % top_k != 0 ||
+            !std::string_view(key).ends_with("MOE_ROUTING_INDICES"))
+        {
+            return;
+        }
+
+        const size_t rows = size / top_k;
+        double overlap_sum = 0.0;
+        size_t top1_matches = 0;
+        for (size_t row_index = 0; row_index < rows; ++row_index)
+        {
+            std::set<int> left_experts;
+            std::set<int> right_experts;
+            for (size_t route = 0; route < top_k; ++route)
+            {
+                const size_t index = row_index * top_k + route;
+                left_experts.insert(static_cast<int>(left[index]));
+                right_experts.insert(static_cast<int>(right[index]));
+            }
+            size_t intersection = 0;
+            for (const int expert : left_experts)
+                intersection += right_experts.contains(expert) ? 1u : 0u;
+            overlap_sum += static_cast<double>(intersection) /
+                           static_cast<double>(top_k);
+            top1_matches +=
+                static_cast<int>(left[row_index * top_k]) ==
+                        static_cast<int>(right[row_index * top_k])
+                    ? 1u
+                    : 0u;
+        }
+        row->routing_set_overlap = overlap_sum / static_cast<double>(rows);
+        row->routing_top1_match =
+            static_cast<double>(top1_matches) / static_cast<double>(rows);
+    }
+
+    /**
+     * @brief Decide whether differing top-k sets are an unresolved router tie.
+     *
+     * Quantized production kernels and the dequantized FP32 CPU oracle can
+     * perturb a post-softmax router component by a few ulps. Requiring literal
+     * expert-set identity when the kth and (k+1)th scores are closer than that
+     * measured componentwise error is numerically ill-posed. This comparison
+     * remains fail-closed: each index tensor must select the top-k set of its
+     * own live router distribution, top-1 must match, the router vector has its
+     * independent cosine/L2 gate, and every substituted expert must be able to
+     * cross the reference cutoff within twice the observed max error.
+     */
+    inline void recordMoERoutingBoundaryEquivalence(
+        MoESnapshotCompareRow *row,
+        const float *reference_indices,
+        const float *production_indices,
+        size_t indices_size,
+        const float *reference_router,
+        size_t reference_router_size,
+        const float *production_router,
+        size_t router_size,
+        size_t top_k = 8)
+    {
+        if (!row)
+            return;
+        const MoERoutingBoundaryResult comparison =
+            compareMoERoutingBoundarySelections(
+                reference_indices,
+                production_indices,
+                indices_size,
+                reference_router,
+                reference_router_size,
+                production_router,
+                router_size,
+                top_k);
+        if (!comparison.evaluated)
+            return;
+        row->routing_boundary_equivalent = comparison.equivalent ? 1.0 : 0.0;
+        row->routing_boundary_gap = comparison.maximum_boundary_gap;
+        row->routing_boundary_error_limit = comparison.maximum_error_limit;
+    }
+
+    /**
      * @brief Compare two stage snapshots as softmax distributions.
      *
      * Most MoE diagnostics compare hidden states rather than logits, so KL is
@@ -5502,6 +6189,145 @@ namespace llaminar2::test::parity::qwen36
         return 0.5 * (left_to_right + right_to_left);
     }
 
+    /**
+     * @brief Compare router probability rows without applying softmax twice.
+     *
+     * `MOE_ROUTER_OUTPUT` is already a normalized probability distribution.
+     * Passing it through the generic signed-tensor diagnostic above flattens
+     * both inputs toward a uniform distribution and can under-report a real
+     * routing change by orders of magnitude.  This helper normalizes only for
+     * harmless FP32 summation residue, then returns the worst symmetric KL
+     * across logical rows so a good row cannot average away a bad one.
+     *
+     * @param left Reference probability rows.
+     * @param right Production probability rows.
+     * @param size Total number of scalar probabilities.
+     * @param row_width Number of experts in each row.
+     * @return Worst row-wise symmetric KL, or infinity for malformed input.
+     */
+    inline double computeMoEProbabilitySymmetricKL(
+        const float *left,
+        const float *right,
+        size_t size,
+        size_t row_width)
+    {
+        return symmetricProbabilityKLDivergence(
+            left,
+            right,
+            size,
+            row_width);
+    }
+
+    /** @brief Identify the established full post-softmax MoE checkpoint. */
+    inline bool isMoERouterProbabilitySnapshot(std::string_view key)
+    {
+        return key.ends_with("MOE_ROUTER_OUTPUT");
+    }
+
+    /**
+     * @brief Choose the semantically correct KL diagnostic for a stage.
+     *
+     * Router outputs have a fixed Qwen3.6 width of 256 experts. All other
+     * tensors keep the generic softmax-shaped diagnostic used by the legacy
+     * CSV schema.
+     */
+    inline double computeMoEDiagnosticSymmetricKL(
+        std::string_view key,
+        const float *left,
+        const float *right,
+        size_t size)
+    {
+        constexpr size_t kQwen36MoEExperts = 256;
+        if (isMoERouterProbabilitySnapshot(key))
+        {
+            return computeMoEProbabilitySymmetricKL(
+                left,
+                right,
+                size,
+                kQwen36MoEExperts);
+        }
+        return computeMoESnapshotSymmetricKL(left, right, size);
+    }
+
+    /**
+     * @brief Evaluate the MTP router on an observed production input.
+     *
+     * This is a diagnostic oracle, not a production execution path.  The
+     * caller supplies the real GGUF gate after independent BF16-to-FP32
+     * decoding and the exact `FFN_NORM` rows captured from the live graph.
+     * Double accumulation and a stable double softmax intentionally avoid
+     * sharing a backend kernel with the value under test.  Comparing this
+     * result with `MOE_ROUTER_OUTPUT` separates upstream hidden-state drift
+     * from an error in the router projection or softmax itself.
+     *
+     * @param normalized_rows Production FFN-normalized hidden rows.
+     * @param gate_weights Row-major expert gate `[num_experts, d_model]`.
+     * @param d_model Hidden width.
+     * @param num_experts Router output width.
+     * @return Row-major post-softmax probabilities, or an empty vector when
+     *         the supplied geometry is inconsistent.
+     */
+    inline std::vector<float> evaluateMoERouterOnProductionInput(
+        const std::vector<float> &normalized_rows,
+        const std::vector<float> &gate_weights,
+        int d_model,
+        int num_experts)
+    {
+        if (d_model <= 0 || num_experts <= 0 || normalized_rows.empty() ||
+            normalized_rows.size() % static_cast<size_t>(d_model) != 0 ||
+            gate_weights.size() !=
+                static_cast<size_t>(d_model) *
+                    static_cast<size_t>(num_experts))
+        {
+            return {};
+        }
+
+        const size_t rows =
+            normalized_rows.size() / static_cast<size_t>(d_model);
+        std::vector<float> probabilities(
+            rows * static_cast<size_t>(num_experts));
+        std::vector<double> logits(static_cast<size_t>(num_experts));
+        for (size_t row = 0; row < rows; ++row)
+        {
+            const float *hidden =
+                normalized_rows.data() + row * static_cast<size_t>(d_model);
+            double maximum = -std::numeric_limits<double>::infinity();
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                const float *weight =
+                    gate_weights.data() +
+                    static_cast<size_t>(expert) *
+                        static_cast<size_t>(d_model);
+                double dot = 0.0;
+                for (int column = 0; column < d_model; ++column)
+                {
+                    dot += static_cast<double>(weight[column]) *
+                           static_cast<double>(hidden[column]);
+                }
+                logits[static_cast<size_t>(expert)] = dot;
+                maximum = std::max(maximum, dot);
+            }
+
+            double denominator = 0.0;
+            for (double &logit : logits)
+            {
+                logit = std::exp(logit - maximum);
+                denominator += logit;
+            }
+            if (!(denominator > 0.0) || !std::isfinite(denominator))
+                return {};
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                probabilities[
+                    row * static_cast<size_t>(num_experts) +
+                    static_cast<size_t>(expert)] =
+                    static_cast<float>(
+                        logits[static_cast<size_t>(expert)] / denominator);
+            }
+        }
+        return probabilities;
+    }
+
     struct MoEDiagnosticSnapshot
     {
         std::vector<int32_t> emitted_tokens;
@@ -5547,6 +6373,12 @@ namespace llaminar2::test::parity::qwen36
             baseline_data,
             mtp_data,
             baseline_size);
+        recordMoERoutingIndexComparison(
+            &row,
+            key,
+            baseline_data,
+            mtp_data,
+            baseline_size);
         double dot = 0.0;
         double baseline_norm = 0.0;
         double mtp_norm = 0.0;
@@ -5575,7 +6407,8 @@ namespace llaminar2::test::parity::qwen36
         row.cosine = denom > 0.0 ? dot / denom : 1.0;
         row.rel_l2 = baseline_norm > 0.0 ? std::sqrt(diff_norm / baseline_norm)
                                          : std::sqrt(diff_norm);
-        row.symmetric_kl = computeMoESnapshotSymmetricKL(
+        row.symmetric_kl = computeMoEDiagnosticSymmetricKL(
+            key,
             baseline_data,
             mtp_data,
             baseline_size);
@@ -5620,6 +6453,12 @@ namespace llaminar2::test::parity::qwen36
             baseline_data.data(),
             mtp_data,
             baseline_data.size());
+        recordMoERoutingIndexComparison(
+            &row,
+            key,
+            baseline_data.data(),
+            mtp_data,
+            baseline_data.size());
         double dot = 0.0;
         double baseline_norm = 0.0;
         double mtp_norm = 0.0;
@@ -5648,7 +6487,8 @@ namespace llaminar2::test::parity::qwen36
         row.cosine = denom > 0.0 ? dot / denom : 1.0;
         row.rel_l2 = baseline_norm > 0.0 ? std::sqrt(diff_norm / baseline_norm)
                                          : std::sqrt(diff_norm);
-        row.symmetric_kl = computeMoESnapshotSymmetricKL(
+        row.symmetric_kl = computeMoEDiagnosticSymmetricKL(
+            key,
             baseline_data.data(),
             mtp_data,
             baseline_data.size());
@@ -5718,13 +6558,24 @@ namespace llaminar2::test::parity::qwen36
     }
 
     inline constexpr std::string_view kMTPDecodeSidecarSnapshotContextPrefix =
-        "MTP_DECODE_SIDECAR_";
+        mtpParityCheckpointContextPrefix(
+            MTPParityCheckpointContext::HostConditionTokenLivePosition);
+
+    inline constexpr std::string_view kHostChainedProductionMTPDecodeSidecarSnapshotPrefix =
+        mtpParityCheckpointContextPrefix(
+            MTPParityCheckpointContext::HostChainedDraftLivePosition);
 
     inline constexpr std::string_view kInitialProductionMTPDecodeSidecarSnapshotPrefix =
-        "MTP_DECODE_SIDECAR_DEVICE_TARGET_TOKEN_LIVE_POSITION_";
+        mtpParityCheckpointContextPrefix(
+            MTPParityCheckpointContext::DeviceTargetTokenLivePosition);
 
     inline constexpr std::string_view kResidentProductionMTPDecodeSidecarSnapshotPrefix =
-        "MTP_DECODE_SIDECAR_RESIDENT_LOGICAL_STATE_";
+        mtpParityCheckpointContextPrefix(
+            MTPParityCheckpointContext::DeviceResidentLogicalState);
+
+    inline constexpr std::string_view kChainedProductionMTPDecodeSidecarSnapshotPrefix =
+        mtpParityCheckpointContextPrefix(
+            MTPParityCheckpointContext::DeviceChainedTokenLivePosition);
 
     /**
      * @brief Return the complete materialized operation surface of one Qwen3.6
@@ -5813,22 +6664,38 @@ namespace llaminar2::test::parity::qwen36
     inline bool isProductionMTPDecodeSidecarSnapshotKey(
         std::string_view key)
     {
-        return key.starts_with(kMTPDecodeSidecarSnapshotContextPrefix) &&
-               key.find("_MTP") != std::string_view::npos;
+        return isMTPParityModelCheckpointSnapshotKey(key);
     }
 
-    inline std::string pytorchReferenceKeyForMoEDiagnosticKey(const std::string &key)
+    inline std::string pytorchReferenceKeyForMoEDiagnosticKey(
+        const std::string &key,
+        int chained_reference_depth = 0)
     {
         if (isProductionMTPDecodeSidecarSnapshotKey(key))
         {
-            const size_t stage_marker = key.find("_MTP");
-            if (stage_marker == std::string::npos)
+            const auto context_prefix =
+                mtpParityModelCheckpointContextPrefix(key);
+            if (!context_prefix)
             {
                 throw std::logic_error(
                     "Context-qualified MTP sidecar snapshot lacks a stage marker: " +
                     key);
             }
-            return key.substr(stage_marker + 1);
+            std::string reference_key = key.substr(context_prefix->size());
+            const bool chained_context =
+                *context_prefix ==
+                    kHostChainedProductionMTPDecodeSidecarSnapshotPrefix ||
+                *context_prefix ==
+                    kChainedProductionMTPDecodeSidecarSnapshotPrefix;
+            if (chained_context &&
+                chained_reference_depth > 0 &&
+                reference_key.rfind("MTP0_", 0) == 0)
+            {
+                reference_key =
+                    "MTP" + std::to_string(chained_reference_depth) + "_" +
+                    reference_key.substr(std::string("MTP0_").size());
+            }
+            return reference_key;
         }
 
         static constexpr std::string_view kGenericDecodeSidecarPrefix =
@@ -5907,6 +6774,12 @@ namespace llaminar2::test::parity::qwen36
             left_data,
             right,
             left_size);
+        recordMoERoutingIndexComparison(
+            &row,
+            key,
+            left_data,
+            right,
+            left_size);
         double dot = 0.0;
         double left_norm = 0.0;
         double right_norm = 0.0;
@@ -5935,7 +6808,8 @@ namespace llaminar2::test::parity::qwen36
         row.cosine = denom > 0.0 ? dot / denom : 1.0;
         row.rel_l2 = left_norm > 0.0 ? std::sqrt(diff_norm / left_norm)
                                      : std::sqrt(diff_norm);
-        row.symmetric_kl = computeMoESnapshotSymmetricKL(
+        row.symmetric_kl = computeMoEDiagnosticSymmetricKL(
+            key,
             left_data,
             right,
             left_size);
@@ -5970,11 +6844,581 @@ namespace llaminar2::test::parity::qwen36
         return snapshot;
     }
 
+    /**
+     * @brief Immutable serial-decode oracle shared by one process MTP campaign.
+     *
+     * Fixed-depth and adaptive MTP executions all verify against the same
+     * ordinary, non-MTP request: identical real GGUF bytes, prompt tokens,
+     * topology, KV policy, and one-token serial decode steps.  Rebuilding that
+     * reference runner for every MTP depth added a full model load and complete
+     * stage-bank copy to each otherwise independent cell without exercising a
+     * new production behavior.  This object owns the copied observations so
+     * later cells never retain a pointer into a destroyed baseline runner.
+     */
+    struct MoEMTPSerialBaselineEvidence
+    {
+        std::vector<int32_t> tokens;
+        std::vector<MoEDiagnosticSnapshot> snapshots_by_output_count;
+    };
+
+    /**
+     * @brief Bounded process-local storage for the invariant MTP serial oracle.
+     *
+     * CTest groups the depth-1, depth-2, depth-3, and dynamic cases in one
+     * exact GTest process.  One cache slot therefore amortizes only the
+     * configuration-invariant serial oracle for that campaign; it never holds
+     * an MTP runner, graph, arena, stream, or mutable request state.  Every
+     * MTP cell still constructs and runs its own production runner.
+     */
+    struct MoEMTPSerialBaselineCampaignCache
+    {
+        std::mutex mutex;
+        std::string key;
+        std::shared_ptr<const MoEMTPSerialBaselineEvidence> evidence;
+    };
+
+    /**
+     * @brief One bounded model/prepared-weight authority for an MTP campaign.
+     *
+     * Speculative depth changes graph capacity, controller policy, arena
+     * geometry, and request state, but it does not change the immutable GGUF
+     * tensors or their device-packed representation.  Keeping this sole slot
+     * alive lets each depth-specific production runner adopt the same
+     * model-owned PreparedWeightStore while still constructing its own graph,
+     * streams, arena, controller, and request lifecycle from scratch.
+     */
+    struct MoEMTPModelContextCampaignCache
+    {
+        std::mutex mutex;
+        std::string key;
+        std::optional<ModelContextReuseContract> contract;
+    };
+
+    /**
+     * @brief Return the sole bounded cache for one process-resident MTP campaign.
+     *
+     * The static lifetime is intentional: production campaigns execute their
+     * exact GTest cells serially in a short-lived process.  Keeping a single
+     * immutable vector bank avoids reloading the baseline while avoiding a
+     * global cache of model data or live GPU objects.
+     */
+    inline MoEMTPSerialBaselineCampaignCache &moeMTPSerialBaselineCampaignCache()
+    {
+        static MoEMTPSerialBaselineCampaignCache cache;
+        return cache;
+    }
+
+    /**
+     * @brief Return the sole bounded real-weight cache for this test process.
+     *
+     * The slot is deliberately separate from the serial-oracle cache.  The
+     * ordinary baseline owns a non-MTP runner and must not accidentally certify
+     * that the MTP sidecar weights were prepared.  This cache is populated only
+     * for MTP-enabled runners and is destroyed with the short-lived GTest
+     * process after all depth cells have completed.
+     */
+    inline MoEMTPModelContextCampaignCache &moeMTPModelContextCampaignCache()
+    {
+        static MoEMTPModelContextCampaignCache cache;
+        return cache;
+    }
+
+    /**
+     * @brief Return whether a static overlay has an immutable reusable weight plan.
+     *
+     * Dynamic residency, current-batch LLEP, hot replicas, and an explicit
+     * enabled maintenance configuration may change which prepared expert
+     * authorities are required. They intentionally remain fresh-context
+     * campaigns. An explicit `Off` value is part of the static proof and is
+     * safe to reuse. A
+     * `StaticById` overlay without those policies has the same immutable
+     * prepared weights across MTP depth and prefix-request lifecycle cells.
+     */
+    inline bool isReusableStaticMoEMTPOverlay(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        const auto &plan = test_case.moe_routed_expert_plan;
+        return plan &&
+               plan->isTieredOverlay() &&
+               plan->residency_policy ==
+                   RoutedExpertResidencyPolicy::StaticById &&
+               !test_case.moe_hot_expert_cache &&
+               !test_case.moe_routed_prefill &&
+               (!test_case.moe_rebalance ||
+                test_case.moe_rebalance->mode ==
+                    MoERebalanceRuntimeMode::Off);
+    }
+
+    /**
+     * @brief Serialize every declarative field that can change overlay weights.
+     *
+     * This is a process-local cache key, not a compatibility hash. Keeping the
+     * full length-delimited identity avoids collision risk and makes a changed
+     * participant, priority, quota, owner order, dense policy, or explicit
+     * placement a cache miss. The production `ModelContextReuseContract`
+     * independently validates its resolved rank plan before adoption.
+     */
+    inline std::string moeMTPStaticOverlayPlanCacheIdentity(
+        const MoERoutedExpertPlacementPlan &plan)
+    {
+        const auto append_string = [](
+                                       std::ostringstream &out,
+                                       const std::string &value)
+        {
+            out << value.size() << ':' << value << ';';
+        };
+        const auto append_ints = [](
+                                    std::ostringstream &out,
+                                    const auto &values)
+        {
+            out << values.size() << '[';
+            for (const auto value : values)
+                out << value << ',';
+            out << "]";
+        };
+
+        std::ostringstream out;
+        out << "enabled=" << plan.enabled
+            << ";topology=" << static_cast<int>(plan.topology)
+            << ";residency=" << static_cast<int>(plan.residency_policy)
+            << ";owner_order=" << static_cast<int>(plan.owner_order) << ';';
+        append_string(out, plan.continuation_domain);
+        append_string(out, plan.base_model_domain);
+        append_string(out, plan.shared_expert_domain);
+
+        const auto &continuation = plan.continuation_domain_spec;
+        append_string(out, continuation.domain);
+        out << "root=" << continuation.logical_root_participant
+            << ";dense_tp=" << continuation.dense_tp_enabled
+            << ";decode_rep=" << continuation.dense_decode_replicated
+            << ";decode_embed="
+            << continuation.dense_decode_mirrored_embedding
+            << ";dense_policy="
+            << static_cast<int>(continuation.dense_policy)
+            << ";hidden_layout="
+            << static_cast<int>(continuation.hidden_layout)
+            << ";shared_dense_tp="
+            << continuation.shared_expert_uses_dense_tp << ';';
+
+        out << "dense_domains=" << plan.dense_domains.size() << '{';
+        for (const auto &domain : plan.dense_domains)
+            append_string(out, domain.toString());
+        out << "};routed_domains=" << plan.domains.size() << '{';
+        for (const auto &domain : plan.domains)
+            append_string(out, domain.toExecutionDomainDefinition().toString());
+        out << "};tiers=" << plan.routed_tiers.size() << '{';
+        for (const auto &tier : plan.routed_tiers)
+        {
+            append_string(out, tier.name);
+            append_string(out, tier.domain);
+            out << tier.priority << ','
+                << tier.max_experts_per_layer << ','
+                << tier.memory_budget_bytes << ','
+                << tier.fallback << ',';
+            append_ints(out, tier.resolved_live_experts_per_layer);
+        }
+        out << "};placements=" << plan.placements.size() << '{';
+        for (const auto &placement : plan.placements)
+        {
+            out << placement.layer << ':';
+            append_ints(out, placement.routed_expert_tier);
+        }
+        out << '}';
+        return out.str();
+    }
+
+    /**
+     * @brief Return whether this call may reuse the process campaign's oracle.
+     *
+     * Focused tests keep their historical fresh-run isolation. Only the CTest
+     * production campaign enables this optimization. The ordinary
+     * single-device topology and an exact immutable static overlay both have a
+     * serial oracle independent of speculative depth and prefix lifecycle.
+     */
+    inline bool mayReuseMoEMTPSerialBaseline(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        const bool reusable_topology =
+            test_case.topology == MoEPrefixParityTopology::SingleDevice ||
+            isReusableStaticMoEMTPOverlay(test_case);
+        return reusable_topology &&
+               DebugEnv::isTruthyEnv(
+                   "LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN");
+    }
+
+    /**
+     * @brief Return whether depth cells may share model-owned prepared weights.
+     *
+     * The model-context cache contract covers only the plain single-device MTP
+     * campaign. A LocalTP overlay has one prepared authority per participant;
+     * reusing it requires a typed multi-authority contract from the production
+     * runner and must never be represented by the existing single pointer.
+     * Overlay, hot-cache, LLEP, and rebalance plans therefore retain fresh
+     * model contexts even when their immutable serial oracle is reusable.
+     * The ordinary GPU raw-source release remains enabled: the first MTP runner
+     * prepares the complete discovered sidecar depth and full single-device
+     * expert set, after which a later identical runner must be able to adopt the
+     * model-owned packed state without consulting released source bytes.  The
+     * cache-hit PerfStats assertion below makes that lifecycle part of the gate.
+     */
+    inline bool mayReuseMoEMTPModelContext(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        return mayReuseMoEMTPSerialBaseline(test_case) &&
+               !test_case.moe_routed_expert_plan &&
+               !test_case.moe_hot_expert_cache &&
+               !test_case.moe_rebalance &&
+               !test_case.moe_routed_prefill;
+    }
+
+    /**
+     * @brief Build the physical identity of the reusable MTP weight authority.
+     *
+     * MTP depth, KV precision, maximum sequence length, and sampling policy are
+     * intentionally excluded: those are runner-owned graph/request properties.
+     * The real model path and exact physical device remain keyed because packed
+     * weight handles are backend- and ordinal-specific.
+     */
+    inline std::string moeMTPModelContextCampaignKey(
+        const MoEPrefixRestoreParityCase &test_case,
+        const std::string &model_path)
+    {
+        std::ostringstream key;
+        key << "model=" << model_path
+            << "|topology=" << static_cast<int>(test_case.topology)
+            << "|devices=";
+        for (const auto &device : test_case.devices)
+            key << device.toString() << ',';
+        return key.str();
+    }
+
+    /**
+     * @brief Find the exact model authority retained by an earlier MTP runner.
+     *
+     * A miss deliberately returns nullptr instead of constructing a guessed
+     * ModelContext.  Qwen3.6's GGUF includes trailing nextn blocks that are not
+     * main-model PP layers, so only the production runner's resolved execution
+     * plan can establish the correct distribution and layer ownership.
+     *
+     * @param test_case Exact single-device production topology.
+     * @param model_path Authenticated real GGUF path.
+     * @param cache_hit Receives true only for a context retained by a prior cell.
+     * @return Prior production reuse contract on a hit, otherwise empty.
+     */
+    inline std::optional<ModelContextReuseContract> findMoEMTPModelContext(
+        const MoEPrefixRestoreParityCase &test_case,
+        const std::string &model_path,
+        bool *cache_hit)
+    {
+        if (cache_hit)
+            *cache_hit = false;
+        if (!mayReuseMoEMTPModelContext(test_case))
+            return std::nullopt;
+
+        const std::string key =
+            moeMTPModelContextCampaignKey(test_case, model_path);
+        auto &cache = moeMTPModelContextCampaignCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.contract && cache.key == key)
+        {
+            if (cache_hit)
+                *cache_hit = true;
+            return cache.contract;
+        }
+
+        if (cache.contract)
+        {
+            /*
+             * The previous runner has already synchronized and retired all
+             * graph-owned handles.  Clear tensor-indexed process caches while
+             * the old model authority is still alive, then evict the sole slot.
+             */
+            llaminar::v2::kernels::KernelFactory::clearCache();
+            cache.contract.reset();
+            cache.key.clear();
+        }
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Publish the first runner's plan-resolved model authority.
+     *
+     * Publication occurs only after ordinary production initialization has
+     * successfully resolved PP/main-layer ownership and installed the model's
+     * PreparedWeightStore.  Later cells can therefore reuse an exact authority,
+     * not a test-side reconstruction of production loading policy.
+     *
+     * @param test_case Exact single-device production topology.
+     * @param model_path Authenticated real GGUF path.
+     * @param contract Exact context/plan contract returned by the initialized runner.
+     * @param error Receives a precise identity/lifecycle diagnostic.
+     * @return True when the context is now the sole campaign cache entry.
+     */
+    inline bool publishMoEMTPModelContext(
+        const MoEPrefixRestoreParityCase &test_case,
+        const std::string &model_path,
+        const ModelContextReuseContract &contract,
+        std::string *error)
+    {
+        if (!mayReuseMoEMTPModelContext(test_case) || !contract.context)
+        {
+            if (error)
+                *error = "cannot publish an ineligible or null MTP model context";
+            return false;
+        }
+        if (contract.context->path() != model_path)
+        {
+            if (error)
+                *error = "production runner returned a different model authority";
+            return false;
+        }
+
+        const std::string key =
+            moeMTPModelContextCampaignKey(test_case, model_path);
+        auto &cache = moeMTPModelContextCampaignCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.contract)
+        {
+            if (cache.key == key &&
+                cache.contract->context == contract.context)
+                return true;
+            if (error)
+                *error = "MTP campaign attempted to replace a live model authority";
+            return false;
+        }
+
+        cache.key = key;
+        cache.contract = contract;
+        return true;
+    }
+
+    /**
+     * @brief Build the complete identity of a reusable serial MTP oracle.
+     *
+     * The key deliberately excludes MTP depth and policy because the baseline
+     * has MTP disabled.  It includes every value that can affect ordinary
+     * production serial arithmetic or the captured snapshot layout, so a
+     * changed topology, model, KV policy, prompt, or decode budget cannot
+     * accidentally inherit a prior oracle.
+     */
+    inline std::string moeMTPSerialBaselineCampaignKey(
+        const MoEPrefixRestoreParityCase &test_case,
+        const std::string &model_path,
+        const std::vector<int32_t> &prompt_tokens,
+        int decode_token_budget)
+    {
+        std::ostringstream key;
+        key << "model=" << model_path
+            << "|topology=" << static_cast<int>(test_case.topology)
+            << "|kv=" << test_case.kv_cache_precision
+            << "|max_seq=" << test_case.max_seq_len
+            << "|decode_budget=" << decode_token_budget
+            << "|devices=";
+        for (const auto &device : test_case.devices)
+            key << device.toString() << ',';
+        if (test_case.moe_routed_expert_plan)
+        {
+            key << "|overlay_plan="
+                << moeMTPStaticOverlayPlanCacheIdentity(
+                       *test_case.moe_routed_expert_plan);
+        }
+        key << "|prompt_tokens=";
+        for (const int32_t token : prompt_tokens)
+            key << token << ',';
+        return key.str();
+    }
+
+    /**
+     * @brief Execute and copy the authoritative ordinary serial-decode oracle.
+     *
+     * This is the exact baseline that each MTP cell used before campaign
+     * amortization: a fresh production graph runner performs one prefill and
+     * one-token incremental decode for every requested output.  It remains
+     * intentionally graph-native and captures every available diagnostic
+     * checkpoint; only its immutable host copies are shared afterwards.
+     *
+     * @param factory Production runner factory for the current process.
+     * @param test_case Concrete topology and precision contract.
+     * @param model_path Real GGUF path already authenticated against PyTorch.
+     * @param prompt_tokens Exact tokenized request prefix.
+     * @param decode_token_budget Number of serial output checkpoints to record.
+     * @param sampling Production sampling policy shared with the MTP runner.
+     * @param error Receives a precise failure when the oracle cannot run.
+     * @return Immutable copied evidence, or an empty pointer on failure.
+     */
+    inline std::shared_ptr<const MoEMTPSerialBaselineEvidence>
+    captureMoEMTPSerialBaselineEvidence(
+        IOrchestrationRunnerFactory &factory,
+        const MoEPrefixRestoreParityCase &test_case,
+        const std::string &model_path,
+        const std::vector<int32_t> &prompt_tokens,
+        int decode_token_budget,
+        const SamplingParams &sampling,
+        std::string *error)
+    {
+        if (decode_token_budget <= 0)
+        {
+            if (error)
+                *error = "serial MTP baseline requires a positive decode budget";
+            return {};
+        }
+
+        auto baseline = factory.createFromOrchestrationConfig(
+            makeMoEPrefixRestoreConfig(test_case, model_path, false, 2, false));
+        if (!baseline)
+        {
+            if (error)
+                *error = "could not construct the production serial baseline runner";
+            return {};
+        }
+        if (!baseline->initialize())
+        {
+            if (error)
+                *error = "serial baseline initialization failed: " +
+                         baseline->lastError();
+            return {};
+        }
+
+        baseline->setSamplingParams(sampling);
+        /*
+         * This parity-only observation boundary deliberately materializes the
+         * complete logits used by the CSV oracle. The first decodeStep samples
+         * the terminal prefill distribution before any decode forward runs, so
+         * both phase policies must opt in; enabling only decode observation
+         * leaves that first distribution correctly device-owned and unreadable.
+         */
+        baseline->setSkipLogitsGatherPrefill(false);
+        baseline->setSkipLogitsGatherDecode(false);
+        baseline->enableSnapshotCapture();
+        if (!baseline->prefill(prompt_tokens))
+        {
+            if (error)
+                *error = "serial baseline prefill failed: " +
+                         baseline->lastError();
+            baseline->disableSnapshotCapture();
+            baseline->shutdown();
+            return {};
+        }
+
+        MoEMTPSerialBaselineEvidence evidence;
+        evidence.snapshots_by_output_count.resize(
+            static_cast<size_t>(decode_token_budget) + 1u);
+        for (int output_count = 1;
+             output_count <= decode_token_budget;
+             ++output_count)
+        {
+            baseline->clearSnapshots();
+            baseline->setDecodeStepTokenBudget(1);
+            GenerationResult step = baseline->decodeStep();
+            baseline->setDecodeStepTokenBudget(0);
+            if (!step.error.empty())
+            {
+                if (error)
+                    *error = "serial baseline decode failed: " + step.error;
+                baseline->disableSnapshotCapture();
+                baseline->shutdown();
+                return {};
+            }
+            if (step.tokens.size() != 1u)
+            {
+                if (error)
+                {
+                    *error = "serial baseline must emit exactly one token per "
+                             "decode step, got " +
+                             std::to_string(step.tokens.size());
+                }
+                baseline->disableSnapshotCapture();
+                baseline->shutdown();
+                return {};
+            }
+
+            evidence.tokens.insert(
+                evidence.tokens.end(), step.tokens.begin(), step.tokens.end());
+            evidence.snapshots_by_output_count[
+                static_cast<size_t>(output_count)] =
+                captureMoEDiagnosticSnapshot(
+                    *baseline, step.tokens, evidence.tokens);
+        }
+
+        baseline->disableSnapshotCapture();
+        baseline->shutdown();
+        return std::make_shared<const MoEMTPSerialBaselineEvidence>(
+            std::move(evidence));
+    }
+
+    /**
+     * @brief Acquire the serial MTP oracle, building it once per production campaign.
+     *
+     * The mutex makes the cache safe if a future runner invokes the exact GTest
+     * cases concurrently.  Current CTest campaign registration is serial, so
+     * the lock has no inference-path cost and simply prevents duplicate model
+     * work should that registration policy ever change.
+     *
+     * @param cache_hit Receives true only when an immutable prior oracle was used.
+     * @param error Receives a construction diagnostic on failure.
+     * @return The immutable baseline evidence, or an empty pointer on failure.
+     */
+    inline std::shared_ptr<const MoEMTPSerialBaselineEvidence>
+    acquireMoEMTPSerialBaselineEvidence(
+        IOrchestrationRunnerFactory &factory,
+        const MoEPrefixRestoreParityCase &test_case,
+        const std::string &model_path,
+        const std::vector<int32_t> &prompt_tokens,
+        int decode_token_budget,
+        const SamplingParams &sampling,
+        bool *cache_hit,
+        std::string *error)
+    {
+        if (cache_hit)
+            *cache_hit = false;
+
+        if (!mayReuseMoEMTPSerialBaseline(test_case))
+        {
+            return captureMoEMTPSerialBaselineEvidence(
+                factory,
+                test_case,
+                model_path,
+                prompt_tokens,
+                decode_token_budget,
+                sampling,
+                error);
+        }
+
+        const std::string key = moeMTPSerialBaselineCampaignKey(
+            test_case, model_path, prompt_tokens, decode_token_budget);
+        auto &cache = moeMTPSerialBaselineCampaignCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.evidence && cache.key == key)
+        {
+            if (cache_hit)
+                *cache_hit = true;
+            return cache.evidence;
+        }
+
+        const auto evidence = captureMoEMTPSerialBaselineEvidence(
+            factory,
+            test_case,
+            model_path,
+            prompt_tokens,
+            decode_token_budget,
+            sampling,
+            error);
+        if (!evidence)
+            return {};
+
+        cache.key = key;
+        cache.evidence = evidence;
+        return evidence;
+    }
+
     inline void writeMoESnapshotCsvHeader(std::ofstream &csv)
     {
         csv << "comparison,sync_idx,output_tokens,key,reference_key,elements,"
                "cosine,rel_l2,symmetric_kl,max_abs_diff,left_l2,right_l2,left_mean,right_mean,left_label,right_label,"
-               "present_left,present_right,byte_identical,first_mismatch_index,first_left_bits,first_right_bits\n";
+               "present_left,present_right,routing_set_overlap,routing_top1_match,"
+               "routing_boundary_equivalent,routing_boundary_gap,"
+               "routing_boundary_error_limit,"
+               "byte_identical,first_mismatch_index,first_left_bits,first_right_bits\n";
     }
 
     inline void writeMoESnapshotCsvRow(std::ofstream &csv, const MoESnapshotCompareRow &row)
@@ -5996,7 +7440,22 @@ namespace llaminar2::test::parity::qwen36
             << csvEscapeMoEDiagnostic(row.left_label) << ','
             << csvEscapeMoEDiagnostic(row.right_label) << ','
             << (row.present_in_baseline ? "true" : "false") << ','
-            << (row.present_in_mtp ? "true" : "false") << ','
+            << (row.present_in_mtp ? "true" : "false") << ',';
+        if (!std::isnan(row.routing_set_overlap))
+            csv << row.routing_set_overlap;
+        csv << ',';
+        if (!std::isnan(row.routing_top1_match))
+            csv << row.routing_top1_match;
+        csv << ',';
+        if (!std::isnan(row.routing_boundary_equivalent))
+            csv << row.routing_boundary_equivalent;
+        csv << ',';
+        if (!std::isnan(row.routing_boundary_gap))
+            csv << row.routing_boundary_gap;
+        csv << ',';
+        if (!std::isnan(row.routing_boundary_error_limit))
+            csv << row.routing_boundary_error_limit;
+        csv << ','
             << (row.byte_identical ? "true" : "false") << ',';
         if (row.first_mismatch_index == std::numeric_limits<size_t>::max())
         {
@@ -6166,6 +7625,18 @@ namespace llaminar2::test::parity::qwen36
             << " present_left=" << (row.present_in_baseline ? "true" : "false")
             << " present_right=" << (row.present_in_mtp ? "true" : "false")
             << " byte_identical=" << (row.byte_identical ? "true" : "false");
+        if (!std::isnan(row.routing_set_overlap))
+            oss << " routing_set_overlap=" << row.routing_set_overlap;
+        if (!std::isnan(row.routing_top1_match))
+            oss << " routing_top1_match=" << row.routing_top1_match;
+        if (!std::isnan(row.routing_boundary_equivalent))
+        {
+            oss << " routing_boundary_equivalent="
+                << row.routing_boundary_equivalent
+                << " routing_boundary_gap=" << row.routing_boundary_gap
+                << " routing_boundary_error_limit="
+                << row.routing_boundary_error_limit;
+        }
         if (row.first_mismatch_index != std::numeric_limits<size_t>::max())
         {
             oss << " first_mismatch_index=" << row.first_mismatch_index
@@ -9470,7 +10941,9 @@ namespace llaminar2::test::parity::qwen36
             {
                 if (!exercise_device_rebalance_maintenance)
                     return true;
-                if (!serial_runner->usesDeviceSideMoERebalanceController())
+                if (serial_runner->moeOverlayAuthorityExecution() !=
+                    MoEOverlayAuthorityExecutionKind::
+                        HomogeneousDeviceResident)
                 {
                     ADD_FAILURE()
                         << context
@@ -9737,7 +11210,9 @@ namespace llaminar2::test::parity::qwen36
         {
             if (!exercise_device_rebalance_maintenance)
                 return true;
-            if (!runner->usesDeviceSideMoERebalanceController())
+            if (runner->moeOverlayAuthorityExecution() !=
+                MoEOverlayAuthorityExecutionKind::
+                    HomogeneousDeviceResident)
             {
                 ADD_FAILURE()
                     << context
@@ -11209,12 +12684,76 @@ namespace llaminar2::test::parity::qwen36
         grouped_snapshot_capture.disable();
     }
 
+    /**
+     * @brief Resolve the full short-prompt reference pack for prefill artifacts.
+     *
+     * Long MTP packs intentionally contain decode checkpoints only.  The
+     * production runner therefore executes one short authenticated request on
+     * the same topology before the long MTP request, preserving full prefill
+     * coverage without duplicating tens of thousands of long-prompt tensors.
+     */
+    inline std::filesystem::path qwen36MoEFullCheckpointReferenceDir(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        if (const char *override_dir =
+                std::getenv("LLAMINAR_QWEN36_MOE_FULL_SNAPSHOT_DIR"))
+        {
+            if (*override_dir)
+                return override_dir;
+        }
+        const bool has_cuda = std::any_of(
+            test_case.devices.begin(),
+            test_case.devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isCUDA();
+            });
+        if (has_cuda)
+            return "pytorch_qwen36_moe_singledevice_cuda_snapshots";
+        const bool has_rocm = std::any_of(
+            test_case.devices.begin(),
+            test_case.devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isROCm();
+            });
+        if (has_rocm)
+            return "pytorch_qwen36_moe_singledevice_rocm_snapshots";
+        return "pytorch_qwen36_moe_singledevice_cpu_snapshots";
+    }
+
+    /**
+     * @brief Request lifecycle certified by one MTP checkpoint campaign cell.
+     *
+     * FreshRequest proves ordinary request admission. FullPrefixRestore first
+     * completes an independent seed request, then records all numerical and
+     * production-path evidence from a second request that restored terminal
+     * logits, hidden state, main KV/GDN state, and shifted-MTP state from the
+     * prefix cache.
+     */
+    enum class MoEMTPCheckpointRequestLifecycle
+    {
+        FreshRequest,
+        FullPrefixRestore,
+    };
+
     inline void runMoEMTPSidecarStageBreakdownDiagnostic(
         const MoEPrefixRestoreParityCase &test_case,
-        int decode_token_budget)
+        int decode_token_budget,
+        int mtp_draft_tokens = 1,
+        MTPDepthPolicyConfig mtp_depth_policy = {},
+        MoEMTPCheckpointRequestLifecycle request_lifecycle =
+            MoEMTPCheckpointRequestLifecycle::FreshRequest)
     {
+        const auto campaign_started_at = std::chrono::steady_clock::now();
         ScopedMoEParityProductionMode production_mode(
             shouldForceMoEParityProductionMode(test_case));
+        ScopedMoEPrefixCaseEnvironment case_environment(
+            test_case.env_overrides);
+        ScopedEnvironmentValues perf_stats_enabled({
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
+        PerfStatsCollector::reset();
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -11224,6 +12763,11 @@ namespace llaminar2::test::parity::qwen36
             return;
         }
         ASSERT_GT(decode_token_budget, 0);
+        ASSERT_GE(mtp_draft_tokens, 1);
+        ASSERT_LE(mtp_draft_tokens, 3);
+        const bool full_prefix_restore =
+            request_lifecycle ==
+            MoEMTPCheckpointRequestLifecycle::FullPrefixRestore;
 
         const std::filesystem::path metadata_path = firstEnvOrDefault(
             test_case.metadata_envs,
@@ -11239,6 +12783,127 @@ namespace llaminar2::test::parity::qwen36
         }
         const auto pytorch_snapshot_dir = metadata_path.parent_path();
 
+        const std::filesystem::path full_reference_dir =
+            qwen36MoEFullCheckpointReferenceDir(test_case);
+        const std::filesystem::path full_reference_metadata =
+            full_reference_dir / "metadata.txt";
+        ASSERT_TRUE(std::filesystem::exists(full_reference_metadata))
+            << "Full prefill checkpoint pack not found: "
+            << full_reference_metadata;
+        const std::vector<int32_t> artifact_prefill_tokens =
+            readTokenListFromMetadata(full_reference_metadata, "token_ids");
+        ASSERT_FALSE(artifact_prefill_tokens.empty())
+            << "Full prefill checkpoint pack has no token_ids: "
+            << full_reference_metadata;
+
+        /*
+         * Snapshot layout is a property of the real GGUF, not of the test
+         * case name.  Parse only the mapped metadata directory here and retain
+         * the small typed geometry; production runner construction below owns
+         * the actual prepared weights and graph lifecycle.
+         */
+        const ModelContextConfig metadata_context_config{
+            .strategy = WeightDistributionStrategy::REPLICATED,
+            .use_mmap = true,
+            .payload_access_pattern =
+                ModelPayloadAccessPattern::DeviceStaging,
+        };
+        auto metadata_context =
+            ModelContext::create(model_path, metadata_context_config);
+        ASSERT_NE(metadata_context, nullptr)
+            << "Could not read GDN parity geometry from " << model_path;
+        const ParityGDNHeadConfig gdn_config =
+            parityGDNHeadConfigFromModel(metadata_context.get());
+        ASSERT_TRUE(gdn_config.needsPermutation())
+            << "Qwen3.6 MoE parity requires a valid unequal-head GDN layout; "
+            << "n_k=" << gdn_config.n_k_heads
+            << " n_v=" << gdn_config.n_v_heads
+            << " d_state=" << gdn_config.d_state
+            << " is_moe=" << gdn_config.is_moe;
+
+        /*
+         * Keep one independently decoded copy of the real MTP router gate for
+         * the counterfactual diagnostic below.  This small BF16 matrix is the
+         * only weight duplicated by the harness; the 35B model itself remains
+         * owned by the production runner and its prepared-weight store.  The
+         * manifest, rather than a guessed `blk.40` spelling, resolves the live
+         * checkpoint's sidecar layout.
+         */
+        const auto metadata_loader = metadata_context->loader();
+        ASSERT_NE(metadata_loader, nullptr);
+        const MTPWeightManifest mtp_weight_manifest =
+            discoverMTPWeightManifest(
+                *metadata_loader,
+                metadata_context->architecture(),
+                metadata_context->totalBlockCount(),
+                /*explicit_mtp=*/true);
+        ASSERT_TRUE(mtp_weight_manifest.available)
+            << mtp_weight_manifest.diagnostic;
+        ASSERT_FALSE(mtp_weight_manifest.depths.empty());
+        ASSERT_TRUE(mtp_weight_manifest.depths.front().moe_ffn_layout)
+            << "Qwen3.6 MoE parity resolved a non-MoE MTP manifest";
+        const std::string mtp_router_gate_name =
+            mtp_weight_manifest.depths.front().moe_gate;
+        auto mtp_router_gate = metadata_context->getWeightForDevice(
+            mtp_router_gate_name,
+            DeviceId::cpu());
+        ASSERT_NE(mtp_router_gate, nullptr)
+            << "Could not load the real MTP router gate "
+            << mtp_router_gate_name;
+        const int mtp_router_num_experts =
+            static_cast<int>(mtp_router_gate->rows());
+        const int mtp_router_d_model =
+            static_cast<int>(mtp_router_gate->cols());
+        ASSERT_EQ(mtp_router_d_model, metadata_context->embeddingLength());
+        ASSERT_GT(mtp_router_num_experts, 0);
+        const float *mtp_router_gate_data = mtp_router_gate->data();
+        ASSERT_NE(mtp_router_gate_data, nullptr);
+        std::vector<float> mtp_router_gate_weights(
+            mtp_router_gate_data,
+            mtp_router_gate_data + mtp_router_gate->numel());
+        mtp_router_gate.reset();
+        metadata_context.reset();
+
+        const bool dynamic_depth =
+            mtp_depth_policy.mode == MTPDepthPolicyMode::Dynamic;
+        const std::string artifact_backend =
+            test_case.name +
+            (full_prefix_restore ? "_PREFIX_RESTORE" : "") +
+            (dynamic_depth
+                 ? "_MTP_DYNAMIC"
+                 : "_MTP_DEPTH" + std::to_string(mtp_draft_tokens));
+        Qwen36CheckpointArtifactRecorder artifact_recorder(
+            artifact_backend,
+            /*prefill_cosine_threshold=*/0.96f,
+            /*decode_cosine_threshold=*/0.98f,
+            /*logit_kl_threshold=*/0.03f);
+        const std::vector<std::string_view> required_sidecar_stage_suffixes = {
+            "EMBEDDING",
+            "NORM_HIDDEN",
+            "CONCAT",
+            "FC",
+            "ATTENTION_NORM",
+            "Q_PROJECTION",
+            "ATTENTION_CONTEXT",
+            "ATTENTION_OUTPUT",
+            "FFN_NORM",
+            "MOE_ROUTER_OUTPUT",
+            "MOE_ROUTING_INDICES",
+            "MOE_ROUTING_WEIGHTS",
+            "MOE_EXPERT_OUTPUT",
+            "MOE_SHARED_EXPERT_OUTPUT",
+            "MOE_SHARED_GATE_OUTPUT",
+            "MOE_COMBINED_OUTPUT",
+            "FFN_RESIDUAL",
+            "FINAL_NORM",
+            "LM_HEAD",
+        };
+        for (const std::string_view suffix : required_sidecar_stage_suffixes)
+        {
+            artifact_recorder.requireDecodeStageSuffix(
+                "MTP0_" + std::string(suffix));
+        }
+
         auto factory = createOrchestrationRunnerFactory();
         SamplingParams greedy;
         greedy.temperature = 0.0f;
@@ -11252,12 +12917,28 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_TRUE(snapshot_csv.is_open()) << "failed to open " << snapshot_csv_path;
         token_csv << "sync_idx,runner,emitted_tokens,total_tokens,current_position,"
                      "logits_argmax,top5,mtp_draft_steps,mtp_accepted_tokens,"
-                     "mtp_rejected_tokens,mtp_rollbacks,snapshot_count\n";
+                     "mtp_rejected_tokens,mtp_rollbacks,transaction_depth,"
+                     "selected_depth,"
+                     "speculative_transaction,"
+                     "transaction_count,attempted_draft_tokens,"
+                     "last_transaction_depth,"
+                     "last_transaction_emitted_tokens,"
+                     "mtp_depth_policy_windows,mtp_depth_policy_updates,"
+                     "mtp_depth_policy_promotions,mtp_depth_policy_demotions,"
+                     "mtp_current_depth,mtp_min_depth,mtp_max_depth,"
+                     "snapshot_count\n";
         writeMoESnapshotCsvHeader(snapshot_csv);
 
         auto write_trace = [&](int sync_idx,
                                const char *runner_name,
-                               const MoEDiagnosticSnapshot &snapshot)
+                               const MoEDiagnosticSnapshot &snapshot,
+                               int transaction_depth = 0,
+                               int selected_depth = 0,
+                               bool speculative_transaction = false,
+                               int transaction_count = 0,
+                               int attempted_draft_tokens = 0,
+                               int last_transaction_depth = 0,
+                               int last_transaction_emitted_tokens = 0)
         {
             token_csv << sync_idx << ','
                       << runner_name << ','
@@ -11270,96 +12951,541 @@ namespace llaminar2::test::parity::qwen36
                       << snapshot.state.mtp_accepted_tokens << ','
                       << snapshot.state.mtp_rejected_tokens << ','
                       << snapshot.state.mtp_rollbacks << ','
+                      << transaction_depth << ','
+                      << selected_depth << ','
+                      << (speculative_transaction ? 1 : 0) << ','
+                      << transaction_count << ','
+                      << attempted_draft_tokens << ','
+                      << last_transaction_depth << ','
+                      << last_transaction_emitted_tokens << ','
+                      << snapshot.state.mtp_depth_policy_windows << ','
+                      << snapshot.state.mtp_depth_policy_updates << ','
+                      << snapshot.state.mtp_depth_policy_promotions << ','
+                      << snapshot.state.mtp_depth_policy_demotions << ','
+                      << snapshot.state.mtp_current_depth << ','
+                      << snapshot.state.mtp_min_depth << ','
+                      << snapshot.state.mtp_max_depth << ','
                       << snapshot.snapshots.size() << '\n';
             token_csv.flush();
         };
 
-        std::vector<int32_t> baseline_tokens;
-        std::vector<MoEDiagnosticSnapshot> baseline_snapshots_by_output_count;
-        baseline_snapshots_by_output_count.resize(static_cast<size_t>(decode_token_budget) + 1);
+        bool serial_baseline_cache_hit = false;
+        std::string serial_baseline_error;
+        const auto serial_baseline = acquireMoEMTPSerialBaselineEvidence(
+            *factory,
+            test_case,
+            model_path,
+            prompt_tokens,
+            decode_token_budget,
+            greedy,
+            &serial_baseline_cache_hit,
+            &serial_baseline_error);
+        ASSERT_NE(serial_baseline, nullptr)
+            << "Could not establish the graph-native serial MTP oracle: "
+            << serial_baseline_error
+            << "\ndiagnostic CSVs:\n"
+            << token_csv_path << '\n'
+            << snapshot_csv_path;
+        ASSERT_EQ(
+            serial_baseline->snapshots_by_output_count.size(),
+            static_cast<size_t>(decode_token_budget) + 1u)
+            << "The serial MTP oracle omitted one required output checkpoint";
 
+        const auto &baseline_tokens = serial_baseline->tokens;
+        const auto &baseline_snapshots_by_output_count =
+            serial_baseline->snapshots_by_output_count;
+        for (int output_count = 1;
+             output_count <= decode_token_budget;
+             ++output_count)
         {
-            auto baseline = factory->createFromOrchestrationConfig(
-                makeMoEPrefixRestoreConfig(test_case, model_path, false, 2, false));
-            ASSERT_NE(baseline, nullptr);
-            ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
-            baseline->setSamplingParams(greedy);
-            baseline->setSkipLogitsGatherDecode(false);
-            baseline->enableSnapshotCapture();
-            ASSERT_TRUE(baseline->prefill(prompt_tokens)) << baseline->lastError();
-
-            for (int output_count = 1; output_count <= decode_token_budget; ++output_count)
-            {
-                baseline->clearSnapshots();
-                baseline->setDecodeStepTokenBudget(1);
-                GenerationResult baseline_step = baseline->decodeStep();
-                baseline->setDecodeStepTokenBudget(0);
-                ASSERT_TRUE(baseline_step.error.empty()) << baseline_step.error;
-                ASSERT_FALSE(baseline_step.tokens.empty()) << "baseline decodeStep produced no tokens";
-                ASSERT_EQ(baseline_step.tokens.size(), 1u);
-                baseline_tokens.insert(
-                    baseline_tokens.end(),
-                    baseline_step.tokens.begin(),
-                    baseline_step.tokens.end());
-                auto snapshot = captureMoEDiagnosticSnapshot(
-                    *baseline,
-                    baseline_step.tokens,
-                    baseline_tokens);
-                write_trace(output_count - 1, "baseline", snapshot);
-                baseline_snapshots_by_output_count[static_cast<size_t>(output_count)] =
-                    std::move(snapshot);
-            }
-            baseline->disableSnapshotCapture();
-            baseline->shutdown();
+            write_trace(
+                output_count - 1,
+                "baseline",
+                baseline_snapshots_by_output_count[
+                    static_cast<size_t>(output_count)]);
         }
+        LOG_INFO(
+            "[Qwen36MoEMTPParity] serial baseline source="
+            << (serial_baseline_cache_hit ? "campaign_cache" : "live_runner")
+            << " checkpoints=" << decode_token_budget);
+
+        /*
+         * The serial oracle is an independent production request.  Its graph
+         * counters must not certify the MTP runner below: resetting here makes
+         * the final production_path.csv and homogeneous-capture assertions
+         * prove only the fresh depth-specific MTP graph.
+         */
+        PerfStatsCollector::reset();
 
         std::vector<int32_t> mtp_tokens;
         std::vector<MoESnapshotCompareRow> all_snapshot_rows;
         std::set<std::string> observed_mtp_sidecar_keys;
+        struct ActiveMTPCheckpointContext
+        {
+            std::string production_prefix;
+            int reference_depth = 0;
+        };
+        std::vector<std::vector<ActiveMTPCheckpointContext>>
+            active_contexts_by_transaction;
 
-        auto mtp = factory->createFromOrchestrationConfig(
-            makeMoEPrefixRestoreConfig(test_case, model_path, false, 2, true));
+        const OrchestrationConfig mtp_config = makeMoEPrefixRestoreConfig(
+            test_case,
+            model_path,
+            full_prefix_restore,
+            full_prefix_restore
+                ? static_cast<int>(prompt_tokens.size())
+                : 2,
+            true,
+            mtp_draft_tokens,
+            mtp_depth_policy);
+        const bool campaign_model_context_enabled =
+            mayReuseMoEMTPModelContext(test_case);
+        bool mtp_model_context_reused = false;
+        double mtp_model_context_cache_hits = 0.0;
+        double mtp_model_context_cache_misses = 0.0;
+        double mtp_prepared_store_reuses = 0.0;
+        std::string mtp_model_context_error;
+        std::optional<ModelContextReuseContract> mtp_reuse_contract;
+        if (campaign_model_context_enabled)
+        {
+            mtp_reuse_contract = findMoEMTPModelContext(
+                test_case,
+                model_path,
+                &mtp_model_context_reused);
+        }
+
+        /*
+         * Reuse only the model-owned immutable/prepared weight authority.  The
+         * constructor below is the ordinary production OrchestrationRunner and
+         * still creates a fresh execution plan, arena, exact streams, captured
+         * graphs, depth controller, and request state for this depth cell.
+         */
+        auto mtp = mtp_reuse_contract
+                       ? factory->createFromOrchestrationConfig(
+                             mtp_config,
+                             *mtp_reuse_contract)
+                       : factory->createFromOrchestrationConfig(mtp_config);
         ASSERT_NE(mtp, nullptr);
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+        if (campaign_model_context_enabled)
+        {
+            if (!mtp_model_context_reused)
+            {
+                /*
+                 * The miss path performs ordinary production model loading.
+                 * Retain only the resulting plan-resolved authority after the
+                 * graph has initialized successfully; never synthesize its
+                 * layer range or distribution from test metadata.
+                 */
+                mtp_reuse_contract = mtp->modelContextReuseContract();
+                ASSERT_TRUE(mtp_reuse_contract.has_value())
+                    << "Production MTP runner did not expose its rank-local "
+                       "prepared-weight reuse contract";
+                ASSERT_TRUE(publishMoEMTPModelContext(
+                    test_case,
+                    model_path,
+                    *mtp_reuse_contract,
+                    &mtp_model_context_error))
+                    << mtp_model_context_error;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                mtp_model_context_reused
+                    ? "parity_campaign_model_context_cache_hits"
+                    : "parity_campaign_model_context_cache_misses",
+                1.0,
+                "setup",
+                mtp->primaryDeviceId().toString(),
+                {{"depth", std::to_string(mtp_draft_tokens)},
+                 {"policy", dynamic_depth ? "dynamic" : "fixed"}});
+
+            /*
+             * Capture construction evidence before an optional seed request.
+             * Prefix-restore cells reset PerfStats after seeding so their final
+             * CSVs certify only the restored request; runner-construction
+             * evidence belongs to this earlier lifecycle boundary.
+             */
+            const auto setup_records = PerfStatsCollector::snapshot(
+                {"mtp", "weight_loading"});
+            mtp_model_context_cache_hits = perfCounterSum(
+                setup_records,
+                "mtp",
+                "parity_campaign_model_context_cache_hits");
+            mtp_model_context_cache_misses = perfCounterSum(
+                setup_records,
+                "mtp",
+                "parity_campaign_model_context_cache_misses");
+            mtp_prepared_store_reuses = perfCounterSum(
+                setup_records,
+                "weight_loading",
+                "preloaded_prepared_weight_store_reuses");
+        }
+        LOG_INFO(
+            "[Qwen36MoEMTPParity] model context source="
+            << (campaign_model_context_enabled
+                    ? (mtp_model_context_reused
+                           ? "campaign_prepared_store"
+                           : "new_production_context")
+                    : "fresh_runner_context")
+            << " depth=" << mtp_draft_tokens
+            << " policy=" << (dynamic_depth ? "dynamic" : "fixed"));
+        const bool host_owned_mtp_sidecar =
+            mtp->primaryDeviceId().is_cpu();
         mtp->setSamplingParams(greedy);
+        /*
+         * Snapshot CSVs include the full terminal logits for prefill and
+         * decode. This is the runner's explicit diagnostic opt-in; graph
+         * execution and device-side sampling remain the production path.
+         */
+        mtp->setSkipLogitsGatherPrefill(false);
         mtp->setSkipLogitsGatherDecode(false);
         mtp->enableSnapshotCapture();
+
+        /*
+         * Capture a complete short-prompt prefill on this exact MTP-enabled
+         * production runner.  The long diagnostic reference pack is decode
+         * only by design; clearing request-owned state afterwards preserves
+         * the captured topology and prepared weights for the MTP request.
+         */
+        ASSERT_TRUE(mtp->prefill(artifact_prefill_tokens)) << mtp->lastError();
+        recordQwen36PrefillArtifacts(
+            artifact_recorder,
+            *mtp,
+            full_reference_dir,
+            artifact_prefill_tokens.size(),
+            gdn_config);
+        mtp->clearSnapshots();
+        mtp->clearCache();
+
+        if (full_prefix_restore)
+        {
+            /*
+             * Populate the prefix authority with a complete independent MTP
+             * request. The next prefill must cross the ordinary public request
+             * boundary and restore this entry; no test-only state injection is
+             * permitted. Keeping snapshot capture enabled also warms/captures
+             * the exact depth-specific graph that the restored request reuses.
+             */
+            const GenerationResult seed = mtp->generate(
+                prompt_tokens,
+                decode_token_budget,
+                greedy);
+            mtp->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+            ASSERT_TRUE(seed.error.empty()) << seed.error;
+            ASSERT_EQ(seed.tokens.size(), baseline_tokens.size());
+            EXPECT_EQ(seed.tokens, baseline_tokens)
+                << "Prefix-cache seed request diverged from the serial MTP oracle";
+
+            const PrefixRuntimeStateSnapshot seed_state =
+                mtp->prefixStateProbe();
+            EXPECT_TRUE(seed_state.prefix_cache_ready);
+            EXPECT_GE(seed_state.prefix_cache_inserts, 1u);
+            EXPECT_GT(seed_state.prefix_cache_mtp_state_bytes, 0u)
+                << "Prefix-cache seed did not persist shifted-MTP state";
+
+            /*
+             * The restored request legitimately skips prefill and may not
+             * schedule a new movement transaction. Export the seed request's
+             * counters before its lifecycle reset so Dynamic/LLEP campaign
+             * cells prove real payload movement on the request that populated
+             * the prefix authority. StaticOwner cells use the same boundary to
+             * prove that no planner, copy, transport, or apply work occurred.
+             */
+            const auto seed_records = PerfStatsCollector::snapshot(
+                {"moe_rebalance", "kernel"});
+            expectMoERebalancePerfPath(
+                test_case,
+                seed_records,
+                test_case.name +
+                    " real-weight MTP checkpoint prefix seed",
+                /*require_fresh_movement=*/true);
+            mtp->clearSnapshots();
+            PerfStatsCollector::reset();
+        }
+
         ASSERT_TRUE(mtp->prefill(prompt_tokens)) << mtp->lastError();
 
+        if (full_prefix_restore)
+        {
+            const PrefixRuntimeStateSnapshot restored_prefill_state =
+                mtp->prefixStateProbe();
+            EXPECT_TRUE(restored_prefill_state.prefix_cache_ready);
+            EXPECT_GE(restored_prefill_state.prefix_cache_hits, 1u);
+            EXPECT_TRUE(restored_prefill_state.prefix_request.hit);
+            EXPECT_FALSE(restored_prefill_state.prefix_request.partial_hit);
+            EXPECT_EQ(
+                restored_prefill_state.prefix_request.matched_tokens,
+                static_cast<int>(prompt_tokens.size()));
+            EXPECT_TRUE(
+                restored_prefill_state.prefix_request.terminal_logits_restored);
+            EXPECT_TRUE(
+                restored_prefill_state.prefix_request.terminal_hidden_restored);
+            EXPECT_TRUE(restored_prefill_state.prefix_request.mtp_state_restored);
+        }
+
         int sync_idx = 0;
+        int speculative_transaction_count = 0;
         while (static_cast<int>(mtp_tokens.size()) < decode_token_budget)
         {
             const int remaining = decode_token_budget - static_cast<int>(mtp_tokens.size());
+            /*
+             * The depth controller owns the depth of the transaction about to
+             * execute. Capture that decision before decodeStep(): the state
+             * published afterwards is the controller's decision for the next
+             * transaction. The chained graph reuses the depth-zero model
+             * weights and stage names, so its last materialized replay maps to
+             * recursive PyTorch depth (executed_depth - 1). The response
+             * budget may truncate the controller-selected maximum on the last
+             * transaction, so the production draft-step delta is authoritative.
+             */
+            const auto before_transaction = mtp->prefixStateProbe();
             const int transaction_first_decode_step =
-                static_cast<int>(mtp_tokens.size());
+                mtpParityReferenceStepForConditionPosition(
+                    before_transaction.mtp_next_condition_position,
+                    static_cast<int>(prompt_tokens.size()));
+            ASSERT_GE(transaction_first_decode_step, 0)
+                << "Production MTP transaction began before the authenticated "
+                   "prefill boundary: next_condition_position="
+                << before_transaction.mtp_next_condition_position
+                << " prompt_tokens=" << prompt_tokens.size();
+            int selected_depth = before_transaction.mtp_current_depth;
+            if (selected_depth <= 0)
+            {
+                selected_depth = mtp_draft_tokens;
+            }
+            selected_depth = std::clamp(
+                selected_depth,
+                1,
+                std::min(mtp_draft_tokens, 3));
+
+            std::vector<ActiveMTPCheckpointContext> active_contexts;
             mtp->clearSnapshots();
             /*
-             * Keep one diagnostic observation bounded to one speculative
-             * transaction.  A larger response budget allows the resident
-             * generation loop to execute several transactions before the sole
-             * terminal observation; every captured snapshot slot would then
-             * contain whichever transaction last wrote that stage.  Two
-             * response tokens are sufficient to exercise one draft and its
-             * target verification while preserving an unambiguous mapping to
-             * the PyTorch decode-step namespace.
+             * Bound one diagnostic observation to one controller-depth output
+             * capacity. A resident generation loop may still need several
+             * transactions after a rejection to exhaust that response budget;
+             * aggregate counters prove every transaction and the terminal
+             * ledger identifies the final transaction that owns each captured
+             * snapshot slot.
              */
-            mtp->setDecodeStepTokenBudget(std::min(remaining, 2));
+            mtp->setDecodeStepTokenBudget(
+                std::min(remaining, mtp_draft_tokens + 1));
             GenerationResult mtp_step = mtp->decodeStep();
             mtp->setDecodeStepTokenBudget(0);
             ASSERT_TRUE(mtp_step.error.empty()) << mtp_step.error;
             ASSERT_FALSE(mtp_step.tokens.empty()) << "MTP decodeStep produced no tokens";
             mtp_tokens.insert(mtp_tokens.end(), mtp_step.tokens.begin(), mtp_step.tokens.end());
 
+            const auto after_transaction = mtp->prefixStateProbe();
+            const MTPParityTransactionCounters before_counters{
+                .draft_steps = before_transaction.mtp_draft_steps,
+                .verifier_runs = before_transaction.mtp_verifier_runs,
+            };
+            const MTPParityTransactionCounters after_counters{
+                .draft_steps = after_transaction.mtp_draft_steps,
+                .verifier_runs = after_transaction.mtp_verifier_runs,
+            };
+            const auto transaction_activity =
+                classifyMTPParityTransactionActivity(
+                    before_counters,
+                    after_counters);
+            ASSERT_NE(
+                transaction_activity,
+                MTPParityTransactionActivity::Inconsistent)
+                << "Production MTP draft/verifier counters disagree around "
+                   "decodeStep: before drafts="
+                << before_transaction.mtp_draft_steps
+                << " verifiers=" << before_transaction.mtp_verifier_runs
+                << " after drafts=" << after_transaction.mtp_draft_steps
+                << " verifiers=" << after_transaction.mtp_verifier_runs;
+            const bool speculative_transaction =
+                transaction_activity ==
+                MTPParityTransactionActivity::Speculative;
+            int executed_depth = 0;
+            int executed_transaction_count = 0;
+            int attempted_draft_tokens = 0;
+            int last_transaction_depth = 0;
+            int last_transaction_emitted_tokens = 0;
+            if (speculative_transaction)
+            {
+                const uint64_t executed_transaction_count_u64 =
+                    mtpParityExecutedTransactionCount(
+                        before_counters,
+                        after_counters);
+                const uint64_t attempted_draft_tokens_u64 =
+                    mtpParityAttemptedDraftTokenCount(
+                        before_counters,
+                        after_counters);
+                ASSERT_LE(
+                    executed_transaction_count_u64,
+                    static_cast<uint64_t>(
+                        std::numeric_limits<int>::max()));
+                ASSERT_LE(
+                    attempted_draft_tokens_u64,
+                    static_cast<uint64_t>(
+                        std::numeric_limits<int>::max()));
+                executed_transaction_count =
+                    static_cast<int>(executed_transaction_count_u64);
+                attempted_draft_tokens =
+                    static_cast<int>(attempted_draft_tokens_u64);
+                ASSERT_GE(executed_transaction_count, 1);
+                ASSERT_GE(
+                    attempted_draft_tokens,
+                    executed_transaction_count)
+                    << "Every speculative transaction must attempt at least "
+                       "one draft";
+                ASSERT_LE(
+                    attempted_draft_tokens,
+                    executed_transaction_count * mtp_draft_tokens)
+                    << "Production attempted more aggregate MTP work than the "
+                       "configured depth permits";
+
+                last_transaction_depth =
+                    after_transaction.mtp_last_transaction_draft_depth;
+                ASSERT_GE(last_transaction_depth, 1)
+                    << "Production omitted final-transaction depth evidence";
+                ASSERT_LE(last_transaction_depth, mtp_draft_tokens);
+                ASSERT_LE(last_transaction_depth, attempted_draft_tokens);
+                if (host_owned_mtp_sidecar)
+                {
+                    ASSERT_EQ(executed_transaction_count, 1)
+                        << "Host snapshot capture expects one visible MTP "
+                           "transaction per decodeStep";
+                    ASSERT_LE(last_transaction_depth, selected_depth)
+                        << "Host transaction drafted beyond the selected depth";
+                    executed_depth = last_transaction_depth;
+                }
+                else
+                {
+                    last_transaction_emitted_tokens =
+                        after_transaction.mtp_last_transaction_emitted_token_count;
+                    ASSERT_GE(last_transaction_emitted_tokens, 1)
+                        << "Device terminal ledger omitted the final "
+                           "transaction response width";
+                    ASSERT_LE(
+                        last_transaction_emitted_tokens,
+                        static_cast<int>(mtp_step.tokens.size()));
+                    if (!dynamic_depth)
+                    {
+                        ASSERT_EQ(last_transaction_depth, selected_depth)
+                            << "Fixed-depth device controller changed depth "
+                               "inside a resident generation call";
+                    }
+                    /*
+                     * GPU snapshot callbacks are attached to the externally
+                     * admitted sidecar graph. The captured slot therefore
+                     * describes the first transaction in this decodeStep,
+                     * even when the resident controller subsequently retires
+                     * more transactions to exhaust its response budget. The
+                     * pre-step selector is the exact graph depth for that
+                     * checkpoint; terminal last-transaction fields remain an
+                     * independent aggregate-ledger audit.
+                     */
+                    executed_depth = selected_depth;
+                }
+                speculative_transaction_count +=
+                    executed_transaction_count;
+                active_contexts.push_back({
+                    .production_prefix = std::string(
+                        host_owned_mtp_sidecar
+                            ? kMTPDecodeSidecarSnapshotContextPrefix
+                            : transaction_first_decode_step == 0
+                                  ? kInitialProductionMTPDecodeSidecarSnapshotPrefix
+                                  : kResidentProductionMTPDecodeSidecarSnapshotPrefix),
+                    .reference_depth = 0,
+                });
+                if (executed_depth > 1)
+                {
+                    active_contexts.push_back({
+                        .production_prefix = std::string(
+                            host_owned_mtp_sidecar
+                                ? kHostChainedProductionMTPDecodeSidecarSnapshotPrefix
+                                : kChainedProductionMTPDecodeSidecarSnapshotPrefix),
+                        .reference_depth = executed_depth - 1,
+                    });
+                }
+                for (const auto &context : active_contexts)
+                {
+                    for (const std::string_view suffix :
+                         required_sidecar_stage_suffixes)
+                    {
+                        artifact_recorder.requireDecodeStageSuffix(
+                            "MTP" +
+                            std::to_string(context.reference_depth) +
+                            "_" + std::string(suffix));
+                    }
+                }
+            }
+            else
+            {
+                active_contexts.clear();
+            }
+            active_contexts_by_transaction.push_back(active_contexts);
+
             ASSERT_LE(mtp_tokens.size(), baseline_snapshots_by_output_count.size() - 1);
             auto mtp_snapshot = captureMoEDiagnosticSnapshot(*mtp, mtp_step.tokens, mtp_tokens);
             for (const auto &entry : mtp_snapshot.snapshots)
             {
-                if (isMTPSidecarSnapshotKey(entry.first))
+                if (isProductionMTPDecodeSidecarSnapshotKey(entry.first))
                 {
                     observed_mtp_sidecar_keys.insert(entry.first);
                 }
             }
-            write_trace(sync_idx, "mtp", mtp_snapshot);
+
+            /*
+             * Re-evaluate each selected sidecar router from the exact hidden
+             * rows that production published at FFN_NORM.  This independent
+             * real-weight oracle is deliberately written into the same CSV as
+             * the PyTorch and serial comparisons: when reference drift enters
+             * through the recurrent/main hidden state, the evidence now says
+             * whether the router itself remained correct for its live input.
+             */
+            for (const auto &context : active_contexts)
+            {
+                const std::string ffn_norm_key =
+                    context.production_prefix + "MTP0_FFN_NORM";
+                const std::string router_key =
+                    context.production_prefix + "MTP0_MOE_ROUTER_OUTPUT";
+                const auto ffn_norm_it =
+                    mtp_snapshot.snapshots.find(ffn_norm_key);
+                const auto router_it =
+                    mtp_snapshot.snapshots.find(router_key);
+                ASSERT_NE(ffn_norm_it, mtp_snapshot.snapshots.end())
+                    << "Active MTP sidecar omitted " << ffn_norm_key;
+                ASSERT_NE(router_it, mtp_snapshot.snapshots.end())
+                    << "Active MTP sidecar omitted " << router_key;
+
+                const auto counterfactual_router =
+                    evaluateMoERouterOnProductionInput(
+                        ffn_norm_it->second,
+                        mtp_router_gate_weights,
+                        mtp_router_d_model,
+                        mtp_router_num_experts);
+                auto counterfactual_row = compareMoESnapshotVectors(
+                    counterfactual_router,
+                    router_it->second.data(),
+                    router_it->second.size(),
+                    sync_idx,
+                    static_cast<int>(mtp_tokens.size()),
+                    router_key,
+                    "real_weight_router(" + ffn_norm_key + ")",
+                    "counterfactual_vs_mtp_router",
+                    "real_weight_counterfactual",
+                    "mtp");
+                all_snapshot_rows.push_back(counterfactual_row);
+                writeMoESnapshotCsvRow(snapshot_csv, counterfactual_row);
+            }
+            write_trace(
+                sync_idx,
+                "mtp",
+                mtp_snapshot,
+                executed_depth,
+                selected_depth,
+                speculative_transaction,
+                executed_transaction_count,
+                attempted_draft_tokens,
+                last_transaction_depth,
+                last_transaction_emitted_tokens);
 
             const auto &baseline_snapshot =
                 baseline_snapshots_by_output_count[mtp_tokens.size()];
@@ -11388,28 +13514,52 @@ namespace llaminar2::test::parity::qwen36
                 all_snapshot_rows.push_back(row);
                 writeMoESnapshotCsvRow(snapshot_csv, row);
 
-                /*
-                 * MTP0 predicts output token N from the terminal main hidden
-                 * preceding the latest emitted token and that latest token's
-                 * embedding.  Before the first transaction the prompt is the
-                 * predecessor, so both indices are zero; after N tokens have
-                 * been emitted the matching teacher-forced PyTorch sidecar
-                 * row is N-1.  Using N here compared a valid post-rollback
-                 * transaction with the following reference token and made the
-                 * embedding boundary appear catastrophically stale.
-                 */
-                const int pytorch_mtp_sidecar_step =
-                    transaction_first_decode_step == 0
-                        ? 0
-                        : transaction_first_decode_step - 1;
+                const ActiveMTPCheckpointContext *active_sidecar_context =
+                    nullptr;
+                if (isProductionMTPDecodeSidecarSnapshotKey(key))
+                {
+                    const auto key_context =
+                        mtpParityModelCheckpointContextPrefix(key);
+                    ASSERT_TRUE(key_context.has_value());
+                    for (const auto &context : active_contexts)
+                    {
+                        if (*key_context ==
+                            std::string_view(context.production_prefix))
+                        {
+                            ASSERT_EQ(active_sidecar_context, nullptr)
+                                << "MTP snapshot key matched multiple active "
+                                   "production contexts: "
+                                << key;
+                            active_sidecar_context = &context;
+                        }
+                    }
+
+                    /*
+                     * Snapshot capture intentionally publishes unqualified
+                     * aliases and retains inactive graph-cache contexts. They
+                     * are useful for graph diagnostics, but comparing them to
+                     * an arbitrary PyTorch depth would manufacture false
+                     * numerical failures. Only the context selected by the
+                     * live transaction is a parity checkpoint.
+                     */
+                    if (!active_sidecar_context)
+                    {
+                        continue;
+                    }
+                }
+
                 const int pytorch_decode_step =
-                    isProductionMTPDecodeSidecarSnapshotKey(key)
-                        ? pytorch_mtp_sidecar_step
+                    active_sidecar_context
+                        ? transaction_first_decode_step
                         : latest_completed_main_decode_step;
                 if (pytorch_decode_step < test_case.decode_steps)
                 {
                     const std::string pytorch_reference_key =
-                        pytorchReferenceKeyForMoEDiagnosticKey(key);
+                        pytorchReferenceKeyForMoEDiagnosticKey(
+                            key,
+                            active_sidecar_context
+                                ? active_sidecar_context->reference_depth
+                                : 0);
                     const std::string pytorch_key =
                         "decode_step" + std::to_string(pytorch_decode_step) + "_" +
                         pytorch_reference_key;
@@ -11454,11 +13604,80 @@ namespace llaminar2::test::parity::qwen36
                         "pytorch_vs_mtp",
                         "pytorch",
                         "mtp");
+
+                    constexpr std::string_view kRoutingIndicesSuffix =
+                        "MOE_ROUTING_INDICES";
+                    if (active_sidecar_context &&
+                        std::string_view(key).ends_with(
+                            kRoutingIndicesSuffix) &&
+                        !pytorch_data.empty() && mtp_data && mtp_size > 0)
+                    {
+                        std::string production_router_key = key;
+                        production_router_key.replace(
+                            production_router_key.size() -
+                                kRoutingIndicesSuffix.size(),
+                            kRoutingIndicesSuffix.size(),
+                            "MOE_ROUTER_OUTPUT");
+                        std::string pytorch_router_key = pytorch_key;
+                        pytorch_router_key.replace(
+                            pytorch_router_key.size() -
+                                kRoutingIndicesSuffix.size(),
+                            kRoutingIndicesSuffix.size(),
+                            "MOE_ROUTER_OUTPUT");
+                        const auto pytorch_router = loadMoEPyTorchSnapshot(
+                            pytorch_snapshot_dir,
+                            pytorch_router_key);
+                        size_t production_router_size = 0;
+                        const float *production_router = mtp->getSnapshot(
+                            production_router_key,
+                            production_router_size);
+                        recordMoERoutingBoundaryEquivalence(
+                            &mtp_pt_row,
+                            pytorch_data.data(),
+                            mtp_data,
+                            mtp_size,
+                            pytorch_router.data(),
+                            pytorch_router.size(),
+                            production_router,
+                            production_router_size);
+                    }
                     all_snapshot_rows.push_back(mtp_pt_row);
                     writeMoESnapshotCsvRow(snapshot_csv, mtp_pt_row);
 
-                    if (key ==
-                            productionMTPDecodeSidecarSnapshotKey("LM_HEAD") &&
+                    if (active_sidecar_context &&
+                        !pytorch_data.empty() && mtp_data && mtp_size > 0)
+                    {
+                        const auto [artifact_layer, artifact_stage] =
+                            qwen36CheckpointLayerAndStage(
+                                pytorch_reference_key);
+                        artifact_recorder.recordDecode(
+                            pytorch_decode_step,
+                            artifact_layer,
+                            artifact_stage,
+                            std::vector<float>(
+                                mtp_data,
+                                mtp_data + mtp_size),
+                            pytorch_data,
+                            qwen36CheckpointKind(artifact_stage));
+                        if (artifact_stage.ends_with("LM_HEAD") &&
+                            pytorch_data.size() == mtp_size)
+                        {
+                            artifact_recorder.recordDecodeToken(
+                                pytorch_decode_step,
+                                argmaxToken(
+                                    mtp_data,
+                                    static_cast<int>(mtp_size)),
+                                argmaxToken(
+                                    pytorch_data.data(),
+                                    static_cast<int>(pytorch_data.size())));
+                        }
+                    }
+
+                    if (active_sidecar_context &&
+                        pytorch_reference_key ==
+                            "MTP" + std::to_string(
+                                active_sidecar_context->reference_depth) +
+                                "_LM_HEAD" &&
                         pytorch_data.size() ==
                             static_cast<size_t>(mtp->vocabSize()) &&
                         mtp_data && mtp_size == pytorch_data.size())
@@ -11469,11 +13688,47 @@ namespace llaminar2::test::parity::qwen36
                         const int production_draft = argmaxToken(
                             mtp_data,
                             static_cast<int>(mtp_size));
-                        EXPECT_EQ(production_draft, pytorch_draft)
-                            << "Production MTP sidecar selected a different "
-                               "greedy draft token from the PyTorch MTP head at "
-                               "decode step "
+                        const float reference_top1_in_production_top3 =
+                            pytorchTop1InLlaminarTopK(
+                                mtp_data,
+                                pytorch_data.data(),
+                                mtp_size,
+                                mtp_size,
+                                3);
+                        const float production_top1_in_reference_top3 =
+                            pytorchTop1InLlaminarTopK(
+                                pytorch_data.data(),
+                                mtp_data,
+                                mtp_size,
+                                mtp_size,
+                                3);
+                        EXPECT_GE(reference_top1_in_production_top3, 1.0f)
+                            << "PyTorch MTP-head top-1 is outside the production "
+                               "top-3 at decode step "
                             << pytorch_decode_step
+                            << " recursive depth "
+                            << active_sidecar_context->reference_depth
+                            << "\nproduction draft=" << production_draft
+                            << " PyTorch draft=" << pytorch_draft
+                            << "\nproduction top-5: "
+                            << topKSummary(
+                                   mtp_data,
+                                   static_cast<int>(mtp_size))
+                            << "\nPyTorch top-5: "
+                            << topKSummary(
+                                   pytorch_data.data(),
+                                   static_cast<int>(pytorch_data.size()))
+                            << "\ndiagnostic CSVs:\n"
+                            << token_csv_path << '\n'
+                            << snapshot_csv_path;
+                        EXPECT_GE(production_top1_in_reference_top3, 1.0f)
+                            << "Production MTP-head top-1 is outside the PyTorch "
+                               "top-3 at decode step "
+                            << pytorch_decode_step
+                            << " recursive depth "
+                            << active_sidecar_context->reference_depth
+                            << "\nproduction draft=" << production_draft
+                            << " PyTorch draft=" << pytorch_draft
                             << "\nproduction top-5: "
                             << topKSummary(
                                    mtp_data,
@@ -11493,8 +13748,41 @@ namespace llaminar2::test::parity::qwen36
         }
 
         const auto mtp_state = mtp->prefixStateProbe();
+        const bool graph_execution = mtp->executorStats() != nullptr;
+        const std::string production_device =
+            mtp->primaryDeviceId().toString();
+        const auto production_records = PerfStatsCollector::snapshot(
+            {"forward_graph",
+             "mtp",
+             "prefix_cache",
+             "weight_loading",
+             "moe_rebalance",
+             "kernel"});
         mtp->disableSnapshotCapture();
         mtp->shutdown();
+
+        if (campaign_model_context_enabled)
+        {
+            EXPECT_EQ(
+                mtp_model_context_cache_hits,
+                mtp_model_context_reused ? 1.0 : 0.0)
+                << "MTP campaign cache-hit telemetry disagrees with runner construction";
+            EXPECT_EQ(
+                mtp_model_context_cache_misses,
+                mtp_model_context_reused ? 0.0 : 1.0)
+                << "MTP campaign cache-miss telemetry disagrees with runner construction";
+            if (mtp_model_context_reused)
+            {
+                EXPECT_GT(mtp_prepared_store_reuses, 0.0)
+                    << "A campaign context hit did not contain prepared device weights "
+                       "before production runner initialization";
+            }
+            else
+            {
+                EXPECT_EQ(mtp_prepared_store_reuses, 0.0)
+                    << "The first campaign cell unexpectedly inherited prepared weights";
+            }
+        }
 
         ASSERT_EQ(baseline_tokens.size(), mtp_tokens.size())
             << "diagnostic CSVs:\n"
@@ -11512,46 +13800,87 @@ namespace llaminar2::test::parity::qwen36
             << " mtp current_position=" << mtp_state.current_position;
         EXPECT_FALSE(mtp_state.mtp_bypassed) << mtp_state.mtp_bypass_reason;
         EXPECT_GE(mtp_state.mtp_verifier_runs, 1u);
-        ASSERT_GE(sync_idx, 2)
-            << "The sidecar regression must cross the first-transaction to "
-               "resident-logical-state handoff";
-
-        const std::vector<std::string_view> required_sidecar_stage_suffixes = {
-            "EMBEDDING",
-            "NORM_HIDDEN",
-            "CONCAT",
-            "FC",
-            "ATTENTION_NORM",
-            "Q_PROJECTION",
-            "ATTENTION_CONTEXT",
-            "ATTENTION_OUTPUT",
-            "FFN_NORM",
-            "MOE_ROUTER_OUTPUT",
-            "MOE_ROUTING_INDICES",
-            "MOE_ROUTING_WEIGHTS",
-            "MOE_EXPERT_OUTPUT",
-            "MOE_SHARED_EXPERT_OUTPUT",
-            "MOE_SHARED_GATE_OUTPUT",
-            "MOE_COMBINED_OUTPUT",
-            "FFN_RESIDUAL",
-            "FINAL_NORM",
-            "LM_HEAD",
-        };
+        if (full_prefix_restore)
+        {
+            EXPECT_TRUE(mtp_state.prefix_cache_ready);
+            EXPECT_GE(mtp_state.prefix_cache_hits, 1u);
+            EXPECT_TRUE(mtp_state.prefix_request.hit);
+            EXPECT_FALSE(mtp_state.prefix_request.partial_hit);
+            EXPECT_EQ(
+                mtp_state.prefix_request.matched_tokens,
+                static_cast<int>(prompt_tokens.size()));
+            EXPECT_TRUE(mtp_state.prefix_request.terminal_logits_restored);
+            EXPECT_TRUE(mtp_state.prefix_request.terminal_hidden_restored);
+            EXPECT_TRUE(mtp_state.prefix_request.mtp_state_restored);
+            expectMoEPrefixCachePerfPath(
+                production_records,
+                test_case.name + " real-weight MTP checkpoint restored request");
+        }
+        expectMoERebalancePerfPath(
+            test_case,
+            production_records,
+            test_case.name + " real-weight MTP checkpoint request",
+            /*require_fresh_movement=*/!full_prefix_restore);
+        if (dynamic_depth)
+        {
+            EXPECT_TRUE(mtp_state.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(mtp_state.mtp_request.depth_policy_mode, "dynamic");
+            EXPECT_GE(mtp_state.mtp_depth_policy_windows, 1u)
+                << "Dynamic-depth checkpoint parity did not evaluate its "
+                   "device-owned controller";
+            EXPECT_EQ(
+                mtp_state.mtp_request.depth_policy_updates,
+                mtp_state.mtp_depth_policy_updates);
+            EXPECT_GE(mtp_state.mtp_depth_policy_updates, 1u)
+                << "Dynamic-depth checkpoint parity behaved like a fixed-depth "
+                   "request despite the known zero-acceptance window";
+            EXPECT_GE(mtp_state.mtp_depth_policy_demotions, 1u);
+            EXPECT_EQ(mtp_state.mtp_min_depth, mtp_depth_policy.min_depth);
+            EXPECT_EQ(mtp_state.mtp_max_depth, mtp_depth_policy.max_depth);
+            EXPECT_GE(mtp_state.mtp_current_depth, mtp_depth_policy.min_depth);
+            EXPECT_LE(mtp_state.mtp_current_depth, mtp_depth_policy.max_depth);
+            EXPECT_LT(mtp_state.mtp_current_depth, mtp_depth_policy.initial_depth);
+        }
+        else
+        {
+            EXPECT_FALSE(mtp_state.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(mtp_state.mtp_request.depth_policy_mode, "fixed");
+            EXPECT_EQ(mtp_state.mtp_current_depth, mtp_draft_tokens);
+            EXPECT_EQ(mtp_state.mtp_max_depth, mtp_draft_tokens);
+            EXPECT_EQ(mtp_state.mtp_depth_policy_updates, 0u);
+        }
+        ASSERT_GE(speculative_transaction_count, 1)
+            << "The sidecar regression executed no speculative transaction";
+        ASSERT_EQ(
+            active_contexts_by_transaction.size(),
+            static_cast<size_t>(sync_idx));
 
         auto find_active_mtp_sidecar_row =
-            [&](int transaction_index,
+            [&](std::string_view comparison,
+                int transaction_index,
+                const ActiveMTPCheckpointContext &context,
                 std::string_view stage_suffix) -> const MoESnapshotCompareRow *
         {
             const std::string stage_tail =
                 "_MTP0_" + std::string(stage_suffix);
+            const std::string reference_tail =
+                "_MTP" + std::to_string(context.reference_depth) + "_" +
+                std::string(stage_suffix);
             const MoESnapshotCompareRow *match = nullptr;
             for (const auto &row : all_snapshot_rows)
             {
-                if (row.comparison != "pytorch_vs_mtp" ||
+                const auto row_context =
+                    mtpParityModelCheckpointContextPrefix(row.key);
+                if (row.comparison != comparison ||
                     row.sync_idx != transaction_index ||
                     !row.present_in_mtp ||
-                    !isProductionMTPDecodeSidecarSnapshotKey(row.key) ||
-                    !std::string_view(row.key).ends_with(stage_tail))
+                    !row_context ||
+                    *row_context !=
+                        std::string_view(context.production_prefix) ||
+                    !std::string_view(row.key).ends_with(stage_tail) ||
+                    (comparison == "pytorch_vs_mtp" &&
+                     !std::string_view(row.reference_key).ends_with(
+                         reference_tail)))
                 {
                     continue;
                 }
@@ -11560,7 +13889,8 @@ namespace llaminar2::test::parity::qwen36
                     ADD_FAILURE()
                         << "Transaction " << transaction_index
                         << " exposed more than one active production sidecar "
-                           "for stage "
+                           "for context "
+                        << context.production_prefix << " and stage "
                         << stage_suffix << ": " << match->key
                         << " and " << row.key;
                     return match;
@@ -11571,12 +13901,12 @@ namespace llaminar2::test::parity::qwen36
         };
 
         /*
-         * Validate every observed transaction, not just transaction zero.  A
-         * rejected draft changes the next transaction from direct target-token
-         * input to the resident logical-state mailbox; checking only the first
-         * graph left precisely that ownership handoff unproved.  Context names
-         * remain opaque policy labels, but exactly one context must be live and
-         * it must expose the complete production stage surface.
+         * Validate every graph context selected by every observed transaction.
+         * The primary sidecar maps to recursive depth zero; the last chained
+         * replay maps to the controller-selected deepest recursive reference.
+         * A rejected draft changes the next transaction from direct target-
+         * token input to the resident logical-state mailbox, so multi-
+         * transaction cases prove that ownership handoff as well.
          */
         for (int transaction_index = 0;
              transaction_index < sync_idx;
@@ -11586,105 +13916,227 @@ namespace llaminar2::test::parity::qwen36
                 "MTP sidecar transaction " +
                 std::to_string(transaction_index));
 
-            std::string active_context;
-            for (const std::string_view suffix : required_sidecar_stage_suffixes)
+            for (const auto &context :
+                 active_contexts_by_transaction[static_cast<size_t>(
+                     transaction_index)])
             {
-                const MoESnapshotCompareRow *row =
-                    find_active_mtp_sidecar_row(transaction_index, suffix);
-                ASSERT_NE(row, nullptr)
-                    << "Missing active production MTP sidecar stage " << suffix
-                    << "\nobserved MTP keys: "
-                    << joinStringsMoEDiagnostic(std::vector<std::string>(
-                           observed_mtp_sidecar_keys.begin(),
-                           observed_mtp_sidecar_keys.end()))
+                SCOPED_TRACE(
+                    "MTP sidecar context " + context.production_prefix +
+                    " -> recursive depth " +
+                    std::to_string(context.reference_depth));
+
+                for (const std::string_view suffix :
+                     required_sidecar_stage_suffixes)
+                {
+                    const MoESnapshotCompareRow *row =
+                        find_active_mtp_sidecar_row(
+                            "pytorch_vs_mtp",
+                            transaction_index,
+                            context,
+                            suffix);
+                    ASSERT_NE(row, nullptr)
+                        << "Missing active production MTP sidecar stage "
+                        << suffix << " in context "
+                        << context.production_prefix
+                        << " mapped to recursive reference depth "
+                        << context.reference_depth
+                        << "\nobserved MTP keys: "
+                        << joinStringsMoEDiagnostic(std::vector<std::string>(
+                               observed_mtp_sidecar_keys.begin(),
+                               observed_mtp_sidecar_keys.end()))
+                        << "\ndiagnostic CSVs:\n"
+                        << token_csv_path << '\n'
+                        << snapshot_csv_path;
+                    EXPECT_TRUE(isComparableMoEDiagnosticRow(*row))
+                        << describeMoEDiagnosticRow(*row);
+                }
+
+                const MoESnapshotCompareRow *embedding_row =
+                    find_active_mtp_sidecar_row(
+                        "pytorch_vs_mtp",
+                        transaction_index,
+                        context,
+                        "EMBEDDING");
+                ASSERT_NE(embedding_row, nullptr);
+                EXPECT_GE(embedding_row->cosine, 0.99)
+                    << "MTP sidecar consumed the wrong condition token: "
+                    << describeMoEDiagnosticRow(*embedding_row);
+                EXPECT_LE(embedding_row->rel_l2, 0.05)
+                    << describeMoEDiagnosticRow(*embedding_row);
+
+                const MoESnapshotCompareRow *ffn_residual_row =
+                    find_active_mtp_sidecar_row(
+                        "pytorch_vs_mtp",
+                        transaction_index,
+                        context,
+                        "FFN_RESIDUAL");
+                ASSERT_NE(ffn_residual_row, nullptr);
+                EXPECT_GE(ffn_residual_row->cosine, 0.98)
+                    << "MTP sidecar block-output PyTorch reference mismatch: "
+                    << describeMoEDiagnosticRow(*ffn_residual_row);
+
+                /*
+                 * The complete post-softmax routing boundary is checked so a
+                 * stale fixture, changed top-k set, or materially different
+                 * weight cannot hide behind a matching final token.
+                 */
+                const MoESnapshotCompareRow *router_logits_row =
+                    find_active_mtp_sidecar_row(
+                        "pytorch_vs_mtp",
+                        transaction_index,
+                        context,
+                        "MOE_ROUTER_OUTPUT");
+                ASSERT_NE(router_logits_row, nullptr);
+                EXPECT_GE(router_logits_row->cosine, 0.99)
+                    << "MTP sidecar router-distribution direction mismatch: "
+                    << describeMoEDiagnosticRow(*router_logits_row);
+
+                /*
+                 * This checkpoint is already a normalized probability
+                 * distribution. Relative L2 is ill-conditioned near a sparse
+                 * softmax and previously failed CPU for a 0.0011 symmetric-KL
+                 * shift even though every selected expert and routed weight
+                 * remained correct. Gate the reference in probability space,
+                 * then prove the kernel separately on its exact live input.
+                 */
+                EXPECT_LE(router_logits_row->symmetric_kl, 0.002)
+                    << "MTP sidecar router-distribution probability mismatch: "
+                    << describeMoEDiagnosticRow(*router_logits_row);
+
+                const MoESnapshotCompareRow *counterfactual_router_row =
+                    find_active_mtp_sidecar_row(
+                        "counterfactual_vs_mtp_router",
+                        transaction_index,
+                        context,
+                        "MOE_ROUTER_OUTPUT");
+                ASSERT_NE(counterfactual_router_row, nullptr)
+                    << "Missing live-input real-weight router oracle for "
+                    << context.production_prefix;
+                EXPECT_GE(counterfactual_router_row->cosine, 0.999999)
+                    << "Production MTP router disagrees with an independent "
+                       "real-weight evaluation on its live FFN input: "
+                    << describeMoEDiagnosticRow(*counterfactual_router_row);
+                EXPECT_LE(counterfactual_router_row->rel_l2, 1.0e-5)
+                    << "Production MTP router projection/softmax is numerically "
+                       "incorrect for its live FFN input: "
+                    << describeMoEDiagnosticRow(*counterfactual_router_row);
+                EXPECT_LE(counterfactual_router_row->symmetric_kl, 1.0e-10)
+                    << "Production MTP router probability distribution is not "
+                       "equivalent to the independent real-weight oracle: "
+                    << describeMoEDiagnosticRow(*counterfactual_router_row);
+
+                const MoESnapshotCompareRow *routing_indices_row =
+                    find_active_mtp_sidecar_row(
+                        "pytorch_vs_mtp",
+                        transaction_index,
+                        context,
+                        "MOE_ROUTING_INDICES");
+                ASSERT_NE(routing_indices_row, nullptr);
+                EXPECT_DOUBLE_EQ(
+                    routing_indices_row->routing_top1_match,
+                    1.0)
+                    << "MTP sidecar selected a different top-1 expert: "
+                    << describeMoEDiagnosticRow(*routing_indices_row);
+                EXPECT_DOUBLE_EQ(
+                    routing_indices_row->routing_boundary_equivalent,
+                    1.0)
+                    << "MTP sidecar selected an expert set that cannot be "
+                       "explained by the measured router cutoff ambiguity: "
+                    << describeMoEDiagnosticRow(*routing_indices_row);
+
+                const MoESnapshotCompareRow *routing_weights_row =
+                    find_active_mtp_sidecar_row(
+                        "pytorch_vs_mtp",
+                        transaction_index,
+                        context,
+                        "MOE_ROUTING_WEIGHTS");
+                ASSERT_NE(routing_weights_row, nullptr);
+                EXPECT_GE(routing_weights_row->cosine, 0.99)
+                    << "MTP sidecar routing-weight direction mismatch: "
+                    << describeMoEDiagnosticRow(*routing_weights_row);
+                EXPECT_LE(routing_weights_row->rel_l2, 0.05)
+                    << "MTP sidecar routing-weight magnitude mismatch: "
+                    << describeMoEDiagnosticRow(*routing_weights_row);
+
+                const MoESnapshotCompareRow *lm_head_row =
+                    find_active_mtp_sidecar_row(
+                        "pytorch_vs_mtp",
+                        transaction_index,
+                        context,
+                        "LM_HEAD");
+                ASSERT_NE(lm_head_row, nullptr);
+                EXPECT_GE(lm_head_row->cosine, 0.98)
+                    << "MTP sidecar PyTorch reference mismatch: "
+                    << describeMoEDiagnosticRow(*lm_head_row)
                     << "\ndiagnostic CSVs:\n"
                     << token_csv_path << '\n'
                     << snapshot_csv_path;
-                EXPECT_TRUE(isComparableMoEDiagnosticRow(*row))
-                    << describeMoEDiagnosticRow(*row);
-
-                const size_t stage_marker = row->key.find("_MTP0_");
-                ASSERT_NE(stage_marker, std::string::npos)
-                    << row->key;
-                const std::string row_context =
-                    row->key.substr(0, stage_marker);
-                if (active_context.empty())
-                {
-                    active_context = row_context;
-                }
-                else
-                {
-                    EXPECT_EQ(row_context, active_context)
-                        << "One transaction mixed snapshots from distinct "
-                           "sidecar graph contexts";
-                }
             }
-
-            const MoESnapshotCompareRow *embedding_row =
-                find_active_mtp_sidecar_row(transaction_index, "EMBEDDING");
-            ASSERT_NE(embedding_row, nullptr);
-            EXPECT_GE(embedding_row->cosine, 0.99)
-                << "MTP sidecar consumed the wrong condition token: "
-                << describeMoEDiagnosticRow(*embedding_row);
-            EXPECT_LE(embedding_row->rel_l2, 0.05)
-                << describeMoEDiagnosticRow(*embedding_row);
-
-            const MoESnapshotCompareRow *ffn_residual_row =
-                find_active_mtp_sidecar_row(transaction_index, "FFN_RESIDUAL");
-            ASSERT_NE(ffn_residual_row, nullptr);
-            EXPECT_GE(ffn_residual_row->cosine, 0.98)
-                << "MTP sidecar block-output PyTorch reference mismatch: "
-                << describeMoEDiagnosticRow(*ffn_residual_row);
-
-            /*
-             * Schema 2 snapshots the true pre-softmax router projection.  The
-             * complete routing boundary is checked so a semantically stale
-             * fixture, changed top-k set, or materially different weight cannot
-             * hide behind a matching final token.
-             */
-            const MoESnapshotCompareRow *router_logits_row =
-                find_active_mtp_sidecar_row(
-                    transaction_index,
-                    "MOE_ROUTER_OUTPUT");
-            ASSERT_NE(router_logits_row, nullptr);
-            EXPECT_GE(router_logits_row->cosine, 0.99)
-                << "MTP sidecar raw router-logit direction mismatch: "
-                << describeMoEDiagnosticRow(*router_logits_row);
-            EXPECT_LE(router_logits_row->rel_l2, 0.05)
-                << "MTP sidecar raw router-logit magnitude mismatch: "
-                << describeMoEDiagnosticRow(*router_logits_row);
-
-            const MoESnapshotCompareRow *routing_indices_row =
-                find_active_mtp_sidecar_row(
-                    transaction_index,
-                    "MOE_ROUTING_INDICES");
-            ASSERT_NE(routing_indices_row, nullptr);
-            EXPECT_TRUE(routing_indices_row->byte_identical)
-                << "MTP sidecar selected a different top-k expert set/order: "
-                << describeMoEDiagnosticRow(*routing_indices_row);
-
-            const MoESnapshotCompareRow *routing_weights_row =
-                find_active_mtp_sidecar_row(
-                    transaction_index,
-                    "MOE_ROUTING_WEIGHTS");
-            ASSERT_NE(routing_weights_row, nullptr);
-            EXPECT_GE(routing_weights_row->cosine, 0.99)
-                << "MTP sidecar routing-weight direction mismatch: "
-                << describeMoEDiagnosticRow(*routing_weights_row);
-            EXPECT_LE(routing_weights_row->rel_l2, 0.05)
-                << "MTP sidecar routing-weight magnitude mismatch: "
-                << describeMoEDiagnosticRow(*routing_weights_row);
-
-            const MoESnapshotCompareRow *lm_head_row =
-                find_active_mtp_sidecar_row(transaction_index, "LM_HEAD");
-            ASSERT_NE(lm_head_row, nullptr);
-            EXPECT_GE(lm_head_row->cosine, 0.98)
-                << "MTP sidecar PyTorch reference mismatch: "
-                << describeMoEDiagnosticRow(*lm_head_row)
-                << "\ndiagnostic CSVs:\n"
-                << token_csv_path << '\n'
-                << snapshot_csv_path;
         }
+
+        artifact_recorder.finalize();
+
+        const bool all_cuda = !test_case.devices.empty() && std::all_of(
+            test_case.devices.begin(),
+            test_case.devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isCUDA();
+            });
+        const bool all_rocm = !test_case.devices.empty() && std::all_of(
+            test_case.devices.begin(),
+            test_case.devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.isROCm();
+            });
+        const bool homogeneous_gpu = all_cuda || all_rocm;
+        const ProductionParityEvidence production_evidence =
+            collectProductionParityEvidence(
+                production_records,
+                graph_execution,
+                homogeneous_gpu,
+                mtp_model_context_reused,
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - campaign_started_at)
+                    .count());
+
+        EXPECT_TRUE(production_evidence.graph_execution)
+            << "MTP parity did not execute through the production graph runner";
+        if (homogeneous_gpu)
+        {
+            ASSERT_TRUE(PerfStatsCollector::isEnabled());
+            EXPECT_TRUE(production_evidence.device_generation_controller)
+                << "MTP checkpoint parity published no device-generation controller evidence";
+            EXPECT_TRUE(production_evidence.generation_loop_certified)
+                << "MTP checkpoint parity used outer-loop policy '"
+                << productionDeviceGenerationPolicyName(
+                       production_evidence.generation_execution_policy)
+                << "' without satisfying its backend-specific authority and dispatch proof: "
+                << production_evidence.generation_certification_detail;
+            EXPECT_TRUE(
+                productionParityHasRequiredGenerationGraph(
+                    production_evidence))
+                << "MTP checkpoint parity did not certify the captured graph body required by its generation policy";
+            expectMoEHomogeneousGPUFullGraphReplay(
+                test_case,
+                production_records,
+                "real-weight MTP checkpoint campaign");
+            EXPECT_TRUE(
+                production_evidence.decode_graph_capture ||
+                production_evidence.decode_graph_replay)
+                << "MTP parity produced no native decode capture/replay evidence.\n"
+                << PerfStatsCollector::summaryString({"forward_graph"});
+        }
+        EXPECT_TRUE(ParityCSVArtifactWriter::writeProductionPath(
+            ParityCSVArtifactWriter::resultsDir(),
+            artifact_backend,
+            production_device,
+            production_evidence))
+            << "Failed to write production_path.csv";
+        // Timing remains part of production_path.csv, but the aggregate driver
+        // owns the one-hour whole-matrix decision. Finish every MTP cell so a
+        // performance miss cannot truncate mathematical or CSV evidence.
     }
 
     inline void runMoEMTPBenchmarkStyleSkipGatherParity(
@@ -11785,7 +14237,7 @@ namespace llaminar2::test::parity::qwen36
                             step.tokens.end());
                     }
                     produced += static_cast<int>(step.tokens.size());
-                    if (!applyHostMoERebalanceIfNeeded(*runner))
+                    if (!applyMoEOverlayMaintenanceIfNeeded(*runner))
                     {
                         ADD_FAILURE() << runner->lastError();
                         return false;
@@ -11870,7 +14322,7 @@ namespace llaminar2::test::parity::qwen36
                     {
                         out_tokens->push_back(step.tokens.front());
                     }
-                    if (!applyHostMoERebalanceIfNeeded(*runner))
+                    if (!applyMoEOverlayMaintenanceIfNeeded(*runner))
                     {
                         ADD_FAILURE() << runner->lastError();
                         return false;
@@ -12409,7 +14861,7 @@ namespace llaminar2::test::parity::qwen36
                         step.tokens.end());
                 }
                 produced += static_cast<int>(step.tokens.size());
-                if (!applyHostMoERebalanceIfNeeded(*runner))
+                if (!applyMoEOverlayMaintenanceIfNeeded(*runner))
                 {
                     ADD_FAILURE() << runner->lastError();
                     return false;
@@ -12755,7 +15207,7 @@ namespace llaminar2::test::parity::qwen36
                     {
                         out_tokens->push_back(token);
                     }
-                    if (!applyHostMoERebalanceIfNeeded(*runner))
+                    if (!applyMoEOverlayMaintenanceIfNeeded(*runner))
                     {
                         ADD_FAILURE() << runner->lastError();
                         return false;
@@ -12865,7 +15317,8 @@ namespace llaminar2::test::parity::qwen36
             ASSERT_EQ(step.tokens.size(), 1u)
                 << "budget-limited MTP decode should emit exactly one token per step";
             tokens.push_back(step.tokens.front());
-            ASSERT_TRUE(applyHostMoERebalanceIfNeeded(*runner)) << runner->lastError();
+            ASSERT_TRUE(applyMoEOverlayMaintenanceIfNeeded(*runner))
+                << runner->lastError();
             if (step.is_complete)
                 break;
         }

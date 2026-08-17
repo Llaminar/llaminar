@@ -24,6 +24,7 @@
 #include "../execution/config/RuntimeConfig.h"
 #include "../execution/mtp/MTPRequestTerminalPublicationGraph.h"
 #include "../execution/mtp/MTPVerifierOutcomeGraph.h"
+#include "../execution/moe/MoEOverlayAuthorityExecution.h"
 #include "../backends/DeviceId.h"
 #include "../memory/BufferId.h"
 #include "../config/TensorParallelConfig.h"
@@ -33,10 +34,12 @@
 #include "../utils/ToolCallTypes.h"
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <functional>
 #include <exception>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -56,11 +59,28 @@ namespace llaminar2
     class TurboQuantContext;
     class ActivationRotation;
     class DecodeExpertHistogram;
+    class MoEOverlayResidencyAuthority;
+    class MoEOverlayParticipantResidencyRegistry;
     struct MoERoutedExpertPlacementPlan;
     struct MoEExpertOverlayExecutionPlan;
     class MoEExpertOverlayRuntimePlan;
+    class MoEOverlayNodeLocalRouteExchange;
     struct PipelineConfig;
-    enum class MoERebalanceMode;
+
+    /**
+     * @enum MoEDurableResidencyAuthorityKind
+     * @brief Sole authority permitted to publish durable routed-expert placement.
+     *
+     * ExpertOverlay owns every multi-participant routed-expert placement,
+     * including a one-domain, one-tier topology. Current-batch LLEP is
+     * intentionally absent: it is a request-local child transaction pinned to
+     * one ExpertOverlay epoch and never owns durable state.
+     */
+    enum class MoEDurableResidencyAuthorityKind : uint8_t
+    {
+        None = 0,         ///< No durable placement writer is installed.
+        ExpertOverlayRCU, ///< One arbitrary-tier RCU authority owns placement.
+    };
 
     // =========================================================================
     // Configuration
@@ -175,18 +195,75 @@ namespace llaminar2
         MTPRuntimeConfig mtp;
 
         /**
-         * @brief Whether GPU startup must publish the complete forward graph family.
+         * @brief Resolve the participant-local MTP terminal-logits ownership.
+         * @return Typed full-vocabulary or vocabulary-shard layout.
+         *
+         * This is the sole model-graph authority for interpreting
+         * `mtp.terminal_head_policy` together with
+         * `lm_head_column_parallel`. Runtime code must query this method rather
+         * than rebuilding the two-axis decision ad hoc.
+         */
+        [[nodiscard]] MTPTerminalLogitsLayout mtpTerminalLogitsLayout() const noexcept
+        {
+            return resolveMTPTerminalLogitsLayout(
+                lm_head_column_parallel,
+                mtp.terminal_head_policy);
+        }
+
+        /**
+         * @brief Return whether each participant owns complete MTP logits.
+         * @return True when no terminal vocabulary collective is required.
+         */
+        [[nodiscard]] bool mtpParticipantOwnsFullVocabulary() const noexcept
+        {
+            return mtpTerminalLogitsLayout() ==
+                   MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+        }
+
+        /**
+         * @brief Return whether MTP replaces a sharded primary head with a mirror.
+         * @return True when this participant must bind the replicated terminal
+         *         norm and full-vocabulary LM-head weight set.
+         *
+         * Single-device graphs also own full-vocabulary logits, but they use
+         * the primary model weights and therefore return false here. This
+         * distinction keeps weight planning separate from output ownership.
+         */
+        [[nodiscard]] bool mtpUsesMirroredTerminalHeadBinding() const noexcept
+        {
+            return lm_head_column_parallel &&
+                   mtpTerminalHeadIsMirrored(mtp.terminal_head_policy);
+        }
+
+        /**
+         * @brief Return whether each participant writes a vocabulary shard.
+         * @return True only for an explicitly vocabulary-sharded MTP head on a
+         *         column-parallel primary LM-head topology.
+         */
+        [[nodiscard]] bool mtpParticipantLogitsAreVocabularySharded() const noexcept
+        {
+            return mtpTerminalLogitsLayout() ==
+                   MTPTerminalLogitsLayout::VocabularyShardPerParticipant;
+        }
+
+        /**
+         * @brief Whether startup must publish the complete forward graph family.
          *
          * A GPU workspace address becomes part of the executable ABI once a
-         * graph captures it. Any configuration that can select more than one
-         * forward topology must therefore materialize every topology before the
-         * first request is allowed to capture a graph. MTP contributes grouped
-         * verifier and sidecar graphs. The two phase-split dense policies
-         * contribute a prefill topology backed by sharded weights and a compact
-         * decode topology backed by mirrored or fully replicated weights.
-         * Dynamic MoE residency adds an asynchronous maintenance graph plus
-         * decode-only ready-wave application buffers, so it independently
-         * requires the same complete family declaration.
+         * graph captures it, while an executable CPU stage likewise retains
+         * its bound workspace address. Any configuration that can select more
+         * than one forward topology must therefore materialize every topology
+         * before the first request executes. MTP contributes grouped verifier
+         * and sidecar graphs. The two phase-split dense policies contribute a
+         * prefill topology backed by sharded weights and a compact decode
+         * topology backed by mirrored or fully replicated weights. Dynamic MoE
+         * residency adds an asynchronous maintenance graph plus decode-only
+         * ready-wave application buffers, so it independently requires the
+         * same complete family declaration. A tiered ExpertOverlay also owns
+         * process-local immutable prepared banks whose initial epoch must be
+         * published before asynchronous maintenance starts; eagerly building
+         * its graph family is what resolves and validates those exact engine
+         * identities on every participant rank.
          *
          * Keeping this predicate on the declarative graph configuration prevents
          * factory call sites from accidentally treating MTP as the only source of
@@ -196,7 +273,7 @@ namespace llaminar2
          *
          * @return true when graph-family workspace planning must run eagerly.
          */
-        [[nodiscard]] bool requiresEagerGPUWorkspaceFamilyManifest() const noexcept;
+        [[nodiscard]] bool requiresEagerWorkspaceFamilyManifest() const noexcept;
 
         /// Runtime-only decode verifier mode: compute LM-head logits for every
         /// input row instead of the selected final row.
@@ -348,6 +425,29 @@ namespace llaminar2
 
         /// Maximum sequence length for buffer allocation (when use_graph_buffer_management=true)
         int max_seq_len = 4096;
+
+        /**
+         * @brief Maximum flattened token rows retained by one captured graph family.
+         *
+         * This is the post-admission graph envelope: it includes the maximum
+         * concurrently admitted batch and is therefore allowed to differ from
+         * @ref max_seq_len, which remains the full KV-context horizon.  A
+         * positive value is published by the production memory planner and
+         * must bound every graph-stable model scratch allocation.  Zero is
+         * reserved for direct graph-builder construction, where the builder
+         * derives a conservative envelope from its explicit build request.
+         */
+        int max_activation_rows = 0;
+
+        /**
+         * @brief Maximum logical requests represented by one retained graph transaction.
+         *
+         * This is independent of flattened activation rows: MTP contributes
+         * several physical verifier rows per request. Distributed retained graph
+         * identities must hash the logical request capacity exactly, so graph
+         * builders may not infer it by dividing an activation envelope.
+         */
+        int max_request_count = 1;
 
         /// Execution policy controlling which operations run
         ExecutionPolicy execution_policy = ExecutionPolicy::allEnabled();
@@ -592,8 +692,17 @@ namespace llaminar2
                 DenseParallelPolicy::TensorParallel,
                 RoutedExpertComputePolicy::Apportioned);
 
+            /// Model-independent ordering used for immutable whole-expert owners.
+            RoutedExpertOwnerOrder owner_order = RoutedExpertOwnerOrder::Ordinal;
+
+            /// Participant coordinates used to derive a per-layer owner mask.
+            int owner_participant_index = 0;
+            int owner_participant_count = 1;
+
             /// Static contiguous expert-id range owned by this TP participant.
-            /// count < 0 means the routed expert output is full/replicated.
+            /// This cached representation is valid only for Ordinal ordering;
+            /// count < 0 means callers must use the policy-derived mask or that
+            /// routed expert output is full/replicated.
             int local_expert_start = 0;
             int local_expert_count = -1;
 
@@ -610,9 +719,10 @@ namespace llaminar2
             /// Durable residency-maintenance controller configuration.
             MoERebalanceRuntimeConfig rebalance_config;
 
-            /// Optional histogram for decode expert tracking.
-            /// Set by the orchestrator when MoE rebalancing is enabled.
-            /// Lifetime managed by MoERebalanceController. Not owned.
+            /// Optional host-visible histogram for decode expert tracking.
+            /// Host-coordinated ExpertOverlay owns this object; a captured
+            /// accelerator authority deliberately leaves the pointer null and
+            /// publishes its routing evidence into device-resident banks.
             DecodeExpertHistogram *decode_histogram = nullptr;
 
             /// Layer index that should advance the decode histogram token window.
@@ -624,11 +734,13 @@ namespace llaminar2
             /// default for models that do not specify this explicitly.
             int decode_histogram_token_boundary_layer = -1;
 
-            /// Durable residency controller mode (OFF / OBSERVE / DYNAMIC).
-            /// Current-batch LLEP is independently selected by the routed
-            /// prefill assignment policy and never changes this controller.
-            /// Set by InferenceRunnerFactory from MoERebalanceController.
-            MoERebalanceMode rebalance_mode{}; // default-initialized to OFF (value 0)
+            /** Sole typed writer of durable routed-expert placement. */
+            MoEDurableResidencyAuthorityKind durable_residency_authority =
+                MoEDurableResidencyAuthorityKind::None;
+
+            /** Frozen physical execution backend of that sole authority. */
+            MoEOverlayAuthorityExecutionKind authority_execution =
+                MoEOverlayAuthorityExecutionKind::Unresolved;
 
             /// Optional same-layer routed-expert placement/overlay plan.
             std::shared_ptr<MoERoutedExpertPlacementPlan> routed_expert_plan = nullptr;
@@ -638,6 +750,32 @@ namespace llaminar2
 
             /// Optional rank-role execution plan used by overlay preparation and diagnostics.
             std::shared_ptr<const MoEExpertOverlayExecutionPlan> expert_overlay_execution_plan = nullptr;
+
+            /**
+             * Process-local device-owned sparse publication fabric for a
+             * multi-GPU continuation domain. Every participant graph retains
+             * this exact owner so mapped aliases and epochs outlive captures.
+             */
+            std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
+                node_local_route_exchange = nullptr;
+
+            /// Versioned, transactional authority for live overlay residency.
+            std::shared_ptr<MoEOverlayResidencyAuthority>
+                expert_overlay_residency_authority = nullptr;
+
+            /**
+             * @brief Return whether arbitrary-tier ExpertOverlay owns placement.
+             * @return True only for the shared RCU authority.
+             */
+            [[nodiscard]] bool usesExpertOverlayDurableResidencyAuthority() const noexcept
+            {
+                return durable_residency_authority ==
+                       MoEDurableResidencyAuthorityKind::ExpertOverlayRCU;
+            }
+
+            /** Process-local prepared-engine banks selected by packet epoch. */
+            std::shared_ptr<MoEOverlayParticipantResidencyRegistry>
+                expert_overlay_participant_residency = nullptr;
 
             /// Optional MPI context dedicated to overlay domain-worker commands.
             /// It is intentionally separate from the graph-builder MPI context so
@@ -987,17 +1125,21 @@ namespace llaminar2
         /**
          * @brief Native MTP-head output owned by this graph participant.
          *
-         * This is a local vocabulary shard for GlobalTP, and a full-vocabulary
-         * row for single-device or mirrored LocalTP execution.
+         * The resolved terminal-head layout determines this tensor exactly: it
+         * is a local vocabulary shard for explicit vocabulary-sharded GlobalTP
+         * and a complete row for single-device or mirrored execution at any TP
+         * scope.
          */
         TensorBase *logits = nullptr;
 
         /**
          * @brief Full-vocabulary GlobalTP sidecar rows produced by allgather.
          *
-         * CPU GlobalTP keeps the MTP head sharded for economical projection, then
-         * gathers only the one-to-four sampled sidecar rows required by stochastic
-         * verification. Other topologies leave this pointer unused.
+         * Explicit vocabulary-sharded GlobalTP gathers only its compact MTP
+         * sidecar rows for sampling. Mirrored terminal-head policy leaves this
+         * pointer null because every rank already owns the complete
+         * distribution; a schema placeholder must never be advertised as a
+         * produced tensor.
          */
         TensorBase *gathered_logits = nullptr;
         TensorBase *hidden = nullptr;
@@ -1294,18 +1436,34 @@ namespace llaminar2
         return bindings;
     }
 
-    inline ModelWeightBindings makeModelWeightBindings(const FrozenModelWeightSet &weight_set)
+    /**
+     * @brief Adapt frozen bindings to graph-facing weight accessors.
+     *
+     * @p preferred_device is required when a frozen authority contains
+     * heterogeneous overlay slices for the same routed-expert parent.  The
+     * returned layer accessor then resolves each binding only on that device;
+     * it never selects a CPU or peer-GPU slice by plan insertion order.
+     */
+    inline ModelWeightBindings makeModelWeightBindings(
+        const FrozenModelWeightSet &weight_set,
+        std::optional<DeviceId> preferred_device = std::nullopt)
     {
         ModelWeightBindings bindings;
         bindings.embedding_table = optionalGlobalBinding(weight_set, "token_embd.weight");
         bindings.final_norm = optionalGlobalBinding(weight_set, "output_norm.weight");
         bindings.lm_head = optionalGlobalBinding(weight_set, "output.weight");
         bindings.mtp = makeMTPWeightBindings(weight_set);
-        bindings.get_layer_weights = [&weight_set](int layer_idx)
+        bindings.get_layer_weights = [&weight_set, preferred_device](int layer_idx)
         {
             LayerWeightBindings layer;
-            auto get = [&weight_set, layer_idx](const std::string &suffix)
+            auto get = [&weight_set, layer_idx, preferred_device](
+                           const std::string &suffix)
             {
+                if (preferred_device)
+                {
+                    return weight_set.optionalLayerForDevice(
+                        layer_idx, suffix, *preferred_device);
+                }
                 return weight_set.optionalLayer(layer_idx, suffix);
             };
 

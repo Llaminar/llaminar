@@ -53,7 +53,7 @@ namespace llaminar2::test
         {
             RoutedExpertDomain d;
             d.name = name;
-            d.scope = ExecutionDomainScope::LOCAL;
+            d.scope = ExecutionDomainScope::RANK_LOCAL;
             d.backend = CollectiveBackendType::RCCL;
             d.participants = {GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(0, 1)};
             d.owner_rank = 0;

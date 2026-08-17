@@ -2,8 +2,10 @@
  * @file CPUNativeVNNITileConfig.h
  * @brief Cache-aware tile configuration for CPU NativeVNNI GEMV/GEMM.
  *
- * Uses detected L1/L2/L3 cache sizes (via CPUFeatures.h) to select optimal
- * tile sizes per shape category (Attention, FFN, LM_Head).
+ * Uses the exact prepared-weight footprint plus detected cache capacity and
+ * associativity to select tile sizes per shape category. Source GGUF payload
+ * bytes are intentionally not part of this API because they do not describe
+ * the bytes consumed by the execution kernel.
  *
  * ## Shape Categories
  *
@@ -18,14 +20,14 @@
  * For GEMV (M=1), the weight matrix is streamed once (no reuse). The key
  * parameters are:
  * - **N_chunk**: Fixed at 64 (AVX-512 ZMM width).
- * - **N_block**: Number of N_chunks processed per task block. Controls
- *   L2 residency for scales/comp data.
- * - **K_tile**: Number of K-blocks per tile. Controls L1 residency for
- *   activation quantized blocks. For M=1, full K usually fits.
+ * - **N_block**: Number of sequential N chunks assigned to one task.
+ * - **K_tile**: Number of K blocks in each decode partition. For M=1, full K
+ *   remains the ordinary path unless parallelism requires a fixed reduction.
  *
  * For GEMM (M>1), B-tile reuse across M rows matters:
- * - **n_block_size**: Chosen so B_tile fits in L2 (nblock × K × payload_bytes)
- * - **k_tile_blocks**: Chosen so one K-tile of B fits in 50% of L2
+ * - **n_block_size**: Number of adjacent 64-column chunks per N task.
+ * - **k_tile_blocks**: Largest B/A/output tile that fits an encoding- and
+ *   grouped-depth-specific fraction of associativity-safe private L2.
  * - **m_unroll**: 2 for M≥2 (process 2 rows to amortize B loads)
  */
 
@@ -35,6 +37,7 @@
 #include <cstdint>
 #include <stdexcept>
 
+#include "CPUNativeVNNIPreparedFootprint.h"
 #include "utils/CPUFeatures.h"
 #include "utils/DebugEnv.h"
 
@@ -66,35 +69,160 @@ namespace llaminar2::cpu::native_vnni
     };
 
     /**
+     * @brief Cache geometry consumed by the deterministic tile policy.
+     *
+     * Production constructs this value from CPUID-backed `CacheInfo`; tests may
+     * provide explicit values to prove boundary behavior independently of the
+     * machine running CTest.
+     */
+    struct NativeVNNICacheTopology
+    {
+        std::uint64_t private_l2_bytes = 0;
+        std::uint64_t shared_l3_bytes = 0;
+        std::uint32_t private_l2_ways = 0;
+        std::uint32_t shared_l3_ways = 0;
+
+        /** @brief Return whether every required cache dimension is valid. */
+        [[nodiscard]] constexpr bool isValid() const noexcept
+        {
+            return private_l2_bytes > 0 && shared_l3_bytes > 0 &&
+                   private_l2_ways > 0 && shared_l3_ways > 0;
+        }
+    };
+
+    /**
+     * @brief Exact rational fraction of private L2 assigned to a prefill tile.
+     *
+     * A rational value keeps policy deterministic across hosts and avoids
+     * floating-point rounding in graph/corpus tools. The remaining cache is
+     * intentionally available to adjacent activation rows, code, stack data,
+     * hardware prefetch, and concurrently scheduled workers.
+     */
+    struct NativeVNNIL2ResidencyFraction
+    {
+        std::uint32_t numerator = 0;
+        std::uint32_t denominator = 0;
+
+        /** @brief Compare deterministic policy values in tests and diagnostics. */
+        [[nodiscard]] friend constexpr bool operator==(
+            const NativeVNNIL2ResidencyFraction &,
+            const NativeVNNIL2ResidencyFraction &) noexcept = default;
+
+        /** @brief Return whether this is a non-zero fraction no greater than one. */
+        [[nodiscard]] constexpr bool isValid() const noexcept
+        {
+            return numerator > 0 && denominator > 0 &&
+                   numerator <= denominator;
+        }
+
+        /**
+         * @brief Apply the fraction without overflow or floating-point math.
+         *
+         * @param bytes Associativity-safe private-L2 bytes.
+         * @return Bytes assigned to one physical two-row tile.
+         */
+        [[nodiscard]] constexpr std::uint64_t apply(
+            std::uint64_t bytes) const noexcept
+        {
+            if (!isValid())
+                return 0;
+            return (bytes / denominator) * numerator +
+                   ((bytes % denominator) * numerator) / denominator;
+        }
+    };
+
+    /**
+     * @brief Select the counter-validated private-L2 residency regime.
+     *
+     * Isolated production-kernel measurements across symmetric/asymmetric
+     * nibble and expanded-INT8 formats showed that consuming nearly all of L2
+     * increases LLC misses without reducing executed instructions. Reserving
+     * three quarters of associativity-safe L2 keeps those decode-heavy streams
+     * from evicting their next activation/weight panels.
+     *
+     * Native Q6_K has a different work/reuse balance. M=2..4 is latency- and
+     * conflict-sensitive and wins with a short one-eighth-L2 stream. At M>=8,
+     * repeated native-payload reuse amortizes a larger three-quarter-L2 tile.
+     * The exact prepared byte footprint still distinguishes symmetric and
+     * asymmetric layouts inside each regime.
+     *
+     * @param footprint Physical prepared encoding and byte footprint.
+     * @param M Positive runtime row count.
+     * @return Deterministic fraction applied after associativity headroom.
+     */
+    [[nodiscard]] inline constexpr NativeVNNIL2ResidencyFraction
+    prefillL2ResidencyFraction(
+        const NativeVNNIPreparedFootprint &footprint,
+        int M) noexcept
+    {
+        if (footprint.encoding ==
+            CPUNativeVNNIEncoding::Q6KNativeDualScale)
+        {
+            return M < 8
+                       ? NativeVNNIL2ResidencyFraction{1, 8}
+                       : NativeVNNIL2ResidencyFraction{3, 4};
+        }
+        return NativeVNNIL2ResidencyFraction{1, 4};
+    }
+
+    /**
+     * @brief Reserve one cache way to avoid conflict-driven capacity thrashing.
+     *
+     * This is topology-derived headroom: an N-way cache contributes N-1 ways
+     * to the planned tile. A one-way or unknown-associativity topology keeps
+     * its full reported capacity because subtracting its only way would make a
+     * valid platform undispatchable.
+     */
+    [[nodiscard]] inline constexpr std::uint64_t associativitySafeBytes(
+        std::uint64_t capacity,
+        std::uint32_t ways) noexcept
+    {
+        return ways > 1 ? capacity - capacity / ways : capacity;
+    }
+
+    /**
      * @brief Compute tile configuration based on shape, cache sizes, and format.
      *
      * @param N           Output dimension (number of weight rows)
      * @param K           Input dimension (weight row length)
      * @param M           Batch size (1 = GEMV, >1 = GEMM)
-     * @param payload_bytes  Bytes per native block (e.g., 16 for Q4_0)
+     * @param footprint Exact prepared B/A/output bytes consumed by the kernel
      * @param num_threads Number of OpenMP threads
+     * @param cache Explicit cache topology for deterministic policy evaluation
      * @return Optimal tile configuration
      */
     inline NativeVNNITileConfig computeTileConfig(
-        int N, int K, int M, int payload_bytes, int num_threads)
+        int N,
+        int K,
+        int M,
+        const NativeVNNIPreparedFootprint &footprint,
+        int num_threads,
+        const NativeVNNICacheTopology &cache)
     {
-        if (N <= 0 || K <= 0 || M <= 0 || payload_bytes <= 0)
+        if (N <= 0 || K <= 0 || M <= 0 || !footprint.isValid())
         {
             throw std::invalid_argument(
-                "CPU NativeVNNI tile geometry requires positive N, K, M, "
-                "and payload byte dimensions");
+                "CPU NativeVNNI tile geometry requires positive N, K, M, and "
+                "prepared-footprint dimensions");
         }
         if (num_threads <= 0)
         {
             throw std::invalid_argument(
                 "CPU NativeVNNI tile geometry requires a positive thread count");
         }
+        if (!cache.isValid())
+        {
+            throw std::invalid_argument(
+                "CPU NativeVNNI tile geometry requires positive cache capacity "
+                "and associativity");
+        }
 
-        CacheInfo cache;
         NativeVNNITileConfig cfg{};
 
-        int N_chunks = (N + 63) / 64;
-        int blocks_per_row = (K + 31) / 32;
+        const int N_chunks = static_cast<int>(
+            (static_cast<std::int64_t>(N) + 63) / 64);
+        const int blocks_per_row = static_cast<int>(
+            (static_cast<std::int64_t>(K) + 31) / 32);
 
         // Classify shape
         if (N <= 2048)
@@ -113,25 +241,18 @@ namespace llaminar2::cpu::native_vnni
             cfg.k_tile_blocks = 0; // Full K (no K-tiling for M=1)
             cfg.k_tiles = 0;       // Default: N-parallel only
 
-            // Compute bytes per N-chunk per K-block iteration:
-            //   vnni_b: 2048 bytes (8 subs × 4 zmms × 64 bytes)
-            //   scales: 256 bytes (64 floats)
-            //   comp:   256 bytes (64 int32s)
-            //   = 2560 bytes per K-block per chunk
-            //
-            // For streaming, we want each thread's working set to stay in L2.
-            // L2 typically: 1MB (Cascade Lake), 1.25MB (Ice Lake), 2MB (Sapphire Rapids)
-            //
-            // Working set per chunk = blocks_per_row * 2560 bytes
-            // Max chunks fitting in 75% of L2:
-            long long l2_usable = (long long)cache.l2_size * 3 / 4;
-            long long bytes_per_chunk = (long long)blocks_per_row * 2560;
-            int max_chunks_l2 = (int)(l2_usable / std::max(bytes_per_chunk, 1LL));
-            max_chunks_l2 = std::max(max_chunks_l2, 1);
-
-            // Target parallelism: at least 4× threads for good load balance
-            int target_tasks = num_threads * 4;
-            int chunks_per_task = std::max(1, N_chunks / target_tasks);
+            // N-blocking is task granularity for streaming GEMV, not a claim
+            // that several complete chunks remain resident simultaneously.
+            // Keep at least four tasks per worker and use 64-bit arithmetic so
+            // every positive thread count and geometry remains total.
+            const std::int64_t target_tasks =
+                std::max<std::int64_t>(
+                    1, static_cast<std::int64_t>(num_threads) * 4);
+            const int chunks_per_task = static_cast<int>(
+                std::max<std::int64_t>(
+                    1,
+                    (static_cast<std::int64_t>(N_chunks) + target_tasks - 1) /
+                        target_tasks));
 
             // ---------------------------------------------------------------
             // Compute-bound detection: when the entire weight matrix fits
@@ -148,14 +269,26 @@ namespace llaminar2::cpu::native_vnni
             //  - 3B FFN_Down (2048×11008): kt=7  → 1.85× vs no k-parallel
             //  - 7B/14B/32B FFN (weights > L3): nbc=1 remains optimal
             // ---------------------------------------------------------------
-            long long weight_bytes = (long long)N_chunks * blocks_per_row * 2560;
-            bool compute_bound = weight_bytes < (long long)cache.l3_size * 3 / 4;
+            const std::uint64_t weight_bytes =
+                static_cast<std::uint64_t>(N_chunks) *
+                static_cast<std::uint64_t>(blocks_per_row) *
+                footprint.weight_bytes_per_n_chunk_k_block;
+            const std::uint64_t activation_bytes =
+                static_cast<std::uint64_t>(blocks_per_row) *
+                footprint.activation_bytes_per_row_k_block;
+            const std::uint64_t output_bytes =
+                static_cast<std::uint64_t>(N_chunks) *
+                footprint.output_bytes_per_row_n_chunk;
+            const std::uint64_t l3_usable = associativitySafeBytes(
+                cache.shared_l3_bytes, cache.shared_l3_ways);
+            const bool compute_bound =
+                weight_bytes + activation_bytes + output_bytes <= l3_usable;
 
             // Per-task FLOPs at nbc=1: each 64-row chunk does 2*64*K ops
             long long flops_per_chunk = 2LL * 64 * K;
 
             // For Attention (small N), use 1 chunk per task for maximum parallelism
-            // For FFN/LM_Head (large N), use larger blocks up to L2 limit
+            // For FFN/LM_Head (large N), amortize scheduling when needed.
             switch (cfg.category)
             {
             case ShapeCategory::ATTENTION:
@@ -165,13 +298,21 @@ namespace llaminar2::cpu::native_vnni
                 break;
 
             case ShapeCategory::FFN:
-                if (compute_bound && N_chunks > num_threads * 4 && flops_per_chunk < 500000)
+                if (compute_bound &&
+                    static_cast<std::int64_t>(N_chunks) >
+                        static_cast<std::int64_t>(num_threads) * 4 &&
+                    flops_per_chunk < 500000)
                 {
                     // Compute-bound with many fine-grained tasks: OMP overhead
                     // dominates. Increase nbc so total tasks ≈ 2× threads.
                     // Example: 3B FFN_Gate (172 chunks, K=2048, 262K FLOP/chunk)
-                    int target_tasks = num_threads * 2;
-                    cfg.n_block_chunks = std::max(1, N_chunks / target_tasks);
+                    const std::int64_t target_tasks =
+                        static_cast<std::int64_t>(num_threads) * 2;
+                    cfg.n_block_chunks = static_cast<int>(
+                        std::max<std::int64_t>(
+                            1,
+                            static_cast<std::int64_t>(N_chunks) /
+                                target_tasks));
                 }
                 else
                 {
@@ -184,13 +325,11 @@ namespace llaminar2::cpu::native_vnni
             case ShapeCategory::LM_HEAD:
                 // Large N (32000+): 500+ chunks total
                 // More chunks per task to amortize OpenMP overhead
-                cfg.n_block_chunks = std::min(chunks_per_task, max_chunks_l2);
-                cfg.n_block_chunks = std::max(cfg.n_block_chunks, 2);
+                cfg.n_block_chunks = std::max(chunks_per_task, 2);
                 break;
 
             default:
-                cfg.n_block_chunks = std::min(chunks_per_task, max_chunks_l2);
-                cfg.n_block_chunks = std::max(cfg.n_block_chunks, 1);
+                cfg.n_block_chunks = std::max(chunks_per_task, 1);
                 break;
             }
 
@@ -217,7 +356,10 @@ namespace llaminar2::cpu::native_vnni
             const int min_bpr = debugEnv().cpu_vnni.min_bpr_k_parallel > 0
                                     ? debugEnv().cpu_vnni.min_bpr_k_parallel
                                     : (compute_bound ? COMPUTE_BOUND_MIN_BPR : DEFAULT_MIN_BPR);
-            int total_n_tasks = (N_chunks + cfg.n_block_chunks - 1) / cfg.n_block_chunks;
+            const std::int64_t total_n_tasks =
+                (static_cast<std::int64_t>(N_chunks) +
+                 cfg.n_block_chunks - 1) /
+                cfg.n_block_chunks;
 
             // Compute-bound: aggressive k-parallel when N-tasks < 2× threads
             // Memory-bound:  conservative k-parallel when N-tasks < threads
@@ -230,18 +372,27 @@ namespace llaminar2::cpu::native_vnni
             constexpr long long MIN_FLOPS_FOR_K_PARALLEL = 16'000'000LL; // 16M
             long long total_flops = 2LL * N * K;
 
-            int k_parallel_threshold = compute_bound ? num_threads * 2 : num_threads;
-            int target_multiplier = compute_bound ? 8 : 1; // tasks/thread target
+            const std::int64_t k_parallel_threshold =
+                static_cast<std::int64_t>(num_threads) *
+                (compute_bound ? 2 : 1);
+            const std::int64_t target_multiplier =
+                compute_bound ? 8 : 1; // tasks/thread target
 
             if (total_n_tasks < k_parallel_threshold && blocks_per_row >= min_bpr
                 && total_flops >= MIN_FLOPS_FOR_K_PARALLEL)
             {
-                int desired_total = compute_bound
-                                        ? num_threads * target_multiplier
-                                        : num_threads;
-                int desired_k_tiles = std::max(1, (desired_total + total_n_tasks - 1) / total_n_tasks);
-                int max_k_tiles = std::max(1, blocks_per_row / MIN_K_BLOCKS_PER_TILE);
-                cfg.k_tiles = std::clamp(desired_k_tiles, 1, max_k_tiles);
+                const std::int64_t desired_total =
+                    static_cast<std::int64_t>(num_threads) *
+                    target_multiplier;
+                const std::int64_t desired_k_tiles =
+                    std::max<std::int64_t>(
+                        1,
+                        (desired_total + total_n_tasks - 1) /
+                            total_n_tasks);
+                const int max_k_tiles =
+                    std::max(1, blocks_per_row / MIN_K_BLOCKS_PER_TILE);
+                cfg.k_tiles = static_cast<int>(
+                    std::min<std::int64_t>(desired_k_tiles, max_k_tiles));
 
                 // Guard: each K-tile must process enough K-blocks
                 int k_blocks_per_tile = (blocks_per_row + cfg.k_tiles - 1) / cfg.k_tiles;
@@ -273,20 +424,45 @@ namespace llaminar2::cpu::native_vnni
         cfg.m_unroll = (M >= 2) ? 2 : 1;
         cfg.k_tiles = 0; // K-parallel only for GEMV
 
-        // B-tile must fit in L2 for reuse across M rows
-        // B-tile size = n_block_size × blocks_per_row × (2048 per chunk + 256 scales + 256 comp)
-        long long l2_for_b = (long long)cache.l2_size * 3 / 4;
-        long long bytes_per_chunk_full_k = (long long)blocks_per_row * 2560;
-        int max_chunks_for_b = (int)(l2_for_b / std::max(bytes_per_chunk_full_k, 1LL));
-        max_chunks_for_b = std::max(max_chunks_for_b, 1);
+        // The physical prefill microkernel owns two rows. Model the exact live
+        // B tile, both Q8_1 activation rows, and both FP32 output chunks. First
+        // reserve one associativity way, then apply the counter-validated
+        // encoding/depth residency regime. This prevents each OpenMP worker's
+        // streaming panel from consuming all private-L2 ways and repeatedly
+        // displacing the data needed by its next tile.
+        const std::uint64_t associativity_safe_l2 = associativitySafeBytes(
+            cache.private_l2_bytes, cache.private_l2_ways);
+        const NativeVNNIL2ResidencyFraction residency =
+            prefillL2ResidencyFraction(footprint, M);
+        const std::uint64_t l2_for_tile =
+            residency.apply(associativity_safe_l2);
+        constexpr std::uint64_t physical_row_tile = 2;
+        const std::uint64_t output_tile_bytes =
+            physical_row_tile * footprint.output_bytes_per_row_n_chunk;
+        const std::uint64_t bytes_per_k_block =
+            footprint.weight_bytes_per_n_chunk_k_block +
+            physical_row_tile * footprint.activation_bytes_per_row_k_block;
+        const std::uint64_t full_k_tile_bytes =
+            output_tile_bytes +
+            static_cast<std::uint64_t>(blocks_per_row) * bytes_per_k_block;
 
-        // Check if full K fits; if not, tile K
-        if (bytes_per_chunk_full_k > l2_for_b)
+        // Check whether one complete-K, one-N-chunk tile fits. If not, choose
+        // the largest exact K tile resident in the associativity-safe L2.
+        if (full_k_tile_bytes > l2_for_tile)
         {
-            // K-tile so that one chunk stays in L2
-            long long target_k_bytes = l2_for_b / 2; // Leave room for activations
-            cfg.k_tile_blocks = (int)(target_k_bytes / 2560);
-            cfg.k_tile_blocks = std::clamp(cfg.k_tile_blocks, 4, blocks_per_row);
+            const std::uint64_t bytes_available_for_k =
+                l2_for_tile > output_tile_bytes
+                    ? l2_for_tile - output_tile_bytes
+                    : bytes_per_k_block;
+            int resident_k_blocks = static_cast<int>(
+                std::min<std::uint64_t>(
+                    std::max<std::uint64_t>(
+                        1, bytes_available_for_k / bytes_per_k_block),
+                    static_cast<std::uint64_t>(blocks_per_row)));
+            // One 32-element K block is already the complete SIMD/decode unit.
+            // Cross-block multiples do not improve alignment and measured odd
+            // tile lengths can win, so preserve every block that really fits.
+            cfg.k_tile_blocks = std::max(1, resident_k_blocks);
             cfg.n_block_chunks = 1;
         }
         else
@@ -317,6 +493,38 @@ namespace llaminar2::cpu::native_vnni
             cfg.k_tiles = vnni.k_tiles;
 
         return cfg;
+    }
+
+    /**
+     * @brief Compute production tile geometry from detected cache topology.
+     *
+     * @param N Output dimension.
+     * @param K Input dimension.
+     * @param M Runtime row count.
+     * @param footprint Exact prepared execution footprint.
+     * @param num_threads Positive OpenMP team size.
+     * @return Deterministic tile configuration for the detected host.
+     */
+    inline NativeVNNITileConfig computeTileConfig(
+        int N,
+        int K,
+        int M,
+        const NativeVNNIPreparedFootprint &footprint,
+        int num_threads)
+    {
+        const CacheInfo detected;
+        return computeTileConfig(
+            N,
+            K,
+            M,
+            footprint,
+            num_threads,
+            NativeVNNICacheTopology{
+                .private_l2_bytes = detected.l2_size,
+                .shared_l3_bytes = detected.l3_size,
+                .private_l2_ways = detected.l2_ways,
+                .shared_l3_ways = detected.l3_ways,
+            });
     }
 
 } // namespace llaminar2::cpu::native_vnni

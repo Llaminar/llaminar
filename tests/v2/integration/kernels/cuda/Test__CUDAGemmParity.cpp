@@ -1393,7 +1393,8 @@ namespace
         config.strategy = WeightDistributionStrategy::REPLICATED;
         config.weight_precision = WeightPrecision::NATIVE;
         config.use_mmap = true;
-        config.target_is_gpu = true;
+        config.payload_access_pattern =
+            ModelPayloadAccessPattern::DeviceStaging;
         return ModelContext::create(model_path.string(), config);
     }
 
@@ -4826,6 +4827,176 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_alpha.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_beta.get());
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Reproduce Qwen3.5's mixed floating GDN bundle under CUDA capture.
+ *
+ * Qwen3.5 stores qkv/z as BF16 but keeps the small recurrent alpha/beta
+ * projections in FP32. CUDA uses one GEMM implementation class for all three
+ * floating formats, so class identity alone must never place these four
+ * matrices in one fused group. This test executes the production stage, then
+ * captures and replays it, proving that the BF16 and FP32 pairs remain separate
+ * graph-native groups and agree with the CPU mathematical reference.
+ */
+TEST_F(Test__CUDAGemmParity, GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysicalFormatSubgroups)
+{
+    constexpr int kM = 1;
+    constexpr int kK = 192;
+    constexpr int kNQKV = 160;
+    constexpr int kNZ = 96;
+    constexpr int kNAlpha = 12;
+    constexpr int kNBeta = 12;
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto input = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kM), static_cast<size_t>(kK)});
+    const auto input_data = randomFP32(static_cast<size_t>(kM) * kK);
+    std::memcpy(input->mutable_data(), input_data.data(), input_data.size() * sizeof(float));
+
+    auto weights_qkv = TestTensorFactory::createBF16Random(
+        {static_cast<size_t>(kNQKV), static_cast<size_t>(kK)}, -0.1f, 0.1f, 8231);
+    auto weights_z = TestTensorFactory::createBF16Random(
+        {static_cast<size_t>(kNZ), static_cast<size_t>(kK)}, -0.1f, 0.1f, 8232);
+    auto weights_alpha = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(kNAlpha), static_cast<size_t>(kK)}, -0.1f, 0.1f, 8233);
+    auto weights_beta = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(kNBeta), static_cast<size_t>(kK)}, -0.1f, 0.1f, 8234);
+
+    auto prepared_qkv = llaminar2::test::makeGpuPreparedFloatingPointGemm(
+        weights_qkv.get(), gpu_device_, "blk.46.attn_qkv.weight", ModelContextId{98231});
+    auto prepared_z = llaminar2::test::makeGpuPreparedFloatingPointGemm(
+        weights_z.get(), gpu_device_, "blk.46.attn_gate.weight", ModelContextId{98231});
+    auto prepared_alpha = llaminar2::test::makeGpuPreparedFloatingPointGemm(
+        weights_alpha.get(), gpu_device_, "blk.46.ssm_alpha.weight", ModelContextId{98231});
+    auto prepared_beta = llaminar2::test::makeGpuPreparedFloatingPointGemm(
+        weights_beta.get(), gpu_device_, "blk.46.ssm_beta.weight", ModelContextId{98231});
+
+    ASSERT_NE(prepared_qkv.kernel, nullptr);
+    ASSERT_NE(prepared_z.kernel, nullptr);
+    ASSERT_NE(prepared_alpha.kernel, nullptr);
+    ASSERT_NE(prepared_beta.kernel, nullptr);
+
+    auto output_qkv = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kM), static_cast<size_t>(kNQKV)});
+    auto output_z = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kM), static_cast<size_t>(kNZ)});
+    auto output_alpha = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kM), static_cast<size_t>(kNAlpha)});
+    auto output_beta = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kM), static_cast<size_t>(kNBeta)});
+
+    GDNProjectionStage::Params params;
+    params.device_id = gpu_device_;
+    params.input = input.get();
+    params.m = kM;
+    params.k = kK;
+    params.w_qkv = weights_qkv.get();
+    params.output_qkv = output_qkv.get();
+    params.n_qkv = kNQKV;
+    params.w_z = weights_z.get();
+    params.output_z = output_z.get();
+    params.n_z = kNZ;
+    params.w_a = weights_alpha.get();
+    params.output_a = output_alpha.get();
+    params.n_a = kNAlpha;
+    params.w_b = weights_beta.get();
+    params.output_b = output_beta.get();
+    params.n_b = kNBeta;
+    params.gemm_qkv = prepared_qkv.kernel;
+    params.gemm_z = prepared_z.kernel;
+    params.gemm_a = prepared_alpha.kernel;
+    params.gemm_b = prepared_beta.kernel;
+
+    GDNProjectionStage stage(params);
+    const WorkspaceRequirements requirements =
+        stage.getWorkspaceRequirements(kM, 0, kK);
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(
+        gpu_device_, workspaceBudgetFor(requirements));
+    ASSERT_TRUE(workspace_->allocate(requirements));
+    stage.bindWorkspace(workspace_.get());
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    stage.setGPUStream(static_cast<void *>(stream));
+    CUDADeviceContext context(gpu_device_, gpu_device_.ordinal);
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {input.get()},
+        {output_qkv.get(), output_z.get(), output_alpha.get(), output_beta.get()},
+        static_cast<void *>(stream),
+        [&] { return stage.execute(&context); }));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ASSERT_TRUE(stage.execute(&context));
+    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    TransferEngine::publishCurrentDeviceWrite(output_qkv, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_z, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_alpha, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_beta, stream);
+
+    std::vector<float> reference_qkv(static_cast<size_t>(kM) * kNQKV);
+    std::vector<float> reference_z(static_cast<size_t>(kM) * kNZ);
+    std::vector<float> reference_alpha(static_cast<size_t>(kM) * kNAlpha);
+    std::vector<float> reference_beta(static_cast<size_t>(kM) * kNBeta);
+    cpuGemmReference(input_data.data(), weights_qkv->data(), reference_qkv.data(), kM, kNQKV, kK);
+    cpuGemmReference(input_data.data(), weights_z->data(), reference_z.data(), kM, kNZ, kK);
+    cpuGemmReference(input_data.data(), weights_alpha->data(), reference_alpha.data(), kM, kNAlpha, kK);
+    cpuGemmReference(input_data.data(), weights_beta->data(), reference_beta.data(), kM, kNBeta, kK);
+
+    auto check_projection = [&](const char *name,
+                                const TensorBase *actual,
+                                const std::vector<float> &reference)
+    {
+        const auto parity = checkParity(
+            actual->data(), reference.data(), reference.size(), 0.99999, 0.001);
+        parity.print(name);
+        EXPECT_FALSE(parity.has_nan_inf);
+        EXPECT_GE(parity.cosine_similarity, 0.99999);
+        EXPECT_LE(parity.relative_l2_error, 0.001);
+    };
+    check_projection("captured mixed-float GDN qkv", output_qkv.get(), reference_qkv);
+    check_projection("captured mixed-float GDN z", output_z.get(), reference_z);
+    check_projection("captured mixed-float GDN alpha", output_alpha.get(), reference_alpha);
+    check_projection("captured mixed-float GDN beta", output_beta.get(), reference_beta);
+
+    const auto routes = PerfStatsCollector::snapshot({"kernel.gdn_projection_route"});
+    auto has_pair = [&](const char *names)
+    {
+        return std::any_of(
+            routes.begin(), routes.end(),
+            [&](const PerfStatRecord &record)
+            {
+                const auto route = record.tags.find("route");
+                const auto projection_names = record.tags.find("names");
+                return record.domain == "kernel" &&
+                       record.name == "gdn_projection_route" &&
+                       route != record.tags.end() &&
+                       route->second == "same_kernel_mixed_codebook_subgroup" &&
+                       projection_names != record.tags.end() &&
+                       projection_names->second == names;
+            });
+    };
+    EXPECT_TRUE(has_pair("qkv+z"));
+    EXPECT_TRUE(has_pair("alpha+beta"));
+
+    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    stage.unbindWorkspace();
+    workspace_.reset();
     PerfStatsCollector::reset();
 }
 

@@ -152,7 +152,7 @@ namespace llaminar2
             PerfStatsCollector::Tags tags{
                 {"stage", stage_name.empty() ? "unnamed" : stage_name},
                 {"backend", collectiveBackendTypeToString(backend)},
-                {"scope", "local"},
+                {"scope", "rank_local"},
                 {"degree", std::to_string(degree)},
                 {"dtype", collectiveDataTypeName(dtype)},
                 {"element_bytes", std::to_string(element_bytes)},
@@ -205,7 +205,7 @@ namespace llaminar2
             PerfStatsCollector::Tags tags{
                 {"stage", stage_name.empty() ? "unnamed" : stage_name},
                 {"backend", collectiveBackendTypeToString(backend)},
-                {"scope", "local"},
+                {"scope", "rank_local"},
                 {"degree", std::to_string(degree)},
                 {"device_index", std::to_string(device_index)},
                 {"dtype", collectiveDataTypeName(dtype)},
@@ -274,7 +274,7 @@ namespace llaminar2
                 {"stage", stage_name.empty() ? "unnamed" : stage_name},
                 {"operation", operation},
                 {"backend", collectiveBackendTypeToString(backend)},
-                {"scope", "local"},
+                {"scope", "rank_local"},
                 {"degree", std::to_string(degree)},
                 {"device_index", std::to_string(device_index)},
                 {"root_device_index", std::to_string(root_device_index)},
@@ -365,7 +365,7 @@ namespace llaminar2
                     {"anchor_stage", stage_name.empty() ? "unnamed" : stage_name},
                     {"anchor_collective", "allreduce"},
                     {"backend", collectiveBackendTypeToString(backend)},
-                    {"scope", "local"},
+                    {"scope", "rank_local"},
                     {"degree", std::to_string(degree)},
                     {"sideband", sideband.name.empty() ? "unnamed" : sideband.name},
                     {"kind", toString(sideband.kind)},
@@ -959,15 +959,21 @@ namespace llaminar2
             precision.empty() ? std::string(kDefaultAllreducePrecision) : precision;
         const bool grouped_explicit_streams =
             backend_ == CollectiveBackendType::NCCL ||
-            backend_ == CollectiveBackendType::RCCL;
+            backend_ == CollectiveBackendType::RCCL ||
+            backend_ == CollectiveBackendType::HETEROGENEOUS;
 
         if (grouped_explicit_streams)
         {
-            if (!backend_impl_ || !backend_impl_->supportsAllreduceMultiOnStreams())
+            const bool supported =
+                backend_impl_ &&
+                (backend_ == CollectiveBackendType::HETEROGENEOUS
+                     ? backend_impl_->supportsAllreduceMultiOnStreamsWithHostCompletionTicket()
+                     : backend_impl_->supportsAllreduceMultiOnStreams());
+            if (!supported)
             {
                 LOG_ERROR("LocalTPContext::allreduceOnStream: backend "
                           << collectiveBackendTypeToString(backend_)
-                          << " does not support grouped explicit-stream allreduce for stage="
+                          << " does not support the required grouped explicit-stream completion authority for stage="
                           << (stage_name.empty() ? "(none)" : stage_name));
                 requestAbort();
                 return false;
@@ -1006,7 +1012,7 @@ namespace llaminar2
 
                 // Step 1: Cast FP32 → FP16 on caller's stream
 #ifdef HAVE_CUDA
-                if (device_group_.allCUDA())
+                if (devices_[device_index].device_type == DeviceType::CUDA)
                 {
                     cast_ok = (cudaCastFP32ToFP16(
                                    static_cast<const float *>(buffer), fp16_buf,
@@ -1016,7 +1022,7 @@ namespace llaminar2
                 }
 #endif
 #ifdef HAVE_ROCM
-                if (device_group_.allROCm())
+                if (devices_[device_index].device_type == DeviceType::ROCm)
                 {
                     cast_ok = (rocmCastFP32ToFP16(
                                    static_cast<const float *>(buffer), fp16_buf,
@@ -1065,7 +1071,7 @@ namespace llaminar2
                         // Step 3: Cast FP16 → FP32 back into the original buffer
                         bool back_ok = false;
 #ifdef HAVE_CUDA
-                        if (device_group_.allCUDA())
+                        if (devices_[device_index].device_type == DeviceType::CUDA)
                         {
                             back_ok = (cudaCastFP16ToFP32(
                                            fp16_buf,
@@ -1076,7 +1082,7 @@ namespace llaminar2
                         }
 #endif
 #ifdef HAVE_ROCM
-                        if (device_group_.allROCm())
+                        if (devices_[device_index].device_type == DeviceType::ROCm)
                         {
                             back_ok = (rocmCastFP16ToFP32(
                                            fp16_buf,
@@ -1090,8 +1096,11 @@ namespace llaminar2
                                 device_group_, backend_, devices_[device_index].toLocalDeviceId(),
                                 stage_name, static_cast<size_t>(degree()), effective_count,
                                 CollectiveDataType::FLOAT16,
-                                grouped_explicit_streams ? "on_stream_grouped_fp16_scratch"
-                                                         : "on_stream_fp16_scratch",
+                                backend_ == CollectiveBackendType::HETEROGENEOUS
+                                    ? "on_stream_grouped_host_ticket_fp16_scratch"
+                                    : (grouped_explicit_streams
+                                           ? "on_stream_grouped_fp16_scratch"
+                                           : "on_stream_fp16_scratch"),
                                 effective_precision);
                             TransferEngine::publishDeviceWrite(
                                 tensor,
@@ -1131,11 +1140,27 @@ namespace llaminar2
             recordLocalTPRuntimeAllreduce(
                 device_group_, backend_, devices_[device_index].toLocalDeviceId(),
                 stage_name, static_cast<size_t>(degree()), effective_count,
-                dtype, "on_stream_grouped", effective_precision);
-            TransferEngine::publishDeviceWrite(
-                tensor,
-                devices_[device_index].toLocalDeviceId(),
-                stream);
+                dtype,
+                backend_ == CollectiveBackendType::HETEROGENEOUS
+                    ? "on_stream_grouped_host_ticket"
+                    : "on_stream_grouped",
+                effective_precision);
+            if (backend_ == CollectiveBackendType::HETEROGENEOUS)
+            {
+                // The authenticated ticket already observed every terminal H2D
+                // event. Recording a compute-stream event here would invent a
+                // producer that did not perform the write.
+                TransferEngine::publishCompletedDeviceWrite(
+                    tensor,
+                    devices_[device_index].toLocalDeviceId());
+            }
+            else
+            {
+                TransferEngine::publishDeviceWrite(
+                    tensor,
+                    devices_[device_index].toLocalDeviceId(),
+                    stream);
+            }
             return true;
         }
 
@@ -1989,21 +2014,30 @@ namespace llaminar2
             requestAbort();
             return false;
         }
-        if (!backend_initialized_ || !backend_impl_ ||
-            (backend_ != CollectiveBackendType::NCCL &&
-             backend_ != CollectiveBackendType::RCCL) ||
-            !backend_impl_->isMultiGpuSingleProcess() ||
-            !backend_impl_->supportsAllreduceSingleDeviceOnStream())
+        const bool homogeneous_device_collective =
+            backend_initialized_ && backend_impl_ &&
+            (backend_ == CollectiveBackendType::NCCL ||
+             backend_ == CollectiveBackendType::RCCL) &&
+            backend_impl_->isMultiGpuSingleProcess() &&
+            backend_impl_->supportsAllreduceSingleDeviceOnStream();
+        const bool heterogeneous_stream_tickets =
+            backend_initialized_ && backend_impl_ &&
+            backend_ == CollectiveBackendType::HETEROGENEOUS &&
+            backend_impl_->isMultiGpuSingleProcess() &&
+            backend_impl_->supportsGraphCaptureLifecycleTickets();
+        if (!homogeneous_device_collective && !heterogeneous_stream_tickets)
         {
-            LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream requires a homogeneous "
-                      << "NCCL/RCCL multi-GPU backend with explicit-stream allreduce support"
+            LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream requires either a "
+                      << "homogeneous explicit-stream collective fence or heterogeneous "
+                      << "persistent lifecycle tickets"
                       << " boundary=" << boundary_name
                       << " backend=" << collectiveBackendTypeToString(backend_));
             requestAbort();
             return false;
         }
-        if (graph_capture_boundary_device_words_.size() != devices_.size() ||
-            !graph_capture_boundary_device_words_[static_cast<size_t>(device_index)])
+        if (homogeneous_device_collective &&
+            (graph_capture_boundary_device_words_.size() != devices_.size() ||
+             !graph_capture_boundary_device_words_[static_cast<size_t>(device_index)]))
         {
             LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream: persistent device fence "
                       << "storage is unavailable for slot=" << device_index
@@ -2020,11 +2054,94 @@ namespace llaminar2
          * launches the newly instantiated graph.
          */
         if (!graphCaptureBoundaryRendezvous(
-                boundary_name + ":device_fence_ready",
+                boundary_name +
+                    (heterogeneous_stream_tickets
+                         ? ":ticket_generation_ready"
+                         : ":device_fence_ready"),
                 device_index,
                 timeout_ms))
         {
             return false;
+        }
+
+        if (heterogeneous_stream_tickets)
+        {
+            /*
+             * CUDA and ROCm events cannot be consumed directly by the other
+             * vendor's stream. Each participant therefore records its own
+             * persistent event, then the host-side generation observes only
+             * those exact events. The second rendezvous proves every event was
+             * recorded before observation; the third prevents a fast device
+             * from entering capture while a slower sibling is still draining.
+             */
+            if (!backend_impl_->recordGraphCaptureLifecycleTicket(
+                    device_index,
+                    stream))
+            {
+                LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream: heterogeneous "
+                          "ticket publication failed"
+                          << " slot=" << device_index
+                          << " boundary=" << boundary_name
+                          << " backend_error=" << backend_impl_->lastError());
+                requestAbort();
+                return false;
+            }
+
+            if (!graphCaptureBoundaryRendezvous(
+                    boundary_name + ":ticket_recorded",
+                    device_index,
+                    timeout_ms))
+            {
+                return false;
+            }
+
+            if (!backend_impl_->awaitGraphCaptureLifecycleTicket(
+                    device_index,
+                    timeout_ms))
+            {
+                LOG_ERROR("LocalTPContext::graphCaptureBoundaryOnStream: heterogeneous "
+                          "ticket observation failed"
+                          << " slot=" << device_index
+                          << " boundary=" << boundary_name
+                          << " backend_error=" << backend_impl_->lastError());
+                requestAbort();
+                return false;
+            }
+
+            if (!graphCaptureBoundaryRendezvous(
+                    boundary_name + ":ticket_observed",
+                    device_index,
+                    timeout_ms))
+            {
+                return false;
+            }
+
+            const char *const phase =
+                boundary_name.rfind("decode_graph:", 0) == 0
+                    ? "decode"
+                    : "prefill";
+            const DeviceId device =
+                devices_[static_cast<size_t>(device_index)].toLocalDeviceId();
+            const PerfStatsCollector::Tags tags{
+                {"boundary", boundary_name},
+                {"backend", collectiveBackendTypeToString(backend_)},
+                {"authority", "host_observed_stream_ticket"},
+                {"steady_state_replay", "false"}};
+            PerfStatsCollector::addCounter(
+                "graph_capture",
+                "localtp_device_boundary_fences",
+                1.0,
+                phase,
+                device.toString(),
+                tags);
+            PerfStatsCollector::addCounter(
+                "graph_capture",
+                "localtp_heterogeneous_ticket_boundary_fences",
+                1.0,
+                phase,
+                device.toString(),
+                tags);
+            return true;
         }
 
         void *const device_word =
@@ -2093,14 +2210,20 @@ namespace llaminar2
             return false;
         }
 
+        const char *const phase =
+            boundary_name.rfind("decode_graph:", 0) == 0
+                ? "decode"
+                : "prefill";
         PerfStatsCollector::addCounter(
             "graph_capture",
             "localtp_device_boundary_fences",
             1.0,
-            "prefill",
+            phase,
             devices_[static_cast<size_t>(device_index)].toLocalDeviceId().toString(),
             {{"boundary", boundary_name},
-             {"backend", collectiveBackendTypeToString(backend_)}});
+             {"backend", collectiveBackendTypeToString(backend_)},
+             {"authority", "native_device_collective"},
+             {"steady_state_replay", "false"}});
         return true;
     }
 
@@ -2441,7 +2564,7 @@ namespace llaminar2
                 {"anchor_stage", anchor_stage_name.empty() ? "unnamed" : anchor_stage_name},
                 {"anchor_collective", "allreduce"},
                 {"backend", collectiveBackendTypeToString(backend_)},
-                {"scope", "local"},
+                {"scope", "rank_local"},
                 {"degree", std::to_string(degree())},
                 {"sideband", sideband.name.empty() ? "unnamed" : sideband.name},
                 {"kind", toString(sideband.kind)},
@@ -3754,7 +3877,10 @@ namespace llaminar2
                 return false;
             }
         }
-        else if (!backend_impl_ || !backend_impl_->supportsAllreduceMultiOnStreams())
+        else if (!backend_impl_ ||
+                 (backend_ == CollectiveBackendType::HETEROGENEOUS
+                      ? !backend_impl_->supportsAllreduceMultiOnStreamsWithHostCompletionTicket()
+                      : !backend_impl_->supportsAllreduceMultiOnStreams()))
         {
             if (!grouped_onstream_allreduce_graph_capture_active_ ||
                 !backend_impl_ ||
@@ -3854,6 +3980,14 @@ namespace llaminar2
 
         if (grouped_onstream_allreduce_graph_capture_active_)
         {
+            if (backend_ == CollectiveBackendType::HETEROGENEOUS)
+            {
+                fail_generation(
+                    "heterogeneous allreduce reached an active native graph capture; "
+                    "the graph planner must expose it as an explicit segmented collective boundary");
+                return false;
+            }
+
             if (grouped_onstream_allreduce_sideband_count_ > 0)
             {
                 /*
@@ -3964,28 +4098,68 @@ namespace llaminar2
             return depart_generation(enqueue_ok);
         }
 
-        else if (!backend_impl_ || !backend_impl_->supportsAllreduceMultiOnStreams())
+        else if (!backend_impl_ ||
+                 (backend_ == CollectiveBackendType::HETEROGENEOUS
+                      ? !backend_impl_->supportsAllreduceMultiOnStreamsWithHostCompletionTicket()
+                      : !backend_impl_->supportsAllreduceMultiOnStreams()))
         {
-            fail_generation(std::string("backend does not support grouped explicit-stream allreduce backend=") +
+            fail_generation(std::string("backend does not support the required grouped explicit-stream completion authority backend=") +
                             collectiveBackendTypeToString(backend_));
             return false;
         }
 
-        const bool success =
-            grouped_onstream_allreduce_sideband_count_ > 0
-                ? backend_impl_->allreduceWithSidebandsMultiOnStreams(
-                      grouped_onstream_allreduce_buffers_,
-                      effective_count,
-                      dtype,
-                      CollectiveOp::ALLREDUCE_SUM,
-                      backend_sidebands,
-                      grouped_onstream_allreduce_streams_)
-                : backend_impl_->allreduceMultiOnStreams(
-                      grouped_onstream_allreduce_buffers_,
-                      effective_count,
-                      dtype,
-                      CollectiveOp::ALLREDUCE_SUM,
-                      grouped_onstream_allreduce_streams_);
+        bool success = false;
+        if (backend_ == CollectiveBackendType::HETEROGENEOUS)
+        {
+            if (grouped_onstream_allreduce_sideband_count_ > 0)
+            {
+                fail_generation(
+                    "heterogeneous grouped sidebands require their own typed host-ticket transport");
+                return false;
+            }
+
+            const auto ticket =
+                backend_impl_->allreduceMultiOnStreamsWithHostCompletionTicket(
+                    grouped_onstream_allreduce_buffers_,
+                    effective_count,
+                    dtype,
+                    CollectiveOp::ALLREDUCE_SUM,
+                    grouped_onstream_allreduce_streams_);
+            if (ticket.has_value())
+            {
+                // This is the explicit heterogeneous segment boundary. Release
+                // the LocalTP state mutex while the background worker progresses
+                // producer-event -> D2H -> fixed-order reduce -> H2D. Waiting
+                // threads remain parked on the generation predicate and cannot
+                // consume the output until readiness is published below.
+                const int timeout_ms =
+                    collective_timeout_policy::effectiveCollectTimeoutMs(
+                        debugEnv().tp_collect_timeout_ms);
+                lock.unlock();
+                success = backend_impl_->awaitHostCompletionTicket(
+                    *ticket,
+                    timeout_ms);
+                lock.lock();
+            }
+        }
+        else
+        {
+            success =
+                grouped_onstream_allreduce_sideband_count_ > 0
+                    ? backend_impl_->allreduceWithSidebandsMultiOnStreams(
+                          grouped_onstream_allreduce_buffers_,
+                          effective_count,
+                          dtype,
+                          CollectiveOp::ALLREDUCE_SUM,
+                          backend_sidebands,
+                          grouped_onstream_allreduce_streams_)
+                    : backend_impl_->allreduceMultiOnStreams(
+                          grouped_onstream_allreduce_buffers_,
+                          effective_count,
+                          dtype,
+                          CollectiveOp::ALLREDUCE_SUM,
+                          grouped_onstream_allreduce_streams_);
+        }
 
         grouped_onstream_allreduce_result_ = success;
         grouped_onstream_allreduce_ready_ = true;
@@ -4008,7 +4182,11 @@ namespace llaminar2
                       << " generation=" << my_generation
                       << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
                       << " count=" << effective_count
-                      << " dtype=" << static_cast<int>(dtype));
+                      << " dtype=" << static_cast<int>(dtype)
+                      << " completion="
+                      << (backend_ == CollectiveBackendType::HETEROGENEOUS
+                              ? "host_observed_ticket"
+                              : "device_stream"));
         }
 
         grouped_onstream_allreduce_cv_.notify_all();

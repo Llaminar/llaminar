@@ -24,6 +24,43 @@
 namespace llaminar2
 {
 
+    /**
+     * @brief Splice one mapped 64-bit wait into an active CUDA stream capture.
+     *
+     * CUDA conditional nodes must remain children of the top-level captured
+     * graph, so a complete ExpertOverlay transaction cannot be assembled later
+     * from child graphs. This helper inserts the native batch-memory wait at
+     * the stream's exact current dependency frontier and makes it the frontier
+     * for subsequently captured work.
+     *
+     * @param stream Exact non-default stream currently being captured.
+     * @param signal Aligned CUDA-visible mapping of the node-local signal word.
+     * @param value Positive capture-stable unsigned-GEQ threshold.
+     * @return True only when the node was appended to the active parent graph.
+     */
+    bool appendCUDAActiveCaptureTimelineWait64(
+        cudaStream_t stream,
+        void *signal,
+        std::uint64_t value) noexcept;
+
+    /**
+     * @brief Splice one system-release publication into an active CUDA capture.
+     *
+     * The publication kernel is ordered after the current stream frontier,
+     * performs a system fence, stores the mapped timeline value, and becomes
+     * the sole dependency of later captured work. This preserves packet-byte
+     * visibility across CUDA, ROCm, and CPU endpoints without a host callback.
+     *
+     * @param stream Exact non-default stream currently being captured.
+     * @param signal Aligned CUDA-visible mapping of the node-local signal word.
+     * @param value Positive capture-stable value to publish.
+     * @return True only when the node was appended to the active parent graph.
+     */
+    bool appendCUDAActiveCaptureTimelinePublish64(
+        cudaStream_t stream,
+        void *signal,
+        std::uint64_t value) noexcept;
+
 #if CUDART_VERSION >= 12030
     /**
      * @brief Body identity for one native CUDA conditional transaction.
@@ -290,6 +327,19 @@ namespace llaminar2
             return false;
 #endif
         }
+        [[nodiscard]] bool
+        supportsDeviceControlledTransaction() const noexcept override
+        {
+#if CUDART_VERSION >= 12030
+            return true;
+#else
+            return false;
+#endif
+        }
+        bool buildDeviceControlledTransaction(
+            std::span<const DeviceControlledLoopFragment> ordered_fragments) override;
+        bool buildOrderedTimelineTransaction(
+            std::span<const GPUOrderedTimelineStep> ordered_steps) override;
         using IGPUGraphCapture::buildDeviceControlledWhileLoop;
         bool buildDeviceControlledWhileLoop(
             std::span<const DeviceControlledLoopFragment> ordered_body_fragments,

@@ -19,6 +19,7 @@
 #include "../utils/Logger.h"
 #include "../utils/NodeDetection.h"
 #include <chrono>
+#include <cstring>
 #include <mpi.h>
 #include <thread>
 #include <utility>
@@ -28,6 +29,138 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        /** Fixed tag on the communicator reserved solely for rooted publication. */
+        constexpr int kRootedPublicationTag = 0;
+
+        /**
+         * @brief Actively progress one MPI collective with the standard fatal timeout.
+         *
+         * Same-node Open MPI commonly relies on the calling thread to progress
+         * segmented collectives. Sleeping here can add one scheduler quantum per
+         * segment, so the loop deliberately drives `MPI_Test` continuously. A
+         * timeout makes communicator ordering unknowable and therefore aborts the
+         * job instead of returning control to an inference path that could limp on.
+         *
+         * @param request Live nonblocking MPI request.
+         * @param operation Human-readable operation identity.
+         * @param domain_id Tensor-parallel domain identifier.
+         * @param domain_rank Rank within the domain.
+         * @param domain_size Number of participants.
+         * @param payload_elements Logical FP32 payload elements for diagnostics.
+         * @return true when MPI reports successful completion.
+         */
+        bool waitForGlobalTPCollective(
+            MPI_Request &request,
+            const std::string &operation,
+            int domain_id,
+            int domain_rank,
+            int domain_size,
+            size_t payload_elements)
+        {
+            const int timeout_ms =
+                collective_timeout_policy::effectiveCollectTimeoutMs(
+                    debugEnv().tp_collect_timeout_ms);
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(timeout_ms);
+            int complete = 0;
+            int result = MPI_SUCCESS;
+            while (!complete)
+            {
+                result = MPI_Test(&request, &complete, MPI_STATUS_IGNORE);
+                if (result != MPI_SUCCESS || complete)
+                    break;
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    LOG_ERROR("GlobalTPContext " << operation
+                              << " timed out after " << timeout_ms
+                              << "ms; domain=" << domain_id
+                              << " rank=" << domain_rank << "/" << domain_size
+                              << " payload_elements=" << payload_elements
+                              << "; aborting MPI job because collective order is indeterminate");
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                    return false;
+                }
+            }
+            if (result != MPI_SUCCESS)
+            {
+                LOG_ERROR("GlobalTPContext " << operation
+                          << " failed with MPI code " << result
+                          << " domain=" << domain_id
+                          << " rank=" << domain_rank << "/" << domain_size);
+                return false;
+            }
+            return true;
+        }
+
+        /**
+         * @brief Actively progress a preallocated set of MPI requests together.
+         *
+         * Root posts every packed-route receive before waiting.  Testing the set
+         * as one transaction gives all peers equal progress and applies one
+         * standard timeout to the protocol, rather than accidentally granting a
+         * separate timeout window to every participant.
+         *
+         * @param requests Persistent request array; null entries are permitted.
+         * @param request_count Number of entries in `requests`.
+         * @param operation Human-readable operation identity.
+         * @param domain_id Tensor-parallel domain identifier.
+         * @param domain_rank Rank within the domain.
+         * @param domain_size Number of participants.
+         * @param payload_elements Total FP32 payload elements for diagnostics.
+         * @return true only when every request completes successfully.
+         */
+        bool waitForGlobalTPRequests(
+            MPI_Request *requests,
+            int request_count,
+            const char *operation,
+            int domain_id,
+            int domain_rank,
+            int domain_size,
+            size_t payload_elements)
+        {
+            const int timeout_ms =
+                collective_timeout_policy::effectiveCollectTimeoutMs(
+                    debugEnv().tp_collect_timeout_ms);
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(timeout_ms);
+            int complete = 0;
+            int result = MPI_SUCCESS;
+            while (!complete)
+            {
+                result = MPI_Testall(
+                    request_count,
+                    requests,
+                    &complete,
+                    MPI_STATUSES_IGNORE);
+                if (result != MPI_SUCCESS || complete)
+                    break;
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    LOG_ERROR("GlobalTPContext " << operation
+                              << " timed out after " << timeout_ms
+                              << "ms; domain=" << domain_id
+                              << " rank=" << domain_rank << "/" << domain_size
+                              << " payload_elements=" << payload_elements
+                              << "; aborting MPI job because message ownership is indeterminate");
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                    return false;
+                }
+            }
+            if (result != MPI_SUCCESS)
+            {
+                LOG_ERROR("GlobalTPContext " << operation
+                          << " failed with MPI code " << result
+                          << " domain=" << domain_id
+                          << " rank=" << domain_rank << "/" << domain_size);
+                return false;
+            }
+            return true;
+        }
+    } // namespace
 
     // =============================================================================
     // Private Constructor
@@ -42,8 +175,49 @@ namespace llaminar2
         bool owns_communicator,
         CollectiveBackendType backend_type,
         std::vector<int> node_ids)
-        : domain_comm_(domain_comm), domain_id_(domain_id), my_rank_in_domain_(my_rank_in_domain), domain_size_(domain_size), world_ranks_(std::move(world_ranks)), node_ids_(std::move(node_ids)), all_same_node_(false), node_count_(0), owns_communicator_(owns_communicator), backend_type_(backend_type), backend_(nullptr)
+        : domain_comm_(domain_comm),
+          rooted_publication_comm_(MPI_COMM_NULL),
+          domain_id_(domain_id),
+          my_rank_in_domain_(my_rank_in_domain),
+          domain_size_(domain_size),
+          world_ranks_(std::move(world_ranks)),
+          node_ids_(std::move(node_ids)),
+          all_same_node_(false),
+          node_count_(0),
+          owns_communicator_(owns_communicator),
+          backend_type_(backend_type),
+          backend_(nullptr),
+          rooted_record_requests_(
+              static_cast<size_t>(std::max(0, domain_size)),
+              MPI_REQUEST_NULL),
+          rooted_record_source_seen_(
+              static_cast<size_t>(std::max(0, domain_size)),
+              uint8_t{0})
     {
+        /*
+         * Point-to-point tags are scoped by communicator.  Duplicating once at
+         * setup makes it impossible for packed publication to match the generic
+         * send/receive API's tag zero, even if future orchestration overlaps the
+         * two protocols.  A failed duplication leaves no valid execution
+         * topology, so abort instead of silently sharing the domain lane.
+         */
+        if (domain_comm_ != MPI_COMM_NULL && domain_size_ > 1)
+        {
+            const int duplicate_result =
+                MPI_Comm_dup(domain_comm_, &rooted_publication_comm_);
+            if (duplicate_result != MPI_SUCCESS ||
+                rooted_publication_comm_ == MPI_COMM_NULL)
+            {
+                LOG_ERROR("GlobalTPContext failed to create the private rooted "
+                          "publication communicator for domain "
+                          << domain_id_ << " rank " << my_rank_in_domain_
+                          << "/" << domain_size_
+                          << " MPI code=" << duplicate_result);
+                requestAbort();
+                return;
+            }
+        }
+
         // Auto-detect node IDs if not provided
         if (node_ids_.empty() && domain_comm_ != MPI_COMM_NULL)
         {
@@ -322,19 +496,23 @@ namespace llaminar2
 
     GlobalTPContext::~GlobalTPContext()
     {
-        // Free the communicator if we own it
-        if (owns_communicator_ && domain_comm_ != MPI_COMM_NULL)
+        // Guard against static destruction after MPI_Finalize.
+        int mpi_finalized = 0;
+        MPI_Finalized(&mpi_finalized);
+        if (!mpi_finalized)
         {
-            // Guard against static destruction after MPI_Finalize
-            int mpi_finalized = 0;
-            MPI_Finalized(&mpi_finalized);
-            if (!mpi_finalized)
+            if (rooted_publication_comm_ != MPI_COMM_NULL)
+            {
+                MPI_Comm_free(&rooted_publication_comm_);
+            }
+            if (owns_communicator_ && domain_comm_ != MPI_COMM_NULL)
             {
                 LOG_DEBUG("GlobalTPContext: Freeing owned communicator for domain " << domain_id_);
                 MPI_Comm_free(&domain_comm_);
             }
-            domain_comm_ = MPI_COMM_NULL;
         }
+        rooted_publication_comm_ = MPI_COMM_NULL;
+        domain_comm_ = MPI_COMM_NULL;
     }
 
     // =============================================================================
@@ -342,10 +520,30 @@ namespace llaminar2
     // =============================================================================
 
     GlobalTPContext::GlobalTPContext(GlobalTPContext &&other) noexcept
-        : domain_comm_(other.domain_comm_), domain_id_(other.domain_id_), my_rank_in_domain_(other.my_rank_in_domain_), domain_size_(other.domain_size_), world_ranks_(std::move(other.world_ranks_)), node_ids_(std::move(other.node_ids_)), all_same_node_(other.all_same_node_), node_count_(other.node_count_), owns_communicator_(other.owns_communicator_), backend_type_(other.backend_type_), backend_(std::move(other.backend_)), abort_requested_(other.abort_requested_.load(std::memory_order_acquire)), allreduce_sequence_(other.allreduce_sequence_.load(std::memory_order_acquire))
+        : domain_comm_(other.domain_comm_),
+          rooted_publication_comm_(other.rooted_publication_comm_),
+          domain_id_(other.domain_id_),
+          my_rank_in_domain_(other.my_rank_in_domain_),
+          domain_size_(other.domain_size_),
+          world_ranks_(std::move(other.world_ranks_)),
+          node_ids_(std::move(other.node_ids_)),
+          all_same_node_(other.all_same_node_),
+          node_count_(other.node_count_),
+          owns_communicator_(other.owns_communicator_),
+          backend_type_(other.backend_type_),
+          backend_(std::move(other.backend_)),
+          abort_requested_(
+              other.abort_requested_.load(std::memory_order_acquire)),
+          rooted_record_requests_(
+              std::move(other.rooted_record_requests_)),
+          rooted_record_source_seen_(
+              std::move(other.rooted_record_source_seen_)),
+          allreduce_sequence_(
+              other.allreduce_sequence_.load(std::memory_order_acquire))
     {
         // Clear source to prevent double-free
         other.domain_comm_ = MPI_COMM_NULL;
+        other.rooted_publication_comm_ = MPI_COMM_NULL;
         other.owns_communicator_ = false;
         other.domain_id_ = -1;
         other.my_rank_in_domain_ = -1;
@@ -358,17 +556,20 @@ namespace llaminar2
     {
         if (this != &other)
         {
-            // Free our communicator if we own it
-            if (owns_communicator_ && domain_comm_ != MPI_COMM_NULL)
+            // Release both communicator contexts currently owned by this object.
+            int mpi_finalized = 0;
+            MPI_Finalized(&mpi_finalized);
+            if (!mpi_finalized)
             {
-                int mpi_finalized = 0;
-                MPI_Finalized(&mpi_finalized);
-                if (!mpi_finalized)
+                if (rooted_publication_comm_ != MPI_COMM_NULL)
+                    MPI_Comm_free(&rooted_publication_comm_);
+                if (owns_communicator_ && domain_comm_ != MPI_COMM_NULL)
                     MPI_Comm_free(&domain_comm_);
             }
 
             // Transfer ownership
             domain_comm_ = other.domain_comm_;
+            rooted_publication_comm_ = other.rooted_publication_comm_;
             domain_id_ = other.domain_id_;
             my_rank_in_domain_ = other.my_rank_in_domain_;
             domain_size_ = other.domain_size_;
@@ -380,12 +581,17 @@ namespace llaminar2
             backend_type_ = other.backend_type_;
             backend_ = std::move(other.backend_);
             abort_requested_.store(other.abort_requested_.load(std::memory_order_acquire), std::memory_order_release);
+            rooted_record_requests_ =
+                std::move(other.rooted_record_requests_);
+            rooted_record_source_seen_ =
+                std::move(other.rooted_record_source_seen_);
             allreduce_sequence_.store(
                 other.allreduce_sequence_.load(std::memory_order_acquire),
                 std::memory_order_release);
 
             // Clear source to prevent double-free
             other.domain_comm_ = MPI_COMM_NULL;
+            other.rooted_publication_comm_ = MPI_COMM_NULL;
             other.owns_communicator_ = false;
             other.domain_id_ = -1;
             other.my_rank_in_domain_ = -1;
@@ -741,6 +947,413 @@ namespace llaminar2
         return true;
     }
 
+    bool GlobalTPContext::gatherVariableFloatRecordsToRoot(
+        const float *local_records,
+        size_t local_record_count,
+        float *root_records,
+        size_t root_record_capacity,
+        size_t record_width_elements,
+        int root_index,
+        size_t &gathered_record_count,
+        const std::string &stage_name)
+    {
+        gathered_record_count = 0u;
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::gatherVariableFloatRecordsToRoot "
+                      "entered after abort; stage="
+                      << (stage_name.empty() ? "(unnamed)" : stage_name)
+                      << " domain=" << domain_id_);
+            return false;
+        }
+        if (domain_comm_ == MPI_COMM_NULL ||
+            rooted_publication_comm_ == MPI_COMM_NULL || domain_size_ <= 1 ||
+            my_rank_in_domain_ < 0 || my_rank_in_domain_ >= domain_size_ ||
+            root_index < 0 || root_index >= domain_size_ ||
+            (local_record_count > 0u && !local_records) ||
+            (my_rank_in_domain_ == root_index && !root_records) ||
+            root_record_capacity == 0u ||
+            record_width_elements == 0u ||
+            local_record_count > root_record_capacity ||
+            rooted_record_requests_.size() !=
+                static_cast<size_t>(domain_size_) ||
+            rooted_record_source_seen_.size() !=
+                static_cast<size_t>(domain_size_))
+        {
+            LOG_ERROR("GlobalTPContext::gatherVariableFloatRecordsToRoot "
+                      "received an invalid persistent gather contract"
+                      << " stage="
+                      << (stage_name.empty() ? "(unnamed)" : stage_name)
+                      << " domain=" << domain_id_
+                      << " rank=" << my_rank_in_domain_ << "/" << domain_size_
+                      << " root=" << root_index
+                      << " local_records=" << local_record_count
+                      << " capacity=" << root_record_capacity
+                      << " record_width=" << record_width_elements);
+            return false;
+        }
+        if (root_record_capacity >
+                std::numeric_limits<size_t>::max() / record_width_elements ||
+            local_record_count >
+                std::numeric_limits<size_t>::max() / record_width_elements)
+        {
+            LOG_ERROR("GlobalTPContext packed record element count overflow; stage="
+                      << (stage_name.empty() ? "(unnamed)" : stage_name));
+            return false;
+        }
+        const size_t local_elements =
+            local_record_count * record_width_elements;
+
+        /*
+         * Same-node UPI has two first-class rooted transports. The typed policy
+         * selects shared memory in the measured latency regime and the private
+         * MPI message lane once copy bandwidth dominates. Selection is complete
+         * before the transaction starts; a runtime failure is fatal and never
+         * causes a retry through the other transport. Cross-node and explicitly
+         * selected MPI domains always use the private message lane below.
+         */
+        const size_t packed_transaction_bytes =
+            root_record_capacity * record_width_elements * sizeof(float);
+        if (auto *const shmem_backend =
+                dynamic_cast<ShmemSpinBackend *>(backend_.get());
+            shmem_backend &&
+            CPURootedPublicationTransportPolicy::select(
+                CPURootedPublicationOperation::PackedRecordGather,
+                packed_transaction_bytes) ==
+                CPURootedPublicationTransport::SharedMemoryLatency)
+        {
+            if (!shmem_backend->gatherVariableFloatRecordsToRoot(
+                    local_records,
+                    local_record_count,
+                    root_records,
+                    root_record_capacity,
+                    record_width_elements,
+                    root_index,
+                    gathered_record_count))
+            {
+                LOG_ERROR("GlobalTPContext native shared-memory packed route "
+                          "publication failed; stage="
+                          << (stage_name.empty() ? "(unnamed)" : stage_name)
+                          << " domain=" << domain_id_
+                          << " rank=" << my_rank_in_domain_ << "/"
+                          << domain_size_ << " error="
+                          << shmem_backend->lastError());
+                requestAbort();
+                return false;
+            }
+            return true;
+        }
+
+        if (local_elements >
+            static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            LOG_ERROR("GlobalTPContext packed route contribution exceeds the "
+                      "portable MPI count range; stage="
+                      << (stage_name.empty() ? "(unnamed)" : stage_name)
+                      << " elements=" << local_elements);
+            return false;
+        }
+
+        /*
+         * Non-root contributes one self-describing MPI message.  The message
+         * envelope is the record count: no count collective, allocation, or
+         * dense padding is needed before payload movement can begin.
+         */
+        if (my_rank_in_domain_ != root_index)
+        {
+            float empty_message_storage = 0.0f;
+            const float *send_records =
+                local_records ? local_records : &empty_message_storage;
+            MPI_Request send_request = MPI_REQUEST_NULL;
+            const int send_result = MPI_Isend(
+                send_records,
+                static_cast<int>(local_elements),
+                MPI_FLOAT,
+                root_index,
+                kRootedPublicationTag,
+                rooted_publication_comm_,
+                &send_request);
+            if (send_result != MPI_SUCCESS ||
+                !waitForGlobalTPCollective(
+                    send_request,
+                    "MPI_Isend(packed route records)",
+                    domain_id_,
+                    my_rank_in_domain_,
+                    domain_size_,
+                    local_elements))
+            {
+                requestAbort();
+                return false;
+            }
+            return true;
+        }
+
+        /*
+         * Root's own records already live in the gather arena in production.
+         * Preserve that zero-copy case while supporting distinct buffers in
+         * tests and future callers.  Remote blocks append in arrival order;
+         * their embedded canonical slot IDs, not packed position, define fold
+         * order later.
+         */
+        if (local_elements > 0u && local_records != root_records)
+        {
+            std::memmove(
+                root_records,
+                local_records,
+                local_elements * sizeof(float));
+        }
+
+        std::fill(
+            rooted_record_requests_.begin(),
+            rooted_record_requests_.end(),
+            MPI_REQUEST_NULL);
+        std::fill(
+            rooted_record_source_seen_.begin(),
+            rooted_record_source_seen_.end(),
+            uint8_t{0});
+        rooted_record_source_seen_[static_cast<size_t>(root_index)] = uint8_t{1};
+
+        size_t total_records = local_record_count;
+        size_t total_elements = local_elements;
+        int matched_remote_participants = 0;
+        const int timeout_ms =
+            collective_timeout_policy::effectiveCollectTimeoutMs(
+                debugEnv().tp_collect_timeout_ms);
+        const auto probe_deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(timeout_ms);
+
+        while (matched_remote_participants < domain_size_ - 1)
+        {
+            int message_available = 0;
+            MPI_Message message = MPI_MESSAGE_NULL;
+            MPI_Status status{};
+            const int probe_result = MPI_Improbe(
+                MPI_ANY_SOURCE,
+                kRootedPublicationTag,
+                rooted_publication_comm_,
+                &message_available,
+                &message,
+                &status);
+            if (probe_result != MPI_SUCCESS)
+            {
+                LOG_ERROR("GlobalTPContext MPI_Improbe failed for packed route "
+                          "publication; stage="
+                          << (stage_name.empty() ? "(unnamed)" : stage_name)
+                          << " MPI code=" << probe_result);
+                requestAbort();
+                return false;
+            }
+            if (!message_available)
+            {
+                if (std::chrono::steady_clock::now() >= probe_deadline)
+                {
+                    LOG_ERROR("GlobalTPContext packed route message discovery "
+                              "timed out after " << timeout_ms << "ms; stage="
+                              << (stage_name.empty() ? "(unnamed)" : stage_name)
+                              << " domain=" << domain_id_
+                              << " rank=" << my_rank_in_domain_ << "/"
+                              << domain_size_
+                              << " matched=" << matched_remote_participants
+                              << "/" << (domain_size_ - 1));
+                    requestAbort();
+                    return false;
+                }
+                continue;
+            }
+
+            const int source = status.MPI_SOURCE;
+            if (source < 0 || source >= domain_size_ || source == root_index ||
+                rooted_record_source_seen_[static_cast<size_t>(source)] != 0u)
+            {
+                LOG_ERROR("GlobalTPContext received a duplicate or invalid "
+                          "packed route source; stage="
+                          << (stage_name.empty() ? "(unnamed)" : stage_name)
+                          << " source=" << source << " root=" << root_index);
+                requestAbort();
+                return false;
+            }
+
+            int remote_elements_int = 0;
+            const int count_result =
+                MPI_Get_count(&status, MPI_FLOAT, &remote_elements_int);
+            if (count_result != MPI_SUCCESS || remote_elements_int < 0 ||
+                static_cast<size_t>(remote_elements_int) %
+                        record_width_elements !=
+                    0u)
+            {
+                LOG_ERROR("GlobalTPContext received a malformed packed route "
+                          "message; stage="
+                          << (stage_name.empty() ? "(unnamed)" : stage_name)
+                          << " source=" << source
+                          << " elements=" << remote_elements_int
+                          << " record_width=" << record_width_elements
+                          << " MPI code=" << count_result);
+                requestAbort();
+                return false;
+            }
+
+            const size_t remote_elements =
+                static_cast<size_t>(remote_elements_int);
+            const size_t remote_records =
+                remote_elements / record_width_elements;
+            if (remote_records > root_record_capacity - total_records)
+            {
+                LOG_ERROR("GlobalTPContext packed route messages exceed root "
+                          "capacity; stage="
+                          << (stage_name.empty() ? "(unnamed)" : stage_name)
+                          << " source=" << source
+                          << " accumulated_records=" << total_records
+                          << " remote_records=" << remote_records
+                          << " capacity=" << root_record_capacity);
+                requestAbort();
+                return false;
+            }
+
+            const int receive_result = MPI_Imrecv(
+                root_records + total_elements,
+                remote_elements_int,
+                MPI_FLOAT,
+                &message,
+                &rooted_record_requests_[static_cast<size_t>(source)]);
+            if (receive_result != MPI_SUCCESS)
+            {
+                LOG_ERROR("GlobalTPContext MPI_Imrecv failed for packed route "
+                          "publication; stage="
+                          << (stage_name.empty() ? "(unnamed)" : stage_name)
+                          << " source=" << source
+                          << " MPI code=" << receive_result);
+                requestAbort();
+                return false;
+            }
+
+            rooted_record_source_seen_[static_cast<size_t>(source)] = uint8_t{1};
+            total_records += remote_records;
+            total_elements += remote_elements;
+            ++matched_remote_participants;
+        }
+
+        if (!waitForGlobalTPRequests(
+                rooted_record_requests_.data(),
+                domain_size_,
+                "MPI_Imrecv(packed route records)",
+                domain_id_,
+                my_rank_in_domain_,
+                domain_size_,
+                total_elements))
+        {
+            requestAbort();
+            return false;
+        }
+
+        gathered_record_count = total_records;
+        return true;
+    }
+
+    bool GlobalTPContext::broadcastFloatElements(
+        TensorBase *tensor,
+        size_t element_count,
+        int root_index,
+        const std::string &stage_name)
+    {
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::broadcastFloatElements entered after "
+                      "abort; stage="
+                      << (stage_name.empty() ? "(unnamed)" : stage_name)
+                      << " domain=" << domain_id_);
+            return false;
+        }
+        if (!backend_ || !tensor || element_count == 0u ||
+            element_count > tensor->numel() ||
+            root_index < 0 || root_index >= domain_size_)
+        {
+            LOG_ERROR("GlobalTPContext::broadcastFloatElements received an "
+                      "invalid compact broadcast contract"
+                      << " stage="
+                      << (stage_name.empty() ? "(unnamed)" : stage_name)
+                      << " elements=" << element_count
+                      << " tensor_elements=" << (tensor ? tensor->numel() : 0u)
+                      << " root=" << root_index
+                      << " degree=" << domain_size_);
+            return false;
+        }
+        float *data = tensor->mutable_data();
+        if (!data)
+        {
+            LOG_ERROR("GlobalTPContext::broadcastFloatElements could not access "
+                      "host tensor storage; stage="
+                      << (stage_name.empty() ? "(unnamed)" : stage_name));
+            return false;
+        }
+        if (element_count >
+            std::numeric_limits<size_t>::max() / sizeof(float))
+        {
+            LOG_ERROR("GlobalTPContext compact rooted broadcast byte count "
+                      "overflow; stage="
+                      << (stage_name.empty() ? "(unnamed)" : stage_name));
+            return false;
+        }
+
+        const size_t payload_bytes = element_count * sizeof(float);
+        const bool use_mpi_bandwidth_transport =
+            dynamic_cast<ShmemSpinBackend *>(backend_.get()) != nullptr &&
+            CPURootedPublicationTransportPolicy::select(
+                CPURootedPublicationOperation::CompactOutputBroadcast,
+                payload_bytes) ==
+                CPURootedPublicationTransport::MPIBandwidth;
+        bool broadcast_ok = true;
+        if (use_mpi_bandwidth_transport)
+        {
+            size_t offset = 0u;
+            while (offset < element_count)
+            {
+                const size_t chunk_elements = std::min(
+                    element_count - offset,
+                    static_cast<size_t>(std::numeric_limits<int>::max()));
+                MPI_Request request = MPI_REQUEST_NULL;
+                const int result = MPI_Ibcast(
+                    data + offset,
+                    static_cast<int>(chunk_elements),
+                    MPI_FLOAT,
+                    root_index,
+                    domain_comm_,
+                    &request);
+                if (result != MPI_SUCCESS ||
+                    !waitForGlobalTPCollective(
+                        request,
+                        "MPI_Ibcast(compact canonical output)",
+                        domain_id_,
+                        my_rank_in_domain_,
+                        domain_size_,
+                        chunk_elements))
+                {
+                    broadcast_ok = false;
+                    break;
+                }
+                offset += chunk_elements;
+            }
+        }
+        else
+        {
+            broadcast_ok = backend_->broadcast(
+                data,
+                element_count,
+                CollectiveDataType::FLOAT32,
+                root_index);
+        }
+        if (!broadcast_ok)
+        {
+            LOG_ERROR("GlobalTPContext compact rooted broadcast failed; stage="
+                      << (stage_name.empty() ? "(unnamed)" : stage_name)
+                      << " backend=" << backend_->name()
+                      << " error=" << backend_->lastError());
+            requestAbort();
+            return false;
+        }
+        return true;
+    }
+
     bool GlobalTPContext::send(const TensorBase *tensor, int dest_index)
     {
         if (!tensor)
@@ -862,7 +1475,9 @@ namespace llaminar2
 
     bool GlobalTPContext::isValid() const
     {
-        return domain_comm_ != MPI_COMM_NULL && domain_size_ > 0;
+        return domain_comm_ != MPI_COMM_NULL && domain_size_ > 0 &&
+               (domain_size_ == 1 ||
+                rooted_publication_comm_ != MPI_COMM_NULL);
     }
 
     // =============================================================================

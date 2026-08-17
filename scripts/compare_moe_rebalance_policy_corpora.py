@@ -59,7 +59,7 @@ FEATURE_FIELDS = (
     "llep_native_rows",
     "llep_spilled_rows",
     "llep_spilled_row_ratio",
-    "llep_spilled_rows_per_transfer",
+    "llep_spilled_rows_per_critical_path_payload_slot",
     "llep_standard_ep_selected",
     "llep_skipped_balanced",
     "llep_skipped_insufficient_spread_improvement",

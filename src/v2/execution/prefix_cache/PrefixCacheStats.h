@@ -50,6 +50,8 @@ namespace llaminar2
         uint64_t bypasses = 0;
         uint64_t verifier_runs = 0;
         uint64_t verifier_token_count = 0;
+        int last_transaction_draft_depth = 0;
+        int last_transaction_emitted_token_count = 0;
         uint64_t stochastic_accept_tests = 0;
         uint64_t stochastic_accepts = 0;
         uint64_t stochastic_residual_samples = 0;

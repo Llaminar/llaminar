@@ -57,10 +57,11 @@ namespace llaminar2::test::gpu_kv_verifier
         const char *source_label;
     };
 
-    /** @brief Return whether a precision names either physical TurboQuant policy. */
+    /** @brief Return whether a precision selects cache-owned AQ8 key storage. */
     constexpr bool isTurboQuantCachePrecision(ActivationPrecision precision)
     {
-        return precision == ActivationPrecision::TQ4 ||
+        return precision == ActivationPrecision::Q8_1 ||
+               precision == ActivationPrecision::TQ4 ||
                precision == ActivationPrecision::TQ8;
     }
 
@@ -69,26 +70,21 @@ namespace llaminar2::test::gpu_kv_verifier
      *
      * FP32 and BF16 caches accept their native source. FP16 and Q8_1 caches
      * additionally expose production conversion kernels for every activation
-     * tensor format. Each TurboQuant storage policy accepts either FP32
-     * projection rows for fused quantize-to-ring publication or its exact
-     * prepared native pair for direct device-to-device publication:
-     * `TQ4` selects TQ8-K/TQ4-V, while `TQ8` selects TQ8-K/TQ8-V.
+     * tensor format. Each asymmetric compressed storage policy accepts FP32
+     * projection rows so its cache-owned anchor and physical blocks are
+     * published atomically by the production fused path. `TQ4` selects
+     * AQ8-K/TQ4-V, while `TQ8` selects AQ8-K/TQ8-V.
      */
-    inline constexpr std::array<FormatCase, 14> kFormatCases = {{
+    inline constexpr std::array<FormatCase, 9> kFormatCases = {{
         {ActivationPrecision::FP32, TensorType::FP32, TensorType::FP32, "FP32", "FP32"},
         {ActivationPrecision::BF16, TensorType::BF16, TensorType::BF16, "BF16", "BF16"},
         {ActivationPrecision::FP16, TensorType::FP32, TensorType::FP32, "FP16", "FP32"},
         {ActivationPrecision::FP16, TensorType::FP16, TensorType::FP16, "FP16", "FP16"},
         {ActivationPrecision::FP16, TensorType::BF16, TensorType::BF16, "FP16", "BF16"},
         {ActivationPrecision::FP16, TensorType::Q8_1, TensorType::Q8_1, "FP16", "Q8_1"},
-        {ActivationPrecision::Q8_1, TensorType::FP32, TensorType::FP32, "Q8_1", "FP32"},
-        {ActivationPrecision::Q8_1, TensorType::FP16, TensorType::FP16, "Q8_1", "FP16"},
-        {ActivationPrecision::Q8_1, TensorType::BF16, TensorType::BF16, "Q8_1", "BF16"},
-        {ActivationPrecision::Q8_1, TensorType::Q8_1, TensorType::Q8_1, "Q8_1", "Q8_1"},
-        {ActivationPrecision::TQ4, TensorType::FP32, TensorType::FP32, "TQ8-K/TQ4-V", "FP32"},
-        {ActivationPrecision::TQ4, TensorType::TQ8, TensorType::TQ4, "TQ8-K/TQ4-V", "TQ8/TQ4"},
-        {ActivationPrecision::TQ8, TensorType::FP32, TensorType::FP32, "TQ8-K/TQ8-V", "FP32"},
-        {ActivationPrecision::TQ8, TensorType::TQ8, TensorType::TQ8, "TQ8-K/TQ8-V", "TQ8"},
+        {ActivationPrecision::Q8_1, TensorType::FP32, TensorType::FP32, "AQ8-K/Q8_1-V", "FP32"},
+        {ActivationPrecision::TQ4, TensorType::FP32, TensorType::FP32, "AQ8-K/TQ4-V", "FP32"},
+        {ActivationPrecision::TQ8, TensorType::FP32, TensorType::FP32, "AQ8-K/TQ8-V", "FP32"},
     }};
 
     /** @brief One native cache family and a lossless append source for read tests. */
@@ -110,9 +106,9 @@ namespace llaminar2::test::gpu_kv_verifier
         {ActivationPrecision::FP32, TensorType::FP32, "FP32"},
         {ActivationPrecision::FP16, TensorType::FP16, "FP16"},
         {ActivationPrecision::BF16, TensorType::BF16, "BF16"},
-        {ActivationPrecision::Q8_1, TensorType::Q8_1, "Q8_1"},
-        {ActivationPrecision::TQ4, TensorType::FP32, "TQ8-K/TQ4-V"},
-        {ActivationPrecision::TQ8, TensorType::FP32, "TQ8-K/TQ8-V"},
+        {ActivationPrecision::Q8_1, TensorType::FP32, "AQ8-K/Q8_1-V"},
+        {ActivationPrecision::TQ4, TensorType::FP32, "AQ8-K/TQ4-V"},
+        {ActivationPrecision::TQ8, TensorType::FP32, "AQ8-K/TQ8-V"},
     }};
 
     /** @brief Replicated and LocalTP-sharded factory configurations. */

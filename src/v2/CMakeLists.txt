@@ -379,15 +379,19 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDATPKVStateKernels.cu       # TP-local K/V state deinterleave for phase-split decode caches
         kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
         kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
+        kernels/cuda/kvcache/CUDAAttentionKeyQ8Kernels.cu # Quadratic-companded attention-key cache codec
         kernels/cuda/kvcache/CUDATurboQuantKernels.cu  # TurboQuant quantize/dequant/RoPE GPU kernels
         kernels/cuda/kvcache/CUDARingKVCacheTQ.cu     # TurboQuant KV cache (TQ8-K/TQ4-V split)
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu  # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
         # MoE (Mixture of Experts) kernels
         kernels/cuda/moe/CUDAMoEKernels.cu            # MoE routing, gather, scatter, gate, swiglu
+        kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.cu # Device-owned node-local sparse activation packets
+        kernels/cuda/moe/CUDAMoEOverlayEpochKernels.cu # Captured ExpertOverlay placement-epoch RCU
         # GPU repack kernels (GGUF → VNNI layout on device)
         kernels/cuda/repack/CUDAVnniRepackKernels.cu   # VNNI repack for all 18 quantization formats
         kernels/cuda/repack/CUDAVnniUnpackKernels.cu   # VNNI reverse repack (GPU separated → raw GGUF)
+        kernels/cuda/repack/CUDAExpertTierWeightKernels.cu # ExpertOverlay GPU/CPU stream conversion
         # Profiling utilities
         utils/CUDAKernelProfiler.cu                   # CUDA event-based kernel profiling
     )
@@ -605,6 +609,7 @@ endif()
 if(HAVE_ROCM)
     # ROCm kernels compiled with hipcc
     set(ROCM_KERNEL_SOURCES
+        backends/rocm/HIPGraphTimelineKernels.hip            # Retained mapped-timeline system-release nodes
         kernels/rocm/gemm/ROCmQuantisedGemmKernel.hip           # Common INT8 GEMM utilities (quantization, scaling, memory)
         kernels/rocm/gemm/ROCmQuantisedGemmKernel_INT8_VNNI.hip # INT8 VNNI wide-tile V3+V7 kernels (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel.hip               # GEMV kernel suite documentation index (split into files below)
@@ -625,6 +630,7 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
+        kernels/rocm/kvcache/ROCmAttentionKeyQ8Kernels.hip    # Quadratic-companded attention-key cache codec
         kernels/rocm/kvcache/ROCmTurboQuantKernels.hip        # TurboQuant quantize/dequant/RoPE GPU kernels
         kernels/rocm/kvcache/ROCmRingKVCacheTQ.hip            # TurboQuant KV cache (TQ8-K/TQ4-V split)
         kernels/rocm/ops/ROCmSwiGLUKernels.hip               # SwiGLU kernels (FP32, BF16, FP16)
@@ -642,9 +648,12 @@ if(HAVE_ROCM)
         kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip        # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
         # MoE (Mixture of Experts) kernels
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
+        kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
+        kernels/rocm/moe/ROCmMoEOverlayEpochKernels.hip       # Captured ExpertOverlay placement-epoch RCU
         # GPU weight loading pipeline repack kernels
         kernels/rocm/repack/VnniRepackKernels.hip            # VNNI repack: Q4_0, IQ4_NL, Q4_K on-device
         kernels/rocm/repack/VnniUnpackKernels.hip            # VNNI reverse repack (GPU separated → raw GGUF)
+        kernels/rocm/repack/ROCmExpertTierWeightKernels.hip  # ExpertOverlay GPU/CPU stream conversion
         # Profiling utilities
         utils/ROCmKernelProfiler.hip                         # ROCm/HIP event-based kernel profiling
     )
@@ -1399,10 +1408,17 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
     execution/compute_stages/stages/MoEExpertDispatchStage.cpp
+    execution/compute_stages/stages/MoEOverlayTicketPublishStage.cpp
+    execution/compute_stages/stages/MoEOverlayTicketConsumeStage.cpp
+    execution/compute_stages/stages/MoEOverlayActivationPacketStages.cpp
     execution/compute_stages/stages/MoELocalExpertStage.cpp
     execution/compute_stages/stages/MoESparseDispatchStage.cpp
     execution/compute_stages/stages/MoESparseReturnReduceStage.cpp
+    execution/compute_stages/stages/MoERankBatchSparseStages.cpp
     execution/compute_stages/stages/MoEDeviceRebalanceStage.cpp
+    execution/compute_stages/stages/MoEGPUCurrentBatchLLEPStage.cpp
+    execution/compute_stages/stages/MoEDeviceDecodeCommitBoundaryStage.cpp
+    execution/compute_stages/stages/MoECPUCurrentBatchLLEPStage.cpp
     execution/compute_stages/stages/MoERoutingStage.cpp
     execution/compute_stages/stages/AttentionOutputGateStage.cpp
     execution/compute_stages/stages/GatedRMSNormStage.cpp
@@ -1415,6 +1431,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/QGateSplitStage.cpp
     execution/compute_stages/stages/MTPConcatStage.cpp
     execution/compute_stages/stages/MTPDraftTokenPublicationStage.cpp
+    execution/compute_stages/stages/MoEOverlayEpochBoundaryStage.cpp
     execution/compute_stages/stages/MTPVerifierPreparationStage.cpp
     execution/compute_stages/stages/PrefillChunkMaterializationStage.cpp
     execution/compute_stages/stages/MTPVerifierOutcomeStage.cpp
@@ -1430,14 +1447,58 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/ExpertRebalancer.cpp
     execution/moe/DecodeExpertHistogram.cpp
     execution/moe/MoERoutedExpertPlacementPlanner.cpp
+    execution/moe/MoEOverlayEconomyProfileComposer.cpp
+    execution/moe/MoEOverlayEconomyCalibrationPlanner.cpp
+    execution/moe/MoEOverlayEconomyCalibrationController.cpp
+    execution/moe/MoEOverlayEconomyCertificationController.cpp
+    execution/moe/MoEOverlayEconomyEvidenceExchange.cpp
+    execution/moe/MoEOverlayMPIEconomyEvidenceExchange.cpp
+    execution/moe/MoEOverlayInferenceInterferenceProbe.cpp
+    execution/moe/MoEOverlayMigrationMeasurementLedger.cpp
+    execution/moe/MoEOverlayMigrationMeasurementExchange.cpp
+    execution/moe/MoEOverlayCapacityResolver.cpp
+    execution/moe/MoEOverlayCapacityAdmission.cpp
+    execution/moe/MoEOverlayLocalCapacityPlanner.cpp
+    execution/moe/MoEExpertOverlayAuthorityPlan.cpp
     execution/moe/MoEExpertOwnerMap.cpp
+    execution/moe/MoEOverlayResidencyAuthority.cpp
+    execution/moe/DeviceMoEOverlayEpochArena.cpp
+    execution/moe/MoEOverlayDeviceEpochProtocol.cpp
+    execution/moe/MoEOverlayDistributedResidencyProtocol.cpp
+    execution/moe/MoEOverlayRemoteProjectionProtocol.cpp
+    execution/moe/MoEOverlayMPIRemoteProjectionTransport.cpp
+    execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.cpp
+    execution/moe/MoEOverlayDistributedResidencyTransport.cpp
+    execution/moe/MoEOverlayMPIResidencyConsensus.cpp
+    execution/moe/MoEOverlayMPIHistogramPublisher.cpp
+    execution/moe/MoEOverlayResidencyMaintenanceService.cpp
+    execution/moe/MoEOverlayTierMigrationTransport.cpp
+    execution/moe/MoEOverlayParticipantMigration.cpp
+    execution/moe/MoEOverlayPhysicalResidencyFabric.cpp
+    execution/moe/CpuExpertSlotPool.cpp
+    execution/moe/MoEOverlayPreparedWeightSource.cpp
+    execution/moe/ExpertTierWeightStream.cpp
+    execution/moe/ExpertTierWeightTransferLane.cpp
+    execution/moe/ExpertTierGpuBlobTransferLane.cpp
+    execution/moe/ExpertTierGpuPeerTransferLane.cpp
+    execution/moe/ExpertTierMigrationOperations.cpp
     execution/moe/MoEExpertTokenRowTransfer.cpp
     execution/moe/MoEExpertOverlayExecutionPlan.cpp
     execution/moe/MoEGraphRoleRunner.cpp
+    execution/moe/MoEOverlayParticipantGraphRunner.cpp
     execution/moe/MoEExpertOverlayPreparationPlan.cpp
     execution/moe/MoEExpertOverlayProfiler.cpp
     execution/moe/MoEExpertOverlayRuntimePlan.cpp
+    execution/moe/MoEOverlayInferenceTransaction.cpp
+    execution/moe/MoEOverlayInferenceTransactionService.cpp
+    execution/moe/MoEOverlayActivationEpochProtocol.cpp
+    execution/moe/MoEOverlayRetainedActivationTransaction.cpp
+    execution/moe/MoEOverlayRetainedParentComposer.cpp
+    execution/moe/MoEOverlayRankBatchTransport.cpp
+    execution/moe/MoEOverlayNodeLocalRankBatchTransport.cpp
+    execution/moe/MoEOverlayNodeLocalRouteExchange.cpp
     execution/moe/MoEOverlaySparseCollective.cpp
+    execution/moe/MoEOverlayParticipantResidency.cpp
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoERuntimeTable.cpp
@@ -1685,6 +1746,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     kernels/cpu/gdn/CPUGatedDeltaNet.cpp
     # MoE kernel implementations (routing, gather/scatter, SwiGLU fallback)
     kernels/IMoEKernel.cpp
+    kernels/cpu/moe/CPUCanonicalRouteReducer.cpp
     kernels/cpu/moe/CPUMoEKernel.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp

@@ -18,13 +18,39 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
-#include <thread>
 #include <vector>
 
 namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Drive one nonblocking MPI collective to completion with a fatal timeout.
+         *
+         * Open MPI's segmented collective algorithms may advance only a bounded
+         * amount of work on each `MPI_Test()` call when no asynchronous progress
+         * thread is enabled.  The inference thread must therefore keep calling
+         * `MPI_Test()` continuously.  Sleeping between calls does not merely save
+         * CPU time: it throttles protocol progress and can add one sleep interval
+         * for every transport segment.  At the Qwen3.6-35B prefill geometry that
+         * turned a roughly two-millisecond same-node allreduce into an 84 ms one.
+         *
+         * The caller is synchronously waiting for this collective before it can
+         * execute the dependent graph stage, so active progress is the economical
+         * use of the rank's orchestration thread.  The deadline remains mandatory;
+         * a timed-out request leaves collective ordering indeterminate and aborts
+         * the entire MPI job rather than permitting inference to continue.
+         *
+         * @param request Live nonblocking MPI request owned by the caller.
+         * @param timeout_ms Positive fatal timeout in milliseconds.
+         * @param operation Human-readable MPI operation name for diagnostics.
+         * @param domain_rank Rank within the collective's domain communicator.
+         * @param domain_size Number of ranks in the collective domain.
+         * @param count Number of logical elements in the operation payload.
+         * @param last_error Destination for a precise failure diagnostic.
+         * @return true when MPI completed the request successfully; false only
+         *         for an MPI error. A timeout terminates the MPI job.
+         */
         bool waitForCollectiveRequest(
             MPI_Request &request,
             int timeout_ms,
@@ -55,7 +81,9 @@ namespace llaminar2
                     return false;
                 }
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                // MPI_Test is also the progress engine on ordinary Open MPI
+                // installations.  Do not sleep or yield here: either one can
+                // serialize a segmented collective behind scheduler quanta.
             }
 
             if (result != MPI_SUCCESS)

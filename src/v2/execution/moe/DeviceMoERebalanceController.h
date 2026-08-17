@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <type_traits>
 #include <unordered_set>
 
@@ -267,6 +268,12 @@ namespace llaminar2
         /** Set when compact MTP metadata already advanced this decode boundary. */
         uint32_t decode_boundary_advanced = 0;
         DeviceMoERebalanceWaveProgress waves[2];
+        /**
+         * Narrow device-published decision used only by HIP's hosted scheduler.
+         * CUDA retains the same ABI so controller layout stays backend-symmetric,
+         * but its native conditional graph never copies this record to the host.
+         */
+        DeviceMoERebalanceDispatchTicket dispatch_ticket;
     };
 
     /**
@@ -457,7 +464,13 @@ namespace llaminar2
         uint32_t min_load_spread_improvement = 0;
         uint32_t min_load_spread_improvement_divisor = 0;
         uint32_t min_wave_spread_improvement_per_payload_slot = 0;
-        uint32_t min_foreign_rows_per_transfer = 0;
+        /**
+         * Useful routed rows required per serialized payload slot on the
+         * transfer wave's busiest participant lane. Reciprocal source lanes
+         * overlap and are charged once; multiple payloads on one lane remain
+         * additive.
+         */
+        uint32_t min_foreign_rows_per_critical_path_payload_slot = 0;
         uint32_t min_router_spread_improvement_per_payload_slot = 0;
         uint32_t max_post_wave_load_spread_per_mille = 0;
         /**
@@ -474,9 +487,10 @@ namespace llaminar2
          * @brief Balanced-load static-owner skip threshold for LLEP.
          *
          * When `llep_enable_balanced_skip` is non-zero, LLEP may intentionally
-         * publish no transfers if max_expert_load / mean_expert_load is below
-         * lambda_numerator / lambda_denominator.  Explicit migration tests set
-         * the enable flag to zero so the LLEP path must do observable work.
+         * publish no transfers if the busiest static-owner participant divided
+         * by mean participant load is below lambda_numerator /
+         * lambda_denominator. Explicit migration tests set the enable flag to
+         * zero so the LLEP path must do observable work.
          */
         uint32_t llep_lambda_numerator = 13;
         uint32_t llep_lambda_denominator = 10;
@@ -516,6 +530,52 @@ namespace llaminar2
         /** Recurring serial-visible decode period after the first boundary. */
         uint32_t maintenance_period_tokens = 1;
     };
+
+    /**
+     * @brief Identify the evidence lifecycle of a prefill payload transfer.
+     *
+     * Current-batch movement consumes freshly observed routing evidence and
+     * starts a new histogram window after apply. Prefix-runtime rehydration
+     * restores placement and histogram evidence from a portable snapshot, so
+     * applying its bytes must preserve that evidence. The two purposes have
+     * distinct graph authorities but share this immutable apply-policy rule.
+     */
+    enum class PrefillLLEPTransferPurpose : uint8_t
+    {
+        CurrentBatchMovement = 0,
+        PrefixRuntimeRehydration = 1,
+    };
+
+    /**
+     * @brief Derive an immutable histogram policy for one payload transfer.
+     * @param base_config Graph-owned rebalance policy copied by value.
+     * @param purpose Evidence lifecycle owned by the calling graph stage.
+     * @return A config whose reset flag matches @p purpose.
+     * @throws std::invalid_argument when @p purpose is not a valid enum value.
+     */
+    [[nodiscard]] inline DeviceMoERebalanceConfig
+    prefillLLEPTransferConfig(
+        const DeviceMoERebalanceConfig &base_config,
+        PrefillLLEPTransferPurpose purpose)
+    {
+        DeviceMoERebalanceConfig result = base_config;
+        const uint32_t reset_histograms =
+            static_cast<uint32_t>(
+                DeviceMoERebalanceFlags::ResetHistogramsAfterApply);
+        switch (purpose)
+        {
+        case PrefillLLEPTransferPurpose::CurrentBatchMovement:
+            result.flags |= reset_histograms;
+            break;
+        case PrefillLLEPTransferPurpose::PrefixRuntimeRehydration:
+            result.flags &= ~reset_histograms;
+            break;
+        default:
+            throw std::invalid_argument(
+                "Unknown prefill LLEP transfer purpose");
+        }
+        return result;
+    }
 
     struct DeviceMoERebalanceStatus
     {
@@ -899,6 +959,61 @@ namespace llaminar2
             return 0;
         constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
         return lhs > (kMax / rhs) ? kMax : lhs * rhs;
+    }
+
+    /**
+     * @brief Durable request-level lower bounds for completed payload movement.
+     *
+     * The two rolling maintenance-wave slots are reused, so the final planner
+     * status may describe an empty wave after an earlier copy/apply completed.
+     * Current-batch LLEP has a separate sticky per-layer marker that is written
+     * only by the apply kernel after the destination payload lease is copy
+     * complete.  Combining these two device-owned authorities with `max`
+     * preserves a conservative lower bound without double-counting a movement
+     * visible through both paths.
+     */
+    struct DeviceMoERebalanceRequestMovementEvidence
+    {
+        uint64_t copied_payload_lower_bound = 0;
+        uint64_t applied_payload_lower_bound = 0;
+        uint64_t completed_payload_lower_bound = 0;
+        uint64_t useful_payload_bytes_lower_bound = 0;
+    };
+
+    /**
+     * @brief Derive terminal movement evidence from durable device state.
+     *
+     * @param wave_copied_arrivals Copied arrivals retained by rolling waves.
+     * @param wave_applied_arrivals Applied arrivals retained by rolling waves.
+     * @param prefill_current_batch_movement_layers LLEP layers with an applied
+     *        copy-complete payload movement marker.
+     * @param slot_payload_bytes Bytes in one whole-expert transfer slot.
+     * @return Conservative request-level count and byte lower bounds.
+     */
+    inline DeviceMoERebalanceRequestMovementEvidence
+    deviceMoERebalanceRequestMovementEvidence(
+        uint64_t wave_copied_arrivals,
+        uint64_t wave_applied_arrivals,
+        uint32_t prefill_current_batch_movement_layers,
+        uint64_t slot_payload_bytes) noexcept
+    {
+        const uint64_t prefill_completed_payload_lower_bound =
+            static_cast<uint64_t>(prefill_current_batch_movement_layers);
+        DeviceMoERebalanceRequestMovementEvidence evidence{};
+        evidence.copied_payload_lower_bound =
+            std::max(wave_copied_arrivals,
+                     prefill_completed_payload_lower_bound);
+        evidence.applied_payload_lower_bound =
+            std::max(wave_applied_arrivals,
+                     prefill_completed_payload_lower_bound);
+        evidence.completed_payload_lower_bound =
+            std::min(evidence.copied_payload_lower_bound,
+                     evidence.applied_payload_lower_bound);
+        evidence.useful_payload_bytes_lower_bound =
+            deviceMoERebalanceSaturatingMul(
+                evidence.completed_payload_lower_bound,
+                slot_payload_bytes);
+        return evidence;
     }
 
     inline uint32_t deviceMoERebalanceLayerWindowCount(
@@ -1293,16 +1408,12 @@ namespace llaminar2
     inline bool deviceMoEDescriptorReady(const DeviceMoEExpertDescriptor &desc) noexcept
     {
         return desc.logical_expert_id >= 0 &&
-               desc.gate.valid() &&
-               desc.up.valid() &&
-               desc.down.valid();
+               desc.weightsReady();
     }
 
     inline bool deviceMoETransferDescriptorReady(const DeviceMoEExpertDescriptor &desc) noexcept
     {
-        return desc.gate.valid() &&
-               desc.up.valid() &&
-               desc.down.valid();
+        return desc.weightsReady();
     }
 
     inline bool deviceMoENativeVnniFormatForCodebook(
@@ -1470,6 +1581,9 @@ namespace llaminar2
         dst.k = src.k;
         dst.blocks_per_row = src.blocks_per_row;
         dst.codebook_id = src.codebook_id;
+        dst.source_codebook_id = src.source_codebook_id;
+        dst.source_is_superblock = src.source_is_superblock;
+        dst.source_identity_present = src.source_identity_present;
     }
 
     inline uint64_t deviceMoEMatrixBlockCount(const DeviceNativeVNNIMatrixDesc &desc) noexcept

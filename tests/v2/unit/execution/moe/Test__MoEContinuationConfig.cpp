@@ -18,7 +18,7 @@ namespace llaminar2::test
             domain.name = name;
             domain.devices = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
             domain.scope = scope;
-            domain.backend = scope == TPScope::LOCAL ? CollectiveBackendType::HOST : CollectiveBackendType::UPI;
+            domain.backend = scope == TPScope::RANK_LOCAL ? CollectiveBackendType::HOST : CollectiveBackendType::UPI;
             if (scope == TPScope::GLOBAL || scope == TPScope::NODE_LOCAL)
                 domain.explicit_ranks = {0, 1};
             else
@@ -30,7 +30,7 @@ namespace llaminar2::test
         {
             RoutedExpertDomain domain;
             domain.name = name;
-            domain.scope = ExecutionDomainScope::LOCAL;
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
             domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
             domain.backend = CollectiveBackendType::RCCL;
             domain.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
@@ -52,8 +52,8 @@ namespace llaminar2::test
         {
             switch (scope)
             {
-            case TPScope::LOCAL:
-                return ExecutionDomainScope::LOCAL;
+            case TPScope::RANK_LOCAL:
+                return ExecutionDomainScope::RANK_LOCAL;
             case TPScope::NODE_LOCAL:
                 return ExecutionDomainScope::NODE_LOCAL;
             case TPScope::GLOBAL:
@@ -107,7 +107,7 @@ namespace llaminar2::test
 
     TEST(Test__MoEContinuationConfig, LocalTPContinuationKeepsRoutedTensorShardingIndependent)
     {
-        expectContinuationConfigPreservesIndependentRoutedTensorSharding(TPScope::LOCAL);
+        expectContinuationConfigPreservesIndependentRoutedTensorSharding(TPScope::RANK_LOCAL);
     }
 
     TEST(Test__MoEContinuationConfig, GlobalTPContinuationKeepsRoutedTensorShardingIndependent)

@@ -27,6 +27,7 @@
 
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -38,6 +39,40 @@ namespace llaminar2
     // Forward declarations
     class TensorBase;
     class IWorkerGPUContext;
+
+    /**
+     * @brief Request-scoped authority over one scheduled prefill graph submission.
+     *
+     * Heterogeneous ExpertOverlay execution has an explicit host-visible ticket
+     * boundary even though model state and sparse payloads remain device-owned.
+     * The authority that opens that ticket must therefore remain alive from
+     * chunk admission through the exact executable launch and local submission
+     * result.  This lease gives ForwardExecutionEngine one typed lifetime for
+     * that boundary without teaching the engine about any particular MoE
+     * transport or topology.
+     *
+     * A host without an external graph authority returns no lease.  A host that
+     * returns a lease must finish it exactly once after execute() returns; its
+     * destructor is responsible for failing an abandoned transaction during an
+     * exception or early exit.
+     */
+    class IPrefillChunkGraphSubmissionLease
+    {
+    public:
+        virtual ~IPrefillChunkGraphSubmissionLease() = default;
+
+        /**
+         * @brief Publish the local submission result and close this lease.
+         *
+         * @param execution_succeeded Whether the production graph was submitted
+         *        successfully on its owned execution stream.
+         * @param error Receives a precise lifecycle diagnostic on failure.
+         * @return True when the external authority accepted the terminal state.
+         */
+        virtual bool finish(
+            bool execution_succeeded,
+            std::string *error) = 0;
+    };
 
     /**
      * @brief Host interface for ForwardExecutionEngine callbacks
@@ -203,27 +238,57 @@ namespace llaminar2
             return true;
         }
 
-        // ----- Logits Publication -----
+        /**
+         * @brief Consume graph-build device-state readiness before setup capture.
+         *
+         * Setup-owned graph families capture and instantiate an executable without
+         * launching it. They therefore do not enter the ordinary live-state
+         * prelude, but graph-builder uploads still need one exact-stream consumer
+         * before another family member may reuse the publication event. The host
+         * queues that event wait on @p capture_stream and retires only the
+         * graph-build publication; request admission, reset, and mutable inference
+         * state remain untouched.
+         *
+         * Lightweight hosts have no asynchronous graph-build publication and may
+         * retain the default no-op implementation.
+         *
+         * @param input Setup-only forward invocation being materialized.
+         * @param capture_stream Exact non-null stream that will record the graph.
+         * @param execution_device GPU that owns @p capture_stream.
+         * @return true when no publication was pending or its wait was enqueued.
+         */
+        virtual bool prepareGraphBuildStateForMaterialization(
+            const ForwardInput &input,
+            void *capture_stream,
+            DeviceId execution_device)
+        {
+            (void)input;
+            (void)capture_stream;
+            (void)execution_device;
+            return true;
+        }
+
+        // ----- Forward-Result Publication -----
 
         /**
-         * @brief Publish the graph-declared logits tensor on its producer stream.
+         * @brief Publish the graph-declared result tensor on its producer stream.
          *
-         * The graph builder is the sole authority for which tensor is the
-         * forward result. GPU implementations record a completion event on
-         * `producer_stream` for that exact tensor. They must not reselect a
-         * tensor from mutable runtime mode flags, synchronize the stream/device,
-         * or materialize the result on the host. An explicit host result accessor
-         * performs the eventual D2H transfer when one is actually requested.
+         * The graph builder is the sole authority for the concrete result:
+         * terminal stages publish `ForwardOutput::logits`, while an explicitly
+         * configured non-head pipeline stage publishes
+         * `ForwardOutput::hidden`. GPU implementations record a completion event
+         * on the exact stream in `ForwardOutput::execution`. They must not
+         * reselect storage from mutable runtime mode flags, synchronize the
+         * stream/device, or materialize the result on the host. An explicit host
+         * result accessor performs the eventual D2H transfer when requested.
          *
-         * @param logits Graph-declared tensor written by the terminal projection.
-         * @param ctx Context for the device that owns the published logits.
-         * @param producer_stream Exact stream that produced the logits.
+         * @param output Graph-declared tensors and exact execution provenance.
+         * @param ctx Context for the device that owns the published result.
          * @return true when device ownership and completion are published.
          */
-        virtual bool publishLogitsAtBoundary(
-            TensorBase *logits,
-            IDeviceContext *ctx,
-            void *producer_stream) = 0;
+        virtual bool publishForwardResultAtBoundary(
+            const ForwardOutput &output,
+            IDeviceContext *ctx) = 0;
 
         /**
          * @brief Commit one successful engine invocation to its semantic owner.
@@ -566,6 +631,102 @@ namespace llaminar2
             (void)decision;
             return true;
         }
+
+        /**
+         * @brief Admit and bind one scheduled prefill graph to an external authority.
+         *
+         * The engine calls this after constructing the chunk-specific
+         * ForwardInput and immediately before execute().  Implementations may
+         * stamp transaction identity into @p chunk_input and install its exact
+         * graph-launch dependency.  Any returned lease remains alive until the
+         * delegated execution result has been published through finish().
+         *
+         * The default represents a graph with no external transaction authority.
+         * It deliberately returns an empty lease rather than inventing a host
+         * synchronization boundary.
+         *
+         * @param chunk_input Mutable chunk view that will be passed to execute().
+         * @param chunk Immutable scheduler geometry for this submission.
+         * @param lease Receives the request-scoped authority, when one is active.
+         * @param error Receives an admission or binding diagnostic on failure.
+         * @return True when the chunk may be submitted.
+         */
+        virtual bool beginPrefillChunkGraphSubmission(
+            ForwardInput &chunk_input,
+            const PrefillChunkPlan &chunk,
+            std::unique_ptr<IPrefillChunkGraphSubmissionLease> *lease,
+            std::string *error)
+        {
+            (void)chunk_input;
+            (void)chunk;
+            if (lease)
+                lease->reset();
+            if (error)
+                error->clear();
+            return true;
+        }
+
+        /**
+         * @brief Begin the diagnostic namespace for one ordered prefill chunk.
+         *
+         * Production graph execution does not depend on this hook. Hosts that
+         * retain parity snapshots use it to preserve every real-row checkpoint
+         * under an immutable chunk ordinal while the graph executor publishes
+         * its post-launch diagnostic copies. The hook runs on the diagnostic
+         * host boundary and may retain host artifact metadata, but it must never
+         * alter live inference state, captured graph topology, or stream order.
+         *
+         * @param chunk Scheduler-owned real/bucket geometry about to execute.
+         */
+        virtual void beginPrefillChunkSnapshotDiagnostics(
+            const PrefillChunkPlan &chunk)
+        {
+            (void)chunk;
+        }
+
+        /**
+         * @brief End the diagnostic namespace begun for one prefill chunk.
+         *
+         * The engine invokes this through an RAII scope, including failed and
+         * exceptional graph attempts, so a later request cannot inherit an
+         * obsolete chunk namespace.
+         *
+         * @param chunk Scheduler-owned chunk whose diagnostic scope is ending.
+         */
+        virtual void endPrefillChunkSnapshotDiagnostics(
+            const PrefillChunkPlan &chunk)
+        {
+            (void)chunk;
+        }
+
+        /**
+         * @brief Publish complete prompt-wide snapshots after all chunks succeed.
+         *
+         * A host may replace the historical bare snapshot keys, which otherwise
+         * contain only the final chunk, with an ordered concatenation of the
+         * context-qualified live rows. Returning false rejects the request's
+         * diagnostic transaction rather than silently comparing an incomplete
+         * checkpoint against a full reference prompt.
+         *
+         * @param schedule Successfully executed scheduler plan.
+         * @return True when diagnostics are complete or the host does not
+         *         retain snapshots.
+         */
+        virtual bool finalizePrefillChunkSnapshotDiagnostics(
+            const PrefillChunkSchedule &schedule)
+        {
+            (void)schedule;
+            return true;
+        }
+
+        /**
+         * @brief Discard pending segmented-prefill diagnostic bookkeeping.
+         *
+         * This is paired with a failed schedule and keeps a partial sequence
+         * from being mistaken for a later request's first chunk. Captured graph
+         * resources and live tensors remain untouched.
+         */
+        virtual void cancelPrefillChunkSnapshotDiagnostics() noexcept {}
     };
 
     /**
@@ -726,6 +887,32 @@ namespace llaminar2
             }
         };
 
+        /**
+         * @brief Immutable identity of one exact retained decode replay plan.
+         *
+         * Unlike @ref DeviceLoopGraphTemplateView, this view deliberately
+         * admits an explicitly segmented heterogeneous plan.  It does not
+         * expose the segment cache or an executable pointer: callers may use
+         * the identity only with @ref replayRetainedDecodeGraph, which keeps
+         * capture ownership and execution policy inside this engine.
+         */
+        struct RetainedDecodeGraphView
+        {
+            ForwardGraphSignature signature;
+            DeviceId device = DeviceId::invalid();
+            void *stream = nullptr;
+            size_t replay_unit_count = 0; ///< Executables submitted per invocation; one for a composed parent.
+            size_t source_capture_unit_count = 0; ///< Native child templates represented by the plan.
+            bool segmented = false; ///< True only for host-sequenced heterogeneous replay.
+            bool composed_parent = false; ///< True when one device parent owns all source units.
+
+            explicit operator bool() const noexcept
+            {
+                return device.is_gpu() && stream != nullptr &&
+                       replay_unit_count > 0;
+            }
+        };
+
         struct ReplayCacheObservation
         {
             ForwardGraphSignature signature;
@@ -806,6 +993,75 @@ namespace llaminar2
         deviceLoopGraphTemplate(
             const ForwardGraphSignature &signature,
             std::string *error = nullptr) const;
+
+        /**
+         * @brief Inspect one exact retained decode graph without requiring monolithic capture.
+         *
+         * The cache entry must already be in steady replay state and must own
+         * device-resident token and position inputs.  Both a single native
+         * capture and a typed heterogeneous segmented plan are valid; warmup,
+         * recapture, eager execution, and stale cache lookup are rejected.
+         *
+         * @param signature Complete immutable forward-cache identity.
+         * @param error Optional first violated retained-replay invariant.
+         * @return Read-only identity for an exact replay-ready plan.
+         */
+        std::optional<RetainedDecodeGraphView> retainedDecodeGraph(
+            const ForwardGraphSignature &signature,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Export the active native units of one exact retained decode graph.
+         *
+         * This is the topology-aware companion to @ref deviceLoopGraphTemplate.
+         * A heterogeneous sparse parent may need to insert mapped timeline nodes
+         * between LocalTP-coordinated capture units, so a monolithic child is not
+         * always the correct composition boundary. Every returned unit has already
+         * passed the strict cache-level retained-plan contract; manual replay units
+         * and per-replay host preparation remain hard failures.
+         *
+         * The returned views borrow graph-cache storage and are setup-only. They
+         * neither launch the graph nor authorize the ordinary segmented host
+         * controller to remain in the inference path.
+         *
+         * @param signature Complete immutable forward-cache identity.
+         * @param error Optional first violated retained-plan invariant.
+         * @return Ordered active native capture units for parent composition.
+         */
+        std::optional<std::vector<
+            DeviceGraphExecutor::GraphSegmentCache::
+                RetainedCaptureUnitTemplateView>>
+        retainedDecodeCaptureUnitTemplates(
+            const ForwardGraphSignature &signature,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Replay one exact retained decode plan with a new sparse wire identity.
+         *
+         * This is the hosted heterogeneous counterpart to cloning a monolithic
+         * child into a native CUDA conditional parent.  It launches the already
+         * captured production plan on its owned stream, including declared
+         * sparse-collective manual boundaries, and never warms, captures,
+         * allocates, synchronizes, or substitutes eager execution.
+         *
+         * @param signature Exact cache identity returned by retainedDecodeGraph().
+         * @param ctx Device context used by the retained plan.
+         * @param sparse_params Root-authoritative generation/operation identity.
+         * @param launch_dependency Exact pre-launch edge used to arm an
+         *        external heterogeneous follower after native graph setup.
+         * @param out_producer_stream Receives the exact replay producer stream.
+         * @param error Optional first violated lifecycle invariant.
+         * @return True after the retained plan has been enqueued successfully.
+         */
+        bool replayRetainedDecodeGraph(
+            const ForwardGraphSignature &signature,
+            IDeviceContext *ctx,
+            const IComputeStage::MoEOverlayCollectiveRuntimeParams
+                &sparse_params,
+            const DeviceGraphExecutor::GraphLaunchDependencyHook
+                &launch_dependency,
+            void **out_producer_stream,
+            std::string *error = nullptr);
 
         /**
          * @brief Export the retained all-position verifier capture for composition.
@@ -1092,6 +1348,21 @@ namespace llaminar2
             bool is_decode,
             std::chrono::high_resolution_clock::time_point start);
 
+        /**
+         * @brief Capture and instantiate one cached GPU graph without execution.
+         *
+         * The cache entry, workspace generation, permanent input addresses, and
+         * explicit capture stream must already be installed. This setup boundary
+         * records native units and local-TP capture waves only; it never prepares
+         * live request state, executes manual segments, launches an executable,
+         * or publishes output provenance.
+         */
+        bool materializeCachedExecutableWithoutLaunch(
+            const ForwardInput &input,
+            ForwardGraphCache &forward_cache,
+            IForwardExecutionHost &host,
+            bool is_decode);
+
         // ----- Cache MISS execution path -----
         bool executeCacheMiss(
             const ForwardInput &input_in,
@@ -1109,19 +1380,24 @@ namespace llaminar2
             const ForwardInput &input,
             ForwardGraphCache &forward_cache,
             IDeviceContext *ctx,
-            IForwardExecutionHost &host);
+            IForwardExecutionHost &host,
+            bool *used_graph_replay = nullptr,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy
+                initial_submission =
+                    DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+                        CaptureInstantiateAndLaunch);
 
-        /** @brief Mark a bucketed prefill forward-cache entry as recently used. */
-        void touchBucketedPrefillForwardCache(
+        /** @brief Mark any exact or bucketed prefill topology entry as recently used. */
+        void touchPrefillForwardCache(
             const ForwardGraphSignature &signature,
             ForwardGraphCache &cache);
 
-        /** @brief Enforce the engine-level cap for reusable bucketed prefill forward graphs. */
-        void enforceBucketedPrefillForwardCapacity(
+        /** @brief Enforce the engine-level cap for all reusable prefill topologies. */
+        void enforcePrefillForwardCapacity(
             const ForwardGraphSignature *active_signature = nullptr);
 
-        /** @brief Count valid top-level bucketed prefill forward-cache entries. */
-        size_t bucketedPrefillForwardCacheSize() const;
+        /** @brief Count valid top-level exact and bucketed prefill cache entries. */
+        size_t prefillForwardCacheSize() const;
 
         // ----- GPU Stage Timeline collection -----
         void collectTimeline(
@@ -1138,8 +1414,8 @@ namespace llaminar2
 
         // ----- Cache -----
         std::unordered_map<ForwardGraphSignature, ForwardGraphCache, ForwardGraphSignatureHash> cache_;
-        uint64_t bucketed_prefill_forward_access_counter_ = 0;
-        uint64_t bucketed_prefill_forward_eviction_count_ = 0;
+        uint64_t prefill_forward_access_counter_ = 0;
+        uint64_t prefill_forward_eviction_count_ = 0;
         LastExecutedForwardGraphState last_executed_forward_graph_;
         LastExecutedForwardGraphState last_all_position_verifier_graph_;
 

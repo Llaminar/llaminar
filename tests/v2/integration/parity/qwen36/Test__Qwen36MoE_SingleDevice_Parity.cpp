@@ -3,7 +3,8 @@
  * @brief Single-device Qwen3.6 MoE parity tests (CPU, CUDA, ROCm)
  *
  * Mirrors the Qwen3.5 MoE layer-by-layer parity harness so Qwen3.6 MoE
- * divergences produce the usual snapshot CSV diagnostics for prefill/decode.
+ * divergences produce the usual snapshot CSV diagnostics from one production
+ * prefill/decode runner lifetime.
  */
 
 #include <gtest/gtest.h>
@@ -76,46 +77,9 @@ public:
     const TestConfig &getTestConfig() const { return GetParam(); }
 };
 
-TEST_P(Qwen36MoESingleDeviceParityTest, PrefillParity)
+TEST_P(Qwen36MoESingleDeviceParityTest, ProductionParity)
 {
-    auto summary = runSingleDevicePrefillParity();
-    assertParity(summary);
-}
-
-TEST_P(Qwen36MoESingleDeviceParityTest, DecodeParity)
-{
-    auto summary = runSingleDeviceDecodeParity();
-    assertDecodeParity(summary);
-}
-
-TEST_P(Qwen36MoESingleDeviceParityTest, SnapshotInfrastructure)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    auto embedding = loadPyTorchSnapshot("EMBEDDING");
-    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
-
-    ASSERT_TRUE(runner_ != nullptr);
-    runner_->forward(config_.token_ids.data(), config_.token_ids.size());
-
-    auto keys = runner_->getSnapshotKeys();
-    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
-
-    EXPECT_NE(std::find(keys.begin(), keys.end(), "EMBEDDING"), keys.end())
-        << "Missing EMBEDDING snapshot";
-    EXPECT_NE(std::find(keys.begin(), keys.end(), "LM_HEAD"), keys.end())
-        << "Missing LM_HEAD snapshot";
-
-    bool has_ffn_residual = false;
-    for (const auto &key : keys)
-    {
-        if (key.find("FFN_RESIDUAL") != std::string::npos)
-        {
-            has_ffn_residual = true;
-            break;
-        }
-    }
-    EXPECT_TRUE(has_ffn_residual) << "Missing FFN_RESIDUAL snapshot";
+    runProductionParityCampaign();
 }
 
 INSTANTIATE_TEST_SUITE_P(

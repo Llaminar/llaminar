@@ -56,7 +56,7 @@ namespace llaminar2::test
         {
             ExecutionDomainDefinition domain;
             domain.name = "dense_cont";
-            domain.scope = ExecutionDomainScope::LOCAL;
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
             domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
             domain.weights = {0.5f, 0.5f};
             domain.backend = CollectiveBackendType::HOST;

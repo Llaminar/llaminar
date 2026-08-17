@@ -6,10 +6,11 @@ observe only a compact serial-visible token result or the terminal response
 ledger produced after a complete device-owned generation request. Prefix-cache
 movement is the sole data-plane exception because RAM and disk are intentional
 cache tiers rather than execution-state mirrors. ROCm additionally permits one
-strictly authenticated 48-byte scheduler ticket per transaction: HIP graphs do
-not provide conditional nodes, so the host submits the already-captured branch
-named by this immutable control-plane snapshot without receiving mutable model
-state, verifier data, KV data, or draft tokens.
+strictly authenticated scheduler ticket per hosted transaction: 48 bytes for
+dynamic MTP and 60 bytes for homogeneous device-side MoE rebalancing. HIP
+graphs do not provide conditional nodes, so the host submits the
+already-captured branch named by this immutable control-plane snapshot without
+receiving mutable model state, verifier data, KV data, or draft tokens.
 
 PerfStats includes both semantic operation records and legacy aggregate
 ``transfer/d2h`` byte counters.  The aggregates do not identify the caller, so
@@ -48,9 +49,13 @@ _FINAL_RESPONSE_OPERATIONS = frozenset(
     }
 )
 
-_ROCM_HOST_DISPATCH_OPERATION = (
-    "device_generation_dispatch_ticket_d2h_submissions"
-)
+_ROCM_HOST_DISPATCH_OPERATIONS = {
+    "device_generation_dispatch_ticket_d2h_submissions": ("mtp", "48"),
+    "device_moe_rebalance_dispatch_ticket_d2h_submissions": (
+        "moe_rebalance",
+        "60",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -130,9 +135,11 @@ def _is_authenticated_rocm_scheduler_ticket(
     nodes and therefore may never emit this operation.
     """
 
-    if record.get("name") != _ROCM_HOST_DISPATCH_OPERATION:
+    operation = _ROCM_HOST_DISPATCH_OPERATIONS.get(str(record.get("name", "")))
+    if operation is None:
         return False
-    if str(record.get("domain", "")).lower() != "mtp":
+    expected_domain, expected_bytes = operation
+    if str(record.get("domain", "")).lower() != expected_domain:
         return False
     if not str(record.get("device", "")).lower().startswith("rocm:"):
         return False
@@ -142,7 +149,7 @@ def _is_authenticated_rocm_scheduler_ticket(
         for key, value in (record.get("tags") or {}).items()
     }
     return (
-        tags.get("bytes") == "48"
+        tags.get("bytes") == expected_bytes
         and tags.get("authority") == "immutable_scheduler_snapshot"
         and tags.get("state_payload") == "false"
     )

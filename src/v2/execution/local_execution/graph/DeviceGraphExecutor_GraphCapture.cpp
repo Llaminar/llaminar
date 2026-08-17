@@ -16,15 +16,19 @@
 #include "../coherence/CoherencePolicy.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/KernelProfiler.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../../memory/BufferArena.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
+#include "../../../collective/CollectiveTimeoutPolicy.h"
 #include "../../../transfer/TransferEngine.h"
 
 #include <algorithm>
+#include <chrono>
 #include <sstream>
+#include <thread>
 #include <unordered_set>
 
 namespace llaminar2
@@ -97,6 +101,200 @@ namespace llaminar2
             .stage_count = segment.stage_names.size(),
             .captured_node_count = segment.capture->nodeCount(),
         };
+    }
+
+    namespace
+    {
+        using SegmentCache = DeviceGraphExecutor::GraphSegmentCache;
+        using UnitInspection =
+            SegmentCache::RetainedCaptureUnitInspection;
+        using UnitView = SegmentCache::RetainedCaptureUnitTemplateView;
+
+        /** @brief Validate and export child captures for one exact lifecycle. */
+        std::optional<std::vector<UnitView>> inspectRetainedCaptureUnits(
+            const SegmentCache &cache,
+            const ComputeGraph &graph,
+            UnitInspection inspection,
+            std::string *error)
+        {
+        auto reject = [&](const std::string &reason)
+            -> std::optional<std::vector<UnitView>>
+        {
+            if (error)
+                *error = reason;
+            return std::nullopt;
+        };
+        if (error)
+            error->clear();
+
+        const auto &execution_order = graph.getExecutionOrder();
+        if (execution_order.empty())
+            return reject("source graph has no stages");
+        switch (inspection)
+        {
+        case UnitInspection::ReplayReady:
+            if (!cache.initialized || cache.needs_capture)
+                return reject("graph cache is not replay-ready");
+            break;
+        case UnitInspection::ParentComposition:
+            if (cache.initialized || !cache.needs_capture ||
+                cache.graph_replay_plan_policy !=
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::
+                        RequireRetainedParentComposition ||
+                cache.retained_parent_capture)
+            {
+                return reject(
+                    "graph cache is not in graph-only parent composition");
+            }
+            break;
+        }
+        if (!cache.capture_stream || cache.segments.empty())
+        {
+            return reject(
+                "retained capture plan has no exact stream or replay units");
+        }
+
+        std::vector<UnitView> views;
+        views.reserve(cache.segments.size());
+        std::vector<std::string_view> represented_stages;
+        represented_stages.reserve(execution_order.size());
+
+        for (size_t segment_index = 0u;
+             segment_index < cache.segments.size();
+             ++segment_index)
+        {
+            const DeviceGraphExecutor::GraphSegment &segment =
+                cache.segments[segment_index];
+            if (!segment.capturable)
+            {
+                return reject(
+                    "retained capture plan contains a manual replay unit at index " +
+                    std::to_string(segment_index));
+            }
+            if (segment.stage_names.empty() || !segment.capture ||
+                segment.capture->nodeCount() == 0u)
+            {
+                return reject(
+                    "retained capture plan has an incomplete native replay unit at index " +
+                    std::to_string(segment_index));
+            }
+            const bool executable_state_valid =
+                inspection == UnitInspection::ReplayReady
+                    ? segment.capture->hasExecutable()
+                    : !segment.capture->hasExecutable();
+            if (!executable_state_valid)
+            {
+                return reject(
+                    inspection == UnitInspection::ReplayReady
+                        ? "retained replay unit has no executable at index " +
+                              std::to_string(segment_index)
+                        : "retained parent child was instantiated before composition at index " +
+                              std::to_string(segment_index));
+            }
+            if (segment.capture->executionStream() != cache.capture_stream)
+            {
+                return reject(
+                    "retained capture plan has ambiguous producer-stream ownership at index " +
+                    std::to_string(segment_index));
+            }
+
+            for (const std::string &stage_name : segment.stage_names)
+            {
+                const ComputeNode *node = graph.getNode(stage_name);
+                if (!node || !node->stage)
+                {
+                    return reject(
+                        "retained capture plan contains an unresolved stage: " +
+                        stage_name);
+                }
+                if (node->stage->graphLaunchPreparationPolicy() ==
+                    GraphLaunchPreparationPolicy::CaptureAndReplay)
+                {
+                    return reject(
+                        "stage requires external preparation before every replay: " +
+                        stage_name);
+                }
+                represented_stages.emplace_back(stage_name);
+            }
+
+            /*
+             * Passive nodes are declarative rendezvous markers. They must occur
+             * in the exact source-graph position, but importing an empty native
+             * graph for them would invent device work and obscure authority.
+             */
+            for (const DeviceGraphExecutor::GraphSegment::PassiveCaptureWave &wave :
+                 segment.passive_capture_waves_after)
+            {
+                for (const std::string &stage_name :
+                     wave.declarative_noop_stage_names)
+                {
+                    const ComputeNode *node = graph.getNode(stage_name);
+                    if (!node || !node->stage ||
+                        !node->stage->isPassiveGraphCaptureNoOp())
+                    {
+                        return reject(
+                            "retained capture plan has an invalid passive stage: " +
+                            stage_name);
+                    }
+                    represented_stages.emplace_back(stage_name);
+                }
+            }
+
+            views.push_back(UnitView{
+                .capture = segment.capture.get(),
+                .stream = cache.capture_stream,
+                .stage_names = std::span<const std::string>(
+                    segment.stage_names.data(), segment.stage_names.size()),
+                .capture_wave_ordinal = segment.capture_wave_ordinal,
+                .capture_wave_identity = segment.capture_wave_identity,
+                .captured_node_count = segment.capture->nodeCount(),
+            });
+        }
+
+        if (represented_stages.size() != execution_order.size() ||
+            !std::equal(
+                represented_stages.begin(),
+                represented_stages.end(),
+                execution_order.begin(),
+                [](std::string_view represented, const std::string &expected)
+                {
+                    return represented == expected;
+                }))
+        {
+            return reject(
+                "retained capture units do not cover the complete source graph in execution order");
+        }
+        return views;
+        }
+    } // namespace
+
+    std::optional<std::vector<
+        DeviceGraphExecutor::GraphSegmentCache::
+            RetainedCaptureUnitTemplateView>>
+    DeviceGraphExecutor::GraphSegmentCache::retainedCaptureUnitTemplates(
+        const ComputeGraph &graph,
+        std::string *error) const
+    {
+        return inspectRetainedCaptureUnits(
+            *this,
+            graph,
+            RetainedCaptureUnitInspection::ReplayReady,
+            error);
+    }
+
+    std::optional<std::vector<
+        DeviceGraphExecutor::GraphSegmentCache::
+            RetainedCaptureUnitTemplateView>>
+    DeviceGraphExecutor::GraphSegmentCache::
+        retainedCaptureUnitTemplatesForParentComposition(
+            const ComputeGraph &graph,
+            std::string *error) const
+    {
+        return inspectRetainedCaptureUnits(
+            *this,
+            graph,
+            RetainedCaptureUnitInspection::ParentComposition,
+            error);
     }
 
     namespace
@@ -225,6 +423,11 @@ namespace llaminar2
     {
         if (capture_stream)
         {
+            if (capture_stream_ownership == CaptureStreamOwnership::None)
+            {
+                terminateGraphSegmentCacheLifecycle(
+                    "capture stream has no typed ownership contract");
+            }
             if (capture_device.is_valid() &&
                 device.is_valid() &&
                 !(capture_device == device))
@@ -261,6 +464,7 @@ namespace llaminar2
             LOG_ERROR("[GraphSegmentCache] Failed to create capture stream");
             return false;
         }
+        capture_stream_ownership = CaptureStreamOwnership::Owned;
         gpu_ctx_ref = ctx;
         capture_device = device.is_gpu() ? device : DeviceId::invalid();
         capture_context_from_pool = context_from_process_pool;
@@ -271,7 +475,54 @@ namespace llaminar2
         return true;
     }
 
-    void DeviceGraphExecutor::GraphSegmentCache::waitForCaptureStreamFence()
+    bool DeviceGraphExecutor::GraphSegmentCache::bindBorrowedCaptureStream(
+        IWorkerGPUContext *ctx,
+        void *stream,
+        DeviceId device,
+        bool context_from_process_pool)
+    {
+        if (!ctx || !stream || !device.is_gpu())
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Borrowed capture stream requires one live context, exact non-null stream, and GPU device");
+            return false;
+        }
+        if (capture_stream)
+        {
+            if (capture_stream_ownership != CaptureStreamOwnership::Borrowed ||
+                capture_stream != stream ||
+                (capture_device.is_valid() && !(capture_device == device)) ||
+                (gpu_ctx_ref && gpu_ctx_ref != ctx &&
+                 !capture_context_from_pool))
+            {
+                LOG_ERROR(
+                    "[GraphSegmentCache] Refusing to replace an established capture-stream ownership contract");
+                return false;
+            }
+            capture_device = device;
+            capture_context_from_pool =
+                capture_context_from_pool || context_from_process_pool;
+            if (!gpu_ctx_ref)
+                gpu_ctx_ref = ctx;
+            return true;
+        }
+        if (initialized || needs_capture || !segments.empty())
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Borrowed capture stream must be bound before graph materialization");
+            return false;
+        }
+
+        capture_stream = stream;
+        capture_stream_ownership = CaptureStreamOwnership::Borrowed;
+        gpu_ctx_ref = ctx;
+        capture_device = device;
+        capture_context_from_pool = context_from_process_pool;
+        return true;
+    }
+
+    void DeviceGraphExecutor::GraphSegmentCache::waitForCaptureStreamFence(
+        HostFenceWaitPolicy wait_policy)
     {
         if (!capture_stream)
             return;
@@ -291,7 +542,42 @@ namespace llaminar2
                 terminateGraphSegmentCacheLifecycle(
                     "capture stream event fence publication was rejected by the backend");
             }
-            if (!ctx->synchronizeEventChecked(sync_event))
+            if (wait_policy == HostFenceWaitPolicy::ActiveProgress)
+            {
+                const auto deadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(
+                        collective_timeout_policy::kDefaultCollectiveTimeoutMs);
+                std::size_t poll_count = 0;
+                for (;;)
+                {
+                    bool ready = false;
+                    if (!ctx->queryEventChecked(sync_event, ready))
+                    {
+                        terminateGraphSegmentCacheLifecycle(
+                            "capture stream active event query was rejected by the backend");
+                    }
+                    if (ready)
+                        break;
+
+                    ++poll_count;
+                    if ((poll_count & 63u) == 0u &&
+                        std::chrono::steady_clock::now() >= deadline)
+                    {
+                        terminateGraphSegmentCacheLifecycle(
+                            "capture stream active event fence exceeded the canonical 30-second deadline");
+                    }
+                    /*
+                     * Backend event queries already provide progress. Yield
+                     * only occasionally so a pathological long-running kernel
+                     * cannot monopolize its host CPU while preserving the
+                     * sub-millisecond wake-up required by sparse transactions.
+                     */
+                    if ((poll_count & 1023u) == 0u)
+                        std::this_thread::yield();
+                }
+            }
+            else if (!ctx->synchronizeEventChecked(sync_event))
             {
                 terminateGraphSegmentCacheLifecycle(
                     "capture stream event fence wait was rejected by the backend");
@@ -310,33 +596,49 @@ namespace llaminar2
         }
     }
 
+    void DeviceGraphExecutor::GraphSegmentCache::waitForManualHostTicketFence()
+    {
+        waitForCaptureStreamFence();
+        ++host_ticket_fence_count;
+    }
+
     void DeviceGraphExecutor::GraphSegmentCache::destroyCaptureStream()
     {
         if (!capture_stream)
         {
+            capture_stream_ownership = CaptureStreamOwnership::None;
             gpu_ctx_ref = nullptr;
             capture_device = DeviceId::invalid();
             capture_context_from_pool = false;
             return;
         }
 
-        IWorkerGPUContext *ctx =
-            requireLifecycleContext("capture stream destruction");
-        try
+        if (capture_stream_ownership == CaptureStreamOwnership::Owned)
         {
-            ctx->destroyStream(capture_stream);
+            IWorkerGPUContext *ctx =
+                requireLifecycleContext("capture stream destruction");
+            try
+            {
+                ctx->destroyStream(capture_stream);
+            }
+            catch (const std::exception &e)
+            {
+                terminateGraphSegmentCacheLifecycle(
+                    std::string("capture stream destruction threw: ") + e.what());
+            }
+            catch (...)
+            {
+                terminateGraphSegmentCacheLifecycle(
+                    "capture stream destruction threw an unknown exception");
+            }
         }
-        catch (const std::exception &e)
+        else if (capture_stream_ownership != CaptureStreamOwnership::Borrowed)
         {
             terminateGraphSegmentCacheLifecycle(
-                std::string("capture stream destruction threw: ") + e.what());
-        }
-        catch (...)
-        {
-            terminateGraphSegmentCacheLifecycle(
-                "capture stream destruction threw an unknown exception");
+                "capture stream destruction found an untyped ownership state");
         }
         capture_stream = nullptr;
+        capture_stream_ownership = CaptureStreamOwnership::None;
         gpu_ctx_ref = nullptr;
         capture_device = DeviceId::invalid();
         capture_context_from_pool = false;
@@ -511,7 +813,10 @@ namespace llaminar2
         std::span<const std::string> stage_names,
         DeviceId capture_device,
         void *capture_stream,
-        const char *context)
+        const char *context,
+        std::span<const BufferId> retained_parent_input_ids,
+        GraphCaptureDependencyLedger::ExternalInputAuthority
+            external_input_authority)
     {
         if (!capture_device.is_gpu() || !capture_stream)
         {
@@ -533,6 +838,9 @@ namespace llaminar2
          * owner is retained only after that BufferId decision has been made.
          */
         std::unordered_map<BufferId, size_t> latest_producer;
+        const std::unordered_set<BufferId> retained_parent_inputs(
+            retained_parent_input_ids.begin(),
+            retained_parent_input_ids.end());
 
         auto canonical_owner = [&](BufferId id,
                                    const std::string &stage_name,
@@ -590,6 +898,7 @@ namespace llaminar2
             const StageBufferContract contract = node->stage->bufferContract();
 
             std::unordered_map<const TensorBase *, size_t> internal_owners;
+            std::unordered_set<const TensorBase *> retained_parent_owners;
             std::unordered_set<const TensorBase *> external_owners;
             for (const auto &binding : contract.allArenaReads())
             {
@@ -601,12 +910,22 @@ namespace llaminar2
                 const auto producer = latest_producer.find(binding.id);
                 if (producer == latest_producer.end())
                 {
-                    if (internal_owners.count(owner) == 0)
+                    if (retained_parent_inputs.contains(binding.id))
+                    {
+                        external_owners.erase(owner);
+                        if (internal_owners.count(owner) == 0)
+                            retained_parent_owners.insert(owner);
+                    }
+                    else if (internal_owners.count(owner) == 0 &&
+                             retained_parent_owners.count(owner) == 0)
+                    {
                         external_owners.insert(owner);
+                    }
                     continue;
                 }
 
                 external_owners.erase(owner);
+                retained_parent_owners.erase(owner);
                 auto [it, inserted] =
                     internal_owners.emplace(owner, producer->second);
                 if (!inserted)
@@ -615,6 +934,8 @@ namespace llaminar2
 
             plan.external_inputs.assign(
                 external_owners.begin(), external_owners.end());
+            plan.retained_parent_inputs.assign(
+                retained_parent_owners.begin(), retained_parent_owners.end());
             plan.internal_inputs.reserve(internal_owners.size());
             for (const auto &[owner, producer_stage_index] : internal_owners)
             {
@@ -645,7 +966,8 @@ namespace llaminar2
                 capture_device,
                 capture_stream,
                 std::move(stage_plans),
-                capture_context);
+                capture_context,
+                external_input_authority);
         }
         catch (const std::exception &e)
         {
@@ -653,6 +975,275 @@ namespace llaminar2
                       << capture_context << "): " << e.what());
             return nullptr;
         }
+    }
+
+    bool DeviceGraphExecutor::recordGraphCaptureBody(
+        ComputeGraph &graph,
+        IDeviceContext *ctx,
+        IGPUGraphCapture *capture,
+        GraphCaptureRecordPurpose purpose,
+        const char *context)
+    {
+        const char *const capture_context =
+            context && context[0] != '\0'
+                ? context
+                : (purpose == GraphCaptureRecordPurpose::RetainedComposition
+                       ? "retained_graph_fragment"
+                       : "single_graph_capture");
+        if (!capture)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                << " requires a non-null capture owner");
+            return false;
+        }
+        if (!ctx || !ctx->deviceId().is_gpu())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                << " requires an exact GPU execution context");
+            return false;
+        }
+
+        void *const gpu_stream = capture->executionStream();
+        if (!gpu_stream)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                << " capture owner has no explicit execution stream");
+            return false;
+        }
+        if (purpose == GraphCaptureRecordPurpose::RetainedComposition &&
+            (capture->hasExecutable() || capture->nodeCount() != 0u))
+        {
+            LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                << " requires a pristine retained-child capture owner");
+            return false;
+        }
+
+        const auto &order = graph.getExecutionOrder();
+        if (order.empty())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                << " cannot record an empty graph");
+            return false;
+        }
+
+        /*
+         * A retained child is a complete participant-local compute unit. Device
+         * selection belongs to topology planning, so this recorder accepts any
+         * GPU backend but requires every node and stage to agree with the exact
+         * selected context. Cross-participant synchronization belongs to the
+         * parent transaction and may not be hidden inside the child.
+         */
+        for (const auto &name : order)
+        {
+            auto *node = graph.getNode(name);
+            if (!node || !node->stage)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                    << " contains a missing stage: " << name);
+                return false;
+            }
+            const DeviceId stage_device =
+                node->device.is_valid() ? node->device : node->stage->device();
+            if (stage_device != ctx->deviceId() ||
+                node->stage->device() != ctx->deviceId())
+            {
+                LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                    << " stage '" << name
+                                                    << "' does not belong to execution device "
+                                                    << ctx->deviceId().toString());
+                return false;
+            }
+            if (!node->stage->supportsBackend(ctx->backendType()))
+            {
+                LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                    << " stage '" << name
+                                                    << "' rejects selected backend");
+                return false;
+            }
+            if (node->stage->isCollectiveStage() ||
+                node->stage->isManualGraphBoundary() ||
+                node->stage->requiresHostGraphTicketFence())
+            {
+                LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                    << " stage '" << name
+                                                    << "' crosses the participant-local capture boundary");
+                return false;
+            }
+            if (purpose == GraphCaptureRecordPurpose::RetainedComposition &&
+                node->graph_capture_wave.has_value())
+            {
+                LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                    << " stage '" << name
+                                                    << "' embeds a domain capture wave owned by its parent transaction");
+                return false;
+            }
+            if (!node->stage->isGraphCapturable() &&
+                !node->stage->supportsGraphCaptureAfterLaunchPreparation())
+            {
+                LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                    << " stage '" << name
+                                                    << "' has no graph-capture implementation");
+                return false;
+            }
+        }
+
+        // Assign the exact capture stream before metadata preparation. Stages
+        // may create immutable pointer tables here, never during native capture.
+        for (const auto &name : order)
+        {
+            graph.getNode(name)->stage->setGPUStream(gpu_stream);
+        }
+
+        /*
+         * Cold capture has no eager execution to allocate arena scratch before
+         * stages build pointer-bearing launch descriptors. Bind every stable
+         * address first without transferring bytes or publishing authority.
+         */
+        if (!allocateGraphStorageForCapture(graph, ctx, capture_context))
+        {
+            LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                << " storage prebind failed");
+            return false;
+        }
+
+        for (const auto &name : order)
+        {
+            auto *node = graph.getNode(name);
+            if (!requiresGraphLaunchPreparation(
+                    node->stage->graphLaunchPreparationPolicy(),
+                    GraphLaunchPreparationPhase::Capture))
+            {
+                continue;
+            }
+            if (!node->stage->prepareGraphLaunch(ctx, gpu_stream))
+            {
+                LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                    << " launch preparation failed for stage '"
+                                                    << name << "'");
+                return false;
+            }
+        }
+
+        /*
+         * Preparation-dependent stages must now expose their strict readiness.
+         * A retained child also rejects per-replay preparation: its parent is
+         * device-owned and cannot safely re-enter stage C++ between epochs.
+         */
+        for (const auto &name : order)
+        {
+            auto *stage = graph.getNode(name)->stage.get();
+            if (!stage->isGraphCapturable())
+            {
+                const std::string readiness =
+                    stage->graphCaptureReadinessDebugString();
+                LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                    << " prepared stage '" << name
+                                                    << "' is not graph-capturable"
+                                                    << (readiness.empty() ? "" : "; ")
+                                                    << readiness);
+                return false;
+            }
+            if (purpose == GraphCaptureRecordPurpose::RetainedComposition &&
+                stage->graphLaunchPreparationPolicy() ==
+                    GraphLaunchPreparationPolicy::CaptureAndReplay)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                    << " stage '" << name
+                                                    << "' requires host launch preparation on every replay");
+                return false;
+            }
+        }
+
+        /*
+         * Join all eager metadata/input producers before beginCapture(). Once
+         * recording starts, every dependency must be internal to this child.
+         */
+        if (!prepareGraphStorageForCapture(
+                graph, ctx, gpu_stream, capture_context))
+        {
+            LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                << " storage preflight failed");
+            return false;
+        }
+
+        auto dependency_ledger = planGraphCaptureDependencies(
+            graph,
+            std::span<const std::string>(order.data(), order.size()),
+            ctx->deviceId(),
+            gpu_stream,
+            capture_context);
+        if (!dependency_ledger)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                << " dependency planning failed");
+            return false;
+        }
+
+        ScopedBackendGraphCapture capture_transaction(
+            *capture,
+            capture_context,
+            dependency_ledger.get());
+        if (!capture_transaction.begin())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] " << capture_context
+                                                << " beginCapture failed");
+            return false;
+        }
+
+        DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
+        bool exec_success = true;
+        const StageRunPolicy capture_policy = StageRunPolicy::capturePhase();
+        for (const auto &name : order)
+        {
+            auto *node = graph.getNode(name);
+            if (!runStage(
+                    *node,
+                    ctx,
+                    capture_policy,
+                    /*is_collective=*/false))
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Stage failed during "
+                          << capture_context << ": " << name);
+                exec_success = false;
+                break;
+            }
+            graph.markCompleted(name);
+        }
+
+        // End capture unconditionally before inspecting failure or graph state.
+        capture_transaction.finish();
+        if (!exec_success)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] A stage failed during mandatory "
+                      << capture_context << "; refusing eager recovery");
+            capture->reset();
+            return false;
+        }
+        if (capture->nodeCount() == 0u)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Mandatory " << capture_context
+                                                          << " produced zero nodes; refusing capture-time eager execution");
+            capture->reset();
+            return false;
+        }
+
+        LOG_DEBUG("[DeviceGraphExecutor] Recorded " << capture->nodeCount()
+                                                     << " nodes for " << capture_context);
+        return true;
+    }
+
+    bool DeviceGraphExecutor::captureRetainedGraphFragment(
+        ComputeGraph &graph,
+        IDeviceContext *ctx,
+        IGPUGraphCapture *capture,
+        const char *context)
+    {
+        return recordGraphCaptureBody(
+            graph,
+            ctx,
+            capture,
+            GraphCaptureRecordPurpose::RetainedComposition,
+            context);
     }
 
     bool DeviceGraphExecutor::executeWithGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
@@ -738,124 +1329,13 @@ namespace llaminar2
             }
         }
 
-        const auto &order = graph.getExecutionOrder();
-
-        // Set GPU stream on all stages before any capture starts. Some stages
-        // own tiny graph metadata buffers and must upload them on this explicit
-        // stream before beginCapture(); doing so from execute() would record an
-        // illegal H2D operation into the graph.
-        for (const auto &name : order)
-        {
-            auto *node = graph.getNode(name);
-            if (node && node->stage)
-                node->stage->setGPUStream(gpu_stream);
-        }
-
-        for (const auto &name : order)
-        {
-            auto *node = graph.getNode(name);
-            if (!node || !node->stage ||
-                !requiresGraphLaunchPreparation(
-                    node->stage->graphLaunchPreparationPolicy(),
-                    GraphLaunchPreparationPhase::Capture))
-                continue;
-            if (!node->stage->prepareGraphLaunch(ctx, gpu_stream))
-            {
-                LOG_ERROR("[DeviceGraphExecutor] Graph launch metadata preparation failed before capture: "
-                          << name);
-                return false;
-            }
-        }
-
-        /*
-         * Stage-owned launch preparation may publish metadata on an eager
-         * stream. Import every resulting arena-read event onto the exact
-         * capture stream before beginCapture(); stage execution inside the
-         * transaction is validation-only and must never add an external wait.
-         */
-        if (!prepareGraphStorageForCapture(
+        if (!recordGraphCaptureBody(
                 graph,
                 ctx,
-                gpu_stream,
+                capture,
+                GraphCaptureRecordPurpose::ImmediateReplay,
                 "single_graph_capture"))
         {
-            LOG_ERROR("[DeviceGraphExecutor] Single-graph capture storage preflight failed");
-            return false;
-        }
-
-        auto dependency_ledger = planGraphCaptureDependencies(
-            graph,
-            std::span<const std::string>(order.data(), order.size()),
-            ctx->deviceId(),
-            gpu_stream,
-            "single_graph_capture");
-        if (!dependency_ledger)
-        {
-            LOG_ERROR(
-                "[DeviceGraphExecutor] Single-graph capture dependency planning failed");
-            return false;
-        }
-
-        // Step 1: Begin one structurally owned capture transaction.
-        ScopedBackendGraphCapture capture_transaction(
-            *capture,
-            "single-graph capture",
-            dependency_ledger.get());
-        if (!capture_transaction.begin())
-        {
-            LOG_ERROR("[DeviceGraphExecutor] GPU graph beginCapture failed");
-            return false;
-        }
-
-        // Step 2: Execute all stages into the captured stream
-        // Set GPU device once before the loop (same as executeFastDecode)
-        DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
-
-        bool exec_success = true;
-
-        const StageRunPolicy capture_policy = StageRunPolicy::capturePhase();
-        for (const auto &name : order)
-        {
-            auto *node = graph.getNode(name);
-            if (!node || !node->stage ||
-                !runStage(
-                    *node,
-                    ctx,
-                    capture_policy,
-                    /*is_collective=*/false))
-            {
-                LOG_ERROR("[DeviceGraphExecutor] Stage failed during graph capture: " << name);
-                exec_success = false;
-                break;
-            }
-            graph.markCompleted(name);
-        }
-
-        // Step 3: Always leave native stream-capture mode before branching.
-        capture_transaction.finish();
-        if (!exec_success)
-        {
-            LOG_ERROR(
-                "[DeviceGraphExecutor] A stage failed during mandatory "
-                "single-graph capture; refusing eager recovery");
-            capture->reset();
-            return false;
-        }
-
-        /*
-         * Selecting this API is an architectural assertion that every stage
-         * in the graph emitted replayable device work onto the owned capture
-         * stream. A zero-node result therefore means the stage binding,
-         * residency preflight, or stream propagation contract is broken.
-         * Treating the capture-time stage execution as a successful eager run
-         * would let production silently leave graph mode.
-         */
-        if (capture->nodeCount() == 0)
-        {
-            LOG_ERROR(
-                "[DeviceGraphExecutor] Mandatory GPU graph capture produced "
-                "zero nodes; refusing capture-time eager execution");
-            capture->reset();
             return false;
         }
 
@@ -947,7 +1427,8 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         const std::unordered_set<std::string> *collective_nodes,
         const DecodeCapturePolicy &policy,
-        bool *used_graph_replay)
+        bool *used_graph_replay,
+        GraphInitialSubmissionPolicy initial_submission)
     {
         if (used_graph_replay)
         {
@@ -980,13 +1461,21 @@ namespace llaminar2
                 policy.defer_final_sync,
                 policy.capture_boundary,
                 policy.graph_replay_plan_policy,
-                policy.launch_dependency);
+                policy.launch_dependency,
+                {},
+                policy.retained_parent_composer,
+                initial_submission);
 
             if (success)
             {
                 if (used_graph_replay)
                 {
                     *used_graph_replay = true;
+                }
+                if (initial_submission ==
+                    GraphInitialSubmissionPolicy::MaterializeWithoutLaunch)
+                {
+                    return true;
                 }
                 return publishSnapshotsAfterGraphExecution(
                     graph,
@@ -1035,7 +1524,13 @@ namespace llaminar2
                                                                bool defer_final_sync,
                                                                GraphCaptureBoundaryHook capture_boundary,
                                                                GraphReplayPlanPolicy plan_policy,
-                                                               GraphLaunchDependencyHook launch_dependency)
+                                                               GraphLaunchDependencyHook launch_dependency,
+                                                               std::span<const BufferId>
+                                                                   event_published_outputs,
+                                                               RetainedParentCompositionHook
+                                                                   retained_parent_composer,
+                                                               GraphInitialSubmissionPolicy
+                                                                   initial_submission)
     {
         if (!gpu_stream || !gpu_ctx)
         {
@@ -1044,6 +1539,574 @@ namespace llaminar2
         }
 
         const bool has_collective_nodes = (collective_nodes && !collective_nodes->empty());
+        const bool retained_parent_requested =
+            plan_policy ==
+            GraphReplayPlanPolicy::RequireRetainedParentComposition;
+        const bool retained_full_graph_requested =
+            segment_cache.steady_replay_host_policy ==
+            GraphSegmentCache::SteadyReplayHostPolicy::RetainedFullGraph;
+        const bool materialize_without_launch =
+            initial_submission ==
+            GraphInitialSubmissionPolicy::MaterializeWithoutLaunch;
+
+        const bool cache_state_consistent =
+            (!segment_cache.initialized &&
+             segment_cache.executable_submission_state ==
+                 GraphSegmentCache::ExecutableSubmissionState::Empty) ||
+            (segment_cache.initialized &&
+             segment_cache.executable_submission_state !=
+                 GraphSegmentCache::ExecutableSubmissionState::Empty);
+        if (!cache_state_consistent)
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Graph cache materialization and executable submission states disagree");
+            return false;
+        }
+
+        if (retained_parent_requested !=
+            static_cast<bool>(retained_parent_composer))
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Retained parent policy and topology composer must be supplied together");
+            return false;
+        }
+        if (retained_parent_requested &&
+            (!ctx || !defer_final_sync || retained_full_graph_requested))
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Retained parent replay requires an exact device context, deferred completion ownership, and no competing retained-full-graph policy");
+            return false;
+        }
+        if (materialize_without_launch &&
+            (segment_cache.initialized || launch_dependency ||
+             !event_published_outputs.empty() || config_.snapshot_callback))
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Setup-only materialization requires one "
+                "pristine cache and cannot publish launch, snapshot, or output "
+                "side effects");
+            return false;
+        }
+        if (segment_cache.initialized &&
+            segment_cache.graph_replay_plan_policy != plan_policy)
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Graph replay plan policy changed behind an initialized executable");
+            return false;
+        }
+
+        if (retained_full_graph_requested &&
+            (!ctx || has_collective_nodes || collectives_graph_capturable ||
+             plan_policy != GraphReplayPlanPolicy::RequireFullGraph ||
+             !defer_final_sync))
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Retained full-graph host replay requires "
+                "one non-collective executable, an exact device context, and "
+                "deferred completion ownership");
+            return false;
+        }
+
+        auto seal_retained_full_graph_plan = [&]() -> bool
+        {
+            if (!retained_full_graph_requested)
+                return true;
+            if (!segment_cache.initialized || segment_cache.needs_capture ||
+                segment_cache.segments.size() != 1u ||
+                !segment_cache.capture_stream)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Cannot seal an incomplete retained full-graph replay cache");
+                return false;
+            }
+
+            auto &segment = segment_cache.segments.front();
+            if (!segment.capturable || !segment.capture ||
+                !segment.capture->hasExecutable() ||
+                segment.capture->nodeCount() == 0u ||
+                segment.capture->executionStream() !=
+                    segment_cache.capture_stream ||
+                !segment.passive_capture_waves_after.empty() ||
+                !segment.arena_writes_cached)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained full-graph replay did not materialize one complete executable and publication plan");
+                return false;
+            }
+
+            const auto &execution_order = graph.getExecutionOrder();
+            const auto &execution_stages = graph.getExecutionStages();
+            if (execution_order.empty() ||
+                segment.stage_names != execution_order ||
+                execution_stages.size() != execution_order.size() ||
+                std::any_of(
+                    execution_stages.begin(),
+                    execution_stages.end(),
+                    [](const IComputeStage *stage)
+                    {
+                        return stage == nullptr;
+                    }))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained full-graph replay cannot freeze an incomplete or partial stage order");
+                return false;
+            }
+
+            auto &plan = segment_cache.retained_full_graph_replay;
+            plan.clear();
+            plan.graph = &graph;
+            plan.topology_generation = graph.topologyGeneration();
+            plan.snapshot_configuration_epoch =
+                segment_cache.snapshot_configuration_epoch;
+            plan.capture_variant_signature =
+                segment_cache.capture_variant_signature;
+            plan.stages.assign(
+                execution_stages.begin(), execution_stages.end());
+            plan.stage_variant_signatures.reserve(plan.stages.size());
+            for (const IComputeStage *stage : plan.stages)
+            {
+                plan.stage_variant_signatures.push_back(
+                    stage->graphCaptureVariantSignature());
+            }
+            if (!plan.valid())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained full-graph replay produced an invalid sealed identity");
+                plan.clear();
+                return false;
+            }
+            return true;
+        };
+
+        auto seal_retained_parent_plan = [&]() -> bool
+        {
+            if (!retained_parent_requested)
+                return true;
+            if (!segment_cache.initialized || segment_cache.needs_capture ||
+                !segment_cache.capture_stream ||
+                !segment_cache.retained_parent_capture ||
+                !segment_cache.retained_parent_capture->hasExecutable() ||
+                segment_cache.retained_parent_capture->nodeCount() == 0u ||
+                segment_cache.retained_parent_capture->executionStream() !=
+                    segment_cache.capture_stream ||
+                segment_cache.segments.empty())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Cannot seal an incomplete retained parent executable");
+                return false;
+            }
+
+            const auto &execution_order = graph.getExecutionOrder();
+            const auto &execution_stages = graph.getExecutionStages();
+            if (execution_order.empty() ||
+                execution_stages.size() != execution_order.size() ||
+                std::any_of(
+                    execution_stages.begin(),
+                    execution_stages.end(),
+                    [](const IComputeStage *stage)
+                    {
+                        return stage == nullptr;
+                    }))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained parent cannot freeze an incomplete source graph");
+                return false;
+            }
+
+            auto &plan = segment_cache.retained_composed_parent_replay;
+            plan.clear();
+            plan.graph = &graph;
+            plan.topology_generation = graph.topologyGeneration();
+            plan.snapshot_configuration_epoch =
+                segment_cache.snapshot_configuration_epoch;
+            plan.capture_variant_signature =
+                segment_cache.capture_variant_signature;
+            plan.child_unit_count = segment_cache.segments.size();
+            plan.stages.assign(
+                execution_stages.begin(), execution_stages.end());
+            plan.stage_variant_signatures.reserve(plan.stages.size());
+            for (const IComputeStage *stage : plan.stages)
+            {
+                plan.stage_variant_signatures.push_back(
+                    stage->graphCaptureVariantSignature());
+            }
+
+            for (const auto &segment : segment_cache.segments)
+            {
+                if (!segment.capturable || !segment.capture ||
+                    segment.capture->hasExecutable() ||
+                    segment.capture->nodeCount() == 0u ||
+                    segment.capture->executionStream() !=
+                        segment_cache.capture_stream ||
+                    !segment.arena_writes_cached)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Retained parent source child or publication plan changed before sealing");
+                    plan.clear();
+                    return false;
+                }
+                for (const auto &write : segment.cached_arena_writes)
+                {
+                    const bool duplicate = std::any_of(
+                        plan.arena_writes.begin(),
+                        plan.arena_writes.end(),
+                        [&](const GraphSegment::ArenaWriteBinding &existing)
+                        {
+                            return existing.id == write.id &&
+                                   existing.device == write.device;
+                        });
+                    if (!duplicate)
+                        plan.arena_writes.push_back(write);
+                }
+            }
+            if (!plan.valid())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained parent produced an invalid sealed identity");
+                plan.clear();
+                return false;
+            }
+
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "retained_parent_executable_nodes",
+                static_cast<double>(
+                    segment_cache.retained_parent_capture->nodeCount()),
+                "decode",
+                ctx->deviceId().toString(),
+                {{"context", segment_cache.perf_context},
+                 {"child_units", std::to_string(plan.child_unit_count)}});
+            return true;
+        };
+
+        auto &retained_parent_plan =
+            segment_cache.retained_composed_parent_replay;
+        if (retained_parent_plan.valid())
+        {
+            if (!retained_parent_requested ||
+                retained_parent_plan.graph != &graph ||
+                retained_parent_plan.topology_generation !=
+                    graph.topologyGeneration())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained parent replay rejected a changed policy or stale graph topology generation");
+                return false;
+            }
+
+            const auto &parent_exec_env = debugEnv().execution;
+            if (parent_exec_env.gpu_graph_verify ||
+                parent_exec_env.gpu_graph_stream_only)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained parent replay cannot be replaced by child-wise verification or stream-only execution");
+                return false;
+            }
+
+            bool stage_variant_changed = false;
+            for (size_t index = 0;
+                 index < retained_parent_plan.stages.size();
+                 ++index)
+            {
+                IComputeStage *const stage =
+                    retained_parent_plan.stages[index];
+                if (!stage ||
+                    stage->graphCaptureVariantSignature() !=
+                        retained_parent_plan.stage_variant_signatures[index])
+                {
+                    stage_variant_changed = true;
+                    break;
+                }
+            }
+
+            const bool diagnostic_recapture =
+                force_recapture || parent_exec_env.gpu_graph_recapture;
+            const bool snapshot_topology_changed =
+                retained_parent_plan.snapshot_configuration_epoch !=
+                    snapshot_configuration_epoch_;
+            if (stage_variant_changed || diagnostic_recapture ||
+                snapshot_topology_changed)
+            {
+                segment_cache.reset(
+                    GraphSegmentCache::StreamResetPolicy::Preserve);
+                if (stage_variant_changed)
+                    ++segment_cache.variant_recapture_count;
+            }
+            else
+            {
+                if (!segment_cache.initialized || segment_cache.needs_capture ||
+                    !segment_cache.retained_parent_capture ||
+                    !segment_cache.retained_parent_capture->hasExecutable() ||
+                    segment_cache.retained_parent_capture->executionStream() !=
+                        segment_cache.capture_stream ||
+                    segment_cache.capture_device != ctx->deviceId() ||
+                    segment_cache.gpu_ctx_ref != gpu_ctx ||
+                    retained_parent_plan.capture_variant_signature !=
+                        segment_cache.capture_variant_signature)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Retained parent executable or cache identity changed after sealing");
+                    return false;
+                }
+
+                const auto submission_state =
+                    segment_cache.executable_submission_state;
+                const bool initial_launch_pending =
+                    submission_state ==
+                    GraphSegmentCache::ExecutableSubmissionState::
+                        MaterializedUnlaunched;
+                if (!initial_launch_pending &&
+                    submission_state !=
+                        GraphSegmentCache::ExecutableSubmissionState::
+                            ReplayReady)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Retained parent has an executable but no valid submission state");
+                    return false;
+                }
+
+                const auto transition =
+                    DeviceGraphCaptureController::beginStep(
+                        segment_cache.initialized,
+                        segment_cache.needs_capture,
+                        segment_cache.decode_step);
+                if (transition.phase !=
+                    DeviceGraphCaptureController::Phase::Replay)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Retained parent reached a non-replay phase after sealing");
+                    return false;
+                }
+                if (launch_dependency &&
+                    !launch_dependency(
+                        initial_launch_pending
+                            ? GraphExecutableLaunchPhase::InitialTransaction
+                            : GraphExecutableLaunchPhase::SteadyReplay,
+                        segment_cache.capture_stream))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Retained parent launch dependency failed on the exact execution stream");
+                    return false;
+                }
+                if (!segment_cache.retained_parent_capture->launch())
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Retained parent executable launch failed");
+                    return false;
+                }
+
+                for (const auto &write : retained_parent_plan.arena_writes)
+                {
+                    if (!arena_)
+                        break;
+                    const bool requires_external_event =
+                        std::find(
+                            event_published_outputs.begin(),
+                            event_published_outputs.end(),
+                            write.id) != event_published_outputs.end();
+                    if (config_.snapshot_callback || requires_external_event)
+                    {
+                        arena_->markWritten(
+                            write.id,
+                            write.device,
+                            segment_cache.capture_stream);
+                    }
+                    else
+                    {
+                        arena_->markWrittenFlagsOnly(
+                            write.id, write.device);
+                    }
+                }
+                for (auto &segment : segment_cache.segments)
+                    segment.last_executed_step = transition.decode_step;
+                segment_cache.executable_submission_state =
+                    GraphSegmentCache::ExecutableSubmissionState::ReplayReady;
+
+                if (PerfStatsCollector::isDomainEnabled("forward_graph"))
+                {
+                    PerfStatsCollector::addCounter(
+                        "forward_graph",
+                        initial_launch_pending
+                            ? "retained_parent_transaction_zero_launches"
+                            : "retained_parent_replays",
+                        1.0,
+                        "decode",
+                        ctx->deviceId().toString(),
+                        {{"context", segment_cache.perf_context},
+                         {"child_units", std::to_string(
+                             retained_parent_plan.child_unit_count)},
+                         {"materialized_during_setup",
+                          initial_launch_pending ? "true" : "false"}});
+                }
+                return true;
+            }
+        }
+        if (retained_parent_requested && segment_cache.initialized)
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Initialized retained-parent cache has no sealed parent replay plan; refusing child replay");
+            return false;
+        }
+
+        auto &retained_plan =
+            segment_cache.retained_full_graph_replay;
+        if (retained_plan.valid())
+        {
+            /*
+             * Check the owning graph and its scalar mutation generation before
+             * dereferencing any borrowed stage pointer. A changed generation is
+             * a stale executable identity, not permission to replay or infer a
+             * vaguely compatible topology.
+             */
+            if (retained_plan.graph != &graph ||
+                retained_plan.topology_generation !=
+                    graph.topologyGeneration())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained full-graph replay rejected a stale graph topology generation");
+                return false;
+            }
+
+            bool stage_variant_changed = false;
+            for (size_t index = 0; index < retained_plan.stages.size();
+                 ++index)
+            {
+                IComputeStage *const stage = retained_plan.stages[index];
+                if (!stage ||
+                    stage->graphCaptureVariantSignature() !=
+                        retained_plan.stage_variant_signatures[index])
+                {
+                    stage_variant_changed = true;
+                    break;
+                }
+            }
+            if (stage_variant_changed)
+            {
+                /*
+                 * A typed launch-topology variant change intentionally returns
+                 * to the capture lifecycle before submitting work. Resetting is
+                 * not an eager fallback: no stale executable is launched, and
+                 * the same mandatory graph mode is recaptured below.
+                 */
+                segment_cache.reset(
+                    GraphSegmentCache::StreamResetPolicy::Preserve);
+                ++segment_cache.variant_recapture_count;
+            }
+        }
+
+        const auto &exec_env = debugEnv().execution;
+        const bool retained_replay_instrumented =
+            exec_env.gpu_graph_verify || exec_env.gpu_graph_recapture ||
+            exec_env.gpu_graph_stream_only ||
+            exec_env.gpu_graph_trace_replay || force_recapture ||
+            static_cast<bool>(config_.snapshot_callback) ||
+            static_cast<bool>(capture_boundary) ||
+            static_cast<bool>(launch_dependency) ||
+            !event_published_outputs.empty() ||
+            KernelProfiler::isEnabled() ||
+            PerfStatsCollector::isDomainEnabled("forward_pass") ||
+            PerfStatsCollector::isDomainEnabled("forward_graph") ||
+            PerfStatsCollector::gpuStageEventTimingEnabled();
+
+        if (retained_full_graph_requested && retained_plan.valid() &&
+            !retained_replay_instrumented)
+        {
+            if (!segment_cache.initialized || segment_cache.needs_capture ||
+                segment_cache.snapshot_configuration_epoch !=
+                    snapshot_configuration_epoch_ ||
+                retained_plan.snapshot_configuration_epoch !=
+                    segment_cache.snapshot_configuration_epoch ||
+                retained_plan.capture_variant_signature !=
+                    segment_cache.capture_variant_signature ||
+                segment_cache.segments.size() != 1u ||
+                !segment_cache.capture_stream ||
+                segment_cache.capture_stream != gpu_stream ||
+                segment_cache.capture_device != ctx->deviceId() ||
+                segment_cache.gpu_ctx_ref != gpu_ctx ||
+                !segment_cache.replay_gpu_timing_slots.empty())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained full-graph replay identity or stream ownership changed after sealing");
+                return false;
+            }
+
+            auto &segment = segment_cache.segments.front();
+            if (!segment.capturable || !segment.capture ||
+                !segment.capture->hasExecutable() ||
+                segment.capture->executionStream() !=
+                    segment_cache.capture_stream ||
+                !segment.arena_writes_cached)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained full-graph executable or publication plan was invalidated after sealing");
+                return false;
+            }
+
+            bool device_activated_for_preparation = false;
+            for (size_t index = 0; index < retained_plan.stages.size();
+                 ++index)
+            {
+                IComputeStage *const stage = retained_plan.stages[index];
+                if (!requiresGraphLaunchPreparation(
+                        stage->graphLaunchPreparationPolicy(),
+                        GraphLaunchPreparationPhase::Replay))
+                {
+                    continue;
+                }
+
+                if (!device_activated_for_preparation)
+                {
+                    ctx->activateDevice();
+                    device_activated_for_preparation = true;
+                }
+                stage->setGPUStream(segment_cache.capture_stream);
+                if (!stage->prepareGraphLaunch(
+                        ctx, segment_cache.capture_stream))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Retained full-graph replay metadata preparation failed");
+                    return false;
+                }
+                if (stage->graphCaptureVariantSignature() !=
+                    retained_plan.stage_variant_signatures[index])
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Retained full-graph stage changed its launch topology during replay preparation");
+                    return false;
+                }
+            }
+
+            const auto transition = DeviceGraphCaptureController::beginStep(
+                segment_cache.initialized,
+                segment_cache.needs_capture,
+                segment_cache.decode_step);
+            if (transition.phase !=
+                DeviceGraphCaptureController::Phase::Replay)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained full-graph plan reached a non-replay phase after sealing");
+                return false;
+            }
+            if (!segment.capture->launch())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphExecutor] Retained full-graph executable launch failed");
+                return false;
+            }
+
+            /*
+             * The executable owns every write listed by the cold publication
+             * plan. No host observer exists in this policy, so authority can be
+             * advanced with flags only; the caller's explicit completion event
+             * remains the sole host boundary for the transaction.
+             */
+            if (arena_)
+            {
+                for (const auto &write : segment.cached_arena_writes)
+                    arena_->markWrittenFlagsOnly(write.id, write.device);
+            }
+            segment.last_executed_step = transition.decode_step;
+            return true;
+        }
 
         /*
          * Snapshot diagnostics change graph topology: every selected GPU stage
@@ -1107,14 +2170,25 @@ namespace llaminar2
             segment_cache.needs_capture,
             segment_cache.decode_step);
         const uint64_t current_step = phase_transition.decode_step;
-        PerfStatsCollector::addCounter(
-            "forward_graph",
-            "decode_graph_phase",
-            1.0,
-            "decode",
-            ctx ? ctx->deviceId().toString() : std::string{},
-            {{"context", segment_cache.perf_context},
-             {"phase", DeviceGraphCaptureController::phaseName(phase_transition.phase)}});
+        /*
+         * Tags are maps of owning strings. Constructing them before the
+         * collector rejects a disabled domain turns observability into a
+         * per-layer allocation tax, which is especially visible for one small
+         * retained graph on each sparse endpoint. Keep the producer-side gate
+         * outside argument evaluation so ordinary replay allocates nothing.
+         */
+        if (PerfStatsCollector::isDomainEnabled("forward_graph"))
+        {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "decode_graph_phase",
+                1.0,
+                "decode",
+                ctx ? ctx->deviceId().toString() : std::string{},
+                {{"context", segment_cache.perf_context},
+                 {"phase", DeviceGraphCaptureController::phaseName(
+                               phase_transition.phase)}});
+        }
 
         auto mark_arena_write_dirty = [&](BufferId id, DeviceId device)
         {
@@ -1130,7 +2204,13 @@ namespace llaminar2
              * ensureOnHost() waits for the captured kernels that produced the
              * tensor instead of racing a stale host copy.
              */
-            if (config_.snapshot_callback && segment_cache.capture_stream)
+            const bool requires_external_event =
+                std::find(
+                    event_published_outputs.begin(),
+                    event_published_outputs.end(),
+                    id) != event_published_outputs.end();
+            if ((config_.snapshot_callback || requires_external_event) &&
+                segment_cache.capture_stream)
                 arena_->markWritten(id, device, segment_cache.capture_stream);
             else
                 arena_->markWrittenFlagsOnly(id, device);
@@ -1175,13 +2255,36 @@ namespace llaminar2
         // (cohere_inputs is skipped for capturable segments, execute_node is
         // unused). Avoid constructing unused lambdas and skip phase 1/2 checks
         // to minimize host overhead on the hot decode path.
-        const auto &exec_env = debugEnv().execution;
         const bool replay_diagnostics_enabled =
             exec_env.gpu_graph_verify || exec_env.gpu_graph_recapture || force_recapture;
+        const bool materialized_transaction_zero_pending =
+            segment_cache.executable_submission_state ==
+            GraphSegmentCache::ExecutableSubmissionState::
+                MaterializedUnlaunched;
         if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay &&
-            !replay_diagnostics_enabled)
+            !replay_diagnostics_enabled &&
+            !materialized_transaction_zero_pending)
         {
             DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
+
+            const bool initial_launch_pending =
+                segment_cache.executable_submission_state ==
+                GraphSegmentCache::ExecutableSubmissionState::
+                    MaterializedUnlaunched;
+            GraphLaunchDependencyHook fast_launch_dependency =
+                launch_dependency;
+            if (initial_launch_pending && launch_dependency)
+            {
+                fast_launch_dependency =
+                    [dependency = std::move(launch_dependency)](
+                        GraphExecutableLaunchPhase,
+                        void *stream)
+                {
+                    return dependency(
+                        GraphExecutableLaunchPhase::InitialTransaction,
+                        stream);
+                };
+            }
 
             DeviceGraphCaptureController::ReplayHooks fast_hooks{
                 .cohere_inputs = nullptr,
@@ -1201,7 +2304,8 @@ namespace llaminar2
                         });
                 },
                 .capture_boundary = nullptr,
-                .launch_dependency = launch_dependency,
+                .launch_dependency = std::move(fast_launch_dependency),
+                .retained_parent_composer = retained_parent_composer,
             };
 
             const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
@@ -1213,6 +2317,21 @@ namespace llaminar2
             if (!replay_result.success)
             {
                 return false;
+            }
+
+            if (initial_launch_pending)
+            {
+                segment_cache.executable_submission_state =
+                    GraphSegmentCache::ExecutableSubmissionState::ReplayReady;
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "materialized_graph_transaction_zero_launches",
+                    1.0,
+                    "decode",
+                    ctx ? ctx->deviceId().toString() : std::string{},
+                    {{"context", segment_cache.perf_context},
+                     {"segments",
+                      std::to_string(segment_cache.segments.size())}});
             }
 
             return true;
@@ -1248,6 +2367,9 @@ namespace llaminar2
                     coherence_stream,
                     prepared_inputs,
                     prepared_outputs,
+                    materialize_without_launch
+                        ? GraphCaptureInputFrontierPolicy::BindAddressesOnly
+                        : GraphCaptureInputFrontierPolicy::RequireReadyBytes,
                     "cached_graph_segment"))
             {
                 return false;
@@ -1291,12 +2413,51 @@ namespace llaminar2
                 [&](ComputeNode &node,
                     const std::vector<BufferBinding> &external_reads)
                 {
+                    std::vector<BufferBinding> strict_external_reads;
+                    strict_external_reads.reserve(external_reads.size());
+                    for (const auto &binding : external_reads)
+                    {
+                        if (!std::binary_search(
+                                seg.retained_parent_input_ids.begin(),
+                                seg.retained_parent_input_ids.end(),
+                                binding.id))
+                        {
+                            strict_external_reads.push_back(binding);
+                        }
+                    }
+
+                    /*
+                     * Retained-parent inputs already have device storage from
+                     * prebinding, but no completed global generation exists
+                     * while child templates are recorded. Only true frontier
+                     * inputs may join coherence events before beginCapture().
+                     */
                     return cohere_replay_stage(
                         node,
-                        external_reads,
+                        strict_external_reads,
                         prepared_inputs,
                         prepared_outputs);
                 });
+        };
+
+        auto prebind_segment_storage = [&](const GraphSegment &seg) -> bool
+        {
+            std::unordered_set<ITensor *> allocated;
+            for (const auto &stage_name : seg.stage_names)
+            {
+                ComputeNode *node = graph.getNode(stage_name);
+                if (!node || !node->stage)
+                    continue;
+                if (!allocateStageArenaStorageForCapture(
+                        *node,
+                        ctx->deviceId(),
+                        allocated,
+                        "cached_graph_segment_prebind"))
+                {
+                    return false;
+                }
+            }
+            return true;
         };
 
         auto plan_capture_dependencies = [&](const GraphSegment &seg)
@@ -1308,7 +2469,15 @@ namespace llaminar2
                     seg.stage_names.data(), seg.stage_names.size()),
                 ctx->deviceId(),
                 segment_cache.capture_stream,
-                "cached_graph_segment");
+                "cached_graph_segment",
+                std::span<const BufferId>(
+                    seg.retained_parent_input_ids.data(),
+                    seg.retained_parent_input_ids.size()),
+                materialize_without_launch
+                    ? GraphCaptureDependencyLedger::ExternalInputAuthority::
+                          BindDeclaredAddressesOnly
+                    : GraphCaptureDependencyLedger::ExternalInputAuthority::
+                          RequireReadyBytes);
         };
 
         DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
@@ -1321,9 +2490,12 @@ namespace llaminar2
         };
 
         const StageRunPolicy capture_phase_policy =
-            StageRunPolicy::capturePhase();
+            materialize_without_launch
+                ? StageRunPolicy::setupGraphMaterialization()
+                : StageRunPolicy::capturePhase();
 
         DeviceGraphCaptureController::ReplayHooks replay_hooks{
+            .prebind_storage = prebind_segment_storage,
             .cohere_inputs = [&](const GraphSegment &segment)
             {
                 return cohere_segment_inputs(segment);
@@ -1349,12 +2521,14 @@ namespace llaminar2
             },
             .capture_boundary = capture_boundary,
             .launch_dependency = launch_dependency,
+            .retained_parent_composer = retained_parent_composer,
             .plan_capture_dependencies = plan_capture_dependencies,
         };
 
         // Capture and replay share the same post-launch lifecycle. All mutable
         // GPU state is published by captured kernels and explicit event edges.
         DeviceGraphCaptureController::ReplayHooks capture_hooks{
+            .prebind_storage = replay_hooks.prebind_storage,
             .cohere_inputs = replay_hooks.cohere_inputs,
             .execute_node = [&](ComputeNode &node)
             {
@@ -1381,14 +2555,39 @@ namespace llaminar2
             },
             .capture_boundary = capture_boundary,
             .launch_dependency = launch_dependency,
+            .retained_parent_composer = retained_parent_composer,
             .plan_capture_dependencies = plan_capture_dependencies,
         };
 
         if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay)
         {
+            const bool initial_launch_pending =
+                segment_cache.executable_submission_state ==
+                GraphSegmentCache::ExecutableSubmissionState::
+                    MaterializedUnlaunched;
+            GraphLaunchDependencyHook replay_launch_dependency =
+                launch_dependency;
+            if (initial_launch_pending && launch_dependency)
+            {
+                replay_launch_dependency =
+                    [dependency = std::move(launch_dependency)](
+                        GraphExecutableLaunchPhase,
+                        void *stream)
+                {
+                    return dependency(
+                        GraphExecutableLaunchPhase::InitialTransaction,
+                        stream);
+                };
+            }
+            DeviceGraphCaptureController::ReplayHooks replay_phase_hooks =
+                replay_hooks;
+            replay_phase_hooks.launch_dependency =
+                std::move(replay_launch_dependency);
+            replay_phase_hooks.require_replay_input_preflight =
+                initial_launch_pending;
             const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
                 graph, segment_cache, ctx, gpu_ctx,
-                has_collective_nodes, collectives_graph_capturable, current_step, replay_hooks, force_recapture,
+                has_collective_nodes, collectives_graph_capturable, current_step, replay_phase_hooks, force_recapture,
                 defer_final_sync);
 
             if (!replay_result.success)
@@ -1396,6 +2595,20 @@ namespace llaminar2
                 return false;
             }
 
+            if (initial_launch_pending)
+            {
+                segment_cache.executable_submission_state =
+                    GraphSegmentCache::ExecutableSubmissionState::ReplayReady;
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "materialized_graph_transaction_zero_launches",
+                    1.0,
+                    "decode",
+                    ctx ? ctx->deviceId().toString() : std::string{},
+                    {{"context", segment_cache.perf_context},
+                     {"segments",
+                      std::to_string(segment_cache.segments.size())}});
+            }
             return true;
         }
 
@@ -1466,6 +2679,7 @@ namespace llaminar2
             }
 
             graph.reset();
+            segment_cache.needs_capture = true;
             const auto capture_result =
                 DeviceGraphCaptureController::executeCapturePhase(
                     graph,
@@ -1474,7 +2688,8 @@ namespace llaminar2
                     gpu_ctx,
                     has_collective_nodes,
                     current_step,
-                    capture_hooks);
+                    capture_hooks,
+                    initial_submission);
             if (capture_result.reset_cache)
             {
                 segment_cache.reset(
@@ -1486,6 +2701,25 @@ namespace llaminar2
             }
             segment_cache.initialized = true;
             segment_cache.needs_capture = false;
+            segment_cache.executable_submission_state =
+                materialize_without_launch
+                    ? GraphSegmentCache::ExecutableSubmissionState::
+                          MaterializedUnlaunched
+                    : GraphSegmentCache::ExecutableSubmissionState::ReplayReady;
+            if (materialize_without_launch)
+            {
+                /*
+                 * Materialization is not an inference step. Preserve transaction
+                 * numbering so the authenticated first launch remains step one in
+                 * lifecycle diagnostics and segment publication bookkeeping.
+                 */
+                segment_cache.decode_step = 0;
+                graph.reset();
+            }
+            if (!seal_retained_full_graph_plan())
+                return false;
+            if (!seal_retained_parent_plan())
+                return false;
             return true;
         }
 

@@ -188,7 +188,10 @@ TEST(Test__MoEPhaseC_StoreResolution, PrepareGemmEngines_ReusesExistingCPUSlabs)
         nullptr,
         std::nullopt,
         std::nullopt,
-        std::nullopt};
+        std::nullopt,
+        true,
+        nullptr,
+        CPUExpertNUMAPlacement::aggregateDomain()};
 
     ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx));
 
@@ -260,7 +263,10 @@ TEST(Test__MoEPhaseC_StoreResolution, PrepareGemmEngines_IncompleteExistingSlabs
         nullptr,
         std::nullopt,
         std::nullopt,
-        std::nullopt};
+        std::nullopt,
+        true,
+        nullptr,
+        CPUExpertNUMAPlacement::aggregateDomain()};
 
     EXPECT_FALSE(MoEExpertWeightService::prepareGemmEngines(ctx));
     EXPECT_EQ(store.expertSlabCount(), 3u);

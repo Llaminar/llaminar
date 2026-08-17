@@ -196,6 +196,7 @@ namespace llaminar2
             domain.devices = canonical.participants;
             domain.weights = canonical.weights;
             domain.backend = canonical.backend;
+            domain.scope = canonical.scope;
 
             // Find ranks for each device
             std::set<int> rank_set;
@@ -203,6 +204,7 @@ namespace llaminar2
             for (const auto &device : domain.devices)
             {
                 int rank = findRankForDevice(device, cluster_inventory);
+                domain.device_ranks.push_back(rank);
                 if (rank >= 0)
                 {
                     rank_set.insert(rank);
@@ -259,6 +261,21 @@ namespace llaminar2
         domain.id = 0;
         domain.name = "default";
         domain.backend = config.default_backend;
+        switch (config.tp_scope)
+        {
+        case TPScope::RANK_LOCAL:
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
+            break;
+        case TPScope::NODE_LOCAL:
+            domain.scope = ExecutionDomainScope::NODE_LOCAL;
+            break;
+        case TPScope::GLOBAL:
+            domain.scope = ExecutionDomainScope::GLOBAL;
+            break;
+        default:
+            domain.scope = ExecutionDomainScope::AUTO;
+            break;
+        }
 
         // Use explicit TP devices if provided
         if (!config.tp_devices.empty())
@@ -297,6 +314,7 @@ namespace llaminar2
         for (const auto &device : domain.devices)
         {
             int rank = findRankForDevice(device, cluster_inventory);
+            domain.device_ranks.push_back(rank);
             if (rank >= 0)
             {
                 rank_set.insert(rank);
@@ -700,22 +718,22 @@ namespace llaminar2
 
         if (primary_domain && !has_tp_in_pp)
         {
-            // Collect devices on this rank's host
-            for (const auto &device : primary_domain->devices)
+            /*
+             * A named domain already resolved one exact owner rank for every
+             * participant. Hostname-only selection is insufficient on a
+             * multi-socket node: it made cpu:0 and cpu:1 appear local to both
+             * ranks and accidentally composed LOCAL TP inside NODE_LOCAL TP.
+             * Preserve the aligned device-to-rank mapping as the authority.
+             */
+            for (size_t device_index = 0;
+                 device_index < primary_domain->devices.size();
+                 ++device_index)
             {
-                bool on_this_rank = false;
-                if (rank < static_cast<int>(cluster_inventory.ranks.size()))
-                {
-                    const auto &rank_inv = cluster_inventory.ranks[rank];
-                    if (device.isLocal() || device.hostname == rank_inv.hostname)
-                    {
-                        on_this_rank = true;
-                    }
-                }
-                if (on_this_rank)
-                {
-                    plan.local_tp_devices.push_back(device);
-                }
+                if (device_index >= primary_domain->device_ranks.size() ||
+                    primary_domain->device_ranks[device_index] != rank)
+                    continue;
+                plan.local_tp_devices.push_back(
+                    primary_domain->devices[device_index]);
             }
 
             plan.local_tp_backend = selectLocalTPBackend(
@@ -768,11 +786,16 @@ namespace llaminar2
         }
         else if (plan.usesGlobalTP())
         {
-            plan.tp_scope = TPScope::GLOBAL;
+            plan.tp_scope =
+                primary_domain &&
+                        primary_domain->scope ==
+                            ExecutionDomainScope::NODE_LOCAL
+                    ? TPScope::NODE_LOCAL
+                    : TPScope::GLOBAL;
         }
         else if (plan.usesLocalTP())
         {
-            plan.tp_scope = TPScope::LOCAL;
+            plan.tp_scope = TPScope::RANK_LOCAL;
         }
         else
         {
@@ -796,6 +819,8 @@ namespace llaminar2
             config.prefix_cache,
             config.mtp,
             config.tp_allreduce_precision_override);
+        plan.runtime.routed_expert_owner_order =
+            config.routed_expert_owner_order;
 
         return plan;
     }
@@ -859,7 +884,7 @@ namespace llaminar2
         // IMPORTANT: Do not implicitly enable LOCAL TP in pure GLOBAL mode.
         // Mixed local/global TP should only happen when tp_scope=HYBRID or explicit local configuration.
         const bool allows_local_tp =
-            config.tp_scope == TPScope::LOCAL ||
+            config.tp_scope == TPScope::RANK_LOCAL ||
             config.tp_scope == TPScope::HYBRID ||
             config.tp_scope == TPScope::AUTO;
 
@@ -1013,7 +1038,7 @@ namespace llaminar2
         {
             if (plan.usesLocalTP())
             {
-                plan.tp_scope = TPScope::LOCAL;
+                plan.tp_scope = TPScope::RANK_LOCAL;
             }
             else if (cluster_inventory.world_size > 1 && config.tp_degree > 1)
             {
@@ -1072,6 +1097,8 @@ namespace llaminar2
             config.prefix_cache,
             config.mtp,
             config.tp_allreduce_precision_override);
+        plan.runtime.routed_expert_owner_order =
+            config.routed_expert_owner_order;
 
         return plan;
     }
@@ -1272,7 +1299,7 @@ namespace llaminar2
             TPScope effective_scope = dom_def ? dom_def->scope : TPScope::AUTO;
 
             bool is_local;
-            if (effective_scope == TPScope::LOCAL)
+            if (effective_scope == TPScope::RANK_LOCAL)
             {
                 is_local = true;
             }

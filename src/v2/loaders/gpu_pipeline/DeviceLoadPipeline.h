@@ -1,3 +1,12 @@
+/**
+ * @file DeviceLoadPipeline.h
+ * @brief Contracts for bounded host-to-device weight staging and GPU repacking.
+ *
+ * This file also owns the source-range coalescing contract used to turn
+ * individually addressed MoE expert views into large, contiguous preparation
+ * jobs without transferring ownership away from the model tensor graph.
+ */
+
 #pragma once
 
 #include "loaders/gpu_pipeline/RepackFormat.h"
@@ -51,6 +60,17 @@ namespace llaminar2
          */
         int packed_group_rows = 0;
 
+        /**
+         * Payload capacity reserved for each logical 32-value block.
+         *
+         * Zero asks the pipeline to infer the compact width from the allocated
+         * slot. ExpertOverlay jobs set this explicitly to the union of their
+         * initial and CPU-promotion layouts. Within each `packed_group_rows`
+         * matrix the live payload remains tightly packed; only group starts
+         * advance by this capacity.
+         */
+        int packed_payload_capacity_bytes_per_block = 0;
+
     };
 
     /**
@@ -79,9 +99,9 @@ namespace llaminar2
     };
 
     /**
-     * @brief Coalesce adjacent logical matrices from the same immutable owner.
+     * @brief Coalesce adjacent logical matrices from one immutable parent.
      *
-     * Two jobs are combined only when they have the same non-null source owner,
+     * Two jobs are combined only when they have the same non-null source identity,
      * format, N/K geometry, metadata layout, bytes-per-row, and adjacent source
      * ranges. A source gap, a different parent, or any format difference starts
      * a new run. This makes arbitrary expert subsets safe while reducing a fully
@@ -89,20 +109,22 @@ namespace llaminar2
      * row-chunked transaction per contiguous parent range.
      *
      * Input jobs may be in graph discovery order. The helper orders them by
-     * owner and source address while retaining original indices in the member
+     * identity and source address while retaining original indices in the member
      * map. Pre-chunked jobs are rejected because coalescing is a planning
      * operation that must happen before LoadOrchestrator applies its staging
      * budget.
      *
      * @param jobs Logical whole-matrix source jobs.
-     * @param source_owners Immutable parent identity for each job.
+     * @param source_identities Immutable, non-owning parent identity for each job.
+     *        The pointed-to object is never dereferenced and need not own the
+     *        source bytes; callers retain the actual source lifetime separately.
      * @return Coalesced runs and exact logical-to-packed row mappings.
      * @throws std::invalid_argument for malformed or mismatched input vectors.
      * @throws std::overflow_error when aggregate rows or bytes exceed their types.
      */
     std::vector<CoalescedWeightJobRun> coalesceContiguousWeightJobs(
         const std::vector<WeightJob> &jobs,
-        const std::vector<const void *> &source_owners);
+        const std::vector<const void *> &source_identities);
 
     /**
      * @brief Order upload jobs by source address to preserve GGUF read locality.

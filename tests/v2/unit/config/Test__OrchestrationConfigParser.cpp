@@ -75,11 +75,16 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(config.pp_degree, 1);
     EXPECT_FALSE(config.dry_run);
     EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Apportioned);
+    EXPECT_EQ(config.routed_expert_owner_order, RoutedExpertOwnerOrder::Ordinal);
     EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
     EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 10.0f);
     EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 25);
     EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
     EXPECT_EQ(config.moe_rebalance.window_size, 256);
+    EXPECT_EQ(
+        config.moe_rebalance.migration_payoff_horizon_tokens,
+        2048u);
+    EXPECT_EQ(config.moe_rebalance.migration_max_cycles_per_wave, 1u);
     EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 0);
     EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 8192u);
     EXPECT_EQ(config.moe_routed_prefill.llep_alpha_numerator, 1u);
@@ -91,9 +96,36 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor,
               moe_rebalance_policy::kDefaultDeviceMinLoadSpreadImprovementDivisor);
     EXPECT_EQ(config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot, 256u);
-    EXPECT_EQ(config.moe_rebalance.device_min_foreign_rows_per_transfer, 0u);
+    EXPECT_EQ(
+        config.moe_rebalance
+            .device_min_foreign_rows_per_critical_path_payload_slot,
+        0u);
     EXPECT_EQ(config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot, 128u);
     EXPECT_EQ(config.moe_rebalance.device_max_post_wave_load_spread_per_mille, 100u);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_RoutedExpertOwnerOrder)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper args{
+        "llaminar2",
+        "--moe-routed-expert-owner-order", "random"};
+
+    const auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.routed_expert_owner_order, RoutedExpertOwnerOrder::Random);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidRoutedExpertOwnerOrderThrows)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper args{
+        "llaminar2",
+        "--moe-routed-expert-owner-order", "frequency"};
+
+    EXPECT_THROW(
+        (void)parser.parseArgs(args.argc(), args.argv()),
+        std::invalid_argument);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_DryRun)
@@ -182,12 +214,12 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_TPDegree_ShortFlag)
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_TPScope)
 {
-    ArgvHelper args{"llaminar2", "--tp-scope", "local"};
+    ArgvHelper args{"llaminar2", "--tp-scope", "rank_local"};
     OrchestrationConfigParser parser;
 
     auto config = parser.parseArgs(args.argc(), args.argv());
 
-    EXPECT_EQ(config.tp_scope, TPScope::LOCAL);
+    EXPECT_EQ(config.tp_scope, TPScope::RANK_LOCAL);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_TPDevices)
@@ -421,14 +453,14 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_DefineDomain_WithWeightsAndBacke
 TEST(Test__OrchestrationConfigParser, ParseArgs_DefineDomain_WithScopeOwnerRanksBackend)
 {
     ArgvHelper args{"llaminar2",
-                    "--define-domain", "rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0",
+                    "--define-domain", "rocm_socket0=0:rocm:0,0:rocm:1;scope=rank_local;backend=rccl;owner=0",
                     "--define-domain", "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1"};
     OrchestrationConfigParser parser;
 
     auto config = parser.parseArgs(args.argc(), args.argv());
 
     ASSERT_EQ(config.domain_definitions.size(), 2u);
-    EXPECT_EQ(config.domain_definitions[0].scope, TPScope::LOCAL);
+    EXPECT_EQ(config.domain_definitions[0].scope, TPScope::RANK_LOCAL);
     ASSERT_TRUE(config.domain_definitions[0].owner_rank.has_value());
     EXPECT_EQ(*config.domain_definitions[0].owner_rank, 0);
     EXPECT_EQ(config.domain_definitions[0].backend, CollectiveBackendType::RCCL);
@@ -440,16 +472,41 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_DefineDomain_WithScopeOwnerRanks
     EXPECT_EQ(config.domain_definitions[1].explicit_ranks[1], 1);
 }
 
+TEST(Test__OrchestrationConfigParser,
+     ParseArgs_MoEAutoScopeDefersRankOwnershipToInventoryBinding)
+{
+    ArgvHelper args{
+        "llaminar2",
+        "--moe-routed-expert-placement", "tiered-overlay",
+        "--moe-routed-expert-continuation-domain", "portable_gpu_pool",
+        "--moe-routed-expert-shared-domain", "portable_gpu_pool",
+        "--moe-routed-expert-domain",
+        "portable_gpu_pool=cuda:0,cuda:1;scope=auto;backend=nccl;routed_compute=apportioned",
+        "--moe-routed-expert-tier",
+        "priority_0@portable_gpu_pool;priority=0;fallback=true",
+    };
+    OrchestrationConfigParser parser;
+
+    const auto config = parser.parseArgs(args.argc(), args.argv());
+
+    ASSERT_NE(config.moe_routed_expert_plan, nullptr);
+    ASSERT_EQ(config.moe_routed_expert_plan->domains.size(), 1u);
+    const auto &domain = config.moe_routed_expert_plan->domains.front();
+    EXPECT_EQ(domain.scope, ExecutionDomainScope::AUTO);
+    EXPECT_EQ(domain.owner_rank, -1);
+    EXPECT_TRUE(domain.world_ranks.empty());
+}
+
 TEST(Test__OrchestrationConfigParser, Phase9B_NamedAndOverlayDomainsShareCanonicalNormalization)
 {
     OrchestrationConfigParser parser;
     ArgvHelper named_args{"llaminar2",
-                          "--define-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=local;backend=rccl;owner=0"};
+                          "--define-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=rank_local;backend=rccl;owner=0"};
     ArgvHelper overlay_args{"llaminar2",
                             "--moe-routed-expert-placement", "tiered-overlay",
                             "--moe-routed-expert-continuation-domain", "rocm_hot",
                             "--moe-routed-expert-shared-domain", "rocm_hot",
-                            "--moe-routed-expert-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=local;backend=rccl;routed_compute=apportioned;owner=0",
+                            "--moe-routed-expert-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=rank_local;backend=rccl;routed_compute=apportioned;owner=0",
                             "--moe-routed-expert-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;routed_compute=apportioned;ranks=0,1",
                             "--moe-routed-expert-tier", "hot@rocm_hot;priority=0",
                             "--moe-routed-expert-tier", "cold@cpu_cold;priority=1;fallback=true"};
@@ -490,7 +547,7 @@ TEST(Test__OrchestrationConfigParser, Phase9B_OverlayDenseTPOptIn)
                     "--moe-routed-expert-shared-domain", "cuda_hot",
                     "--moe-continuation-dense-tp", "true",
                     "--moe-continuation-dense-decode-replicated", "true",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -518,7 +575,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDensePolicyNamesPhaseSplitHybrid
                     "--moe-routed-expert-base-model-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
                     "--moe-continuation-dense-policy", "prefill-tensor-parallel-decode-replicated",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -544,7 +601,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDensePolicyNamesDecodeMirroredEm
                     "--moe-routed-expert-base-model-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
                     "--moe-continuation-dense-policy", "tensor-parallel-decode-mirrored-embedding",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -616,7 +673,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesPhaseSplitIndependen
         "--moe-routed-expert-continuation-domain", "cuda_hot",
         "--moe-routed-expert-shared-domain", "cuda_hot",
         "--moe-routed-expert-domain",
-        "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;"
+        "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;"
         "routed_compute=replicated;"
         "routed_phase=prefill-apportioned-decode-replicated;"
         "routed_decode_assignment=static-owner;"
@@ -658,7 +715,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsPhaseSplitWithoutRe
         "--moe-routed-expert-continuation-domain", "cuda_hot",
         "--moe-routed-expert-shared-domain", "cuda_hot",
         "--moe-routed-expert-domain",
-        "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;"
+        "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;"
         "routed_compute=apportioned;"
         "routed_phase=prefill-apportioned-decode-replicated;owner=0",
         "--moe-routed-expert-tier",
@@ -674,7 +731,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesDecodeAndPrefillAssi
                     "--moe-routed-expert-placement", "tiered-overlay",
                     "--moe-routed-expert-continuation-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;routed_decode_assignment=static-owner;routed_prefill_assignment=least-loaded-resident;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -706,7 +763,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsAmbiguousAllWorkAss
         "--moe-routed-expert-continuation-domain", "cuda_hot",
         "--moe-routed-expert-shared-domain", "cuda_hot",
         "--moe-routed-expert-domain",
-        "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;"
+        "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;"
         "routed_compute=apportioned;"
         "routed_assignment=least-loaded-resident;owner=0",
         "--moe-routed-expert-tier",
@@ -724,7 +781,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLeastLoadedAsComput
                     "--moe-routed-expert-placement", "tiered-overlay",
                     "--moe-routed-expert-continuation-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=least-loaded-resident;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=least-loaded-resident;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
@@ -737,7 +794,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLegacyExpertParalle
                     "--moe-routed-expert-placement", "tiered-overlay",
                     "--moe-routed-expert-continuation-domain", "cuda_hot",
                     "--moe-routed-expert-shared-domain", "cuda_hot",
-                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=expert_parallel;owner=0",
+                    "--moe-routed-expert-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=expert_parallel;owner=0",
                     "--moe-routed-expert-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
@@ -757,7 +814,7 @@ TEST(Test__OrchestrationConfigParser, Phase9B_DomainIdentityIsNameScopedForShare
 TEST(Test__OrchestrationConfigParser, Phase9B_PPStageRemainsLayerPlacementNotMoEOverlay)
 {
     ArgvHelper args{"llaminar2",
-                    "--define-domain", "gpu_tp=0:cuda:0,0:cuda:1;scope=local;backend=nccl;owner=0",
+                    "--define-domain", "gpu_tp=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;owner=0",
                     "--pp-stage", "0=gpu_tp:0-3"};
     OrchestrationConfigParser parser;
 
@@ -957,7 +1014,7 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_TPConfig)
 
     std::string yaml = R"(
 tp_degree: 2
-tp_scope: local
+tp_scope: rank_local
 tp_devices: [cuda:0, cuda:1]
 tp_weights: [0.73, 0.27]
     )";
@@ -965,7 +1022,7 @@ tp_weights: [0.73, 0.27]
     auto config = parser.parseYamlString(yaml);
 
     EXPECT_EQ(config.tp_degree, 2);
-    EXPECT_EQ(config.tp_scope, TPScope::LOCAL);
+    EXPECT_EQ(config.tp_scope, TPScope::RANK_LOCAL);
     EXPECT_EQ(config.tp_devices.size(), 2);
     EXPECT_EQ(config.tp_weights.size(), 2);
 }
@@ -989,7 +1046,7 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_NamedDomainLists)
 
     std::string yaml = R"(
 domains:
-    - "rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"
+    - "rocm_socket0=0:rocm:0,0:rocm:1;scope=rank_local;backend=rccl;owner=0"
     - "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1"
 pp_stages:
     - "0=rocm_socket0:0-13"
@@ -1000,7 +1057,7 @@ pp_stages:
 
     ASSERT_EQ(config.domain_definitions.size(), 2u);
     EXPECT_EQ(config.domain_definitions[0].name, "rocm_socket0");
-    EXPECT_EQ(config.domain_definitions[0].scope, TPScope::LOCAL);
+    EXPECT_EQ(config.domain_definitions[0].scope, TPScope::RANK_LOCAL);
     ASSERT_TRUE(config.domain_definitions[0].owner_rank.has_value());
     EXPECT_EQ(*config.domain_definitions[0].owner_rank, 0);
     EXPECT_EQ(config.domain_definitions[0].backend, CollectiveBackendType::RCCL);
@@ -1117,12 +1174,16 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_MoENestedBlock)
     std::string yaml = R"(
 moe:
     routed_expert_compute_policy: replicated
+    routed_expert_owner_order: random
     hot_expert_cache: 12
     residency_maintenance: observe
     residency_maintenance_window: 64
     residency_maintenance_max_window: 512
     residency_maintenance_window_growth: 2.5
+    migration_payoff_horizon_tokens: 16384
+    migration_max_cycles_per_wave: 3
     routed_prefill_assignment_window_tokens: 96
+    overlay_prefill_segment_rows: 320
     routed_prefill_least_loaded_min_routed_rows: 2048
     routed_prefill_llep_alpha_numerator: 3
     routed_prefill_llep_alpha_denominator: 4
@@ -1140,7 +1201,7 @@ moe:
     device_min_load_spread_improvement: 44
     device_min_load_spread_improvement_divisor: 15
     device_min_wave_spread_improvement_per_payload_slot: 192
-    device_min_foreign_rows_per_transfer: 320
+    device_min_foreign_rows_per_critical_path_payload_slot: 320
     device_min_router_spread_improvement_per_payload_slot: 384
     device_max_post_wave_load_spread_permille: 75
     release_raw_expert_weights: true
@@ -1149,6 +1210,7 @@ moe:
     auto config = parser.parseYamlString(yaml);
 
     EXPECT_EQ(config.routed_expert_compute_policy, RoutedExpertComputePolicy::Replicated);
+    EXPECT_EQ(config.routed_expert_owner_order, RoutedExpertOwnerOrder::Random);
     EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Count);
     EXPECT_EQ(config.moe_hot_expert_cache.count, 12);
     EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 12);
@@ -1156,7 +1218,12 @@ moe:
     EXPECT_EQ(config.moe_rebalance.window_size, 64);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 512);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.5f);
+    EXPECT_EQ(
+        config.moe_rebalance.migration_payoff_horizon_tokens,
+        16'384u);
+    EXPECT_EQ(config.moe_rebalance.migration_max_cycles_per_wave, 3u);
     EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 96);
+    EXPECT_EQ(config.moe_routed_prefill.overlay_segment_rows, 320);
     EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 2048u);
     EXPECT_EQ(config.moe_routed_prefill.llep_alpha_numerator, 3u);
     EXPECT_EQ(config.moe_routed_prefill.llep_alpha_denominator, 4u);
@@ -1174,7 +1241,10 @@ moe:
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 44u);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor, 15u);
     EXPECT_EQ(config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot, 192u);
-    EXPECT_EQ(config.moe_rebalance.device_min_foreign_rows_per_transfer, 320u);
+    EXPECT_EQ(
+        config.moe_rebalance
+            .device_min_foreign_rows_per_critical_path_payload_slot,
+        320u);
     EXPECT_EQ(config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot, 384u);
     EXPECT_EQ(config.moe_rebalance.device_max_post_wave_load_spread_per_mille, 75u);
     EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
@@ -1191,7 +1261,10 @@ moe_residency_maintenance: off
 moe_residency_maintenance_window: 128
 moe_residency_maintenance_max_window: 1024
 moe_residency_maintenance_window_growth: 1.25
+moe_migration_payoff_horizon_tokens: 32768
+moe_migration_max_cycles_per_wave: 4
 moe_routed_prefill_assignment_window_tokens: 192
+moe_overlay_prefill_segment_rows: 384
 moe_routed_prefill_least_loaded_min_routed_rows: 4096
 moe_routed_prefill_llep_alpha_numerator: 5
 moe_routed_prefill_llep_alpha_denominator: 8
@@ -1209,7 +1282,7 @@ moe_device_rebalance_initial_maintenance_period_tokens: 69
 moe_device_rebalance_min_load_spread_improvement: 64
 moe_device_rebalance_min_load_spread_improvement_divisor: 20
 moe_device_rebalance_min_wave_spread_improvement_per_payload_slot: 256
-moe_device_rebalance_min_foreign_rows_per_transfer: 640
+moe_device_rebalance_min_foreign_rows_per_critical_path_payload_slot: 640
 moe_device_rebalance_min_router_spread_improvement_per_payload_slot: 512
 moe_device_rebalance_max_post_wave_load_spread_permille: 80
 moe_release_raw_expert_weights: false
@@ -1225,7 +1298,12 @@ moe_release_raw_expert_weights: false
     EXPECT_EQ(config.moe_rebalance.window_size, 128);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 1024);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 1.25f);
+    EXPECT_EQ(
+        config.moe_rebalance.migration_payoff_horizon_tokens,
+        32'768u);
+    EXPECT_EQ(config.moe_rebalance.migration_max_cycles_per_wave, 4u);
     EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 192);
+    EXPECT_EQ(config.moe_routed_prefill.overlay_segment_rows, 384);
     EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 4096u);
     EXPECT_EQ(config.moe_routed_prefill.llep_alpha_numerator, 5u);
     EXPECT_EQ(config.moe_routed_prefill.llep_alpha_denominator, 8u);
@@ -1243,7 +1321,10 @@ moe_release_raw_expert_weights: false
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 64u);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor, 20u);
     EXPECT_EQ(config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot, 256u);
-    EXPECT_EQ(config.moe_rebalance.device_min_foreign_rows_per_transfer, 640u);
+    EXPECT_EQ(
+        config.moe_rebalance
+            .device_min_foreign_rows_per_critical_path_payload_slot,
+        640u);
     EXPECT_EQ(config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot, 512u);
     EXPECT_EQ(config.moe_rebalance.device_max_post_wave_load_spread_per_mille, 80u);
     EXPECT_FALSE(config.moe_rebalance.release_raw_expert_weights);
@@ -1260,7 +1341,7 @@ moe_routed_expert_placement:
     base_model_domain: gpu_hot
     shared_expert_domain: gpu_hot
     domains:
-        - "gpu_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;routed_compute=apportioned;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0"
+        - "gpu_hot=0:cuda:0,0:cuda:1;scope=rank_local;backend=nccl;routed_compute=apportioned;routed_decode_assignment=static-owner;routed_prefill_assignment=static-owner;owner=0"
     routed_tiers:
         - "hot@gpu_hot;priority=0;fallback=true"
     )";
@@ -1299,14 +1380,14 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_QuotedValues)
 
     std::string yaml = R"(
 device: "cuda:0"
-tp_scope: 'local'
+tp_scope: 'rank_local'
     )";
 
     auto config = parser.parseYamlString(yaml);
 
     EXPECT_TRUE(config.device_for_this_rank.has_value());
     EXPECT_EQ(config.device_for_this_rank->device_type, DeviceType::CUDA);
-    EXPECT_EQ(config.tp_scope, TPScope::LOCAL);
+    EXPECT_EQ(config.tp_scope, TPScope::RANK_LOCAL);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseYamlFile_NonExistent_Throws)
@@ -1332,6 +1413,7 @@ TEST(Test__OrchestrationConfigParser, GetHelpText_ContainsKeyOptions)
     EXPECT_TRUE(help.find("--backend") != std::string::npos);
     EXPECT_TRUE(help.find("--config") != std::string::npos);
     EXPECT_TRUE(help.find("--moe-routed-expert-compute") != std::string::npos);
+    EXPECT_TRUE(help.find("--moe-routed-expert-owner-order") != std::string::npos);
     EXPECT_TRUE(help.find("--moe-routed-expert-placement") != std::string::npos);
     EXPECT_TRUE(help.find("--moe-routed-expert-domain") != std::string::npos);
     EXPECT_TRUE(help.find("--moe-hot-expert-cache") != std::string::npos);
@@ -1908,7 +1990,10 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
                     "--moe-residency-maintenance-window", "128",
                     "--moe-residency-maintenance-max-window", "2048",
                     "--moe-residency-maintenance-window-growth", "2.0",
+                    "--moe-migration-payoff-horizon-tokens", "65536",
+                    "--moe-migration-max-cycles-per-wave", "5",
                     "--moe-routed-prefill-assignment-window", "384",
+                    "--moe-overlay-prefill-segment-rows", "448",
                     "--moe-routed-prefill-least-loaded-min-routed-rows", "1024",
                     "--moe-routed-prefill-llep-alpha-numerator", "2",
                     "--moe-routed-prefill-llep-alpha-denominator", "3",
@@ -1926,7 +2011,7 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
                     "--moe-device-rebalance-min-load-spread-improvement", "72",
                     "--moe-device-rebalance-min-load-spread-improvement-divisor", "25",
                     "--moe-device-rebalance-min-wave-spread-improvement-per-payload-slot", "144",
-                    "--moe-device-rebalance-min-foreign-rows-per-transfer", "216",
+                    "--moe-device-rebalance-min-foreign-rows-per-critical-path-payload-slot", "216",
                     "--moe-device-rebalance-min-router-spread-improvement-per-payload-slot", "288",
                     "--moe-device-rebalance-max-post-wave-load-spread-permille", "90",
                     "--moe-release-raw-expert-weights"};
@@ -1938,7 +2023,12 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
     EXPECT_EQ(config.moe_rebalance.window_size, 128);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 2048);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.0f);
+    EXPECT_EQ(
+        config.moe_rebalance.migration_payoff_horizon_tokens,
+        65'536u);
+    EXPECT_EQ(config.moe_rebalance.migration_max_cycles_per_wave, 5u);
     EXPECT_EQ(config.moe_routed_prefill.assignment_window_tokens, 384);
+    EXPECT_EQ(config.moe_routed_prefill.overlay_segment_rows, 448);
     EXPECT_EQ(config.moe_routed_prefill.least_loaded_min_routed_rows, 1024u);
     EXPECT_EQ(config.moe_routed_prefill.llep_alpha_numerator, 2u);
     EXPECT_EQ(config.moe_routed_prefill.llep_alpha_denominator, 3u);
@@ -1956,7 +2046,10 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 72u);
     EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor, 25u);
     EXPECT_EQ(config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot, 144u);
-    EXPECT_EQ(config.moe_rebalance.device_min_foreign_rows_per_transfer, 216u);
+    EXPECT_EQ(
+        config.moe_rebalance
+            .device_min_foreign_rows_per_critical_path_payload_slot,
+        216u);
     EXPECT_EQ(config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot, 288u);
     EXPECT_EQ(config.moe_rebalance.device_max_post_wave_load_spread_per_mille, 90u);
     EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
@@ -1976,6 +2069,20 @@ TEST(Test__OrchestrationConfigParser,
         std::invalid_argument)
         << "Current-batch LLEP belongs to routed_prefill_assignment, not "
            "durable residency maintenance.";
+}
+
+TEST(Test__OrchestrationConfigParser,
+     ParseArgs_MigrationCyclesPerWaveMustBePositive)
+{
+    ArgvHelper args{
+        "llaminar2",
+        "--moe-migration-max-cycles-per-wave",
+        "0"};
+    OrchestrationConfigParser parser;
+
+    EXPECT_THROW(
+        parser.parseArgs(args.argc(), args.argv()),
+        std::invalid_argument);
 }
 
 TEST(Test__OrchestrationConfigParser,
@@ -2034,6 +2141,16 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidMoEConfig_Throws)
         ArgvHelper args{"llaminar2", "--moe-dynamic-max-swaps-per-layer", "-1"};
         OrchestrationConfigParser parser;
         EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    {
+        ArgvHelper args{
+            "llaminar2",
+            "--moe-migration-payoff-horizon-tokens",
+            "0"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(
+            parser.parseArgs(args.argc(), args.argv()),
+            std::invalid_argument);
     }
     {
         ArgvHelper args{
@@ -2611,10 +2728,10 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_NegativeNPredictSpaceForm)
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_EqualsForm_OnEnum)
 {
-    ArgvHelper args({"llaminar2", "--tp-scope=local"});
+    ArgvHelper args({"llaminar2", "--tp-scope=rank_local"});
     auto parser = createOrchestrationConfigParser();
     auto config = parser->parseArgs(args.argc(), args.argv());
-    EXPECT_EQ(config.tp_scope, TPScope::LOCAL);
+    EXPECT_EQ(config.tp_scope, TPScope::RANK_LOCAL);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_EqualsForm_OnString)

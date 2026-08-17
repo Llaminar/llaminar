@@ -71,7 +71,8 @@ namespace
         const ModelContextConfig tokenizer_context_config{
             .strategy = WeightDistributionStrategy::REPLICATED,
             .use_mmap = true,
-            .target_is_gpu = true,
+            .payload_access_pattern =
+                ModelPayloadAccessPattern::DeviceStaging,
         };
         auto tokenizer_context =
             ModelContext::create(model_path, tokenizer_context_config);
@@ -256,7 +257,7 @@ namespace
             config.device_min_load_spread_improvement = 0;
             config.device_min_load_spread_improvement_divisor = 0;
             config.device_min_wave_spread_improvement_per_payload_slot = 0;
-            config.device_min_foreign_rows_per_transfer = 0;
+            config.device_min_foreign_rows_per_critical_path_payload_slot = 0;
             config.device_min_router_spread_improvement_per_payload_slot = 0;
             config.device_max_post_wave_load_spread_per_mille = 1000;
             config.device_maintenance_slack_tokens = 0;
@@ -1217,6 +1218,69 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMat
         true);
 }
 
+/*
+ * ProductionParity is a registration contract consumed by the campaign
+ * discovery layer. These cells execute the ordinary sparse-collective
+ * two-device ExpertOverlay runner while retaining the complete PyTorch
+ * sidecar checkpoint oracle and canonical CSV artifact contract. Fixed depth
+ * two, fixed depth three, and adaptive depth are distinct capture identities;
+ * fresh and full-prefix-restored requests are distinct lifecycle identities.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointFixedDepth2_CUDA2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        cudaOnlyStochasticBenchmarkCase(),
+        4,
+        2);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointFixedDepth3_CUDA2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        cudaOnlyStochasticBenchmarkCase(),
+        4,
+        3);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointDynamicDepth_CUDA2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        cudaOnlyStochasticBenchmarkCase(),
+        4,
+        3,
+        qwen36MoEStochasticDynamicDepthPolicy(3));
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreFixedDepth2_CUDA2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        cudaOnlyStochasticBenchmarkCase(),
+        4,
+        2,
+        {},
+        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreFixedDepth3_CUDA2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        cudaOnlyStochasticBenchmarkCase(),
+        4,
+        3,
+        {},
+        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreDynamicDepth_CUDA2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        cudaOnlyStochasticBenchmarkCase(),
+        4,
+        3,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
+}
+
 /**
  * @brief Proves CUDA stochastic grouped MTP at long absolute positions without
  *        runtime expert movement.
@@ -1653,7 +1717,8 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
         qwen36MoEProductionStochasticSamplingParams(),
         /*prefix_block_size=*/0,
         MoEDeviceMaintenanceCoverage::
-            ExecutedAndSkippedInsideCapturedLoop);
+            ExecutedAndSkippedInsideCapturedLoop,
+        /*emit_canonical_artifacts=*/true);
 }
 
 /**
@@ -1787,6 +1852,61 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMat
         false,
         qwen36MoEStochasticDynamicDepthPolicy(3),
         true);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointFixedDepth2_ROCm2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        rocmOnlyStochasticBenchmarkCase(),
+        4,
+        2);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointFixedDepth3_ROCm2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        rocmOnlyStochasticBenchmarkCase(),
+        4,
+        3);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointDynamicDepth_ROCm2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        rocmOnlyStochasticBenchmarkCase(),
+        4,
+        3,
+        qwen36MoEStochasticDynamicDepthPolicy(3));
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreFixedDepth2_ROCm2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        rocmOnlyStochasticBenchmarkCase(),
+        4,
+        2,
+        {},
+        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreFixedDepth3_ROCm2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        rocmOnlyStochasticBenchmarkCase(),
+        4,
+        3,
+        {},
+        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreDynamicDepth_ROCm2TPHotOnly)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        rocmOnlyStochasticBenchmarkCase(),
+        4,
+        3,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
 }
 
 /**
@@ -2042,6 +2162,37 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_ROCm2TP
     runExpertOverlayRequestBoundaryStress(rocmOnlyDynamicMaintenanceCase());
 }
 
+/**
+ * @brief Proves fixed-depth ROCm Dynamic maintenance is device-gated in-graph.
+ *
+ * This is the RCCL/HIP companion to the CUDA cadence proof. A real 64-token
+ * prefix and sixteen stochastic decode tokens cross the four-token Dynamic
+ * maintenance cadence while leaving ordinary transactions between due waves.
+ * The shared verifier requires accepted placement work, copied and applied
+ * expert bytes, both the taken and skipped native conditional branches, full
+ * graph replay, serial-equivalent tokens, and identical behavior after
+ * clearCache() without rebuilding the production runner.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity,
+     StochasticMTPDepth3DeviceGatedMaintenance_ROCm2TPDynamicMaintenanceDenseTP)
+{
+    runMoEStochasticMTPVerifierParity(
+        rocmOnlyDynamicMaintenanceCase(),
+        /*draft_depth=*/3,
+        /*require_stochastic_outcome_after_reuse=*/true,
+        MTPDepthPolicyConfig{},
+        /*enable_prefix_cache=*/false,
+        /*clear_cache_repetitions=*/1,
+        /*minimum_decode_steps=*/16,
+        /*required_first_request_draft_depth=*/0,
+        /*maximum_prompt_tokens=*/64,
+        qwen36MoEProductionStochasticSamplingParams(),
+        /*prefix_block_size=*/0,
+        MoEDeviceMaintenanceCoverage::
+            ExecutedAndSkippedInsideCapturedLoop,
+        /*emit_canonical_artifacts=*/true);
+}
+
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixRestorePartialHit_ROCm2TPCurrentBatchLLEPStaticDecodeDenseTP)
 {
     runMoEPrefixRestoreParity(
@@ -2232,6 +2383,46 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PartialPrefixFixturesUseLongMetadata
         EXPECT_TRUE(test_case.default_metadata_path.empty());
         EXPECT_TRUE(test_case.metadata_envs.empty());
     }
+}
+
+/**
+ * @brief Prove campaign reuse is limited to one exact immutable overlay plan.
+ *
+ * This model-free regression protects the runtime optimization: depth and
+ * prefix lifecycle may reuse prepared weights, while a changed tier priority,
+ * physical participant, or dynamic residency policy must miss the cache.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StaticOverlayCampaignCacheIdentityIsExact)
+{
+    auto test_case = cudaOnlyStochasticBenchmarkCase();
+    ASSERT_TRUE(test_case.moe_routed_expert_plan);
+    ASSERT_TRUE(isReusableStaticMoEMTPOverlay(test_case));
+
+    const auto &plan = *test_case.moe_routed_expert_plan;
+    ASSERT_EQ(plan.routed_tiers.size(), 1u);
+    EXPECT_TRUE(plan.routed_tiers.front().fallback)
+        << "a one-tier overlay must explicitly own final expert coverage";
+    const std::string identity =
+        moeMTPStaticOverlayPlanCacheIdentity(plan);
+
+    auto changed_priority = plan;
+    ++changed_priority.routed_tiers.front().priority;
+    EXPECT_NE(
+        identity,
+        moeMTPStaticOverlayPlanCacheIdentity(changed_priority));
+
+    auto changed_participant = plan;
+    changed_participant.domains.front().participants.front() =
+        GlobalDeviceAddress::cuda(1);
+    EXPECT_NE(
+        identity,
+        moeMTPStaticOverlayPlanCacheIdentity(changed_participant));
+
+    auto dynamic_plan = std::make_shared<MoERoutedExpertPlacementPlan>(plan);
+    dynamic_plan->residency_policy =
+        RoutedExpertResidencyPolicy::HistogramTieredCache;
+    test_case.moe_routed_expert_plan = std::move(dynamic_plan);
+    EXPECT_FALSE(isReusableStaticMoEMTPOverlay(test_case));
 }
 
 /**

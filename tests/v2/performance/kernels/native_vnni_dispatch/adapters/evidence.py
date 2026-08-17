@@ -30,16 +30,19 @@ class RobustTimingEvidence:
 
 
 def raw_corpus_id(paths: Iterable[Path]) -> str:
-    """Stream-hash ordered evidence paths and bytes without a whole-file copy.
+    """Stream-hash canonical evidence paths and bytes without a whole-file copy.
 
-    The path is part of the existing corpus identity, so moving a shard remains
-    a deliberate provenance change. Reading fixed-size chunks preserves the
-    exact historical digest while avoiding a second in-memory copy of timing
-    sidecars that can contain millions of rows.
+    The canonical path is part of the corpus identity, so moving a shard remains
+    a deliberate provenance change while relative and absolute aliases of the
+    same file do not create two identities. Reading fixed-size chunks avoids a
+    second in-memory copy of timing sidecars that can contain millions of rows.
     """
 
     digest = hashlib.sha256()
-    for path in sorted(Path(item) for item in paths):
+    canonical_paths = sorted(
+        Path(item).resolve(strict=True) for item in paths
+    )
+    for path in canonical_paths:
         digest.update(str(path).encode())
         digest.update(b"\0")
         with path.open("rb") as handle:

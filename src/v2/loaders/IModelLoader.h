@@ -158,6 +158,43 @@ namespace llaminar2
         }
 
         /**
+         * @brief Load an explicit ordered selection of expert IDs.
+         *
+         * The returned tensor's slowest dimension follows @p expert_ids exactly.
+         * This is the physical-loading contract required by non-contiguous
+         * static expert ownership. Implementations may preserve a zero-copy
+         * range when the IDs are contiguous, but must not silently substitute a
+         * different ownership set.
+         *
+         * @param name Tensor name (must be 3D expert-packed storage).
+         * @param expert_ids Strictly increasing logical expert IDs.
+         * @param device Target device for the materialized source tensor.
+         * @param weight_precision Requested source precision.
+         * @return Packed tensor with one slot per requested ID, or nullptr when
+         *         the loader cannot represent a non-contiguous selection.
+         */
+        virtual std::shared_ptr<TensorBase> loadTensorExpertSelection(
+            const std::string &name,
+            const std::vector<size_t> &expert_ids,
+            DeviceId device = DeviceId::cpu(),
+            WeightPrecision weight_precision = WeightPrecision::NATIVE)
+        {
+            if (expert_ids.empty())
+                return nullptr;
+            for (size_t index = 1; index < expert_ids.size(); ++index)
+            {
+                if (expert_ids[index] != expert_ids[index - 1] + 1u)
+                    return nullptr;
+            }
+            return loadTensorExpertSlice(
+                name,
+                expert_ids.front(),
+                expert_ids.back() + 1u,
+                device,
+                weight_precision);
+        }
+
+        /**
          * @brief Check if a tensor exists in the model
          * @param name Tensor name
          * @return true if tensor exists

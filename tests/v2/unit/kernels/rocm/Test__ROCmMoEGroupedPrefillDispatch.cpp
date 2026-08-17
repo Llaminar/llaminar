@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "kernels/rocm/gemm/ROCmMoEGroupedPrefillDispatchGenerated.inc"
+#include "kernels/rocm/gemm/ROCmMoEGroupedPrefillRoutePolicy.h"
 
 #include <array>
 #include <cstddef>
@@ -143,4 +144,84 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, UnsupportedPolicyHardFailsWithZeroConf
         invalid_role));
     EXPECT_EQ(invalid_role.tile_m, 0);
     EXPECT_EQ(invalid_role.tile_n, 0);
+}
+
+TEST(Test__ROCmMoEGroupedPrefillDispatch,
+     Qwen35_122BSparseEndpointUsesMeasuredRouteOwnedBuckets)
+{
+    using llaminar2::rocm::ROCmMoEGroupedPrefillRouteKey;
+    using llaminar2::rocm::ROCmMoEGroupedPrefillRouteStrategy;
+    using llaminar2::rocm::selectROCmMoEGroupedPrefillRouteStrategy;
+
+    ROCmMoEGroupedPrefillRouteKey key{
+        .gateup_codebook = 19, // NativeVNNI Q8_0 execution id.
+        .down_codebook = 19,
+        .hidden_size = 3072,
+        .expert_width = 1024,
+        .expert_count = 256,
+        .top_k = 1,
+        .rows = 16,
+    };
+    for (const int rows : {16, 32})
+    {
+        key.rows = rows;
+        const auto decision = selectROCmMoEGroupedPrefillRouteStrategy(key);
+        EXPECT_EQ(
+            decision.strategy,
+            ROCmMoEGroupedPrefillRouteStrategy::RouteOwned);
+        EXPECT_TRUE(decision.exact);
+    }
+
+    // Adjacent untrained identities must not inherit the measured exception.
+    key.rows = 64;
+    auto decision = selectROCmMoEGroupedPrefillRouteStrategy(key);
+    EXPECT_EQ(
+        decision.strategy,
+        ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled);
+    EXPECT_FALSE(decision.exact);
+
+    key.rows = 16;
+    key.top_k = 2;
+    decision = selectROCmMoEGroupedPrefillRouteStrategy(key);
+    EXPECT_EQ(
+        decision.strategy,
+        ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled);
+    EXPECT_FALSE(decision.exact);
+}
+
+TEST(Test__ROCmMoEGroupedPrefillDispatch,
+     GenericRoutePolicyIsTotalAndRejectsMalformedGeometry)
+{
+    using llaminar2::rocm::ROCmMoEGroupedPrefillRouteKey;
+    using llaminar2::rocm::ROCmMoEGroupedPrefillRouteStrategy;
+    using llaminar2::rocm::selectROCmMoEGroupedPrefillRouteStrategy;
+
+    ROCmMoEGroupedPrefillRouteKey key{
+        .gateup_codebook = 13,
+        .down_codebook = 4,
+        .hidden_size = 2048,
+        .expert_width = 512,
+        .expert_count = 256,
+        .top_k = 8,
+        .rows = 8,
+    };
+    auto decision = selectROCmMoEGroupedPrefillRouteStrategy(key);
+    EXPECT_EQ(
+        decision.strategy,
+        ROCmMoEGroupedPrefillRouteStrategy::RouteOwned);
+    EXPECT_FALSE(decision.exact);
+
+    key.rows = 9;
+    decision = selectROCmMoEGroupedPrefillRouteStrategy(key);
+    EXPECT_EQ(
+        decision.strategy,
+        ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled);
+    EXPECT_FALSE(decision.exact);
+
+    key.rows = 0;
+    decision = selectROCmMoEGroupedPrefillRouteStrategy(key);
+    EXPECT_EQ(
+        decision.strategy,
+        ROCmMoEGroupedPrefillRouteStrategy::Invalid);
+    EXPECT_FALSE(decision.valid());
 }

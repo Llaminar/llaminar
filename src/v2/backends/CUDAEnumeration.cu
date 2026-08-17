@@ -54,6 +54,7 @@ namespace llaminar2
                 dev.name = std::string(prop.name);
                 dev.device_id = i;
                 dev.compute_capability = prop.major * 10 + prop.minor;
+                dev.compute_units = prop.multiProcessorCount;
                 dev.total_memory_bytes = prop.totalGlobalMem;
 
                 // Get free memory

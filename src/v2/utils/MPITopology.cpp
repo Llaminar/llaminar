@@ -21,8 +21,10 @@
 
 #include <sstream>
 #include <algorithm>
+#include <chrono>
 #include <numeric>
 #include <cstring> // memcpy
+#include <unistd.h>
 
 namespace llaminar2
 {
@@ -108,6 +110,7 @@ namespace llaminar2
             writeIntVector(buffer, info.physical_cores);
             writeIntVector(buffer, info.ht_threads);
             writeValue(buffer, static_cast<uint64_t>(info.memory_bytes));
+            writeValue(buffer, static_cast<uint64_t>(info.available_memory_bytes));
         }
 
         // Deserialize a CPUSocketInfo
@@ -120,6 +123,7 @@ namespace llaminar2
             info.physical_cores = readIntVector(ptr, end);
             info.ht_threads = readIntVector(ptr, end);
             info.memory_bytes = readValue<uint64_t>(ptr, end);
+            info.available_memory_bytes = readValue<uint64_t>(ptr, end);
             return info;
         }
 
@@ -354,6 +358,18 @@ namespace llaminar2
         placement_.numa_node = placement_.socket_id;
         placement_.hostname = "explicit";
 
+        /*
+         * Explicit topology objects are test/setup fixtures and do not own a
+         * live shared communicator.  Give every fixture for the same declared
+         * topology one stable non-zero namespace so locality-dependent pure
+         * planning remains deterministic without pretending it is a fresh
+         * production MPI run.
+         */
+        node_shared_memory_namespace_ =
+            0x4d5049544f504f4cULL ^
+            (static_cast<uint64_t>(static_cast<uint32_t>(world_size_)) << 16u) ^
+            static_cast<uint64_t>(static_cast<uint32_t>(ranks_per_node_));
+
         // Add default CPU device
         DeviceCapability cpu_dev;
         cpu_dev.type = DeviceCapability::Type::CPU;
@@ -402,6 +418,7 @@ namespace llaminar2
           placement_(std::move(other.placement_)),
           rank_node_ids_(std::move(other.rank_node_ids_)),
           all_placements_(std::move(other.all_placements_)),
+          node_shared_memory_namespace_(other.node_shared_memory_namespace_),
           world_comm_(other.world_comm_),
           intra_node_comm_(other.intra_node_comm_),
           inter_node_comm_(other.inter_node_comm_),
@@ -439,6 +456,8 @@ namespace llaminar2
             placement_ = std::move(other.placement_);
             rank_node_ids_ = std::move(other.rank_node_ids_);
             all_placements_ = std::move(other.all_placements_);
+            node_shared_memory_namespace_ =
+                other.node_shared_memory_namespace_;
             world_comm_ = other.world_comm_;
             intra_node_comm_ = other.intra_node_comm_;
             inter_node_comm_ = other.inter_node_comm_;
@@ -478,6 +497,40 @@ namespace llaminar2
         node_count_ = detection.node_count;
         placement_.node_id = rank_node_ids_[rank_];
         placement_.hostname = detection.hostnames[rank_];
+
+        /*
+         * Only the node leader invents the run identity.  Broadcasting on the
+         * communicator returned by MPI_COMM_TYPE_SHARED proves that every
+         * process deriving a POSIX channel name sees the same value without
+         * imposing a world-wide setup barrier.  PID and monotonic time make a
+         * stale segment from a crashed prior run unable to alias this run.
+         */
+        if (local_rank == 0)
+        {
+            const uint64_t now = static_cast<uint64_t>(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            const uint64_t pid =
+                static_cast<uint64_t>(static_cast<uint32_t>(::getpid()));
+            node_shared_memory_namespace_ =
+                now ^ (pid << 32u) ^
+                (static_cast<uint64_t>(
+                     static_cast<uint32_t>(placement_.node_id))
+                 << 1u) ^
+                0x4c4c414d494e4152ULL;
+            if (node_shared_memory_namespace_ == 0)
+                node_shared_memory_namespace_ = 1;
+        }
+        if (MPI_Bcast(
+                &node_shared_memory_namespace_,
+                1,
+                MPI_UINT64_T,
+                0,
+                shared_comm) != MPI_SUCCESS ||
+            node_shared_memory_namespace_ == 0)
+        {
+            throw std::runtime_error(
+                "MPITopology could not publish a node-local shared-memory namespace");
+        }
 
         // Store shared comm temporarily for setup_communicators
         intra_node_comm_ = shared_comm;
@@ -647,20 +700,34 @@ namespace llaminar2
         auto hw = HardwareInventory::detect();
         local_inventory.cpu_socket_info = hw.cpu_sockets;
 
-        // Enrich CPU info from detected hardware
+        // Enrich CPU info from the exact socket/NUMA endpoint owned by this rank.
         {
-            int total_cores = 0, total_threads = 0;
-            size_t total_mem = 0;
-            for (const auto &sock : hw.cpu_sockets)
+            const CPUSocketInfo *owned_socket = nullptr;
+            for (const auto &socket : hw.cpu_sockets)
             {
-                total_cores += sock.num_physical_cores();
-                total_threads += sock.num_threads();
-                total_mem += sock.memory_bytes;
+                if (socket.numa_node == placement_.numa_node ||
+                    socket.socket_id == placement_.socket_id)
+                {
+                    owned_socket = &socket;
+                    break;
+                }
             }
-            local_inventory.cpu_cores = total_cores;
             local_inventory.cpu_sockets = static_cast<int>(hw.cpu_sockets.size());
-            local_inventory.cpu_memory_bytes = total_mem;
             local_inventory.numa_nodes = static_cast<int>(hw.cpu_sockets.size());
+            if (owned_socket)
+            {
+                local_inventory.cpu_cores =
+                    owned_socket->num_physical_cores();
+                local_inventory.cpu.compute_units =
+                    owned_socket->num_threads();
+                local_inventory.cpu.memory_bytes =
+                    owned_socket->memory_bytes;
+                local_inventory.cpu.free_memory_bytes =
+                    owned_socket->available_memory_bytes;
+                local_inventory.cpu_memory_bytes =
+                    owned_socket->memory_bytes;
+                local_inventory.cpu.numa_node = owned_socket->numa_node;
+            }
         }
 
         // Enrich GPU DeviceInfos with real hardware data (PCIe, memory, etc.)

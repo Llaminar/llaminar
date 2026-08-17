@@ -103,7 +103,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--tp-devices rocm:0\\,rocm:1", result.stdout)
-        self.assertIn("--tp-scope local", result.stdout)
+        self.assertIn("--tp-scope rank_local", result.stdout)
         self.assertIn("--backend rccl", result.stdout)
         self.assertNotIn(" -d ", result.stdout)
 
@@ -116,7 +116,7 @@ class MTPIterationBenchmarkMatrixTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--pipeline-parallelism-degree 2", result.stdout)
-        self.assertIn("--define-domain stage0=rocm:0\\;scope=local\\;owner=0", result.stdout)
+        self.assertIn("--define-domain stage0=rocm:0\\;scope=rank_local\\;owner=0", result.stdout)
         self.assertIn("--pp-stage 0=stage0:0-31", result.stdout)
         self.assertIn("--pp-stage 1=stage1:32-63", result.stdout)
         self.assertNotIn(" -d ", result.stdout)

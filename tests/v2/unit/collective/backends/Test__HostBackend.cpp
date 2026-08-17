@@ -6,6 +6,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <array>
 #include "v2/collective/backends/HostBackend.h"
 #include "v2/collective/DeviceGroup.h"
 #include "v2/backends/DeviceId.h"
@@ -453,6 +454,47 @@ namespace llaminar2::test
             EXPECT_TRUE(backend_->allgather(send.data(), recv.data(), 4, CollectiveDataType::INT8));
             EXPECT_EQ(recv, send);
         }
+    }
+
+    /**
+     * @test FP16 reduction shares tensor conversion semantics for ties and
+     *       subnormals rather than truncating or flushing them.
+     */
+    TEST_F(Test__HostBackend, FP16ReductionUsesRoundToNearestEvenAndSubnormals)
+    {
+        // 1.0 + 3*2^-11 is exactly halfway between 0x3c01 and 0x3c02;
+        // ties-to-even must select 0x3c02. Two minimum subnormals must remain
+        // representable as the next subnormal instead of being flushed.
+        std::array<uint16_t, 2> accumulator = {0x3c00U, 0x0001U};
+        const std::array<uint16_t, 2> source = {0x1600U, 0x0001U};
+
+        HostBackend::reduceOnHost(
+            accumulator.data(),
+            source.data(),
+            accumulator.size(),
+            CollectiveDataType::FLOAT16,
+            CollectiveOp::ALLREDUCE_SUM);
+
+        EXPECT_EQ(accumulator[0], 0x3c02U);
+        EXPECT_EQ(accumulator[1], 0x0002U);
+    }
+
+    /** @test BF16 reduction contracts FP32 sums with round-to-nearest-even. */
+    TEST_F(Test__HostBackend, BF16ReductionUsesRoundToNearestEven)
+    {
+        // 1.0 + 3*2^-8 is the BF16 halfway case immediately above 0x3f81;
+        // the even result is 0x3f82, while truncation incorrectly gives 0x3f81.
+        uint16_t accumulator = 0x3f80U;
+        const uint16_t source = 0x3c40U;
+
+        HostBackend::reduceOnHost(
+            &accumulator,
+            &source,
+            1,
+            CollectiveDataType::BFLOAT16,
+            CollectiveOp::ALLREDUCE_SUM);
+
+        EXPECT_EQ(accumulator, 0x3f82U);
     }
 
 } // namespace llaminar2::test

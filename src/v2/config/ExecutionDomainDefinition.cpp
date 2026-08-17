@@ -88,8 +88,8 @@ namespace llaminar2
             return "auto";
         case ExecutionDomainScope::SINGLE:
             return "single";
-        case ExecutionDomainScope::LOCAL:
-            return "local";
+        case ExecutionDomainScope::RANK_LOCAL:
+            return "rank_local";
         case ExecutionDomainScope::NODE_LOCAL:
             return "node_local";
         case ExecutionDomainScope::GLOBAL:
@@ -105,9 +105,9 @@ namespace llaminar2
             return ExecutionDomainScope::AUTO;
         if (normalized == "single" || normalized == "single_device")
             return ExecutionDomainScope::SINGLE;
-        if (normalized == "local" || normalized == "local_tp")
-            return ExecutionDomainScope::LOCAL;
-        if (normalized == "node_local" || normalized == "nodelocal" || normalized == "node_local_tp")
+        if (normalized == "rank_local")
+            return ExecutionDomainScope::RANK_LOCAL;
+        if (normalized == "node_local")
             return ExecutionDomainScope::NODE_LOCAL;
         if (normalized == "global")
             return ExecutionDomainScope::GLOBAL;
@@ -248,7 +248,7 @@ namespace llaminar2
         }
 
         if (options.require_scope && !saw_scope)
-            throw std::invalid_argument(options.context + " '" + domain.name + "' is missing scope=<single|local|node_local>");
+            throw std::invalid_argument(options.context + " '" + domain.name + "' is missing scope=<auto|single|rank_local|node_local>");
         if (options.require_routed_expert_compute && !saw_routed_compute)
             throw std::invalid_argument(options.context + " '" + domain.name + "' is missing routed_compute=<replicated|apportioned|tensor-sharded>");
 
@@ -271,7 +271,7 @@ namespace llaminar2
 
     bool ExecutionDomainDefinition::isDomainScopedTP() const
     {
-        return scope == ExecutionDomainScope::LOCAL || scope == ExecutionDomainScope::NODE_LOCAL;
+        return scope == ExecutionDomainScope::RANK_LOCAL || scope == ExecutionDomainScope::NODE_LOCAL;
     }
 
     bool ExecutionDomainDefinition::supportsWholeExpertApportionment() const
@@ -327,22 +327,24 @@ namespace llaminar2
         if (scope == ExecutionDomainScope::SINGLE && participants.size() > 1)
             errors.push_back("Domain '" + name + "' has scope=single but multiple participants specified");
 
-        if (scope == ExecutionDomainScope::LOCAL && !ranks.empty())
-            errors.push_back("Domain '" + name + "' has scope=local but explicit_ranks is set (use owner= for local domains)");
+        if (scope == ExecutionDomainScope::RANK_LOCAL && !ranks.empty())
+            errors.push_back("Domain '" + name + "' has scope=rank_local but explicit_ranks is set (use owner= for rank-local domains)");
 
         if (owner_rank.has_value() && *owner_rank < 0)
             errors.push_back("Domain '" + name + "' has invalid owner_rank " + std::to_string(*owner_rank));
 
-        std::set<int> seen_ranks;
+        std::set<int> participating_ranks;
         for (int rank : ranks)
         {
             if (rank < 0)
                 errors.push_back("Domain '" + name + "' has a negative rank");
-            else if (!seen_ranks.insert(rank).second)
-                errors.push_back("Domain '" + name + "' has duplicate rank " + std::to_string(rank));
+            else
+                participating_ranks.insert(rank);
         }
 
-        if (owner_rank.has_value() && !ranks.empty() && seen_ranks.find(*owner_rank) == seen_ranks.end())
+        if (owner_rank.has_value() && !ranks.empty() &&
+            participating_ranks.find(*owner_rank) ==
+                participating_ranks.end())
         {
             errors.push_back("Domain '" + name + "' owner rank " + std::to_string(*owner_rank) +
                              " is not in its rank list");

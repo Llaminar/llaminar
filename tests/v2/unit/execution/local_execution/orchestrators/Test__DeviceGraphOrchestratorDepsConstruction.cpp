@@ -267,7 +267,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpre
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT", nullptr},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR", nullptr},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", nullptr},
-        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT", nullptr},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", nullptr},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE", nullptr},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS", nullptr},
@@ -282,7 +282,10 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpre
            "maintenance economical.";
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot, 256)
         << "The wave-level value gate should reject low-value hot-cache transfer churn by default.";
-    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_foreign_rows_per_transfer, 0)
+    EXPECT_EQ(
+        debugEnv().moe_rebalance
+            .device_rebalance_min_foreign_rows_per_critical_path_payload_slot,
+        0)
         << "The useful-work gate should be available for sweeps without changing existing policy by default.";
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot, 128)
         << "Steady-state hot-replica transfer waves should require measured realized router benefit by default.";
@@ -298,7 +301,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpre
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT", "96"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR", "12"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "192"},
-        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER", "768"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT", "768"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "384"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE", "75"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS", "3"},
@@ -308,8 +311,12 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpre
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement_divisor, 12);
     EXPECT_TRUE(debugEnv().presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR"));
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot, 192);
-    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_foreign_rows_per_transfer, 768);
-    EXPECT_TRUE(debugEnv().presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER"));
+    EXPECT_EQ(
+        debugEnv().moe_rebalance
+            .device_rebalance_min_foreign_rows_per_critical_path_payload_slot,
+        768);
+    EXPECT_TRUE(debugEnv().presence.has(
+        "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT"));
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot, 384);
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille, 75);
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_no_work_backoff_periods, 3);
@@ -341,7 +348,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
         &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
-    EXPECT_FALSE(policy.collective_segmented_enabled);
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled);
     EXPECT_TRUE(policy.collectives_graph_capturable);
     EXPECT_TRUE(policy.allow_cached_graph_replay)
         << "Homogeneous CUDA LocalTP collective decode must remain graph-replay eligible by default.";
@@ -373,7 +380,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
         &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
-    EXPECT_FALSE(policy.collective_segmented_enabled);
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled);
     EXPECT_TRUE(policy.collectives_graph_capturable);
     EXPECT_TRUE(policy.allow_cached_graph_replay)
         << "Homogeneous ROCm LocalTP collective decode should graph-capture through participant-local RCCL enqueue.";
@@ -406,7 +413,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
 
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_TRUE(policy.collectives_graph_capturable);
-    EXPECT_FALSE(policy.collective_segmented_enabled)
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled)
         << "Segmented replay is an explicit compatibility lane, not the primary LocalTP graph path.";
     EXPECT_TRUE(policy.allow_cached_graph_replay);
 }
@@ -439,7 +446,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
         &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
-    EXPECT_FALSE(policy.collective_segmented_enabled);
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled);
     EXPECT_TRUE(policy.collectives_graph_capturable);
     EXPECT_TRUE(policy.allow_cached_graph_replay)
         << "Phase-split dense decode builds a decode-only graph with replicated dense bindings; "
@@ -472,7 +479,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
         &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
-    EXPECT_FALSE(policy.collective_segmented_enabled);
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled);
     EXPECT_TRUE(policy.collectives_graph_capturable);
     EXPECT_TRUE(policy.allow_cached_graph_replay);
 }
@@ -503,12 +510,12 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
         &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
-    EXPECT_FALSE(policy.collective_segmented_enabled);
+    EXPECT_FALSE(policy.heterogeneous_segmented_enabled);
     EXPECT_TRUE(policy.collectives_graph_capturable);
     EXPECT_TRUE(policy.allow_cached_graph_replay);
 }
 
-TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_RejectsCapturedCollectivesForMixedLocalTP)
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_AdmitsTopologyDrivenSegmentationForMixedLocalTP)
 {
     ScopedEnvVars env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -534,12 +541,16 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Reject
         &gpu_ctx);
 
     EXPECT_TRUE(policy.allow_fast_decode);
-    EXPECT_FALSE(policy.collective_segmented_enabled);
+    EXPECT_TRUE(policy.heterogeneous_segmented_enabled);
     EXPECT_FALSE(policy.collectives_graph_capturable);
-    EXPECT_FALSE(policy.allow_cached_graph_replay);
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
+    EXPECT_EQ(
+        policy.graph_replay_plan_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
 }
 
-TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_AdmitsSegmentationForMixedExpertOverlayCollectives)
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_AdmitsExpertOverlayBoundaryWithoutNamedCollective)
 {
     ScopedEnvVars env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -555,7 +566,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Admits
     placement->enabled = true;
     RoutedExpertDomain hot;
     hot.name = "cuda_hot";
-    hot.scope = ExecutionDomainScope::LOCAL;
+    hot.scope = ExecutionDomainScope::RANK_LOCAL;
     hot.backend = CollectiveBackendType::NCCL;
     hot.participants = {
         GlobalDeviceAddress::cuda(0),
@@ -603,16 +614,72 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Admits
         DeviceType::CPU);
 
     const auto policy = host.buildDecodeCapturePolicy(
-        true,
+        false,
         &gpu_ctx);
 
-    EXPECT_TRUE(policy.collective_segmented_enabled);
+    EXPECT_TRUE(policy.heterogeneous_segmented_enabled);
     EXPECT_FALSE(policy.collectives_graph_capturable);
     EXPECT_EQ(
         policy.graph_replay_plan_policy,
         DeviceGraphExecutor::GraphReplayPlanPolicy::
-            AllowHeterogeneousCollectiveSegmentation);
+            AllowHeterogeneousBoundarySegmentation);
     EXPECT_TRUE(policy.allow_cached_graph_replay);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesHomogeneousContinuationCollectivesAcrossExpertOverlayBoundary)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", "1"},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setDevices({
+        GlobalDeviceAddress::cuda(0, 0, "worker-a"),
+        GlobalDeviceAddress::cuda(1, 0, "worker-a")});
+
+    auto placement = std::make_shared<MoERoutedExpertPlacementPlan>();
+    placement->enabled = true;
+    RoutedExpertDomain continuation;
+    continuation.name = "priority_0";
+    continuation.scope = ExecutionDomainScope::RANK_LOCAL;
+    continuation.backend = CollectiveBackendType::NCCL;
+    continuation.participants = {
+        GlobalDeviceAddress::cuda(0, 0, "worker-a"),
+        GlobalDeviceAddress::cuda(1, 0, "worker-a")};
+    RoutedExpertDomain remote;
+    remote.name = "priority_1";
+    remote.scope = ExecutionDomainScope::RANK_LOCAL;
+    remote.backend = CollectiveBackendType::RCCL;
+    remote.participants = {
+        GlobalDeviceAddress::rocm(0, 1, "worker-a"),
+        GlobalDeviceAddress::rocm(1, 1, "worker-a")};
+    placement->domains = {continuation, remote};
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    cfg.moe.routed_expert_plan = placement;
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        /*has_collective_nodes=*/true,
+        &gpu_ctx);
+
+    EXPECT_TRUE(policy.heterogeneous_segmented_enabled);
+    EXPECT_TRUE(policy.collectives_graph_capturable)
+        << "A remote ExpertOverlay domain must not eject homogeneous continuation NCCL stages from capture.";
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
+    EXPECT_EQ(
+        policy.graph_replay_plan_policy,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
 }
 
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, ExecutorAccessible)

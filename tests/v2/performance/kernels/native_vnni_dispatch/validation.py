@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .candidate_registry import CandidateRegistry
 from .corpus import ObservationCorpus, RuntimeKey, SurfaceKey, runtime_key
@@ -129,24 +129,42 @@ def require_candidate_matrix_complete(corpus: ObservationCorpus) -> None:
 def require_registry_candidate_coverage(
     corpus: ObservationCorpus,
     registry: CandidateRegistry,
+    *,
+    candidate_ids_for_runtime_key: (
+        Callable[[RuntimeKey], Iterable[str]] | None
+    ) = None,
 ) -> None:
-    """Require every contract-compatible registry candidate at every exact key.
+    """Require every forceable registry candidate at every exact runtime key.
 
     Matrix completeness alone cannot detect a candidate omitted from every
     alias.  This registry-backed check closes that gap.  Unsupported launches
-    must still be represented by explicit ``supported=false`` observations so
-    the corpus records why the candidate was unavailable.
+    may be represented by explicit ``supported=false`` observations when that
+    negative evidence is useful. A surface whose nominal registry entries
+    collapse to fewer physical schedules must supply
+    ``candidate_ids_for_runtime_key``; aliases of one launch are then required
+    exactly once under their canonical physical candidate ID.
     """
 
     failures = []
     for key in corpus.runtime_keys():
         if key.backend != registry.backend:
             continue
-        required = {
+        registered = {
             entry.effective_candidate_id
             for entry in registry.entries
             if entry.supports_contract(key.semantic_contract)
         }
+        required = (
+            registered
+            if candidate_ids_for_runtime_key is None
+            else set(candidate_ids_for_runtime_key(key))
+        )
+        foreign = sorted(required - registered)
+        if foreign:
+            raise ValueError(
+                "runtime candidate resolver returned IDs outside the "
+                f"contract-compatible registry: {foreign}"
+            )
         actual = {
             row.effective_candidate_id for row in corpus.rows_for_runtime_key(key)
         }

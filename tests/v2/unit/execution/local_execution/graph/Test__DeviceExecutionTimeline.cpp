@@ -153,6 +153,31 @@ namespace llaminar2::test
             EXPECT_FALSE(publication.to(role).validForConsumption())
                 << deviceTimelineRoleName(role);
         }
+
+        /*
+         * Parent materialization transfers authority from the externally
+         * scheduled first transaction to the captured generation family. Its
+         * exact stream must therefore be able to join every predecessor that
+         * may own live KV/GDN/MTP state before the first internal sidecar.
+         */
+        EXPECT_TRUE(
+            DeviceEventEdge::at(
+                DeviceTimelinePoint::AcceptedSpecPublicationReady)
+                .from(DeviceTimelineRole::AcceptedStatePublication)
+                .to(DeviceTimelineRole::DeviceGenerationController)
+                .validForConsumption());
+        EXPECT_TRUE(
+            DeviceEventEdge::at(
+                DeviceTimelinePoint::LivePrefixMutationReady)
+                .from(DeviceTimelineRole::PrefixRestoreMutation)
+                .to(DeviceTimelineRole::DeviceGenerationController)
+                .validForConsumption());
+        EXPECT_TRUE(
+            DeviceEventEdge::at(
+                DeviceTimelinePoint::ForwardGraphOutputReady)
+                .from(DeviceTimelineRole::MainForwardGraph)
+                .to(DeviceTimelineRole::DeviceGenerationController)
+                .validForConsumption());
     }
 
     TEST(Test__DeviceExecutionTimeline, RequestResetMustPrecedeEveryGpuGraphFamily)
@@ -255,7 +280,8 @@ namespace llaminar2::test
         Test__DeviceExecutionTimeline,
         PublishedLiveStateEdgesDeclareEveryPermittedOwner)
     {
-        const std::array<DeviceTimelineRole, 8> permitted = {
+        const std::array<DeviceTimelineRole, 9> common_permitted = {
+            DeviceTimelineRole::DeviceGenerationController,
             DeviceTimelineRole::MainForwardGraph,
             DeviceTimelineRole::MTPSidecarGraph,
             DeviceTimelineRole::PrefixCheckpointArchive,
@@ -277,7 +303,7 @@ namespace llaminar2::test
         ASSERT_TRUE(accepted.validForPublication());
         ASSERT_TRUE(prefix_mutation.validForPublication());
 
-        for (const DeviceTimelineRole role : permitted)
+        for (const DeviceTimelineRole role : common_permitted)
         {
             EXPECT_TRUE(accepted.to(role).validForConsumption())
                 << deviceTimelineRoleName(role);
@@ -285,10 +311,20 @@ namespace llaminar2::test
                 << deviceTimelineRoleName(role);
         }
 
+        EXPECT_FALSE(
+            accepted.to(DeviceTimelineRole::HostResultBridge)
+                .validForConsumption())
+            << "Accepted speculative state reaches the host through the typed "
+               "compact-response publication, not through its mutation event.";
+        EXPECT_TRUE(
+            prefix_mutation.to(DeviceTimelineRole::HostResultBridge)
+                .validForConsumption())
+            << "A host parity/result bridge must be able to observe terminal "
+               "logits restored without a forward graph.";
+
         for (const DeviceTimelineRole role : {
                  DeviceTimelineRole::AllPositionVerifier,
                  DeviceTimelineRole::AcceptedStatePublication,
-                 DeviceTimelineRole::HostResultBridge,
                  DeviceTimelineRole::HostArchiveBoundary,
              })
         {

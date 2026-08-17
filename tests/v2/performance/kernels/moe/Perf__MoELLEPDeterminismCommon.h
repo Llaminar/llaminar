@@ -81,6 +81,80 @@ namespace llaminar2::test::moe_llep_perf
         return hash;
     }
 
+    /**
+     * @brief Validate sparse publication of a compact active-expert plan.
+     *
+     * Fused verifier publication deliberately leaves inactive descriptor
+     * slots untouched: consumers can reach descriptors only through the
+     * compact active-expert list. This validator checks the complete contract,
+     * not allocator history: every reachable descriptor byte must equal the
+     * full-table reference, while every unreachable slot must retain the
+     * caller's poison byte.
+     *
+     * @param actual Bytes produced by the sparse fused publisher.
+     * @param reference Bytes produced by full-table publication.
+     * @param active_experts Compact expert ids followed by optional -1 padding.
+     * @param num_experts Number of descriptor-table entries.
+     * @param descriptor_stride Bytes in one descriptor entry.
+     * @param inactive_poison Byte installed in the fused table before launch.
+     * @return Empty string on success, otherwise a focused mismatch diagnostic.
+     */
+    inline std::string validateSparseDescriptorPublication(
+        const std::vector<uint8_t> &actual,
+        const std::vector<uint8_t> &reference,
+        const std::vector<int32_t> &active_experts,
+        int num_experts,
+        size_t descriptor_stride,
+        uint8_t inactive_poison)
+    {
+        if (num_experts <= 0 || descriptor_stride == 0u)
+            return "invalid descriptor-table geometry";
+        const size_t expected_bytes =
+            static_cast<size_t>(num_experts) * descriptor_stride;
+        if (actual.size() != expected_bytes || reference.size() != expected_bytes)
+            return "descriptor-table byte count does not match geometry";
+
+        std::vector<uint8_t> active(static_cast<size_t>(num_experts), 0u);
+        bool saw_padding = false;
+        for (const int32_t expert : active_experts)
+        {
+            if (expert == -1)
+            {
+                saw_padding = true;
+                continue;
+            }
+            if (saw_padding)
+                return "active-expert id appears after -1 padding";
+            if (expert < 0 || expert >= num_experts)
+                return "active-expert id is outside the descriptor table";
+            if (active[static_cast<size_t>(expert)] != 0u)
+                return "active-expert list contains a duplicate id";
+            active[static_cast<size_t>(expert)] = 1u;
+        }
+
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const size_t begin =
+                static_cast<size_t>(expert) * descriptor_stride;
+            for (size_t byte = 0; byte < descriptor_stride; ++byte)
+            {
+                const uint8_t expected =
+                    active[static_cast<size_t>(expert)] != 0u
+                        ? reference[begin + byte]
+                        : inactive_poison;
+                if (actual[begin + byte] != expected)
+                {
+                    return "descriptor mismatch at expert=" +
+                           std::to_string(expert) +
+                           " byte=" + std::to_string(byte) +
+                           " expected=" + std::to_string(expected) +
+                           " actual=" + std::to_string(actual[begin + byte]);
+                }
+            }
+        }
+        return {};
+    }
+
     inline uint32_t participantMask(int participant_count)
     {
         return participant_count >= 32 ? 0xffffffffu : ((1u << participant_count) - 1u);
@@ -91,12 +165,21 @@ namespace llaminar2::test::moe_llep_perf
                                       bool all_participants_resident,
                                       int participant_id = 0)
     {
+        /* Production runtime placement always begins at a positive epoch.
+         * Leaving the synthetic table at epoch zero lets route planning run,
+         * but produces a command header that no request ticket can legally
+         * acquire. Keep the fixture on the same epoch-one lifecycle used by
+         * DeviceMoEOverlayEpochArena so payload apply exercises its real
+         * transaction checks instead of an impossible pre-admission state. */
+        runtime.active_bank = 0u;
+        runtime.active_epoch = 1u;
         runtime.participant_id = static_cast<uint32_t>(participant_id);
         runtime.participant_count = static_cast<uint32_t>(shape.participant_count);
         runtime.expert_count = static_cast<uint32_t>(shape.num_experts);
         runtime.top_k = static_cast<uint32_t>(shape.top_k);
 
         auto &bank = runtime.banks[runtime.active_bank];
+        bank.epoch = runtime.active_epoch;
         bank.expert_count = static_cast<uint32_t>(shape.num_experts);
         const uint32_t all_mask = participantMask(shape.participant_count);
         for (int expert = 0; expert < shape.num_experts; ++expert)
@@ -377,7 +460,7 @@ namespace llaminar2::test::moe_llep_perf
         config.expert_count = static_cast<uint32_t>(shape.num_experts);
         config.participant_count = static_cast<uint32_t>(shape.participant_count);
         config.enable_balanced_skip = false;
-        config.min_foreign_rows_per_transfer = 0;
+        config.min_foreign_rows_per_critical_path_slot = 0;
         return config;
     }
 

@@ -13,6 +13,8 @@
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
+#include "execution/moe/CanonicalMoERouteRecord.h"
+#include "execution/moe/RoutedExpertOwnerAssignment.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/local_execution/graph/GraphSchema.h"
 #include "tensors/Tensors.h"
@@ -20,10 +22,13 @@
 #include "tensors/FP16Utils.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/IMoEKernel.h"
+#include "kernels/cpu/moe/CPUCanonicalRouteReducer.h"
+#include "kernels/cpu/primitives/VectorPrimitives.h"
 #include "loaders/PreparedWeightStore.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/OpenMPUtils.h"
 #include "utils/QuantizedVerifierFormats.h"
 #include "utils/PreparedWeightTestHarness.h"
 #include "utils/VerifierRowTestInventory.h"
@@ -42,6 +47,10 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -86,6 +95,52 @@ namespace
     private:
         std::string name_;
         std::optional<std::string> old_value_;
+    };
+
+    /**
+     * @brief Temporarily bound OpenMP work to a small deterministic team.
+     *
+     * The all-format arithmetic regressions below launch many deliberately
+     * tiny expert problems.  Using the machine-wide production team would
+     * measure repeated team construction rather than the stage contract and
+     * can turn a device-free unit test into a multi-minute workload on a
+     * many-core host.  Thread-count scaling remains the responsibility of the
+     * NativeVNNI performance suites; this guard keeps the correctness sweep
+     * fast while executing the same kernels and arithmetic implementation.
+     */
+    class ScopedOpenMPThreadCount
+    {
+    public:
+        /**
+         * @brief Set the OpenMP team size until this scope is destroyed.
+         * @param threads Positive number of workers used by nested kernels.
+         */
+        explicit ScopedOpenMPThreadCount(int threads)
+        {
+#ifdef _OPENMP
+            previous_ = omp_get_max_threads();
+            omp_set_num_threads(threads);
+#else
+            (void)threads;
+#endif
+        }
+
+        /** @brief Restore the caller's OpenMP team size. */
+        ~ScopedOpenMPThreadCount()
+        {
+#ifdef _OPENMP
+            omp_set_num_threads(previous_);
+#endif
+        }
+
+        ScopedOpenMPThreadCount(const ScopedOpenMPThreadCount &) = delete;
+        ScopedOpenMPThreadCount &operator=(
+            const ScopedOpenMPThreadCount &) = delete;
+
+    private:
+#ifdef _OPENMP
+        int previous_ = 1;
+#endif
     };
 
     bool hasPerfCounterWithRoute(
@@ -630,10 +685,11 @@ TEST(Test__MoEKernelOwnership, FactoryCreatesIndependentLaunchState)
 /**
  * @brief Prove payload transaction purpose owns histogram lifecycle policy.
  *
- * Prefix rehydration and current-batch movement deliberately share a captured
- * transport implementation. They must not share reset semantics: rehydration
- * preserves the routing evidence imported with the prefix, while a new
- * current-batch placement consumes that evidence and starts the next window.
+ * Prefix rehydration and current-batch movement have distinct graph
+ * authorities, but both consume the shared immutable rebalance config ABI.
+ * They must not share reset semantics: rehydration preserves routing evidence
+ * imported with the prefix, while current-batch placement consumes it and
+ * starts the next window.
  */
 TEST(Test__MoEExpertComputeStage,
      PrefillLLEPTransferPurposeMakesHistogramOwnershipExplicit)
@@ -922,6 +978,22 @@ TEST_F(MoEExpertComputeStageTest,
            "weight preparation owns normalization before graph construction.";
 }
 
+TEST_F(MoEExpertComputeStageTest,
+       ExactExpertMaskMatchIdentifiesSparseCPUOwnershipPublication)
+{
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.num_experts = 4;
+    params.expert_mask = {true, false, true, false};
+
+    MoEExpertComputeStage stage(std::move(params));
+
+    EXPECT_TRUE(stage.expertMaskMatches({true, false, true, false}));
+    EXPECT_FALSE(stage.expertMaskMatches({false, true, true, false}));
+    EXPECT_FALSE(stage.expertMaskMatches({true, false, true}))
+        << "Mask geometry is part of exact publication identity";
+}
+
 TEST_F(MoEExpertComputeStageTest, SharedGate_FusedCombinePublishesGatedSharedAndCombinedOutput)
 {
     const int seq = 2;
@@ -1138,6 +1210,101 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q4K)
         EXPECT_FALSE(std::isnan(out[i])) << "NaN at index " << i;
         EXPECT_FALSE(std::isinf(out[i])) << "Inf at index " << i;
     }
+}
+
+/**
+ * @brief A sparse CPU ExpertOverlay row must publish the same NativeVNNI input.
+ *
+ * The continuation router is intentionally absent from the second invocation:
+ * its compact row models an authoritative CPU-cold packet received through the
+ * graph-native sparse collective.  A transport-owned Q8_1 publication must
+ * make that serial M=1 execution byte-identical to the normal router-owned
+ * decode path.  This prevents the one-row tier case from being masked by the
+ * separate grouped-row transport implementation.
+ */
+TEST_F(MoEExpertComputeStageTest,
+       CpuTransportedSerialRowPublishesNativeVNNIRouterQ8BeforeExpertCompute)
+{
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedOpenMPThreadCount omp_threads(/*threads=*/1);
+    PerfStatsCollector::reset();
+
+    constexpr int d = 256;
+    constexpr int intermediate = 256;
+    constexpr int experts = 4;
+    constexpr int top_k = 2;
+
+    auto input = TestTensorFactory::createFP32Random(
+        {1, d}, -0.5f, 0.5f, 220);
+    auto router_weights = TestTensorFactory::createFP32Random(
+        {experts, d}, -0.1f, 0.1f, 221);
+    auto gate_experts = createExpertQ4K(experts, intermediate, d, 222);
+    auto up_experts = createExpertQ4K(experts, intermediate, d, 223);
+    auto down_experts = createExpertQ4K(experts, d, intermediate, 224);
+    const auto routing = computeRouting(
+        input.get(), router_weights.get(), 1, d, experts, top_k);
+
+    const auto make_params = [&]()
+    {
+        MoEExpertComputeStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.input = input.get();
+        params.routing_indices = routing.indices.get();
+        params.routing_weights = routing.weights.get();
+        params.gate_exps = gate_experts.get();
+        params.up_exps = up_experts.get();
+        params.down_exps = down_experts.get();
+        params.seq_len = 1;
+        params.d_model = d;
+        params.num_experts = experts;
+        params.top_k = top_k;
+        params.expert_intermediate = intermediate;
+        params.layer_idx = 37;
+        return params;
+    };
+
+    auto router_output = TestTensorFactory::createFP32({1, d});
+    auto router_params = make_params();
+    router_params.output = router_output.get();
+    router_params.routed_pipeline_kernel_owner = routing.kernel_owner;
+    ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(router_params));
+    ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(router_params));
+    MoEExpertComputeStage router_stage(std::move(router_params));
+    ASSERT_TRUE(router_stage.execute(cpu_ctx_.get()));
+
+    auto transported_output = TestTensorFactory::createFP32({1, d});
+    auto transported_params = make_params();
+    transported_params.output = transported_output.get();
+    transported_params.cpu_router_q8_input_publication =
+        CPURouterQ8InputPublicationPolicy::PublishTransportedRows;
+    ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(transported_params));
+    ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(transported_params));
+    MoEExpertComputeStage transported_stage(std::move(transported_params));
+    ASSERT_TRUE(transported_stage.execute(cpu_ctx_.get()));
+
+    expectRowsByteEqual(
+        transported_output->data(),
+        router_output->data(),
+        /*rows=*/1,
+        d,
+        "CPU transported serial NativeVNNI expert row");
+
+    const auto records = PerfStatsCollector::snapshot({"moe_overlay"});
+    EXPECT_TRUE(std::any_of(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            const auto source = record.tags.find("source");
+            return record.domain == "moe_overlay" &&
+                   record.name == "cpu_transport_router_q8_publications" &&
+                   record.phase == "decode" &&
+                   source != record.tags.end() &&
+                   source->second == "compact_transport_serial_row" &&
+                   record.count > 0;
+        }))
+        << PerfStatsCollector::summaryString({"moe_overlay"});
+    PerfStatsCollector::reset();
 }
 
 TEST_F(MoEExpertComputeStageTest, MoEFFN_OutputNonZero_Q5K)
@@ -1377,6 +1544,7 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_RuntimeMVerifierAllNativeFormatsM
 TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_AllNativeFormatsRouterQ8Reuse)
 {
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedOpenMPThreadCount omp_threads(/*threads=*/1);
     constexpr int d = 256;
     constexpr int inter = 256;
     constexpr int experts = 4;
@@ -1418,7 +1586,10 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                            TensorBase *run_weights,
                            const std::shared_ptr<MoERoutedPipelineKernelOwner> &kernel_owner,
                            TensorBase *run_output,
-                           int run_seq)
+                           int run_seq,
+                           bool verifier_rows,
+                           const std::vector<bool> *run_expert_mask,
+                           TensorBase *run_canonical_routes = nullptr)
         {
             MoEExpertComputeStage::Params params;
             params.device_id = DeviceId::cpu();
@@ -1430,12 +1601,32 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
             params.expert_up_views = up_views;
             params.expert_down_views = down_views;
             params.output = run_output;
+            params.canonical_route_contributions = run_canonical_routes;
+            params.canonical_route_arithmetic = run_canonical_routes
+                ? MoECanonicalRouteArithmeticPolicy::
+                      UnweightedExpertRowThenOrderedFMA
+                : MoECanonicalRouteArithmeticPolicy::Unspecified;
+            params.canonical_route_layout = run_canonical_routes
+                ? MoECanonicalRoutePublicationLayout::
+                      PackedIndexedRouteRows
+                : MoECanonicalRoutePublicationLayout::Unspecified;
             params.seq_len = run_seq;
             params.d_model = d;
             params.num_experts = experts;
             params.top_k = topk;
             params.expert_intermediate = inter;
-            params.force_decode_equivalent_verifier_prefill = run_seq > 1;
+            params.force_decode_equivalent_verifier_prefill = verifier_rows;
+            if (run_expert_mask)
+            {
+                /*
+                 * Keep the contiguous range deliberately broad. The explicit
+                 * ownership mask is authoritative, so a latent range-based
+                 * scheduler will compute an extra expert and fail byte parity.
+                 */
+                params.local_expert_start = 0;
+                params.local_expert_count = experts;
+                params.expert_mask = *run_expert_mask;
+            }
 
             if (!MoEExpertComputeStage::prepareExpertGemmEngines(params))
             {
@@ -1445,6 +1636,230 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
             return stage.execute(cpu_ctx_.get());
         };
 
+        constexpr int owner_participants = 2;
+        constexpr int owner_layer = 0;
+        const std::array<std::vector<bool>, owner_participants> random_owner_masks = {
+            routed_expert_ownership::expertMaskForParticipant(
+                experts,
+                owner_participants,
+                0,
+                owner_layer,
+                RoutedExpertOwnerOrder::Random),
+            routed_expert_ownership::expertMaskForParticipant(
+                experts,
+                owner_participants,
+                1,
+                owner_layer,
+                RoutedExpertOwnerOrder::Random)};
+        ASSERT_EQ(
+            random_owner_masks[0],
+            (std::vector<bool>{true, false, true, false}));
+        ASSERT_EQ(
+            random_owner_masks[1],
+            (std::vector<bool>{false, true, false, true}));
+
+        const std::array<std::array<std::vector<bool>, owner_participants>, 2>
+            ownership_maps = {{
+                {
+                    routed_expert_ownership::expertMaskForParticipant(
+                        experts,
+                        owner_participants,
+                        0,
+                        owner_layer,
+                        RoutedExpertOwnerOrder::Ordinal),
+                    routed_expert_ownership::expertMaskForParticipant(
+                        experts,
+                        owner_participants,
+                        1,
+                        owner_layer,
+                        RoutedExpertOwnerOrder::Ordinal),
+                },
+                random_owner_masks,
+            }};
+        const std::array<const char *, 2> ownership_labels = {
+            "ordinal",
+            "random",
+        };
+
+        auto prove_distributed_canonical_rows =
+            [&](TensorBase *run_input,
+                TensorBase *run_indices,
+                TensorBase *run_weights,
+                const std::shared_ptr<MoERoutedPipelineKernelOwner> &kernel_owner,
+                TensorBase *serial_rows,
+                int run_seq,
+                bool verifier_rows)
+        {
+            std::vector<float> first_ownership_result;
+            for (size_t ownership_index = 0;
+                 ownership_index < ownership_maps.size();
+                 ++ownership_index)
+            {
+                SCOPED_TRACE(
+                    std::string("distributed_owner_map=") +
+                    ownership_labels[ownership_index] +
+                    " seq=" + std::to_string(run_seq));
+
+                const size_t route_slot_count =
+                    static_cast<size_t>(run_seq) *
+                    static_cast<size_t>(topk);
+                const size_t record_width =
+                    canonical_moe_route_record::recordWidth(d);
+                const size_t packed_elements =
+                    route_slot_count * record_width +
+                    canonical_moe_route_record::kTrailerElements;
+                std::array<std::shared_ptr<FP32Tensor>, owner_participants>
+                    participant_routes;
+                for (int participant = 0;
+                     participant < owner_participants;
+                     ++participant)
+                {
+                    participant_routes[static_cast<size_t>(participant)] =
+                        TestTensorFactory::createFP32(
+                            {packed_elements});
+                    auto unused_compact_output =
+                        TestTensorFactory::createFP32(
+                            {static_cast<size_t>(run_seq),
+                             static_cast<size_t>(d)});
+                    ASSERT_TRUE(run_moe(
+                        run_input,
+                        run_indices,
+                        run_weights,
+                        kernel_owner,
+                        unused_compact_output.get(),
+                        run_seq,
+                        verifier_rows,
+                        &ownership_maps[ownership_index]
+                             [static_cast<size_t>(participant)],
+                        participant_routes[static_cast<size_t>(participant)]
+                            .get()));
+                }
+
+                /*
+                 * Model the production variable gather without MPI. Copy rank
+                 * blocks in reverse participant order so gathered record order
+                 * cannot accidentally match the router's row/top-k order. The
+                 * root reducer must use each record's exact slot metadata.
+                 */
+                auto gathered_routes =
+                    TestTensorFactory::createFP32({packed_elements});
+                size_t gathered_count = 0u;
+                for (int participant = owner_participants - 1;
+                     participant >= 0;
+                     --participant)
+                {
+                    const auto &participant_records =
+                        participant_routes[static_cast<size_t>(participant)];
+                    const size_t participant_count =
+                        canonical_moe_route_record::readRecordCount(
+                            participant_records->data(),
+                            participant_records->numel());
+                    ASSERT_LE(
+                        gathered_count + participant_count,
+                        route_slot_count);
+                    std::copy_n(
+                        participant_records->data(),
+                        participant_count * record_width,
+                        gathered_routes->mutable_data() +
+                            gathered_count * record_width);
+                    gathered_count += participant_count;
+                }
+                ASSERT_TRUE(canonical_moe_route_record::writeRecordCount(
+                    gathered_routes->mutable_data(),
+                    gathered_routes->numel(),
+                    gathered_count));
+
+                auto canonical_output = TestTensorFactory::createFP32(
+                    {static_cast<size_t>(run_seq),
+                     static_cast<size_t>(d)});
+                MoECanonicalRouteReduceStage::Params reduce_params;
+                reduce_params.device_id = DeviceId::cpu();
+                reduce_params.canonical_route_contributions =
+                    gathered_routes.get();
+                reduce_params.routing_weights = run_weights;
+                reduce_params.output = canonical_output.get();
+                reduce_params.seq_len = run_seq;
+                reduce_params.top_k = topk;
+                reduce_params.d_model = d;
+                reduce_params.canonical_route_arithmetic =
+                    MoECanonicalRouteArithmeticPolicy::
+                        UnweightedExpertRowThenOrderedFMA;
+                reduce_params.canonical_route_layout =
+                    MoECanonicalRoutePublicationLayout::
+                        PackedIndexedRouteRows;
+                reduce_params.reduction_role =
+                    MoECanonicalRouteReductionRole::RootOwner;
+                MoECanonicalRouteReduceStage reduce_stage(
+                    std::move(reduce_params));
+                ASSERT_TRUE(reduce_stage.execute(cpu_ctx_.get()));
+
+                const std::string context =
+                    std::string("CPU distributed canonical ") +
+                    (verifier_rows ? "grouped verifier" : "decode") +
+                    " ownership=" + ownership_labels[ownership_index] +
+                    " format=" + format.label +
+                    " M=" + std::to_string(run_seq);
+                expectRowsByteEqual(
+                    canonical_output->data(),
+                    serial_rows->data(),
+                    run_seq,
+                    d,
+                    context);
+
+                if (first_ownership_result.empty())
+                {
+                    first_ownership_result.assign(
+                        canonical_output->data(),
+                        canonical_output->data() + canonical_output->numel());
+                }
+                else
+                {
+                    expectRowsByteEqual(
+                        canonical_output->data(),
+                        first_ownership_result.data(),
+                        run_seq,
+                        d,
+                        context + " versus prior ownership map");
+                }
+            }
+        };
+
+        {
+            constexpr int decode_rows = 1;
+            auto decode_input = TestTensorFactory::createFP32Random(
+                {decode_rows, d},
+                -0.5f,
+                0.5f,
+                static_cast<uint32_t>(790 + 100 * format_index));
+            auto decode_routing = computeRouting(
+                decode_input.get(),
+                gate_weights.get(),
+                decode_rows,
+                d,
+                experts,
+                topk);
+            auto serial_decode_output = TestTensorFactory::createFP32(
+                {decode_rows, d});
+            ASSERT_TRUE(run_moe(
+                decode_input.get(),
+                decode_routing.indices.get(),
+                decode_routing.weights.get(),
+                decode_routing.kernel_owner,
+                serial_decode_output.get(),
+                decode_rows,
+                /*verifier_rows=*/false,
+                /*run_expert_mask=*/nullptr));
+            prove_distributed_canonical_rows(
+                decode_input.get(),
+                decode_routing.indices.get(),
+                decode_routing.weights.get(),
+                decode_routing.kernel_owner,
+                serial_decode_output.get(),
+                decode_rows,
+                /*verifier_rows=*/false);
+        }
+
+        bool observed_grouped_multirow_launch = false;
         for (const int seq : kGroupedVerifierRuntimeRows)
         {
             SCOPED_TRACE("seq=" + std::to_string(seq));
@@ -1455,18 +1870,39 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                 static_cast<uint32_t>(720 + seq + 100 * format_index));
             auto grouped_output = TestTensorFactory::createFP32(
                 {static_cast<size_t>(seq), static_cast<size_t>(d)});
+            auto ordinary_prefill_output = TestTensorFactory::createFP32(
+                {static_cast<size_t>(seq), static_cast<size_t>(d)});
             auto serial_output = TestTensorFactory::createFP32(
                 {static_cast<size_t>(seq), static_cast<size_t>(d)});
 
             auto grouped_routing = computeRouting(
                 input.get(), gate_weights.get(), seq, d, experts, topk);
+            /*
+             * Sparse transport uses {-1, 0.0f} as an inert route slot. Keep
+             * that production sentinel in the all-format byte-equivalence
+             * sweep so grouped ordinary-prefill and verifier scheduling prove
+             * that padding neither fails validation nor changes arithmetic.
+             */
+            grouped_routing.indices->mutable_data()[topk - 1] = -1.0f;
+            grouped_routing.weights->mutable_data()[topk - 1] = 0.0f;
             ASSERT_TRUE(run_moe(
                 input.get(),
                 grouped_routing.indices.get(),
                 grouped_routing.weights.get(),
                 grouped_routing.kernel_owner,
                 grouped_output.get(),
-                seq));
+                seq,
+                /*verifier_rows=*/true,
+                /*run_expert_mask=*/nullptr));
+            ASSERT_TRUE(run_moe(
+                input.get(),
+                grouped_routing.indices.get(),
+                grouped_routing.weights.get(),
+                grouped_routing.kernel_owner,
+                ordinary_prefill_output.get(),
+                seq,
+                /*verifier_rows=*/false,
+                /*run_expert_mask=*/nullptr));
 
             for (int row = 0; row < seq; ++row)
             {
@@ -1478,13 +1914,20 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                     row_input.mutable_data());
                 auto row_routing = computeRouting(
                     &row_input, gate_weights.get(), 1, d, experts, topk);
+                if (row == 0)
+                {
+                    row_routing.indices->mutable_data()[topk - 1] = -1.0f;
+                    row_routing.weights->mutable_data()[topk - 1] = 0.0f;
+                }
                 ASSERT_TRUE(run_moe(
                     &row_input,
                     row_routing.indices.get(),
                     row_routing.weights.get(),
                     row_routing.kernel_owner,
                     &row_output,
-                    1));
+                    1,
+                    /*verifier_rows=*/false,
+                    /*run_expert_mask=*/nullptr));
                 std::copy_n(
                     row_output.data(),
                     d,
@@ -1497,9 +1940,116 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                 seq,
                 d,
                 std::string("CPU routed expert verifier format=") + format.label);
+            expectRowsByteEqual(
+                ordinary_prefill_output->data(),
+                serial_output->data(),
+                seq,
+                d,
+                std::string("CPU routed expert ordinary prefill format=") +
+                    format.label);
 
-            const auto records = PerfStatsCollector::snapshot({"mtp", "kernel"});
+            if (std::find(
+                    kGroupedVerifierBoundaryRows.begin(),
+                    kGroupedVerifierBoundaryRows.end(),
+                    seq) != kGroupedVerifierBoundaryRows.end())
+            {
+                prove_distributed_canonical_rows(
+                    input.get(),
+                    grouped_routing.indices.get(),
+                    grouped_routing.weights.get(),
+                    grouped_routing.kernel_owner,
+                    serial_output.get(),
+                    seq,
+                    /*verifier_rows=*/true);
+            }
+
+            for (int participant = 0;
+                 participant < owner_participants;
+                 ++participant)
+            {
+                SCOPED_TRACE(
+                    "random_owner_participant=" + std::to_string(participant));
+                const std::vector<bool> &owner_mask =
+                    random_owner_masks[static_cast<size_t>(participant)];
+                auto masked_grouped_output = TestTensorFactory::createFP32(
+                    {static_cast<size_t>(seq), static_cast<size_t>(d)});
+                auto masked_prefill_output = TestTensorFactory::createFP32(
+                    {static_cast<size_t>(seq), static_cast<size_t>(d)});
+                auto masked_serial_output = TestTensorFactory::createFP32(
+                    {static_cast<size_t>(seq), static_cast<size_t>(d)});
+
+                ASSERT_TRUE(run_moe(
+                    input.get(),
+                    grouped_routing.indices.get(),
+                    grouped_routing.weights.get(),
+                    grouped_routing.kernel_owner,
+                    masked_grouped_output.get(),
+                    seq,
+                    /*verifier_rows=*/true,
+                    &owner_mask));
+                ASSERT_TRUE(run_moe(
+                    input.get(),
+                    grouped_routing.indices.get(),
+                    grouped_routing.weights.get(),
+                    grouped_routing.kernel_owner,
+                    masked_prefill_output.get(),
+                    seq,
+                    /*verifier_rows=*/false,
+                    &owner_mask));
+
+                for (int row = 0; row < seq; ++row)
+                {
+                    FP32Tensor row_input({1u, static_cast<size_t>(d)});
+                    FP32Tensor row_output({1u, static_cast<size_t>(d)});
+                    std::copy_n(
+                        input->data() + static_cast<size_t>(row) * d,
+                        d,
+                        row_input.mutable_data());
+                    auto row_routing = computeRouting(
+                        &row_input, gate_weights.get(), 1, d, experts, topk);
+                    if (row == 0)
+                    {
+                        row_routing.indices->mutable_data()[topk - 1] = -1.0f;
+                        row_routing.weights->mutable_data()[topk - 1] = 0.0f;
+                    }
+                    ASSERT_TRUE(run_moe(
+                        &row_input,
+                        row_routing.indices.get(),
+                        row_routing.weights.get(),
+                        row_routing.kernel_owner,
+                        &row_output,
+                        1,
+                        /*verifier_rows=*/false,
+                        &owner_mask));
+                    std::copy_n(
+                        row_output.data(),
+                        d,
+                        masked_serial_output->mutable_data() +
+                            static_cast<size_t>(row) * d);
+                }
+
+                const std::string ownership_context =
+                    " random-owner participant=" +
+                    std::to_string(participant) + " format=" + format.label;
+                expectRowsByteEqual(
+                    masked_grouped_output->data(),
+                    masked_serial_output->data(),
+                    seq,
+                    d,
+                    "CPU routed expert verifier" + ownership_context);
+                expectRowsByteEqual(
+                    masked_prefill_output->data(),
+                    masked_serial_output->data(),
+                    seq,
+                    d,
+                    "CPU routed expert ordinary prefill" + ownership_context);
+            }
+
+            const auto records = PerfStatsCollector::snapshot(
+                {"mtp", "prefill", "kernel"});
             const std::string expected_seq_len = std::to_string(seq);
+            const std::string expected_route_rows =
+                std::to_string(seq * topk - 1);
             EXPECT_TRUE(std::any_of(
                 records.begin(),
                 records.end(),
@@ -1519,16 +2069,86 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
             EXPECT_TRUE(std::any_of(
                 records.begin(),
                 records.end(),
+                [&](const PerfStatRecord &record)
+                {
+                    const auto seq_it = record.tags.find("seq_len");
+                    return record.domain == "kernel" &&
+                           record.name ==
+                               "cpu_moe_prefill_router_q8_reuse_calls" &&
+                           seq_it != record.tags.end() &&
+                           seq_it->second == expected_seq_len &&
+                           record.count > 0;
+                }))
+                << "CPU " << format.label << " M=" << seq
+                << " ordinary prefill must consume router-published Q8_1 rows.\n"
+                << PerfStatsCollector::summaryString({"prefill", "kernel"});
+            EXPECT_TRUE(std::any_of(
+                records.begin(),
+                records.end(),
                 [](const PerfStatRecord &record)
                 {
                     return record.domain == "kernel" &&
                            record.name ==
-                               "cpu_native_vnni_router_q8_grouped_verifier_projection_calls" &&
+                               "cpu_native_vnni_router_q8_grouped_decode_equivalent_projection_calls" &&
                            record.count > 0;
                 }))
                 << "CPU " << format.label
-                << " must execute the prequantized NativeVNNI gate/up kernel.\n"
+                << " verifier must execute the prequantized NativeVNNI grouped gate/up kernel.\n"
                 << PerfStatsCollector::summaryString({"mtp", "kernel"});
+            EXPECT_TRUE(std::any_of(
+                records.begin(),
+                records.end(),
+                [&](const PerfStatRecord &record)
+                {
+                    const auto rows_it = record.tags.find("local_route_rows");
+                    return record.domain == "kernel" &&
+                           record.name ==
+                               "cpu_moe_native_vnni_layer_batched_expert_calls" &&
+                           record.phase == "prefill" &&
+                           rows_it != record.tags.end() &&
+                           rows_it->second == expected_route_rows &&
+                           record.count > 0;
+                }))
+                << "CPU " << format.label << " M=" << seq
+                << " ordinary prefill must execute the layer-batched "
+                   "NativeVNNI production path.\n"
+                << PerfStatsCollector::summaryString({"prefill", "kernel"});
+            EXPECT_TRUE(std::any_of(
+                records.begin(),
+                records.end(),
+                [&](const PerfStatRecord &record)
+                {
+                    const auto rows_it = record.tags.find("local_route_rows");
+                    return record.domain == "kernel" &&
+                           record.name ==
+                               "cpu_moe_native_vnni_layer_batched_expert_calls" &&
+                           record.phase == "verifier" &&
+                           rows_it != record.tags.end() &&
+                           rows_it->second == expected_route_rows &&
+                           record.count > 0;
+                }))
+                << "CPU " << format.label << " M=" << seq
+                << " verifier must execute the layer-batched NativeVNNI "
+                   "production path.\n"
+                << PerfStatsCollector::summaryString({"mtp", "kernel"});
+            observed_grouped_multirow_launch =
+                observed_grouped_multirow_launch ||
+                std::any_of(
+                    records.begin(),
+                    records.end(),
+                    [](const PerfStatRecord &record)
+                    {
+                        const auto m_it = record.tags.find("m");
+                        const auto route_it = record.tags.find("route");
+                        return record.domain == "kernel" &&
+                               record.name ==
+                                   "cpu_native_vnni_fused_verifier_rows_projection_launch" &&
+                               m_it != record.tags.end() &&
+                               std::stoi(m_it->second) > 1 &&
+                               route_it != record.tags.end() &&
+                               route_it->second.rfind("grouped_", 0) == 0 &&
+                               record.count > 0;
+                    });
             EXPECT_TRUE(std::any_of(
                 records.begin(),
                 records.end(),
@@ -1543,6 +2163,12 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
                 << PerfStatsCollector::summaryString({"mtp", "kernel"});
         }
 
+        EXPECT_TRUE(observed_grouped_multirow_launch)
+            << "CPU " << format.label
+            << " layer-batched production execution must use a real multi-row "
+               "grouped launch when an expert receives multiple rows.\n"
+            << PerfStatsCollector::summaryString({"prefill", "kernel"});
+
         const auto records = PerfStatsCollector::snapshot({"mtp", "kernel"});
         EXPECT_TRUE(hasPerfCounterWithRoute(
             records,
@@ -1552,8 +2178,227 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_All
             << "CPU routed expert verifier must use grouped expert-slot execution for "
             << format.label << ".\n"
             << PerfStatsCollector::summaryString({"mtp", "kernel"});
+        EXPECT_TRUE(hasPerfCounterWithRoute(
+            PerfStatsCollector::snapshot({"prefill", "kernel"}),
+            "prefill",
+            "moe_routed_grouped_decode_equivalent_prefill_rows",
+            "cpu_expert_slot_grouped"))
+            << "CPU routed expert ordinary prefill must use grouped expert-slot execution for "
+            << format.label << ".\n"
+            << PerfStatsCollector::summaryString({"prefill", "kernel"});
     }
     PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Require packed canonical publication to reject malformed transactions.
+ *
+ * Sparse participant gathers are intentionally unordered, but they must contain
+ * exactly one record for every live original router slot and no record for an
+ * inert slot. A duplicate, omission, or inert payload indicates a broken
+ * ownership/publication transaction and must fail rather than produce a
+ * numerically plausible partial row.
+ */
+TEST_F(
+    MoEExpertComputeStageTest,
+    PackedCanonicalRouteReducerRejectsDuplicateMissingAndInertSlots)
+{
+    constexpr int seq_len = 2;
+    constexpr int top_k = 2;
+    constexpr int d_model = 4;
+    constexpr size_t route_slot_count =
+        static_cast<size_t>(seq_len * top_k);
+    constexpr size_t record_width =
+        canonical_moe_route_record::recordWidth(d_model);
+    constexpr size_t packed_elements =
+        route_slot_count * record_width +
+        canonical_moe_route_record::kTrailerElements;
+
+    FP32Tensor routing_weights(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+    const std::array<float, route_slot_count> weights = {
+        0.5f,
+        0.25f,
+        0.0f,
+        0.75f,
+    };
+    std::copy(weights.begin(), weights.end(), routing_weights.mutable_data());
+
+    const auto execute_slots =
+        [&](const std::vector<uint32_t> &flat_slots) -> bool
+    {
+        FP32Tensor packed_records({packed_elements});
+        FP32Tensor output(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+        for (size_t record_index = 0;
+             record_index < flat_slots.size();
+             ++record_index)
+        {
+            float *const route_record =
+                canonical_moe_route_record::record(
+                    packed_records.mutable_data(),
+                    record_index,
+                    d_model);
+            for (int column = 0; column < d_model; ++column)
+            {
+                route_record[static_cast<size_t>(column)] =
+                    static_cast<float>(flat_slots[record_index] * 10u +
+                                       static_cast<uint32_t>(column + 1));
+            }
+            if (!canonical_moe_route_record::writeFlatRouteSlot(
+                    route_record,
+                    d_model,
+                    static_cast<size_t>(flat_slots[record_index])))
+            {
+                return false;
+            }
+        }
+        if (!canonical_moe_route_record::writeRecordCount(
+                packed_records.mutable_data(),
+                packed_records.numel(),
+                flat_slots.size()))
+        {
+            return false;
+        }
+
+        MoECanonicalRouteReduceStage::Params params;
+        params.device_id = DeviceId::cpu();
+        params.canonical_route_contributions = &packed_records;
+        params.routing_weights = &routing_weights;
+        params.output = &output;
+        params.seq_len = seq_len;
+        params.top_k = top_k;
+        params.d_model = d_model;
+        params.canonical_route_arithmetic =
+            MoECanonicalRouteArithmeticPolicy::
+                UnweightedExpertRowThenOrderedFMA;
+        params.canonical_route_layout =
+            MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows;
+        params.reduction_role =
+            MoECanonicalRouteReductionRole::RootOwner;
+        MoECanonicalRouteReduceStage stage(std::move(params));
+        return stage.execute(cpu_ctx_.get());
+    };
+
+    EXPECT_TRUE(execute_slots({3u, 0u, 1u}))
+        << "record order is intentionally arbitrary after a rooted gather";
+    EXPECT_FALSE(execute_slots({0u, 0u, 3u}))
+        << "a duplicate live slot must be fatal";
+    EXPECT_FALSE(execute_slots({0u, 1u}))
+        << "a missing live slot must be fatal";
+    EXPECT_FALSE(execute_slots({0u, 1u, 2u, 3u}))
+        << "an inert zero-weight slot must never have a published row";
+}
+
+/**
+ * @brief Prove the CPU canonical fold is M-total and never requests a small team.
+ *
+ * The original root-only reduction used `num_threads(M)`. At grouped M=4 this
+ * made libgomp retire 24 workers on a 28-core socket, and the next NativeVNNI
+ * projection recreated them for every model layer. The typed planner permits
+ * only caller-thread execution or the complete configured/existing team.
+ */
+TEST(
+    CPUCanonicalRouteReducerTest,
+    PositiveGeometryUsesCallerOrStableFullTeamAndMatchesOrderedRows)
+{
+    llaminar::v2::ThreadCountGuard thread_count(/*num_threads=*/8);
+    constexpr int top_k = 8;
+    constexpr std::array<int, 4> column_counts = {31, 32, 33, 257};
+
+    for (int rows = 1; rows <= 31; ++rows)
+    {
+        for (int columns : column_counts)
+        {
+            SCOPED_TRACE(
+                "rows=" + std::to_string(rows) +
+                " columns=" + std::to_string(columns));
+            const auto plan = cpu::moe::planCanonicalRouteFold(
+                rows,
+                top_k,
+                columns);
+            EXPECT_TRUE(
+                plan.executor ==
+                    cpu::moe::CanonicalRouteFoldExecutor::CallerThread ||
+                plan.executor ==
+                    cpu::moe::CanonicalRouteFoldExecutor::FullOpenMPTeam);
+            EXPECT_EQ(plan.team_threads, 8);
+            EXPECT_GT(plan.column_tile, 0);
+            EXPECT_GT(plan.column_tiles_per_row, 0);
+            EXPECT_EQ(
+                plan.parallel_tasks,
+                static_cast<size_t>(rows) *
+                    static_cast<size_t>(plan.column_tiles_per_row));
+
+            const size_t route_slots =
+                static_cast<size_t>(rows) * top_k;
+            std::vector<float> route_rows(
+                route_slots * static_cast<size_t>(columns));
+            std::vector<float> route_weights(route_slots);
+            for (size_t slot = 0; slot < route_slots; ++slot)
+            {
+                route_weights[slot] =
+                    slot % 11u == 0u
+                        ? 0.0f
+                        : static_cast<float>((slot % 9u) + 1u) / 19.0f;
+                for (int column = 0; column < columns; ++column)
+                {
+                    route_rows[slot * static_cast<size_t>(columns) +
+                               static_cast<size_t>(column)] =
+                        static_cast<float>(
+                            static_cast<int>((slot * 37u +
+                                              static_cast<size_t>(column) * 13u) %
+                                             211u) -
+                            105) /
+                        127.0f;
+                }
+            }
+
+            std::vector<float> expected(
+                static_cast<size_t>(rows) * columns,
+                0.0f);
+            for (int row = 0; row < rows; ++row)
+            {
+                float *const expected_row =
+                    expected.data() + static_cast<size_t>(row) * columns;
+                for (int route = 0; route < top_k; ++route)
+                {
+                    const size_t slot =
+                        static_cast<size_t>(row) * top_k +
+                        static_cast<size_t>(route);
+                    if (route_weights[slot] == 0.0f)
+                        continue;
+                    primitives::vec_axpy(
+                        expected_row,
+                        route_rows.data() + slot * columns,
+                        route_weights[slot],
+                        columns);
+                }
+            }
+
+            std::vector<float> actual(expected.size(), 1.0f);
+            cpu::moe::CanonicalRouteFoldPlan used_plan;
+            ASSERT_TRUE(cpu::moe::reduceCanonicalRouteRowsOrderedFMA(
+                {
+                    .route_rows = route_rows.data(),
+                    .route_weights = route_weights.data(),
+                    .record_for_route_slot = nullptr,
+                    .output = actual.data(),
+                    .rows = rows,
+                    .top_k = top_k,
+                    .columns = columns,
+                },
+                &used_plan));
+            EXPECT_EQ(used_plan.executor, plan.executor);
+            EXPECT_EQ(
+                std::memcmp(
+                    actual.data(),
+                    expected.data(),
+                    expected.size() * sizeof(float)),
+                0)
+                << "column tiling must preserve every ordered FMA byte";
+        }
+    }
 }
 
 TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeMVerifierMatchesSerialDecode_IQ3S_TopK8)
@@ -2278,20 +3123,30 @@ TEST_F(MoEExpertComputeStageTest, FixedTopologyPrefillUsesOwnerOnlyMaskWhenRepli
     params.top_k = 2;
     params.expert_intermediate = 32;
     params.my_socket_id = 0;
+    params.layer_idx = 0;
 
     params.expert_mask = {true, true, true, false};
     params.replica_set.domain_id = "cuda_ep";
-    params.replica_set.is_replicated = {false, true, false, false};
-    params.replica_set.owner_socket = {0, 1, 0, 1};
-    params.replica_set.num_replicated = 1;
-    params.replica_set.num_sockets = 2;
-    params.replica_set.buildPrefillMask(params.my_socket_id, params.expert_mask);
+    params.replica_set.base_ownership =
+        MoELayeredExpertOwnership::uniform(1, 2, {0, 1, 0, 1});
+    params.replica_set.replica_participants_by_layer.assign(
+        1,
+        std::vector<std::vector<bool>>(4, std::vector<bool>(2, false)));
+    params.replica_set.setReplicaOnParticipant(0, 1, 0);
+    params.replica_set.rebuildAggregateReplicaFlags();
+    params.replica_set.buildPrefillMask(
+        params.my_socket_id, params.expert_mask, params.layer_idx);
 
     MoEExpertComputeStage stage(params);
     const auto ids = stage.fixedTopologyPrefillExpertIdsForTesting();
     const auto mask = stage.fixedTopologyPrefillExpertMaskBytesForTesting();
 
+#if defined(HAVE_CUDA)
     EXPECT_TRUE(stage.usesFixedTopologyGroupedPrefillForTesting());
+#else
+    EXPECT_FALSE(stage.usesFixedTopologyGroupedPrefillForTesting())
+        << "A CPU-only unit build must not advertise a compiled CUDA route";
+#endif
     EXPECT_EQ(ids, std::vector<int>({0, 2}));
     ASSERT_EQ(mask.size(), 4u);
     EXPECT_EQ(mask[0], 1u);
@@ -2310,15 +3165,20 @@ TEST_F(MoEExpertComputeStageTest, FixedTopologyVerifierReplayStillRejectsReplica
     params.top_k = 2;
     params.expert_intermediate = 32;
     params.my_socket_id = 0;
+    params.layer_idx = 0;
     params.force_grouped_verifier_prefill_for_decode = true;
 
     params.expert_mask = {true, true, true, false};
     params.replica_set.domain_id = "cuda_ep";
-    params.replica_set.is_replicated = {false, true, false, false};
-    params.replica_set.owner_socket = {0, 1, 0, 1};
-    params.replica_set.num_replicated = 1;
-    params.replica_set.num_sockets = 2;
-    params.replica_set.buildPrefillMask(params.my_socket_id, params.expert_mask);
+    params.replica_set.base_ownership =
+        MoELayeredExpertOwnership::uniform(1, 2, {0, 1, 0, 1});
+    params.replica_set.replica_participants_by_layer.assign(
+        1,
+        std::vector<std::vector<bool>>(4, std::vector<bool>(2, false)));
+    params.replica_set.setReplicaOnParticipant(0, 1, 0);
+    params.replica_set.rebuildAggregateReplicaFlags();
+    params.replica_set.buildPrefillMask(
+        params.my_socket_id, params.expert_mask, params.layer_idx);
 
     MoEExpertComputeStage stage(params);
     EXPECT_FALSE(stage.usesFixedTopologyGroupedVerifierReplayForTesting());

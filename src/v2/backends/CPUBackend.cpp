@@ -387,6 +387,19 @@ namespace llaminar2
         return true;
     }
 
+    bool CPUBackend::queryEvent(void *event, int device_id, bool *ready)
+    {
+        if (!event || !ready || !isValidDeviceId(device_id))
+        {
+            if (ready)
+                *ready = false;
+            return false;
+        }
+
+        *ready = true;
+        return true;
+    }
+
     bool CPUBackend::eventElapsedTimeMs(
         void *start_event,
         void *stop_event,

@@ -1,18 +1,27 @@
 /**
  * @file Test__GPUExpertTransfer_ROCm.cpp
- * @brief ROCm D2D coverage for GPU expert packed transfer.
+ * @brief ROCm D2D coverage for packed and floating expert transfers.
+ *
+ * In addition to the separated NativeVNNI layout, this suite moves raw FP16,
+ * BF16, and FP32 projection payloads through the persistent production peer
+ * lane. Every case joins an exact producer event, observes completion only by
+ * polling the destination event, and compares every bit at the destination.
  */
 
 #include <gtest/gtest.h>
 
 #include "backends/DeviceId.h"
+#include "execution/moe/ExpertTierGpuPeerTransferLane.h"
 #include "execution/moe/GPUExpertTransfer.h"
 
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
 #include <cstring>
+#include <chrono>
 #include <random>
+#include <string>
+#include <thread>
 #include <vector>
 
 using namespace llaminar2;
@@ -363,6 +372,316 @@ namespace
         freeROCm(d_active2_mins, dst_dev);
         freeROCm(d_active2_emins, dst_dev);
     }
+
+    /**
+     * @brief Prove destination-stream peer DMA and event-only completion on HIP.
+     *
+     * Starting from the source device catches accidental dependence on the
+     * caller's current HIP device while exact byte comparisons cover all four
+     * separated NativeVNNI regions.
+     */
+    void runROCmPeerLaneTransfer()
+    {
+        requireTwoROCmDevices();
+        constexpr int src_dev = 0;
+        constexpr int dst_dev = 1;
+        constexpr int n = 2048;
+        constexpr int k = 256;
+        constexpr uint8_t payload_bytes_per_block = 16;
+        constexpr size_t block_count =
+            static_cast<size_t>(n) * static_cast<size_t>(k / 32);
+        constexpr size_t vnni_bytes =
+            block_count * payload_bytes_per_block;
+
+        std::mt19937 rng(0xBADC0DEu);
+        std::vector<uint8_t> expected_vnni(vnni_bytes);
+        std::vector<uint16_t> expected_scales(block_count);
+        std::vector<uint16_t> expected_mins(block_count);
+        std::vector<uint32_t> expected_emins(block_count);
+        for (auto &value : expected_vnni)
+            value = static_cast<uint8_t>(rng());
+        for (auto &value : expected_scales)
+            value = static_cast<uint16_t>(rng());
+        for (auto &value : expected_mins)
+            value = static_cast<uint16_t>(rng());
+        for (auto &value : expected_emins)
+            value = rng();
+
+        auto *src_vnni = allocROCm<uint8_t>(src_dev, vnni_bytes);
+        auto *src_scales = allocROCm<uint16_t>(src_dev, block_count);
+        auto *src_mins = allocROCm<uint16_t>(src_dev, block_count);
+        auto *src_emins = allocROCm<uint32_t>(src_dev, block_count);
+        auto *dst_vnni = allocROCm<uint8_t>(dst_dev, vnni_bytes);
+        auto *dst_scales = allocROCm<uint16_t>(dst_dev, block_count);
+        auto *dst_mins = allocROCm<uint16_t>(dst_dev, block_count);
+        auto *dst_emins = allocROCm<uint32_t>(dst_dev, block_count);
+        ASSERT_NE(src_vnni, nullptr);
+        ASSERT_NE(src_scales, nullptr);
+        ASSERT_NE(src_mins, nullptr);
+        ASSERT_NE(src_emins, nullptr);
+        ASSERT_NE(dst_vnni, nullptr);
+        ASSERT_NE(dst_scales, nullptr);
+        ASSERT_NE(dst_mins, nullptr);
+        ASSERT_NE(dst_emins, nullptr);
+
+        ASSERT_TRUE(uploadROCm(
+            src_vnni, expected_vnni.data(), vnni_bytes, src_dev));
+        ASSERT_TRUE(uploadROCm(
+            src_scales, expected_scales.data(), block_count, src_dev));
+        ASSERT_TRUE(uploadROCm(
+            src_mins, expected_mins.data(), block_count, src_dev));
+        ASSERT_TRUE(uploadROCm(
+            src_emins, expected_emins.data(), block_count, src_dev));
+
+        const auto source = makeROCmDescriptor(
+            src_vnni, src_scales, src_mins, src_emins,
+            n, k, payload_bytes_per_block);
+        const auto destination = makeROCmDescriptor(
+            dst_vnni, dst_scales, dst_mins, dst_emins,
+            n, k, payload_bytes_per_block);
+
+        (void)hipSetDevice(src_dev);
+        hipStream_t producer_stream = nullptr;
+        hipEvent_t source_ready = nullptr;
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(
+                &producer_stream, hipStreamNonBlocking),
+            hipSuccess);
+        ASSERT_EQ(
+            hipEventCreateWithFlags(
+                &source_ready, hipEventDisableTiming),
+            hipSuccess);
+        ASSERT_EQ(hipEventRecord(source_ready, producer_stream), hipSuccess);
+
+        {
+            ExpertTierGpuPeerTransferLane lane({
+                .source_device = DeviceId::rocm(src_dev),
+                .destination_device = DeviceId::rocm(dst_dev),
+                .lane_name = "rocm_peer_event_polled",
+                .perf_device = "rocm-peer",
+                .collect_timing_measurements = true,
+            });
+            std::string error;
+            ASSERT_TRUE(lane.materialize(&error)) << error;
+            ASSERT_EQ(hipSetDevice(src_dev), hipSuccess);
+            ASSERT_TRUE(lane.start(
+                source,
+                destination,
+                ExpertTierSourceReadiness::producerEvent(source_ready),
+                &error)) << error;
+
+            int current_device = -1;
+            ASSERT_EQ(hipGetDevice(&current_device), hipSuccess);
+            EXPECT_EQ(current_device, src_dev);
+
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10);
+            while (lane.progress() ==
+                       ExpertTierGpuPeerTransferProgress::Pending &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                ASSERT_NE(
+                    lane.poll(&error),
+                    ExpertTierGpuPeerTransferProgress::Failed)
+                    << error;
+                std::this_thread::yield();
+            }
+            ASSERT_EQ(
+                lane.progress(),
+                ExpertTierGpuPeerTransferProgress::Ready)
+                << error;
+
+            /* Installed-bank readiness is epoch proof, not a synthetic event. */
+            ASSERT_EQ(hipSetDevice(src_dev), hipSuccess);
+            ASSERT_TRUE(lane.start(
+                source,
+                destination,
+                ExpertTierSourceReadiness::publishedResidencyBank(17),
+                &error)) << error;
+            while (lane.progress() ==
+                       ExpertTierGpuPeerTransferProgress::Pending &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                ASSERT_NE(
+                    lane.poll(&error),
+                    ExpertTierGpuPeerTransferProgress::Failed)
+                    << error;
+                std::this_thread::yield();
+            }
+            ASSERT_EQ(
+                lane.progress(),
+                ExpertTierGpuPeerTransferProgress::Ready)
+                << error;
+            ASSERT_EQ(hipGetDevice(&current_device), hipSuccess);
+            EXPECT_EQ(current_device, src_dev);
+
+            const auto stats = lane.stats();
+            EXPECT_EQ(stats.transfers_started, 2u);
+            EXPECT_EQ(stats.transfers_completed, 2u);
+            EXPECT_EQ(stats.bytes_submitted, source.totalBytes() * 2u);
+            EXPECT_EQ(stats.producer_event_waits, 1u);
+            EXPECT_EQ(stats.published_bank_sources, 1u);
+            EXPECT_EQ(stats.timing_measurement_failures, 0u);
+            EXPECT_TRUE(stats.last_measurement.valid());
+            EXPECT_EQ(stats.last_measurement.bytes, source.totalBytes());
+            EXPECT_GT(stats.last_measurement.device_nanoseconds, 0u);
+            EXPECT_EQ(stats.inference_stream_waits, 0u);
+            EXPECT_EQ(stats.blocking_synchronizations, 0u);
+        }
+
+        std::vector<uint8_t> actual_vnni(vnni_bytes);
+        std::vector<uint16_t> actual_scales(block_count);
+        std::vector<uint16_t> actual_mins(block_count);
+        std::vector<uint32_t> actual_emins(block_count);
+        ASSERT_TRUE(downloadROCm(
+            actual_vnni.data(), dst_vnni, vnni_bytes, dst_dev));
+        ASSERT_TRUE(downloadROCm(
+            actual_scales.data(), dst_scales, block_count, dst_dev));
+        ASSERT_TRUE(downloadROCm(
+            actual_mins.data(), dst_mins, block_count, dst_dev));
+        ASSERT_TRUE(downloadROCm(
+            actual_emins.data(), dst_emins, block_count, dst_dev));
+        EXPECT_EQ(actual_vnni, expected_vnni);
+        EXPECT_EQ(actual_scales, expected_scales);
+        EXPECT_EQ(actual_mins, expected_mins);
+        EXPECT_EQ(actual_emins, expected_emins);
+
+        (void)hipSetDevice(src_dev);
+        ASSERT_EQ(hipEventDestroy(source_ready), hipSuccess);
+        ASSERT_EQ(hipStreamDestroy(producer_stream), hipSuccess);
+        freeROCm(src_vnni, src_dev);
+        freeROCm(src_scales, src_dev);
+        freeROCm(src_mins, src_dev);
+        freeROCm(src_emins, src_dev);
+        freeROCm(dst_vnni, dst_dev);
+        freeROCm(dst_scales, dst_dev);
+        freeROCm(dst_mins, dst_dev);
+        freeROCm(dst_emins, dst_dev);
+    }
+
+    /**
+     * @brief Prove one contiguous floating projection uses peer DMA unchanged.
+     *
+     * Same-backend movement treats floating representations as opaque bytes.
+     * Arbitrary bit patterns ensure the lane cannot silently reinterpret,
+     * normalize, or repack FP16, BF16, or FP32 payloads.
+     *
+     * @param precision_name Stable test/evidence identity (fp16, bf16, fp32).
+     * @param element_bytes Bytes per scalar in the floating representation.
+     * @param seed Deterministic source-pattern seed.
+     */
+    void runROCmContiguousPeerLaneTransfer(
+        const char *precision_name,
+        std::size_t element_bytes,
+        std::uint32_t seed)
+    {
+        requireTwoROCmDevices();
+        ASSERT_TRUE(element_bytes == 2 || element_bytes == 4);
+        constexpr int src_dev = 0;
+        constexpr int dst_dev = 1;
+        constexpr std::size_t element_count = 32771;
+        const std::size_t bytes = element_count * element_bytes;
+
+        std::vector<std::uint8_t> expected(bytes);
+        for (std::size_t index = 0; index < expected.size(); ++index)
+        {
+            expected[index] = static_cast<std::uint8_t>(
+                (index * 47u + seed * 19u + (index >> 2u)) & 0xffu);
+        }
+
+        auto *source = allocROCm<std::uint8_t>(src_dev, bytes);
+        auto *destination = allocROCm<std::uint8_t>(dst_dev, bytes);
+        ASSERT_NE(source, nullptr);
+        ASSERT_NE(destination, nullptr);
+
+        ASSERT_EQ(hipSetDevice(src_dev), hipSuccess);
+        hipStream_t producer_stream = nullptr;
+        hipEvent_t source_ready = nullptr;
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(
+                &producer_stream, hipStreamNonBlocking),
+            hipSuccess);
+        ASSERT_EQ(
+            hipEventCreateWithFlags(&source_ready, hipEventDisableTiming),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                source,
+                expected.data(),
+                bytes,
+                hipMemcpyHostToDevice,
+                producer_stream),
+            hipSuccess);
+        ASSERT_EQ(hipEventRecord(source_ready, producer_stream), hipSuccess);
+
+        {
+            ExpertTierGpuPeerTransferLane lane({
+                .source_device = DeviceId::rocm(src_dev),
+                .destination_device = DeviceId::rocm(dst_dev),
+                .lane_name = std::string("rocm_peer_contiguous_") +
+                             precision_name,
+                .perf_device = "rocm-peer-floating",
+                .collect_timing_measurements = true,
+            });
+            std::string error;
+            ASSERT_TRUE(lane.materialize(&error)) << error;
+
+            /* Start from the source device to catch ambient-device coupling. */
+            ASSERT_EQ(hipSetDevice(src_dev), hipSuccess);
+            ASSERT_TRUE(lane.startContiguous(
+                source,
+                destination,
+                bytes,
+                ExpertTierSourceReadiness::producerEvent(source_ready),
+                &error))
+                << error;
+
+            int current_device = -1;
+            ASSERT_EQ(hipGetDevice(&current_device), hipSuccess);
+            EXPECT_EQ(current_device, src_dev);
+
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10);
+            while (lane.progress() ==
+                       ExpertTierGpuPeerTransferProgress::Pending &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                ASSERT_NE(
+                    lane.poll(&error),
+                    ExpertTierGpuPeerTransferProgress::Failed)
+                    << error;
+                std::this_thread::yield();
+            }
+            ASSERT_EQ(
+                lane.progress(), ExpertTierGpuPeerTransferProgress::Ready)
+                << error;
+
+            const auto stats = lane.stats();
+            EXPECT_EQ(stats.transfers_started, 1u);
+            EXPECT_EQ(stats.transfers_completed, 1u);
+            EXPECT_EQ(stats.bytes_submitted, bytes);
+            EXPECT_EQ(stats.producer_event_waits, 1u);
+            EXPECT_EQ(stats.published_bank_sources, 0u);
+            EXPECT_EQ(stats.failed_transfers, 0u);
+            EXPECT_EQ(stats.timing_measurement_failures, 0u);
+            EXPECT_TRUE(stats.last_measurement.valid());
+            EXPECT_EQ(stats.last_measurement.bytes, bytes);
+            EXPECT_GT(stats.last_measurement.device_nanoseconds, 0u);
+            EXPECT_EQ(stats.inference_stream_waits, 0u);
+            EXPECT_EQ(stats.blocking_synchronizations, 0u);
+        }
+
+        std::vector<std::uint8_t> actual(bytes);
+        ASSERT_TRUE(downloadROCm(
+            actual.data(), destination, bytes, dst_dev));
+        EXPECT_EQ(actual, expected);
+
+        ASSERT_EQ(hipSetDevice(src_dev), hipSuccess);
+        ASSERT_EQ(hipEventDestroy(source_ready), hipSuccess);
+        ASSERT_EQ(hipStreamDestroy(producer_stream), hipSuccess);
+        freeROCm(source, src_dev);
+        freeROCm(destination, dst_dev);
+    }
 }
 
 TEST(Test__GPUExpertTransferROCm, D2DTransfer)
@@ -383,4 +702,24 @@ TEST(Test__GPUExpertTransferROCm, RepeatedD2DTransfer)
 TEST(Test__GPUExpertTransferROCm, StagedActivationCopiesTransferSlotIntoActiveSlot)
 {
     runROCmStagedActivation();
+}
+
+TEST(Test__ExpertTierGpuPeerTransferROCm, EventPolledTransferIsByteExact)
+{
+    runROCmPeerLaneTransfer();
+}
+
+TEST(Test__ExpertTierGpuPeerTransferROCm, FP16ContiguousTransferIsByteExact)
+{
+    runROCmContiguousPeerLaneTransfer("fp16", 2, 0xF016u);
+}
+
+TEST(Test__ExpertTierGpuPeerTransferROCm, BF16ContiguousTransferIsByteExact)
+{
+    runROCmContiguousPeerLaneTransfer("bf16", 2, 0xBF16u);
+}
+
+TEST(Test__ExpertTierGpuPeerTransferROCm, FP32ContiguousTransferIsByteExact)
+{
+    runROCmContiguousPeerLaneTransfer("fp32", 4, 0xF032u);
 }

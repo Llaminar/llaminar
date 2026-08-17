@@ -23,13 +23,19 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
+#include "backends/IBackend.h"
 #include "backends/IWorkerGPUContext.h"
 #include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/GraphArenaTestHarness.h"
@@ -65,6 +71,151 @@ using namespace llaminar2::test;
             GTEST_SKIP() << LINKED_GPU_SKIP_MESSAGE;          \
     } while (false)
 
+namespace
+{
+    /** @brief Enable and restore PerfStats for one integration certificate. */
+    class ScopedPerfStats final
+    {
+    public:
+        ScopedPerfStats()
+        {
+            if (const char *value =
+                    std::getenv("LLAMINAR_PERF_STATS_SUMMARY"))
+            {
+                had_value_ = true;
+                value_ = value;
+            }
+            setenv("LLAMINAR_PERF_STATS_SUMMARY", "1", 1);
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reset();
+        }
+
+        ~ScopedPerfStats()
+        {
+            if (had_value_)
+                setenv(
+                    "LLAMINAR_PERF_STATS_SUMMARY",
+                    value_.c_str(),
+                    1);
+            else
+                unsetenv("LLAMINAR_PERF_STATS_SUMMARY");
+            mutableDebugEnv().reload();
+            PerfStatsCollector::reset();
+        }
+
+        ScopedPerfStats(const ScopedPerfStats &) = delete;
+        ScopedPerfStats &operator=(const ScopedPerfStats &) = delete;
+
+    private:
+        bool had_value_ = false;
+        std::string value_;
+    };
+
+    /**
+     * @brief CPU-only participant used to certify the captured ticket ABI.
+     *
+     * Production dispatch/local/return stages receive their own CPU integration
+     * certificate.  This deliberately tiny stage isolates the heterogeneous
+     * graph protocol: it reads the captured pinned dispatch ticket and writes
+     * the pinned return ticket without any backend operation or tensor shadow.
+     */
+    class TicketEchoManualStage final : public IComputeStage
+    {
+    public:
+        explicit TicketEchoManualStage(
+            std::shared_ptr<MoEOverlayDispatchTicketStorage> storage)
+            : IComputeStage(DeviceId::cpu()), storage_(std::move(storage))
+        {
+        }
+
+        bool execute(IDeviceContext *ctx) override
+        {
+            complete_ = false;
+            if (!ctx || !storage_ || !storage_->hasValidBoundIdentity())
+                return false;
+            auto &ticket = storage_->ticket();
+            if (!ticket.isValid())
+                return false;
+
+            const int rows = ticket.header->logical_row_count;
+            const int bucket = ticket.header->bucket_row_capacity;
+            const int top_k = ticket.header->top_k;
+            const int d_model = ticket.header->d_model;
+            std::fill_n(
+                ticket.return_rows_fp32,
+                static_cast<size_t>(bucket) * static_cast<size_t>(d_model),
+                0.0f);
+            for (int row = 0; row < rows; ++row)
+            {
+                const float bias = ticket.routing_weights_fp32[
+                    static_cast<size_t>(row) * static_cast<size_t>(top_k)];
+                for (int col = 0; col < d_model; ++col)
+                {
+                    const size_t index =
+                        static_cast<size_t>(row) *
+                            static_cast<size_t>(d_model) +
+                        static_cast<size_t>(col);
+                    ticket.return_rows_fp32[index] =
+                        ticket.hidden_rows_fp32[index] * 2.0f + bias;
+                }
+            }
+            ticket.header->return_logical_row_count = rows;
+            if (call_count_ < observed_rows_.size())
+                observed_rows_[call_count_] = rows;
+            ++call_count_;
+            complete_ = true;
+            return true;
+        }
+
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::MOE_EXPERT_DISPATCH;
+        }
+        std::string name() const override
+        {
+            return "ticket_echo_manual";
+        }
+        bool supportsBackend(ComputeBackendType) const override { return true; }
+        bool isGraphCapturable() const override { return false; }
+        bool isManualGraphBoundary() const override { return true; }
+        bool requiresHostGraphTicketFence() const override { return true; }
+        bool manualGraphBoundaryComplete() const override { return complete_; }
+        bool supportsPaddedPrefillGraphCapturePreflight() const override
+        {
+            return true;
+        }
+        bool supportsPaddedPrefillRealLengthContract() const override
+        {
+            return true;
+        }
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::NONE;
+        }
+        StageBufferRequirements getBufferRequirements() const override
+        {
+            return {};
+        }
+        StageBufferContract bufferContract() const override
+        {
+            return StageBufferContract::build();
+        }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+        size_t callCount() const noexcept { return call_count_; }
+        int observedRows(size_t call) const noexcept
+        {
+            return call < observed_rows_.size() ? observed_rows_[call] : -1;
+        }
+
+    private:
+        std::shared_ptr<MoEOverlayDispatchTicketStorage> storage_;
+        std::array<int, 4> observed_rows_{};
+        size_t call_count_ = 0;
+        bool complete_ = false;
+    };
+} // namespace
+
 class CachedGraphReplayExecutionTest : public ::testing::Test
 {
 protected:
@@ -97,6 +248,14 @@ protected:
         auto *ptr = tensor.get();
         tensor_storage_.push_back(std::move(tensor));
         return static_cast<FP32Tensor *>(ptr);
+    }
+
+    INT32Tensor *createINT32Tensor(const std::vector<size_t> &shape)
+    {
+        auto tensor = TestTensorFactory::createINT32(shape);
+        auto *ptr = tensor.get();
+        tensor_storage_.push_back(std::move(tensor));
+        return static_cast<INT32Tensor *>(ptr);
     }
 
     FP32Tensor *createArenaFP32Tensor(
@@ -357,7 +516,6 @@ TEST_F(CachedGraphReplayExecutionTest, FirstUseMaterializesReplayWithoutSecondMu
     SKIP_IF_NO_GPU();
     ASSERT_NE(gpu_ctx_, nullptr);
     ASSERT_NE(device_ctx_, nullptr);
-
     const size_t seq_len = 4;
     const size_t d_model = 64;
     const size_t num_elements = seq_len * d_model;
@@ -526,6 +684,325 @@ TEST_F(CachedGraphReplayExecutionTest, DISABLED_CollectiveMarkedMode_RemainsFunc
         result, num_elements, segment_cache.capture_stream);
 }
 
+TEST_F(CachedGraphReplayExecutionTest,
+       HeterogeneousTicketSegmentsReuseCapturedBucketAcrossLogicalLengths)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    ASSERT_NE(device_ctx_, nullptr);
+    ScopedPerfStats perf_stats;
+
+    constexpr int layer = 3;
+    constexpr int bucket_rows = 4;
+    constexpr int top_k = 2;
+    constexpr int d_model = 8;
+    const DeviceId device = device_ctx_->deviceId();
+
+    auto *hidden = createArenaFP32Tensor(
+        BufferId::NORMALIZED,
+        {bucket_rows, d_model});
+    auto *routing_indices = createArenaFP32Tensor(
+        BufferId::MOE_EXPERT_INDICES,
+        {bucket_rows, top_k});
+    auto *routing_weights = createArenaFP32Tensor(
+        BufferId::MOE_EXPERT_WEIGHTS,
+        {bucket_rows, top_k});
+    auto *output = createArenaFP32Tensor(
+        BufferId::MOE_COMBINED_OUTPUT,
+        {bucket_rows, d_model});
+    auto *active_rows = createINT32Tensor({1});
+
+    auto ticket_storage =
+        std::make_shared<MoEOverlayDispatchTicketStorage>();
+    ticket_storage->bindFixedCapacity(
+        layer,
+        bucket_rows,
+        top_k,
+        d_model,
+        device,
+        /*workspace_generation=*/29);
+    const auto *const ticket_header = ticket_storage->ticket().header;
+    const auto *const ticket_hidden =
+        ticket_storage->ticket().hidden_rows_fp32;
+    const auto *const ticket_return =
+        ticket_storage->ticket().return_rows_fp32;
+
+    /*
+     * Reproduce production cold preflight before the arena has published GPU
+     * addresses. Static ticket geometry must be admitted, while the stronger
+     * capture-ready predicate must still reject the unbound device pointers.
+     */
+    MoEOverlayTicketPublishStage::Params cold_publish_params;
+    cold_publish_params.device_id = device;
+    cold_publish_params.hidden = hidden;
+    cold_publish_params.routing_indices = routing_indices;
+    cold_publish_params.routing_weights = routing_weights;
+    cold_publish_params.layer_idx = layer;
+    cold_publish_params.bucket_rows = bucket_rows;
+    cold_publish_params.top_k = top_k;
+    cold_publish_params.d_model = d_model;
+    cold_publish_params.ticket_storage = ticket_storage;
+    MoEOverlayTicketPublishStage cold_publish(cold_publish_params);
+    EXPECT_TRUE(cold_publish.supportsLazyPrefillGraphCapturePreflight());
+    EXPECT_TRUE(cold_publish.supportsGraphCaptureAfterLaunchPreparation());
+    EXPECT_EQ(
+        cold_publish.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::CaptureOnly);
+    EXPECT_FALSE(cold_publish.isGraphCapturable());
+    EXPECT_FALSE(cold_publish.supportsPaddedPrefillGraphCapturePreflight())
+        << "Padded capture additionally requires the device-owned live-row scalar";
+
+    MoEOverlayTicketConsumeStage::Params cold_consume_params;
+    cold_consume_params.device_id = device;
+    cold_consume_params.output = output;
+    cold_consume_params.layer_idx = layer;
+    cold_consume_params.bucket_rows = bucket_rows;
+    cold_consume_params.d_model = d_model;
+    cold_consume_params.ticket_storage = ticket_storage;
+    MoEOverlayTicketConsumeStage cold_consume(cold_consume_params);
+    EXPECT_TRUE(cold_consume.supportsLazyPrefillGraphCapturePreflight());
+    EXPECT_TRUE(cold_consume.supportsGraphCaptureAfterLaunchPreparation());
+    EXPECT_EQ(
+        cold_consume.graphLaunchPreparationPolicy(),
+        GraphLaunchPreparationPolicy::CaptureOnly);
+    EXPECT_TRUE(cold_consume.supportsPaddedPrefillGraphCapturePreflight());
+    EXPECT_FALSE(cold_consume.isGraphCapturable());
+
+    const auto fill_transaction = [&](int logical_rows, float base)
+    {
+        ASSERT_GT(logical_rows, 0);
+        ASSERT_LE(logical_rows, bucket_rows);
+        std::fill_n(
+            hidden->mutable_data(),
+            hidden->numel(),
+            -777.0f);
+        std::fill_n(
+            routing_indices->mutable_data(),
+            routing_indices->numel(),
+            99.0f);
+        std::fill_n(
+            routing_weights->mutable_data(),
+            routing_weights->numel(),
+            -999.0f);
+        for (int row = 0; row < logical_rows; ++row)
+        {
+            routing_indices->mutable_data()[
+                static_cast<size_t>(row) * top_k] =
+                static_cast<float>(row);
+            routing_indices->mutable_data()[
+                static_cast<size_t>(row) * top_k + 1] =
+                static_cast<float>(row + 1);
+            routing_weights->mutable_data()[
+                static_cast<size_t>(row) * top_k] =
+                0.2f + 0.1f * static_cast<float>(row);
+            routing_weights->mutable_data()[
+                static_cast<size_t>(row) * top_k + 1] =
+                0.8f - 0.1f * static_cast<float>(row);
+            for (int col = 0; col < d_model; ++col)
+            {
+                hidden->mutable_data()[
+                    static_cast<size_t>(row) * d_model + col] =
+                    base + static_cast<float>(row) * 0.5f +
+                    static_cast<float>(col) * 0.025f;
+            }
+        }
+        active_rows->mutable_int32_data()[0] = logical_rows;
+    };
+
+    fill_transaction(/*logical_rows=*/3, /*base=*/1.0f);
+    ASSERT_TRUE(prepareFixtureTensorsForGPUExecution());
+
+    IBackend *const backend = getBackendFor(device);
+    ASSERT_NE(backend, nullptr);
+    const int device_ordinal = device.gpu_ordinal();
+    const auto pinned_scalar_deleter =
+        [backend, device_ordinal](int32_t *pointer)
+    {
+        backend->freePinned(pointer, device_ordinal);
+    };
+    std::unique_ptr<int32_t, decltype(pinned_scalar_deleter)>
+        active_rows_staging(
+            static_cast<int32_t *>(backend->allocatePinned(
+                sizeof(int32_t), device_ordinal)),
+            pinned_scalar_deleter);
+    ASSERT_NE(active_rows_staging, nullptr);
+
+    MoEOverlayTicketPublishStage::Params publish_params;
+    publish_params.device_id = device;
+    publish_params.hidden = hidden;
+    publish_params.routing_indices = routing_indices;
+    publish_params.routing_weights = routing_weights;
+    publish_params.hidden_buffer_id = BufferId::NORMALIZED;
+    publish_params.routing_indices_buffer_id =
+        BufferId::MOE_EXPERT_INDICES;
+    publish_params.routing_weights_buffer_id =
+        BufferId::MOE_EXPERT_WEIGHTS;
+    publish_params.active_row_count_device =
+        static_cast<const int32_t *>(active_rows->gpu_data_ptr());
+    publish_params.layer_idx = layer;
+    publish_params.bucket_rows = bucket_rows;
+    publish_params.top_k = top_k;
+    publish_params.d_model = d_model;
+    publish_params.ticket_storage = ticket_storage;
+
+    auto manual_stage =
+        std::make_unique<TicketEchoManualStage>(ticket_storage);
+    TicketEchoManualStage *const manual_probe = manual_stage.get();
+
+    MoEOverlayTicketConsumeStage::Params consume_params;
+    consume_params.device_id = device;
+    consume_params.output = output;
+    consume_params.output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+    consume_params.layer_idx = layer;
+    consume_params.bucket_rows = bucket_rows;
+    consume_params.d_model = d_model;
+    consume_params.ticket_storage = ticket_storage;
+
+    ComputeGraph graph;
+    graph.addNode(
+        "ticket_publish",
+        ComputeStageFactory::createMoEOverlayTicketPublish(publish_params),
+        device);
+    graph.addNode(
+        "cpu_ticket_participant",
+        std::move(manual_stage),
+        DeviceId::cpu());
+    graph.addNode(
+        "ticket_consume",
+        ComputeStageFactory::createMoEOverlayTicketConsume(consume_params),
+        device);
+    graph.addDependency("cpu_ticket_participant", "ticket_publish");
+    graph.addDependency("ticket_consume", "cpu_ticket_participant");
+
+    GraphExecutorConfig exec_config;
+    exec_config.enable_validation = false;
+    DeviceGraphExecutor executor(exec_config);
+    graph_arena_.bindExecutor(executor);
+    DeviceGraphExecutor::GraphSegmentCache segment_cache;
+    void *dispatch_stream = gpu_ctx_->defaultStream();
+    ASSERT_NE(dispatch_stream, nullptr);
+
+    const auto execute = [&]()
+    {
+        return executor.executeWithCachedGraphReplay(
+            graph,
+            device_ctx_.get(),
+            segment_cache,
+            dispatch_stream,
+            gpu_ctx_,
+            nullptr,
+            /*collectives_graph_capturable=*/false,
+            /*force_recapture=*/false,
+            /*defer_final_sync=*/false,
+            {},
+            DeviceGraphExecutor::GraphReplayPlanPolicy::
+                AllowHeterogeneousBoundarySegmentation);
+    };
+
+    const auto expect_output = [&](int logical_rows, float base)
+    {
+        ASSERT_TRUE(output->ensureOnHost(segment_cache.capture_stream));
+        for (int row = 0; row < logical_rows; ++row)
+        {
+            const float bias =
+                0.2f + 0.1f * static_cast<float>(row);
+            for (int col = 0; col < d_model; ++col)
+            {
+                const float input =
+                    base + static_cast<float>(row) * 0.5f +
+                    static_cast<float>(col) * 0.025f;
+                EXPECT_FLOAT_EQ(
+                    output->data()[
+                        static_cast<size_t>(row) * d_model + col],
+                    input * 2.0f + bias)
+                    << "row=" << row << " col=" << col;
+            }
+        }
+        for (int row = logical_rows; row < bucket_rows; ++row)
+        {
+            for (int col = 0; col < d_model; ++col)
+            {
+                EXPECT_FLOAT_EQ(
+                    output->data()[
+                        static_cast<size_t>(row) * d_model + col],
+                    0.0f)
+                    << "padding row=" << row << " col=" << col;
+            }
+        }
+    };
+
+    ASSERT_TRUE(execute());
+    ASSERT_EQ(segment_cache.segments.size(), 3u);
+    EXPECT_TRUE(segment_cache.segments[0].capturable);
+    EXPECT_FALSE(segment_cache.segments[1].capturable);
+    EXPECT_TRUE(segment_cache.segments[2].capturable);
+    ASSERT_NE(segment_cache.segments[0].capture, nullptr);
+    ASSERT_NE(segment_cache.segments[2].capture, nullptr);
+    const auto *const publish_capture =
+        segment_cache.segments[0].capture.get();
+    const auto *const consume_capture =
+        segment_cache.segments[2].capture.get();
+    EXPECT_EQ(segment_cache.host_ticket_fence_count, 1u);
+    ASSERT_EQ(manual_probe->callCount(), 1u);
+    EXPECT_EQ(manual_probe->observedRows(0), 3);
+    expect_output(/*logical_rows=*/3, /*base=*/1.0f);
+
+    fill_transaction(/*logical_rows=*/1, /*base=*/4.0f);
+    ASSERT_TRUE(hidden->ensureOnDevice(device, segment_cache.capture_stream));
+    ASSERT_TRUE(routing_indices->ensureOnDevice(
+        device,
+        segment_cache.capture_stream));
+    ASSERT_TRUE(routing_weights->ensureOnDevice(
+        device,
+        segment_cache.capture_stream));
+    *active_rows_staging = 1;
+    ASSERT_TRUE(backend->hostToDeviceOnStream(
+        active_rows->gpu_data_ptr(),
+        active_rows_staging.get(),
+        sizeof(int32_t),
+        device_ordinal,
+        segment_cache.capture_stream));
+    graph.reset();
+    ASSERT_TRUE(execute());
+
+    EXPECT_EQ(segment_cache.segments[0].capture.get(), publish_capture);
+    EXPECT_EQ(segment_cache.segments[2].capture.get(), consume_capture);
+    EXPECT_EQ(segment_cache.host_ticket_fence_count, 2u);
+    ASSERT_EQ(manual_probe->callCount(), 2u);
+    EXPECT_EQ(manual_probe->observedRows(1), 1);
+    EXPECT_EQ(ticket_storage->ticket().header, ticket_header);
+    EXPECT_EQ(ticket_storage->ticket().hidden_rows_fp32, ticket_hidden);
+    EXPECT_EQ(ticket_storage->ticket().return_rows_fp32, ticket_return);
+    expect_output(/*logical_rows=*/1, /*base=*/4.0f);
+
+    double ticket_fence_count = 0.0;
+    bool saw_capture_fence = false;
+    bool saw_replay_fence = false;
+    for (const auto &record :
+         PerfStatsCollector::snapshot({"forward_graph"}))
+    {
+        if (record.name != "heterogeneous_host_ticket_fences")
+            continue;
+        const auto authority = record.tags.find("authority");
+        const auto consumer = record.tags.find("consumer_stage");
+        if (authority == record.tags.end() ||
+            authority->second != "captured_pinned_ticket" ||
+            consumer == record.tags.end() ||
+            consumer->second != "cpu_ticket_participant")
+        {
+            continue;
+        }
+        ticket_fence_count += record.value;
+        saw_capture_fence =
+            saw_capture_fence || record.phase == "capture";
+        saw_replay_fence =
+            saw_replay_fence || record.phase == "replay";
+    }
+    EXPECT_DOUBLE_EQ(ticket_fence_count, 2.0);
+    EXPECT_TRUE(saw_capture_fence);
+    EXPECT_TRUE(saw_replay_fence);
+}
+
 TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamForRecapture)
 {
     SKIP_IF_NO_GPU();
@@ -632,6 +1109,103 @@ TEST_F(CachedGraphReplayExecutionTest, CapturedSnapshotsPreservePointInTimeOutpu
     const auto warmup_snapshots = snapshots;
     assertTensorFiniteAndNonZero(
         scratch, num_elements, segment_cache.capture_stream);
+
+    /*
+     * Fixed-width prefill graphs retain all captured rows in their immutable
+     * D2D snapshot slots, but publication must expose only request-owned rows.
+     * Model a two-request bucket with two physical rows each: request zero owns
+     * one row and request one owns both. The callback must receive the compact
+     * three-row matrix without changing or recapturing the graph.
+     */
+    const DeviceGraphExecutor::GraphSnapshotLogicalRows logical_rows{
+        .physical_rows_per_sequence = 2,
+        .logical_rows_per_sequence = {1, 2},
+    };
+    snapshots.clear();
+    ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(
+        graph,
+        segment_cache.capture_stream,
+        "snapshot-logical-row-projection",
+        &segment_cache.snapshot_manifest,
+        &logical_rows));
+    for (const std::string stage_name : {"stage1_norm", "stage2_overwrite"})
+    {
+        const auto full = warmup_snapshots.find(stage_name);
+        const auto projected = snapshots.find(stage_name);
+        ASSERT_NE(full, warmup_snapshots.end());
+        ASSERT_NE(projected, snapshots.end());
+        ASSERT_EQ(full->second.size(), num_elements);
+        ASSERT_EQ(projected->second.size(), 3 * d_model);
+
+        std::vector<float> expected;
+        expected.reserve(3 * d_model);
+        expected.insert(
+            expected.end(),
+            full->second.begin(),
+            full->second.begin() + static_cast<std::ptrdiff_t>(d_model));
+        expected.insert(
+            expected.end(),
+            full->second.begin() + static_cast<std::ptrdiff_t>(2 * d_model),
+            full->second.end());
+        EXPECT_EQ(projected->second, expected)
+            << "Logical snapshot row projection changed payload order for "
+            << stage_name;
+    }
+
+    /*
+     * A heterogeneous captured prefill graph can cross a CPU/manual boundary
+     * after a GPU segment. The CPU stage has no graph-stable D2D snapshot slot,
+     * but its parity artifact still must expose logical rather than padded
+     * rows. Exercise the common post-graph publisher directly so this remains
+     * true independently of the GPU manifest implementation above.
+     */
+    auto *cpu_input = createFP32Tensor({seq_len, d_model});
+    auto *cpu_residual = createFP32Tensor({seq_len, d_model});
+    auto *cpu_output = createFP32Tensor({seq_len, d_model});
+    for (size_t index = 0; index < num_elements; ++index)
+    {
+        cpu_input->mutable_data()[index] = static_cast<float>(index + 1);
+        cpu_residual->mutable_data()[index] = 0.25f;
+        cpu_output->mutable_data()[index] =
+            cpu_input->data()[index] + cpu_residual->data()[index];
+    }
+
+    ResidualAddStage::Params cpu_snapshot_params;
+    cpu_snapshot_params.device_id = DeviceId::cpu();
+    cpu_snapshot_params.input = cpu_input;
+    cpu_snapshot_params.residual = cpu_residual;
+    cpu_snapshot_params.output = cpu_output;
+    cpu_snapshot_params.num_elements = num_elements;
+    ComputeGraph cpu_snapshot_graph;
+    cpu_snapshot_graph.addNode(
+        "cpu_snapshot_boundary",
+        ComputeStageFactory::createResidualAdd(cpu_snapshot_params),
+        DeviceId::cpu());
+
+    const std::vector<float> full_cpu_snapshot(
+        cpu_output->data(), cpu_output->data() + num_elements);
+    snapshots.clear();
+    ASSERT_TRUE(executor.publishSnapshotsAfterGraphExecution(
+        cpu_snapshot_graph,
+        segment_cache.capture_stream,
+        "snapshot-logical-row-projection-cpu-boundary",
+        nullptr,
+        &logical_rows));
+    const auto projected_cpu = snapshots.find("cpu_snapshot_boundary");
+    ASSERT_NE(projected_cpu, snapshots.end());
+    ASSERT_EQ(projected_cpu->second.size(), 3 * d_model);
+    std::vector<float> expected_cpu_snapshot;
+    expected_cpu_snapshot.reserve(3 * d_model);
+    expected_cpu_snapshot.insert(
+        expected_cpu_snapshot.end(),
+        full_cpu_snapshot.begin(),
+        full_cpu_snapshot.begin() + static_cast<std::ptrdiff_t>(d_model));
+    expected_cpu_snapshot.insert(
+        expected_cpu_snapshot.end(),
+        full_cpu_snapshot.begin() + static_cast<std::ptrdiff_t>(2 * d_model),
+        full_cpu_snapshot.end());
+    EXPECT_EQ(projected_cpu->second, expected_cpu_snapshot)
+        << "CPU/manual snapshot publication leaked padded rows";
 
     fillSnapshotInput(norm_input, 3.0f);
     ASSERT_TRUE(norm_input->ensureOnDevice(device_ctx_->deviceId(), segment_cache.capture_stream));

@@ -106,6 +106,23 @@ namespace llaminar2
             const MTPForwardInput &input,
             MTPForwardOutput &output) override;
 
+        /**
+         * @brief Declare dense Qwen3.5/3.6 MTP sidecar state ownership.
+         *
+         * The sidecar writes only MTP-prefixed activation buffers and its
+         * shifted KV cache. Its first shifted row is the same row that dense
+         * accepted-state publication would append, so the row may be retained.
+         */
+        [[nodiscard]] MTPSidecarStateContract
+        mtpSidecarStateContract() const noexcept override
+        {
+            return {
+                .main_state = MTPSidecarMainStatePolicy::Preserved,
+                .shifted_row =
+                    MTPShiftedRowPublicationPolicy::ReuseSidecarRow,
+            };
+        }
+
             /**
              * @brief Resolve the global GDN value-head offset for a local TP shard.
              *
@@ -122,6 +139,40 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx);
 
     protected:
+        /**
+         * @brief Return whether a recursive MTP sidecar is being assembled.
+         *
+         * Derived dense/MoE FFN builders use this typed construction context to
+         * select sidecar-owned buffers, registries, and semantic node names.
+         * It is never runtime inference state and is restored by RAII before
+         * graph construction returns.
+         */
+        [[nodiscard]] bool mtpGraphContextActive() const noexcept
+        {
+            return mtp_graph_context_active_;
+        }
+
+        /**
+         * @brief Return the depth owned by the active MTP graph context.
+         * @return Non-negative MTP depth while @ref mtpGraphContextActive is
+         *         true, otherwise -1.
+         */
+        [[nodiscard]] int mtpGraphDepthIndex() const noexcept
+        {
+            return mtp_graph_depth_idx_;
+        }
+
+        /**
+         * @brief Name dense FFN nodes after their executable sidecar owner.
+         *
+         * The trailing Qwen3.6 NextN block borrows weights from a model layer,
+         * but it is not that main-graph layer. Keeping the depth namespace
+         * here aligns dense and MoE graphs and makes every production
+         * checkpoint addressable as `MTP<n>_*`.
+         */
+        [[nodiscard]] std::string ffnGraphStagePrefix(
+            int layer_idx) const override;
+
         /**
          * @brief Optionally insert one terminal-row checkpoint into a GDN graph.
          *
@@ -173,6 +224,30 @@ namespace llaminar2
         std::string gdnWorkspaceRoleNamespace() const;
 
     private:
+        /**
+         * @brief RAII owner for one recursive MTP graph-construction context.
+         *
+         * Nested calls are supported because binding-based builders delegate
+         * to legacy tensor views. Restoring the previous context prevents an
+         * unsuccessful sidecar build from leaking its depth into the next
+         * ordinary forward graph.
+         */
+        class ScopedMTPGraphContext
+        {
+        public:
+            ScopedMTPGraphContext(Qwen35Graph &graph, int depth_idx) noexcept;
+            ~ScopedMTPGraphContext();
+
+            ScopedMTPGraphContext(const ScopedMTPGraphContext &) = delete;
+            ScopedMTPGraphContext &operator=(
+                const ScopedMTPGraphContext &) = delete;
+
+        private:
+            Qwen35Graph &graph_;
+            bool previous_active_ = false;
+            int previous_depth_idx_ = -1;
+        };
+
         // =====================================================================
         // FA (Full Attention) Sub-Graph Building
         // =====================================================================
@@ -256,6 +331,11 @@ namespace llaminar2
          * @brief Check if a layer uses GDN (vs full attention)
          */
         bool isGDNLayer(int layer_idx) const;
+
+        /** Graph-construction-only owner for depth-specific sidecar policy. */
+        bool mtp_graph_context_active_ = false;
+        /** Recursive depth paired with @ref mtp_graph_context_active_. */
+        int mtp_graph_depth_idx_ = -1;
     };
 
 } // namespace llaminar2

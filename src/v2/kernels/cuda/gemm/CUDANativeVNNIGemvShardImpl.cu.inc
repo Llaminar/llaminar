@@ -53,7 +53,7 @@
 #endif
 
 #ifndef LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK
-#error "CUDA NativeVNNI GEMV shard must declare its two owned codebooks"
+#error "CUDA NativeVNNI GEMV shard must declare its owned codebooks"
 #endif
 
 /*
@@ -66,14 +66,22 @@
     LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_supportsCodebook)
 #define cudaNativeVNNIGemvTuned_queryGeneratedDispatch \
     LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_queryGeneratedDispatch)
+#define cudaNativeVNNIGemvTuned_queryCompleteGeneratedDispatch \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_queryCompleteGeneratedDispatch)
+#define cudaNativeVNNIGemvTuned_queryGeneratedGroupedDispatch \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_queryGeneratedGroupedDispatch)
 #define cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule \
     LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule)
 #define cudaNativeVNNIGemvTuned_measureGeneratedDispatchNs \
     LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_measureGeneratedDispatchNs)
 #define cudaNativeVNNIGemvTuned_fp32 \
     LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_fp32)
+#define cudaNativeVNNIGemvTuned_fp32_withPolicy \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_fp32_withPolicy)
 #define cudaNativeVNNIGemvTuned_small_m_fp32 \
     LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_small_m_fp32)
+#define cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy \
+    LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy)
 #define cudaNativeVNNIInitIQGridTables_tuned \
     LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIInitIQGridTables_tuned)
 #define cudaNativeVNNIGemvSweep_setConfig \
@@ -111,6 +119,35 @@
 #define cudaNativeVNNIGemvTuned_getSerialPartitionN \
     LLAMINAR_CUDA_NATIVE_VNNI_GEMV_SHARD_SYMBOL(cudaNativeVNNIGemvTuned_getSerialPartitionN)
 
+extern "C"
+{
+    /** Resolve a source codebook through its owning policy shard. */
+    bool cudaNativeVNNIGemvTuned_resolveArithmeticPolicy(
+        uint8_t codebook_id,
+        int graph_captured,
+        int m,
+        int n,
+        int k,
+        int *shape_id,
+        int *tile_n,
+        int *cpt,
+        int *target_waves,
+        int *mkg,
+        int *max_kb,
+        int *force_two_phase,
+        int *exact_kb);
+
+    /** Resolve source-codebook grouped row reuse through its policy shard. */
+    bool cudaNativeVNNIGemvTuned_resolveGroupedArithmeticPolicy(
+        uint8_t codebook_id,
+        int graph_captured,
+        int m,
+        int n,
+        int k,
+        int *kernel,
+        int *grouped_rows);
+}
+
 static thread_local int g_cuda_native_vnni_decode_equivalent_m1_config = 0;
 static thread_local int g_cuda_native_vnni_serial_partition_n = 0;
 
@@ -124,6 +161,24 @@ static int serialEquivalentPolicyN(int actual_n)
     return g_cuda_native_vnni_serial_partition_n > 0
                ? g_cuda_native_vnni_serial_partition_n
                : actual_n;
+}
+
+/**
+ * @brief Resolve the trained policy identity for one execution codebook.
+ *
+ * Codebook 23 has the same 32-byte payload traffic and launch geometry as
+ * codebook 19; its only additional work is the already-templated minimum
+ * correction. Until the synthetic expanded-asymmetric format owns a separate
+ * sealed dispatch corpus, it deliberately inherits the complete codebook-19
+ * policy rather than entering an untrained generic route.
+ */
+template <uint8_t ExecutionCodebook>
+inline constexpr uint8_t trainedPolicyCodebook()
+{
+    return ExecutionCodebook ==
+                   llaminar2::kNativeVnniExpandedInt8MinCodebook
+               ? static_cast<uint8_t>(19)
+               : ExecutionCodebook;
 }
 
 // =====================================================================
@@ -315,12 +370,76 @@ namespace
         }
 
         CUDAGeneratedDispatchSelection cached{};
-        selected = selectGeneratedDispatch<CB>(
+        selected = selectGeneratedDispatch<trainedPolicyCodebook<CB>()>(
             graph_captured, m, policy_n, k, cached.shape, cached.tuning);
         cache.insert(key, selected, cached);
         shape = cached.shape;
         tuning = cached.tuning;
         return selected;
+    }
+
+    /**
+     * @brief Resolve launch arithmetic independently from physical decoding.
+     * @tparam ExecutionCodebook Codebook compiled into the launched kernel.
+     * @param policy_codebook Source-format identity whose reduction tree must
+     *        be preserved.
+     * @return Whether the source policy has an exact generated entry.
+     *
+     * CPU residency normalizes decoded weights into execution codebook 19 or
+     * 23.  Their accelerator decoder changes, but their source-format launch
+     * geometry and ordered K-partition fold remain part of numerical identity.
+     * Only the normalized execution shard needs cross-codebook policy
+     * instantiations; compact formats require policy and execution identities
+     * to agree.
+     */
+    template <uint8_t ExecutionCodebook>
+    bool selectCachedGeneratedDispatchForPolicy(
+        uint8_t policy_codebook,
+        bool graph_captured,
+        int m,
+        int n,
+        int k,
+        NativeGemvShape &shape,
+        GeneratedDispatchTuning &tuning)
+    {
+        if (policy_codebook == ExecutionCodebook)
+        {
+            return selectCachedGeneratedDispatch<ExecutionCodebook>(
+                graph_captured, m, n, k, shape, tuning);
+        }
+
+        if constexpr (
+            ExecutionCodebook == 19 ||
+            ExecutionCodebook ==
+                llaminar2::kNativeVnniExpandedInt8MinCodebook)
+        {
+            int shape_id = -1;
+            if (!cudaNativeVNNIGemvTuned_resolveArithmeticPolicy(
+                    policy_codebook,
+                    graph_captured ? 1 : 0,
+                    m,
+                    n,
+                    k,
+                    &shape_id,
+                    &tuning.tile_n,
+                    &tuning.cpt,
+                    &tuning.target_waves,
+                    &tuning.mkg,
+                    &tuning.max_kb,
+                    &tuning.force_two_phase,
+                    &tuning.exact_kb))
+            {
+                return false;
+            }
+            if (shape_id < static_cast<int>(NativeGemvShape::WIDE) ||
+                shape_id > static_cast<int>(NativeGemvShape::ROWPAR))
+            {
+                return false;
+            }
+            shape = static_cast<NativeGemvShape>(shape_id);
+            return true;
+        }
+        return false;
     }
 
 #if defined(LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2)
@@ -357,11 +476,79 @@ namespace
             return selected;
         }
 
-        selected = selectGeneratedGroupedTuning<CB>(
+        selected = selectGeneratedGroupedTuning<trainedPolicyCodebook<CB>()>(
             graph_captured, m, policy_n, k, cached);
         cache.insert(key, selected, cached);
         tuning = cached;
         return selected;
+    }
+
+    /** Resolve grouped row reuse from source arithmetic identity. */
+    template <uint8_t ExecutionCodebook>
+    bool selectCachedGeneratedGroupedTuningForPolicy(
+        uint8_t policy_codebook,
+        bool graph_captured,
+        int m,
+        int n,
+        int k,
+        GeneratedGroupedTuning &tuning)
+    {
+        if (policy_codebook == ExecutionCodebook)
+        {
+            return selectCachedGeneratedGroupedTuning<ExecutionCodebook>(
+                graph_captured, m, n, k, tuning);
+        }
+
+        if constexpr (
+            ExecutionCodebook == 19 ||
+            ExecutionCodebook ==
+                llaminar2::kNativeVnniExpandedInt8MinCodebook)
+        {
+            int kernel = 0;
+            if (!cudaNativeVNNIGemvTuned_resolveGroupedArithmeticPolicy(
+                    policy_codebook,
+                    graph_captured ? 1 : 0,
+                    m,
+                    n,
+                    k,
+                    &kernel,
+                    &tuning.grouped_rows))
+            {
+                return false;
+            }
+            if (kernel < static_cast<int>(GeneratedGroupedKernel::Invalid) ||
+                kernel >
+                    static_cast<int>(GeneratedGroupedKernel::TensorCoreMma16))
+            {
+                return false;
+            }
+            tuning.kernel = static_cast<GeneratedGroupedKernel>(kernel);
+            return tuning.kernel != GeneratedGroupedKernel::Invalid;
+        }
+        return false;
+    }
+
+    /** Runtime adapter for the grouped policy query exported by each shard. */
+    bool queryCachedGeneratedGroupedTuning(
+        uint8_t codebook_id,
+        bool graph_captured,
+        int m,
+        int n,
+        int k,
+        GeneratedGroupedTuning &tuning)
+    {
+#define LLAMINAR_QUERY_CUDA_NVNNI_GROUPED_CODEBOOK(CODEBOOK)            \
+        case CODEBOOK:                                                  \
+            return selectCachedGeneratedGroupedTuning<CODEBOOK>(        \
+                graph_captured, m, n, k, tuning)
+        switch (codebook_id)
+        {
+            LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK(
+                LLAMINAR_QUERY_CUDA_NVNNI_GROUPED_CODEBOOK);
+        default:
+            return false;
+        }
+#undef LLAMINAR_QUERY_CUDA_NVNNI_GROUPED_CODEBOOK
     }
 #endif
 
@@ -713,6 +900,7 @@ namespace
     static void recordGemvDispatch(
         NativeGemvShape shape,
         const GeneratedDispatchTuning &tuning,
+        uint8_t arithmetic_policy_codebook_id,
         int M,
         int N,
         int K,
@@ -748,6 +936,9 @@ namespace
             "cuda:" + std::to_string(cuda_device_id),
             llaminar2::PerfStatsCollector::Tags{
                 {"codebook", std::to_string(static_cast<int>(CB))},
+                {"arithmetic_policy_codebook",
+                 std::to_string(
+                     static_cast<int>(arithmetic_policy_codebook_id))},
                 {"m", std::to_string(M)},
                 {"n", std::to_string(N)},
                 {"k", std::to_string(K)},
@@ -783,6 +974,7 @@ namespace
     template <uint8_t CB>
     static void recordTensorCoreVerifierDispatch(
         const GeneratedDispatchTuning &serial_tuning,
+        uint8_t arithmetic_policy_codebook_id,
         int M,
         int N,
         int K,
@@ -801,6 +993,9 @@ namespace
             "cuda:" + std::to_string(cuda_device_id),
             llaminar2::PerfStatsCollector::Tags{
                 {"codebook", std::to_string(static_cast<int>(CB))},
+                {"arithmetic_policy_codebook",
+                 std::to_string(
+                     static_cast<int>(arithmetic_policy_codebook_id))},
                 {"m", std::to_string(M)},
                 {"n", std::to_string(N)},
                 {"k", std::to_string(K)},
@@ -2761,6 +2956,7 @@ namespace
         const float *d_C_existing, const float *d_bias,
         CUDAGemvContext_ *gemv_ctx,
         CUDARowMajorWeights_ **rm_slot,
+        uint8_t arithmetic_policy_codebook_id,
         int cuda_device_id, cudaStream_t stream)
     {
         bool graph_captured = false;
@@ -2811,6 +3007,7 @@ namespace
             recordGemvDispatch<CB>(
                 shape,
                 tuning,
+                arithmetic_policy_codebook_id,
                 1,
                 N,
                 K,
@@ -2835,7 +3032,8 @@ namespace
          */
         NativeGemvShape shape = NativeGemvShape::KPAR;
         GeneratedDispatchTuning tuning{};
-        if (!selectCachedGeneratedDispatch<CB>(
+        if (!selectCachedGeneratedDispatchForPolicy<CB>(
+                arithmetic_policy_codebook_id,
                 kCanonicalDecodePolicyGraphCaptured,
                 1,
                 N,
@@ -2847,6 +3045,7 @@ namespace
         recordGemvDispatch<CB>(
             shape,
             tuning,
+            arithmetic_policy_codebook_id,
             1,
             N,
             K,
@@ -2876,6 +3075,7 @@ namespace
         const float *d_C_existing, const float *d_bias,
         CUDAGemvContext_ *gemv_ctx,
         CUDARowMajorWeights_ **rm_slot,
+        uint8_t arithmetic_policy_codebook_id,
         int cuda_device_id, cudaStream_t stream)
     {
         bool graph_captured = false;
@@ -2942,7 +3142,8 @@ namespace
                 decode_equivalent_m1
                     ? kCanonicalDecodePolicyGraphCaptured
                     : graph_captured;
-            if (!selectCachedGeneratedDispatch<CB>(
+            if (!selectCachedGeneratedDispatchForPolicy<CB>(
+                    arithmetic_policy_codebook_id,
                     dispatch_policy_graph_captured,
                     dispatch_m,
                     N,
@@ -2975,7 +3176,8 @@ namespace
                 {
 #if defined(LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2)
                     GeneratedGroupedTuning grouped_tuning{};
-                    if (!selectCachedGeneratedGroupedTuning<CB>(
+                    if (!selectCachedGeneratedGroupedTuningForPolicy<CB>(
+                            arithmetic_policy_codebook_id,
                             dispatch_policy_graph_captured,
                             M,
                             N,
@@ -3030,6 +3232,7 @@ namespace
                 return false;
             recordTensorCoreVerifierDispatch<CB>(
                 tuning,
+                arithmetic_policy_codebook_id,
                 M,
                 N,
                 K,
@@ -3041,6 +3244,7 @@ namespace
         recordGemvDispatch<CB>(
             shape,
             tuning,
+            arithmetic_policy_codebook_id,
             M,
             N,
             K,
@@ -3128,6 +3332,7 @@ namespace
         const float *d_C_existing,
         const float *d_bias,
         uint8_t codebook_id,
+        uint8_t arithmetic_policy_codebook_id,
         int cuda_device_id,
         cudaStream_t cuda_stream,
         CUDAGemvContext_ *gemv_ctx,
@@ -3143,6 +3348,7 @@ namespace
                 extendedMinimumPlaneForCodebook<CODEBOOK>(d_emins),     \
                 d_C_fp32, d_scales_A_block, M, N, K, alpha, beta,       \
                 d_C_existing, d_bias, gemv_ctx, rm_slot,                \
+                arithmetic_policy_codebook_id,                         \
                 cuda_device_id, cuda_stream)
             LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK(
                 LLAMINAR_DISPATCH_CUDA_NVNNI_SMALL_M);
@@ -3280,6 +3486,18 @@ static double measureCachedGeneratedDispatchNs(
 
 extern "C"
 {
+    bool cudaNativeVNNIGemvTuned_fp32_withPolicy(
+        const int8_t *, const uint8_t *, const uint16_t *,
+        const uint16_t *, const uint32_t *, float *, const float *,
+        int, int, float, float, const float *, const float *, uint8_t,
+        uint8_t, int, void *, CUDAGemvContext *, CUDARowMajorWeights **);
+
+    bool cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
+        const int8_t *, const uint8_t *, const uint16_t *,
+        const uint16_t *, const uint32_t *, float *, const float *,
+        int, int, int, float, float, const float *, const float *, uint8_t,
+        uint8_t, int, void *, CUDAGemvContext *, CUDARowMajorWeights **);
+
     bool cudaNativeVNNIGemvTuned_supportsCodebook(uint8_t codebook_id)
     {
         switch (codebook_id)
@@ -3333,6 +3551,96 @@ extern "C"
         if (exact_kb)
             *exact_kb = tuning.exact_kb;
         return true;
+    }
+
+    /**
+     * @brief Export every field of one generated arithmetic policy.
+     *
+     * Normalized execution shards use this host-only ABI to obtain the source
+     * codebook's exact schedule without compiling another copy of every source
+     * decoder or selector into the normalized shard.
+     */
+    bool cudaNativeVNNIGemvTuned_queryCompleteGeneratedDispatch(
+        uint8_t codebook_id,
+        int graph_captured,
+        int m,
+        int n,
+        int k,
+        int *shape_id,
+        int *tile_n,
+        int *cpt,
+        int *target_waves,
+        int *mkg,
+        int *max_kb,
+        int *force_two_phase,
+        int *exact_kb)
+    {
+        if (!shape_id || !tile_n || !cpt || !target_waves || !mkg ||
+            !max_kb || !force_two_phase || !exact_kb)
+        {
+            return false;
+        }
+        NativeGemvShape shape = NativeGemvShape::KPAR;
+        GeneratedDispatchTuning tuning{};
+        if (!queryCachedGeneratedDispatch(
+                codebook_id,
+                graph_captured != 0,
+                m,
+                n,
+                k,
+                shape,
+                tuning))
+        {
+            return false;
+        }
+        *shape_id = static_cast<int>(shape);
+        *tile_n = tuning.tile_n;
+        *cpt = tuning.cpt;
+        *target_waves = tuning.target_waves;
+        *mkg = tuning.mkg;
+        *max_kb = tuning.max_kb;
+        *force_two_phase = tuning.force_two_phase;
+        *exact_kb = tuning.exact_kb;
+        return true;
+    }
+
+    /** Export the source policy's independently trained grouped-row choice. */
+    bool cudaNativeVNNIGemvTuned_queryGeneratedGroupedDispatch(
+        uint8_t codebook_id,
+        int graph_captured,
+        int m,
+        int n,
+        int k,
+        int *kernel,
+        int *grouped_rows)
+    {
+#if defined(LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2)
+        if (!kernel || !grouped_rows)
+            return false;
+        GeneratedGroupedTuning tuning{};
+        if (!queryCachedGeneratedGroupedTuning(
+                codebook_id,
+                graph_captured != 0,
+                m,
+                n,
+                k,
+                tuning))
+        {
+            return false;
+        }
+        *kernel = static_cast<int>(tuning.kernel);
+        *grouped_rows = tuning.grouped_rows;
+        return true;
+#else
+        (void)codebook_id;
+        (void)graph_captured;
+        (void)m;
+        (void)n;
+        (void)k;
+        (void)kernel;
+        (void)grouped_rows;
+        return false;
+#endif
     }
 
     /**
@@ -3468,6 +3776,54 @@ extern "C"
         CUDAGemvContext *gemv_ctx,
         CUDARowMajorWeights **rm_slot)
     {
+        return cudaNativeVNNIGemvTuned_fp32_withPolicy(
+            d_A_int8,
+            d_payload,
+            d_scales,
+            d_mins,
+            d_emins,
+            d_C_fp32,
+            d_scales_A_block,
+            N,
+            K,
+            alpha,
+            beta,
+            d_C_existing,
+            d_bias,
+            codebook_id,
+            codebook_id,
+            cuda_device_id,
+            stream,
+            gemv_ctx,
+            rm_slot);
+    }
+
+    /**
+     * @brief Launch physical decode under the source-format reduction policy.
+     *
+     * Normalized ExpertOverlay weights use codebook 19 or 23 for decoding but
+     * must retain the exact generated source-codebook partition tree. Keeping
+     * both identities explicit prevents residency from changing FP32 words.
+     */
+    bool cudaNativeVNNIGemvTuned_fp32_withPolicy(
+        const int8_t *d_A_int8,
+        const uint8_t *d_payload,
+        const uint16_t *d_scales,
+        const uint16_t *d_mins,
+        const uint32_t *d_emins,
+        float *d_C_fp32,
+        const float *d_scales_A_block,
+        int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        uint8_t codebook_id,
+        uint8_t arithmetic_policy_codebook_id,
+        int cuda_device_id,
+        void *stream,
+        CUDAGemvContext *gemv_ctx,
+        CUDARowMajorWeights **rm_slot)
+    {
         if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
             return false;
         if (N <= 0 || K <= 0 || (K % BLOCK_K) != 0)
@@ -3493,6 +3849,7 @@ extern "C"
                 extendedMinimumPlaneForCodebook<CODEBOOK>(d_emins),     \
                 d_C_fp32, d_scales_A_block, N, K, alpha, beta,          \
                 d_C_existing, d_bias, gemv_ctx, rm_slot,                \
+                arithmetic_policy_codebook_id,                         \
                 cuda_device_id, cuda_stream)
             LLAMINAR_CUDA_NATIVE_VNNI_GEMV_FOR_EACH_CODEBOOK(
                 LLAMINAR_DISPATCH_CUDA_NVNNI_M1);
@@ -3521,6 +3878,50 @@ extern "C"
         CUDAGemvContext *gemv_ctx,
         CUDARowMajorWeights **rm_slot)
     {
+        return cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
+            d_A_int8,
+            d_payload,
+            d_scales,
+            d_mins,
+            d_emins,
+            d_C_fp32,
+            d_scales_A_block,
+            M,
+            N,
+            K,
+            alpha,
+            beta,
+            d_C_existing,
+            d_bias,
+            codebook_id,
+            codebook_id,
+            cuda_device_id,
+            stream,
+            gemv_ctx,
+            rm_slot);
+    }
+
+    /** Launch grouped physical decode under source-format arithmetic policy. */
+    bool cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
+        const int8_t *d_A_int8,
+        const uint8_t *d_payload,
+        const uint16_t *d_scales,
+        const uint16_t *d_mins,
+        const uint32_t *d_emins,
+        float *d_C_fp32,
+        const float *d_scales_A_block,
+        int M,
+        int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        uint8_t codebook_id,
+        uint8_t arithmetic_policy_codebook_id,
+        int cuda_device_id,
+        void *stream,
+        CUDAGemvContext *gemv_ctx,
+        CUDARowMajorWeights **rm_slot)
+    {
         if (!d_A_int8 || !d_payload || !d_scales || !d_C_fp32 || !d_scales_A_block)
             return false;
         if (M < 2 || N <= 0 || K <= 0 || (K % BLOCK_K) != 0)
@@ -3539,7 +3940,8 @@ extern "C"
         return dispatchSmallMByCodebook(
             d_A_int8, d_payload, d_scales, d_mins, d_emins,
             d_C_fp32, d_scales_A_block, M, N, K, alpha, beta,
-            d_C_existing, d_bias, codebook_id, cuda_device_id,
+            d_C_existing, d_bias, codebook_id,
+            arithmetic_policy_codebook_id, cuda_device_id,
             cuda_stream, gemv_ctx, rm_slot);
     }
 
@@ -3888,10 +4290,14 @@ extern "C" int cudaNativeVNNIGemvTuned_getSerialPartitionN()
 
 #undef cudaNativeVNNIGemvTuned_supportsCodebook
 #undef cudaNativeVNNIGemvTuned_queryGeneratedDispatch
+#undef cudaNativeVNNIGemvTuned_queryCompleteGeneratedDispatch
+#undef cudaNativeVNNIGemvTuned_queryGeneratedGroupedDispatch
 #undef cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule
 #undef cudaNativeVNNIGemvTuned_measureGeneratedDispatchNs
 #undef cudaNativeVNNIGemvTuned_fp32
+#undef cudaNativeVNNIGemvTuned_fp32_withPolicy
 #undef cudaNativeVNNIGemvTuned_small_m_fp32
+#undef cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy
 #undef cudaNativeVNNIInitIQGridTables_tuned
 #undef cudaNativeVNNIGemvSweep_setConfig
 #undef cudaNativeVNNIGemvSweep_clearConfig

@@ -2528,8 +2528,10 @@ namespace
 
             // ---- TQ8 K dot product ----
             const uint8_t *k_block = K_base + phys_pos * k_row_stride;
-            float k_norm = *reinterpret_cast<const float *>(k_block);
-            const uint8_t *k_indices = k_block + 2 * sizeof(float); // skip norm + residual_norm
+            // Key scoring retains the source norm. The second scalar is fitted
+            // for value reconstruction and would bias the QK distribution.
+            float k_norm = reinterpret_cast<const float *>(k_block)[0];
+            const uint8_t *k_indices = k_block + 2 * sizeof(float); // skip source/reconstruction norms
 
             float partial_dot = 0.0f;
             for (int d = lane_id; d < head_dim; d += WARP_SIZE)
@@ -2545,7 +2547,7 @@ namespace
 
             // ---- TQ4 V accumulation (in rotated centroid space) ----
             const uint8_t *v_block = V_base + phys_pos * v_row_stride;
-            float v_norm = *reinterpret_cast<const float *>(v_block);
+            float v_norm = reinterpret_cast<const float *>(v_block)[1];
             const uint8_t *v_mse = v_block + 2 * sizeof(float);
             const uint8_t *v_high = v_mse + head_dim * 3 / 8;
             float weight = p * v_norm * inv_sqrt_d;

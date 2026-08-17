@@ -20,8 +20,10 @@ namespace llaminar2
     enum class SnapshotShardingMode
     {
         REPLICATED,      ///< Full output on each device (norms, residuals after AllReduce)
-        COLUMN_PARALLEL, ///< Split on output dimension (Q/K/V, FFN_GATE, FFN_UP, ATTENTION_CONTEXT)
+        COLUMN_PARALLEL, ///< One output dimension split across participants
+        PACKED_COLUMN_PARALLEL, ///< Several independently sharded column groups packed into every local row
         ROW_PARALLEL,    ///< Split on input dimension, combined after AllReduce (Wo, FFN_DOWN)
+        ROOT_ONLY,       ///< A rooted collective publishes one complete output on exactly one participant
         GATHERED,        ///< Column-parallel then AllGather (LM_HEAD)
         UNKNOWN          ///< Sharding mode not determined
     };
@@ -37,8 +39,12 @@ namespace llaminar2
             return "REPLICATED";
         case SnapshotShardingMode::COLUMN_PARALLEL:
             return "COLUMN_PARALLEL";
+        case SnapshotShardingMode::PACKED_COLUMN_PARALLEL:
+            return "PACKED_COLUMN_PARALLEL";
         case SnapshotShardingMode::ROW_PARALLEL:
             return "ROW_PARALLEL";
+        case SnapshotShardingMode::ROOT_ONLY:
+            return "ROOT_ONLY";
         case SnapshotShardingMode::GATHERED:
             return "GATHERED";
         case SnapshotShardingMode::UNKNOWN:

@@ -99,37 +99,9 @@ public:
 // Test Cases
 // =============================================================================
 
-TEST_P(Qwen2LocalPPParityTest, PrefillParity)
+TEST_P(Qwen2LocalPPParityTest, ProductionParity)
 {
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runPrefillParity();
-    assertParity(summary);
-}
-
-TEST_P(Qwen2LocalPPParityTest, DecodeParity)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runDecodeParity();
-    assertDecodeParity(summary);
-}
-
-TEST_P(Qwen2LocalPPParityTest, SnapshotInfrastructure)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    auto embedding = loadPyTorchSnapshot("EMBEDDING");
-    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
-
-    ASSERT_TRUE(runner_ != nullptr);
-    runner_->forward(config_.token_ids.data(), config_.token_ids.size());
-
-    auto keys = runner_->getSnapshotKeys();
-    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
-
-    bool has_embedding = std::find(keys.begin(), keys.end(), "EMBEDDING") != keys.end();
-    bool has_lm_head = std::find(keys.begin(), keys.end(), "LM_HEAD") != keys.end();
-    EXPECT_TRUE(has_embedding) << "Missing EMBEDDING snapshot";
-    EXPECT_TRUE(has_lm_head) << "Missing LM_HEAD snapshot";
+    runProductionParityCampaign();
 }
 
 // =============================================================================

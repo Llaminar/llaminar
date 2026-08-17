@@ -6,6 +6,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+import re
 from pathlib import Path
 
 
@@ -27,6 +28,11 @@ from analyze_cpu_native_vnni_decode_trainer import (  # noqa: E402
     validate_total_policy,
 )
 from native_vnni_dispatch.corpus import GenericDomain  # noqa: E402
+from native_vnni_dispatch.candidate_registry import (  # noqa: E402
+    CPU_DECODE_UNDERFILL_CROSSOVER_ELEMENTS,
+    cpu_native_vnni_decode_physical_candidate_ids,
+    resolve_cpu_native_vnni_decode_n_block_chunks,
+)
 from native_vnni_dispatch.format_registry import FORMAT_SPECS  # noqa: E402
 from native_vnni_dispatch.profiles import MeasurementProfile  # noqa: E402
 from native_vnni_dispatch.schema import (  # noqa: E402
@@ -98,6 +104,82 @@ class CPUDecodeTrainerTest(unittest.TestCase):
         self.assertEqual(
             _candidate_policy("cpu.nvnni.decode.n_chunk_grid.nbc16"),
             "Nbc16",
+        )
+
+    def test_large_underfilled_candidates_resolve_to_full_team_width(self) -> None:
+        """Keep corpus forceability identical to the production task grid."""
+
+        geometry = {"n": 11264, "k": 38912, "k_tiles": 0, "threads": 28}
+        self.assertEqual(
+            resolve_cpu_native_vnni_decode_n_block_chunks(8, **geometry),
+            4,
+        )
+        self.assertEqual(
+            resolve_cpu_native_vnni_decode_n_block_chunks(16, **geometry),
+            4,
+        )
+        for width in (1, 2, 4):
+            self.assertEqual(
+                resolve_cpu_native_vnni_decode_n_block_chunks(width, **geometry),
+                width,
+            )
+
+        self.assertEqual(
+            resolve_cpu_native_vnni_decode_n_block_chunks(
+                16, n=11264, k=2048, k_tiles=0, threads=28
+            ),
+            16,
+        )
+        self.assertEqual(
+            resolve_cpu_native_vnni_decode_n_block_chunks(
+                8, n=11264, k=38912, k_tiles=2, threads=28
+            ),
+            8,
+        )
+
+    def test_physical_candidate_inventory_removes_only_launch_aliases(self) -> None:
+        """Coverage requires every real task grid, never duplicate labels."""
+
+        self.assertEqual(
+            cpu_native_vnni_decode_physical_candidate_ids(
+                n=16,
+                k=1024,
+                k_tiles=0,
+                threads=28,
+            ),
+            frozenset({"cpu.nvnni.decode.n_chunk_grid.nbc1"}),
+        )
+        self.assertEqual(
+            cpu_native_vnni_decode_physical_candidate_ids(
+                n=11264,
+                k=38912,
+                k_tiles=0,
+                threads=28,
+            ),
+            frozenset({
+                "cpu.nvnni.decode.n_chunk_grid.nbc1",
+                "cpu.nvnni.decode.n_chunk_grid.nbc2",
+                "cpu.nvnni.decode.n_chunk_grid.nbc4",
+            }),
+        )
+
+    def test_underfill_crossover_matches_cpp_runtime_constant(self) -> None:
+        """Prevent Python sealing and C++ execution from drifting apart."""
+
+        header = (
+            REPO_ROOT / "src" / "v2" / "kernels" / "cpu" / "gemm"
+            / "CPUNativeVNNIGemv.h"
+        ).read_text(encoding="utf-8")
+        match = re.search(
+            r"kDecodeScheduleUnderfillCrossoverElements\s*=\s*"
+            r"(\d+)LL\s*\*\s*(\d+)LL\s*\*\s*(\d+)LL",
+            header,
+        )
+        self.assertIsNotNone(match)
+        factors = (int(value) for value in match.groups())
+        self.assertEqual(
+            CPU_DECODE_UNDERFILL_CROSSOVER_ELEMENTS,
+            next(factors) * next(factors) * next(factors),
         )
 
     def test_exact_key_distinguishes_frozen_kpart_regime(self) -> None:

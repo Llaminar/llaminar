@@ -4,17 +4,61 @@
  */
 
 #include <gtest/gtest.h>
+#include "execution/moe/DeviceMoERebalanceABI.h"
 #include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/MoERebalanceController.h"
 #include <algorithm>
 #include <array>
+#include <initializer_list>
 #include <iterator>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 using namespace llaminar2;
+
+/** @brief Replace a controller fixture's complete ownership with one static row. */
+static void setUniformOwnership(
+    MoERebalanceController::Config &config,
+    const std::vector<int> &owners)
+{
+    config.initial_ownership = MoELayeredExpertOwnership::uniform(
+        config.num_layers,
+        static_cast<int>(config.sockets.size()),
+        owners);
+}
+
+/**
+ * @brief Build a complete replica set from explicit layer/expert destinations.
+ *
+ * Every tuple is `{layer, expert, participant}`. Owner residency is implicit
+ * in `base_ownership`; only non-owner copies belong in the replica matrix.
+ */
+static ExpertReplicaSet makeReplicaSet(
+    MoELayeredExpertOwnership base_ownership,
+    std::initializer_list<std::array<int, 3>> replicas,
+    std::string domain_id = {})
+{
+    ExpertReplicaSet result;
+    result.domain_id = std::move(domain_id);
+    result.base_ownership = std::move(base_ownership);
+    result.replica_participants_by_layer.assign(
+        static_cast<size_t>(result.base_ownership.layerCount()),
+        std::vector<std::vector<bool>>(
+            static_cast<size_t>(result.base_ownership.expertCount()),
+            std::vector<bool>(
+                static_cast<size_t>(result.base_ownership.participantCount()),
+                false)));
+    for (const auto &replica : replicas)
+    {
+        result.setReplicaOnParticipant(
+            replica[0], replica[1], replica[2]);
+    }
+    result.rebuildAggregateReplicaFlags();
+    return result;
+}
 
 // ── Helpers ───────────────────────────────────────────
 
@@ -36,10 +80,11 @@ static MoERebalanceController::Config makeConfig(
     for (int s = 0; s < num_sockets; ++s)
         cfg.sockets.push_back(DeviceId(DeviceType::CPU, s));
 
-    // Round-robin expert-to-socket
-    cfg.initial_expert_to_socket.resize(num_experts);
+    // Repeat one round-robin static owner row across all routed layers.
+    std::vector<int> owners(static_cast<size_t>(num_experts));
     for (int e = 0; e < num_experts; ++e)
-        cfg.initial_expert_to_socket[e] = e % num_sockets;
+        owners[static_cast<size_t>(e)] = e % num_sockets;
+    setUniformOwnership(cfg, owners);
 
     cfg.rebalance_config.imbalance_threshold = 1.3f;
     cfg.rebalance_config.max_swaps_per_layer = 4;
@@ -71,7 +116,7 @@ static void fillWindowBalanced(DecodeExpertHistogram &hist, int window_size,
     }
 }
 
-/// Fill the histogram window with heavily skewed routing (all to experts 0,1)
+/// Fill the histogram window with routing concentrated on participant zero.
 static void fillWindowSkewed(DecodeExpertHistogram &hist, int window_size,
                              int num_layers, int top_k)
 {
@@ -79,12 +124,14 @@ static void fillWindowSkewed(DecodeExpertHistogram &hist, int window_size,
     {
         for (int l = 0; l < num_layers; ++l)
         {
-            // Always route to experts 0 and 1 (both on socket 0 in round-robin)
+            // Under the default round-robin row, experts 0,2,4,... all belong
+            // to participant zero. The old 0,1 fixture was accidentally
+            // balanced and therefore failed to exercise Dynamic ownership.
             std::vector<int> indices(top_k);
             std::vector<float> weights(top_k);
             for (int k = 0; k < top_k; ++k)
             {
-                indices[k] = k; // experts 0, 1
+                indices[k] = k * 2;
                 weights[k] = 1.0f / static_cast<float>(top_k);
             }
             hist.record(l, indices.data(), weights.data(), top_k);
@@ -129,6 +176,85 @@ static DeviceMoELayerRuntime makeDeviceRuntimeLayerForLoadStats()
 // ── Tests ─────────────────────────────────────────────
 
 /**
+ * @brief Prove the hosted ticket admits exactly the three legal clock states.
+ *
+ * HIP's bound can observe a pending non-due edge, a pending due edge, or an
+ * already-acknowledged idle controller.  The last state is expected when the
+ * first generated token is sampled from prefill logits and therefore commits
+ * no new model-state row.  A due-but-unadvanced state remains impossible.
+ */
+TEST(Test__MoERebalanceController,
+     DispatchTicketAuthenticatesAcknowledgedIdleCadence)
+{
+    constexpr uint64_t session_epoch = 7u;
+    constexpr uint64_t workspace_generation = 13u;
+    DeviceMoERebalanceDispatchTicket ticket;
+    ticket.magic = DeviceMoERebalanceDispatchTicket::kMagic;
+    ticket.abi_version = DeviceMoERebalanceDispatchTicket::kABIVersion;
+    ticket.session_epoch_low = static_cast<uint32_t>(session_epoch);
+    ticket.workspace_generation_low =
+        static_cast<uint32_t>(workspace_generation);
+    ticket.participant_id = 0u;
+    ticket.participant_count = 2u;
+    ticket.healthy = 1u;
+    ticket.controller_version = moe_rebalance_abi::kVersion;
+    ticket.decode_rounds_committed = 63u;
+    ticket.decode_rounds_until_maintenance = 1u;
+    ticket.maintenance_due = 0u;
+    ticket.decode_boundary_advanced = 0u;
+
+    EXPECT_TRUE(ticket.matchesLifecycle(
+        session_epoch,
+        workspace_generation,
+        /*expected_participant_id=*/0u,
+        /*expected_participant_count=*/2u));
+    EXPECT_EQ(
+        ticket.dispatchAction(),
+        DeviceMoERebalanceDispatchAction::None);
+
+    ticket.decode_boundary_advanced = 1u;
+    EXPECT_TRUE(ticket.matchesLifecycle(
+        session_epoch,
+        workspace_generation,
+        0u,
+        2u));
+    EXPECT_EQ(
+        ticket.dispatchAction(),
+        DeviceMoERebalanceDispatchAction::Acknowledge);
+
+    ticket.maintenance_due = 1u;
+    ticket.decode_rounds_until_maintenance = 0u;
+    EXPECT_TRUE(ticket.matchesLifecycle(
+        session_epoch,
+        workspace_generation,
+        0u,
+        2u));
+    EXPECT_EQ(
+        ticket.dispatchAction(),
+        DeviceMoERebalanceDispatchAction::Maintain);
+
+    ticket.decode_boundary_advanced = 0u;
+    EXPECT_FALSE(ticket.matchesLifecycle(
+        session_epoch,
+        workspace_generation,
+        0u,
+        2u));
+    EXPECT_EQ(
+        ticket.dispatchAction(),
+        DeviceMoERebalanceDispatchAction::Invalid);
+
+    ticket.maintenance_due = 0u;
+    EXPECT_FALSE(ticket.matchesLifecycle(
+        session_epoch,
+        workspace_generation,
+        0u,
+        2u));
+    EXPECT_EQ(
+        ticket.dispatchAction(),
+        DeviceMoERebalanceDispatchAction::Invalid);
+}
+
+/**
  * @brief Lock the generation-stamped transfer-slot transaction into the ABI.
  *
  * Destination projection turns a logical root command into a participant-local
@@ -141,7 +267,7 @@ TEST(Test__MoERebalanceController,
      DevicePlanAbiCarriesAuthenticatedTransferSlotLease)
 {
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalancePlanEntry>);
-    EXPECT_EQ(kDeviceMoERebalanceVersion, 10u);
+    EXPECT_EQ(kDeviceMoERebalanceVersion, 11u);
     EXPECT_EQ(
         sizeof(DeviceMoERebalanceConfig),
         moe_rebalance_abi::kConfigBytes);
@@ -860,6 +986,77 @@ TEST(Test__MoERebalanceController, SharedDynamicPolicyChoosesPairedOwnershipSwap
     EXPECT_EQ(expert_owner[2], 0);
 }
 
+TEST(Test__MoERebalanceController, SharedDynamicPolicyRejectsLayerSwapThatWorsensWaveLoad)
+{
+    uint64_t aggregate_load[2] = {1924u, 2140u};
+    moe_rebalance_policy::OwnershipSwapChoice choice{};
+    choice.overloaded_participant = 0u;
+    choice.underloaded_participant = 1u;
+    choice.heavy_count = 30u;
+    choice.light_count = 5u;
+    choice.valid = true;
+
+    const auto delta =
+        moe_rebalance_policy::evaluateDynamicOwnershipSwapAgainstAggregateLoad(
+            aggregate_load,
+            2u,
+            choice);
+    EXPECT_TRUE(delta.total_preserved);
+    EXPECT_EQ(delta.current_spread, 216u);
+    EXPECT_EQ(delta.proposed_spread, 266u);
+    EXPECT_FALSE(delta.improves)
+        << "A locally overloaded layer must not push work toward the participant already overloaded across the wave.";
+    EXPECT_FALSE(
+        moe_rebalance_policy::applyDynamicOwnershipSwapToAggregateLoadIfImproved(
+            aggregate_load,
+            2u,
+            choice));
+    EXPECT_EQ(aggregate_load[0], 1924u);
+    EXPECT_EQ(aggregate_load[1], 2140u);
+}
+
+TEST(Test__MoERebalanceController, SharedDynamicPolicyStopsBeforeAggregateOvershoot)
+{
+    uint64_t aggregate_load[2] = {100u, 0u};
+    moe_rebalance_policy::OwnershipSwapChoice choice{};
+    choice.overloaded_participant = 0u;
+    choice.underloaded_participant = 1u;
+    choice.heavy_count = 35u;
+    choice.light_count = 5u;
+    choice.valid = true;
+
+    uint64_t improvement = 0u;
+    ASSERT_TRUE(
+        moe_rebalance_policy::applyDynamicOwnershipSwapToAggregateLoadIfImproved(
+            aggregate_load,
+            2u,
+            choice,
+            &improvement));
+    EXPECT_EQ(aggregate_load[0], 70u);
+    EXPECT_EQ(aggregate_load[1], 30u);
+    EXPECT_EQ(improvement, 60u);
+
+    ASSERT_TRUE(
+        moe_rebalance_policy::applyDynamicOwnershipSwapToAggregateLoadIfImproved(
+            aggregate_load,
+            2u,
+            choice,
+            &improvement));
+    EXPECT_EQ(aggregate_load[0], 40u);
+    EXPECT_EQ(aggregate_load[1], 60u);
+    EXPECT_EQ(improvement, 20u);
+
+    EXPECT_FALSE(
+        moe_rebalance_policy::applyDynamicOwnershipSwapToAggregateLoadIfImproved(
+            aggregate_load,
+            2u,
+            choice,
+            &improvement));
+    EXPECT_EQ(aggregate_load[0], 40u);
+    EXPECT_EQ(aggregate_load[1], 60u);
+    EXPECT_EQ(improvement, 0u);
+}
+
 TEST(Test__MoERebalanceController, SharedDynamicPolicyChoosesCapacityReleasingSwap)
 {
     uint64_t participant_load[2] = {100u, 10u};
@@ -1093,7 +1290,8 @@ TEST(Test__MoERebalanceController, Construction_OffMode)
     EXPECT_EQ(ctrl.histogram(), nullptr);
     EXPECT_FALSE(ctrl.shouldRebalance());
     EXPECT_EQ(ctrl.totalRebalances(), 0);
-    EXPECT_EQ(ctrl.totalSwaps(), 0);
+    EXPECT_EQ(ctrl.totalSwapPairs(), 0);
+    EXPECT_EQ(ctrl.totalOwnershipChanges(), 0);
 }
 
 TEST(Test__MoERebalanceController, Construction_ObserveMode)
@@ -1144,11 +1342,8 @@ TEST(Test__MoERebalanceController, DynamicSingleParticipantDowngradesToObserveOn
 {
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/1,
                           /*num_layers=*/2, /*top_k=*/2, /*window_size=*/16);
-    for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = 0;
-
     MoERebalanceController ctrl(cfg);
-    const auto initial = ctrl.currentPlacement();
+    const auto initial = ctrl.currentOwnership();
 
     EXPECT_EQ(ctrl.requestedMode(), MoERebalanceMode::DYNAMIC);
     EXPECT_EQ(ctrl.mode(), MoERebalanceMode::OBSERVE);
@@ -1163,16 +1358,15 @@ TEST(Test__MoERebalanceController, DynamicSingleParticipantDowngradesToObserveOn
     EXPECT_FALSE(ctrl.shouldRebalance());
 
     EXPECT_TRUE(ctrl.rebalance().empty());
-    ctrl.rebalanceLPT();
     const auto replicas = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
 
-    EXPECT_EQ(ctrl.currentPlacement(), initial);
+    EXPECT_EQ(ctrl.currentOwnership(), initial);
     EXPECT_EQ(ctrl.placementEpoch(), 0u);
     EXPECT_EQ(ctrl.totalRebalances(), 0);
     EXPECT_EQ(replicas.num_replicated, 0);
 }
 
-TEST(Test__MoERebalanceController, ParticipantVocabularyAliasesLegacySocketState)
+TEST(Test__MoERebalanceController, ParticipantVocabularyAliasesAreConsistent)
 {
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/6, /*num_sockets=*/3,
                           /*num_layers=*/2, /*top_k=*/2, /*window_size=*/16);
@@ -1180,7 +1374,6 @@ TEST(Test__MoERebalanceController, ParticipantVocabularyAliasesLegacySocketState
 
     EXPECT_EQ(ctrl.participantCount(), 3);
     EXPECT_EQ(ctrl.participantDevices(), cfg.sockets);
-    EXPECT_EQ(ctrl.currentParticipantPlacement(), ctrl.currentPlacement());
     EXPECT_EQ(ctrl.computeExpertMasksForParticipant(2), ctrl.computeExpertMasks(2));
 
     fillWindowBalanced(*ctrl.histogram(), 16, 2, 6, 2);
@@ -1201,8 +1394,10 @@ TEST(Test__MoERebalanceController, NonCpuParticipantsSupportOwnershipAndReplicaR
                           /*num_layers=*/1, /*top_k=*/2, /*window_size=*/16);
     cfg.domain_id = "cuda_ep";
     cfg.sockets = {DeviceId::cuda(0), DeviceId::cuda(1)};
+    std::vector<int> owners(8);
     for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = (e < 6) ? 0 : 1;
+        owners[static_cast<size_t>(e)] = (e < 6) ? 0 : 1;
+    setUniformOwnership(cfg, owners);
 
     MoERebalanceController replica_ctrl(cfg);
     EXPECT_EQ(replica_ctrl.participantDevices(), cfg.sockets);
@@ -1224,9 +1419,12 @@ TEST(Test__MoERebalanceController, NonCpuParticipantsSupportOwnershipAndReplicaR
     MoERebalanceController swap_ctrl(cfg);
     fillWindowSkewed(*swap_ctrl.histogram(), 16, 1, 2);
     ASSERT_TRUE(swap_ctrl.shouldRebalance());
-    const auto new_placement = swap_ctrl.rebalance();
-    ASSERT_EQ(new_placement.size(), 8u);
-    EXPECT_NE(new_placement, cfg.initial_expert_to_socket);
+    const auto changes = swap_ctrl.rebalance();
+    ASSERT_FALSE(changes.empty());
+    EXPECT_NE(swap_ctrl.currentOwnership(), cfg.initial_ownership);
+    EXPECT_TRUE(
+        swap_ctrl.currentOwnership().hasSameLayerCapacitiesAs(
+            cfg.initial_ownership));
     EXPECT_EQ(swap_ctrl.placementEpoch(), 1u);
 
     auto masks0 = swap_ctrl.computeExpertMasksForParticipant(0);
@@ -1324,8 +1522,10 @@ TEST(Test__MoERebalanceController, Rebalance_WithImbalance)
     // Placement: experts 0-5 on socket 0, experts 6-7 on socket 1
     // Routing skewed to experts 0,1 (both on socket 0) → socket 0 is heavily overloaded
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
+    std::vector<int> owners(8);
     for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = (e < 6) ? 0 : 1;
+        owners[static_cast<size_t>(e)] = (e < 6) ? 0 : 1;
+    setUniformOwnership(cfg, owners);
     MoERebalanceController ctrl(cfg);
 
     // Skewed routing → heavy imbalance between sockets
@@ -1334,9 +1534,9 @@ TEST(Test__MoERebalanceController, Rebalance_WithImbalance)
 
     auto result = ctrl.rebalance();
 
-    // With heavy imbalance, rebalancer should propose swaps and return new placement
+    // With heavy imbalance, the rebalancer returns exact changed entries.
     EXPECT_FALSE(result.empty());
-    EXPECT_EQ(static_cast<int>(result.size()), 8); // Full placement vector
+    EXPECT_EQ(result.size() % 2, 0u);
     EXPECT_EQ(ctrl.placementEpoch(), 1u);
 
     const auto &before = ctrl.lastImbalanceBefore();
@@ -1351,11 +1551,13 @@ TEST(Test__MoERebalanceController, Rebalance_UpdatesPlacement)
 {
     // Experts 0-5 on socket 0, 6-7 on socket 1
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
+    std::vector<int> owners(8);
     for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = (e < 6) ? 0 : 1;
+        owners[static_cast<size_t>(e)] = (e < 6) ? 0 : 1;
+    setUniformOwnership(cfg, owners);
     MoERebalanceController ctrl(cfg);
 
-    auto initial = ctrl.currentPlacement();
+    const auto initial = ctrl.currentOwnership();
 
     fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
     auto result = ctrl.rebalance();
@@ -1364,13 +1566,9 @@ TEST(Test__MoERebalanceController, Rebalance_UpdatesPlacement)
     {
         // Pair swaps move a heavy expert to socket 1 and a light expert to socket 0.
         // At least one expert's socket assignment should differ from initial.
-        bool placement_changed = false;
-        for (int e = 0; e < 8; ++e)
-        {
-            if (ctrl.currentPlacement()[e] != initial[e])
-                placement_changed = true;
-        }
-        EXPECT_TRUE(placement_changed);
+        EXPECT_NE(ctrl.currentOwnership(), initial);
+        EXPECT_TRUE(
+            ctrl.currentOwnership().hasSameLayerCapacitiesAs(initial));
     }
 }
 
@@ -1393,12 +1591,14 @@ TEST(Test__MoERebalanceController, Rebalance_CountsTotal)
 {
     // Experts 0-5 on socket 0, 6-7 on socket 1 for forced imbalance
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
+    std::vector<int> owners(8);
     for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = (e < 6) ? 0 : 1;
+        owners[static_cast<size_t>(e)] = (e < 6) ? 0 : 1;
+    setUniformOwnership(cfg, owners);
     MoERebalanceController ctrl(cfg);
 
     EXPECT_EQ(ctrl.totalRebalances(), 0);
-    EXPECT_EQ(ctrl.totalSwaps(), 0);
+    EXPECT_EQ(ctrl.totalSwapPairs(), 0);
 
     // First rebalance cycle
     fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
@@ -1407,8 +1607,8 @@ TEST(Test__MoERebalanceController, Rebalance_CountsTotal)
     if (!result1.empty())
     {
         EXPECT_EQ(ctrl.totalRebalances(), 1);
-        EXPECT_GT(ctrl.totalSwaps(), 0);
-        int swaps_after_first = ctrl.totalSwaps();
+        EXPECT_GT(ctrl.totalSwapPairs(), 0);
+        const int swaps_after_first = ctrl.totalSwapPairs();
 
         // Second rebalance cycle
         fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
@@ -1417,7 +1617,7 @@ TEST(Test__MoERebalanceController, Rebalance_CountsTotal)
         if (!result2.empty())
         {
             EXPECT_EQ(ctrl.totalRebalances(), 2);
-            EXPECT_GE(ctrl.totalSwaps(), swaps_after_first);
+            EXPECT_GE(ctrl.totalSwapPairs(), swaps_after_first);
         }
     }
 }
@@ -1426,8 +1626,10 @@ TEST(Test__MoERebalanceController, ObserveMode_NeverRebalances)
 {
     // Experts 0-5 on socket 0, 6-7 on socket 1 for extreme imbalance
     auto cfg = makeConfig(MoERebalanceMode::OBSERVE, 8, 2, 2, 2, 16);
+    std::vector<int> owners(8);
     for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = (e < 6) ? 0 : 1;
+        owners[static_cast<size_t>(e)] = (e < 6) ? 0 : 1;
+    setUniformOwnership(cfg, owners);
     MoERebalanceController ctrl(cfg);
 
     // Fill window
@@ -1510,8 +1712,7 @@ TEST(Test__MoERebalanceController, PlacementEpochTracksBasePlacementAndReplicas)
 {
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/2,
                           /*num_layers=*/2, /*top_k=*/2, /*window_size=*/16);
-    for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = (e < 4) ? 0 : 1;
+    setUniformOwnership(cfg, {0, 0, 0, 0, 1, 1, 1, 1});
 
     MoERebalanceController ctrl(cfg);
     EXPECT_EQ(ctrl.placementEpoch(), 0u);
@@ -1521,15 +1722,15 @@ TEST(Test__MoERebalanceController, PlacementEpochTracksBasePlacementAndReplicas)
     ASSERT_FALSE(rebalanced.empty());
     EXPECT_EQ(ctrl.placementEpoch(), 1u);
 
-    const auto placement_after_rebalance = ctrl.currentPlacement();
-    auto hot_expert = std::find(placement_after_rebalance.begin(), placement_after_rebalance.end(), 0);
-    if (hot_expert == placement_after_rebalance.end())
-        hot_expert = placement_after_rebalance.begin();
-    ASSERT_NE(hot_expert, placement_after_rebalance.end());
+    const auto &owners_after_rebalance =
+        ctrl.currentOwnership().ownersForLayer(0);
+    auto hot_expert = std::find(
+        owners_after_rebalance.begin(), owners_after_rebalance.end(), 0);
+    ASSERT_NE(hot_expert, owners_after_rebalance.end());
     recordExpertHits(
         *ctrl.histogram(),
         0,
-        {{static_cast<int>(std::distance(placement_after_rebalance.begin(), hot_expert)), 16}});
+        {{static_cast<int>(std::distance(owners_after_rebalance.begin(), hot_expert)), 16}});
     const auto replicas = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
     ASSERT_GT(replicas.num_replicated, 0);
     EXPECT_EQ(ctrl.placementEpoch(), 2u);
@@ -1543,11 +1744,10 @@ TEST(Test__MoERebalanceController, ReplicasExpandMasksButPreserveBasePlacement)
 {
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/2,
                           /*num_layers=*/2, /*top_k=*/2, /*window_size=*/16);
-    for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = (e < 4) ? 0 : 1;
+    setUniformOwnership(cfg, {0, 0, 0, 0, 1, 1, 1, 1});
 
     MoERebalanceController ctrl(cfg);
-    const auto initial_placement = ctrl.currentPlacement();
+    const auto initial_ownership = ctrl.currentOwnership();
 
     recordExpertHits(*ctrl.histogram(), 0, {{0, 20}});
     recordExpertHits(*ctrl.histogram(), 1, {{4, 20}});
@@ -1555,8 +1755,8 @@ TEST(Test__MoERebalanceController, ReplicasExpandMasksButPreserveBasePlacement)
 
     auto replicas = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
     ASSERT_EQ(replicas.num_replicated, 2);
-    EXPECT_TRUE(replicas.is_replicated[0]);
-    EXPECT_TRUE(replicas.is_replicated[4]);
+    EXPECT_TRUE(replicas.replicated_in_any_layer[0]);
+    EXPECT_TRUE(replicas.replicated_in_any_layer[4]);
     EXPECT_TRUE(replicas.hasLayerReplicaPlacement());
     EXPECT_TRUE(replicas.hasReplicaOnParticipant(0, 0, 1));
     EXPECT_TRUE(replicas.hasReplicaOnParticipant(1, 4, 0));
@@ -1564,7 +1764,7 @@ TEST(Test__MoERebalanceController, ReplicasExpandMasksButPreserveBasePlacement)
         << "a hot expert id must not implicitly expand to every layer";
     EXPECT_FALSE(replicas.hasReplicaOnParticipant(1, 0, 1))
         << "a hot expert id must not implicitly expand to every layer";
-    EXPECT_EQ(ctrl.currentPlacement(), initial_placement);
+    EXPECT_EQ(ctrl.currentOwnership(), initial_ownership);
 
     auto socket0_masks = ctrl.computeExpertMasks(0);
     auto socket1_masks = ctrl.computeExpertMasks(1);
@@ -1593,7 +1793,7 @@ TEST(Test__MoERebalanceController, ReplicasExpandMasksButPreserveBasePlacement)
     ctrl.resetRebalanceWindow();
     EXPECT_FALSE(ctrl.shouldRebalance());
     EXPECT_FALSE(ctrl.histogram()->windowFull());
-    EXPECT_EQ(ctrl.currentPlacement(), initial_placement);
+    EXPECT_EQ(ctrl.currentOwnership(), initial_ownership);
 }
 
 TEST(Test__MoERebalanceController, ReplicaProposalSkipsHotRemoteExpertWhenTargetIsAlreadyHeavier)
@@ -1605,7 +1805,7 @@ TEST(Test__MoERebalanceController, ReplicaProposalSkipsHotRemoteExpertWhenTarget
     recordExpertHits(*ctrl.histogram(), 0, {{0, 100}, {1, 90}});
 
     auto replicas = ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
-    ASSERT_EQ(replicas.num_sockets, 2);
+    ASSERT_EQ(replicas.participantCount(), 2);
     ASSERT_EQ(replicas.num_replicated, 1);
 
     EXPECT_TRUE(replicas.hasReplicaOnParticipant(0, 0, 1))
@@ -1676,7 +1876,7 @@ TEST(Test__MoERebalanceController, ReplicaProposalIsLayerAndParticipantScopedFor
     recordExpertHits(*ctrl.histogram(), 2, {{2, 15}});
 
     auto replicas = ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
-    ASSERT_EQ(replicas.num_sockets, 3);
+    ASSERT_EQ(replicas.participantCount(), 3);
     ASSERT_EQ(replicas.num_replicated, 3);
     EXPECT_TRUE(replicas.hasLayerReplicaPlacement());
 
@@ -1725,15 +1925,15 @@ TEST(Test__MoERebalanceController, ReplicaProposalKeepsStillWarmExistingReplica)
     recordExpertHits(*ctrl.histogram(), 0, {{1, 10}});
     auto first = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
     ASSERT_EQ(first.num_replicated, 1);
-    ASSERT_TRUE(first.is_replicated[1]);
+    ASSERT_TRUE(first.replicated_in_any_layer[1]);
 
     ctrl.resetRebalanceWindow();
     recordExpertHits(*ctrl.histogram(), 0, {{1, 8}, {3, 10}});
     auto second = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
     EXPECT_EQ(second.num_replicated, 1);
-    EXPECT_TRUE(second.is_replicated[1])
+    EXPECT_TRUE(second.replicated_in_any_layer[1])
         << "existing replica remains within 50% of the hottest replacement";
-    EXPECT_FALSE(second.is_replicated[3]);
+    EXPECT_FALSE(second.replicated_in_any_layer[3]);
     EXPECT_EQ(ctrl.placementEpoch(), 1u)
         << "keeping the same replica placement must not invalidate graph caches";
 }
@@ -1747,14 +1947,14 @@ TEST(Test__MoERebalanceController, ReplicaProposalReplacesColdExistingReplica)
     recordExpertHits(*ctrl.histogram(), 0, {{1, 10}});
     auto first = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
     ASSERT_EQ(first.num_replicated, 1);
-    ASSERT_TRUE(first.is_replicated[1]);
+    ASSERT_TRUE(first.replicated_in_any_layer[1]);
 
     ctrl.resetRebalanceWindow();
     recordExpertHits(*ctrl.histogram(), 0, {{1, 4}, {3, 10}});
     auto second = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
     EXPECT_EQ(second.num_replicated, 1);
-    EXPECT_FALSE(second.is_replicated[1]);
-    EXPECT_TRUE(second.is_replicated[3])
+    EXPECT_FALSE(second.replicated_in_any_layer[1]);
+    EXPECT_TRUE(second.replicated_in_any_layer[3])
         << "cold existing replica should make room for a much hotter expert";
     EXPECT_EQ(ctrl.placementEpoch(), 2u);
 }
@@ -1768,7 +1968,7 @@ TEST(Test__MoERebalanceController, ReplicaProposalPreservesExistingReplicasWitho
     recordExpertHits(*ctrl.histogram(), 0, {{1, 10}});
     auto first = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
     ASSERT_EQ(first.num_replicated, 1);
-    ASSERT_TRUE(first.is_replicated[1]);
+    ASSERT_TRUE(first.replicated_in_any_layer[1]);
     const auto epoch_after_first = ctrl.placementEpoch();
 
     ctrl.resetRebalanceWindow();
@@ -1781,24 +1981,27 @@ TEST(Test__MoERebalanceController, ReplicaProposalPreservesExistingReplicasWitho
 
 TEST(Test__MoERebalanceController, ReplicaPrefillMaskKeepsReplicatedComputeOnOwnerOnly)
 {
-    ExpertReplicaSet replicas;
-    replicas.is_replicated = {true, false, false, false, true, false, false, false};
-    replicas.owner_socket = {0, 0, 0, 0, 1, 1, 1, 1};
-    replicas.num_replicated = 2;
-    replicas.num_sockets = 2;
+    const auto ownership = MoELayeredExpertOwnership::uniform(
+        1, 2, {0, 0, 0, 0, 1, 1, 1, 1});
+    const auto replicas = makeReplicaSet(
+        ownership,
+        {
+            {0, 0, 1},
+            {0, 4, 0},
+        });
 
     std::vector<bool> socket0_mask = {true, true, true, true, true, false, false, false};
     std::vector<bool> socket1_mask = {true, false, false, false, true, true, true, true};
 
     auto socket0_replicas = replicas;
-    socket0_replicas.buildPrefillMask(0, socket0_mask);
+    socket0_replicas.buildPrefillMask(0, socket0_mask, 0);
     EXPECT_TRUE(socket0_replicas.prefill_mask[0]);
     EXPECT_FALSE(socket0_replicas.prefill_mask[4]);
     EXPECT_TRUE(socket0_replicas.prefill_mask[1]);
     EXPECT_FALSE(socket0_replicas.prefill_mask[5]);
 
     auto socket1_replicas = replicas;
-    socket1_replicas.buildPrefillMask(1, socket1_mask);
+    socket1_replicas.buildPrefillMask(1, socket1_mask, 0);
     EXPECT_FALSE(socket1_replicas.prefill_mask[0]);
     EXPECT_TRUE(socket1_replicas.prefill_mask[4]);
     EXPECT_FALSE(socket1_replicas.prefill_mask[1]);
@@ -1807,60 +2010,69 @@ TEST(Test__MoERebalanceController, ReplicaPrefillMaskKeepsReplicatedComputeOnOwn
 
 TEST(Test__MoERebalanceController, ReplicaPlacementComparisonIgnoresPrefillMask)
 {
-    ExpertReplicaSet a;
-    a.is_replicated = {true, false, true, false};
-    a.owner_socket = {0, 0, 1, 1};
-    a.num_replicated = 2;
-    a.num_sockets = 2;
+    const auto ownership = MoELayeredExpertOwnership::uniform(
+        1, 2, {0, 0, 1, 1});
+    auto a = makeReplicaSet(
+        ownership,
+        {
+            {0, 0, 1},
+            {0, 2, 0},
+        });
     a.prefill_mask = {true, true, false, false};
 
     ExpertReplicaSet b = a;
     b.prefill_mask = {false, false, true, true};
     EXPECT_TRUE(a.sameReplicaPlacement(b));
 
-    b.is_replicated[1] = true;
-    b.num_replicated = 3;
+    b.setReplicaOnParticipant(0, 1, 1);
+    b.rebuildAggregateReplicaFlags();
     EXPECT_FALSE(a.sameReplicaPlacement(b));
 }
 
 TEST(Test__MoERebalanceController, ReplicaArrivalsSinceReturnsOnlyNewResidentExperts)
 {
-    ExpertReplicaSet previous;
-    previous.is_replicated = {true, false, true, false, false, false};
-    previous.owner_socket = {0, 0, 1, 1, 0, 1};
-    previous.num_replicated = 2;
-    previous.num_sockets = 2;
+    const auto previous_ownership = MoELayeredExpertOwnership::uniform(
+        1, 2, {0, 0, 1, 1, 0, 1});
+    const auto previous = makeReplicaSet(
+        previous_ownership,
+        {
+            {0, 0, 1},
+            {0, 2, 0},
+        });
 
-    ExpertReplicaSet current;
-    current.is_replicated = {true, true, true, false, true, false};
-    current.owner_socket = {0, 0, 0, 1, 0, 1};
-    current.num_replicated = 4;
-    current.num_sockets = 2;
+    const auto current_ownership = MoELayeredExpertOwnership::uniform(
+        1, 2, {0, 0, 0, 1, 0, 1});
+    const auto current = makeReplicaSet(
+        current_ownership,
+        {
+            {0, 0, 1},
+            {0, 1, 1},
+            {0, 2, 1},
+            {0, 4, 1},
+        });
 
     auto arrivals = current.arrivalsSince(previous);
     EXPECT_EQ(arrivals.num_replicated, 3);
-    EXPECT_FALSE(arrivals.is_replicated[0]); // unchanged owner/socket residency
-    EXPECT_TRUE(arrivals.is_replicated[1]);  // new replica
-    EXPECT_TRUE(arrivals.is_replicated[2]);  // owner changed, must resend
-    EXPECT_FALSE(arrivals.is_replicated[3]);
-    EXPECT_TRUE(arrivals.is_replicated[4]); // new replica
-    EXPECT_FALSE(arrivals.is_replicated[5]);
-    EXPECT_EQ(arrivals.owner_socket, current.owner_socket);
-    EXPECT_EQ(arrivals.num_sockets, current.num_sockets);
+    EXPECT_FALSE(arrivals.replicated_in_any_layer[0]); // unchanged owner/socket residency
+    EXPECT_TRUE(arrivals.replicated_in_any_layer[1]);  // new replica
+    EXPECT_TRUE(arrivals.replicated_in_any_layer[2]);  // owner changed, must resend
+    EXPECT_FALSE(arrivals.replicated_in_any_layer[3]);
+    EXPECT_TRUE(arrivals.replicated_in_any_layer[4]); // new replica
+    EXPECT_FALSE(arrivals.replicated_in_any_layer[5]);
+    EXPECT_EQ(arrivals.base_ownership, current.base_ownership);
+    EXPECT_EQ(arrivals.participantCount(), current.participantCount());
 }
 
 TEST(Test__MoERebalanceController, ReplicaArrivalsSinceUsesLayerParticipantResidency)
 {
-    ExpertReplicaSet previous;
-    previous.owner_socket = {0, 1, 2, 0};
-    previous.num_sockets = 3;
-    previous.is_replicated.assign(4, false);
-    previous.replica_participants_by_layer.assign(
-        3,
-        std::vector<std::vector<bool>>(4, std::vector<bool>(3, false)));
-    previous.setReplicaOnParticipant(0, 1, 0);
-    previous.setReplicaOnParticipant(1, 2, 0);
-    previous.rebuildAggregateReplicaFlags();
+    const auto ownership = MoELayeredExpertOwnership::uniform(
+        3, 3, {0, 1, 2, 0});
+    const auto previous = makeReplicaSet(
+        ownership,
+        {
+            {0, 1, 0},
+            {1, 2, 0},
+        });
     ASSERT_EQ(previous.num_replicated, 2);
 
     ExpertReplicaSet current = previous;
@@ -1878,17 +2090,18 @@ TEST(Test__MoERebalanceController, ReplicaArrivalsSinceUsesLayerParticipantResid
 
     EXPECT_FALSE(arrivals.hasReplicaOnParticipant(1, 1, 2))
         << "arrival residency should not expand to unrelated layers";
-    EXPECT_EQ(arrivals.owner_socket, current.owner_socket);
-    EXPECT_EQ(arrivals.num_sockets, current.num_sockets);
+    EXPECT_EQ(arrivals.base_ownership, current.base_ownership);
+    EXPECT_EQ(arrivals.participantCount(), current.participantCount());
 }
 
 TEST(Test__MoERebalanceController, ReplicaDecodeDispatchAssignsEachRoutedExpertToExactlyOneSocket)
 {
-    ExpertReplicaSet replicas;
-    replicas.is_replicated = {true, true, false, false};
-    replicas.owner_socket = {0, 1, 0, 1};
-    replicas.num_replicated = 2;
-    replicas.num_sockets = 2;
+    const auto replicas = makeReplicaSet(
+        MoELayeredExpertOwnership::uniform(1, 2, {0, 1, 0, 1}),
+        {
+            {0, 0, 1},
+            {0, 1, 0},
+        });
 
     const int expert_indices[] = {0, 1, 2, 3};
     const float expert_weights[] = {0.4f, 0.3f, 0.2f, 0.1f};
@@ -1897,8 +2110,10 @@ TEST(Test__MoERebalanceController, ReplicaDecodeDispatchAssignsEachRoutedExpertT
 
     bool socket0_compute[4] = {};
     bool socket1_compute[4] = {};
-    replicas.assignForToken(expert_indices, expert_weights, 4, 0, socket0_mask, socket0_compute);
-    replicas.assignForToken(expert_indices, expert_weights, 4, 1, socket1_mask, socket1_compute);
+    replicas.assignForToken(
+        expert_indices, expert_weights, 4, 0, socket0_mask, socket0_compute, 0);
+    replicas.assignForToken(
+        expert_indices, expert_weights, 4, 1, socket1_mask, socket1_compute, 0);
 
     int socket0_count = 0;
     int socket1_count = 0;
@@ -1916,6 +2131,49 @@ TEST(Test__MoERebalanceController, ReplicaDecodeDispatchAssignsEachRoutedExpertT
     EXPECT_TRUE(socket1_compute[1]);
     EXPECT_TRUE(socket0_compute[2]);
     EXPECT_TRUE(socket1_compute[3]);
+}
+
+TEST(Test__MoERebalanceController, ReplicaDecodeDispatchIgnoresZeroWeightPadding)
+{
+    const auto replicas = makeReplicaSet(
+        MoELayeredExpertOwnership::uniform(1, 2, {0, 1, 0, 1}),
+        {
+            {0, 0, 1},
+            {0, 1, 0},
+        });
+
+    const int expert_indices[] = {0, -1, 2, 3};
+    const float expert_weights[] = {0.4f, 0.0f, 0.2f, 0.1f};
+    const std::vector<bool> socket0_mask = {true, true, true, false};
+    const std::vector<bool> socket1_mask = {true, true, false, true};
+
+    bool socket0_compute[] = {true, true, true, true};
+    bool socket1_compute[] = {true, true, true, true};
+    replicas.assignForToken(
+        expert_indices,
+        expert_weights,
+        4,
+        0,
+        socket0_mask,
+        socket0_compute,
+        0);
+    replicas.assignForToken(
+        expert_indices,
+        expert_weights,
+        4,
+        1,
+        socket1_mask,
+        socket1_compute,
+        0);
+
+    EXPECT_FALSE(socket0_compute[1]);
+    EXPECT_FALSE(socket1_compute[1]);
+    for (const int active_slot : {0, 2, 3})
+    {
+        EXPECT_NE(socket0_compute[active_slot], socket1_compute[active_slot])
+            << "active slot " << active_slot
+            << " must still be assigned to exactly one participant";
+    }
 }
 
 TEST(Test__MoERebalanceController, GpuCacheMasks_AssignsHottestExpertsToGpuDomain)
@@ -1983,7 +2241,7 @@ TEST(Test__MoERebalanceController, GpuCacheMasks_CanPlaceAllExpertsOnGpuDomain)
     }
 }
 
-TEST(Test__MoERebalanceController, GpuCacheMasks_FallsBackWithoutMixedDomains)
+TEST(Test__MoERebalanceController, GpuCacheMasksPreserveOwnershipWithoutMixedDomains)
 {
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/2,
                           /*num_layers=*/2, /*top_k=*/1, /*window_size=*/16);
@@ -2000,322 +2258,134 @@ TEST(Test__MoERebalanceController, GpuCacheMasks_FallsBackWithoutMixedDomains)
     EXPECT_EQ(masks[1], expected_s1);
 }
 
-// ── rebalanceLPT() Tests ──────────────────────────────
-
-TEST(Test__MoERebalanceController, RebalanceLPT_BalancedInput_NearPerfectBalance)
+TEST(Test__MoERebalanceController, ComputeExpertMasksCoverEveryOwnerExactlyOnce)
 {
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
-    MoERebalanceController ctrl(cfg);
+    auto cfg = makeConfig(
+        MoERebalanceMode::DYNAMIC,
+        /*num_experts=*/8,
+        /*num_sockets=*/3,
+        /*num_layers=*/4,
+        /*top_k=*/2,
+        /*window_size=*/16);
+    MoERebalanceController controller(cfg);
 
-    fillWindowBalanced(*ctrl.histogram(), 16, 2, 8, 2);
-    ctrl.rebalanceLPT();
+    std::vector<std::vector<std::vector<bool>>> masks;
+    for (int participant = 0; participant < controller.participantCount(); ++participant)
+        masks.push_back(controller.computeExpertMasks(participant));
 
-    // Verify near-perfect balance: compute load per socket
-    // Re-fill histogram to measure post-LPT imbalance
-    fillWindowBalanced(*ctrl.histogram(), 16, 2, 8, 2);
-
-    const auto &placement = ctrl.currentPlacement();
-    // Count experts per socket
-    int count_s0 = 0, count_s1 = 0;
-    for (int e = 0; e < 8; ++e)
+    for (int layer = 0; layer < controller.numLayers(); ++layer)
     {
-        if (placement[e] == 0)
-            count_s0++;
-        else
-            count_s1++;
-    }
-    // With balanced input, LPT should assign 4 experts per socket
-    EXPECT_EQ(count_s0, 4);
-    EXPECT_EQ(count_s1, 4);
-}
-
-TEST(Test__MoERebalanceController, RebalanceLPT_SkewedInput_ImproveBalance)
-{
-    // Round-robin: experts 0,2,4,6→socket0, experts 1,3,5,7→socket1
-    // Skewed routing to experts 0,1 → socket0 gets expert 0, socket1 gets expert 1
-    // Both are equally hot, so initially balanced. Use contiguous partition instead.
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
-    // Contiguous: 0-3→socket0, 4-7→socket1
-    for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = (e < 4) ? 0 : 1;
-    MoERebalanceController ctrl(cfg);
-
-    // Route exclusively to experts 0,1 (both on socket 0)
-    fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
-
-    ctrl.rebalanceLPT();
-
-    // LPT should move one of {0,1} to socket 1 for better balance
-    const auto &placement = ctrl.currentPlacement();
-    int hot_on_s0 = 0;
-    for (int e : {0, 1})
-    {
-        if (placement[e] == 0)
-            hot_on_s0++;
-    }
-    // Expect at most 1 hot expert per socket (LPT splits them)
-    EXPECT_LE(hot_on_s0, 1);
-}
-
-TEST(Test__MoERebalanceController, RebalanceLPT_UpdatesPlacement)
-{
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
-    // Contiguous: 0-3→socket0, 4-7→socket1
-    for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = (e < 4) ? 0 : 1;
-    MoERebalanceController ctrl(cfg);
-
-    auto initial = ctrl.currentPlacement();
-
-    // Skewed to experts 0,1 (both on socket 0) → LPT should change placement
-    fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
-    ctrl.rebalanceLPT();
-
-    const auto &updated = ctrl.currentPlacement();
-    ASSERT_EQ(static_cast<int>(updated.size()), 8);
-
-    // At least one expert should have moved
-    bool any_changed = false;
-    for (int e = 0; e < 8; ++e)
-    {
-        if (updated[e] != initial[e])
-            any_changed = true;
-    }
-    EXPECT_TRUE(any_changed);
-}
-
-TEST(Test__MoERebalanceController, RebalanceLPT_ResetsWindow)
-{
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
-    MoERebalanceController ctrl(cfg);
-
-    fillWindowBalanced(*ctrl.histogram(), 16, 2, 8, 2);
-    ASSERT_TRUE(ctrl.histogram()->windowFull());
-
-    ctrl.rebalanceLPT();
-
-    EXPECT_FALSE(ctrl.histogram()->windowFull());
-}
-
-TEST(Test__MoERebalanceController, RebalanceLPT_IncrementsRebalanceCount)
-{
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
-    MoERebalanceController ctrl(cfg);
-
-    EXPECT_EQ(ctrl.totalRebalances(), 0);
-
-    fillWindowBalanced(*ctrl.histogram(), 16, 2, 8, 2);
-    ctrl.rebalanceLPT();
-    EXPECT_EQ(ctrl.totalRebalances(), 1);
-
-    // Second cycle
-    fillWindowBalanced(*ctrl.histogram(), 16, 2, 8, 2);
-    ctrl.rebalanceLPT();
-    EXPECT_EQ(ctrl.totalRebalances(), 2);
-}
-
-TEST(Test__MoERebalanceController, RebalanceLPT_ContiguousPartition_SkewedRouting)
-{
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
-    // Contiguous: 0-3→socket0, 4-7→socket1
-    for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = (e < 4) ? 0 : 1;
-    MoERebalanceController ctrl(cfg);
-
-    // Route only to experts 0-3 (all on socket 0)
-    fillWindowWithExperts(*ctrl.histogram(), 16, 2, {0, 1, 2, 3});
-
-    ctrl.rebalanceLPT();
-
-    const auto &placement = ctrl.currentPlacement();
-    // LPT should distribute experts 0-3 across both sockets
-    int hot_on_s0 = 0, hot_on_s1 = 0;
-    for (int e = 0; e < 4; ++e)
-    {
-        if (placement[e] == 0)
-            hot_on_s0++;
-        else
-            hot_on_s1++;
-    }
-    // At least one of experts 0-3 should now be on socket 1
-    EXPECT_GT(hot_on_s1, 0);
-    // Should be roughly balanced: 2 hot experts per socket
-    EXPECT_EQ(hot_on_s0, 2);
-    EXPECT_EQ(hot_on_s1, 2);
-}
-
-TEST(Test__MoERebalanceController, RebalanceLPT_MultiSocket)
-{
-    // 4 sockets, 16 experts
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/16, /*num_sockets=*/4,
-                          /*num_layers=*/2, /*top_k=*/4, /*window_size=*/16);
-    MoERebalanceController ctrl(cfg);
-
-    // Route to experts 0-3 (all on socket 0 in round-robin with 4 sockets)
-    fillWindowWithExperts(*ctrl.histogram(), 16, 2, {0, 1, 2, 3});
-
-    ctrl.rebalanceLPT();
-
-    const auto &placement = ctrl.currentPlacement();
-    // LPT should spread experts 0-3 across all 4 sockets
-    std::vector<int> socket_for_hot(4);
-    for (int e = 0; e < 4; ++e)
-        socket_for_hot[e] = placement[e];
-
-    // With 4 equally-loaded hot experts and 4 sockets, each should go to a different socket
-    std::sort(socket_for_hot.begin(), socket_for_hot.end());
-    // All 4 hot experts on distinct sockets
-    EXPECT_EQ(socket_for_hot[0], 0);
-    EXPECT_EQ(socket_for_hot[1], 1);
-    EXPECT_EQ(socket_for_hot[2], 2);
-    EXPECT_EQ(socket_for_hot[3], 3);
-}
-
-TEST(Test__MoERebalanceController, RebalanceLPT_ZeroCountExperts)
-{
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
-    MoERebalanceController ctrl(cfg);
-
-    // Only experts 0,1 are active — experts 2-7 have zero counts
-    fillWindowWithExperts(*ctrl.histogram(), 16, 2, {0, 1});
-
-    ctrl.rebalanceLPT();
-
-    const auto &placement = ctrl.currentPlacement();
-
-    // All 8 experts should still have valid placements (0 or 1)
-    for (int e = 0; e < 8; ++e)
-    {
-        EXPECT_GE(placement[e], 0);
-        EXPECT_LE(placement[e], 1);
-    }
-
-    // LPT balances by LOAD, not expert count.
-    // The 2 hot experts should be split across sockets for load balance.
-    int hot_on_s0 = 0, hot_on_s1 = 0;
-    for (int e : {0, 1})
-    {
-        if (placement[e] == 0)
-            hot_on_s0++;
-        else
-            hot_on_s1++;
-    }
-    EXPECT_EQ(hot_on_s0, 1);
-    EXPECT_EQ(hot_on_s1, 1);
-
-    // Zero-count experts all tie at load=0, so LPT tie-breaks to lowest-index socket.
-    // They don't affect balance — just verify they're all placed somewhere valid.
-    for (int e = 2; e < 8; ++e)
-    {
-        EXPECT_GE(placement[e], 0);
-        EXPECT_LE(placement[e], 1);
-    }
-}
-
-// ── computeExpertMasks() Tests ────────────────────────
-
-TEST(Test__MoERebalanceController, ComputeExpertMasks_InitialPartition)
-{
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
-    MoERebalanceController ctrl(cfg);
-
-    // Round-robin: experts 0,2,4,6→socket0; experts 1,3,5,7→socket1
-    auto masks_s0 = ctrl.computeExpertMasks(0);
-    auto masks_s1 = ctrl.computeExpertMasks(1);
-
-    ASSERT_EQ(static_cast<int>(masks_s0.size()), 2);    // num_layers
-    ASSERT_EQ(static_cast<int>(masks_s0[0].size()), 8); // num_experts
-
-    // Check socket 0 mask matches round-robin
-    for (int l = 0; l < 2; ++l)
-    {
-        EXPECT_TRUE(masks_s0[l][0]);  // expert 0 → socket 0
-        EXPECT_FALSE(masks_s0[l][1]); // expert 1 → socket 1
-        EXPECT_TRUE(masks_s0[l][2]);  // expert 2 → socket 0
-        EXPECT_FALSE(masks_s0[l][3]); // expert 3 → socket 1
-        EXPECT_TRUE(masks_s0[l][4]);  // expert 4 → socket 0
-        EXPECT_FALSE(masks_s0[l][5]); // expert 5 → socket 1
-        EXPECT_TRUE(masks_s0[l][6]);  // expert 6 → socket 0
-        EXPECT_FALSE(masks_s0[l][7]); // expert 7 → socket 1
-    }
-
-    // Check socket 1 is the complement
-    for (int l = 0; l < 2; ++l)
-    {
-        EXPECT_FALSE(masks_s1[l][0]);
-        EXPECT_TRUE(masks_s1[l][1]);
-        EXPECT_FALSE(masks_s1[l][2]);
-        EXPECT_TRUE(masks_s1[l][3]);
-        EXPECT_FALSE(masks_s1[l][4]);
-        EXPECT_TRUE(masks_s1[l][5]);
-        EXPECT_FALSE(masks_s1[l][6]);
-        EXPECT_TRUE(masks_s1[l][7]);
-    }
-}
-
-TEST(Test__MoERebalanceController, ComputeExpertMasks_AfterLPT)
-{
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
-    // Contiguous: 0-3→socket0, 4-7→socket1
-    for (int e = 0; e < 8; ++e)
-        cfg.initial_expert_to_socket[e] = (e < 4) ? 0 : 1;
-    MoERebalanceController ctrl(cfg);
-
-    // Skewed to experts 0,1 → LPT will move one to socket 1
-    fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
-    ctrl.rebalanceLPT();
-
-    const auto &placement = ctrl.currentPlacement();
-    auto masks_s0 = ctrl.computeExpertMasks(0);
-
-    // Masks should reflect the updated LPT placement
-    for (int l = 0; l < 2; ++l)
-    {
-        for (int e = 0; e < 8; ++e)
+        for (int expert = 0; expert < controller.numExperts(); ++expert)
         {
-            EXPECT_EQ(masks_s0[l][e], placement[e] == 0)
-                << "Mismatch at layer=" << l << " expert=" << e;
+            int owner_count = 0;
+            for (int participant = 0;
+                 participant < controller.participantCount();
+                 ++participant)
+            {
+                owner_count += masks[static_cast<size_t>(participant)]
+                                    [static_cast<size_t>(layer)]
+                                    [static_cast<size_t>(expert)]
+                                   ? 1
+                                   : 0;
+            }
+            EXPECT_EQ(owner_count, 1)
+                << "layer=" << layer << " expert=" << expert;
         }
     }
 }
 
-TEST(Test__MoERebalanceController, ComputeExpertMasks_SocketComplementary)
+TEST(Test__MoERebalanceController, DynamicOwnershipKeepsConflictingLayerMoves)
 {
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
-    MoERebalanceController ctrl(cfg);
-
-    fillWindowBalanced(*ctrl.histogram(), 16, 2, 8, 2);
-    ctrl.rebalanceLPT();
-
-    auto masks_s0 = ctrl.computeExpertMasks(0);
-    auto masks_s1 = ctrl.computeExpertMasks(1);
-
-    for (int l = 0; l < 2; ++l)
-    {
-        for (int e = 0; e < 8; ++e)
+    auto cfg = makeConfig(
+        MoERebalanceMode::DYNAMIC,
+        /*num_experts=*/4,
+        /*num_sockets=*/2,
+        /*num_layers=*/2,
+        /*top_k=*/1,
+        /*window_size=*/1);
+    cfg.initial_ownership = MoELayeredExpertOwnership(
+        2,
         {
-            // Exactly one socket owns each expert (no overlap, no gap)
-            EXPECT_NE(masks_s0[l][e], masks_s1[l][e])
-                << "Overlap or gap at layer=" << l << " expert=" << e;
-        }
+            {0, 0, 1, 1},
+            {1, 1, 0, 0},
+        });
+    cfg.rebalance_config.imbalance_threshold = 1.01f;
+    cfg.rebalance_config.min_improvement_ratio = 0.0f;
+    cfg.rebalance_config.max_swaps_per_layer = 1;
+    cfg.rebalance_config.max_total_swaps = 4;
+    MoERebalanceController controller(cfg);
+
+    // Each layer has an 80/20 participant split. The opposing owner rows make
+    // expert zero's beneficial move point in opposite directions by layer.
+    const uint64_t counts[] = {40, 40, 20, 0};
+    controller.histogram()->mergeLayerCounts(0, counts, 4, false);
+    controller.histogram()->mergeLayerCounts(1, counts, 4, true);
+    ASSERT_TRUE(controller.shouldRebalance());
+
+    const auto changes = controller.rebalance();
+    ASSERT_EQ(changes.size(), 4u);
+    EXPECT_EQ(controller.currentOwnership().owner(0, 0), 1);
+    EXPECT_EQ(controller.currentOwnership().owner(1, 0), 0);
+    EXPECT_TRUE(
+        controller.currentOwnership().hasSameLayerCapacitiesAs(
+            cfg.initial_ownership));
+
+    bool saw_layer_zero = false;
+    bool saw_layer_one = false;
+    for (const auto &change : changes)
+    {
+        saw_layer_zero |= change.layer_idx == 0 && change.expert_id == 0;
+        saw_layer_one |= change.layer_idx == 1 && change.expert_id == 0;
     }
+    EXPECT_TRUE(saw_layer_zero);
+    EXPECT_TRUE(saw_layer_one);
+
+    ASSERT_TRUE(controller.lastImbalanceBefore().valid);
+    ASSERT_TRUE(controller.lastImbalanceAfter().valid);
+    EXPECT_LT(
+        controller.lastImbalanceAfter().average_spread,
+        controller.lastImbalanceBefore().average_spread);
+    EXPECT_LE(
+        controller.lastImbalanceAfter().worst_spread,
+        controller.lastImbalanceBefore().worst_spread);
 }
 
-TEST(Test__MoERebalanceController, ComputeExpertMasks_AllLayersSameGlobalPartition)
+TEST(Test__MoERebalanceController, DynamicMasksReflectLayerSpecificOwners)
 {
-    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, /*num_layers=*/4, 2, 16);
-    MoERebalanceController ctrl(cfg);
+    auto cfg = makeConfig(
+        MoERebalanceMode::DYNAMIC,
+        /*num_experts=*/4,
+        /*num_sockets=*/2,
+        /*num_layers=*/2,
+        /*top_k=*/1,
+        /*window_size=*/16);
+    cfg.initial_ownership = MoELayeredExpertOwnership(
+        2,
+        {
+            {0, 0, 1, 1},
+            {1, 1, 0, 0},
+        });
+    MoERebalanceController controller(cfg);
 
-    fillWindowBalanced(*ctrl.histogram(), 16, 4, 8, 2);
-    ctrl.rebalanceLPT();
+    const auto participant_zero = controller.computeExpertMasks(0);
+    const auto participant_one = controller.computeExpertMasks(1);
+    ASSERT_EQ(participant_zero.size(), 2u);
+    ASSERT_EQ(participant_one.size(), 2u);
 
-    auto masks = ctrl.computeExpertMasks(0);
-    ASSERT_EQ(static_cast<int>(masks.size()), 4);
+    EXPECT_TRUE(participant_zero[0][0]);
+    EXPECT_FALSE(participant_one[0][0]);
+    EXPECT_FALSE(participant_zero[1][0]);
+    EXPECT_TRUE(participant_one[1][0]);
 
-    // All layers should have identical masks (global LPT, not per-layer)
-    for (int l = 1; l < 4; ++l)
+    for (int layer = 0; layer < 2; ++layer)
     {
-        EXPECT_EQ(masks[l], masks[0])
-            << "Layer " << l << " mask differs from layer 0";
+        for (int expert = 0; expert < 4; ++expert)
+        {
+            EXPECT_NE(
+                participant_zero[static_cast<size_t>(layer)]
+                                [static_cast<size_t>(expert)],
+                participant_one[static_cast<size_t>(layer)]
+                               [static_cast<size_t>(expert)]);
+        }
     }
 }

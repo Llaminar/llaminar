@@ -193,6 +193,9 @@ namespace llaminar2
         int gdn_group_count = 0;      ///< Key head count (ssm.group_count)
         int gdn_time_step_rank = 0;   ///< Value head count (ssm.time_step_rank)
 
+        /// First global attention head owned by this participant.
+        int local_head_start = 0;
+
         /// TP-aware local head count (0 = use full n_heads, no sharding)
         int local_n_heads = 0;
         int n_heads = 0; ///< Total attention head count

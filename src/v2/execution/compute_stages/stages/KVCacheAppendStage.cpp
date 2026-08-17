@@ -264,6 +264,17 @@ namespace llaminar2
             return success;
         };
 
+        /*
+         * Cache storage is an ordered K/V precision pair. Reading the legacy
+         * single `precision()` value loses V's physical format and previously
+         * made asymmetric caches depend on branch accidents. Resolve the pair
+         * once and use it for every batched and scalar publication decision.
+         */
+        const ActivationPrecision cache_k_precision =
+            params_.kv_cache->k_precision();
+        const ActivationPrecision cache_v_precision =
+            params_.kv_cache->v_precision();
+
         // Determine batch handling mode
         const int batch_size = params_.batch_size;
         const int seq_len = params_.seq_len;
@@ -409,8 +420,8 @@ namespace llaminar2
                                                             << params_.layer_idx << " seq_idx=" << seq_idx);
 
                 bool success = false;
-                const ActivationPrecision cache_precision = params_.kv_cache->precision();
-                if (cache_precision == ActivationPrecision::FP16)
+                if (cache_k_precision == ActivationPrecision::FP16 &&
+                    cache_v_precision == ActivationPrecision::FP16)
                 {
                     const auto conv_start = std::chrono::high_resolution_clock::now();
 
@@ -432,7 +443,8 @@ namespace llaminar2
 
                     success = append_to_cache(seq_idx, k_fp16.get(), v_fp16.get(), seq_len);
                 }
-                else if (cache_precision == ActivationPrecision::Q8_1)
+                else if (cache_k_precision == ActivationPrecision::Q8_1 &&
+                         cache_v_precision == ActivationPrecision::Q8_1)
                 {
                     const auto conv_start = std::chrono::high_resolution_clock::now();
 
@@ -459,7 +471,8 @@ namespace llaminar2
 
                     success = append_to_cache(seq_idx, k_q8.get(), v_q8.get(), seq_len);
                 }
-                else if (cache_precision == ActivationPrecision::TQ4)
+                else if (cache_k_precision == ActivationPrecision::TQ4 &&
+                         cache_v_precision == ActivationPrecision::TQ4)
                 {
                     if (!params_.turboquant_ctx)
                     {
@@ -479,9 +492,10 @@ namespace llaminar2
 
                     success = append_to_cache(seq_idx, k_tq4.get(), v_tq4.get(), seq_len);
                 }
-                else if (cache_precision == ActivationPrecision::TQ8)
+                else if (cache_k_precision == ActivationPrecision::TQ8 &&
+                         (cache_v_precision == ActivationPrecision::TQ4 ||
+                          cache_v_precision == ActivationPrecision::TQ8))
                 {
-                    // Split TQ: TQ8 for K, TQ4 for V
                     if (!params_.turboquant_ctx)
                     {
                         LOG_ERROR("[KVCacheAppendStage] Split TQ cache requires turboquant_ctx in params");
@@ -490,15 +504,26 @@ namespace llaminar2
                     const auto &turboquant_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
                     const std::vector<size_t> tq_shape{static_cast<size_t>(seq_len), kv_dim};
 
-                    auto k_tq8 = TQ8Tensor::quantize_from_fp32(k_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
-                    auto v_tq4 = TQ4Tensor::quantize_from_fp32(v_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
-                    if (!k_tq8 || !v_tq4)
+                    auto k_tq8 = TQ8Tensor::quantize_from_fp32(
+                        k_slice->data(), tq_shape, params_.head_dim,
+                        turboquant_ctx);
+                    std::shared_ptr<TensorBase> v_tq;
+                    if (cache_v_precision == ActivationPrecision::TQ8)
+                        v_tq = TQ8Tensor::quantize_from_fp32(
+                            v_slice->data(), tq_shape, params_.head_dim,
+                            turboquant_ctx);
+                    else
+                        v_tq = TQ4Tensor::quantize_from_fp32(
+                            v_slice->data(), tq_shape, params_.head_dim,
+                            turboquant_ctx);
+                    if (!k_tq8 || !v_tq)
                     {
-                        LOG_ERROR("[KVCacheAppendStage] Failed to quantize batched K/V slices to split TQ");
+                        LOG_ERROR("[KVCacheAppendStage] Failed to quantize batched K/V slices to the declared TQ pair");
                         return false;
                     }
 
-                    success = append_to_cache(seq_idx, k_tq8.get(), v_tq4.get(), seq_len);
+                    success = append_to_cache(
+                        seq_idx, k_tq8.get(), v_tq.get(), seq_len);
                 }
                 else
                 {
@@ -521,12 +546,70 @@ namespace llaminar2
 
         // Check if tensors match cache precision - if not, need to convert
         // This handles Hybrid mode where K_rope is FP32 and V is Q8_1 but cache is FP32
-        bool cache_is_fp32 = (params_.kv_cache->precision() == ActivationPrecision::FP32);
-        bool cache_is_fp16 = (params_.kv_cache->precision() == ActivationPrecision::FP16);
-        bool cache_is_q8_1 = (params_.kv_cache->precision() == ActivationPrecision::Q8_1);
+        const bool cache_is_fp32 =
+            cache_k_precision == ActivationPrecision::FP32 &&
+            cache_v_precision == ActivationPrecision::FP32;
+        const bool cache_is_fp16 =
+            cache_k_precision == ActivationPrecision::FP16 &&
+            cache_v_precision == ActivationPrecision::FP16;
+        const bool cache_is_q8_1 =
+            cache_k_precision == ActivationPrecision::Q8_1 &&
+            cache_v_precision == ActivationPrecision::Q8_1;
         bool k_is_fp32 = (params_.K->native_type() == TensorType::FP32);
         bool v_is_fp32 = (params_.V->native_type() == TensorType::FP32);
         const bool has_gpu_inputs = (params_.K->gpu_data_ptr() != nullptr && params_.V->gpu_data_ptr() != nullptr);
+
+        /*
+         * CUDA and ROCm compressed caches own one fused FP32-to-physical
+         * append launch: AQ8 for K and Q8_1/TQ4/TQ8 for V. Keeping that
+         * conversion behind the cache boundary preserves capture, avoids host
+         * scratch, and lets Q8_1 operate without an unrelated TQ context.
+         */
+        const bool gpu_asymmetric_compressed_cache =
+            params_.device_id.is_gpu() &&
+            cache_k_precision == ActivationPrecision::AQ8 &&
+            (cache_v_precision == ActivationPrecision::Q8_1 ||
+             cache_v_precision == ActivationPrecision::TQ4 ||
+             cache_v_precision == ActivationPrecision::TQ8);
+        if (gpu_asymmetric_compressed_cache)
+        {
+            const bool value_uses_turboquant =
+                cache_v_precision == ActivationPrecision::TQ4 ||
+                cache_v_precision == ActivationPrecision::TQ8;
+            if (value_uses_turboquant && !params_.turboquant_ctx)
+            {
+                LOG_ERROR("[KVCacheAppendStage] AQ8/TQ GPU cache requires turboquant_ctx for value rotation");
+                return false;
+            }
+            if (!has_gpu_inputs)
+            {
+                LOG_ERROR("[KVCacheAppendStage] AQ8/compressed GPU cache requires device-resident K/V inputs");
+                return false;
+            }
+
+            const auto conv_start = std::chrono::high_resolution_clock::now();
+            const bool success = append_to_cache(
+                params_.seq_idx, params_.K, params_.V, total_tokens);
+            const auto conv_end = std::chrono::high_resolution_clock::now();
+            const uint64_t conv_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    conv_end - conv_start)
+                    .count());
+            KVCacheProfiler::record(
+                value_uses_turboquant
+                    ? KVCacheOpType::CONVERT_TO_TQ
+                    : KVCacheOpType::CONVERT_TO_Q8_1,
+                conv_ns, static_cast<uint64_t>(total_tokens), 0);
+            if (!success)
+            {
+                LOG_ERROR("[KVCacheAppendStage] fused AQ8/compressed GPU append failed for K="
+                          << activationPrecisionToString(cache_k_precision)
+                          << " V="
+                          << activationPrecisionToString(cache_v_precision));
+                return false;
+            }
+            return true;
+        }
 
         /*
          * CPU caches convert mismatched producer tensors here because their
@@ -808,7 +891,9 @@ namespace llaminar2
         // See: PROJECT_Q16_INTEGER_ATTENTION_V2.md "VNNI OVERFLOW PREVENTION CONTRACT"
         // =================================================================
 
-        bool cache_is_q16_1 = (params_.kv_cache->precision() == ActivationPrecision::Q16_1);
+        const bool cache_is_q16_1 =
+            cache_k_precision == ActivationPrecision::Q16_1 &&
+            cache_v_precision == ActivationPrecision::Q16_1;
 
         if (cache_is_q16_1)
         {
@@ -1104,7 +1189,9 @@ namespace llaminar2
         // =================================================================
         // TQ4 cache path with TurboQuant rotation-based quantization
         // =================================================================
-        bool cache_is_tq4 = (params_.kv_cache->precision() == ActivationPrecision::TQ4);
+        const bool cache_is_tq4 =
+            cache_k_precision == ActivationPrecision::TQ4 &&
+            cache_v_precision == ActivationPrecision::TQ4;
 
         if (cache_is_tq4)
         {
@@ -1226,9 +1313,12 @@ namespace llaminar2
         }
 
         // =================================================================
-        // TurboQuant cache path: TQ8 K with selectable TQ4 or TQ8 V
+        // CPU TurboQuant cache path: TQ8 K with selectable TQ4 or TQ8 V
         // =================================================================
-        bool cache_is_tq8 = (params_.kv_cache->k_precision() == ActivationPrecision::TQ8);
+        const bool cache_is_tq8 =
+            cache_k_precision == ActivationPrecision::TQ8 &&
+            (cache_v_precision == ActivationPrecision::TQ4 ||
+             cache_v_precision == ActivationPrecision::TQ8);
 
         if (cache_is_tq8)
         {
@@ -1238,37 +1328,7 @@ namespace llaminar2
                 return false;
             }
 
-            // =============================================================
-            // GPU fast path: pass FP32 K/V directly to the TQ cache.
-            // The GPU cache (CUDARingKVCacheTQ / ROCmRingKVCacheTQ) has
-            // built-in GPU quantize kernels that avoid the catastrophic
-            // D2H → CPU quant → H2D round-trip.
-            // =============================================================
-            if (params_.device_id.is_gpu())
-            {
-                const auto conv_start = std::chrono::high_resolution_clock::now();
-
-                // K/V are already on GPU from upstream stages (QKV proj, RoPE).
-                // Pass them directly — appendWithStream() will detect FP32 and
-                // use GPU quantize kernels (tq8_quantize_kernel + tq4_quantize_kernel).
-                bool success = append_to_cache(params_.seq_idx, params_.K, params_.V, total_tokens);
-
-                const auto conv_end = std::chrono::high_resolution_clock::now();
-                const uint64_t conv_ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
-                KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_TQ, conv_ns, static_cast<uint64_t>(total_tokens), 0);
-
-                if (!success)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] append failed (split TQ GPU quantize path)");
-                    return false;
-                }
-                return true;
-            }
-
-            // =============================================================
-            // CPU path: quantize on CPU, then upload blocks to cache
-            // =============================================================
+            // CPU path: quantize into cache-native blocks before publication.
             const auto conv_start = std::chrono::high_resolution_clock::now();
             const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
             const int head_dim = params_.head_dim;
@@ -1291,7 +1351,7 @@ namespace llaminar2
                 tq8_k_scratch_->set_turboquant_context(&turboquant_ctx);
             }
             const bool value_is_tq8 =
-                params_.kv_cache->v_precision() == ActivationPrecision::TQ8;
+                cache_v_precision == ActivationPrecision::TQ8;
             if (value_is_tq8 &&
                 (!tq8_v_scratch_ || tq8_v_scratch_->shape() != tq_shape))
             {

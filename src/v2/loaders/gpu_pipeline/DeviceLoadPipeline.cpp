@@ -1,3 +1,12 @@
+/**
+ * @file DeviceLoadPipeline.cpp
+ * @brief Implements bounded asynchronous GPU weight staging and repacking.
+ *
+ * Source coalescing is deliberately a planning operation: immutable parent
+ * identities group adjacent expert views, while their tensor views retain the
+ * mapped GGUF lifetime until all staging work has completed.
+ */
+
 #include "loaders/gpu_pipeline/DeviceLoadPipeline.h"
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
 #include "loaders/gpu_pipeline/PinnedRingBuffer.h"
@@ -64,12 +73,12 @@ namespace llaminar2
 
     std::vector<CoalescedWeightJobRun> coalesceContiguousWeightJobs(
         const std::vector<WeightJob> &jobs,
-        const std::vector<const void *> &source_owners)
+        const std::vector<const void *> &source_identities)
     {
-        if (jobs.size() != source_owners.size())
+        if (jobs.size() != source_identities.size())
         {
             throw std::invalid_argument(
-                "coalesceContiguousWeightJobs requires one source owner per job");
+                "coalesceContiguousWeightJobs requires one source identity per job");
         }
         if (jobs.empty())
             return {};
@@ -82,10 +91,10 @@ namespace llaminar2
             const auto &job = jobs[index];
             const int full_n = job.full_N > 0 ? job.full_N : job.N;
             const int full_k = job.full_K > 0 ? job.full_K : job.K;
-            if (!source_owners[index])
+            if (!source_identities[index])
             {
                 throw std::invalid_argument(
-                    "coalesceContiguousWeightJobs requires a non-null immutable source owner for '" +
+                    "coalesceContiguousWeightJobs requires a non-null immutable source identity for '" +
                     job.name + "'");
             }
             if (!job.host_raw_data || job.raw_bytes == 0 || job.N <= 0 || job.K <= 0 ||
@@ -107,18 +116,24 @@ namespace llaminar2
                     "coalesceContiguousWeightJobs requires ungrouped logical input for '" +
                     job.name + "'");
             }
+            if (job.packed_payload_capacity_bytes_per_block < 0)
+            {
+                throw std::invalid_argument(
+                    "coalesceContiguousWeightJobs received a negative payload capacity for '" +
+                    job.name + "'");
+            }
         }
 
         std::stable_sort(
             ordered_indices.begin(), ordered_indices.end(),
             [&](size_t lhs_index, size_t rhs_index)
             {
-                const auto lhs_owner =
-                    reinterpret_cast<uintptr_t>(source_owners[lhs_index]);
-                const auto rhs_owner =
-                    reinterpret_cast<uintptr_t>(source_owners[rhs_index]);
-                if (lhs_owner != rhs_owner)
-                    return lhs_owner < rhs_owner;
+                const auto lhs_identity =
+                    reinterpret_cast<uintptr_t>(source_identities[lhs_index]);
+                const auto rhs_identity =
+                    reinterpret_cast<uintptr_t>(source_identities[rhs_index]);
+                if (lhs_identity != rhs_identity)
+                    return lhs_identity < rhs_identity;
 
                 const auto lhs_source = reinterpret_cast<uintptr_t>(
                     jobs[lhs_index].host_raw_data);
@@ -152,11 +167,13 @@ namespace llaminar2
                     std::numeric_limits<uintptr_t>::max() - previous.raw_bytes;
 
                 append =
-                    source_owners[source_index] == source_owners[previous_index] &&
+                    source_identities[source_index] == source_identities[previous_index] &&
                     source.format == previous.format &&
                     source.N == previous.N &&
                     source.K == previous.K &&
                     source.is_asymmetric == previous.is_asymmetric &&
+                    source.packed_payload_capacity_bytes_per_block ==
+                        previous.packed_payload_capacity_bytes_per_block &&
                     source_bytes_per_row == previous_bytes_per_row &&
                     previous_end_representable &&
                     source_address == previous_address + previous.raw_bytes;
@@ -800,6 +817,12 @@ namespace llaminar2
                           << job.packed_group_rows << " full_N=" << full_n);
                 return false;
             }
+            if (job.packed_payload_capacity_bytes_per_block < 0)
+            {
+                LOG_ERROR("DeviceLoadPipeline: invalid payload capacity for '"
+                          << job.name << "'");
+                return false;
+            }
             if (job.K <= 0 || full_k <= 0 || job.raw_bytes > max_staging)
             {
                 LOG_ERROR("DeviceLoadPipeline: invalid bounded row-chunk geometry for '"
@@ -982,6 +1005,24 @@ namespace llaminar2
                               << job.name << "'");
                     return false;
                 }
+                const size_t allocated_payload_bytes_per_block =
+                    slot->payload_bytes / total_output_blocks;
+                const int compact_payload_bytes =
+                    repackPayloadBytesPerBlock(job.format);
+                if (compact_payload_bytes <= 0 ||
+                    allocated_payload_bytes_per_block <
+                        static_cast<size_t>(compact_payload_bytes) ||
+                    allocated_payload_bytes_per_block >
+                        static_cast<size_t>(std::numeric_limits<int>::max()) ||
+                    (job.packed_payload_capacity_bytes_per_block > 0 &&
+                     allocated_payload_bytes_per_block !=
+                         static_cast<size_t>(
+                             job.packed_payload_capacity_bytes_per_block)))
+                {
+                    LOG_ERROR("DeviceLoadPipeline: persistent payload capacity disagrees with repack geometry for '"
+                              << job.name << "'");
+                    return false;
+                }
                 const bool repack_ok = kernels_.vnniRepack(
                     job.format,
                     staging_ptr,
@@ -992,6 +1033,7 @@ namespace llaminar2
                     job.N, job.K,
                     full_n, job.row_offset,
                     job.packed_group_rows,
+                    static_cast<int>(allocated_payload_bytes_per_block),
                     repack_stream_);
 
                 if (!repack_ok)

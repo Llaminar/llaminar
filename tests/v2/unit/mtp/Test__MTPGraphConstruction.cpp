@@ -11,12 +11,14 @@
 #include <gmock/gmock.h>
 
 #include "backends/ComputeBackend.h"
+#include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/IGlobalTPContext.h"
 #include "collective/ITPContext.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/compute_stages/stages/MTPConcatStage.h"
 #include "execution/compute_stages/stages/MTPVerifierOutcomeStage.h"
+#include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "execution/compute_stages/stages/TPKVCacheStateAllGatherStage.h"
@@ -33,6 +35,7 @@
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
 #include "kernels/cpu/CPURingKVCache.h"
+#include "loaders/ExpertGemmRegistry.h"
 #include "loaders/PreparedWeightStore.h"
 #include "mocks/MockLocalTPContext.h"
 #include "mocks/MockMPIContext.h"
@@ -50,6 +53,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -61,6 +65,31 @@ using namespace llaminar2::test;
 
 namespace
 {
+    /**
+     * @brief Install the aggregate host-memory backend required by CPU graphs.
+     *
+     * Production startup creates this backend only after rank affinity is
+     * known.  This device-free unit process intentionally represents one
+     * aggregate CPU domain, so its test environment must install the matching
+     * authority before WorkspaceAllocator queries host memory.  DeviceManager
+     * inventory alone does not own backend construction.
+     */
+    class MTPGraphConstructionCPUBackendEnvironment final
+        : public ::testing::Environment
+    {
+    public:
+        /** @brief Initialize the process-wide aggregate CPU backend once. */
+        void SetUp() override
+        {
+            initCPUBackend(-1);
+        }
+    };
+
+    [[maybe_unused]] ::testing::Environment *const
+        mtp_graph_construction_cpu_backend_environment =
+            ::testing::AddGlobalTestEnvironment(
+                new MTPGraphConstructionCPUBackendEnvironment());
+
     class ScopedDebugEnv
     {
     public:
@@ -110,7 +139,7 @@ namespace
     class GraphConstructionTPContext : public ITPContext
     {
     public:
-        TPScope scope() const override { return TPScope::LOCAL; }
+        TPScope scope() const override { return TPScope::RANK_LOCAL; }
         int degree() const override { return 2; }
         int myIndex() const override { return 0; }
         CollectiveBackendType backend() const override { return CollectiveBackendType::HOST; }
@@ -141,6 +170,21 @@ namespace
         bool mirroredHeadActiveForProjectedRows(int total_tokens) const
         {
             return mirroredMTPHeadActiveForProjectedRows(total_tokens);
+        }
+
+        std::string addVerifierOutcome(
+            ComputeGraph &graph,
+            const std::string &dependency_node,
+            TensorBase *logits,
+            int verifier_row_count,
+            DeviceId device) const
+        {
+            return addMTPVerifierOutcomeToGraph(
+                graph,
+                dependency_node,
+                logits,
+                verifier_row_count,
+                device);
         }
     };
 
@@ -178,6 +222,17 @@ namespace
             std::memcpy(out, send_data, byte_count);
             std::memcpy(out + byte_count, remote_record_.data(), byte_count);
             return true;
+        }
+        bool gatherVariableFloatRecordsToRoot(
+            const float *, size_t, float *, size_t, size_t, int,
+            size_t &, const std::string &) override
+        {
+            return false;
+        }
+        bool broadcastFloatElements(
+            TensorBase *, size_t, int, const std::string &) override
+        {
+            return false;
         }
 
         int allgatherBytesCalls() const { return allgather_bytes_calls_; }
@@ -959,12 +1014,12 @@ namespace
         plan->residency_policy = RoutedExpertResidencyPolicy::ExplicitMasks;
         plan->domains = {
             mtpOverlayDomain("continuation", GlobalDeviceAddress::cpu(0)),
-            mtpOverlayDomain("hot_domain", GlobalDeviceAddress::cpu(0)),
-            mtpOverlayDomain("cold_domain", GlobalDeviceAddress::cpu(1)),
+            mtpOverlayDomain("priority0_domain", GlobalDeviceAddress::cpu(0)),
+            mtpOverlayDomain("priority1_domain", GlobalDeviceAddress::cpu(1)),
         };
         plan->routed_tiers = {
-            mtpOverlayTier("hot", "hot_domain", 0),
-            mtpOverlayTier("cold", "cold_domain", 1, true),
+            mtpOverlayTier("priority0", "priority0_domain", 0),
+            mtpOverlayTier("priority1", "priority1_domain", 1, true),
         };
         plan->placements.push_back(RoutedExpertLayerPlacement{
             .layer = layer_idx,
@@ -974,6 +1029,109 @@ namespace
             *plan,
             {.routed_expert_count = 4});
         return plan;
+    }
+
+    /**
+     * @brief Prepare and publish the tiny overlay's real CPU expert engines.
+     *
+     * Production ExpertOverlay graphs resolve participant-local engines only
+     * through the model-owned ExpertGemmRegistry.  This fixture follows that
+     * same path: it packs the real FP32 expert matrices into the prepared store,
+     * then publishes only the experts assigned to each logical tier.  Keeping
+     * the raw 3-D parents on the graph is intentional; registry-only lowering
+     * must still ignore them, which prevents this unit fixture from masking a
+     * missing production preparation step.
+     *
+     * @param fixture Owner of the tiny source expert matrices.
+     * @param store Model-lifetime prepared-weight authority used by the graph.
+     * @return Model context owning the populated registry, or null on failure.
+     */
+    std::shared_ptr<ModelContext> prepareMTPOverlayCPUExpertRegistry(
+        const DenseMTPGraphFixture &fixture,
+        PreparedWeightStore &store)
+    {
+        constexpr int source_layer = 64;
+        auto model_ctx = ModelContext::createForTesting(
+            "mtp-overlay-test.gguf",
+            nullptr,
+            /*block_count=*/source_layer + 1,
+            /*with_weight_manager=*/true);
+        if (!model_ctx || !model_ctx->concreteWeightManager())
+        {
+            ADD_FAILURE() << "Failed to create the concrete overlay WeightManager";
+            return nullptr;
+        }
+
+        MoELocalExpertStage::Params preparation;
+        preparation.device_id = DeviceId::cpu();
+        preparation.gate_exps = fixture.moe_gate_exps.get();
+        preparation.up_exps = fixture.moe_up_exps.get();
+        preparation.down_exps = fixture.moe_down_exps.get();
+        preparation.num_experts = fixture.config.moe.num_experts;
+        preparation.top_k = fixture.config.moe.top_k;
+        preparation.d_model = fixture.config.d_model;
+        preparation.expert_intermediate = fixture.config.moe.intermediate_size;
+        preparation.layer_idx = source_layer;
+        preparation.expert_mask.assign(
+            static_cast<size_t>(fixture.config.moe.num_experts), true);
+        preparation.prepared_store = &store;
+
+        if (!MoELocalExpertStage::prepareExpertGemmEngines(preparation) ||
+            !preparation.gate_slab_ref ||
+            !preparation.up_slab_ref ||
+            !preparation.down_slab_ref)
+        {
+            ADD_FAILURE() << "Failed to prepare the tiny overlay expert slabs";
+            return nullptr;
+        }
+
+        auto &registry =
+            model_ctx->concreteWeightManager()->expertGemmRegistry();
+        auto publish = [&](const char *domain,
+                           int expert,
+                           ExpertGemmRegistry::WeightRole role,
+                           const ExpertSlabRef &slab)
+        {
+            auto lifetime = store.expertGemmKernelLifetime(slab, expert);
+            if (!lifetime)
+            {
+                ADD_FAILURE() << "Missing prepared lifetime for domain " << domain
+                              << " expert " << expert << " role "
+                              << static_cast<int>(role);
+                return false;
+            }
+            // Capture the borrowed pointer before moving shared ownership. The
+            // relative evaluation order of function arguments is unspecified,
+            // so spelling both operations inside the call could publish null.
+            ITensorGemm *const engine = lifetime.get();
+            registry.registerEngineForDomain(
+                domain,
+                DeviceId::cpu(),
+                source_layer,
+                expert,
+                role,
+                engine,
+                std::move(lifetime));
+            return true;
+        };
+
+        for (int expert = 0; expert < fixture.config.moe.num_experts; ++expert)
+        {
+            // The adversarial alternating placement in makeMTPOverlayPlanForLayer
+            // assigns even experts to priority 0 and odd experts to priority 1.
+            const char *domain =
+                (expert % 2 == 0) ? "priority0_domain" : "priority1_domain";
+            if (!publish(domain, expert, ExpertGemmRegistry::WeightRole::GATE,
+                         *preparation.gate_slab_ref) ||
+                !publish(domain, expert, ExpertGemmRegistry::WeightRole::UP,
+                         *preparation.up_slab_ref) ||
+                !publish(domain, expert, ExpertGemmRegistry::WeightRole::DOWN,
+                         *preparation.down_slab_ref))
+            {
+                return nullptr;
+            }
+        }
+        return model_ctx;
     }
 
     int maxCachedTokens(const std::vector<PrefixKVCacheProbe> &caches)
@@ -1006,9 +1164,13 @@ namespace
         cfg.top_k = 2;
         cfg.window_size = 16;
         cfg.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
-        cfg.initial_expert_to_socket.resize(static_cast<size_t>(cfg.num_experts));
+        std::vector<int> owners(static_cast<size_t>(cfg.num_experts));
         for (int expert = 0; expert < cfg.num_experts; ++expert)
-            cfg.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+            owners[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+        cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+            cfg.num_layers,
+            static_cast<int>(cfg.sockets.size()),
+            owners);
         cfg.rebalance_config.imbalance_threshold = 1.3f;
         cfg.rebalance_config.max_swaps_per_layer = 4;
         cfg.rebalance_config.max_total_swaps = 16;
@@ -1448,7 +1610,7 @@ TEST(Test__MTPGraphConstruction,
         .vocab_size = 32,
         .ownership_policy =
             MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal,
-        .mirrored_local_tp = false,
+        .participant_full_vocabulary = false,
         .stage_name = "mtp_verifier_outcome",
     });
 
@@ -1509,7 +1671,7 @@ TEST(Test__MTPGraphConstruction,
         .vocab_size = 32,
         .ownership_policy =
             MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal,
-        .mirrored_local_tp = true,
+        .participant_full_vocabulary = true,
         .stage_name = "mtp_verifier_outcome",
     });
     const StageBufferContract mirrored_participant_contract =
@@ -1574,7 +1736,10 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     ASSERT_NE(graph.getNode("mtp0_fc"), nullptr);
     ASSERT_NE(graph.getNode("MTP0_kv_append"), nullptr);
     ASSERT_NE(graph.getNode("MTP0_attention"), nullptr);
-    ASSERT_NE(graph.getNode("layer64_ffn_residual"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_ffn_norm"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_gate_up_proj"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_down_proj"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_ffn_residual"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_final_norm"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_lm_head"), nullptr);
 
@@ -1607,7 +1772,7 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     EXPECT_TRUE(contractWrites(attention_contract, BufferId::MTP_ATTN_OUTPUT));
     EXPECT_FALSE(contractWrites(attention_contract, BufferId::ATTN_OUTPUT));
 
-    const auto down_contract = graph.getNode("layer64_down_proj")->stage->bufferContract();
+    const auto down_contract = graph.getNode("MTP0_down_proj")->stage->bufferContract();
     EXPECT_TRUE(contractReads(down_contract, BufferId::MTP_UP_PROJ));
     EXPECT_TRUE(contractReads(down_contract, BufferId::MTP_GATE_PROJ));
     EXPECT_TRUE(contractWrites(down_contract, BufferId::MTP_ATTN_PROJ));
@@ -1616,7 +1781,10 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     EXPECT_TRUE(hasDependency(graph, "mtp0_concat", "mtp0_norm_hidden"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_concat", "mtp0_norm_embedding"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_fc", "mtp0_concat"));
-    EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "layer64_ffn_residual"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_gate_up_proj", "MTP0_ffn_norm"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_down_proj", "MTP0_gate_up_proj"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_ffn_residual", "MTP0_down_proj"));
+    EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "MTP0_ffn_residual"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_lm_head", "mtp0_final_norm"));
 }
 
@@ -1624,6 +1792,8 @@ TEST(Test__MTPGraphConstruction, LocalTPMirroredMTPHeadBuildsFullVocabSidecarLMH
 {
     DenseMTPGraphFixture sharded_fixture;
     sharded_fixture.config.mtp.enabled = true;
+    sharded_fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded;
     sharded_fixture.config.lm_head_column_parallel = true;
     sharded_fixture.config.vocab_local = sharded_fixture.config.vocab_size / 2;
 
@@ -1705,22 +1875,22 @@ TEST(Test__MTPGraphConstruction, LocalTPMirroredMTPHeadBuildsFullVocabSidecarLMH
 }
 
 /**
- * @brief GlobalTP sidecars gather their sharded MTP vocabulary projection.
+ * @brief Cross-rank TP mirrors the complete MTP head on every rank.
  *
- * CPU NodeLocalTP keeps the MTP LM head column-sharded because duplicating a
- * 248k-vocabulary projection on every socket is needlessly expensive.  Unlike
- * greedy argmax, stochastic draft sampling needs the complete distribution.
- * The declarative sidecar graph must therefore make its one-row allgather an
- * explicit terminal stage; leaving `mtp0_lm_head` terminal exposes only one
- * rank's vocabulary shard to the stochastic verifier.
+ * TP scope is a transport choice, not an ownership-policy override. A
+ * node-local or global MPI participant under MirroredFullVocabulary must bind
+ * the replicated terminal weight set, project the complete vocabulary, and
+ * end at its local LM-head node without a per-draft vocabulary collective.
  */
 TEST(Test__MTPGraphConstruction,
-     GlobalTPMTPHeadAllgathersShardedSidecarLogitsForStochasticVerifier)
+     GlobalTPMirroredMTPHeadProjectsFullVocabularyWithoutAllGather)
 {
     DenseMTPGraphFixture fixture;
     ScriptedGlobalTPContext global_tp;
 
     fixture.config.mtp.enabled = true;
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
     fixture.config.lm_head_column_parallel = true;
     fixture.config.vocab_local = fixture.config.vocab_size / global_tp.degree();
     fixture.config.tp_ctx = &global_tp;
@@ -1732,12 +1902,21 @@ TEST(Test__MTPGraphConstruction,
             fixture.config.d_ff,
             fixture.config.vocab_size));
     fixture.logits = TestTensorFactory::createFP32(
-        {4, static_cast<size_t>(fixture.config.vocab_local)});
-    fixture.gathered_logits = TestTensorFactory::createFP32(
         {4, static_cast<size_t>(fixture.config.vocab_size)});
+    fixture.gathered_logits = TestTensorFactory::createFP32(
+        {1, 1});
 
     Qwen35Graph graph_builder(fixture.config, fixture.mpi);
     graph_builder.setWeights(fixture.modelWeights());
+
+    WeightBinding mirrored_final_norm;
+    mirrored_final_norm.tensor = fixture.final_norm.get();
+    WeightBinding mirrored_lm_head;
+    mirrored_lm_head.tensor = fixture.lm_head.get();
+    ModelWeightBindings mirrored_bindings;
+    mirrored_bindings.final_norm = &mirrored_final_norm;
+    mirrored_bindings.lm_head = &mirrored_lm_head;
+    graph_builder.setDecodeReplicatedDenseWeightBindings(mirrored_bindings);
 
     auto output = fixture.output();
     ComputeGraph graph = graph_builder.buildMTPGraph(
@@ -1746,25 +1925,204 @@ TEST(Test__MTPGraphConstruction,
         fixture.input(),
         output);
 
-    const auto *local_head = graph.getNode("mtp0_lm_head");
-    ASSERT_NE(local_head, nullptr);
+    const auto *mirrored_head = graph.getNode("mtp0_lm_head");
+    ASSERT_NE(mirrored_head, nullptr);
     EXPECT_EQ(
-        dumpScalarInt(local_head->stage->getDumpInfoSnapshot(), "vocab_size"),
-        fixture.config.vocab_local)
-        << "GlobalTP must retain economical column-sharded MTP-head compute.";
+        dumpScalarInt(mirrored_head->stage->getDumpInfoSnapshot(), "vocab_size"),
+        fixture.config.vocab_size)
+        << "Mirrored ownership must retain its full-vocabulary meaning across MPI ranks.";
+    EXPECT_EQ(graph.getNode("mtp0_lm_head_allgather"), nullptr)
+        << "A rank-local full-vocabulary MTP result must not be gathered again.";
+    EXPECT_EQ(graph.terminalNode(), "mtp0_lm_head");
+}
 
-    const auto *allgather = graph.getNode("mtp0_lm_head_allgather");
-    ASSERT_NE(allgather, nullptr)
-        << "Stochastic GlobalTP MTP needs one full-vocabulary sidecar row on every rank.";
-    EXPECT_EQ(allgather->stage->type(), ComputeStageType::ALLGATHER);
-    const StageBufferContract gather_contract =
-        allgather->stage->bufferContract();
-    EXPECT_TRUE(contractReads(gather_contract, BufferId::MTP_LOGITS));
-    EXPECT_TRUE(contractWrites(
-        gather_contract,
-        BufferId::MTP_LOGITS_GATHERED));
-    EXPECT_TRUE(hasDependency(graph, "mtp0_lm_head_allgather", "mtp0_lm_head"));
-    EXPECT_EQ(graph.terminalNode(), "mtp0_lm_head_allgather");
+/**
+ * @brief Prove terminal-logits ownership and collective planning are total.
+ *
+ * Every combination of primary-head layout, explicit MTP ownership, graph
+ * output role, and GlobalTP scope resolves through the same typed policy used
+ * by graph construction and orchestration. In particular, global rank scope
+ * must never reinterpret a mirrored head as a vocabulary shard.
+ */
+TEST(Test__MTPGraphConstruction,
+     TerminalLogitsPolicyIsTotalAndMirroringIsScopeIndependent)
+{
+    GraphConfig config;
+
+    config.lm_head_column_parallel = false;
+    config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded;
+    EXPECT_TRUE(config.mtpParticipantOwnsFullVocabulary());
+    EXPECT_FALSE(config.mtpParticipantLogitsAreVocabularySharded());
+    EXPECT_FALSE(config.mtpUsesMirroredTerminalHeadBinding())
+        << "A naturally full single-device head does not need replicated TP weights.";
+
+    config.lm_head_column_parallel = true;
+    config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    EXPECT_TRUE(config.mtpParticipantOwnsFullVocabulary());
+    EXPECT_FALSE(config.mtpParticipantLogitsAreVocabularySharded());
+    EXPECT_TRUE(config.mtpUsesMirroredTerminalHeadBinding());
+
+    for (const bool spans_multiple_global_ranks : {false, true})
+    {
+        EXPECT_EQ(
+            resolveMTPTerminalLogitsCollective({
+                .layout = config.mtpTerminalLogitsLayout(),
+                .sidecar_produces_logits = true,
+                .spans_multiple_global_ranks =
+                    spans_multiple_global_ranks,
+            }),
+            MTPTerminalLogitsCollective::None)
+            << "Mirrored full-vocabulary participant output owns no logits "
+               "collective at any TP scope.";
+    }
+
+    config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded;
+    EXPECT_FALSE(config.mtpParticipantOwnsFullVocabulary());
+    EXPECT_TRUE(config.mtpParticipantLogitsAreVocabularySharded());
+    EXPECT_FALSE(config.mtpUsesMirroredTerminalHeadBinding());
+
+    EXPECT_EQ(
+        resolveMTPTerminalLogitsCollective({
+            .layout = config.mtpTerminalLogitsLayout(),
+            .sidecar_produces_logits = false,
+            .spans_multiple_global_ranks = true,
+        }),
+        MTPTerminalLogitsCollective::None)
+        << "Shifted-prefill KV-only graphs do not produce terminal logits.";
+    EXPECT_EQ(
+        resolveMTPTerminalLogitsCollective({
+            .layout = config.mtpTerminalLogitsLayout(),
+            .sidecar_produces_logits = true,
+            .spans_multiple_global_ranks = false,
+        }),
+        MTPTerminalLogitsCollective::None)
+        << "A participant-local vocabulary shard does not invent a GlobalTP collective.";
+    EXPECT_EQ(
+        resolveMTPTerminalLogitsCollective({
+            .layout = config.mtpTerminalLogitsLayout(),
+            .sidecar_produces_logits = true,
+            .spans_multiple_global_ranks = true,
+        }),
+        MTPTerminalLogitsCollective::GlobalVocabularyAllGather)
+        << "Only explicit sharding plus a logits-producing multi-rank graph owns an allgather.";
+}
+
+/**
+ * @brief Prove mirrored GlobalTP owns graph-local verifier reduction per rank.
+ *
+ * A full-vocabulary mirror makes every rank a complete verifier participant;
+ * GlobalTP changes transport scope but does not re-shard that terminal tensor.
+ * Conversely, participant-local reduction over an explicit vocabulary shard
+ * is malformed and must fail during graph construction.
+ */
+TEST(Test__MTPGraphConstruction,
+     GlobalTPMirroredHeadOwnsParticipantLocalVerifierOutcome)
+{
+    DenseMTPGraphFixture fixture(/*rows=*/4);
+    ScriptedGlobalTPContext global_tp;
+    constexpr int verifier_rows = 4;
+
+    fixture.config.default_device = DeviceId::cuda(0);
+    fixture.config.mtp.enabled = true;
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::MirroredFullVocabulary;
+    fixture.config.lm_head_column_parallel = true;
+    fixture.config.vocab_local = fixture.config.vocab_size / global_tp.degree();
+    fixture.config.tp_ctx = &global_tp;
+    fixture.config.grouped_mtp_verifier = true;
+    fixture.config.compute_all_position_logits = true;
+    fixture.config.compute_row_indexed_logits = true;
+    fixture.config.row_indexed_logits_row_count = verifier_rows;
+    fixture.config.mtp_verifier_outcome_graph_mode =
+        MTPVerifierOutcomeGraphMode::Greedy;
+    fixture.config.mtp_verifier_outcome_ownership =
+        MTPVerifierOutcomeOwnershipPolicy::ParticipantLocal;
+    fixture.config.mtp_verifier_outcome_graph_binding = {
+        .verifier_input_tokens_device =
+            reinterpret_cast<const int32_t *>(0x1000),
+        .active_verifier_row_count_device =
+            reinterpret_cast<const int32_t *>(0x1100),
+        .transaction_commit_budget_device =
+            reinterpret_cast<const uint32_t *>(0x1200),
+        .next_leading_committed_output_count_device =
+            reinterpret_cast<const int32_t *>(0x1300),
+        .stop_tokens_device =
+            reinterpret_cast<const int32_t *>(0x2000),
+        .penalty_policy_device =
+            reinterpret_cast<const MTPGreedyPenaltyPolicy *>(0x2100),
+        .generated_token_counts_device =
+            reinterpret_cast<int32_t *>(0x2200),
+        .generated_token_count_capacity = fixture.config.vocab_size,
+        .verifier_tokens_device =
+            reinterpret_cast<int32_t *>(0x3000),
+        .argmax_values_device =
+            reinterpret_cast<float *>(0x4000),
+        .argmax_partial_values_device =
+            reinterpret_cast<float *>(0x5000),
+        .argmax_partial_indices_device =
+            reinterpret_cast<int32_t *>(0x6000),
+        .argmax_partial_capacity = fixture.config.vocab_size,
+        .output_tokens_device =
+            reinterpret_cast<int32_t *>(0x7000),
+        .output_meta_device =
+            reinterpret_cast<int32_t *>(0x8000),
+        .output_token_capacity = verifier_rows,
+        .output_meta_capacity =
+            sampling_math::kSpeculativeBatchMetaCount,
+    };
+
+    InspectableQwen35Graph mirrored_builder(fixture.config, fixture.mpi);
+    ComputeGraph mirrored_graph;
+    mirrored_graph.addNode(
+        "lm_head",
+        std::make_unique<MTPConcatStage>(MTPConcatStage::Params{
+            .device_id = DeviceId::cuda(0),
+            .hidden = fixture.hidden.get(),
+            .embedding = fixture.embedding.get(),
+            .output = fixture.concat.get(),
+            .num_tokens = verifier_rows,
+            .hidden_dim = fixture.config.d_model,
+        }),
+        DeviceId::cuda(0));
+
+    EXPECT_NO_THROW({
+        EXPECT_EQ(
+            mirrored_builder.addVerifierOutcome(
+                mirrored_graph,
+                "lm_head",
+                fixture.logits.get(),
+                verifier_rows,
+                DeviceId::cuda(0)),
+            "mtp_verifier_outcome");
+    });
+    const auto *outcome_node =
+        mirrored_graph.getNode("mtp_verifier_outcome");
+    ASSERT_NE(outcome_node, nullptr);
+    const auto *outcome_stage =
+        dynamic_cast<const MTPVerifierOutcomeStage *>(
+            outcome_node->stage.get());
+    ASSERT_NE(outcome_stage, nullptr);
+    EXPECT_TRUE(
+        outcome_stage->getParams().participant_full_vocabulary);
+    EXPECT_FALSE(outcome_stage->isCollectiveStage())
+        << "Mirrored rank-local reduction must not acquire a compact control collective.";
+
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded;
+    InspectableQwen35Graph sharded_builder(fixture.config, fixture.mpi);
+    ComputeGraph sharded_graph;
+    EXPECT_THROW(
+        sharded_builder.addVerifierOutcome(
+            sharded_graph,
+            "lm_head",
+            fixture.logits.get(),
+            verifier_rows,
+            DeviceId::cuda(0)),
+        std::runtime_error)
+        << "A participant-local reducer must reject incomplete vocabulary logits.";
 }
 
 TEST(Test__MTPGraphConstruction,
@@ -1875,7 +2233,7 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraphForRequestBatch)
     ASSERT_NE(graph.getNode("mtp0_embedding"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_fc"), nullptr);
     ASSERT_NE(graph.getNode("MTP0_attention"), nullptr);
-    ASSERT_NE(graph.getNode("layer64_ffn_residual"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_ffn_residual"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_lm_head"), nullptr);
 }
 
@@ -1929,7 +2287,7 @@ TEST(Test__MTPGraphConstruction, CPUKVOnlySidecarPublishesPostRotaryKDespiteGpuR
     ASSERT_NE(key_rope, nullptr);
     EXPECT_EQ(key_rope->getParams().operand_set, RoPEOperandSet::KeyOnly);
     EXPECT_EQ(graph.getNode("MTP0_attention"), nullptr);
-    EXPECT_EQ(graph.getNode("layer64_ffn_residual"), nullptr);
+    EXPECT_EQ(graph.getNode("MTP0_ffn_residual"), nullptr);
     EXPECT_EQ(graph.getNode("mtp0_final_norm"), nullptr);
     EXPECT_EQ(graph.getNode("mtp0_lm_head"), nullptr);
 
@@ -2678,11 +3036,11 @@ TEST(Test__MTPGraphConstruction, DenseSidecarInsertsTPAllreduceForRowParallelWei
     EXPECT_EQ(wo_allreduce->stage->type(), ComputeStageType::ALLREDUCE);
     EXPECT_TRUE(hasDependency(graph, "MTP0_wo_allreduce", "MTP0_wo_proj"));
 
-    auto *down_allreduce = graph.getNode("layer64_down_allreduce");
+    auto *down_allreduce = graph.getNode("MTP0_down_allreduce");
     ASSERT_NE(down_allreduce, nullptr);
     EXPECT_EQ(down_allreduce->stage->type(), ComputeStageType::ALLREDUCE);
-    EXPECT_TRUE(hasDependency(graph, "layer64_down_allreduce", "layer64_down_proj"));
-    EXPECT_TRUE(hasDependency(graph, "layer64_ffn_residual", "layer64_down_allreduce"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_down_allreduce", "MTP0_down_proj"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_ffn_residual", "MTP0_down_allreduce"));
 }
 
 TEST(Test__MTPGraphConstruction, DenseSidecarAllreducesVocabParallelEmbedding)
@@ -2774,6 +3132,8 @@ TEST(Test__MTPGraphConstruction, FullPhysicalVerifierRowsBypassLMHeadRowSelect)
 TEST(Test__MTPGraphConstruction, ColumnParallelAllPositionLMHeadUsesVerifierShardContracts)
 {
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded;
     fixture.config.compute_all_position_logits = true;
     fixture.config.lm_head_column_parallel = true;
     fixture.config.vocab_local = fixture.config.vocab_size / 2;
@@ -2936,6 +3296,8 @@ TEST(Test__MTPGraphConstruction, PhaseSplitColumnParallelLogitsReportsSemanticSh
     DeviceManager::instance().initialize(-1, false);
 
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded;
     fixture.config.lm_head_column_parallel = true;
     fixture.config.vocab_local = fixture.config.vocab_size / 2;
     fixture.config.dense_tp_decode_replicated = true;
@@ -2965,6 +3327,8 @@ TEST(Test__MTPGraphConstruction, PhaseSplitDecodeDoesNotExposeStaleColumnParalle
     DeviceManager::instance().initialize(-1, false);
 
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded;
     fixture.config.lm_head_column_parallel = true;
     fixture.config.vocab_local = fixture.config.vocab_size / 2;
     fixture.config.dense_tp_decode_replicated = true;
@@ -3499,6 +3863,9 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     PreparedWeightStore store;
     prepareFrozenGemmWeightsForCPU(*frozen, store);
     graph_builder.setPreparedWeightStore(&store);
+    auto model_ctx = prepareMTPOverlayCPUExpertRegistry(fixture, store);
+    ASSERT_NE(model_ctx, nullptr);
+    graph_builder.setModelContext(model_ctx);
 
     auto input = fixture.input();
     auto output = fixture.output();
@@ -3649,6 +4016,9 @@ TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
     PreparedWeightStore store;
     prepareFrozenGemmWeightsForCPU(*frozen, store);
     graph_builder.setPreparedWeightStore(&store);
+    auto model_ctx = prepareMTPOverlayCPUExpertRegistry(fixture, store);
+    ASSERT_NE(model_ctx, nullptr);
+    graph_builder.setModelContext(model_ctx);
 
     auto input = fixture.input();
     auto output = fixture.output();
@@ -4224,9 +4594,13 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
 
     auto rebalance_config = makeTinyRebalanceConfig();
     rebalance_config.num_experts = fixture.config.moe.num_experts;
-    rebalance_config.initial_expert_to_socket.resize(static_cast<size_t>(rebalance_config.num_experts));
+    std::vector<int> owners(static_cast<size_t>(rebalance_config.num_experts));
     for (int expert = 0; expert < rebalance_config.num_experts; ++expert)
-        rebalance_config.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 2 ? 0 : 1;
+        owners[static_cast<size_t>(expert)] = expert < 2 ? 0 : 1;
+    rebalance_config.initial_ownership = MoELayeredExpertOwnership::uniform(
+        rebalance_config.num_layers,
+        static_cast<int>(rebalance_config.sockets.size()),
+        owners);
     auto controller = std::make_unique<MoERebalanceController>(rebalance_config);
     auto *controller_ptr = controller.get();
     orchestrator.setMoERebalanceController(std::move(controller));
@@ -4377,7 +4751,7 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheMaterializesAndUsesFullGrap
 
     const auto policy_tags = PerfStatsCollector::Tags{
         {"allow_graph_replay", "true"},
-        {"collective_segmented", "false"},
+        {"heterogeneous_segmented", "false"},
         {"collectives_graph_capturable", "false"},
         {"context", "mtp_decode_sidecar"},
         {"defer_final_sync", "false"},
@@ -4564,7 +4938,7 @@ TEST(Test__MTPGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefil
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto policy_tags = PerfStatsCollector::Tags{
         {"allow_graph_replay", "true"},
-        {"collective_segmented", "false"},
+        {"heterogeneous_segmented", "false"},
         {"collectives_graph_capturable", "false"},
         {"context", "mtp_shifted_prefill"},
         {"defer_final_sync", "false"},
@@ -4728,6 +5102,8 @@ TEST(Test__MTPGraphConstruction, GlobalTPMTPSamplingAllgathersShardCandidates)
     DeviceManager::instance().initialize(-1, false);
 
     TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.terminal_head_policy =
+        MTPTerminalHeadPolicy::VocabularySharded;
     fixture.config.tp_config = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::equalSplit(
             /*world_size=*/2,
@@ -6396,4 +6772,73 @@ TEST(Test__MTPGraphConstruction,
     static_assert(invalid.scalarCount() == 0);
     EXPECT_EQ(invalid.sequenceLengths(geometry.data()), nullptr);
     EXPECT_EQ(invalid.rowStride(geometry.data()), nullptr);
+}
+
+/**
+ * @brief Lock the durable placement reader around each complete MTP transaction.
+ *
+ * The first main-model transaction is host scheduled, while subsequent fixed or
+ * dynamic depth transactions execute inside a CUDA conditional parent or ROCm
+ * ticket-selected captured branch. The external ticket must be closed before
+ * composition, and every internal branch must acquire before its first sidecar
+ * and release after state publication but before optional maintenance.
+ */
+TEST(Test__MTPGraphConstruction,
+     ExpertOverlayEpochBoundariesEncloseCompleteResidentMTPTransactions)
+{
+    std::ifstream in(LLAMINAR_DEVICE_GRAPH_ORCHESTRATOR_SOURCE);
+    ASSERT_TRUE(in.is_open())
+        << "Unable to open " << LLAMINAR_DEVICE_GRAPH_ORCHESTRATOR_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t materialize = source.find(
+        "bool DeviceGraphOrchestrator::materializeDeviceResidentGeneration(");
+    const size_t materialize_parent = source.find(
+        "materializeMTPDeviceGenerationLoopGraph(", materialize);
+    ASSERT_NE(materialize, std::string::npos);
+    ASSERT_NE(materialize_parent, std::string::npos);
+    const std::string materialize_preamble =
+        source.substr(materialize, materialize_parent - materialize);
+    EXPECT_NE(
+        materialize_preamble.find(
+            "prepareMoEOverlayEpochForInternalParent("),
+        std::string::npos)
+        << "Static overlay must capture/submit release before parent composition";
+    EXPECT_NE(
+        materialize_preamble.find(
+            "waitForLiveInferenceStateReadyForObservation("),
+        std::string::npos)
+        << "The external reader may close only after the first transaction commits";
+
+    const size_t branch = source.find(
+        "auto assemble_transaction_branch =");
+    const size_t branch_end = source.find(
+        "const size_t assembled_count", branch);
+    ASSERT_NE(branch, std::string::npos);
+    ASSERT_NE(branch_end, std::string::npos);
+    const std::string body = source.substr(branch, branch_end - branch);
+    const size_t acquire = body.find(
+        "MoEOverlayEpochBoundaryStage::Operation::Acquire");
+    const size_t sidecar = body.find("mtpSidecarDeviceLoopGraphTemplate(");
+    const size_t state_publication = body.find(
+        "mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(");
+    const size_t terminal_publication = body.find(
+        "mtpAcceptedTerminalHiddenDeviceLoopGraphTemplate(");
+    const size_t release = body.find(
+        "MoEOverlayEpochBoundaryStage::Operation::Release");
+    const size_t maintenance = body.find(
+        "device_moe_rebalance_maintenance_graph_");
+    ASSERT_NE(acquire, std::string::npos);
+    ASSERT_NE(sidecar, std::string::npos);
+    ASSERT_NE(state_publication, std::string::npos);
+    ASSERT_NE(terminal_publication, std::string::npos);
+    ASSERT_NE(release, std::string::npos);
+    ASSERT_NE(maintenance, std::string::npos);
+    EXPECT_LT(acquire, sidecar);
+    EXPECT_LT(sidecar, state_publication);
+    EXPECT_LT(state_publication, terminal_publication);
+    EXPECT_LT(terminal_publication, release);
+    EXPECT_LT(release, maintenance);
 }

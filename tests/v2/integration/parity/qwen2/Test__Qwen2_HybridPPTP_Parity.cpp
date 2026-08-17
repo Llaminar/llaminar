@@ -109,44 +109,9 @@ public:
 // Test Cases
 // =============================================================================
 
-TEST_P(Qwen2HybridPPTPParityTest, PrefillParity)
+TEST_P(Qwen2HybridPPTPParityTest, ProductionParity)
 {
-    // Hybrid PP+TP: pipeline uses LocalPPTestRunner wrapping pre-compiled
-    // TP MDO + single-device DGO. Use non-TP parity comparison since the
-    // outer runner is not a RankOrchestrator (TP-specific snapshot
-    // access requires MDO cast). The combined output is still compared
-    // against PyTorch reference for correctness.
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runPrefillParity();
-    assertParity(summary);
-}
-
-TEST_P(Qwen2HybridPPTPParityTest, DecodeParity)
-{
-    // Hybrid PP+TP: use non-TP decode parity comparison for the same reason
-    // as PrefillParity — the outer runner is a LocalPPTestRunner, not MDO.
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    auto summary = runDecodeParity();
-    assertDecodeParity(summary);
-}
-
-TEST_P(Qwen2HybridPPTPParityTest, SnapshotInfrastructure)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    auto embedding = loadPyTorchSnapshot("EMBEDDING");
-    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
-
-    ASSERT_TRUE(runner_ != nullptr);
-    runner_->forward(config_.token_ids.data(), config_.token_ids.size());
-
-    auto keys = runner_->getSnapshotKeys();
-    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
-
-    bool has_embedding = std::find(keys.begin(), keys.end(), "EMBEDDING") != keys.end();
-    bool has_lm_head = std::find(keys.begin(), keys.end(), "LM_HEAD") != keys.end();
-    EXPECT_TRUE(has_embedding) << "Missing EMBEDDING snapshot";
-    EXPECT_TRUE(has_lm_head) << "Missing LM_HEAD snapshot";
+    runProductionParityCampaign();
 }
 
 // =============================================================================

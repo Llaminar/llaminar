@@ -53,6 +53,17 @@ namespace llaminar2
         // Host memory pinning for async DMA
         bool pinHostMemory(void *ptr, size_t bytes) override;
         bool unpinHostMemory(void *ptr) override;
+        bool registerExternalMappedHostMemory(
+            void *ptr,
+            size_t bytes,
+            int registration_device_id) override;
+        bool externalMappedHostDevicePointer(
+            void *host_ptr,
+            int device_id,
+            void **device_ptr) override;
+        bool unregisterExternalMappedHostMemory(
+            void *ptr,
+            int registration_device_id) override;
 
         // GPU-side argmax for greedy sampling
         bool argmaxF32(const void *data_device, int n, int device_id,
@@ -546,6 +557,38 @@ namespace llaminar2
             void *decode_boundary_advanced_device,
             int device_id,
             void *stream) override;
+        bool enqueuePublishSerialDecodeCommitBoundary(
+            void *decode_rounds_committed_device,
+            void *decode_rounds_until_maintenance_device,
+            void *maintenance_due_device,
+            void *decode_boundary_advanced_device,
+            int device_id,
+            void *stream) override;
+        bool enqueueAcknowledgeDecodeCommitBoundary(
+            void *decode_rounds_until_maintenance_device,
+            void *maintenance_due_device,
+            void *decode_boundary_advanced_device,
+            int device_id,
+            void *stream) override;
+        bool enqueueInitializeDeviceMoERebalanceDispatchTicket(
+            uint64_t session_epoch,
+            uint64_t workspace_generation,
+            uint32_t participant_id,
+            uint32_t participant_count,
+            void *ticket_device,
+            int device_id,
+            void *stream) override;
+        bool enqueuePublishDeviceMoERebalanceDispatchTicket(
+            const void *controller_magic_device,
+            const void *controller_version_device,
+            const void *controller_error_device,
+            const void *decode_rounds_committed_device,
+            const void *decode_rounds_until_maintenance_device,
+            const void *maintenance_due_device,
+            const void *decode_boundary_advanced_device,
+            void *ticket_device,
+            int device_id,
+            void *stream) override;
         bool enqueueInitializeDeviceGeneration(
             int request_count,
             int max_new_tokens,
@@ -739,6 +782,8 @@ namespace llaminar2
         void destroyEvent(void *event, int device_id) override;
         bool recordEvent(void *event, int device_id, void *stream) override;
         bool waitForEvent(void *event, int device_id) override;
+        /** @copydoc IBackend::queryEvent */
+        bool queryEvent(void *event, int device_id, bool *ready) override;
         bool eventElapsedTimeMs(
             void *start_event,
             void *stop_event,
@@ -810,6 +855,48 @@ namespace llaminar2
         void destroyStream(void *stream, int device_id) override;
         bool synchronizeStream(void *stream, int device_id) override;
         bool streamWaitEvent(void *stream, void *event, int device_id) override;
+
+        /** @copydoc IBackend::supportsStreamTimelineSignal32 */
+        bool supportsStreamTimelineSignal32(int device_id) const override;
+
+        /** @copydoc IBackend::allocateStreamTimelineSignal32 */
+        void *allocateStreamTimelineSignal32(int device_id) override;
+
+        /** @copydoc IBackend::freeStreamTimelineSignal32 */
+        void freeStreamTimelineSignal32(void *signal, int device_id) override;
+
+        /** @copydoc IBackend::streamWaitTimelineSignal32 */
+        bool streamWaitTimelineSignal32(
+            void *stream,
+            void *signal,
+            uint32_t value,
+            int device_id) override;
+
+        /** @copydoc IBackend::streamPublishTimelineSignal32 */
+        bool streamPublishTimelineSignal32(
+            void *stream,
+            void *signal,
+            uint32_t value,
+            int device_id) override;
+
+        /** @copydoc IBackend::supportsStreamTimelineSignal64 */
+        bool supportsStreamTimelineSignal64(int device_id) const override;
+        /** @copydoc IBackend::allocateStreamTimelineSignal64 */
+        void *allocateStreamTimelineSignal64(int device_id) override;
+        /** @copydoc IBackend::freeStreamTimelineSignal64 */
+        void freeStreamTimelineSignal64(void *signal, int device_id) override;
+        /** @copydoc IBackend::streamWaitTimelineSignal64 */
+        bool streamWaitTimelineSignal64(
+            void *stream,
+            void *signal,
+            uint64_t value,
+            int device_id) override;
+        /** @copydoc IBackend::streamPublishTimelineSignal64 */
+        bool streamPublishTimelineSignal64(
+            void *stream,
+            void *signal,
+            uint64_t value,
+            int device_id) override;
 
         // Async H2D without sync (for pipelined loading)
         bool hostToDeviceOnStream(void *dst, const void *src, size_t bytes,

@@ -34,7 +34,7 @@ namespace llaminar2::test
         {
             RoutedExpertDomain domain;
             domain.name = name;
-            domain.scope = ExecutionDomainScope::LOCAL;
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(0, 1)};
             domain.owner_rank = 0;
@@ -121,7 +121,7 @@ namespace llaminar2::test
 
     } // namespace
 
-    TEST(Test__MoERoutedTierPlanner, FlexibleNamesAndBudgets)
+    TEST(Test__MoERoutedTierPlanner, OnlyIntegerPriorityControlsTierPreference)
     {
         auto gpu_only = baseGpuOnlyPlan();
         const auto gpu_only_result = MoERoutedExpertPlacementPlanner::plan(gpu_only, metadata());

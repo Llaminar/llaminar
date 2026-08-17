@@ -81,6 +81,7 @@ namespace llaminar2
                 ComputeDevice dev;
                 dev.type = ComputeBackendType::GPU_ROCM;
                 dev.device_id = i;
+                dev.compute_units = prop.multiProcessorCount;
                 dev.total_memory_bytes = prop.totalGlobalMem;
 
                 // Parse gcnArchName for architecture info

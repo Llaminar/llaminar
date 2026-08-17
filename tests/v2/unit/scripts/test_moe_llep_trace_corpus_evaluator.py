@@ -30,8 +30,8 @@ def evaluator_args(**overrides: object) -> argparse.Namespace:
         "lambda_numerator": 13,
         "lambda_denominator": 10,
         "min_spread_improvement": 0,
-        "min_spread_improvement_per_transfer": 0,
-        "sweep_min_spread_improvement_per_transfer": "",
+        "min_spread_improvement_per_critical_path_slot": 0,
+        "sweep_min_spread_improvement_per_critical_path_slot": "",
         "disable_balanced_skip": False,
     }
     values.update(overrides)
@@ -78,6 +78,29 @@ def write_summary(corpus: Path, trace: Path, seed: str = "101") -> None:
 
 
 class MoELLEPTraceCorpusEvaluatorTest(unittest.TestCase):
+    def test_reciprocal_wave_prices_one_critical_path_slot(self) -> None:
+        plan = moe_llep_evaluator.plan_llep(
+            [5, 15, 20, 20],
+            [0, 0, 1, 1],
+            2,
+            min_chunk_tokens=0,
+            alpha_numerator=3,
+            alpha_denominator=4,
+            lambda_numerator=13,
+            lambda_denominator=10,
+            min_spread_improvement=0,
+            min_spread_improvement_per_critical_path_slot=5,
+            enable_balanced_skip=False,
+        )
+
+        status = plan["status"]
+        self.assertEqual(status["weight_transfer_count"], 2)
+        self.assertEqual(status["critical_path_transfer_slots"], 1)
+        self.assertEqual(status["assigned_load_spread_improvement"], 6)
+        self.assertEqual(status["required_spread_improvement"], 5)
+        self.assertEqual(status["skipped_insufficient_spread_improvement"], 0)
+        self.assertEqual(status["standard_ep_selected"], 0)
+
     def test_evaluates_llep_assignment_from_gathered_histogram_and_owner_map(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             corpus = Path(tmp)
@@ -130,7 +153,9 @@ class MoELLEPTraceCorpusEvaluatorTest(unittest.TestCase):
         self.assertEqual(window_rows[0]["standard_load_spread"], 100)
         self.assertEqual(window_rows[0]["llep_load_spread"], 0)
         self.assertEqual(window_rows[0]["spread_improvement"], 100)
-        self.assertEqual(window_rows[0]["spread_improvement_per_transfer"], "100")
+        self.assertEqual(
+            window_rows[0]["spread_improvement_per_critical_path_slot"], "100"
+        )
         self.assertEqual(window_rows[0]["required_spread_improvement"], 0)
         self.assertEqual(window_rows[0]["capacity_per_participant"], 50)
         self.assertEqual(window_rows[0]["native_rows"], 50)
@@ -143,7 +168,9 @@ class MoELLEPTraceCorpusEvaluatorTest(unittest.TestCase):
         self.assertEqual(run_rows[0]["duplicate_trace_rows"], 1)
         self.assertEqual(run_rows[0]["spread_improvement"], 100)
         self.assertEqual(run_rows[0]["spread_improvement_fraction"], "1")
-        self.assertEqual(run_rows[0]["spread_improvement_per_transfer"], "100")
+        self.assertEqual(
+            run_rows[0]["spread_improvement_per_critical_path_slot"], "100"
+        )
         self.assertEqual(run_rows[0]["required_spread_improvement"], 0)
         self.assertEqual(run_rows[0]["skipped_insufficient_spread_improvement"], 0)
         self.assertEqual(split_rows[0]["eligible_wave_layers"], 1)
@@ -189,7 +216,9 @@ class MoELLEPTraceCorpusEvaluatorTest(unittest.TestCase):
 
             run_rows, window_rows, split_rows = moe_llep_evaluator.build_tables(
                 corpus,
-                evaluator_args(min_spread_improvement_per_transfer=128),
+                evaluator_args(
+                    min_spread_improvement_per_critical_path_slot=128
+                ),
             )
 
         self.assertEqual(len(window_rows), 1)
@@ -246,11 +275,17 @@ class MoELLEPTraceCorpusEvaluatorTest(unittest.TestCase):
             rows = moe_llep_evaluator.build_roi_sweep(corpus, args, [0, 128])
 
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]["min_spread_improvement_per_transfer"], 0)
+        self.assertEqual(
+            rows[0]["min_spread_improvement_per_critical_path_slot"], 0
+        )
         self.assertEqual(rows[0]["spread_improvement"], 100)
         self.assertEqual(rows[0]["weight_transfer_count"], 1)
-        self.assertEqual(rows[0]["spread_improvement_per_transfer"], "100")
-        self.assertEqual(rows[1]["min_spread_improvement_per_transfer"], 128)
+        self.assertEqual(
+            rows[0]["spread_improvement_per_critical_path_slot"], "100"
+        )
+        self.assertEqual(
+            rows[1]["min_spread_improvement_per_critical_path_slot"], 128
+        )
         self.assertEqual(rows[1]["spread_improvement"], 0)
         self.assertEqual(rows[1]["weight_transfer_count"], 0)
         self.assertEqual(rows[1]["skipped_insufficient_spread_improvement"], 1)

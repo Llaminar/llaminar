@@ -162,12 +162,17 @@ namespace llaminar2
              * @param codebook_id NativeVNNI codebook identifier
              * @param blocks_per_row Number of 32-element blocks per row (K/32)
              * @param lifetime_owner Shared pointer that keeps the GPU allocation alive
+             * @param source_identity Exact GGUF arithmetic provenance
+             * @param allocation_format Optional reusable-slot capacity; zero
+             *        payload identifies an ordinary immutable allocation
              */
             CUDAQuantisedGemmKernel(
                 int N, int K, int cuda_device_id,
                 uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
                 uint8_t codebook_id, uint32_t blocks_per_row,
-                std::shared_ptr<void> lifetime_owner);
+                std::shared_ptr<void> lifetime_owner,
+                NativeVnniSourceIdentity source_identity,
+                NativeVnniReusableDeviceAllocationFormat allocation_format = {});
 
             ~CUDAQuantisedGemmKernel() override;
 
@@ -272,6 +277,15 @@ namespace llaminar2
             bool supports_fused_projection() const override { return true; }
 
             /**
+             * @brief Create the shared CUDA projection stream/event pool before capture.
+             *
+             * The pool is device-scoped and persistent. Calling this method is
+             * idempotent; entering it during an active graph capture is rejected.
+             */
+            bool prepareFusedProjectionGraphCapture(
+                size_t projection_count) override;
+
+            /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
              *
              * CUDAQuantisedGemmKernel is for weight projections only.
@@ -369,6 +383,8 @@ namespace llaminar2
 
             /// @brief Export native-VNNI device pointers for grouped MoE CUDA prefill.
             bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
+            bool exportNativeVNNISourceIdentity(
+                NativeVnniSourceIdentity &out) const override;
 
             /**
              * @brief Prepare weights for efficient execution (ITensorGemm interface)

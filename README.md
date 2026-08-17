@@ -43,6 +43,20 @@ Llaminar uses a predefined devcontainer and the recommended development environm
 
 Open vscode in the devcontainer, and run the Build Integration / Build Release vscode tasks with `CTRL + Shift + P`.
 
+The image pins one Ninja release for both the system and workspace tools.
+Resolve the devcontainer's active executable while configuring and always
+build through CMake, so an existing tree keeps using that same tool. Mixing
+Ninja executables can make their command-log hashes differ and cause a
+needless full rebuild.
+
+```bash
+LLAMINAR_NINJA_BIN="$(command -v ninja)"
+cmake -B build_v2_integration -S src/v2 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Integration \
+  -DCMAKE_MAKE_PROGRAM:FILEPATH="${LLAMINAR_NINJA_BIN}"
+cmake --build build_v2_integration --parallel
+```
+
 ### Running Llaminar
 
 Set these once before running the one-liners below:

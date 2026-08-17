@@ -395,7 +395,9 @@ namespace llaminar2
 
             const bool numa_bind = (numa_node >= 0);
 
-            if (numa_bind && !skip_cache_eviction)
+            if (numa_bind &&
+                prefault_policy != PrefaultPolicy::DemandPaged &&
+                !skip_cache_eviction)
             {
                 // Evict any stale page-cache pages for this file so that our
                 // first-touch loop below allocates fresh pages on the target
@@ -465,7 +467,8 @@ namespace llaminar2
             // This ensures all page-cache pages allocated for this mapping
             // land on the correct NUMA node, avoiding cross-socket bandwidth
             // penalties for memory-bandwidth-bound GEMV decode.
-            if (numa_bind)
+            if (numa_bind &&
+                prefault_policy != PrefaultPolicy::DemandPaged)
             {
                 if (numa_available() < 0)
                 {
@@ -552,10 +555,10 @@ namespace llaminar2
             {
                 if (!eager_populate)
                 {
-                    // Demand-paged GPU staging should not request whole-file
-                    // prefault or prefetch. Sequential access hints are enough
-                    // for kernel readahead as the actual tensor uploads walk the
-                    // GGUF, and they avoid cold-load stalls before the first H2D.
+                    // Demand-paged device staging and sparse expert selection
+                    // must not request whole-file prefault or prefetch. mbind,
+                    // when requested, still governs pages faulted by exact
+                    // selections without reading every unrelated tensor.
                     ::madvise(base, file_size, MADV_SEQUENTIAL);
                 }
                 else
@@ -569,8 +572,12 @@ namespace llaminar2
                                                  << ", THP requested)");
             }
 
+            const bool fully_resident =
+                (numa_bind &&
+                 prefault_policy != PrefaultPolicy::DemandPaged) ||
+                eager_populate;
             return std::unique_ptr<MmapRegion>(
-                new MmapRegion(base, file_size, fd, file_path, numa_bind || eager_populate));
+                new MmapRegion(base, file_size, fd, file_path, fully_resident));
 #else
             (void)numa_node;
             (void)skip_cache_eviction;

@@ -49,6 +49,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -596,6 +597,30 @@ namespace llaminar2
             }
         }
 
+        /**
+         * Resolve the canonical format descriptor embedded in a portable
+         * packed-weight record. Codebook id alone is ambiguous for K-family
+         * superblocks, so the serialized superblock bit is part of the lookup.
+         */
+        static const NativeVnniFormatInfo *nativeVnniFormatForPacked(
+            uint8_t codebook_id,
+            bool is_superblock)
+        {
+            return native_vnni_formats::forSourceIdentity(
+                codebook_id, is_superblock);
+        }
+
+        /** Build the exact source provenance carried by a prepared engine. */
+        static NativeVnniSourceIdentity sourceIdentityFor(
+            const NativeVnniFormatInfo &format)
+        {
+            return {
+                .codebook_id = format.codebook_id,
+                .is_superblock = format.is_superblock,
+                .present = true,
+            };
+        }
+
         static ExpertSlabDescriptor makeExpertSlabDescriptor(const MoEWeightContext &ctx, WeightRole role)
         {
             ExpertSlabDescriptor desc;
@@ -715,6 +740,7 @@ namespace llaminar2
             int K,
             uint32_t blocks_per_row,
             uint8_t codebook_id,
+            NativeVnniSourceIdentity source_identity,
             const std::shared_ptr<void> &lifetime_owner)
         {
 #ifdef HAVE_CUDA
@@ -727,7 +753,8 @@ namespace llaminar2
                     static_cast<uint16_t *>(slot.d_native_vnni_mins),
                     static_cast<uint32_t *>(slot.d_native_vnni_emins),
                     codebook_id, blocks_per_row,
-                    lifetime_owner);
+                    lifetime_owner,
+                    source_identity);
             }
 #endif
 #ifdef HAVE_ROCM
@@ -740,7 +767,8 @@ namespace llaminar2
                     slot.d_native_vnni_mins,
                     slot.d_native_vnni_emins,
                     codebook_id, blocks_per_row,
-                    lifetime_owner);
+                    lifetime_owner,
+                    source_identity);
             }
 #endif
             return nullptr;
@@ -814,15 +842,19 @@ namespace llaminar2
             return false;
         }
 
-        // Expert-ID ownership range: extract views only for local experts.
-        // Dynamic rebalancing may set an expert mask while using replicated
-        // parent tensors. In that case, extracting all views is safe because
-        // every global expert id is physically present. LocalTP static expert
-        // ownership can also be expressed as a mask, but its parent tensor is
-        // presliced to the local expert range. Presliced tensors are the source
-        // of truth for physical bounds, so they must never attempt to view
-        // global expert ids outside [local_start, local_end).
-        const bool extract_all = !ctx.expert_mask.empty();
+        // A mask is authoritative logical ownership. For a full parent tensor it
+        // controls which engines are prepared while every global expert remains
+        // directly addressable. For a packed parent tensor its sorted true bits
+        // are also the packed-slot map: slot i contains the i-th enabled global
+        // expert. This is the same order used by ModelLoader's explicit expert
+        // selection and avoids inventing a second, contiguous ownership rule.
+        const bool has_expert_mask = !ctx.expert_mask.empty();
+        if (has_expert_mask &&
+            ctx.expert_mask.size() != static_cast<size_t>(num_experts))
+        {
+            throw std::runtime_error(
+                "[MoEWeightService] Expert ownership mask size does not match num_experts");
+        }
         const size_t active_mask_count =
             static_cast<size_t>(std::count(ctx.expert_mask.begin(), ctx.expert_mask.end(), true));
         const int local_start = ctx.local_expert_start;
@@ -844,7 +876,7 @@ namespace llaminar2
         // In that case, global expert index `e` maps to local tensor index
         // `e - local_start`. When the tensor has all experts (shape[2] == num_experts),
         // the offset uses the global index directly.
-        auto extract_views = [local_start, local_count, local_end, extract_all, active_mask_count, &ctx](
+        auto extract_views = [local_start, local_count, local_end, has_expert_mask, active_mask_count, &ctx](
                                  TensorBase *tensor_3d, int n_experts,
                                  const char *role_name,
                                  std::vector<std::shared_ptr<TensorBase>> &views) -> bool
@@ -866,19 +898,70 @@ namespace llaminar2
             // or contains all experts (replicated mode).
             const bool is_presliced = (static_cast<int>(tensor_expert_count) != n_experts);
 
+            std::vector<int> packed_index_by_expert(
+                static_cast<size_t>(n_experts), -1);
+            if (is_presliced && has_expert_mask)
+            {
+                if (active_mask_count != tensor_expert_count)
+                {
+                    std::ostringstream oss;
+                    oss << "[MoEWeightService] Packed " << role_name
+                        << " tensor contains " << tensor_expert_count
+                        << " experts but its authoritative ownership mask contains "
+                        << active_mask_count
+                        << " for layer " << ctx.layer_idx;
+                    throw std::runtime_error(oss.str());
+                }
+
+                int packed_index = 0;
+                for (int expert_id = 0; expert_id < n_experts; ++expert_id)
+                {
+                    if (ctx.expert_mask[static_cast<size_t>(expert_id)])
+                        packed_index_by_expert[static_cast<size_t>(expert_id)] = packed_index++;
+                }
+            }
+            else if (is_presliced)
+            {
+                if (local_start < 0 || local_count <= 0 || local_end > n_experts ||
+                    static_cast<size_t>(local_count) != tensor_expert_count)
+                {
+                    std::ostringstream oss;
+                    oss << "[MoEWeightService] Packed " << role_name
+                        << " tensor cannot be mapped by its contiguous local span"
+                        << " layer=" << ctx.layer_idx
+                        << " tensor_experts=" << tensor_expert_count
+                        << " local_start=" << local_start
+                        << " local_count=" << local_count
+                        << " num_experts=" << n_experts;
+                    throw std::runtime_error(oss.str());
+                }
+                for (int expert_id = local_start; expert_id < local_end; ++expert_id)
+                {
+                    packed_index_by_expert[static_cast<size_t>(expert_id)] =
+                        expert_id - local_start;
+                }
+            }
+            else
+            {
+                for (int expert_id = 0; expert_id < n_experts; ++expert_id)
+                    packed_index_by_expert[static_cast<size_t>(expert_id)] = expert_id;
+            }
+
             for (int e = 0; e < n_experts; ++e)
             {
-                // Skip non-local expert IDs under apportioned ownership. A replicated tensor can
-                // still extract every global expert when dynamic rebalance asks
-                // for it, but a presliced LocalTP tensor contains only local
-                // expert storage and must clamp to the physical local range.
-                if ((is_presliced || !extract_all) && (e < local_start || e >= local_end))
+                // Full replicated tensors keep every view available when a mask
+                // is present because dynamic ownership may later change. Without
+                // a mask, preserve the declared contiguous local range. Packed
+                // tensors always follow the explicit map constructed above.
+                if (is_presliced &&
+                    packed_index_by_expert[static_cast<size_t>(e)] < 0)
+                    continue;
+                if (!is_presliced && !has_expert_mask &&
+                    (e < local_start || e >= local_end))
                     continue;
 
-                // For pre-sliced tensors: local expert `e` is at tensor index `e - local_start`
-                // For full tensors: expert `e` is at tensor index `e`
-                size_t tensor_idx = is_presliced ? static_cast<size_t>(e - local_start)
-                                                 : static_cast<size_t>(e);
+                const size_t tensor_idx = static_cast<size_t>(
+                    packed_index_by_expert[static_cast<size_t>(e)]);
                 size_t element_offset = tensor_idx * elements_per_expert;
 
                 std::vector<size_t> view_shape = {rows, cols};
@@ -927,10 +1010,17 @@ namespace llaminar2
         if (!extract_views(ctx.down_exps, num_experts, "down", ctx.expert_down_views))
             return false;
 
-        LOG_TRACE("[MoEWeightService] Extracted " << (extract_all ? num_experts : local_count) << "/" << num_experts
-                                                  << " expert 2D views (expert-ID range [" << local_start
-                                                  << ", " << local_end << ")"
-                                                  << (extract_all ? " extract_all=true" : "") << ")");
+        const size_t extracted_count = static_cast<size_t>(std::count_if(
+            ctx.expert_gate_views.begin(),
+            ctx.expert_gate_views.end(),
+            [](const std::shared_ptr<TensorBase> &view)
+            {
+                return view != nullptr;
+            }));
+        LOG_TRACE("[MoEWeightService] Extracted " << extracted_count << "/" << num_experts
+                                                  << " expert 2D views"
+                                                  << (has_expert_mask ? " from authoritative ownership mask" : "")
+                                                  << ")");
         return true;
     }
 
@@ -1117,8 +1207,9 @@ namespace llaminar2
         // Each expert has unique tensors (unique raw_data() keys), so no cache
         // key collisions.  The heavy VNNI interleave runs lock-free.
         // Phase D: prepareExpertGemmLocal returns shared_ptr without global registry.
-        const int target_numa_node = ctx.cpu_numa_node;
-        const bool enforce_numa_placement = target_numa_node >= 0;
+        const int target_numa_node = ctx.cpu_numa_placement.node();
+        const bool enforce_numa_placement =
+            ctx.cpu_numa_placement.requiresNodeBinding();
         if (enforce_numa_placement && numa_available() < 0)
         {
             LOG_ERROR("[MoEWeightService][NUMA] Cannot enforce CPU expert packing on NUMA node "
@@ -1372,27 +1463,82 @@ namespace llaminar2
     // Weight serialization (for MPI transfer)
     // =========================================================================
 
-    ExpertWeightBlobs MoEExpertWeightService::detachAndSerializeExpert(MoEWeightContext &ctx, int expert_id)
+    ExpertPackedWeights MoEExpertWeightService::detachPreparedExpert(
+        MoEWeightContext &ctx,
+        int expert_id)
     {
-        ExpertWeightBlobs blobs;
-
-        auto serialize_proj = [&](ITensorGemm *engine, const char * /*proj_name*/) -> std::vector<uint8_t>
+        if (expert_id < 0 || expert_id >= ctx.num_experts)
         {
-            if (!engine)
-                return {};
-            if (!engine->hasWeights())
-                return {};
-            auto packed = engine->detachWeights();
-            if (!packed)
-                return {};
-            return packed_weights_serialization::serialize(*packed);
+            throw std::out_of_range(
+                "Cannot detach prepared expert outside the layer geometry");
+        }
+
+        std::array<ITensorGemm *, 3> engines{
+            ctx.prepared_gate_gemm[expert_id],
+            ctx.prepared_up_gemm[expert_id],
+            ctx.prepared_down_gemm[expert_id],
         };
+        if (std::any_of(
+                engines.begin(),
+                engines.end(),
+                [](ITensorGemm *engine)
+                {
+                    return engine == nullptr || !engine->hasWeights();
+                }))
+        {
+            throw std::runtime_error(
+                "Cannot detach an incomplete prepared CPU expert");
+        }
 
-        blobs.gate = serialize_proj(ctx.prepared_gate_gemm[expert_id], "gate");
-        blobs.up = serialize_proj(ctx.prepared_up_gemm[expert_id], "up");
-        blobs.down = serialize_proj(ctx.prepared_down_gemm[expert_id], "down");
+        ExpertPackedWeights weights;
+        weights.gate = engines[0]->detachWeights();
+        weights.up = engines[1]->detachWeights();
+        weights.down = engines[2]->detachWeights();
+        if (!weights.complete())
+        {
+            throw std::runtime_error(
+                "Prepared CPU expert did not implement complete detachable weights");
+        }
+        return weights;
+    }
 
-        return blobs;
+    ExpertPackedWeights MoEExpertWeightService::clonePreparedExpert(
+        const MoEWeightContext &ctx,
+        int expert_id)
+    {
+        if (expert_id < 0 || expert_id >= ctx.num_experts)
+        {
+            throw std::out_of_range(
+                "Cannot clone prepared expert outside the layer geometry");
+        }
+
+        std::array<ITensorGemm *, 3> engines{
+            ctx.prepared_gate_gemm[expert_id],
+            ctx.prepared_up_gemm[expert_id],
+            ctx.prepared_down_gemm[expert_id],
+        };
+        if (std::any_of(
+                engines.begin(),
+                engines.end(),
+                [](ITensorGemm *engine)
+                {
+                    return engine == nullptr || !engine->hasWeights();
+                }))
+        {
+            throw std::runtime_error(
+                "Cannot clone an incomplete prepared CPU expert");
+        }
+
+        ExpertPackedWeights weights;
+        weights.gate = engines[0]->cloneWeights();
+        weights.up = engines[1]->cloneWeights();
+        weights.down = engines[2]->cloneWeights();
+        if (!weights.complete())
+        {
+            throw std::runtime_error(
+                "Prepared CPU expert did not implement complete cloneable weights");
+        }
+        return weights;
     }
 
     ExpertWeightBlobs MoEExpertWeightService::serializeExpert(const MoEWeightContext &ctx, int expert_id)
@@ -1401,7 +1547,7 @@ namespace llaminar2
 
         ExpertWeightBlobs blobs;
 
-        auto serialize_proj = [expert_id, &ctx](ITensorGemm *engine, const char *proj_name) -> std::vector<uint8_t>
+        auto serialize_proj = [expert_id, &ctx](ITensorGemm *engine, const char *proj_name) -> ExpertTransferBuffer
         {
             if (!engine || !engine->hasWeights())
             {
@@ -1420,7 +1566,10 @@ namespace llaminar2
                 return {};
             }
 
-            return packed_weights_serialization::serialize(*packed);
+            ExpertTransferBuffer buffer;
+            if (!packed_weights_serialization::serializeInto(*packed, buffer))
+                return {};
+            return buffer;
         };
 
         blobs.gate = serialize_proj(ctx.prepared_gate_gemm[expert_id], "gate");
@@ -1556,7 +1705,9 @@ namespace llaminar2
     bool MoEExpertWeightService::registerAndPrepareNewExperts(
         MoEWeightContext &ctx,
         const std::vector<bool> &new_mask,
-        const std::unordered_map<int, ExpertWeightBlobs> *received_weights)
+        const std::unordered_map<int, ExpertWeightBlobs> *received_weights,
+        const std::unordered_map<int, PreparedExpertEngines> *
+            received_prepared_experts)
     {
         // Find newly-acquired experts (true in new_mask, not previously prepared)
         std::vector<int> new_experts;
@@ -1581,13 +1732,18 @@ namespace llaminar2
             return registerAndPrepareNewExpertsGPU(ctx, new_experts, received_weights);
         }
 
-        // CPU path: deserialize transferred weights or resolve existing store-owned engines.
+        // CPU path: adopt final directly-received engines, resolve an existing
+        // canonical store owner, or consume the portable archive wire record.
+        // The wire record contains eager CPU NativeVNNI data as well as the
+        // original native blocks needed by accelerator destinations. CPU uses
+        // the eager representation without another quantization pass.
         auto t_start = std::chrono::high_resolution_clock::now();
         int transferred_count = 0;
         std::atomic<bool> error_flag{false};
         const int count = static_cast<int>(new_experts.size());
-        const int target_numa_node = ctx.cpu_numa_node;
-        const bool enforce_numa_placement = target_numa_node >= 0;
+        const int target_numa_node = ctx.cpu_numa_placement.node();
+        const bool enforce_numa_placement =
+            ctx.cpu_numa_placement.requiresNodeBinding();
         if (enforce_numa_placement && numa_available() < 0)
         {
             LOG_ERROR("[MoEWeightService][NUMA] Cannot enforce CPU expert arrivals on NUMA node "
@@ -1608,9 +1764,9 @@ namespace llaminar2
             return ctx.prepared_store->expertGemmKernel(*slab_ref, expert_id);
         };
 
-        // Prepare engines: use store-owned engines first, then transferred blobs.
-        // Raw tensor repacking is intentionally forbidden after initial eager graph
-        // materialization because host expert data may already have been released.
+        // Prepare engines: use store-owned engines first, then direct prepared
+        // arrivals, then the canonical portable archive payload. Raw tensor
+        // repacking remains forbidden after initial graph materialization.
         for (int idx = 0; idx < count; ++idx)
         {
             if (error_flag.load(std::memory_order_relaxed))
@@ -1630,37 +1786,76 @@ namespace llaminar2
                 continue;
             }
 
-            // Fast path: create kernels directly from pre-packed transferred blobs
-            const ExpertWeightBlobs *blobs = nullptr;
-            if (received_weights)
+            const PreparedExpertEngines *prepared = nullptr;
+            if (received_prepared_experts)
             {
-                auto it = received_weights->find(e);
-                if (it != received_weights->end() && !it->second.empty())
-                    blobs = &it->second;
+                auto it = received_prepared_experts->find(e);
+                if (it != received_prepared_experts->end())
+                    prepared = &it->second;
             }
 
-            if (!blobs)
+            if (prepared && prepared->complete())
             {
-                LOG_ERROR("[MoEWeightService] Missing transferred/store-owned packed weights for new CPU expert "
-                          << e << " on layer " << ctx.layer_idx << "; raw expert repack fallback is disabled");
-                error_flag.store(true, std::memory_order_relaxed);
-                continue;
+                gate_engine = prepared->gate;
+                up_engine = prepared->up;
+                down_engine = prepared->down;
             }
-
-            gate_engine = KernelFactory::createExpertGemmFromTransferBlob(blobs->gate);
-            up_engine = KernelFactory::createExpertGemmFromTransferBlob(blobs->up);
-            down_engine = KernelFactory::createExpertGemmFromTransferBlob(blobs->down);
-
-            if (gate_engine && up_engine && down_engine)
-                ++transferred_count;
-
-            if (!gate_engine || !up_engine || !down_engine)
+            else
             {
-                LOG_ERROR("[MoEWeightService] Failed to deserialize transferred packed GEMM weights for new CPU expert "
-                          << e << " on layer " << ctx.layer_idx << "; raw expert repack fallback is disabled");
-                error_flag.store(true, std::memory_order_relaxed);
-                continue;
+                const ExpertWeightBlobs *portable = nullptr;
+                std::optional<ExpertWeightBlobs> provider_payload;
+                if (received_weights)
+                {
+                    const auto found = received_weights->find(e);
+                    if (found != received_weights->end() &&
+                        !found->second.empty())
+                    {
+                        portable = &found->second;
+                    }
+                }
+                if (!portable && ctx.payload_provider)
+                {
+                    provider_payload =
+                        ctx.payload_provider->payloadFor(ctx.layer_idx, e);
+                    if (provider_payload && !provider_payload->empty())
+                        portable = &*provider_payload;
+                }
+
+                const auto build_projection = [](
+                                                  const ExpertTransferBuffer &blob)
+                    -> std::shared_ptr<ITensorGemm>
+                {
+                    if (blob.empty())
+                        return nullptr;
+                    return KernelFactory::createExpertGemmFromTransferBlob(
+                        blob.data(), blob.size());
+                };
+                if (portable)
+                {
+                    gate_engine = build_projection(portable->gate);
+                    up_engine = build_projection(portable->up);
+                    down_engine = build_projection(portable->down);
+                }
+
+                if (!gate_engine || !up_engine || !down_engine)
+                {
+                    LOG_ERROR("[MoEWeightService] Missing complete prepared/archive weights for new CPU expert "
+                              << e << " on layer " << ctx.layer_idx
+                              << "; raw tensor repacking is forbidden after materialization");
+                    error_flag.store(true, std::memory_order_relaxed);
+                    continue;
+                }
+
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_residency",
+                    "cpu_portable_payload_arrivals",
+                    1.0,
+                    "maintenance",
+                    ctx.device_id.to_string(),
+                    {{"layer", std::to_string(ctx.layer_idx)},
+                     {"expert", std::to_string(e)}});
             }
+            ++transferred_count;
             if (enforce_numa_placement &&
                 (!enforceExpertKernelNUMA(gate_engine.get(), target_numa_node, ctx.layer_idx, e, "gate") ||
                  !enforceExpertKernelNUMA(up_engine.get(), target_numa_node, ctx.layer_idx, e, "up") ||
@@ -1777,13 +1972,12 @@ namespace llaminar2
         struct WeightGroup
         {
             const char *label;
-            std::vector<std::shared_ptr<TensorBase>> &views;
             std::vector<ITensorGemm *> &out_gemms;
         };
         WeightGroup groups[] = {
-            {"gate", ctx.expert_gate_views, ctx.prepared_gate_gemm},
-            {"up", ctx.expert_up_views, ctx.prepared_up_gemm},
-            {"down", ctx.expert_down_views, ctx.prepared_down_gemm},
+            {"gate", ctx.prepared_gate_gemm},
+            {"up", ctx.prepared_up_gemm},
+            {"down", ctx.prepared_down_gemm},
         };
         resolveExpertSlabRefs(ctx, /*create_if_missing=*/false);
 
@@ -1797,6 +1991,7 @@ namespace llaminar2
         {
             std::unique_ptr<IPackedWeights> packed;
             const cpu::native_vnni::CPUPackedWeightsWithNativeBlocks *native = nullptr;
+            const NativeVnniFormatInfo *format_info = nullptr;
             RepackFormat format = RepackFormat::Q4_0;
         };
         std::vector<TransferSource> transfer_sources;
@@ -1829,7 +2024,7 @@ namespace llaminar2
             return nullptr;
         };
 
-        auto blobFor = [&](int expert_id, const char *label) -> const std::vector<uint8_t> *
+        auto blobFor = [&](int expert_id, const char *label) -> const ExpertTransferBuffer *
         {
             const ExpertWeightBlobs *blobs = blobsForExpert(expert_id);
             if (!blobs)
@@ -1852,7 +2047,7 @@ namespace llaminar2
             return true;
         };
 
-        auto makeTransferSource = [&](const std::vector<uint8_t> &blob,
+        auto makeTransferSource = [&](const ExpertTransferBuffer &blob,
                                       int expert_id,
                                       const char *label) -> std::optional<TransferSource>
         {
@@ -1876,7 +2071,12 @@ namespace llaminar2
 
             const auto &cpu_packed = native->packed();
             auto repack_fmt = codebookIdToRepackFormat(cpu_packed.codebook_id, cpu_packed.is_superblock);
-            if (!repack_fmt)
+            const auto *format_info = nativeVnniFormatForPacked(
+                cpu_packed.codebook_id,
+                cpu_packed.is_superblock);
+            if (!repack_fmt || !format_info || cpu_packed.N <= 0 ||
+                cpu_packed.K <= 0 || (cpu_packed.K % 32) != 0 ||
+                native->nativeBlocks().empty())
             {
                 LOG_ERROR("[MoEWeightService::GPU-rebalance] Unsupported transferred packed format for expert "
                           << expert_id << " " << label
@@ -1887,6 +2087,7 @@ namespace llaminar2
 
             TransferSource source;
             source.native = native;
+            source.format_info = format_info;
             source.format = *repack_fmt;
             source.packed = std::move(packed);
             return source;
@@ -1929,7 +2130,7 @@ namespace llaminar2
                 LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e
                                                                       << " requires transferred/provider blobs for all gate/up/down weights on "
                                                                       << ctx.device_id.to_string() << " (layer " << ctx.layer_idx
-                                                                      << "). Raw GGUF fallback is not allowed during GPU rebalance after host release.");
+                                                                      << "). The canonical archive payload is mandatory after host release.");
                 return false;
             }
 
@@ -1951,44 +2152,6 @@ namespace llaminar2
             for (int idx = 0; idx < count; ++idx)
             {
                 const int e = experts_to_load[idx];
-                const auto &view = grp.views[e];
-                if (!view)
-                {
-                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Null view for expert "
-                              << e << " in " << grp.label);
-                    return false;
-                }
-
-                auto *unpackable = dynamic_cast<IINT8Unpackable *>(view.get());
-                const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
-                if (!vnni)
-                {
-                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Expert " << e << " "
-                                                                          << grp.label << " has no VNNI format info");
-                    return false;
-                }
-
-#ifdef HAVE_ROCM
-                if (ctx.device_id.is_rocm() && vnni->codebook_id >= 11 && vnni->codebook_id <= 17)
-                {
-                    if (!rocm::ensureIQGridTablesInitialized(gpu_ordinal))
-                    {
-                        LOG_ERROR("[MoEWeightService::GPU-rebalance] Failed to initialize ROCm IQ grid tables for "
-                                  << ctx.device_id.to_string());
-                        return false;
-                    }
-                }
-#endif
-
-                const int N = static_cast<int>(view->rows());
-                const int K = static_cast<int>(view->cols());
-                const size_t raw_bytes = quantizedViewRawBytes(*view);
-                if (raw_bytes == 0)
-                {
-                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Could not determine raw byte size for expert "
-                              << e << " " << grp.label);
-                    return false;
-                }
                 const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
 
                 auto *blob = blobFor(e, grp.label);
@@ -2003,12 +2166,29 @@ namespace llaminar2
                 auto source = makeTransferSource(*blob, e, grp.label);
                 if (!source)
                     return false;
+                const auto &packed = source->native->packed();
+                const auto &format = *source->format_info;
+#ifdef HAVE_ROCM
+                if (ctx.device_id.is_rocm() &&
+                    format.codebook_id >= 11 && format.codebook_id <= 17 &&
+                    !rocm::ensureIQGridTablesInitialized(gpu_ordinal))
+                {
+                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Failed to initialize ROCm IQ grid tables for "
+                              << ctx.device_id.to_string());
+                    return false;
+                }
+#endif
                 const size_t source_bytes = source->native->nativeBlocks().size();
+                orchestrator->planWeight(
+                    gpu_ordinal,
+                    slot_name,
+                    packed.N,
+                    packed.K,
+                    format.payload_bytes,
+                    format.is_asymmetric,
+                    format.has_emins,
+                    source_bytes);
                 transfer_sources.push_back(std::move(*source));
-
-                orchestrator->planWeight(gpu_ordinal, slot_name, N, K,
-                                         vnni->payload_bytes, vnni->is_asymmetric,
-                                         vnni->has_emins, source_bytes);
                 max_raw_bytes = std::max(max_raw_bytes, source_bytes);
                 ++total_planned;
             }
@@ -2038,29 +2218,7 @@ namespace llaminar2
             for (int idx = 0; idx < count; ++idx)
             {
                 const int e = experts_to_load[idx];
-                const auto &view = grp.views[e];
-
-                auto *unpackable = dynamic_cast<IINT8Unpackable *>(view.get());
-                const NativeVnniFormatInfo *vnni = unpackable->vnniFormatInfo();
-
-                auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
-                if (!repack_fmt)
-                {
-                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Unsupported repack format for expert "
-                              << e << " " << grp.label
-                              << " (codebook=" << static_cast<int>(vnni->codebook_id)
-                              << ", superblock=" << vnni->is_superblock << ")");
-                    return false;
-                }
-
                 const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
-
-                WeightJob job;
-                job.name = slot_name;
-                job.format = *repack_fmt;
-                job.N = static_cast<int>(view->rows());
-                job.K = static_cast<int>(view->cols());
-                job.is_asymmetric = vnni->is_asymmetric;
 
                 if (transfer_source_idx >= transfer_sources.size())
                 {
@@ -2068,6 +2226,13 @@ namespace llaminar2
                     return false;
                 }
                 const auto &source = transfer_sources[transfer_source_idx++];
+                const auto &packed = source.native->packed();
+                const auto &format = *source.format_info;
+                WeightJob job;
+                job.name = slot_name;
+                job.N = packed.N;
+                job.K = packed.K;
+                job.is_asymmetric = format.is_asymmetric;
                 job.host_raw_data = source.native->nativeBlocks().data();
                 job.raw_bytes = source.native->nativeBlocks().size();
                 job.format = source.format;
@@ -2087,12 +2252,12 @@ namespace llaminar2
         }
 
         // Phase 5: Create per-expert GEMM kernels from pool slots
+        transfer_source_idx = 0;
         for (auto &grp : groups)
         {
             for (int idx = 0; idx < count; ++idx)
             {
                 const int e = experts_to_load[idx];
-                const auto &view = grp.views[e];
                 const std::string slot_name = std::string(grp.label) + "_e" + std::to_string(e);
 
                 auto slot = pool->getSlot(slot_name);
@@ -2102,10 +2267,16 @@ namespace llaminar2
                     return false;
                 }
 
-                auto *unpackable = dynamic_cast<IINT8Unpackable *>(view.get());
-                const NativeVnniFormatInfo *vnni = unpackable->vnniFormatInfo();
-                const int N = static_cast<int>(view->rows());
-                const int K = static_cast<int>(view->cols());
+                if (transfer_source_idx >= transfer_sources.size())
+                {
+                    LOG_ERROR("[MoEWeightService::GPU-rebalance] Kernel publication source accounting mismatch");
+                    return false;
+                }
+                const auto &source = transfer_sources[transfer_source_idx++];
+                const auto &packed = source.native->packed();
+                const auto &format = *source.format_info;
+                const int N = packed.N;
+                const int K = packed.K;
                 const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
 
                 std::shared_ptr<ITensorGemm> kernel;
@@ -2119,8 +2290,9 @@ namespace llaminar2
                         static_cast<uint16_t *>(slot->d_native_vnni_scales),
                         static_cast<uint16_t *>(slot->d_native_vnni_mins),
                         static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                        vnni->codebook_id, blocks_per_row,
-                        orchestrator);
+                        canonicalDeviceVnniCodebookId(format.codebook_id), blocks_per_row,
+                        orchestrator,
+                        sourceIdentityFor(format));
                 }
 #endif
 #ifdef HAVE_ROCM
@@ -2132,8 +2304,9 @@ namespace llaminar2
                         slot->d_native_vnni_scales,
                         slot->d_native_vnni_mins,
                         slot->d_native_vnni_emins,
-                        vnni->codebook_id, blocks_per_row,
-                        orchestrator);
+                        canonicalDeviceVnniCodebookId(format.codebook_id), blocks_per_row,
+                        orchestrator,
+                        sourceIdentityFor(format));
                 }
 #endif
 
@@ -2473,8 +2646,9 @@ namespace llaminar2
                         static_cast<uint16_t *>(slot->d_native_vnni_scales),
                         static_cast<uint16_t *>(slot->d_native_vnni_mins),
                         static_cast<uint32_t *>(slot->d_native_vnni_emins),
-                        vnni->codebook_id, blocks_per_row,
-                        orchestrator); // lifetime: keeps VRAM pool alive
+                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
+                        orchestrator,
+                        sourceIdentityFor(*vnni)); // lifetime: keeps VRAM pool alive
                 }
 #endif
 #ifdef HAVE_ROCM
@@ -2486,8 +2660,9 @@ namespace llaminar2
                         slot->d_native_vnni_scales,
                         slot->d_native_vnni_mins,
                         slot->d_native_vnni_emins,
-                        vnni->codebook_id, blocks_per_row,
-                        orchestrator); // lifetime: keeps VRAM pool alive
+                        canonicalDeviceVnniCodebookId(vnni->codebook_id), blocks_per_row,
+                        orchestrator,
+                        sourceIdentityFor(*vnni)); // lifetime: keeps VRAM pool alive
                 }
 #endif
 
@@ -2630,6 +2805,12 @@ namespace llaminar2
                staged.is_asymmetric == is_asymmetric &&
                staged.has_emins == has_emins &&
                staged.codebook_id == codebook_id &&
+               source_identity.present &&
+               native_vnni_formats::forSourceIdentity(
+                   source_identity.codebook_id,
+                   source_identity.is_superblock) != nullptr &&
+               canonicalDeviceVnniCodebookId(source_identity.codebook_id) ==
+                   codebook_id &&
                transfer_slot_lifetime != nullptr;
     }
 
@@ -2899,6 +3080,7 @@ namespace llaminar2
                 projection.K,
                 projection.blocks_per_row,
                 projection.codebook_id,
+                projection.source_identity,
                 active_it->second.lifetime);
             wrap_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                  Clock::now() - wrap_start)
@@ -3356,7 +3538,8 @@ namespace llaminar2
 
         auto source_descriptor_for = [&](const WeightGroup &grp,
                                          int expert_id,
-                                         DeviceNativeVNNIMatrixDesc &out) -> bool
+                                         DeviceNativeVNNIMatrixDesc &out,
+                                         NativeVnniSourceIdentity &source_identity) -> bool
         {
             ITensorGemm *source_engine = source_engine_for(grp, expert_id);
             if (!source_engine)
@@ -3372,6 +3555,17 @@ namespace llaminar2
                           << grp.label << " engine for expert " << expert_id
                           << " layer " << layer_idx
                           << " cannot export NativeVNNI descriptor");
+                return false;
+            }
+            if (!source_engine->exportNativeVNNISourceIdentity(source_identity) ||
+                !source_identity.present ||
+                canonicalDeviceVnniCodebookId(source_identity.codebook_id) !=
+                    out.codebook_id)
+            {
+                LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: source "
+                          << grp.label << " engine for expert " << expert_id
+                          << " layer " << layer_idx
+                          << " cannot export compatible NativeVNNI source identity");
                 return false;
             }
             return true;
@@ -3393,6 +3587,7 @@ namespace llaminar2
             [&](const WeightGroup &grp,
                 int expert_id,
                 const DeviceNativeVNNIMatrixDesc &src_desc,
+                const NativeVnniSourceIdentity &source_identity,
                 uint8_t payload_bytes_per_block,
                 uint8_t is_asymmetric,
                 uint8_t has_emins) -> bool
@@ -3419,7 +3614,9 @@ namespace llaminar2
 
             if (const NativeVnniFormatInfo *vnni = vnni_info_for(grp, expert_id);
                 vnni &&
-                (src_desc.codebook_id != vnni->codebook_id ||
+                (src_desc.codebook_id != canonicalDeviceVnniCodebookId(vnni->codebook_id) ||
+                 source_identity.codebook_id != vnni->codebook_id ||
+                 source_identity.is_superblock != vnni->is_superblock ||
                  payload_bytes_per_block != static_cast<uint8_t>(vnni->payload_bytes) ||
                  (is_asymmetric != 0) != vnni->is_asymmetric ||
                  (has_emins != 0) != vnni->has_emins))
@@ -3440,7 +3637,9 @@ namespace llaminar2
             for (const auto &grp : groups)
             {
                 DeviceNativeVNNIMatrixDesc src_desc{};
-                if (!source_descriptor_for(grp, expert_id, src_desc))
+                NativeVnniSourceIdentity source_identity{};
+                if (!source_descriptor_for(
+                        grp, expert_id, src_desc, source_identity))
                 {
                     can_copy = false;
                     break;
@@ -3467,6 +3666,7 @@ namespace llaminar2
                         grp,
                         expert_id,
                         src_desc,
+                        source_identity,
                         payload_bytes_per_block,
                         is_asymmetric,
                         has_emins))
@@ -3496,7 +3696,9 @@ namespace llaminar2
                     return std::nullopt;
 
                 DeviceNativeVNNIMatrixDesc src_desc{};
-                if (!source_descriptor_for(grp, sample_expert, src_desc))
+                NativeVnniSourceIdentity source_identity{};
+                if (!source_descriptor_for(
+                        grp, sample_expert, src_desc, source_identity))
                     return std::nullopt;
 
                 uint8_t payload_bytes_per_block = 0;
@@ -3515,6 +3717,7 @@ namespace llaminar2
                         grp,
                         sample_expert,
                         src_desc,
+                        source_identity,
                         payload_bytes_per_block,
                         is_asymmetric,
                         has_emins))
@@ -3902,7 +4105,9 @@ namespace llaminar2
                 }
 
                 DeviceNativeVNNIMatrixDesc src_matrix{};
-                if (!source_descriptor_for(grp, expert_id, src_matrix))
+                NativeVnniSourceIdentity source_identity{};
+                if (!source_descriptor_for(
+                        grp, expert_id, src_matrix, source_identity))
                 {
                     publish_already_satisfied();
                     return false;
@@ -3968,6 +4173,7 @@ namespace llaminar2
                 projection.is_asymmetric = is_asymmetric != 0;
                 projection.has_emins = has_emins != 0;
                 projection.codebook_id = src_matrix.codebook_id;
+                projection.source_identity = source_identity;
                 projection.transfer_slot_lifetime = staging_lease->lifetime;
                 out.projections.push_back(std::move(projection));
                 staged_bytes += src_desc.totalBytes();
@@ -4441,8 +4647,9 @@ namespace llaminar2
                     static_cast<uint16_t *>(slot.d_native_vnni_scales),
                     static_cast<uint16_t *>(slot.d_native_vnni_mins),
                     static_cast<uint32_t *>(slot.d_native_vnni_emins),
-                    vnni.codebook_id, blocks_per_row,
-                    lifetime_owner);
+                    canonicalDeviceVnniCodebookId(vnni.codebook_id), blocks_per_row,
+                    lifetime_owner,
+                    sourceIdentityFor(vnni));
             }
 #endif
 #ifdef HAVE_ROCM
@@ -4454,8 +4661,9 @@ namespace llaminar2
                     slot.d_native_vnni_scales,
                     slot.d_native_vnni_mins,
                     slot.d_native_vnni_emins,
-                    vnni.codebook_id, blocks_per_row,
-                    lifetime_owner);
+                    canonicalDeviceVnniCodebookId(vnni.codebook_id), blocks_per_row,
+                    lifetime_owner,
+                    sourceIdentityFor(vnni));
             }
 #endif
             return nullptr;

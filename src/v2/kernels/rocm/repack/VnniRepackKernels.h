@@ -41,6 +41,9 @@ namespace llaminar2 {
  * @param output_row_offset First destination row represented by this source chunk
  * @param packed_group_rows Rows per independently addressable packed matrix;
  *        zero selects one ordinary output_N-row matrix
+ * @param allocation_payload_bytes_per_block Physical payload capacity for one
+ *        logical block; may exceed the compact live payload for recyclable
+ *        ExpertOverlay slots
  * @param stream       Exact non-null HIP producer stream
  * @return true on successful kernel launch, false on error or unsupported format
  */
@@ -59,6 +62,21 @@ bool launchVnniRepack(
  * @param d_emins      Output VNNI effective mins (uint32_t), nullptr except for Q2_K
  * @see launchVnniRepack (7-param overload) for other parameters
  */
+bool launchVnniRepack(
+    RepackFormat format,
+    const void* d_raw_blocks,
+    uint8_t* d_payload,
+    uint16_t* d_scales,
+    uint16_t* d_mins,
+    uint32_t* d_emins,
+    int N, int K,
+    int output_N,
+    int output_row_offset,
+    int packed_group_rows,
+    int allocation_payload_bytes_per_block,
+    void* stream);
+
+/** @brief Compatibility overload using compact payload allocation geometry. */
 bool launchVnniRepack(
     RepackFormat format,
     const void* d_raw_blocks,

@@ -60,40 +60,68 @@ namespace llaminar2::test::parity::qwen35moe
         }
 
         /**
+         * @brief Reject authenticated packs with the retired raw-logit key.
+         *
+         * Production CUDA and ROCm routing reuse their full probability
+         * workspace after softmax. The CPU PyTorch oracle must therefore bind
+         * `MOE_ROUTER_OUTPUT` to that same distribution, not reconstruct the
+         * pre-softmax projection under an identical filename.
+         */
+        typename Base::ReferenceSnapshotValidation
+        validateModelSpecificReferenceSnapshotMetadata(
+            const std::filesystem::path &metadata_path) const override
+        {
+            constexpr int kMoERouterSnapshotSchema = 1;
+            const auto observed = Base::readSnapshotMetadataValue(
+                metadata_path,
+                "moe_router_snapshot_schema");
+            if (!observed || *observed != std::to_string(kMoERouterSnapshotSchema))
+            {
+                return {
+                    false,
+                    "moe_router_snapshot_schema is missing or does not publish "
+                    "the post-softmax production boundary"};
+            }
+            return {true, {}};
+        }
+
+        /**
          * @brief Regenerate PyTorch snapshots using Qwen3.5 MoE-specific generator.
          *
          * The standard Qwen3.5 snapshot generator only handles dense SwiGLU FFN.
          * MoE models require a dedicated generator that uses the
          * Qwen35MoEReferenceModel from the Python registry, which hooks:
-         *   - MOE_ROUTER_OUTPUT (router logits)
+         *   - MOE_ROUTER_OUTPUT (full post-softmax router distribution)
          *   - MOE_EXPERT_OUTPUT (combined routed expert output)
          *   - MOE_SHARED_EXPERT_OUTPUT (shared expert before gate)
          *   - MOE_SHARED_GATE_OUTPUT (after sigmoid gating)
          *   - MOE_COMBINED_OUTPUT (routed + shared)
          */
-        bool regeneratePyTorchSnapshots()
+        bool regeneratePyTorchSnapshots() override
         {
             LOG_INFO("[" << Base::getBackendName()
                          << " Parity] Regenerating Qwen3.5 MoE PyTorch snapshots from GGUF: "
                          << Base::config_.model_path);
 
-            std::ostringstream cmd;
+            std::ostringstream script;
             // Source devcontainer venv if present, else fall back to system
             // python3 (CI builder image installs deps to system site-packages).
             //
             // IMPORTANT: CTest sets OMP_NUM_THREADS=1 and MKL_NUM_THREADS=1 for the
             // Llaminar test process. Unset them so PyTorch uses all available cores
             // (Qwen3.5 MoE 35B prefill is especially slow single-threaded).
-            cmd << "bash -c 'unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
-                << "[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
-                << " python/reference/generate_qwen35_moe_pipeline_snapshots.py"
-                << " --model " << Base::config_.model_path
-                << " --prompt \"" << Base::config_.prompt << "\""
-                << " --output " << Base::config_.snapshot_dir
-                << " --decode-steps " << Base::config_.decode_steps
-                << "' 2>&1";
+            script << "unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
+                   << "if [ -f /workspaces/llaminar/.venv/bin/activate ]; then "
+                   << "source /workspaces/llaminar/.venv/bin/activate; fi; "
+                   << "python3 python/reference/generate_qwen35_moe_pipeline_snapshots.py"
+                   << " --model " << Base::parityShellQuote(Base::config_.model_path)
+                   << " --prompt " << Base::parityShellQuote(Base::config_.prompt)
+                   << " --output " << Base::parityShellQuote(Base::config_.snapshot_dir)
+                   << " --decode-steps " << Base::config_.decode_steps;
+            const std::string command =
+                "bash -c " + Base::parityShellQuote(script.str()) + " 2>&1";
 
-            FILE *pipe = popen(cmd.str().c_str(), "r");
+            FILE *pipe = popen(command.c_str(), "r");
             if (!pipe)
             {
                 LOG_ERROR("[Parity] Failed to execute Qwen3.5 MoE snapshot generator");

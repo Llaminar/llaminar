@@ -10,6 +10,7 @@
 
 #ifdef HAVE_ROCM
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -120,6 +121,37 @@ namespace
             first_error = status;
             step = std::move(where);
         }
+    };
+
+    /**
+     * @brief Persistent resources for a production-shaped layered allgather graph.
+     *
+     * Qwen3.6 prefill LLEP records one compute-to-transfer event, one compact
+     * payload allgather, and one transfer-to-compute event for every routed
+     * layer. Adjacent layers use two rolling transfer lanes, while every layer
+     * owns distinct event objects so captured dependencies cannot alias a later
+     * record. This fixture mirrors that topology without loading model weights.
+     */
+    struct LayeredAllgatherGraph
+    {
+        std::array<CaptureResult, 2> results{};
+        std::array<void *, 2> compute_streams{};
+        std::array<std::array<void *, 2>, 2> transfer_streams{};
+        std::array<std::vector<hipEvent_t>, 2> compute_ready_events{};
+        std::array<std::vector<hipEvent_t>, 2> transfer_done_events{};
+        std::array<hipEvent_t, 2> start_events{};
+        std::array<hipEvent_t, 2> stop_events{};
+    };
+
+    /**
+     * @brief GPU-event distribution for one captured graph topology.
+     */
+    struct LayeredAllgatherTiming
+    {
+        double minimum_us = 0.0;
+        double median_us = 0.0;
+        double p95_us = 0.0;
+        double maximum_us = 0.0;
     };
 
     enum class RcclOverlapPattern
@@ -452,6 +484,155 @@ namespace
         t1.join();
     }
 
+    /**
+     * @brief Capture one FP16 activation allreduce, one allgather sideband,
+     *        and the activation's immediate consumer in one RCCL group.
+     *
+     * Dynamic maintenance already attaches future-epoch control traffic to an
+     * activation collective.  Current-batch LLEP may use the same mechanism
+     * only if graph construction can expose a causally valid pre-routed-FFN
+     * anchor.  This helper proves the backend primitive independently of that
+     * model-graph decision: both participant graphs must publish the reduced
+     * activation and the complete rank-major sideband on every replay.
+     *
+     * The caller performs one eager grouped launch before capture so FP16
+     * transport scratch is persistent.  No allocation, host transfer, or host
+     * synchronization occurs inside the captured transaction.
+     *
+     * @param ctx Shared two-device LocalTP RCCL context.
+     * @param tensor0 Device-0 FP32 activation buffer.
+     * @param tensor1 Device-1 FP32 activation buffer.
+     * @param stream0 Explicit capture stream for ROCm device 0.
+     * @param stream1 Explicit capture stream for ROCm device 1.
+     * @param consumer0 Persistent device-0 immediate-consumer buffer.
+     * @param consumer1 Persistent device-1 immediate-consumer buffer.
+     * @param count Number of FP32 activation elements.
+     * @param sidebands0 Device-0 sideband descriptors.
+     * @param sidebands1 Device-1 sideband descriptors.
+     * @param result0 Device-0 capture result.
+     * @param result1 Device-1 capture result.
+     */
+    void captureFP16AllreduceWithSidebandAndConsumer(
+        ILocalTPContext &ctx,
+        TensorBase *tensor0,
+        TensorBase *tensor1,
+        void *stream0,
+        void *stream1,
+        float *consumer0,
+        float *consumer1,
+        size_t count,
+        const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands0,
+        const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands1,
+        CaptureResult &result0,
+        CaptureResult &result1)
+    {
+        ASSERT_NE(tensor0, nullptr);
+        ASSERT_NE(tensor1, nullptr);
+        ASSERT_NE(stream0, nullptr);
+        ASSERT_NE(stream1, nullptr);
+        ASSERT_NE(consumer0, nullptr);
+        ASSERT_NE(consumer1, nullptr);
+        ASSERT_FALSE(sidebands0.empty());
+        ASSERT_EQ(sidebands0.size(), sidebands1.size());
+
+        Barrier ready_to_capture(2);
+        Barrier collective_recorded(2);
+
+        auto capture_worker =
+            [&](int device,
+                TensorBase *tensor,
+                void *stream,
+                float *consumer,
+                const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands,
+                CaptureResult *result)
+        {
+            result->begin_status = hipSetDevice(device);
+            if (result->begin_status == hipSuccess)
+            {
+                result->begin_status = hipStreamBeginCapture(
+                    static_cast<hipStream_t>(stream),
+                    hipStreamCaptureModeRelaxed);
+            }
+
+            ready_to_capture.arriveAndWait();
+
+            if (result->begin_status == hipSuccess)
+            {
+                GraphCaptureGuard guard;
+                result->collective_ok = ctx.allreduceWithSidebandsOnStream(
+                    tensor,
+                    "layer0_moe_combined_allreduce_with_rebalance_sidebands",
+                    count,
+                    stream,
+                    "fp16",
+                    *sidebands,
+                    device);
+                if (result->collective_ok)
+                {
+                    result->launch_status = hipMemcpyAsync(
+                        consumer,
+                        tensor->gpu_data_ptr(),
+                        count * sizeof(float),
+                        hipMemcpyDeviceToDevice,
+                        static_cast<hipStream_t>(stream));
+                }
+            }
+
+            /*
+             * The final participant submits the complete multi-stream RCCL
+             * group.  Keep both relaxed captures live until that rendezvous
+             * has returned so neither graph ends with a partial collective.
+             */
+            collective_recorded.arriveAndWait();
+
+            if (result->begin_status == hipSuccess &&
+                result->launch_status == hipSuccess &&
+                result->collective_ok)
+            {
+                result->end_status = hipSetDevice(device);
+                if (result->end_status == hipSuccess)
+                {
+                    result->end_status = hipStreamEndCapture(
+                        static_cast<hipStream_t>(stream),
+                        &result->graph);
+                }
+            }
+
+            if (result->end_status == hipSuccess && result->graph)
+            {
+                result->instantiate_status = hipSetDevice(device);
+                if (result->instantiate_status == hipSuccess)
+                {
+                    result->instantiate_status = hipGraphInstantiate(
+                        &result->exec,
+                        result->graph,
+                        nullptr,
+                        nullptr,
+                        0);
+                }
+            }
+        };
+
+        std::thread worker0(
+            capture_worker,
+            0,
+            tensor0,
+            stream0,
+            consumer0,
+            &sidebands0,
+            &result0);
+        std::thread worker1(
+            capture_worker,
+            1,
+            tensor1,
+            stream1,
+            consumer1,
+            &sidebands1,
+            &result1);
+        worker0.join();
+        worker1.join();
+    }
+
     void captureMaintenanceRawAllgatherGraph(
         ILocalTPContext &ctx,
         TensorBase *send0,
@@ -600,6 +781,362 @@ namespace
             backend->destroyStream(graph.transfer_stream1, 1);
             graph.transfer_stream1 = nullptr;
         }
+    }
+
+    /**
+     * @brief Allocate streams and per-layer event identities before capture.
+     *
+     * @param backend ROCm backend that owns the explicit streams.
+     * @param layer_count Number of MoE layer transactions recorded in the graph.
+     * @param graph Resource bundle to populate.
+     */
+    void createLayeredAllgatherResources(
+        IBackend *backend,
+        size_t layer_count,
+        LayeredAllgatherGraph &graph)
+    {
+        ASSERT_NE(backend, nullptr);
+        ASSERT_GT(layer_count, 0u);
+
+        for (int participant = 0; participant < 2; ++participant)
+        {
+            ASSERT_EQ(hipSetDevice(participant), hipSuccess);
+            graph.compute_streams[static_cast<size_t>(participant)] =
+                backend->createStream(participant);
+            ASSERT_NE(
+                graph.compute_streams[static_cast<size_t>(participant)],
+                nullptr);
+
+            for (size_t lane = 0; lane < 2; ++lane)
+            {
+                graph.transfer_streams[static_cast<size_t>(participant)][lane] =
+                    backend->createStream(participant);
+                ASSERT_NE(
+                    graph.transfer_streams[static_cast<size_t>(participant)][lane],
+                    nullptr);
+            }
+
+            auto &ready =
+                graph.compute_ready_events[static_cast<size_t>(participant)];
+            auto &done =
+                graph.transfer_done_events[static_cast<size_t>(participant)];
+            ready.resize(layer_count, nullptr);
+            done.resize(layer_count, nullptr);
+            for (size_t layer = 0; layer < layer_count; ++layer)
+            {
+                ASSERT_EQ(
+                    hipEventCreateWithFlags(
+                        &ready[layer],
+                        hipEventDisableTiming),
+                    hipSuccess);
+                ASSERT_EQ(
+                    hipEventCreateWithFlags(
+                        &done[layer],
+                        hipEventDisableTiming),
+                    hipSuccess);
+            }
+
+            ASSERT_EQ(
+                hipEventCreateWithFlags(
+                    &graph.start_events[static_cast<size_t>(participant)],
+                    hipEventDefault),
+                hipSuccess);
+            ASSERT_EQ(
+                hipEventCreateWithFlags(
+                    &graph.stop_events[static_cast<size_t>(participant)],
+                    hipEventDefault),
+                hipSuccess);
+        }
+    }
+
+    /**
+     * @brief Release a layered graph after all replay and observation ends.
+     *
+     * Graph executables are destroyed before events, streams, and the RCCL
+     * context because their nodes retain those resource identities.
+     */
+    void destroyLayeredAllgatherResources(
+        IBackend *backend,
+        LayeredAllgatherGraph &graph)
+    {
+        ASSERT_NE(backend, nullptr);
+        for (int participant = 0; participant < 2; ++participant)
+        {
+            const size_t index = static_cast<size_t>(participant);
+            EXPECT_EQ(hipSetDevice(participant), hipSuccess);
+            destroyCaptureResult(graph.results[index]);
+
+            for (hipEvent_t event : graph.compute_ready_events[index])
+            {
+                if (event)
+                    EXPECT_EQ(hipEventDestroy(event), hipSuccess);
+            }
+            for (hipEvent_t event : graph.transfer_done_events[index])
+            {
+                if (event)
+                    EXPECT_EQ(hipEventDestroy(event), hipSuccess);
+            }
+            graph.compute_ready_events[index].clear();
+            graph.transfer_done_events[index].clear();
+
+            if (graph.start_events[index])
+            {
+                EXPECT_EQ(hipEventDestroy(graph.start_events[index]), hipSuccess);
+                graph.start_events[index] = nullptr;
+            }
+            if (graph.stop_events[index])
+            {
+                EXPECT_EQ(hipEventDestroy(graph.stop_events[index]), hipSuccess);
+                graph.stop_events[index] = nullptr;
+            }
+            for (size_t lane = 0; lane < 2; ++lane)
+            {
+                if (graph.transfer_streams[index][lane])
+                {
+                    backend->destroyStream(
+                        graph.transfer_streams[index][lane],
+                        participant);
+                    graph.transfer_streams[index][lane] = nullptr;
+                }
+            }
+            if (graph.compute_streams[index])
+            {
+                backend->destroyStream(
+                    graph.compute_streams[index],
+                    participant);
+                graph.compute_streams[index] = nullptr;
+            }
+        }
+    }
+
+    /**
+     * @brief Capture the same fixed-size allgather once per modeled MoE layer.
+     *
+     * With @p auxiliary_lanes false, all collectives are recorded directly on
+     * the graph's compute stream. With it true, layer N records the production
+     * compute -> lane(N % 2) -> compute event chain around its allgather. The
+     * latter is the topology used by transfer-backed prefill LLEP.
+     *
+     * @param ctx Production LocalTP collective authority.
+     * @param send_buffers Participant-local compact payloads.
+     * @param recv_buffers Participant-local rank-major gathered payloads.
+     * @param send_count Number of INT8 payload bytes contributed per participant.
+     * @param layer_count Number of repeated layer transactions to capture.
+     * @param auxiliary_lanes Whether to route collectives through two transfer lanes.
+     * @param graph Preallocated graph resource bundle.
+     */
+    void captureLayeredAllgatherGraph(
+        ILocalTPContext &ctx,
+        const std::array<const void *, 2> &send_buffers,
+        const std::array<void *, 2> &recv_buffers,
+        size_t send_count,
+        size_t layer_count,
+        bool auxiliary_lanes,
+        LayeredAllgatherGraph &graph)
+    {
+        Barrier capture_started(2);
+        Barrier all_collectives_recorded(2);
+
+        auto capture_worker = [&](int participant)
+        {
+            const size_t index = static_cast<size_t>(participant);
+            CaptureResult &result = graph.results[index];
+            auto compute_stream =
+                static_cast<hipStream_t>(graph.compute_streams[index]);
+
+            result.begin_status = hipSetDevice(participant);
+            if (result.begin_status == hipSuccess)
+            {
+                result.begin_status = hipStreamBeginCapture(
+                    compute_stream,
+                    hipStreamCaptureModeRelaxed);
+            }
+
+            capture_started.arriveAndWait();
+            result.collective_ok = result.begin_status == hipSuccess;
+            if (result.collective_ok)
+            {
+                GraphCaptureGuard guard;
+                for (size_t layer = 0; layer < layer_count; ++layer)
+                {
+                    void *collective_stream = graph.compute_streams[index];
+                    if (auxiliary_lanes)
+                    {
+                        const size_t lane = layer % 2u;
+                        collective_stream = graph.transfer_streams[index][lane];
+                        result.launch_status = hipEventRecord(
+                            graph.compute_ready_events[index][layer],
+                            compute_stream);
+                        if (result.launch_status == hipSuccess)
+                        {
+                            result.launch_status = hipStreamWaitEvent(
+                                static_cast<hipStream_t>(collective_stream),
+                                graph.compute_ready_events[index][layer],
+                                0);
+                        }
+                    }
+
+                    const bool gathered = ctx.allgatherRawOnStream(
+                        send_buffers[index],
+                        recv_buffers[index],
+                        send_count,
+                        CollectiveDataType::INT8,
+                        participant,
+                        collective_stream,
+                        auxiliary_lanes
+                            ? "rccl_llep_layered_auxiliary_allgather"
+                            : "rccl_llep_layered_compute_allgather");
+                    result.collective_ok = result.collective_ok && gathered;
+
+                    if (auxiliary_lanes &&
+                        result.launch_status == hipSuccess)
+                    {
+                        result.launch_status = hipEventRecord(
+                            graph.transfer_done_events[index][layer],
+                            static_cast<hipStream_t>(collective_stream));
+                        if (result.launch_status == hipSuccess)
+                        {
+                            result.launch_status = hipStreamWaitEvent(
+                                compute_stream,
+                                graph.transfer_done_events[index][layer],
+                                0);
+                        }
+                    }
+                }
+            }
+
+            all_collectives_recorded.arriveAndWait();
+            if (result.begin_status == hipSuccess &&
+                result.launch_status == hipSuccess &&
+                result.collective_ok)
+            {
+                result.end_status = hipStreamEndCapture(
+                    compute_stream,
+                    &result.graph);
+            }
+            if (result.end_status == hipSuccess && result.graph)
+            {
+                result.instantiate_status = hipGraphInstantiate(
+                    &result.exec,
+                    result.graph,
+                    nullptr,
+                    nullptr,
+                    0);
+            }
+        };
+
+        std::thread worker0(capture_worker, 0);
+        std::thread worker1(capture_worker, 1);
+        worker0.join();
+        worker1.join();
+    }
+
+    /**
+     * @brief Measure one paired graph replay with events on both compute streams.
+     *
+     * The stop event follows the graph launch on the compute stream. Auxiliary
+     * work is included because every transfer lane explicitly rejoins that
+     * stream before graph completion.
+     */
+    double measureLayeredAllgatherGraphOnce(LayeredAllgatherGraph &graph)
+    {
+        Barrier replay_started(2);
+        std::array<hipError_t, 2> statuses{hipSuccess, hipSuccess};
+        std::array<double, 2> elapsed_us{0.0, 0.0};
+
+        auto replay_worker = [&](int participant)
+        {
+            const size_t index = static_cast<size_t>(participant);
+            auto compute_stream =
+                static_cast<hipStream_t>(graph.compute_streams[index]);
+            hipError_t &status = statuses[index];
+            status = hipSetDevice(participant);
+            replay_started.arriveAndWait();
+            if (status == hipSuccess)
+            {
+                status = hipEventRecord(
+                    graph.start_events[index],
+                    compute_stream);
+            }
+            if (status == hipSuccess)
+            {
+                status = hipGraphLaunch(
+                    graph.results[index].exec,
+                    compute_stream);
+            }
+            if (status == hipSuccess)
+            {
+                status = hipEventRecord(
+                    graph.stop_events[index],
+                    compute_stream);
+            }
+            if (status == hipSuccess)
+                status = hipEventSynchronize(graph.stop_events[index]);
+            if (status == hipSuccess)
+            {
+                float elapsed_ms = 0.0f;
+                status = hipEventElapsedTime(
+                    &elapsed_ms,
+                    graph.start_events[index],
+                    graph.stop_events[index]);
+                elapsed_us[index] = static_cast<double>(elapsed_ms) * 1000.0;
+            }
+        };
+
+        std::thread worker0(replay_worker, 0);
+        std::thread worker1(replay_worker, 1);
+        worker0.join();
+        worker1.join();
+
+        EXPECT_EQ(statuses[0], hipSuccess)
+            << "participant 0 replay: " << hipGetErrorString(statuses[0]);
+        EXPECT_EQ(statuses[1], hipSuccess)
+            << "participant 1 replay: " << hipGetErrorString(statuses[1]);
+        return std::max(elapsed_us[0], elapsed_us[1]);
+    }
+
+    /**
+     * @brief Warm and summarize repeated paired graph replays.
+     */
+    LayeredAllgatherTiming benchmarkLayeredAllgatherGraph(
+        LayeredAllgatherGraph &graph,
+        int warmup_iterations,
+        int measured_iterations)
+    {
+        EXPECT_GE(warmup_iterations, 0);
+        EXPECT_GT(measured_iterations, 0);
+        for (int iteration = 0; iteration < warmup_iterations; ++iteration)
+            (void)measureLayeredAllgatherGraphOnce(graph);
+
+        std::vector<double> samples;
+        samples.reserve(static_cast<size_t>(measured_iterations));
+        for (int iteration = 0; iteration < measured_iterations; ++iteration)
+            samples.push_back(measureLayeredAllgatherGraphOnce(graph));
+        std::sort(samples.begin(), samples.end());
+
+        LayeredAllgatherTiming timing;
+        if (samples.empty())
+            return timing;
+        timing.minimum_us = samples.front();
+        timing.median_us = samples[samples.size() / 2u];
+        const size_t p95_index = std::min(
+            samples.size() - 1u,
+            (samples.size() * 95u) / 100u);
+        timing.p95_us = samples[p95_index];
+        timing.maximum_us = samples.back();
+        return timing;
+    }
+
+    /**
+     * @brief Return the number of native nodes retained by one HIP graph.
+     */
+    size_t layeredAllgatherNodeCount(const CaptureResult &result)
+    {
+        size_t node_count = 0;
+        EXPECT_NE(result.graph, nullptr);
+        if (result.graph)
+            EXPECT_EQ(hipGraphGetNodes(result.graph, nullptr, &node_count), hipSuccess);
+        return node_count;
     }
 
     void captureMaintenanceGroupedP2PGraph(
@@ -1193,6 +1730,292 @@ namespace
         rocm_backend->destroyStream(maintenance_stream1, 1);
     }
 } // namespace
+
+/**
+ * @brief Captured RCCL activation and allgather sidebands publish atomically.
+ *
+ * This is the ROCm peer of the NCCL grouped-sideband regression.  It proves
+ * the exact primitive needed to carry an LLEP expert payload on a causally
+ * independent activation collective: FP16 activation transport, an INT32
+ * rank-major allgather, and the activation's first consumer all remain inside
+ * each participant's complete captured graph.  Two replays with different
+ * values reject an eager-warmup or stale-buffer false positive.
+ */
+TEST(
+    Test__LocalTPRCCLGraphCapture,
+    RCCLFP16AllreduceWithAllgatherSidebandGraph_EveryReplayPublishesWholeBundle)
+{
+    auto *rocm_backend = getROCmBackend();
+    ASSERT_NE(rocm_backend, nullptr);
+    if (rocm_backend->deviceCount() < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ ROCm GPUs, found "
+                     << rocm_backend->deviceCount();
+    }
+
+    constexpr size_t kPromptRows = 9;
+    constexpr size_t kQwen36MoEHiddenDim = 2048;
+    constexpr size_t kElementCount =
+        kPromptRows * kQwen36MoEHiddenDim;
+    constexpr size_t kSidebandElementCount = 128;
+    constexpr size_t kGatheredSidebandElementCount =
+        2 * kSidebandElementCount;
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::rocm(0),
+        GlobalDeviceAddress::rocm(1)};
+    auto ctx = createLocalTPContext(
+        devices,
+        {},
+        CollectiveBackendType::RCCL);
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_TRUE(ctx->supportsCollectiveSidebandOnStreamGraphCapture());
+
+    auto tensor0 = TestTensorFactory::createFP32({kElementCount});
+    auto tensor1 = TestTensorFactory::createFP32({kElementCount});
+    TestTensorFactory::fillValue(tensor0.get(), 1.0f);
+    TestTensorFactory::fillValue(tensor1.get(), 2.0f);
+    ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::rocm(0)));
+    ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::rocm(1)));
+
+    int32_t *sideband_send0 = nullptr;
+    int32_t *sideband_send1 = nullptr;
+    int32_t *sideband_recv0 = nullptr;
+    int32_t *sideband_recv1 = nullptr;
+    allocateAndUpload<int32_t>(
+        0,
+        std::vector<int32_t>(kSidebandElementCount, 11),
+        &sideband_send0);
+    allocateAndUpload<int32_t>(
+        1,
+        std::vector<int32_t>(kSidebandElementCount, 22),
+        &sideband_send1);
+    allocateAndUpload<int32_t>(
+        0,
+        std::vector<int32_t>(kGatheredSidebandElementCount, -1),
+        &sideband_recv0);
+    allocateAndUpload<int32_t>(
+        1,
+        std::vector<int32_t>(kGatheredSidebandElementCount, -1),
+        &sideband_recv1);
+
+    const std::vector<LocalTPCollectiveSidebandBuffer> sidebands0 = {
+        LocalTPCollectiveSidebandBuffer{
+            .kind = LocalTPCollectiveSidebandKind::Allgather,
+            .send_buffer = sideband_send0,
+            .recv_buffer = sideband_recv0,
+            .element_count = kSidebandElementCount,
+            .dtype = CollectiveDataType::INT32,
+            .root_device_index = 0,
+            .name = "moe_rebalance_histogram_sideband"}};
+    const std::vector<LocalTPCollectiveSidebandBuffer> sidebands1 = {
+        LocalTPCollectiveSidebandBuffer{
+            .kind = LocalTPCollectiveSidebandKind::Allgather,
+            .send_buffer = sideband_send1,
+            .recv_buffer = sideband_recv1,
+            .element_count = kSidebandElementCount,
+            .dtype = CollectiveDataType::INT32,
+            .root_device_index = 0,
+            .name = "moe_rebalance_histogram_sideband"}};
+
+    void *stream0 = rocm_backend->createStream(0);
+    void *stream1 = rocm_backend->createStream(1);
+    ASSERT_NE(stream0, nullptr);
+    ASSERT_NE(stream1, nullptr);
+    float *consumer0 = nullptr;
+    float *consumer1 = nullptr;
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&consumer0),
+            kElementCount * sizeof(float)),
+        hipSuccess);
+    ASSERT_EQ(hipSetDevice(1), hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&consumer1),
+            kElementCount * sizeof(float)),
+        hipSuccess);
+
+    /*
+     * LocalTP owns persistent FP16 conversion buffers.  Materialize them and
+     * validate the same grouped RCCL call before capture so capture itself is
+     * allocation-free.
+     */
+    bool warmup0 = false;
+    bool warmup1 = false;
+    std::thread warmup_worker0(
+        [&]
+        {
+            ASSERT_EQ(hipSetDevice(0), hipSuccess);
+            warmup0 = ctx->allreduceWithSidebandsOnStream(
+                tensor0.get(),
+                "warmup_moe_combined_allreduce_with_rebalance_sidebands",
+                kElementCount,
+                stream0,
+                "fp16",
+                sidebands0,
+                0);
+        });
+    std::thread warmup_worker1(
+        [&]
+        {
+            ASSERT_EQ(hipSetDevice(1), hipSuccess);
+            warmup1 = ctx->allreduceWithSidebandsOnStream(
+                tensor1.get(),
+                "warmup_moe_combined_allreduce_with_rebalance_sidebands",
+                kElementCount,
+                stream1,
+                "fp16",
+                sidebands1,
+                1);
+        });
+    warmup_worker0.join();
+    warmup_worker1.join();
+    ASSERT_TRUE(warmup0);
+    ASSERT_TRUE(warmup1);
+    ASSERT_TRUE(rocm_backend->synchronizeStream(stream0, 0));
+    ASSERT_TRUE(rocm_backend->synchronizeStream(stream1, 1));
+
+    CaptureResult result0;
+    CaptureResult result1;
+    captureFP16AllreduceWithSidebandAndConsumer(
+        *ctx,
+        tensor0.get(),
+        tensor1.get(),
+        stream0,
+        stream1,
+        consumer0,
+        consumer1,
+        kElementCount,
+        sidebands0,
+        sidebands1,
+        result0,
+        result1);
+    expectCapturedGraphReady(result0, "fp16_sideband_bundle_graph0");
+    expectCapturedGraphReady(result1, "fp16_sideband_bundle_graph1");
+    ASSERT_FALSE(::testing::Test::HasFailure());
+
+    std::cout
+        << "[RCCL_FP16_ALLREDUCE_ALLGATHER_SIDEBAND]"
+        << " graph_nodes="
+        << layeredAllgatherNodeCount(result0) << ','
+        << layeredAllgatherNodeCount(result1)
+        << std::endl;
+
+    const auto replay_and_expect =
+        [&](float value0,
+            float value1,
+            int32_t sideband_value0,
+            int32_t sideband_value1)
+    {
+        const std::vector<float> input0(kElementCount, value0);
+        const std::vector<float> input1(kElementCount, value1);
+        const std::vector<int32_t> sideband_input0(
+            kSidebandElementCount,
+            sideband_value0);
+        const std::vector<int32_t> sideband_input1(
+            kSidebandElementCount,
+            sideband_value1);
+
+        ASSERT_EQ(hipSetDevice(0), hipSuccess);
+        ASSERT_EQ(
+            hipMemcpy(
+                tensor0->gpu_data_ptr(),
+                input0.data(),
+                kElementCount * sizeof(float),
+                hipMemcpyHostToDevice),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpy(
+                sideband_send0,
+                sideband_input0.data(),
+                kSidebandElementCount * sizeof(int32_t),
+                hipMemcpyHostToDevice),
+            hipSuccess);
+        ASSERT_EQ(hipSetDevice(1), hipSuccess);
+        ASSERT_EQ(
+            hipMemcpy(
+                tensor1->gpu_data_ptr(),
+                input1.data(),
+                kElementCount * sizeof(float),
+                hipMemcpyHostToDevice),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpy(
+                sideband_send1,
+                sideband_input1.data(),
+                kSidebandElementCount * sizeof(int32_t),
+                hipMemcpyHostToDevice),
+            hipSuccess);
+
+        ASSERT_EQ(hipSetDevice(0), hipSuccess);
+        result0.launch_status = hipGraphLaunch(
+            result0.exec,
+            static_cast<hipStream_t>(stream0));
+        ASSERT_EQ(result0.launch_status, hipSuccess)
+            << hipGetErrorString(result0.launch_status);
+        ASSERT_EQ(hipSetDevice(1), hipSuccess);
+        result1.launch_status = hipGraphLaunch(
+            result1.exec,
+            static_cast<hipStream_t>(stream1));
+        ASSERT_EQ(result1.launch_status, hipSuccess)
+            << hipGetErrorString(result1.launch_status);
+        ASSERT_TRUE(rocm_backend->synchronizeStream(stream0, 0));
+        ASSERT_TRUE(rocm_backend->synchronizeStream(stream1, 1));
+
+        std::vector<float> output0(kElementCount, 0.0f);
+        std::vector<float> output1(kElementCount, 0.0f);
+        std::vector<int32_t> gathered0(
+            kGatheredSidebandElementCount,
+            0);
+        std::vector<int32_t> gathered1(
+            kGatheredSidebandElementCount,
+            0);
+        downloadDeviceVector(0, consumer0, &output0);
+        downloadDeviceVector(1, consumer1, &output1);
+        downloadDeviceVector(0, sideband_recv0, &gathered0);
+        downloadDeviceVector(1, sideband_recv1, &gathered1);
+
+        const float expected_activation = value0 + value1;
+        for (size_t element = 0; element < kElementCount; ++element)
+        {
+            ASSERT_FLOAT_EQ(output0[element], expected_activation)
+                << "device0 immediate consumer mismatch at element "
+                << element;
+            ASSERT_FLOAT_EQ(output1[element], expected_activation)
+                << "device1 immediate consumer mismatch at element "
+                << element;
+        }
+        for (size_t element = 0;
+             element < kSidebandElementCount;
+             ++element)
+        {
+            ASSERT_EQ(gathered0[element], sideband_value0);
+            ASSERT_EQ(
+                gathered0[kSidebandElementCount + element],
+                sideband_value1);
+            ASSERT_EQ(gathered1[element], sideband_value0);
+            ASSERT_EQ(
+                gathered1[kSidebandElementCount + element],
+                sideband_value1);
+        }
+    };
+
+    replay_and_expect(4.0f, 5.0f, 101, 202);
+    replay_and_expect(7.0f, 8.0f, 303, 404);
+
+    destroyCaptureResult(result0);
+    destroyCaptureResult(result1);
+    freeDevicePtr(0, consumer0);
+    freeDevicePtr(1, consumer1);
+    freeDevicePtr(0, sideband_send0);
+    freeDevicePtr(1, sideband_send1);
+    freeDevicePtr(0, sideband_recv0);
+    freeDevicePtr(1, sideband_recv1);
+    rocm_backend->destroyStream(stream0, 0);
+    rocm_backend->destroyStream(stream1, 1);
+}
 
 TEST(Test__LocalTPRCCLGraphCapture, RCCLAllreduce_OnStreamGraphCapture_Completes)
 {
@@ -2382,6 +3205,157 @@ TEST(Test__LocalTPRCCLGraphCapture, RCCLRawAllgather_GraphCapturedLargeBackToBac
     freeDevicePtr(1, recv_k1);
     freeDevicePtr(0, recv_v0);
     freeDevicePtr(1, recv_v1);
+}
+
+/**
+ * @brief Measure the exact repeated RCCL topology used by Qwen3.6 prefill LLEP.
+ *
+ * A forced real-weight Qwen3.6-35B run moves one 1,900,800-byte prepared expert
+ * slot in each of forty routed layers. Isolated payload kernels and one raw
+ * allgather are much faster than the observed whole-graph regression, so this
+ * probe separates two possible transport costs while retaining production
+ * capture semantics:
+ *
+ *  - forty allgathers recorded directly on each participant compute stream;
+ *  - forty allgathers on two rolling transfer lanes, with distinct per-layer
+ *    compute-ready and transfer-done events.
+ *
+ * Both variants are complete participant-local HIP graphs over the production
+ * LocalTPContext/RCCL API. Timing uses device events, while terminal host reads
+ * validate the rank-major gathered bytes. Results are diagnostic rather than a
+ * fixed hardware threshold; the model-level economy gate owns the speed target.
+ */
+TEST(Test__LocalTPRCCLGraphCapture,
+     RCCLRawAllgather_GraphCapturedQwen36LLEPFortyLayerScalingProbe)
+{
+    auto *rocm_backend = getROCmBackend();
+    ASSERT_NE(rocm_backend, nullptr);
+    if (rocm_backend->deviceCount() < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ ROCm GPUs, found "
+                     << rocm_backend->deviceCount();
+    }
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::rocm(0),
+        GlobalDeviceAddress::rocm(1)};
+    auto ctx = createLocalTPContext(
+        devices,
+        {},
+        CollectiveBackendType::RCCL);
+    ASSERT_NE(ctx, nullptr);
+    ASSERT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+
+    constexpr size_t kPreparedExpertPayloadBytes = 1'900'800u;
+    constexpr size_t kRoutedLayerCount = 40u;
+    constexpr int kWarmupIterations = 3;
+    constexpr int kMeasuredIterations = 12;
+
+    int8_t *send0 = nullptr;
+    int8_t *send1 = nullptr;
+    int8_t *recv0 = nullptr;
+    int8_t *recv1 = nullptr;
+    allocateAndUpload<int8_t>(
+        0,
+        std::vector<int8_t>(kPreparedExpertPayloadBytes, 3),
+        &send0);
+    allocateAndUpload<int8_t>(
+        1,
+        std::vector<int8_t>(kPreparedExpertPayloadBytes, 5),
+        &send1);
+    allocateAndUpload<int8_t>(
+        0,
+        std::vector<int8_t>(kPreparedExpertPayloadBytes * 2u, -1),
+        &recv0);
+    allocateAndUpload<int8_t>(
+        1,
+        std::vector<int8_t>(kPreparedExpertPayloadBytes * 2u, -1),
+        &recv1);
+
+    const std::array<const void *, 2> send_buffers{send0, send1};
+    const std::array<void *, 2> recv_buffers{recv0, recv1};
+    LayeredAllgatherTiming direct_timing;
+    LayeredAllgatherTiming auxiliary_timing;
+    std::array<size_t, 2> direct_nodes{};
+    std::array<size_t, 2> auxiliary_nodes{};
+
+    auto run_variant = [&](bool auxiliary_lanes,
+                           LayeredAllgatherTiming &timing,
+                           std::array<size_t, 2> &node_counts)
+    {
+        LayeredAllgatherGraph graph;
+        createLayeredAllgatherResources(
+            rocm_backend,
+            kRoutedLayerCount,
+            graph);
+        captureLayeredAllgatherGraph(
+            *ctx,
+            send_buffers,
+            recv_buffers,
+            kPreparedExpertPayloadBytes,
+            kRoutedLayerCount,
+            auxiliary_lanes,
+            graph);
+
+        expectCapturedGraphReady(graph.results[0], "layered allgather graph 0");
+        expectCapturedGraphReady(graph.results[1], "layered allgather graph 1");
+        if (!::testing::Test::HasFailure())
+        {
+            node_counts[0] = layeredAllgatherNodeCount(graph.results[0]);
+            node_counts[1] = layeredAllgatherNodeCount(graph.results[1]);
+            timing = benchmarkLayeredAllgatherGraph(
+                graph,
+                kWarmupIterations,
+                kMeasuredIterations);
+        }
+        destroyLayeredAllgatherResources(rocm_backend, graph);
+    };
+
+    run_variant(false, direct_timing, direct_nodes);
+    if (!::testing::Test::HasFailure())
+        run_variant(true, auxiliary_timing, auxiliary_nodes);
+
+    if (!::testing::Test::HasFailure())
+    {
+        EXPECT_GT(direct_timing.median_us, 0.0);
+        EXPECT_GT(auxiliary_timing.median_us, 0.0);
+        std::cout
+            << "[RCCL_QWEN36_LLEP_LAYER_SCALING]"
+            << " payload_bytes=" << kPreparedExpertPayloadBytes
+            << " layers=" << kRoutedLayerCount
+            << " direct_nodes=" << direct_nodes[0] << ',' << direct_nodes[1]
+            << " direct_median_us=" << direct_timing.median_us
+            << " direct_per_layer_us="
+            << direct_timing.median_us / static_cast<double>(kRoutedLayerCount)
+            << " direct_p95_us=" << direct_timing.p95_us
+            << " auxiliary_nodes=" << auxiliary_nodes[0] << ',' << auxiliary_nodes[1]
+            << " auxiliary_median_us=" << auxiliary_timing.median_us
+            << " auxiliary_per_layer_us="
+            << auxiliary_timing.median_us / static_cast<double>(kRoutedLayerCount)
+            << " auxiliary_p95_us=" << auxiliary_timing.p95_us
+            << std::endl;
+
+        std::vector<int8_t> recv_host0(kPreparedExpertPayloadBytes * 2u);
+        std::vector<int8_t> recv_host1(kPreparedExpertPayloadBytes * 2u);
+        downloadDeviceVector(0, recv0, &recv_host0);
+        downloadDeviceVector(1, recv1, &recv_host1);
+        for (size_t byte = 0; byte < kPreparedExpertPayloadBytes; byte += 4096u)
+        {
+            EXPECT_EQ(recv_host0[byte], 3)
+                << "device 0 rank-0 shard mismatch at byte " << byte;
+            EXPECT_EQ(recv_host0[kPreparedExpertPayloadBytes + byte], 5)
+                << "device 0 rank-1 shard mismatch at byte " << byte;
+            EXPECT_EQ(recv_host1[byte], 3)
+                << "device 1 rank-0 shard mismatch at byte " << byte;
+            EXPECT_EQ(recv_host1[kPreparedExpertPayloadBytes + byte], 5)
+                << "device 1 rank-1 shard mismatch at byte " << byte;
+        }
+    }
+
+    freeDevicePtr(0, send0);
+    freeDevicePtr(1, send1);
+    freeDevicePtr(0, recv0);
+    freeDevicePtr(1, recv1);
 }
 
 TEST(Test__LocalTPRCCLGraphCapture, RCCLGroupedP2PMaintenanceGraph_AuxiliaryStream_TimingProbe)

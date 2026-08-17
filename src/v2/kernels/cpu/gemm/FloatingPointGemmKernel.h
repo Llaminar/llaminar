@@ -1319,6 +1319,38 @@ namespace llaminar2
 
             ~FloatingPointGemmKernel() override = default;
 
+            /** @brief Export the engine's exact live row-major CPU weights. */
+            bool exportContiguousFloatingPointWeights(
+                ContiguousFloatingPointWeightDescriptor &out) const override
+            {
+                out = {};
+                if (!weight_tensor_)
+                    return false;
+                out = {
+                    .data = weight_tensor_->raw_data(),
+                    .type = weight_type_,
+                    .n = static_cast<int>(weight_tensor_->rows()),
+                    .k = static_cast<int>(weight_tensor_->cols()),
+                    .bytes = weight_tensor_->size_bytes(),
+                };
+                return out.valid();
+            }
+
+            /** @brief Expose a retired slot's final row-major storage. */
+            std::span<std::uint8_t>
+            exportRetiredCPUFloatingPointStorage() noexcept override
+            {
+                if (!weight_tensor_)
+                    return {};
+                void *bytes =
+                    const_cast<TensorBase *>(weight_tensor_)->raw_mutable_data();
+                return bytes
+                           ? std::span<std::uint8_t>(
+                                 static_cast<std::uint8_t *>(bytes),
+                                 weight_tensor_->size_bytes())
+                           : std::span<std::uint8_t>{};
+            }
+
             /**
              * @brief Check device support (CPU-only for OneDNN)
              */
@@ -1786,7 +1818,8 @@ namespace llaminar2
                     static_cast<size_t>(m) * static_cast<size_t>(k);
                 if (swiglu_scratch_tls.size() < elements)
                     swiglu_scratch_tls.resize(elements);
-                const bool perf_enabled = PerfStatsCollector::isEnabled();
+                const bool perf_enabled =
+                    PerfStatsCollector::isDomainEnabled("kernel");
                 auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                                : PerfStatsCollector::Clock::time_point{};
                 primitives::compute_swiglu(
@@ -1865,7 +1898,7 @@ namespace llaminar2
                     k,
                     1);
 
-                if (PerfStatsCollector::isEnabled())
+                if (PerfStatsCollector::isDomainEnabled("kernel"))
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
@@ -1891,6 +1924,170 @@ namespace llaminar2
                                 {"n", std::to_string(n)},
                                 {"k", std::to_string(k)}});
                     }
+                }
+                return true;
+            }
+
+            /**
+             * @brief Report the first-class CPU floating projection-bundle path.
+             *
+             * Floating projections do not share activation quantization, but the
+             * bundle still owns validation and execution as one typed operation.
+             * This prevents stages from rebuilding a failed bundle through the
+             * polymorphic single-projection entry point.
+             */
+            bool supports_fused_projection() const override { return true; }
+
+            /**
+             * @brief Execute a homogeneous floating-point projection bundle.
+             *
+             * Every descriptor is authenticated before the first output is
+             * touched. The backend then invokes the native oneDNN primitive for
+             * each independent weight matrix directly; unlike the retired
+             * interface default, this method never calls multiply_tensor() and
+             * cannot silently cross into another kernel implementation.
+             *
+             * @param input Shared activation matrix with shape at least `[m,k]`.
+             * @param projections Homogeneous FP32, FP16, or BF16 projections.
+             * @param m Runtime row count.
+             * @param k Shared reduction width.
+             * @param mpi_ctx Unused for this rank-local CPU implementation.
+             * @param workspace Unused because oneDNN owns its internal scratch.
+             * @return true only after every projection completed successfully.
+             */
+            bool multiply_fused_tensor(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m,
+                int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override
+            {
+                (void)mpi_ctx;
+                (void)workspace;
+
+                if (!weight_tensor_ || !input || projections.empty() ||
+                    m <= 0 || k <= 0 || input->native_type() != weight_type_ ||
+                    input->numel() < static_cast<size_t>(m) * k)
+                {
+                    LOG_ERROR("[FloatingPointGemmKernel] Invalid fused projection bundle");
+                    return false;
+                }
+
+                // Validate the complete transaction before any projection writes.
+                for (size_t index = 0; index < projections.size(); ++index)
+                {
+                    const auto &projection = projections[index];
+                    const auto *kernel =
+                        dynamic_cast<const FloatingPointGemmKernel *>(
+                            projection.kernel);
+                    if (!kernel || !kernel->weight_tensor_ ||
+                        kernel->weight_type_ != weight_type_ ||
+                        !projection.output || projection.n <= 0 ||
+                        projection.output->native_type() != TensorType::FP32 ||
+                        projection.output->numel() <
+                            static_cast<size_t>(m) * projection.n ||
+                        (projection.bias &&
+                         (weight_type_ != TensorType::FP32 ||
+                          projection.bias->native_type() != TensorType::FP32 ||
+                          projection.bias->numel() <
+                              static_cast<size_t>(projection.n))))
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] Fused projection contract "
+                                  "mismatch at descriptor " << index);
+                        return false;
+                    }
+                }
+
+                for (const auto &projection : projections)
+                {
+                    auto *kernel = static_cast<FloatingPointGemmKernel *>(
+                        projection.kernel);
+                    float *output = projection.output->mutable_data();
+                    if (!output)
+                        return false;
+
+                    bool succeeded = false;
+                    switch (weight_type_)
+                    {
+                    case TensorType::FP32:
+                        succeeded = run_onednn_fp32_matmul(
+                            input->data(),
+                            kernel->weight_tensor_->data(),
+                            output,
+                            m,
+                            projection.n,
+                            k,
+                            /*transpose_B=*/true,
+                            /*alpha=*/1.0f,
+                            /*beta=*/0.0f,
+                            projection.bias ? projection.bias->data() : nullptr);
+                        break;
+                    case TensorType::FP16:
+                    {
+                        const auto *typed_input =
+                            dynamic_cast<const FP16Tensor *>(input);
+                        const auto *typed_weight =
+                            dynamic_cast<const FP16Tensor *>(
+                                kernel->weight_tensor_);
+                        succeeded = typed_input && typed_weight &&
+                            run_onednn_fp16_matmul(
+                                typed_input->typed_data(),
+                                typed_weight->typed_data(),
+                                output,
+                                m,
+                                projection.n,
+                                k,
+                                /*transpose_B=*/true,
+                                /*alpha=*/1.0f,
+                                /*beta=*/0.0f);
+                        break;
+                    }
+                    case TensorType::BF16:
+                    {
+                        const auto *typed_input =
+                            dynamic_cast<const BF16Tensor *>(input);
+                        const auto *typed_weight =
+                            dynamic_cast<const BF16Tensor *>(
+                                kernel->weight_tensor_);
+                        succeeded = typed_input && typed_weight &&
+                            run_onednn_bf16_matmul(
+                                typed_input->typed_data(),
+                                typed_weight->typed_data(),
+                                output,
+                                m,
+                                projection.n,
+                                k,
+                                /*transpose_B=*/true,
+                                /*alpha=*/1.0f,
+                                /*beta=*/0.0f);
+                        break;
+                    }
+                    default:
+                        return false;
+                    }
+
+                    if (!succeeded)
+                    {
+                        LOG_ERROR("[FloatingPointGemmKernel] Fused projection "
+                                  "execution failed for "
+                                  << (projection.name ? projection.name
+                                                      : "unnamed"));
+                        return false;
+                    }
+                }
+
+                if (PerfStatsCollector::isDomainEnabled("kernel"))
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cpu_floating_fused_projection_calls",
+                        1.0,
+                        "gemm",
+                        "cpu",
+                        {{"m", std::to_string(m)},
+                         {"k", std::to_string(k)},
+                         {"projections", std::to_string(projections.size())}});
                 }
                 return true;
             }
@@ -2027,7 +2224,8 @@ namespace llaminar2
                         return false;
                     }
 
-                    const bool perf_enabled = PerfStatsCollector::isEnabled();
+                    const bool perf_enabled =
+                        PerfStatsCollector::isDomainEnabled("kernel");
                     const auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
                                                          : PerfStatsCollector::Clock::time_point{};
                     bool projection_ok = false;
@@ -2086,7 +2284,7 @@ namespace llaminar2
                         static_cast<int>(projections.size()));
                 }
 
-                if (PerfStatsCollector::isEnabled())
+                if (PerfStatsCollector::isDomainEnabled("kernel"))
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
@@ -2135,7 +2333,7 @@ namespace llaminar2
                 int k,
                 int projections)
             {
-                if (!PerfStatsCollector::isEnabled())
+                if (!PerfStatsCollector::isDomainEnabled("kernel"))
                     return;
 
                 const auto end = PerfStatsCollector::Clock::now();

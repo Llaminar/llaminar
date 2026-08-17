@@ -288,6 +288,71 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
 }
 
 TEST(Test__MoELocalExpertStage_PreparedWeights,
+     RegistryOnlyPreparationRejectsRawParentFallback)
+{
+    auto params = makePreparedVectorParams(2);
+    params.expert_mask = {true, true};
+    params.prepared_gate_gemm[1] = nullptr;
+    params.expert_weight_resolution_policy =
+        MoELocalExpertStage::ExpertWeightResolutionPolicy::RegistryOnly;
+
+    /*
+     * An ExpertOverlay graph must fail during construction when its exact
+     * registry slice is incomplete. It may not recover by reading a raw 3-D
+     * parent that could belong to a different tier.
+     */
+    EXPECT_FALSE(MoELocalExpertStage::prepareExpertGemmEngines(params));
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     CudaWorkspaceReservesFullLogicalExpertDescriptorTables)
+{
+    constexpr int kLogicalExperts = 256;
+    MoELocalExpertStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.num_experts = kLogicalExperts;
+    params.top_k = 2;
+    params.d_model = 256;
+    params.expert_intermediate = 512;
+    params.layer_idx = 0;
+
+    MoELocalExpertStage stage(params);
+    const WorkspaceRequirements requirements =
+        stage.getWorkspaceRequirements(/*m=*/9);
+    const auto descriptor_bytes = [](const WorkspaceRequirements &candidate,
+                                     const char *name) -> size_t
+    {
+        const auto it = std::find_if(
+            candidate.buffers.begin(), candidate.buffers.end(),
+            [name](const WorkspaceDescriptor &buffer)
+            {
+                return buffer.name == name;
+            });
+        return it == candidate.buffers.end() ? 0u : it->size_bytes;
+    };
+    const size_t expected_bytes =
+        static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) *
+        static_cast<size_t>(kLogicalExperts) *
+        sizeof(DeviceNativeVNNIMatrixDesc);
+
+    EXPECT_EQ(
+        descriptor_bytes(
+            requirements,
+            MoEWorkspaceBuffers::CUDA_GROUPED_GATE_DESC_TABLES),
+        expected_bytes);
+    EXPECT_EQ(
+        descriptor_bytes(
+            requirements,
+            MoEWorkspaceBuffers::CUDA_GROUPED_UP_DESC_TABLES),
+        expected_bytes);
+    EXPECT_EQ(
+        descriptor_bytes(
+            requirements,
+            MoEWorkspaceBuffers::CUDA_GROUPED_DOWN_DESC_TABLES),
+        expected_bytes);
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
      ValidatePreparedWeights_FailsWithMismatchedVectorSizes)
 {
     auto p = makePreparedVectorParams(4);
@@ -497,6 +562,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     workspace.ensureCapacity(/*max_rows=*/2, /*max_entries=*/4, kDModel, kTopK, DeviceId::cpu());
 
     auto input = workspace.localExpertInput(0, 0);
+    input.residency_epoch = 1;
     input.live_row_count = 1;
     input.live_entry_count = 1;
     input.row_ids_host[0] = 0;
@@ -542,6 +608,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     workspace.ensureCapacity(/*max_rows=*/1, /*max_entries=*/2, kDModel, kTopK, DeviceId::cpu());
 
     auto input = workspace.localExpertInput(0, 0);
+    input.residency_epoch = 1;
     input.live_row_count = 1;
     input.live_entry_count = 1;
     input.row_ids_host[0] = 0;
@@ -662,6 +729,298 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     subset.expert_mask = {true, false, true, false};
     MoELocalExpertStage subset_stage(subset);
     EXPECT_FALSE(subset_stage.refreshRuntimePlacement());
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     ResidencyPublicationFlipsOneCompletePreparedMaskAtANewerEpoch)
+{
+    constexpr int kNumExperts = 4;
+    MoERuntimeTable table(DeviceId::cpu(), 1, kNumExperts, 2);
+
+    MoELocalExpertStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.num_experts = kNumExperts;
+    params.top_k = 2;
+    params.d_model = 32;
+    params.expert_intermediate = 64;
+    params.layer_idx = 0;
+    params.expert_mask = {true, false, true, false};
+    params.runtime_participant_index = 1;
+    params.moe_runtime_table = &table;
+
+    std::vector<std::unique_ptr<FakePreparedGemm>> owned;
+    attachFakePreparedEngines(params, owned);
+
+    MoELocalExpertStage stage(params);
+    ASSERT_TRUE(stage.refreshRuntimePlacement());
+    ASSERT_EQ(table.hostLayerState(0).active_epoch, 1u);
+
+    const std::vector<bool> migrated_mask{false, true, false, true};
+    EXPECT_TRUE(stage.missingPreparedExpertIds({1, 3}).empty());
+    ASSERT_NO_THROW(stage.applyExpertMask(migrated_mask));
+
+    const auto &state = table.hostLayerState(0);
+    ASSERT_EQ(state.active_epoch, 2u);
+    ASSERT_LE(state.active_bank, 1u);
+    const auto &bank = state.banks[state.active_bank];
+    EXPECT_EQ(bank.local_compute_mask[0], 0u);
+    EXPECT_EQ(bank.local_compute_mask[1], 1u);
+    EXPECT_EQ(bank.local_compute_mask[2], 0u);
+    EXPECT_EQ(bank.local_compute_mask[3], 1u);
+    EXPECT_EQ(bank.experts[1].owner_participant, 1);
+    EXPECT_EQ(stage.expertMask(), migrated_mask);
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     ResidencyPublicationRejectsMissingArrivalWithoutChangingLiveEpoch)
+{
+    constexpr int kNumExperts = 4;
+    MoERuntimeTable table(DeviceId::cpu(), 1, kNumExperts, 2);
+
+    MoELocalExpertStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.num_experts = kNumExperts;
+    params.top_k = 2;
+    params.d_model = 32;
+    params.expert_intermediate = 64;
+    params.layer_idx = 0;
+    params.expert_mask = {true, false, true, false};
+    params.moe_runtime_table = &table;
+
+    std::vector<std::unique_ptr<FakePreparedGemm>> owned;
+    attachFakePreparedEngines(params, owned);
+    params.prepared_gate_gemm[1] = nullptr;
+    params.prepared_up_gemm[1] = nullptr;
+    params.prepared_down_gemm[1] = nullptr;
+
+    MoELocalExpertStage stage(params);
+    ASSERT_TRUE(stage.refreshRuntimePlacement());
+    ASSERT_EQ(stage.missingPreparedExpertIds({1}), (std::vector<int>{1}));
+
+    EXPECT_THROW(
+        stage.applyExpertMask({false, true, true, false}),
+        std::runtime_error);
+    EXPECT_EQ(table.hostLayerState(0).active_epoch, 1u);
+    EXPECT_EQ(stage.expertMask(),
+              (std::vector<bool>{true, false, true, false}));
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     SparseExecutionAcquiresExactParticipantResidencyEpoch)
+{
+    constexpr int kNumExperts = 2;
+    constexpr int kDModel = 8;
+    constexpr int kTopK = 1;
+
+    auto residency = std::make_shared<MoEOverlayParticipantResidency>(
+        MoEOverlayParticipantResidency::Config{
+            .participant_id = 3,
+            .device = DeviceId::cpu(),
+            .num_layers = 1,
+            .num_experts = kNumExperts,
+            .retained_epoch_capacity = 2,
+        });
+    MoEOverlayParticipantResidencyBank epoch_one;
+    epoch_one.epoch = 1;
+    epoch_one.participant_id = 3;
+    epoch_one.device = DeviceId::cpu();
+    epoch_one.layers.resize(1);
+    epoch_one.layers[0].resident_mask.assign(kNumExperts, false);
+    epoch_one.layers[0].experts.resize(kNumExperts);
+    epoch_one.layers[0].setResidentExpert(
+        0,
+        {
+            .gate = std::make_shared<FakePreparedGemm>(
+                nativeDesc(0, 0, 32, kDModel)),
+            .up = std::make_shared<FakePreparedGemm>(
+                nativeDesc(0, 1, 32, kDModel)),
+            .down = std::make_shared<FakePreparedGemm>(
+                nativeDesc(0, 2, kDModel, 32)),
+        });
+    std::string error;
+    ASSERT_EQ(
+        residency->installReadyBank(epoch_one, &error),
+        MoEOverlayParticipantBankInstallStatus::Installed)
+        << error;
+    const auto epoch_two = residency->cloneCandidate(1, 2);
+    ASSERT_EQ(
+        residency->installReadyBank(epoch_two, &error),
+        MoEOverlayParticipantBankInstallStatus::Installed)
+        << error;
+
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(1, 1, kDModel, kTopK, DeviceId::cpu());
+    auto input = workspace.localExpertInput(0, 0);
+    input.residency_epoch = 1;
+    auto output = workspace.localExpertOutput(0, 0);
+
+    MoELocalExpertStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input_rows = &input;
+    params.output_rows = &output;
+    params.num_experts = kNumExperts;
+    params.top_k = kTopK;
+    params.d_model = kDModel;
+    params.expert_intermediate = 32;
+    params.layer_idx = 0;
+    params.runtime_participant_index = 3;
+    params.overlay_participant_residency = residency;
+    MoELocalExpertStage stage(params);
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cpu(), ComputeBackendType::CPU);
+
+    /* Epoch one remains executable even after epoch two is ready. */
+    EXPECT_TRUE(stage.execute(&ctx));
+    EXPECT_EQ(output.residency_epoch, 1u);
+
+    /* Retirement makes a stale packet fail instead of using epoch two. */
+    ASSERT_TRUE(residency->retire(1));
+    EXPECT_FALSE(stage.execute(&ctx));
+
+    input.residency_epoch = 2;
+    EXPECT_TRUE(stage.execute(&ctx));
+    EXPECT_EQ(output.residency_epoch, 2u);
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     ParticipantResidencyRejectsCompetingMutableRuntimeTable)
+{
+    constexpr int kNumExperts = 2;
+    auto residency = std::make_shared<MoEOverlayParticipantResidency>(
+        MoEOverlayParticipantResidency::Config{
+            .participant_id = 0,
+            .device = DeviceId::cpu(),
+            .num_layers = 1,
+            .num_experts = kNumExperts,
+        });
+    MoEOverlayParticipantResidencyBank bank;
+    bank.epoch = 1;
+    bank.participant_id = 0;
+    bank.device = DeviceId::cpu();
+    bank.layers.resize(1);
+    bank.layers[0].resident_mask.assign(kNumExperts, false);
+    bank.layers[0].experts.resize(kNumExperts);
+    std::string error;
+    ASSERT_EQ(
+        residency->installReadyBank(bank, &error),
+        MoEOverlayParticipantBankInstallStatus::Installed);
+
+    MoERuntimeTable runtime_table(DeviceId::cpu(), 1, kNumExperts, 1);
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(1, 1, 8, 1, DeviceId::cpu());
+    auto input = workspace.localExpertInput(0, 0);
+    input.residency_epoch = 1;
+    auto output = workspace.localExpertOutput(0, 0);
+
+    MoELocalExpertStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input_rows = &input;
+    params.output_rows = &output;
+    params.num_experts = kNumExperts;
+    params.top_k = 1;
+    params.d_model = 8;
+    params.expert_intermediate = 16;
+    params.layer_idx = 0;
+    params.runtime_participant_index = 0;
+    params.overlay_participant_residency = residency;
+    params.moe_runtime_table = &runtime_table;
+
+    MoELocalExpertStage stage(params);
+    llaminar2::testing::MockDeviceContext ctx(
+        DeviceId::cpu(), ComputeBackendType::CPU);
+    EXPECT_FALSE(stage.execute(&ctx));
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     DeferredCompletionIsADeviceFreeTypedGraphOwnershipContract)
+{
+    constexpr int kNumExperts = 2;
+    constexpr int kDModel = 8;
+    constexpr int kTopK = 2;
+    const DeviceId device = DeviceId::cuda(0);
+
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(
+        /*max_rows=*/1,
+        /*max_entries=*/kTopK,
+        kDModel,
+        kTopK,
+        device);
+    auto input = workspace.localExpertInput(0, 0);
+    auto output = workspace.localExpertOutput(0, 0);
+    auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
+        MoELocalExpertSerialBufferArena::Config{
+            .device_id = device,
+            .row_capacity = 1,
+            .row_capacity_buckets = {1},
+            .d_model = kDModel,
+            .routing_top_k = kTopK,
+            .logical_participant_id = 7,
+            .debug_name = "unit.deferred_local_expert"});
+    auto residency = std::make_shared<MoEOverlayParticipantResidency>(
+        MoEOverlayParticipantResidency::Config{
+            .participant_id = 7,
+            .device = device,
+            .num_layers = 1,
+            .num_experts = kNumExperts,
+        });
+
+    MoELocalExpertStage::Params params;
+    params.device_id = device;
+    params.input_rows = &input;
+    params.output_rows = &output;
+    params.serial_compact_buffer_arena = arena;
+    params.graph_row_capacity = 1;
+    params.completion_policy =
+        MoELocalExpertStage::CompletionPolicy::DeferredExplicitStage;
+    params.num_experts = kNumExperts;
+    params.top_k = kTopK;
+    params.d_model = kDModel;
+    params.expert_intermediate = 16;
+    params.layer_idx = 0;
+    params.runtime_participant_index = 7;
+    params.expert_mask.assign(kNumExperts, true);
+    params.overlay_participant_residency = residency;
+    std::vector<std::unique_ptr<FakePreparedGemm>> owned;
+    attachFakePreparedEngines(params, owned);
+
+    MoELocalExpertStage producer(params);
+    EXPECT_TRUE(producer.usesDeferredCompletion());
+    EXPECT_FALSE(producer.hasPendingDeferredOutput());
+
+    MoELocalExpertCompletionStage completion(
+        MoELocalExpertCompletionStage::Params{
+            .device_id = device,
+            .producer = &producer,
+        });
+    EXPECT_EQ(
+        completion.type(),
+        ComputeStageType::MOE_LOCAL_EXPERT_COMPLETION);
+    EXPECT_TRUE(completion.supportsBackend(
+        ComputeBackendType::GPU_CUDA));
+    EXPECT_TRUE(completion.supportsBackend(
+        ComputeBackendType::GPU_ROCM));
+    EXPECT_FALSE(completion.supportsBackend(
+        ComputeBackendType::CPU));
+
+    EXPECT_THROW(
+        ([&]
+         {
+             (void)MoELocalExpertCompletionStage{
+                 MoELocalExpertCompletionStage::Params{
+                     .device_id = device,
+                     .producer = nullptr,
+                 }};
+         }()),
+        std::invalid_argument);
+
+    auto cpu_params = params;
+    cpu_params.device_id = DeviceId::cpu();
+    cpu_params.serial_compact_buffer_arena.reset();
+    EXPECT_THROW(
+        (void)MoELocalExpertStage{cpu_params},
+        std::invalid_argument)
+        << "Only GPU endpoints may defer their host-visible completion";
 }
 
 // ---------------------------------------------------------------------------

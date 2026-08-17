@@ -17,6 +17,7 @@
 #include "../graph/ComputeGraph.h"
 #include "../graph/GraphCaptureGuard.h"
 #include "../../compute_stages/IComputeStage.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 
 #include <cstdint>
 #include <functional>
@@ -100,7 +101,8 @@ namespace llaminar2
         bool trace = false;                  ///< LLAMINAR_PREFILL_GRAPH_TRACE
         bool buckets_enabled = true;         ///< Bucketed capture is on by default; LLAMINAR_PREFILL_GRAPH_BUCKETS=0 opts out.
         std::vector<int> bucket_sizes;       ///< LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES
-        size_t max_cached_entries = 10;      ///< LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS
+        size_t max_cached_entries =
+            kDefaultPrefillGraphMaxCachedEntries; ///< LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS
     };
 
     /// Per-entry state in the prefill graph cache.
@@ -155,6 +157,7 @@ namespace llaminar2
             int bucket_seq_len = 0,
             PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default,
             bool collectives_graph_capturable = false,
+            bool heterogeneous_segmentation_admitted = false,
             bool moe_rebalancing_graph_stable = false,
             std::string *reject_stage_name = nullptr,
             std::string *reject_stage_type = nullptr) const;

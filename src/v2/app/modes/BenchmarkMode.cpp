@@ -9,7 +9,6 @@
 #include "app/InferenceRunnerAdapter.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include "execution/moe/MoEExpertOverlayProfiler.h"
-#include "execution/moe/MoERebalanceController.h"
 #include "interfaces/IMPIContext.h"
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
@@ -72,19 +71,9 @@ namespace llaminar2
             return false;
         }
 
-        bool benchmarkHasDynamicMoERebalance(IOrchestrationRunner *runner)
-        {
-            auto *orch_runner = dynamic_cast<OrchestrationRunner *>(runner);
-            if (orch_runner == nullptr)
-                return false;
-            auto *controller = orch_runner->moeRebalanceController();
-            return controller != nullptr && controller->mode() == MoERebalanceMode::DYNAMIC;
-        }
-
         /// @brief Opt benchmark mode into production bucketed prefill defaults.
         void configureBenchmarkPrefillBuckets(const std::shared_ptr<IMPIContext> &mpi_ctx,
-                                              const OrchestrationConfig &config,
-                                              IOrchestrationRunner *runner)
+                                              const OrchestrationConfig &config)
         {
             const auto &env = debugEnv();
             const bool user_selected_bucket_mode = env.presence.has("LLAMINAR_PREFILL_GRAPH_BUCKETS");
@@ -97,14 +86,22 @@ namespace llaminar2
             // hit the fail-loud guard if it is incompatible with collectives).
             const bool uses_collectives = benchmarkUsesCollectives(config, mpi_ctx);
 
-            // MoE dynamic rebalancing rejects padded bucketed prefill graphs during
-            // preflight (PrefillGraphRejectReason::ActiveMoERebalancing): a captured
-            // padded-bucket graph could outlive the exact placement state it was
-            // warmed with. Exact-shape prefill graphs are keyed by placement epoch
-            // and can still be captured, so leave bucketing disabled in this case.
-            const bool moe_rebalancing_active = benchmarkHasDynamicMoERebalance(runner);
+            /*
+             * ExpertOverlay owns an explicit heterogeneous segmented-capture
+             * protocol. Its root-published physical bucket is common to every
+             * rank and participant, including a padded final segment, so its
+             * collective shapes cannot diverge. Ordinary TP/PP configurations
+             * still need the conservative fail-loud policy below.
+             */
+            const bool segmented_collective_capture_authority =
+                config.moe_routed_expert_plan &&
+                config.moe_routed_expert_plan
+                    ->usesExpertOverlayAuthority();
             const BenchmarkPrefillBucketDisableReason disable_reason =
-                benchmarkPrefillBucketDisableReason(uses_collectives, moe_rebalancing_active);
+                benchmarkPrefillBucketDisableReason(
+                    uses_collectives,
+                    /*moe_rebalancing_active=*/false,
+                    segmented_collective_capture_authority);
 
             if (!user_selected_bucket_mode)
             {
@@ -184,9 +181,35 @@ namespace llaminar2
         auto &runner = ctx.runner;
         auto &tokenizer = ctx.tokenizer;
 
+        const bool mpi_coordinated = mpi_ctx->world_size() > 1;
+        if (mpi_coordinated && mpi_ctx->rank() != 0)
+        {
+            /*
+             * BenchmarkRunner is the request controller, not a rank-local
+             * graph driver.  Exactly one controller must issue clear/prefill/
+             * decode commands; every other rank remains in the production
+             * command loop and participates when rank zero admits a command.
+             * Running one BenchmarkRunner per rank creates two competing MPI
+             * collective schedules (for example CLEAR_CACHE versus PREFILL).
+             */
+            LOG_DEBUG("Rank " << mpi_ctx->rank()
+                              << " entering MPI worker loop for benchmark inference");
+            runner->setMPICoordinatedMode(true);
+            runner->runMPIWorkerLoop();
+            runner->shutdown();
+            MoEExpertOverlayProfiler::flush();
+            mpiShutdown();
+            return 0;
+        }
+
+        if (mpi_coordinated)
+            runner->setMPICoordinatedMode(true);
+
         auto shutdownAndFinalize = [&](bool success, const std::string &failure_reason = {}) -> int
         {
             MoEExpertOverlayProfiler::flush();
+            if (mpi_coordinated)
+                runner->shutdownMPIWorkers();
             runner->shutdown();
             mpiShutdown();
             return success ? 0 : 1;
@@ -197,51 +220,11 @@ namespace llaminar2
             LOG_DEBUG("Running benchmark mode...");
         }
 
-        configureBenchmarkPrefillBuckets(mpi_ctx, ctx.config, runner.get());
+        configureBenchmarkPrefillBuckets(mpi_ctx, ctx.config);
 
         auto adapter = std::make_shared<InferenceRunnerAdapter>(runner.get());
 
-        BenchmarkRunner benchmark(adapter, tokenizer, mpi_ctx);
-
-        // Set up MoE expert rebalancing (incremental, during decode)
-        if (auto *orch_runner = dynamic_cast<OrchestrationRunner *>(runner.get()))
-        {
-            if (auto *controller = orch_runner->moeRebalanceController())
-            {
-                if (controller->mode() == MoERebalanceMode::DYNAMIC)
-                {
-                    // Strategy: Do one swap-based rebalance after warmup using
-                    // the 128-token histogram, then run benchmark with zero
-                    // ongoing overhead. Per-step callback only tracks histogram
-                    // (no rebalancing) for profiling summary.
-                    benchmark.setPostWarmupCallback([orch_runner, controller, &mpi_ctx]()
-                                                    {
-                        if (orch_runner->usesDeviceSideMoERebalanceController())
-                        {
-                            if (mpi_ctx->rank() == 0)
-                            {
-                                LOG_DEBUG("[MoE] Skipping host post-warmup rebalance; "
-                                          "device-side graph controller owns publish/apply");
-                            }
-                            return;
-                        }
-
-                        if (!orch_runner->applyMoERebalanceWithReplicas(/*log_histogram_summary=*/true))
-                        {
-                            LOG_ERROR("[MoE] Post-warmup rebalance failed");
-                        }
-                        if (mpi_ctx->rank() == 0)
-                        {
-                    LOG_DEBUG("[MoE] Post-warmup setup complete"
-                              << (controller->hasReplicas()
-                                  ? " (with per-token replica dispatch)"
-                                  : " (local rebalance only)"));
-                        } });
-                    // No per-step rebalancing — the post-warmup placement
-                    // is used for all benchmark iterations.
-                }
-            }
-        }
+        BenchmarkRunner benchmark(adapter, tokenizer);
 
         BenchmarkResult result = benchmark.run(ctx.config);
         benchmark.printResults(result);
@@ -266,23 +249,6 @@ namespace llaminar2
             LOG_INFO("Benchmark JSON written to " << ctx.config.benchmark_json_output_path);
         }
         MoEExpertOverlayProfiler::flush();
-
-        // Log MoE histogram if controller is active
-        if (auto *orch_runner = dynamic_cast<OrchestrationRunner *>(runner.get()))
-        {
-            if (auto *controller = orch_runner->moeRebalanceController())
-            {
-                controller->logHistogramSummary();
-
-                // Keep the legacy human-readable table behind its explicit
-                // switch. PerfStats requests export the same measurements as
-                // structured records and must not revive legacy console output.
-                if (debugEnv().profile.enabled)
-                {
-                    std::print("{}", controller->getProfilingSummary());
-                }
-            }
-        }
 
         return shutdownAndFinalize(
             result.success,

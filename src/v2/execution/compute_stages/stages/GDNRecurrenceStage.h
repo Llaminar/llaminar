@@ -245,6 +245,14 @@ namespace llaminar2
             const int *host_row_indices,
             int request_count,
             void *stream = nullptr) override;
+        /**
+         * @brief Expose the selected CPU recurrence snapshot as a byte-copy plan.
+         *
+         * Planning binds no shared backend state and performs no copy. The
+         * central MTP publisher validates every layer plan before committing
+         * all independent recurrence matrices in one OpenMP team.
+         */
+        CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override;
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
             const int *device_row_index,
             void *stream) override;
@@ -305,11 +313,6 @@ namespace llaminar2
         bool speculative_state_work_bound_ = false;
         int verifier_capture_rows_bound_ = 0;
         int verifier_capture_state_size_bound_ = 0;
-        // Reusable scratch for QKV deinterleaving (grow-only)
-        mutable std::vector<float> q_deinterleave_;
-        mutable std::vector<float> k_deinterleave_;
-        mutable std::vector<float> v_deinterleave_;
-
         int effectivePrefillSeqLen() const;
         bool shouldUseScalarRealLengthContract() const;
         std::string workspaceStableId() const;

@@ -261,6 +261,61 @@ namespace llaminar2
         return ptr;
     }
 
+    bool NUMAAllocator::bindUntouchedExternalRangeToNode(
+        void *ptr, size_t bytes, int numa_node) const
+    {
+        if (!ptr || bytes == 0)
+            return true;
+        if (!numa_available_)
+        {
+            LOG_ERROR("NUMAAllocator: Cannot bind an external receive range because NUMA policy APIs are unavailable");
+            return false;
+        }
+        if (numa_node < 0 || numa_node >= num_numa_nodes_)
+        {
+            LOG_ERROR("NUMAAllocator: External receive range requires an exact NUMA node; got "
+                      << numa_node);
+            return false;
+        }
+
+        const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
+        if ((address % PAGE_SIZE) != 0)
+        {
+            LOG_ERROR("NUMAAllocator: External receive range " << ptr
+                                                               << " is not page aligned");
+            return false;
+        }
+
+        struct bitmask *nodemask = numa_allocate_nodemask();
+        if (!nodemask)
+        {
+            LOG_ERROR("NUMAAllocator: Failed to allocate nodemask for external receive range");
+            return false;
+        }
+        numa_bitmask_clearall(nodemask);
+        numa_bitmask_setbit(nodemask, numa_node);
+
+        const size_t page_bytes = alignUp(bytes, PAGE_SIZE);
+        errno = 0;
+        const int result = mbind(
+            ptr,
+            page_bytes,
+            MPOL_BIND,
+            nodemask->maskp,
+            nodemask->size,
+            0);
+        const int bind_errno = errno;
+        numa_free_nodemask(nodemask);
+        if (result != 0)
+        {
+            LOG_ERROR("NUMAAllocator: Failed to bind external receive range of "
+                      << page_bytes << " bytes to node " << numa_node << ": "
+                      << std::strerror(bind_errno));
+            return false;
+        }
+        return true;
+    }
+
     void NUMAAllocator::free(void *ptr, size_t bytes)
     {
         if (!ptr || bytes == 0)

@@ -65,6 +65,19 @@ struct GpuExpertPackedDescriptor {
     bool is_asymmetric = false;
     bool has_emins = false;
 
+    /**
+     * Physical capacity of the persistent allocation backing this live view.
+     *
+     * These fields are deliberately distinct from the execution fields above:
+     * an initially compact expert can occupy a slot large enough for a later
+     * CPU-normalized promotion without changing the bytes consumed by GEMM.
+     * Zero identifies an ordinary immutable allocation with no recycling
+     * contract.
+     */
+    uint8_t allocation_payload_bytes_per_block = 0;
+    bool allocation_has_mins = false;
+    bool allocation_has_emins = false;
+
     size_t vnni_bytes = 0;
     size_t scales_bytes = 0;
     size_t mins_bytes = 0;
@@ -85,6 +98,36 @@ struct GpuExpertPackedDescriptor {
     size_t totalBytes() const
     {
         return vnni_bytes + scales_bytes + mins_bytes + emins_bytes;
+    }
+
+
+    /** @return Number of logical 32-value blocks in this projection. */
+    [[nodiscard]] size_t blockCount() const
+    {
+        return static_cast<size_t>(blocks_per_row) *
+               static_cast<size_t>(n);
+    }
+
+    /** @return Bytes physically reserved for payload, or zero if unspecified. */
+    [[nodiscard]] size_t allocationPayloadBytes() const
+    {
+        return blockCount() * allocation_payload_bytes_per_block;
+    }
+
+    /** @return Bytes physically reserved for minima, or zero when absent. */
+    [[nodiscard]] size_t allocationMinsBytes() const
+    {
+        return allocation_has_mins
+                   ? blockCount() * sizeof(uint16_t)
+                   : 0;
+    }
+
+    /** @return Bytes physically reserved for extended minima, or zero when absent. */
+    [[nodiscard]] size_t allocationEminsBytes() const
+    {
+        return allocation_has_emins
+                   ? blockCount() * sizeof(uint32_t)
+                   : 0;
     }
 };
 
@@ -115,6 +158,10 @@ inline GpuExpertPackedDescriptor makeGpuExpertPackedDescriptor(
     out.payload_bytes_per_block = payload_bytes_per_block;
     out.is_asymmetric = is_asymmetric;
     out.has_emins = has_emins;
+    out.allocation_payload_bytes_per_block =
+        desc.allocation_payload_bytes_per_block;
+    out.allocation_has_mins = desc.allocation_has_mins != 0;
+    out.allocation_has_emins = desc.allocation_has_emins != 0;
     out.vnni_bytes = block_count * payload_bytes_per_block;
     out.scales_bytes = block_count * sizeof(uint16_t);
     out.mins_bytes = is_asymmetric ? out.scales_bytes : 0;

@@ -157,6 +157,26 @@ namespace llaminar2
                 CUDAGemvContext *gemv_ctx,
                 CUDARowMajorWeights **rm_slot);
 
+            /** Execute physical M=1 bytes under source-format arithmetic policy. */
+            bool cudaNativeVNNIGemvTuned_fp32_withPolicy(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const uint16_t *d_scales,
+                const uint16_t *d_mins,
+                const uint32_t *d_emins,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
+                int cuda_device_id,
+                void *stream,
+                CUDAGemvContext *gemv_ctx,
+                CUDARowMajorWeights **rm_slot);
+
             bool cudaNativeVNNIGemvTuned_small_m_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
@@ -171,6 +191,27 @@ namespace llaminar2
                 const float *d_C_existing,
                 const float *d_bias,
                 uint8_t codebook_id,
+                int cuda_device_id,
+                void *stream,
+                CUDAGemvContext *gemv_ctx,
+                CUDARowMajorWeights **rm_slot);
+
+            /** Execute grouped physical bytes under source arithmetic policy. */
+            bool cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const uint16_t *d_scales,
+                const uint16_t *d_mins,
+                const uint32_t *d_emins,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                int M,
+                int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
                 int cuda_device_id,
                 void *stream,
                 CUDAGemvContext *gemv_ctx,
@@ -202,6 +243,31 @@ namespace llaminar2
                 void *stream,
                 CUDAPrefillContext *prefill_ctx);
 
+            /**
+             * @brief Execute physical NativeVNNI bytes with a source policy.
+             *
+             * Expert promotion may normalize the byte decoder to codebook 23
+             * while retaining a compact source codebook's reduction order.
+             */
+            bool cudaNativeVNNIPrefill_fp32_withPolicy(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const uint16_t *d_scales,
+                const uint16_t *d_mins,
+                const uint32_t *d_emins,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                const int32_t *d_sums_A_block,
+                int M, int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
+                int cuda_device_id,
+                void *stream,
+                CUDAPrefillContext *prefill_ctx);
+
             void cudaPrefillContext_bindWorkspace(
                 CUDAPrefillContext *ctx,
                 float *canonical_kpart_partials,
@@ -218,6 +284,18 @@ namespace llaminar2
 
             bool cudaNativeVNNIPrefill_getWorkspaceEnvelope(
                 uint8_t codebook_id,
+                int max_M,
+                int N,
+                int K,
+                int cuda_device_id,
+                size_t *canonical_kpart_partials_bytes,
+                int *planned_k_partitions,
+                int *planned_rows);
+
+            /** @brief Plan prefill scratch for distinct decoder/policy IDs. */
+            bool cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
+                uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
                 int max_M,
                 int N,
                 int K,
@@ -434,6 +512,8 @@ namespace llaminar2
             uint32_t *d_weights_native_emins = nullptr;
             uint8_t native_codebook_id = 0;
             uint32_t native_blocks_per_row = 0;
+            NativeVnniSourceIdentity native_source_identity;
+            NativeVnniReusableDeviceAllocationFormat native_allocation_format;
             CUDARowMajorWeights *rowmajor = nullptr;
 
             // Per-device contexts (replaces process-global static state)
@@ -520,6 +600,7 @@ namespace llaminar2
             struct NativePrefillWorkspaceCacheKey
             {
                 uint8_t codebook_id = 0;
+                uint8_t arithmetic_policy_codebook_id = 0;
                 int max_m = 0;
                 int n = 0;
                 int k = 0;
@@ -532,6 +613,8 @@ namespace llaminar2
                 bool operator==(const NativePrefillWorkspaceCacheKey &other) const
                 {
                     return codebook_id == other.codebook_id &&
+                           arithmetic_policy_codebook_id ==
+                               other.arithmetic_policy_codebook_id &&
                            max_m == other.max_m &&
                            n == other.n &&
                            k == other.k &&
@@ -553,6 +636,8 @@ namespace llaminar2
                         h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
                     };
                     mix(static_cast<size_t>(key.codebook_id));
+                    mix(static_cast<size_t>(
+                        key.arithmetic_policy_codebook_id));
                     mix(static_cast<size_t>(key.max_m));
                     mix(static_cast<size_t>(key.n));
                     mix(static_cast<size_t>(key.k));
@@ -585,6 +670,7 @@ namespace llaminar2
 
             NativePrefillWorkspaceBounds maxNativePrefillWorkspaceForRowsUpTo(
                 uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
                 int max_m,
                 int n,
                 int k,
@@ -595,6 +681,8 @@ namespace llaminar2
 
                 const NativePrefillWorkspaceCacheKey key{
                     .codebook_id = codebook_id,
+                    .arithmetic_policy_codebook_id =
+                        arithmetic_policy_codebook_id,
                     .max_m = max_m,
                     .n = n,
                     .k = k,
@@ -619,8 +707,9 @@ namespace llaminar2
                 size_t canonical_kpart_partials_bytes = 0;
                 int planned_k_partitions = 1;
                 int planned_rows = 0;
-                if (!cudaNativeVNNIPrefill_getWorkspaceEnvelope(
+                if (!cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
                         codebook_id,
+                        arithmetic_policy_codebook_id,
                         max_m,
                         n,
                         k,
@@ -633,6 +722,9 @@ namespace llaminar2
                         "[CUDAQuantisedGemmKernel] NativeVNNI prefill "
                         "workspace-envelope planning failed [codebook=" +
                         std::to_string(static_cast<int>(codebook_id)) +
+                        ", arithmetic_policy_codebook=" +
+                        std::to_string(static_cast<int>(
+                            arithmetic_policy_codebook_id)) +
                         ", max_M=" + std::to_string(max_m) +
                         ", N=" + std::to_string(n) +
                         ", K=" + std::to_string(k) +
@@ -760,6 +852,7 @@ namespace llaminar2
                 case 16:
                 case 17:
                 case 19:
+                case kNativeVnniExpandedInt8MinCodebook:
                     return true;
                 default:
                     return false;
@@ -773,6 +866,7 @@ namespace llaminar2
                 case 5:  // Q4_1 / Q4_K
                 case 7:  // Q5_1 / Q5_K
                 case 16: // IQ1_S
+                case kNativeVnniExpandedInt8MinCodebook:
                     return true;
                 default:
                     return false;
@@ -850,6 +944,12 @@ namespace llaminar2
                     return false;
                 }
 
+                const uint8_t arithmetic_policy_codebook_id =
+                    impl->native_source_identity.present
+                        ? canonicalDeviceVnniCodebookId(
+                              impl->native_source_identity.codebook_id)
+                        : impl->native_codebook_id;
+
                 if (!ensureNativeVNNIIQGridTablesInitialized(
                         impl->native_codebook_id,
                         cuda_device_id,
@@ -870,7 +970,8 @@ namespace llaminar2
                     if (!impl->gemv_ctx)
                         impl->gemv_ctx = cudaGemvContext_create(cuda_device_id);
 
-                    const bool gemv_ok = cudaNativeVNNIGemvTuned_fp32(
+                    const bool gemv_ok =
+                        cudaNativeVNNIGemvTuned_fp32_withPolicy(
                         d_A_int8,
                         impl->d_weights_native_vnni,
                         impl->d_weights_native_scales,
@@ -883,6 +984,7 @@ namespace llaminar2
                         d_C_existing,
                         d_bias,
                         impl->native_codebook_id,
+                        arithmetic_policy_codebook_id,
                         cuda_device_id,
                         stream,
                         impl->gemv_ctx,
@@ -914,7 +1016,7 @@ namespace llaminar2
                     if (!impl->prefill_ctx)
                         impl->prefill_ctx = cudaPrefillContext_create(cuda_device_id);
 
-                    if (cudaNativeVNNIPrefill_fp32(
+                    if (cudaNativeVNNIPrefill_fp32_withPolicy(
                             d_A_int8,
                             impl->d_weights_native_vnni,
                             impl->d_weights_native_scales,
@@ -928,6 +1030,7 @@ namespace llaminar2
                             d_C_existing,
                             d_bias,
                             impl->native_codebook_id,
+                            arithmetic_policy_codebook_id,
                             cuda_device_id,
                             stream,
                             impl->prefill_ctx))
@@ -1015,6 +1118,20 @@ namespace llaminar2
 
             impl_->owns_weight_memory = true; // Legacy constructor owns weight memory
 
+            const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
+            const NativeVnniFormatInfo *format =
+                unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            if (!format)
+            {
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Quantized tensor has no NativeVNNI source identity");
+            }
+            impl_->native_source_identity = {
+                .codebook_id = format->codebook_id,
+                .is_superblock = format->is_superblock,
+                .present = true,
+            };
+
             LOG_TRACE("[CUDAQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
                                                                         << " quantized weights (type=" << static_cast<int>(wt)
                                                                         << ") on CUDA device " << cuda_device_id_);
@@ -1040,6 +1157,12 @@ namespace llaminar2
             K_ = static_cast<size_t>(packed->K);
 
             impl_->owns_weight_memory = false; // Packed cache owns weight memory
+            impl_->native_source_identity = packed->native_source_identity;
+            if (!impl_->native_source_identity.present)
+            {
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Pre-packed weights lost NativeVNNI source identity");
+            }
 
             LOG_TRACE("[CUDAQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
                                                                             << " INT8 weights on CUDA device " << cuda_device_id_);
@@ -1049,7 +1172,9 @@ namespace llaminar2
             int N, int K, int cuda_device_id,
             uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
             uint8_t codebook_id, uint32_t blocks_per_row,
-            std::shared_ptr<void> lifetime_owner)
+            std::shared_ptr<void> lifetime_owner,
+            NativeVnniSourceIdentity source_identity,
+            NativeVnniReusableDeviceAllocationFormat allocation_format)
             : weights_(nullptr),
               packed_(nullptr),
               lifetime_owner_(std::move(lifetime_owner)),
@@ -1067,6 +1192,48 @@ namespace llaminar2
             impl_->d_weights_native_emins = d_emins;
             impl_->native_codebook_id = codebook_id;
             impl_->native_blocks_per_row = blocks_per_row;
+            const NativeVnniFormatInfo *source_format =
+                source_identity.present
+                    ? native_vnni_formats::forSourceIdentity(
+                          source_identity.codebook_id,
+                          source_identity.is_superblock)
+                    : nullptr;
+            if (!source_format ||
+                !deviceVnniExecutionCompatibleWithSource(
+                    *source_format, codebook_id) ||
+                (codebook_id == kNativeVnniExpandedInt8MinCodebook &&
+                 d_mins == nullptr))
+            {
+                throw std::invalid_argument(
+                    "[CUDAQuantisedGemmKernel] Direct device weights require an exact, "
+                    "execution-compatible NativeVNNI source identity");
+            }
+            impl_->native_source_identity = source_identity;
+            if (allocation_format.payload_bytes_per_block != 0)
+            {
+                const auto execution_format =
+                    codebook_id == canonicalDeviceVnniCodebookId(
+                                       source_format->codebook_id)
+                        ? NativeVnniMigrationStableDeviceFormat{
+                              .codebook_id = codebook_id,
+                              .payload_bytes_per_block = static_cast<uint8_t>(
+                                  source_format->payload_bytes),
+                              .is_asymmetric = source_format->is_asymmetric,
+                              .has_emins = source_format->has_emins,
+                          }
+                        : migrationStableDeviceVnniFormat(*source_format);
+                if (allocation_format.payload_bytes_per_block <
+                        execution_format.payload_bytes_per_block ||
+                    (execution_format.is_asymmetric &&
+                     !allocation_format.has_mins) ||
+                    (execution_format.has_emins &&
+                     !allocation_format.has_emins))
+                {
+                    throw std::invalid_argument(
+                        "[CUDAQuantisedGemmKernel] Reusable allocation cannot represent its live execution format");
+                }
+            }
+            impl_->native_allocation_format = allocation_format;
             impl_->owns_weight_memory = false;
 
             LOG_TRACE("[CUDAQuantisedGemmKernel] Created (MoE batch) for " << N_ << "x" << K_
@@ -1131,6 +1298,18 @@ namespace llaminar2
                 {
                     it = pools.emplace(cuda_device_id, std::make_unique<CUDAConcurrentPrefillPool>()).first;
                 }
+                if (!it->second->initialized)
+                {
+                    if (isGraphCaptureActive())
+                    {
+                        throw std::runtime_error(
+                            "[ConcurrentGemm] Capture began before the CUDA projection "
+                            "stream/event pool was initialized");
+                    }
+                    it->second->init(
+                        cuda_device_id,
+                        CUDAConcurrentPrefillPool::MAX_STREAMS);
+                }
                 return *it->second;
             }
         } // namespace
@@ -1139,6 +1318,26 @@ namespace llaminar2
         {
             std::lock_guard<std::mutex> lk(sharedPrefillPoolsMutex());
             sharedPrefillPools().clear();
+        }
+
+        bool CUDAQuantisedGemmKernel::prepareFusedProjectionGraphCapture(
+            size_t projection_count)
+        {
+            if (projection_count == 0)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel] Fused projection capture "
+                          "preparation requires positive fan-out");
+                return false;
+            }
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel] Fused projection resources "
+                          "must be prepared before graph capture begins");
+                return false;
+            }
+
+            auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
+            return pool.initialized && pool.count > 0;
         }
 
         void CUDAQuantisedGemmKernel::resetDynamicState()
@@ -1271,7 +1470,31 @@ namespace llaminar2
             out.k = static_cast<int>(K_);
             out.blocks_per_row = impl_->native_blocks_per_row;
             out.codebook_id = impl_->native_codebook_id;
+            out.allocation_payload_bytes_per_block =
+                impl_->native_allocation_format.payload_bytes_per_block;
+            out.allocation_has_mins = static_cast<uint8_t>(
+                impl_->native_allocation_format.has_mins);
+            out.allocation_has_emins = static_cast<uint8_t>(
+                impl_->native_allocation_format.has_emins);
+            out.source_codebook_id = impl_->native_source_identity.codebook_id;
+            out.source_is_superblock = static_cast<uint8_t>(
+                impl_->native_source_identity.is_superblock);
+            out.source_identity_present = static_cast<uint8_t>(
+                impl_->native_source_identity.present);
             return out.valid();
+        }
+
+        bool CUDAQuantisedGemmKernel::exportNativeVNNISourceIdentity(
+            NativeVnniSourceIdentity &out) const
+        {
+            if (!impl_ || !impl_->native_source_identity.present)
+            {
+                out = {};
+                return false;
+            }
+            out = impl_->native_source_identity;
+            return native_vnni_formats::forSourceIdentity(
+                       out.codebook_id, out.is_superblock) != nullptr;
         }
 
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(CUDAQuantisedGemmKernel &&other) noexcept
@@ -1392,6 +1615,7 @@ namespace llaminar2
                 impl_->d_weights_native_emins = upload.d_native_emins;
                 impl_->native_codebook_id = packed_->native_codebook_id;
                 impl_->native_blocks_per_row = packed_->native_blocks_per_row;
+                impl_->native_source_identity = packed_->native_source_identity;
                 weights_converted_ = true;
 
                 // Release host-side packing buffers — data is now on GPU.
@@ -1470,6 +1694,7 @@ namespace llaminar2
             impl_->d_weights_native_emins = legacy_packed.device_uploads[cuda_device_id_].d_native_emins;
             impl_->native_codebook_id = legacy_packed.native_codebook_id;
             impl_->native_blocks_per_row = legacy_packed.native_blocks_per_row;
+            impl_->native_source_identity = legacy_packed.native_source_identity;
 
             weights_converted_ = true;
             LOG_DEBUG("[CUDAQuantisedGemmKernel] Weight conversion complete (legacy)");
@@ -2414,21 +2639,11 @@ namespace llaminar2
             const bool concurrent_eligible = prefill_concurrent_eligible || decode_concurrent_eligible;
             const bool concurrent_decode = decode_concurrent_eligible;
 
-            // CUDA stream/event creation (pool.init) is illegal while a graph capture is
-            // active. The eager preparation phase must therefore initialize the pool
-            // before capture begins. Reaching capture without that lifecycle edge is a
-            // malformed graph, not permission to silently change its launch topology.
-            bool concurrent_safe = concurrent_eligible;
-            if (concurrent_eligible && isGraphCaptureActive())
-            {
-                auto &pool_check = getSharedCUDAPrefillPool(cuda_device_id_);
-                if (!pool_check.initialized)
-                {
-                    throw std::runtime_error(
-                        "[ConcurrentGemm] Capture began before the CUDA projection "
-                        "stream/event pool was initialized");
-                }
-            }
+            // Stream/event creation is illegal while a graph capture is active.
+            // Fused projection stages provision the shared pool through their
+            // CaptureOnly prepareGraphLaunch() contract. The accessor retains a
+            // fail-closed check for direct kernel callers and eager execution.
+            const bool concurrent_safe = concurrent_eligible;
 
             if (concurrent_safe)
             {
@@ -2442,7 +2657,67 @@ namespace llaminar2
                         std::to_string(num_proj));
                 }
                 auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
-                pool.init(cuda_device_id_, num_proj);
+
+                /*
+                 * The projection streams fork from `execution_stream` by
+                 * waiting on `quant_ready`.  Join every optional bias producer
+                 * to that root stream before recording the fork event.  This
+                 * makes the exact dependency DAG
+                 *
+                 *   bias producer -> root stream -> quant_ready -> side stream
+                 *
+                 * explicit for eager execution and for one monolithic native
+                 * graph capture.  Asking TransferEngine to join a bias directly
+                 * to a side stream after beginCapture() is both too late for an
+                 * external event and inconsistent with the capture ledger's
+                 * root-stream ownership.
+                 */
+                for (int pi = 0; pi < num_proj; ++pi)
+                {
+                    const auto &projection = projections[pi];
+                    if (!projection.bias)
+                        continue;
+
+                    const TensorBase *bias_tensor = projection.bias;
+                    if (auto *slice =
+                            dynamic_cast<const TensorSlice *>(projection.bias))
+                    {
+                        bias_tensor = slice->inner();
+                    }
+
+                    auto *fp32_bias = dynamic_cast<FP32Tensor *>(
+                        const_cast<TensorBase *>(bias_tensor));
+                    if (!fp32_bias)
+                    {
+                        throw std::runtime_error(
+                            "[ConcurrentGemm] Projection " +
+                            std::to_string(pi) + " bias is not FP32Tensor");
+                    }
+
+                    const auto current_device = fp32_bias->current_device();
+                    if (current_device.has_value() &&
+                        current_device->is_gpu() &&
+                        current_device.value() != target_device)
+                    {
+                        throw std::runtime_error(
+                            "[ConcurrentGemm] Projection " +
+                            std::to_string(pi) + " bias is resident on " +
+                            current_device->to_string() + " instead of " +
+                            target_device.toString());
+                    }
+
+                    TransferEngine::requireDeviceInput(
+                        fp32_bias,
+                        target_device,
+                        execution_stream);
+                    if (!fp32_bias->gpu_data_ptr())
+                    {
+                        throw std::runtime_error(
+                            "[ConcurrentGemm] Projection " +
+                            std::to_string(pi) +
+                            " bias has no device storage after root-stream join");
+                    }
+                }
 
                 // Record event after quantization completes on main stream
                 cudaQuantGemm_recordEvent(pool.quant_ready, execution_stream);
@@ -2574,11 +2849,14 @@ namespace llaminar2
                                 " bias is resident on " + current_dev->to_string() +
                                 " instead of CUDA:" + std::to_string(cuda_device_id_));
                         }
-                        TransferEngine::requireDeviceInput(
-                            fp32_bias,
-                            target_device,
-                            pool.streams[stream_idx]);
                         d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
+                        if (!d_bias)
+                        {
+                            throw std::runtime_error(
+                                "[ConcurrentPrefill] Projection " +
+                                std::to_string(pi) +
+                                " bias lost its prejoined device storage");
+                        }
                     }
 
                     // stream_idx already computed above for scratch allocation
@@ -2621,6 +2899,28 @@ namespace llaminar2
                 for (int si = 0; si < std::min(num_proj, pool.count); ++si)
                 {
                     cudaQuantGemm_streamWaitEvent(execution_stream, pool.completion[si]);
+                }
+                /*
+                 * This counter is the executable proof that an integration
+                 * test reached the real persistent side-stream fan-out. A
+                 * concurrency test that merely enables the policy but falls
+                 * through to sequential projection dispatch is not evidence.
+                 */
+                if (PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cuda_fused_projection_stream_pool_calls",
+                        1.0,
+                        "gemm",
+                        "cuda:" + std::to_string(cuda_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"mode", concurrent_decode ? "decode" : "prefill"},
+                            {"m", std::to_string(m)},
+                            {"k", std::to_string(k)},
+                            {"projections", std::to_string(num_proj)},
+                            {"streams", std::to_string(
+                                 std::min(num_proj, pool.count))}});
                 }
                 LOG_TRACE("[ConcurrentPrefill] All " << num_proj << " projections dispatched concurrently");
                 publish_projection_outputs();
@@ -3309,6 +3609,11 @@ namespace llaminar2
             }
 
             ensureWeightsConverted();
+            const uint8_t arithmetic_policy_codebook_id =
+                impl_->native_source_identity.present
+                    ? canonicalDeviceVnniCodebookId(
+                          impl_->native_source_identity.codebook_id)
+                    : impl_->native_codebook_id;
             if (!canUseNativeVNNIBlockwise(impl_.get(), 1, k))
             {
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] NativeVNNI GEMV unsupported for codebook "
@@ -3370,7 +3675,7 @@ namespace llaminar2
                     explicitSmallMVerifierScopeActive()
                         ? nullptr
                         : (impl_ ? &impl_->rowmajor : nullptr);
-                return cudaNativeVNNIGemvTuned_small_m_fp32(
+                return cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
                     d_A_int8,
                     impl_->d_weights_native_vnni,
                     impl_->d_weights_native_scales,
@@ -3386,6 +3691,7 @@ namespace llaminar2
                     beta != 0.0f ? d_C : nullptr,
                     d_bias,
                     impl_->native_codebook_id,
+                    arithmetic_policy_codebook_id,
                     cuda_device_id_,
                     stream_handle,
                     impl_->gemv_ctx,
@@ -3456,6 +3762,11 @@ namespace llaminar2
 
             validateWorkspace();
             ensureWeightsConverted();
+            const uint8_t arithmetic_policy_codebook_id =
+                impl_->native_source_identity.present
+                    ? canonicalDeviceVnniCodebookId(
+                          impl_->native_source_identity.codebook_id)
+                    : impl_->native_codebook_id;
             if (!canUseNativeVNNIBlockwise(impl_.get(), 1, k))
                 return false;
 
@@ -3481,7 +3792,7 @@ namespace llaminar2
              * same first-call repeat tests.
              */
             ScopedNativeVNNIGemvDecodeEquivalentM1Config decode_equivalent_m1_scope;
-            const bool ok = cudaNativeVNNIGemvTuned_fp32(
+            const bool ok = cudaNativeVNNIGemvTuned_fp32_withPolicy(
                 d_A_int8,
                 impl_->d_weights_native_vnni,
                 impl_->d_weights_native_scales,
@@ -3496,6 +3807,7 @@ namespace llaminar2
                 nullptr,
                 d_bias,
                 impl_->native_codebook_id,
+                arithmetic_policy_codebook_id,
                 cuda_device_id_,
                 stream_handle,
                 impl_->gemv_ctx,
@@ -3918,14 +4230,25 @@ namespace llaminar2
 
             bool has_native_codebook = false;
             uint8_t native_codebook_id = 0;
+            uint8_t native_arithmetic_policy_codebook_id = 0;
             if (packed_)
             {
                 native_codebook_id = packed_->native_codebook_id;
+                native_arithmetic_policy_codebook_id =
+                    packed_->native_source_identity.present
+                        ? canonicalDeviceVnniCodebookId(
+                              packed_->native_source_identity.codebook_id)
+                        : native_codebook_id;
                 has_native_codebook = true;
             }
             else if (weights_converted_ && impl_ && impl_->d_weights_native_vnni)
             {
                 native_codebook_id = impl_->native_codebook_id;
+                native_arithmetic_policy_codebook_id =
+                    impl_->native_source_identity.present
+                        ? canonicalDeviceVnniCodebookId(
+                              impl_->native_source_identity.codebook_id)
+                        : native_codebook_id;
                 has_native_codebook = true;
             }
             else if (weights_)
@@ -3935,6 +4258,8 @@ namespace llaminar2
                     if (const auto *info = unpackable->vnniFormatInfo())
                     {
                         native_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
+                        native_arithmetic_policy_codebook_id =
+                            canonicalDeviceVnniCodebookId(info->codebook_id);
                         has_native_codebook = true;
                     }
                 }
@@ -3945,6 +4270,7 @@ namespace llaminar2
                 const NativePrefillWorkspaceBounds prefill_bounds =
                     maxNativePrefillWorkspaceForRowsUpTo(
                         native_codebook_id,
+                        native_arithmetic_policy_codebook_id,
                         m,
                         n,
                         k,
@@ -3962,6 +4288,9 @@ namespace llaminar2
                 }
                 LOG_TRACE("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
                           << static_cast<int>(native_codebook_id)
+                          << " arithmetic_policy_codebook="
+                          << static_cast<int>(
+                                 native_arithmetic_policy_codebook_id)
                           << " max_rows=" << m
                           << " canonical_kpart_rows="
                           << prefill_bounds.canonical_kpart_rows

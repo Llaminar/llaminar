@@ -163,6 +163,10 @@ namespace llaminar2
                 return 2;
             case TensorType::Q8_1:
                 return sizeof(Q8_1Block);
+            case TensorType::AQ8:
+                // AQ8 uses one variable-width block per attention head. The
+                // view is metadata-only; cache publication owns exact row bytes.
+                return 1;
             default:
                 return 4; // Fallback
             }

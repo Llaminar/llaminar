@@ -40,10 +40,13 @@ namespace llaminar2
         std::vector<GlobalDeviceAddress> devices; ///< Devices in domain
         std::vector<float> weights;               ///< Work distribution
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
+        ExecutionDomainScope scope = ExecutionDomainScope::AUTO;
 
-        // Rank mappings (computed during resolution)
-        std::vector<int> ranks;           ///< MPI ranks in this domain
-        std::map<int, int> rank_to_index; ///< Rank -> index within domain
+        // Rank mappings (computed during resolution). device_ranks is aligned
+        // with devices; ranks is the sorted unique collective membership.
+        std::vector<int> device_ranks;     ///< Exact owner rank per device
+        std::vector<int> ranks;            ///< MPI ranks in this domain
+        std::map<int, int> rank_to_index;  ///< Rank -> index within domain
     };
 
     /**

@@ -1,9 +1,24 @@
+/**
+ * @file Test__MemoryPlanner.cpp
+ * @brief Unit coverage for metadata-only device memory admission.
+ *
+ * These tests pin the boundary between a declarative execution placement and
+ * the bytes that its real graph allocates.  In particular, mixed ExpertOverlay
+ * continuation endpoints must reserve both dense graph state and their own
+ * stable sparse-route buffers before captured graph construction begins.
+ */
+
 #include <gtest/gtest.h>
 #include "planning/MemoryPlanner.h"
 #include "planning/MemoryPlan.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/ActivationBufferSizing.h"
+#include "planning/KVCacheMemoryEstimator.h"
 #include "backends/DeviceId.h"
+
+#include <string>
+#include <stdexcept>
+#include <utility>
 
 using namespace llaminar2;
 
@@ -124,6 +139,81 @@ namespace
         return profile;
     }
 
+    ModelMemoryProfile createMoEOverlayProfile()
+    {
+        ModelMemoryProfile profile;
+        profile.architecture = "qwen3.5moe";
+        profile.n_layers = 2;
+        profile.d_model = 32;
+        profile.d_ff = 64;
+        profile.n_heads = 4;
+        profile.n_kv_heads = 2;
+        profile.head_dim = 8;
+        profile.vocab_size = 100;
+        profile.max_seq_len = 64;
+        profile.expert_count = 8;
+        profile.expert_used_count = 2;
+        profile.expert_feed_forward_length = 64;
+        profile.expert_shared_feed_forward_length = 64;
+
+        auto addF32 = [&](const std::string &name,
+                          size_t elements,
+                          size_t k,
+                          int layer)
+        {
+            TensorSizeInfo tensor;
+            tensor.name = name;
+            tensor.elements = elements;
+            tensor.K = k;
+            tensor.quant_type = "F32";
+            tensor.native_bytes = elements * sizeof(float);
+            tensor.layer_index = layer;
+            profile.total_native_bytes += tensor.native_bytes;
+            profile.tensors.push_back(std::move(tensor));
+        };
+
+        addF32("token_embd.weight", 100u * 32u, 32, -1);
+        addF32("output.weight", 100u * 32u, 32, -1);
+        for (int layer = 0; layer < profile.n_layers; ++layer)
+        {
+            const std::string prefix = "blk." + std::to_string(layer);
+            addF32(prefix + ".attn_q.weight", 32u * 32u, 32, layer);
+            addF32(prefix + ".ffn_gate_shexp.weight", 64u * 32u, 32, layer);
+            addF32(
+                prefix + ".ffn_gate_exps.weight",
+                8u * 64u * 32u,
+                32,
+                layer);
+            addF32(
+                prefix + ".ffn_up_exps.weight",
+                8u * 64u * 32u,
+                32,
+                layer);
+            addF32(
+                prefix + ".ffn_down_exps.weight",
+                8u * 32u * 64u,
+                64,
+                layer);
+        }
+        return profile;
+    }
+
+    DevicePlanConfig overlayDeviceConfig(DeviceId device)
+    {
+        DevicePlanConfig config;
+        config.device = device;
+        config.device_compute_units = device.is_cuda() ? 82 : 60;
+        config.device_total_bytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
+        config.device_free_bytes = config.device_total_bytes;
+        config.first_layer = 0;
+        config.last_layer = 1;
+        config.batch_size = 1;
+        config.max_seq_len = 64;
+        config.activation_seq_len = 32;
+        config.kv_precision = "fp16";
+        return config;
+    }
+
 } // anonymous namespace
 
 TEST(Test__MemoryPlanner, SingleGPU_Fits)
@@ -132,6 +222,7 @@ TEST(Test__MemoryPlanner, SingleGPU_Fits)
 
     DevicePlanConfig cfg;
     cfg.device = DeviceId::cuda(0);
+    cfg.device_compute_units = 82;
     cfg.device_total_bytes = 24ULL * 1024 * 1024 * 1024; // 24 GB
     cfg.device_free_bytes = 23ULL * 1024 * 1024 * 1024;  // 23 GB free
     cfg.batch_size = 1;
@@ -157,6 +248,7 @@ TEST(Test__MemoryPlanner, Qwen36DenseLike_UsesTerminalLogitsAndPreparedEmbedding
 
     DevicePlanConfig cfg;
     cfg.device = DeviceId::cuda(0);
+    cfg.device_compute_units = 82;
     cfg.device_total_bytes = 24ULL * GiB;
     cfg.device_free_bytes = static_cast<size_t>(23.3 * static_cast<double>(GiB));
     cfg.batch_size = 1;
@@ -184,6 +276,7 @@ TEST(Test__MemoryPlanner, Qwen36HybridMTP_AccountsExactKVAndPersistentState)
 
     DevicePlanConfig cfg;
     cfg.device = DeviceId::cuda(0);
+    cfg.device_compute_units = 82;
     cfg.device_total_bytes = 24ULL * 1024ULL * 1024ULL * 1024ULL;
     cfg.device_free_bytes = cfg.device_total_bytes;
     cfg.batch_size = 1;
@@ -201,9 +294,14 @@ TEST(Test__MemoryPlanner, Qwen36HybridMTP_AccountsExactKVAndPersistentState)
         313786368ULL;
     constexpr size_t expected_terminal_hidden =
         5120ULL * sizeof(float);
-    constexpr size_t expected_kv =
-        17ULL * 4096ULL * 8ULL * 128ULL *
-        2ULL * sizeof(uint16_t);
+    const size_t expected_kv = KVCacheMemoryEstimator::estimate(
+        /*n_layers=*/17,
+        /*batch_size=*/1,
+        /*max_seq_len=*/4096,
+        /*n_kv_heads=*/8,
+        /*head_dim=*/128,
+        "fp16",
+        DeviceId::cuda(0));
 
     EXPECT_EQ(device.kv_cache_bytes, expected_kv)
         << "Only 16 main FA layers plus one shifted MTP FA layer own KV.";
@@ -253,6 +351,7 @@ TEST(Test__MemoryPlanner, TerminalParticipantOwnsTrailingMTPWeights)
 
     DevicePlanConfig config;
     config.device = DeviceId::cuda(0);
+    config.device_compute_units = 82;
     config.device_total_bytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
     config.device_free_bytes = config.device_total_bytes;
     config.first_layer = 0;
@@ -291,6 +390,7 @@ TEST(Test__MemoryPlanner, LongContext_KeepsKVFullContextButCapsActivationWorkspa
 
     DevicePlanConfig short_context;
     short_context.device = DeviceId::cuda(0);
+    short_context.device_compute_units = 82;
     short_context.device_total_bytes = 48ULL * GiB;
     short_context.device_free_bytes = 48ULL * GiB;
     short_context.batch_size = 1;
@@ -315,8 +415,9 @@ TEST(Test__MemoryPlanner, LongContext_KeepsKVFullContextButCapsActivationWorkspa
         << "KV cache must still reserve the requested long context";
     EXPECT_EQ(long_device.activation_bytes, short_device.activation_bytes)
         << "Activation arena must be sized to graph chunk capacity, not context capacity";
-    EXPECT_EQ(long_device.workspace_bytes, short_device.workspace_bytes)
-        << "GPU workspace must follow activation graph capacity, not context capacity";
+    EXPECT_GT(long_device.workspace_bytes, short_device.workspace_bytes)
+        << "FA2 context-summary capacity follows the full KV horizon even "
+           "when ordinary activation rows remain bucketed";
     EXPECT_EQ(long_device.max_seq_len, 16384);
     EXPECT_EQ(long_device.activation_seq_len, 4096);
     EXPECT_TRUE(long_plan.fits()) << long_plan.renderTable();
@@ -329,6 +430,7 @@ TEST(Test__MemoryPlanner, ResidentGraphSelection_ChoosesLargestFittingBucket)
 
     DevicePlanConfig probe;
     probe.device = DeviceId::cuda(0);
+    probe.device_compute_units = 82;
     probe.device_total_bytes = 24ULL * GiB;
     probe.device_free_bytes = 24ULL * GiB;
     probe.batch_size = 1;
@@ -364,6 +466,7 @@ TEST(Test__MemoryPlanner, SingleGPU_DoesNotFit)
 
     DevicePlanConfig cfg;
     cfg.device = DeviceId::cuda(0);
+    cfg.device_compute_units = 82;
     cfg.device_total_bytes = 1ULL * 1024 * 1024 * 1024; // 1 GB
     cfg.device_free_bytes = 512ULL * 1024 * 1024;       // 512 MB free
     cfg.batch_size = 1;
@@ -377,6 +480,49 @@ TEST(Test__MemoryPlanner, SingleGPU_DoesNotFit)
     EXPECT_FALSE(plan.diagnostics.empty());
 }
 
+TEST(Test__MemoryPlanner, CertifiedRetainedWeightsUseIncrementalAdmission)
+{
+    auto profile = createTestProfile();
+
+    DevicePlanConfig config;
+    config.device = DeviceId::cuda(0);
+    config.device_compute_units = 82;
+    config.device_total_bytes = 24ULL * 1024ULL * 1024ULL * 1024ULL;
+    config.device_free_bytes = config.device_total_bytes;
+    config.batch_size = 1;
+    config.max_seq_len = 4096;
+    config.kv_precision = "fp16";
+
+    const auto complete = MemoryPlanner::plan(profile, {config});
+    ASSERT_EQ(complete.devices.size(), 1u);
+    const auto &complete_device = complete.devices.front();
+    ASSERT_GT(complete_device.weight_bytes, 0u);
+    ASSERT_EQ(complete_device.retained_weight_bytes, 0u);
+
+    const size_t non_weight_bytes =
+        complete_device.total_bytes() - complete_device.weight_bytes;
+    config.device_free_bytes =
+        non_weight_bytes + config.headroom_bytes + 1ULL * 1024ULL * 1024ULL;
+
+    const auto fresh = MemoryPlanner::plan(profile, {config});
+    ASSERT_EQ(fresh.devices.size(), 1u);
+    EXPECT_FALSE(fresh.fits())
+        << "A fresh runner must still reserve the complete weight allocation";
+
+    config.prepared_weight_admission =
+        PreparedWeightAdmission::ReuseCertifiedCompleteSet;
+    const auto retained = MemoryPlanner::plan(profile, {config});
+    ASSERT_EQ(retained.devices.size(), 1u);
+    const auto &retained_device = retained.devices.front();
+    EXPECT_TRUE(retained.fits()) << retained.renderTable();
+    EXPECT_EQ(retained_device.weight_bytes, complete_device.weight_bytes)
+        << "The final capacity BOM must retain the complete model footprint";
+    EXPECT_EQ(retained_device.retained_weight_bytes, retained_device.weight_bytes);
+    EXPECT_EQ(retained_device.incremental_weight_bytes(), 0u);
+    EXPECT_EQ(retained_device.incremental_bytes(), non_weight_bytes);
+    EXPECT_NE(retained.renderTable().find("Retained"), std::string::npos);
+}
+
 TEST(Test__MemoryPlanner, TP2_ReducesPerDeviceWeight)
 {
     auto profile = createTestProfile();
@@ -384,6 +530,7 @@ TEST(Test__MemoryPlanner, TP2_ReducesPerDeviceWeight)
     // Single device
     DevicePlanConfig single;
     single.device = DeviceId::cuda(0);
+    single.device_compute_units = 82;
     single.device_total_bytes = 24ULL * 1024 * 1024 * 1024;
     single.device_free_bytes = 23ULL * 1024 * 1024 * 1024;
     single.batch_size = 1;
@@ -410,6 +557,60 @@ TEST(Test__MemoryPlanner, TP2_ReducesPerDeviceWeight)
     EXPECT_LT(tp_plan.devices[1].weight_bytes, single_plan.devices[0].weight_bytes);
 }
 
+TEST(Test__MemoryPlanner,
+     PhaseSplitDensePolicyPricesConcurrentReplicatedDecodeWeights)
+{
+    const auto profile = createMoEOverlayProfile();
+    auto config = overlayDeviceConfig(DeviceId::cuda(0));
+    config.shard_index = 0;
+    config.total_shards = 2;
+    const std::vector<int> no_routed_experts(
+        static_cast<std::size_t>(profile.n_layers), 0);
+    config.weight_residency =
+        DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,
+            no_routed_experts);
+    config.additional_weight_sets =
+        resolveAdditionalPersistentWeightSets(
+            DenseParallelPolicy::PrefillTensorParallelDecodeReplicated,
+            config.total_shards);
+
+    const auto planned = MemoryPlanner::plan(profile, {config});
+    ASSERT_EQ(planned.devices.size(), 1u);
+    const auto primary = WeightMemoryEstimator::estimate(
+        profile,
+        config.device,
+        config.shard_index,
+        config.total_shards,
+        config.first_layer,
+        config.last_layer,
+        config.weight_residency);
+    const auto replicated_decode = WeightMemoryEstimator::estimate(
+        profile,
+        config.device,
+        /*shard_index=*/0,
+        /*total_shards=*/1,
+        config.first_layer,
+        config.last_layer,
+        DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,
+            no_routed_experts));
+
+    EXPECT_EQ(planned.devices.front().weight_bytes, primary.device_bytes);
+    EXPECT_EQ(
+        planned.devices.front().additional_weight_bytes,
+        replicated_decode.device_bytes);
+    EXPECT_EQ(
+        planned.devices.front().total_weight_bytes(),
+        primary.device_bytes + replicated_decode.device_bytes);
+
+    config.additional_weight_sets.push_back(
+        AdditionalPersistentWeightSet::ReplicatedDenseDecode);
+    EXPECT_THROW(
+        (void)MemoryPlanner::plan(profile, {config}),
+        std::invalid_argument);
+}
+
 TEST(Test__MemoryPlanner, TP2_ReducesKVCachePerDevice)
 {
     auto profile = createTestProfile();
@@ -417,6 +618,7 @@ TEST(Test__MemoryPlanner, TP2_ReducesKVCachePerDevice)
     // Single device — all KV heads
     DevicePlanConfig single;
     single.device = DeviceId::cuda(0);
+    single.device_compute_units = 82;
     single.device_total_bytes = 24ULL * 1024 * 1024 * 1024;
     single.device_free_bytes = 23ULL * 1024 * 1024 * 1024;
     single.batch_size = 1;
@@ -450,6 +652,7 @@ TEST(Test__MemoryPlanner, PP2_SplitsLayersAcrossDevices)
     // Stage 0: layers 0-11
     DevicePlanConfig stage0;
     stage0.device = DeviceId::cuda(0);
+    stage0.device_compute_units = 82;
     stage0.device_total_bytes = 24ULL * 1024 * 1024 * 1024;
     stage0.device_free_bytes = 23ULL * 1024 * 1024 * 1024;
     stage0.batch_size = 1;
@@ -472,6 +675,7 @@ TEST(Test__MemoryPlanner, PP2_SplitsLayersAcrossDevices)
     // (plus replicated embedding/lm_head/norms, so > 50% each)
     DevicePlanConfig full;
     full.device = DeviceId::cuda(0);
+    full.device_compute_units = 82;
     full.device_total_bytes = 24ULL * 1024 * 1024 * 1024;
     full.device_free_bytes = 23ULL * 1024 * 1024 * 1024;
     full.batch_size = 1;
@@ -494,6 +698,7 @@ TEST(Test__MemoryPlanner, MixedDevices_CUDAAndROCm)
 
     DevicePlanConfig cuda_cfg;
     cuda_cfg.device = DeviceId::cuda(0);
+    cuda_cfg.device_compute_units = 82;
     cuda_cfg.device_total_bytes = 24ULL * 1024 * 1024 * 1024; // 24 GB (RTX 3090)
     cuda_cfg.device_free_bytes = 23ULL * 1024 * 1024 * 1024;
     cuda_cfg.batch_size = 1;
@@ -504,6 +709,7 @@ TEST(Test__MemoryPlanner, MixedDevices_CUDAAndROCm)
 
     DevicePlanConfig rocm_cfg;
     rocm_cfg.device = DeviceId::rocm(0);
+    rocm_cfg.device_compute_units = 60;
     rocm_cfg.device_total_bytes = 32ULL * 1024 * 1024 * 1024; // 32 GB (MI60)
     rocm_cfg.device_free_bytes = 31ULL * 1024 * 1024 * 1024;
     rocm_cfg.batch_size = 1;
@@ -554,6 +760,7 @@ TEST(Test__MemoryPlanner, RenderTable_ProducesOutput)
 
     DevicePlanConfig cfg;
     cfg.device = DeviceId::cuda(0);
+    cfg.device_compute_units = 82;
     cfg.device_total_bytes = 24ULL * 1024 * 1024 * 1024;
     cfg.device_free_bytes = 23ULL * 1024 * 1024 * 1024;
     cfg.batch_size = 1;
@@ -578,6 +785,7 @@ TEST(Test__MemoryPlanner, Diagnostics_WarnsOnTightHeadroom)
     // First, compute the plan with generous memory to learn the total
     DevicePlanConfig probe;
     probe.device = DeviceId::cuda(0);
+    probe.device_compute_units = 82;
     probe.device_total_bytes = 24ULL * 1024 * 1024 * 1024;
     probe.device_free_bytes = 24ULL * 1024 * 1024 * 1024;
     probe.batch_size = 1;
@@ -611,6 +819,7 @@ TEST(Test__MemoryPlanner, PP2_DoesNotFit_WithoutLayerSplit)
     // Full model on a single 24 GB GPU that doesn't have enough free memory
     DevicePlanConfig cfg;
     cfg.device = DeviceId::cuda(0);
+    cfg.device_compute_units = 82;
     cfg.device_total_bytes = 24ULL * 1024 * 1024 * 1024;
     cfg.device_free_bytes = 1ULL * 1024 * 1024 * 1024; // Only 1 GB free
     cfg.batch_size = 1;
@@ -662,6 +871,7 @@ TEST(Test__MemoryPlanner, PP_LayerRange_ReducesWeightEstimate_Proportionally)
     // Full model
     DevicePlanConfig full;
     full.device = DeviceId::cuda(0);
+    full.device_compute_units = 82;
     full.device_total_bytes = 48ULL * 1024 * 1024 * 1024;
     full.device_free_bytes = 48ULL * 1024 * 1024 * 1024;
     full.batch_size = 1;
@@ -704,4 +914,217 @@ TEST(Test__MemoryPlanner, DeviceMemoryPlan_Summary)
     EXPECT_FALSE(summary.empty());
     EXPECT_NE(summary.find("CUDA:0"), std::string::npos);
     EXPECT_NE(summary.find("[OK]"), std::string::npos);
+}
+
+TEST(Test__MemoryPlanner, RoutedExpertParticipantOwnsNoDensePersistentState)
+{
+    const auto profile = createMoEOverlayProfile();
+
+    auto continuation = overlayDeviceConfig(DeviceId::cuda(0));
+    continuation.weight_residency =
+        DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,
+            {2, 2});
+
+    auto participant = overlayDeviceConfig(DeviceId::rocm(0));
+    participant.execution_role =
+        DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    participant.weight_residency =
+        DeviceWeightResidency::selectedRoutedExpertsOnly(
+            profile.expert_count,
+            {2, 2});
+
+    const auto plan = MemoryPlanner::plan(
+        profile, {continuation, participant});
+
+    ASSERT_EQ(plan.devices.size(), 2u);
+    const auto &continuation_plan = plan.devices[0];
+    const auto &participant_plan = plan.devices[1];
+    EXPECT_GT(continuation_plan.kv_cache_bytes, 0u);
+    EXPECT_GT(continuation_plan.activation_bytes, 0u);
+    EXPECT_GT(continuation_plan.workspace_bytes, 0u);
+    EXPECT_EQ(participant_plan.kv_cache_bytes, 0u);
+    EXPECT_EQ(participant_plan.live_recurrent_state_bytes, 0u);
+    EXPECT_EQ(participant_plan.checkpoint_state_bytes, 0u);
+    EXPECT_EQ(participant_plan.persistent_state_bytes, 0u);
+    EXPECT_GT(participant_plan.activation_bytes, 0u);
+    EXPECT_GT(participant_plan.workspace_bytes, 0u);
+    EXPECT_LT(participant_plan.weight_bytes, continuation_plan.weight_bytes);
+}
+
+TEST(Test__MemoryPlanner, OverlayContinuationReservesItsOwnCompactRouteBuffers)
+{
+    const auto profile = createMoEOverlayProfile();
+
+    auto dense_continuation = overlayDeviceConfig(DeviceId::cuda(0));
+    const auto dense_plan = MemoryPlanner::plan(
+        profile, {dense_continuation});
+    ASSERT_EQ(dense_plan.devices.size(), 1u);
+
+    auto overlay_continuation = dense_continuation;
+    overlay_continuation.weight_residency =
+        DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,
+            {2, 2});
+    const auto overlay_plan = MemoryPlanner::plan(
+        profile, {overlay_continuation});
+    ASSERT_EQ(overlay_plan.devices.size(), 1u);
+
+    /*
+     * MoELocalExpertStage owns hidden + output vectors and one routing-index
+     * and routing-weight scalar per compact route.  Both selected layers keep
+     * those buffers alive because a captured graph holds their addresses.
+     */
+    const size_t route_rows =
+        static_cast<size_t>(overlay_continuation.batch_size) *
+        static_cast<size_t>(overlay_continuation.activation_seq_len) *
+        static_cast<size_t>(profile.expert_used_count);
+    const size_t bytes_per_route =
+        (2u * static_cast<size_t>(profile.d_model) + 2u) * sizeof(float);
+    const size_t expected_compact_bytes =
+        route_rows * bytes_per_route * static_cast<size_t>(profile.n_layers);
+
+    EXPECT_EQ(
+        overlay_plan.devices.front().activation_bytes,
+        dense_plan.devices.front().activation_bytes + expected_compact_bytes)
+        << "A continuation that owns hot routed experts must account for the "
+           "same persistent compact tensors as an expert-only endpoint";
+}
+
+/**
+ * @brief A serial graph family reserves one compact packet per participant, not per layer.
+ *
+ * This is the production ExpertOverlay contract used by Qwen3.5 MoE: graph
+ * roles and transformer layers are explicitly ordered, while distinct logical
+ * participants remain independently runnable and therefore retain separate
+ * packet addresses.
+ */
+TEST(Test__MemoryPlanner,
+     OverlaySerialParticipantFamilyReservesOneCompactRouteBufferPerParticipant)
+{
+    const auto profile = createMoEOverlayProfile();
+
+    auto dense_continuation = overlayDeviceConfig(DeviceId::cuda(0));
+    const auto dense_plan = MemoryPlanner::plan(
+        profile, {dense_continuation});
+
+    auto serial_overlay = dense_continuation;
+    serial_overlay.weight_residency =
+        DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,
+            {2, 2});
+    serial_overlay.routed_expert_compact_buffer_lifetime =
+        RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
+    serial_overlay.serial_routed_expert_participant_count = 2;
+
+    const auto serial_plan = MemoryPlanner::plan(
+        profile, {serial_overlay});
+    ASSERT_EQ(serial_plan.devices.size(), 1u);
+
+    const size_t route_rows =
+        static_cast<size_t>(serial_overlay.batch_size) *
+        static_cast<size_t>(serial_overlay.activation_seq_len) *
+        static_cast<size_t>(profile.expert_used_count);
+    const size_t bytes_per_route =
+        (2u * static_cast<size_t>(profile.d_model) + 2u) * sizeof(float);
+    const size_t expected_compact_bytes =
+        route_rows * bytes_per_route *
+        static_cast<size_t>(serial_overlay.serial_routed_expert_participant_count);
+
+    EXPECT_EQ(
+        serial_plan.devices.front().activation_bytes,
+        dense_plan.devices.front().activation_bytes + expected_compact_bytes)
+        << "The serial packet arena may alias layers and graph roles, but never "
+           "two independently runnable overlay participants";
+}
+
+/**
+ * @brief The planner prices every retained segment bucket, not the KV envelope.
+ */
+TEST(Test__MemoryPlanner,
+     OverlaySerialSegmentFamiliesUseBoundedRowsAndExactPowerOfTwoBom)
+{
+    const auto profile = createMoEOverlayProfile();
+
+    auto dense_continuation = overlayDeviceConfig(DeviceId::cuda(0));
+    const auto dense_plan = MemoryPlanner::plan(
+        profile, {dense_continuation});
+
+    auto serial_overlay = dense_continuation;
+    serial_overlay.weight_residency =
+        DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,
+            {2, 2});
+    serial_overlay.routed_expert_compact_buffer_lifetime =
+        RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
+    serial_overlay.serial_routed_expert_participant_count = 2;
+    /* Five flattened token rows at top-k two produce ten route rows. */
+    serial_overlay.serial_routed_expert_compact_rows = 5;
+
+    const auto serial_plan = MemoryPlanner::plan(
+        profile, {serial_overlay});
+    ASSERT_EQ(serial_plan.devices.size(), 1u);
+
+    const size_t retained_route_rows = 1u + 2u + 4u + 8u + 10u;
+    const size_t bytes_per_route =
+        (2u * static_cast<size_t>(profile.d_model) + 2u) *
+        sizeof(float);
+    const size_t expected_compact_bytes =
+        retained_route_rows * bytes_per_route *
+        static_cast<size_t>(
+            serial_overlay.serial_routed_expert_participant_count);
+
+    EXPECT_EQ(
+        serial_plan.devices.front().activation_bytes,
+        dense_plan.devices.front().activation_bytes +
+            expected_compact_bytes);
+}
+
+TEST(Test__MemoryPlanner,
+     OverlaySerialParticipantFamilyRejectsMissingParticipantCount)
+{
+    const auto profile = createMoEOverlayProfile();
+    auto serial_overlay = overlayDeviceConfig(DeviceId::cuda(0));
+    serial_overlay.weight_residency =
+        DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,
+            {2, 2});
+    serial_overlay.routed_expert_compact_buffer_lifetime =
+        RoutedExpertCompactBufferLifetime::SerialFamilyPerParticipant;
+
+    EXPECT_THROW(
+        (void)MemoryPlanner::plan(profile, {serial_overlay}),
+        std::invalid_argument);
+}
+
+TEST(Test__MemoryPlanner, CpuExpertParticipantUsesTheSameResidentTicketBucket)
+{
+    const auto profile = createMoEOverlayProfile();
+
+    auto continuation = overlayDeviceConfig(DeviceId::cuda(0));
+    continuation.weight_residency =
+        DeviceWeightResidency::continuationWithSelectedRoutedExperts(
+            profile.expert_count,
+            {4, 4});
+
+    auto cpu_participant = overlayDeviceConfig(DeviceId::cpu());
+    cpu_participant.execution_role =
+        DeviceExecutionMemoryRole::RoutedExpertParticipant;
+    cpu_participant.weight_residency =
+        DeviceWeightResidency::selectedRoutedExpertsOnly(
+            profile.expert_count,
+            {2, 2});
+
+    const auto selected =
+        MemoryPlanner::planLargestFittingResidentGraphRows(
+            profile,
+            {continuation, cpu_participant},
+            {8, 16, 32});
+
+    ASSERT_TRUE(selected.fits()) << selected.memory_plan.renderTable();
+    EXPECT_EQ(selected.resident_graph_rows, 32);
+    ASSERT_EQ(selected.memory_plan.devices.size(), 2u);
+    EXPECT_EQ(selected.memory_plan.devices[0].activation_seq_len, 32);
+    EXPECT_EQ(selected.memory_plan.devices[1].activation_seq_len, 32)
+        << "CPU cold endpoints consume the same segmented ticket geometry as captured GPU participants";
 }

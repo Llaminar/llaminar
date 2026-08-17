@@ -1312,11 +1312,22 @@ namespace llaminar2
                 params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0);
             const bool needs_device_sequence_params =
                 has_current_dynamic_sequence_state ||
-                effective_kv_len > logical_seq_len;
+                effective_kv_len > logical_seq_len ||
+                isGraphCaptureActive();
             if (device_cached_tokens && needs_device_sequence_params)
             {
                 if (!gpu_grouped_request_decode)
                 {
+                    /*
+                     * Setup-only capture has no admitted request and therefore
+                     * no host dynamic-sequence mirror. It still records the
+                     * production device-count parameter writer: at transaction
+                     * zero the preceding KV append owns the live count, and the
+                     * adaptive CUDA predicate plus attention body consume that
+                     * value entirely on the captured stream. Restricting this
+                     * to host-observed prefix growth omits the conditional
+                     * transaction from a cold materialized executable.
+                     */
                     const int query_rows_for_params =
                         dynamicAttentionParamRows(logical_seq_len, effective_kv_len);
                     if (!kernel->prepareDynamicAttnParamsFromDeviceSequenceState(

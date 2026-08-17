@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <optional>
@@ -91,6 +92,134 @@ namespace llaminar2
         bool isDeviceTensorSnapshotOutput(const StageDumpInfo::OutputBuffer &output)
         {
             return output.tensor != nullptr;
+        }
+
+        /**
+         * @brief Project fixed-width captured snapshot rows to the request-owned rows.
+         *
+         * Captured prefill graphs deliberately retain a fixed physical bucket
+         * shape.  That constraint applies equally to a GPU stage copied into a
+         * graph-stable manifest and to a synchronous CPU/manual boundary in a
+         * heterogeneous graph.  Diagnostics, however, represent the logical
+         * prompt rather than padding.  This helper performs the one allowed
+         * shape adaptation after the producer has completed and after any
+         * required device-to-host publication; it never mutates graph storage,
+         * graph identity, or inference-owned tensor state.
+         *
+         * @param stage_name Stable graph node name used in fatal diagnostics.
+         * @param snapshot_info Host-visible stage outputs to project in place.
+         * @param logical_rows Per-sequence real-row descriptor for this launch.
+         * @param compacted_outputs Caller-owned backing storage for non-prefix
+         *        batch compaction.  It remains alive through the callback.
+         * @return True when every token-shaped output was projected safely.
+         */
+        bool projectSnapshotOutputsToLogicalRows(
+            const std::string &stage_name,
+            StageDumpInfo *snapshot_info,
+            const DeviceGraphExecutor::GraphSnapshotLogicalRows *logical_rows,
+            std::vector<std::vector<uint8_t>> *compacted_outputs)
+        {
+            if (!logical_rows || !logical_rows->active())
+                return true;
+
+            if (!snapshot_info || !compacted_outputs)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Snapshot logical-row projection for stage '"
+                          << stage_name << "' received incomplete diagnostic state");
+                return false;
+            }
+
+            const size_t batch_size =
+                logical_rows->logical_rows_per_sequence.size();
+            if (logical_rows->physical_rows_per_sequence >
+                std::numeric_limits<size_t>::max() / batch_size)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Snapshot logical-row descriptor overflows its captured row count");
+                return false;
+            }
+
+            const size_t physical_token_rows =
+                logical_rows->physical_rows_per_sequence * batch_size;
+            size_t logical_token_rows = 0;
+            for (const size_t rows : logical_rows->logical_rows_per_sequence)
+            {
+                if (rows > logical_rows->physical_rows_per_sequence ||
+                    rows > std::numeric_limits<size_t>::max() - logical_token_rows)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Snapshot logical-row descriptor exceeds its captured sequence width");
+                    return false;
+                }
+                logical_token_rows += rows;
+            }
+
+            compacted_outputs->clear();
+            compacted_outputs->resize(snapshot_info->outputs.size());
+            for (size_t output_index = 0;
+                 output_index < snapshot_info->outputs.size();
+                 ++output_index)
+            {
+                auto &output = snapshot_info->outputs[output_index];
+                if (output.rows != physical_token_rows)
+                    continue;
+                if (!output.data || output.rows == 0 ||
+                    output.byte_size == 0 ||
+                    output.byte_size % output.rows != 0)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Snapshot stage '"
+                              << stage_name
+                              << "' cannot project logical rows for output '"
+                              << (output.name ? output.name : "<unnamed>")
+                              << "' because its physical row layout is incomplete");
+                    return false;
+                }
+
+                const size_t row_bytes = output.byte_size / output.rows;
+                if (logical_token_rows > 0 &&
+                    row_bytes > std::numeric_limits<size_t>::max() /
+                                    logical_token_rows)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Snapshot logical-row projection overflows output storage");
+                    return false;
+                }
+                const size_t logical_bytes = logical_token_rows * row_bytes;
+
+                /* A one-sequence request owns a contiguous prefix. */
+                if (batch_size == 1)
+                {
+                    output.rows = logical_token_rows;
+                    output.byte_size = logical_bytes;
+                    continue;
+                }
+
+                auto &compacted = (*compacted_outputs)[output_index];
+                compacted.resize(logical_bytes);
+                const auto *source = static_cast<const uint8_t *>(output.data);
+                size_t destination_offset = 0;
+                for (size_t batch = 0; batch < batch_size; ++batch)
+                {
+                    const size_t rows =
+                        logical_rows->logical_rows_per_sequence[batch];
+                    const size_t bytes = rows * row_bytes;
+                    if (bytes > 0)
+                    {
+                        std::memcpy(
+                            compacted.data() + destination_offset,
+                            source + batch *
+                                         logical_rows->physical_rows_per_sequence *
+                                         row_bytes,
+                            bytes);
+                    }
+                    destination_offset += bytes;
+                }
+
+                output.data = compacted.data();
+                output.rows = logical_token_rows;
+                output.byte_size = logical_bytes;
+                /* The compacted view is callback-only, not a live tensor. */
+                output.tensor = nullptr;
+            }
+
+            return true;
         }
 
         bool validateStagePointerSet(
@@ -315,6 +444,16 @@ namespace llaminar2
         {
             if (policy.coherence || !arena || contract.empty())
                 return false;
+            if (policy.graph_recording_authority ==
+                StageRunPolicy::GraphRecordingAuthority::SetupAddressesOnly)
+            {
+                /*
+                 * Setup capture has already allocated the complete arena
+                 * frontier. No request producer exists to join, and forcing the
+                 * ordinary coherence repair here would invent payload authority.
+                 */
+                return false;
+            }
 
             // Host-staged graph-native collectives must always honor arena
             // contracts in decode: they are exactly the CPU bridges between
@@ -346,6 +485,27 @@ namespace llaminar2
         const std::string &stage_name,
         const StageDumpInfo &dump_info,
         const IWorkerGPUContext *gpu_ctx);
+
+    /**
+     * @brief Stable PerfStats spelling for the executor's typed runtime phase.
+     *
+     * Keeping phase attribution at the executor boundary prevents prefill and
+     * grouped-verifier samples for the same declarative graph node from being
+     * merged into one misleading aggregate.
+     */
+    static const char *executionPhasePerfName(ExecutionPhase phase)
+    {
+        switch (phase)
+        {
+        case ExecutionPhase::PREFILL:
+            return "prefill";
+        case ExecutionPhase::DECODE:
+            return "decode";
+        case ExecutionPhase::COMBINED:
+            return "combined";
+        }
+        return "unknown";
+    }
 
     // =============================================================================
     // ExecutionMode Helpers
@@ -753,6 +913,137 @@ namespace llaminar2
             snapshot_manifest);
     }
 
+    bool DeviceGraphExecutor::allocateStageArenaStorageForCapture(
+        ComputeNode &node,
+        DeviceId capture_device,
+        std::unordered_set<ITensor *> &allocated,
+        const char *context)
+    {
+        if (!arena_ || !node.stage)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Stage arena capture allocation requires an arena and stage"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+        if (!capture_device.is_gpu())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Stage arena capture allocation requires a GPU"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Stage arena storage must be allocated before beginCapture()"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+
+        DeviceId target_device =
+            node.device.is_valid() ? node.device : node.stage->device();
+        if (!target_device.is_valid())
+            target_device = capture_device;
+        if (target_device != capture_device)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] A native graph capture cannot allocate arena storage across "
+                      << capture_device.toString() << " and "
+                      << target_device.toString() << " at stage '" << node.name << "'"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+
+        const auto allocate_binding = [&](const BufferBinding &binding) -> bool
+        {
+            ITensor *tensor = arena_->getTensor(binding.id);
+            if (!tensor)
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Graph arena binding "
+                          << bufferIdName(binding.id)
+                          << " is not bound for stage '" << node.name << "'"
+                          << (context ? std::string(" (") + context + ")" : std::string()));
+                return false;
+            }
+            if (!allocated.insert(tensor).second)
+                return true;
+
+            if (!arena_->allocateDeviceStorage(binding.id, capture_device))
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Failed to allocate graph arena binding "
+                          << bufferIdName(binding.id)
+                          << " before launch preparation at stage '" << node.name << "'"
+                          << (context ? std::string(" (") + context + ")" : std::string()));
+                return false;
+            }
+            return true;
+        };
+
+        try
+        {
+            const StageBufferContract contract = node.stage->bufferContract();
+            for (const auto &binding : contract.allArenaReads())
+            {
+                if (!allocate_binding(binding))
+                    return false;
+            }
+            for (const auto &binding : contract.writesRequiringPrepare())
+            {
+                if (!allocate_binding(binding))
+                    return false;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Failed to allocate graph arena storage at stage '"
+                      << node.name << "'"
+                      << (context ? std::string(" (") + context + ")" : std::string())
+                      << ": " << e.what());
+            return false;
+        }
+
+        return true;
+    }
+
+    bool DeviceGraphExecutor::allocateGraphStorageForCapture(
+        ComputeGraph &graph,
+        IDeviceContext *ctx,
+        const char *context)
+    {
+        if (!arena_)
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Cannot allocate graph storage without a BufferArena"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+        if (!ctx || !ctx->isGPU())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Graph storage allocation requires a GPU context"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Graph storage must be allocated before beginCapture()"
+                      << (context ? std::string(" (") + context + ")" : std::string()));
+            return false;
+        }
+
+        std::unordered_set<ITensor *> allocated;
+        for (const auto &name : graph.getExecutionOrder())
+        {
+            ComputeNode *node = graph.getNode(name);
+            if (!node || !node->stage)
+                continue;
+            if (!allocateStageArenaStorageForCapture(
+                    *node,
+                    ctx->deviceId(),
+                    allocated,
+                    context))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool DeviceGraphExecutor::prepareStageArenaFrontierForCapture(
         ComputeNode &node,
         const std::vector<BufferBinding> &external_reads,
@@ -760,6 +1051,7 @@ namespace llaminar2
         void *capture_stream,
         std::unordered_set<ITensor *> &prepared_inputs,
         std::unordered_set<ITensor *> &prepared_outputs,
+        GraphCaptureInputFrontierPolicy input_policy,
         const char *context)
     {
         if (!arena_ || !node.stage)
@@ -810,13 +1102,50 @@ namespace llaminar2
                 if (!prepared_inputs.insert(tensor).second)
                     continue;
 
-                TransferEngine::requireDeviceInput(
-                    tensor,
-                    capture_device,
-                    capture_stream);
+                if (input_policy ==
+                    GraphCaptureInputFrontierPolicy::RequireReadyBytes)
+                {
+                    TransferEngine::requireDeviceInput(
+                        tensor,
+                        capture_device,
+                        capture_stream);
+                }
+                /*
+                 * BindAddressesOnly deliberately performs no coherence
+                 * transition. allocateStageArenaStorageForCapture() has already
+                 * established the permanent pointer; setup records that pointer
+                 * but owns no request payload to publish into it.
+                 */
             }
 
             const StageBufferContract contract = node.stage->bufferContract();
+
+            /*
+             * Raw tensor weights are external graph reads just like activation
+             * frontier inputs. They are intentionally absent from BufferArena,
+             * but their upload event still has to be joined to the exact capture
+             * stream before beginCapture(). Deferring this check to runStage()
+             * would attempt an event wait while native capture is active.
+             * PreparedWeightBinding entries name backend-owned allocations and
+             * are validated by the stage's preparation path instead; their host
+             * source tensors are not the bytes consumed by the device kernel.
+             */
+            for (ITensor *weight : contract.weight_tensors)
+            {
+                if (!weight)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Raw graph weight is null for stage '"
+                              << node.name << "'"
+                              << (context ? std::string(" (") + context + ")" : std::string()));
+                    return false;
+                }
+                if (!prepared_inputs.insert(weight).second)
+                    continue;
+                TransferEngine::requireDeviceInput(
+                    weight,
+                    capture_device,
+                    capture_stream);
+            }
             for (const auto &binding : contract.writesRequiringPrepare())
             {
                 ITensor *tensor = arena_->getTensor(binding.id);
@@ -908,6 +1237,7 @@ namespace llaminar2
                     capture_stream,
                     prepared_inputs,
                     prepared_outputs,
+                    GraphCaptureInputFrontierPolicy::RequireReadyBytes,
                     context))
             {
                 return false;
@@ -1365,7 +1695,8 @@ namespace llaminar2
     bool DeviceGraphExecutor::publishGraphSnapshotCopies(
         const std::string &stage_name,
         void *producer_stream,
-        GraphSnapshotManifest &snapshot_manifest)
+        GraphSnapshotManifest &snapshot_manifest,
+        const GraphSnapshotLogicalRows *logical_rows)
     {
         if (!config_.snapshot_callback)
             return true;
@@ -1439,6 +1770,16 @@ namespace llaminar2
         }
 
         snapshot_info.ensureOutputsOnHost(producer_stream);
+        std::vector<std::vector<uint8_t>> compacted_outputs;
+        if (!projectSnapshotOutputsToLogicalRows(
+                stage_name,
+                &snapshot_info,
+                logical_rows,
+                &compacted_outputs))
+        {
+            return false;
+        }
+
         config_.snapshot_callback(stage_name, snapshot_info);
         return true;
     }
@@ -1447,7 +1788,8 @@ namespace llaminar2
         ComputeGraph &graph,
         void *producer_stream_override,
         const char *context,
-        GraphSnapshotManifest *snapshot_manifest)
+        GraphSnapshotManifest *snapshot_manifest,
+        const GraphSnapshotLogicalRows *logical_rows)
     {
         if (!config_.snapshot_callback)
             return true;
@@ -1455,6 +1797,26 @@ namespace llaminar2
         const auto &order = graph.getExecutionOrder();
         if (order.empty())
             return true;
+
+        if (logical_rows && logical_rows->active())
+        {
+            /*
+             * A logical-row descriptor belongs to this one post-launch
+             * diagnostic publication, rather than to the captured graph or
+             * its persistent snapshot slots.  Keep the provenance visible in
+             * debug output so a parity artifact with padded rows can be traced
+             * to either a missing engine handoff or a bad per-output layout.
+             */
+            LOG_DEBUG(
+                "[DeviceGraphExecutor] Post-graph snapshot logical-row contract"
+                << " context=" << (context ? context : "<unspecified>")
+                << " physical_rows_per_sequence="
+                << logical_rows->physical_rows_per_sequence
+                << " batch_size="
+                << logical_rows->logical_rows_per_sequence.size()
+                << " first_logical_rows="
+                << logical_rows->logical_rows_per_sequence.front());
+        }
 
         auto total_start = std::chrono::high_resolution_clock::now();
         size_t callback_count = 0;
@@ -1492,17 +1854,30 @@ namespace llaminar2
                     if (!publishGraphSnapshotCopies(
                             name,
                             producer_stream,
-                            manifest))
+                            manifest,
+                            logical_rows))
                         return false;
                 }
                 else
                 {
                     // CPU stages execute synchronously and have no captured
                     // snapshot slots, so their ordinary dump path remains the
-                    // canonical publication mechanism.
+                    // canonical publication mechanism. They still share the
+                    // exact logical-row diagnostic contract with captured GPU
+                    // stages: a heterogeneous final bucket must never leak
+                    // physical padding into parity CSV artifacts.
                     StageDumpInfo snapshot_dump_info =
                         node->stage->refreshDumpInfoSnapshot();
                     snapshot_dump_info.ensureOutputsOnHost(producer_stream);
+                    std::vector<std::vector<uint8_t>> compacted_outputs;
+                    if (!projectSnapshotOutputsToLogicalRows(
+                            name,
+                            &snapshot_dump_info,
+                            logical_rows,
+                            &compacted_outputs))
+                    {
+                        return false;
+                    }
                     config_.snapshot_callback(name, snapshot_dump_info);
                 }
                 ++callback_count;
@@ -1536,7 +1911,7 @@ namespace llaminar2
             "stage_executor_cpu",
             "post_graph_snapshot_callbacks",
             static_cast<uint64_t>(callback_ms * 1.0e6),
-            GraphExecutorStats::currentPhase() == ExecutionPhase::DECODE ? "decode" : "prefill",
+            executionPhasePerfName(GraphExecutorStats::currentPhase()),
             "",
             PerfStatsCollector::Tags{
                 {"attribution", "host"},
@@ -1906,8 +2281,12 @@ namespace llaminar2
         // =====================================================================
         const bool timeline_requested = PerfStatsCollector::gpuStageEventTimingEnabled();
         const bool timeline_active = policy.timeline && timeline_requested && ctx->isGPU() && !isGraphCaptureActive();
+        // Per-stage CPU timing performs a clock read plus structured-map
+        // publication for every graph node. Keep that instrumentation behind
+        // its exact family gate so collecting an unrelated MTP or collective
+        // timer cannot perturb the graph being diagnosed.
         const bool cpu_stage_timing_active =
-            PerfStatsCollector::isEnabled() && ctx && !ctx->isGPU();
+            PerfStatsCollector::cpuStageTimingEnabled() && ctx && !ctx->isGPU();
         IWorkerGPUContext *timeline_gpu_ctx = nullptr;
         if (timeline_active)
         {
@@ -2015,12 +2394,15 @@ namespace llaminar2
 
                 // Keep the coarse aggregate stable for existing dashboards, then
                 // add a node-level record so verifier tuning can identify the
-                // exact graph stage that dominates an M=2..4 replay.
+                // exact graph stage that dominates an M=2..4 replay. The stable
+                // schedule index makes producer-to-collective arrival skew
+                // reconstructable across MPI ranks without enabling per-stage
+                // logging or adding timestamps to the execution hot path.
                 PerfStatsCollector::recordTimingNs(
                     "stage_cpu",
                     std::string("type.") + stage_type_name,
                     ns > 0 ? static_cast<uint64_t>(ns) : 0,
-                    "execute",
+                    executionPhasePerfName(GraphExecutorStats::currentPhase()),
                     ctx->deviceId().to_string(),
                     PerfStatsCollector::Tags{
                         {"attribution", "cpu_wall"},
@@ -2029,12 +2411,13 @@ namespace llaminar2
                     "stage_cpu_detail",
                     node->name,
                     ns > 0 ? static_cast<uint64_t>(ns) : 0,
-                    "execute",
+                    executionPhasePerfName(GraphExecutorStats::currentPhase()),
                     ctx->deviceId().to_string(),
                     PerfStatsCollector::Tags{
                         {"attribution", "cpu_wall"},
                         {"source", "device_graph_executor"},
-                        {"stage_type", stage_type_name}});
+                        {"stage_type", stage_type_name},
+                        {"index", std::to_string(i)}});
             }
 
             if (debugEnv().vram_trace && ctx->isGPU())
@@ -2254,7 +2637,8 @@ namespace llaminar2
                              !publishGraphSnapshotCopies(
                                  node.name,
                                  node.stage->gpuStream(),
-                                 manifest))
+                                 manifest,
+                                 nullptr))
                     {
                         ok = false;
                     }
@@ -2596,7 +2980,8 @@ namespace llaminar2
                                                 << " device=" << target_device.to_string());
         }
 
-        if (success && debugEnv().validation.sync_each_stage)
+        if (success && policy.validation &&
+            debugEnv().validation.sync_each_stage)
         {
             DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
             if (target_device.is_gpu())
@@ -2618,10 +3003,10 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Mark Outputs Dirty (contract-based) — UNCONDITIONAL when arena is
-        // present. Skipping this causes stale host reads on the next iteration.
+        // Mark outputs dirty after real execution. Setup-only graph recording
+        // enqueues topology but launches no nodes, so it must not publish writes.
         // =====================================================================
-        if (success && use_contract)
+        if (success && use_contract && policy.mark_dirty)
         {
             auto coh_policy = node.stage->coherencePolicy();
             DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
@@ -2779,7 +3164,8 @@ namespace llaminar2
                          !publishGraphSnapshotCopies(
                              node.name,
                              node.stage->gpuStream(),
-                             manifest))
+                             manifest,
+                             nullptr))
                 {
                     success = false;
                 }
@@ -2933,14 +3319,28 @@ namespace llaminar2
             if (cancellationRequested(name))
                 return false;
 
-            // Find appropriate context for this node's device
+            // Find the exact context for every explicitly assigned node.  A
+            // heterogeneous ExpertOverlay graph deliberately alternates CPU
+            // transport boundaries with a participant-local GPU stage; using
+            // the unordered-map's arbitrary first entry for CPU nodes can hand
+            // a CUDA/ROCm context to a host-only collective stage.
             IDeviceContext *ctx = default_ctx;
-            if (node->device.is_gpu())
+            if (node->device.is_valid())
             {
                 auto it = contexts.find(node->device);
                 if (it != contexts.end())
                 {
                     ctx = it->second;
+                }
+                else
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Missing exact context for stage '"
+                              << name << "' on "
+                              << node->device.to_string());
+                    notifyStageFailure(
+                        name,
+                        "no exact device context was supplied");
+                    return false;
                 }
             }
 
@@ -2954,6 +3354,478 @@ namespace llaminar2
             graph.markCompleted(name);
         }
 
+        return true;
+    }
+
+    bool DeviceGraphExecutor::prepareRetainedMultiDeviceExecutionPlan(
+        ComputeGraph &graph,
+        const std::unordered_map<DeviceId, IDeviceContext *> &contexts,
+        RetainedMultiDeviceExecutionPlan &plan,
+        std::string *error)
+    {
+        auto fail = [&](const std::string &reason)
+        {
+            plan.clear();
+            if (error)
+                *error = reason;
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Retained multi-device plan rejected: "
+                << reason);
+            return false;
+        };
+        if (error)
+            error->clear();
+        plan.clear();
+
+        if (contexts.empty())
+            return fail("no device contexts were supplied");
+        if (arena_ || collective_ctx_)
+        {
+            return fail(
+                "stage-owned retained execution cannot bypass an executor arena or collective interceptor");
+        }
+        if (config_.snapshot_callback)
+        {
+            return fail(
+                "snapshot publication requires the general per-stage controller");
+        }
+
+        const auto &order = graph.getExecutionOrder();
+        if (order.empty())
+            return fail("graph has no executable stages");
+
+        plan.entries.reserve(order.size());
+        std::unordered_map<std::string, size_t> entry_indices;
+        entry_indices.reserve(order.size());
+        std::vector<size_t> dependency_levels;
+        dependency_levels.reserve(order.size());
+        for (const auto &name : order)
+        {
+            ComputeNode *const node = graph.getNode(name);
+            if (!node || !node->stage)
+                return fail("graph order contains an unresolved stage: " + name);
+
+            if (!node->device.is_valid() ||
+                node->stage->device() != node->device)
+            {
+                return fail(
+                    "stage and graph node do not share one exact device identity: " +
+                    name);
+            }
+            const DeviceId target_device = node->device;
+            const auto context_it = contexts.find(target_device);
+            if (context_it == contexts.end() || !context_it->second ||
+                context_it->second->deviceId() != target_device)
+            {
+                return fail(
+                    "stage has no exact retained context: " + name +
+                    " device=" + target_device.to_string());
+            }
+            if (!node->stage->supportsBackend(
+                    context_it->second->backendType()))
+            {
+                return fail(
+                    "stage does not support its retained context backend: " +
+                    name);
+            }
+            if (node->stage->coherencePolicy() != CoherencePolicy::NONE ||
+                !node->stage->bufferContract().empty())
+            {
+                return fail(
+                    "stage does not own an empty explicit coherence boundary: " +
+                    name);
+            }
+            if (target_device.is_gpu() && !node->stage->gpuStream())
+            {
+                return fail(
+                    "GPU stage has no exact setup-bound stream: " + name);
+            }
+
+            IWorkerGPUContext *worker_context = nullptr;
+            if (target_device.is_gpu())
+            {
+                worker_context = tryGetWorkerContext(target_device, config_);
+                if (!worker_context || !worker_context->isInitialized() ||
+                    worker_context->deviceOrdinal() !=
+                        target_device.gpu_ordinal())
+                {
+                    return fail(
+                        "GPU stage has no exact initialized persistent worker: " +
+                        name + " device=" + target_device.to_string());
+                }
+            }
+
+            std::string prepared_error;
+            if (!node->stage->validatePreparedWeights(&prepared_error))
+            {
+                return fail(
+                    "prepared-weight proof failed for " + name + ": " +
+                    prepared_error);
+            }
+
+            plan.entries.push_back(
+                RetainedMultiDeviceExecutionPlan::Entry{
+                    .node = node,
+                    .context = context_it->second,
+                    .device = target_device,
+                    .worker_context = worker_context,
+                    .validate_prepared_each_execution =
+                        node->stage->preparedWeightValidationLifetime() ==
+                        PreparedWeightValidationLifetime::PerExecution,
+                });
+
+            size_t dependency_level = 0;
+            for (const auto &dependency_name : node->dependencies)
+            {
+                const auto dependency_it =
+                    entry_indices.find(dependency_name);
+                if (dependency_it == entry_indices.end() ||
+                    dependency_it->second >= dependency_levels.size())
+                {
+                    return fail(
+                        "topological order did not resolve dependency '" +
+                        dependency_name + "' before " + name);
+                }
+                dependency_level = std::max(
+                    dependency_level,
+                    dependency_levels[dependency_it->second] + 1u);
+            }
+            const size_t entry_index = plan.entries.size() - 1u;
+            entry_indices.emplace(name, entry_index);
+            dependency_levels.push_back(dependency_level);
+            if (plan.waves.size() <= dependency_level)
+                plan.waves.resize(dependency_level + 1u);
+            plan.waves[dependency_level].entry_indices.push_back(entry_index);
+        }
+
+        size_t scheduled_entries = 0;
+        for (auto &wave : plan.waves)
+        {
+            if (wave.entry_indices.empty())
+                return fail("retained schedule contains an empty dependency wave");
+
+            scheduled_entries += wave.entry_indices.size();
+            plan.max_wave_width =
+                std::max(plan.max_wave_width, wave.entry_indices.size());
+
+            std::unordered_set<DeviceId> devices;
+            bool all_distinct_gpu_devices = wave.entry_indices.size() > 1u;
+            for (const size_t entry_index : wave.entry_indices)
+            {
+                if (entry_index >= plan.entries.size())
+                    return fail("dependency wave contains an invalid entry index");
+                const auto &entry = plan.entries[entry_index];
+                if (!entry.device.is_gpu() || !entry.worker_context ||
+                    !devices.insert(entry.device).second)
+                {
+                    all_distinct_gpu_devices = false;
+                }
+            }
+            wave.concurrent_distinct_gpu_devices =
+                all_distinct_gpu_devices;
+            if (all_distinct_gpu_devices)
+                ++plan.concurrent_gpu_wave_count;
+        }
+        if (scheduled_entries != plan.entries.size())
+        {
+            return fail(
+                "dependency waves do not cover the complete retained schedule");
+        }
+
+        plan.graph = &graph;
+        plan.topology_generation = graph.topologyGeneration();
+        plan.snapshot_configuration_epoch = snapshot_configuration_epoch_;
+        if (!plan.valid())
+            return fail("sealed plan identity is incomplete");
+        return true;
+    }
+
+    bool DeviceGraphExecutor::executeRetainedMultiDevice(
+        const RetainedMultiDeviceExecutionPlan &plan,
+        std::string *error)
+    {
+        auto fail = [&](const std::string &reason)
+        {
+            if (error)
+                *error = reason;
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Retained multi-device execution failed: "
+                << reason);
+            return false;
+        };
+        if (error)
+            error->clear();
+        if (!plan.valid())
+            return fail("plan is incomplete");
+
+        /*
+         * This scalar check must precede every borrowed node/context access.
+         * A stale topology is fatal; the caller must deliberately build a new
+         * retained plan instead of replaying or guessing compatibility.
+         */
+        if (plan.graph->topologyGeneration() !=
+                plan.topology_generation ||
+            snapshot_configuration_epoch_ !=
+                plan.snapshot_configuration_epoch ||
+            arena_ || collective_ctx_ || config_.snapshot_callback)
+        {
+            return fail(
+                "graph topology, diagnostics, or executor ownership changed after plan sealing");
+        }
+
+        const auto &validation = debugEnv().validation;
+        const bool general_stage_controller =
+            debugEnv().profile.enabled || debugEnv().stage_dump.enabled ||
+            validation.validate_inputs || validation.validate_buffers ||
+            validation.validate_gpu_ptrs ||
+            debugEnv().execution.trace_stages ||
+            debugEnv().validation.sync_each_stage;
+        const bool cpu_stage_timing =
+            PerfStatsCollector::cpuStageTimingEnabled();
+        const StageRunPolicy diagnostic_policy = StageRunPolicy::full();
+
+        const auto validate_entry = [&](size_t index) -> std::string
+        {
+            const auto &entry = plan.entries[index];
+            ComputeNode *const node = entry.node;
+            IDeviceContext *const ctx = entry.context;
+            if (!node || !node->stage || !ctx ||
+                node->device != entry.device ||
+                ctx->deviceId() != entry.device ||
+                (entry.device.is_gpu() &&
+                 (!entry.worker_context ||
+                  !entry.worker_context->isInitialized() ||
+                  entry.worker_context->deviceOrdinal() !=
+                      entry.device.gpu_ordinal())))
+            {
+                return "entry identity changed at index " +
+                       std::to_string(index);
+            }
+            if (cancellationRequested(node->name))
+                return "execution was canceled before " + node->name;
+
+            if (entry.validate_prepared_each_execution)
+            {
+                std::string prepared_error;
+                if (!node->stage->validatePreparedWeights(&prepared_error))
+                {
+                    return "prepared-weight validation failed for " +
+                           node->name + ": " + prepared_error;
+                }
+            }
+            return {};
+        };
+
+        const auto execute_entry = [&](size_t index) -> bool
+        {
+            const auto &entry = plan.entries[index];
+            ComputeNode *const node = entry.node;
+            IDeviceContext *const ctx = entry.context;
+            const auto stage_begin =
+                cpu_stage_timing ? PerfStatsCollector::Clock::now()
+                                 : PerfStatsCollector::Clock::time_point{};
+            bool stage_ok = false;
+            if (general_stage_controller)
+            {
+                stage_ok = runStage(
+                    *node,
+                    ctx,
+                    diagnostic_policy,
+                    node->stage->isCollectiveStage());
+            }
+            else
+            {
+                /*
+                 * Setup proved the stage-owned coherence, context, stream,
+                 * backend, and prepared representation. The stage now owns
+                 * the exact manual boundary; no generic arena or graph-state
+                 * transition remains to perform around execute().
+                 */
+                stage_ok = node->stage->execute(ctx);
+            }
+
+            if (cpu_stage_timing)
+            {
+                const auto elapsed =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        PerfStatsCollector::Clock::now() - stage_begin)
+                        .count();
+                PerfStatsCollector::recordTimingNs(
+                    "stage_cpu_detail",
+                    node->name,
+                    elapsed > 0 ? static_cast<uint64_t>(elapsed) : 0u,
+                    executionPhasePerfName(
+                        GraphExecutorStats::currentPhase()),
+                    entry.device.to_string(),
+                    {{"attribution", "retained_multi_device_host_wall"},
+                     {"index", std::to_string(index)},
+                     {"stage_type",
+                      computeStageTypeName(node->stage->type())}});
+            }
+            return stage_ok;
+        };
+
+        /*
+         * Scratch is bounded once per retained transaction, while each GPU
+         * task itself is queued onto the already-running device worker. The
+         * graph's all-submit barrier therefore becomes real host concurrency;
+         * no new GPU stream, event, context, or executable is created here.
+         */
+        std::vector<std::future<void>> pending;
+        std::vector<uint8_t> wave_results(
+            plan.max_wave_width, uint8_t{0});
+        pending.reserve(plan.max_wave_width);
+
+        for (const auto &wave : plan.waves)
+        {
+            for (const size_t entry_index : wave.entry_indices)
+            {
+                if (entry_index >= plan.entries.size())
+                    return fail("dependency wave entry index changed after sealing");
+                const std::string validation_error =
+                    validate_entry(entry_index);
+                if (!validation_error.empty())
+                    return fail(validation_error);
+            }
+
+            const bool parallel_wave =
+                wave.concurrent_distinct_gpu_devices &&
+                !general_stage_controller && !cpu_stage_timing;
+            if (parallel_wave)
+            {
+                pending.clear();
+                std::fill_n(
+                    wave_results.begin(), wave.entry_indices.size(),
+                    uint8_t{0});
+                size_t submitted = 0;
+                std::string submission_error;
+                for (size_t wave_index = 0;
+                     wave_index < wave.entry_indices.size();
+                     ++wave_index)
+                {
+                    const size_t entry_index =
+                        wave.entry_indices[wave_index];
+                    const auto &entry = plan.entries[entry_index];
+                    try
+                    {
+                        pending.push_back(
+                            entry.worker_context->submitAsync(
+                                [&, entry_index, wave_index]
+                                {
+                                    wave_results[wave_index] =
+                                        execute_entry(entry_index)
+                                            ? uint8_t{1}
+                                            : uint8_t{0};
+                                }));
+                        ++submitted;
+                    }
+                    catch (const std::exception &exception)
+                    {
+                        submission_error =
+                            "worker submission threw before " +
+                            entry.node->name + ": " + exception.what();
+                        break;
+                    }
+                    catch (...)
+                    {
+                        submission_error =
+                            "worker submission threw an unknown exception before " +
+                            entry.node->name;
+                        break;
+                    }
+                }
+
+                std::string asynchronous_error;
+                for (size_t index = 0; index < submitted; ++index)
+                {
+                    try
+                    {
+                        pending[index].get();
+                    }
+                    catch (const std::exception &exception)
+                    {
+                        if (asynchronous_error.empty())
+                        {
+                            asynchronous_error =
+                                "worker execution threw at " +
+                                plan.entries[wave.entry_indices[index]]
+                                    .node->name +
+                                ": " + exception.what();
+                        }
+                    }
+                    catch (...)
+                    {
+                        if (asynchronous_error.empty())
+                        {
+                            asynchronous_error =
+                                "worker execution threw an unknown exception at " +
+                                plan.entries[wave.entry_indices[index]]
+                                    .node->name;
+                        }
+                    }
+                }
+                if (!submission_error.empty())
+                    return fail(submission_error);
+                if (!asynchronous_error.empty())
+                    return fail(asynchronous_error);
+                for (size_t index = 0;
+                     index < wave.entry_indices.size(); ++index)
+                {
+                    if (wave_results[index] != 0u)
+                        continue;
+                    const auto *const node =
+                        plan.entries[wave.entry_indices[index]].node;
+                    notifyStageFailure(
+                        node->name, "stage execution returned false");
+                    return fail("stage returned false: " + node->name);
+                }
+                continue;
+            }
+
+            for (const size_t entry_index : wave.entry_indices)
+            {
+                const auto &entry = plan.entries[entry_index];
+                bool stage_ok = false;
+                try
+                {
+                    if (entry.device.is_gpu())
+                    {
+                        entry.worker_context->submitAndWait(
+                            [&]
+                            {
+                                stage_ok = execute_entry(entry_index);
+                            });
+                    }
+                    else
+                    {
+                        stage_ok = execute_entry(entry_index);
+                    }
+                }
+                catch (const std::exception &exception)
+                {
+                    notifyStageFailure(entry.node->name, exception.what());
+                    return fail(
+                        "worker execution threw at " + entry.node->name +
+                        ": " + exception.what());
+                }
+                catch (...)
+                {
+                    notifyStageFailure(
+                        entry.node->name, "unknown worker exception");
+                    return fail(
+                        "worker execution threw an unknown exception at " +
+                        entry.node->name);
+                }
+                if (!stage_ok)
+                {
+                    notifyStageFailure(
+                        entry.node->name,
+                        "stage execution returned false");
+                    return fail(
+                        "stage returned false: " + entry.node->name);
+                }
+            }
+        }
         return true;
     }
 

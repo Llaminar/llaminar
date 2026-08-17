@@ -2,18 +2,20 @@
  * @file ShmemSpinBackend.h
  * @brief Shared-memory spin-wait collective backend for N-rank intra-node CPU TP
  *
- * Replaces MPI_Allreduce with a purpose-built spin-wait protocol for the
- * common case: N MPI ranks on the same node doing FLOAT32/FP16/BF16 SUM
- * allreduce of small vectors (≤8192 elements / 32KB per rank).
+ * Replaces MPI_Allreduce with a purpose-built spin-wait protocol for N MPI
+ * ranks on the same node doing FLOAT32/FP16/BF16 SUM allreduce. Logical
+ * payloads of every size use a bounded, chunked shared-memory arena.
  *
  * Protocol:
- *   1. Each rank copies its data to a shared-memory staging buffer
+ *   1. Each rank copies its data to its shared-memory staging buffer
  *   2. Signals "ready" via atomic epoch counter (store-release)
  *   3. Spins on all peers' epoch counters (load-acquire + _mm_pause)
  *   4. AVX-512 reduces all N buffers into caller's output
+ *   5. Signals "consumed" before any rank may reuse its staging buffer
  *
- * For operations outside the fast path (non-SUM, count > MAX,
- * allgather, broadcast, etc.), delegates to a wrapped UPICollectiveBackend.
+ * Native protocols also cover variable packed-record publication to one root
+ * and broadcast from one root. Operations with different semantics, such as
+ * non-SUM reductions and allgather, delegate to the wrapped UPI backend.
  *
  * @author David Sanftenberg
  * @date April 2026
@@ -27,6 +29,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
@@ -38,26 +41,42 @@ namespace llaminar2
      * Layout (all cache-line aligned):
      *   [0, 64)                          → Header (num_ranks)
      *   [64, 64 + N*64)                  → N × EpochSlot (one per rank)
-     *   [64 + N*64, 64 + N*64 + N*32KB)  → N × float[MAX_COUNT] buffers
+     *   [64 + N*64, end)                   → N rank-local chunk buffers
      *
      * Access epoch slots and buffers via epoch_at(rank) / buffer_at(rank).
      */
     struct alignas(64) ShmemSpinArena
     {
         static constexpr size_t CACHE_LINE = 64;
-        static constexpr size_t MAX_COUNT = 8192; // Max elements per allreduce (32KB FP32, 16KB FP16/BF16)
+
+        /**
+         * @brief Maximum elements reduced during one protocol epoch.
+         *
+         * Larger logical payloads execute as consecutive chunks without
+         * changing any output element's arithmetic order. One million FP32
+         * elements occupies 4 MiB per rank and covers the Qwen3.6-35B
+         * 434-by-2048 prefill payload in one epoch.
+         */
+        static constexpr size_t CHUNK_CAPACITY = 1u << 20;
 
         /// Per-rank epoch counters (each on its own cache line)
         struct alignas(CACHE_LINE) EpochSlot
         {
             std::atomic<uint64_t> epoch;
-            char pad_[CACHE_LINE - sizeof(std::atomic<uint64_t>)];
+            /**
+             * Number of FP32 payload elements offered by this participant for
+             * the current rooted packed-record transaction. The owning rank
+             * writes the value before publishing `epoch`; readers acquire the
+             * epoch before consuming it.
+             */
+            std::atomic<uint64_t> payload_elements;
+            char pad_[CACHE_LINE - 2u * sizeof(std::atomic<uint64_t>)];
         };
 
         // Header (occupies first cache line)
         int32_t num_ranks;
 
-        // Variable-length data follows — use epoch_at() / buffer_at()
+        // Variable-length data follows — use epoch_at() / buffer_at(rank)
 
         EpochSlot *epoch_at(int rank)
         {
@@ -74,13 +93,15 @@ namespace llaminar2
         {
             auto *base = reinterpret_cast<char *>(this) + sizeof(ShmemSpinArena)
                          + static_cast<size_t>(num_ranks) * sizeof(EpochSlot);
-            return reinterpret_cast<float *>(base) + static_cast<size_t>(rank) * MAX_COUNT;
+            return reinterpret_cast<float *>(base) +
+                   static_cast<size_t>(rank) * CHUNK_CAPACITY;
         }
         const float *buffer_at(int rank) const
         {
             auto *base = reinterpret_cast<const char *>(this) + sizeof(ShmemSpinArena)
                          + static_cast<size_t>(num_ranks) * sizeof(EpochSlot);
-            return reinterpret_cast<const float *>(base) + static_cast<size_t>(rank) * MAX_COUNT;
+            return reinterpret_cast<const float *>(base) +
+                   static_cast<size_t>(rank) * CHUNK_CAPACITY;
         }
 
         /// Total arena size in bytes for a given rank count
@@ -88,7 +109,7 @@ namespace llaminar2
         {
             return sizeof(ShmemSpinArena) // header (one cache line)
                    + static_cast<size_t>(num_ranks) * sizeof(EpochSlot)
-                   + static_cast<size_t>(num_ranks) * MAX_COUNT * sizeof(float);
+                   + static_cast<size_t>(num_ranks) * CHUNK_CAPACITY * sizeof(float);
         }
     };
 
@@ -97,8 +118,9 @@ namespace llaminar2
     /**
      * @brief Shared-memory spin-wait collective backend for N-rank intra-node allreduce
      *
-     * Fast path: FLOAT32/FP16/BF16 SUM allreduce with count ≤ MAX_COUNT
-     * Fallback:  Delegates to UPICollectiveBackend (MPI) for everything else
+     * The native path handles every FLOAT32/FP16/BF16 SUM payload size by
+     * partitioning it into bounded chunks. Other operations delegate to the
+     * wrapped UPI backend because they have different collective semantics.
      *
      * Thread Safety:
      * - Single backend instance should be used from one thread per rank
@@ -112,10 +134,11 @@ namespace llaminar2
          *
          * @param domain_id  Unique domain identifier (included in generated shm names)
          * @param my_rank    This rank's index (0 to N-1)
-         * @param fallback   UPI backend for non-fast-path operations (takes ownership)
+         * @param general_backend UPI backend for collective operations outside
+         *                        the native shared-memory SUM contract
          */
         ShmemSpinBackend(int domain_id, int my_rank,
-                         std::unique_ptr<UPICollectiveBackend> fallback);
+                         std::unique_ptr<UPICollectiveBackend> general_backend);
 
         ~ShmemSpinBackend() override;
 
@@ -172,6 +195,34 @@ namespace llaminar2
         bool broadcast(void *buffer, size_t count,
                        CollectiveDataType dtype, int root_rank) override;
 
+        /**
+         * @brief Gather variable-width FP32 record blocks through shared memory.
+         *
+         * Each participant publishes its total element count and streams its
+         * payload through its NUMA-local persistent arena buffer. The root
+         * appends complete participant blocks to `root_records`, beginning with
+         * its own block. The method is total over payload size: records larger
+         * than one arena slot are transferred in bounded chunks without MPI
+         * payload traffic or hot-path allocation.
+         *
+         * @param local_records Participant-local packed records.
+         * @param local_record_count Number of local records.
+         * @param root_records Root receive storage; ignored on non-root ranks.
+         * @param root_record_capacity Root storage capacity in records.
+         * @param record_width_elements Width of one record in FP32 elements.
+         * @param root_rank Root participant index.
+         * @param gathered_record_count Total records on root; zero elsewhere.
+         * @return true after every participant has completed the transaction.
+         */
+        bool gatherVariableFloatRecordsToRoot(
+            const float *local_records,
+            size_t local_record_count,
+            float *root_records,
+            size_t root_record_capacity,
+            size_t record_width_elements,
+            int root_rank,
+            size_t &gathered_record_count);
+
         bool synchronize() override;
 
         // =====================================================================
@@ -193,8 +244,18 @@ namespace llaminar2
         /// Get the POSIX shared-memory name used by this initialized backend.
         const std::string &shmName() const { return shm_name_; }
 
-        /// Check if a given allreduce would use the fast path
-        bool isFastPath(size_t count, CollectiveDataType dtype, CollectiveOp op) const;
+        /**
+         * @brief Return whether an allreduce uses the native shared-memory path.
+         *
+         * @param count Logical element count. Size never removes a supported
+         *              SUM reduction from the shared-memory path.
+         * @param dtype Element representation.
+         * @param op Reduction operation.
+         */
+        bool usesSharedMemoryAllreduce(
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op) const;
 
         // =================================================================
         // Vectorized reduction — public static (pure functions, no state)
@@ -254,8 +315,12 @@ namespace llaminar2
         ShmemSpinArena *arena_ = nullptr;     ///< Mapped shared-memory arena
         bool shm_unlinked_ = false;           ///< Whether rank 0 has unlinked shm_name_
 
-        std::unique_ptr<UPICollectiveBackend> fallback_; ///< MPI fallback for non-fast-path ops
+        std::unique_ptr<UPICollectiveBackend> general_backend_; ///< UPI implementation for other collective semantics
         std::atomic<bool> abort_requested_{false};       ///< Local abort requested for this backend
+        /** Persistent per-rank element counts for rooted publication. */
+        std::vector<size_t> rooted_publication_element_counts_;
+        /** Persistent root destination offsets in FP32 elements. */
+        std::vector<size_t> rooted_publication_element_offsets_;
         bool initialized_ = false;
         mutable std::string last_error_;
     };

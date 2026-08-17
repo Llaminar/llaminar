@@ -304,6 +304,17 @@ namespace llaminar2
         uint64_t mtp_bypasses = 0;
         uint64_t mtp_verifier_runs = 0;
         uint64_t mtp_verifier_token_count = 0;
+        int mtp_last_transaction_draft_depth = 0;
+        int mtp_last_transaction_emitted_token_count = 0;
+        /**
+         * @brief Logical position consumed by the next MTP sidecar transaction.
+         *
+         * CPU runners publish their host-owned live position. GPU runners
+         * publish the scheduler-owned transaction coordinate initialized at
+         * prefill and advanced only by validated device state publication. A
+         * negative value means no MTP condition boundary is currently live.
+         */
+        int mtp_next_condition_position = -1;
         uint64_t mtp_stochastic_accept_tests = 0;
         uint64_t mtp_stochastic_accepts = 0;
         uint64_t mtp_stochastic_residual_samples = 0;

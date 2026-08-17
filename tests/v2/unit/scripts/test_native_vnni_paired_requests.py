@@ -30,8 +30,12 @@ from native_vnni_dispatch.cuda_shape_resolved import (  # noqa: E402
     resolve_cuda_concrete_candidate_id,
 )
 from native_vnni_dispatch.paired_confirmation import (  # noqa: E402
+    CPU_PROCESS_ISOLATED_TIMING_SCOPE,
     PairedCellKey,
     PairedTimingComparison,
+)
+from native_vnni_dispatch.paired_history import (  # noqa: E402
+    scan_paired_refinement_history,
 )
 from native_vnni_dispatch.paired_requests import (  # noqa: E402
     PAIRED_REQUEST_SCHEMA_VERSION,
@@ -67,6 +71,82 @@ from test_native_vnni_common_dispatch_policy import observation  # noqa: E402
 
 class NativeVNNIPairedRequestsTest(unittest.TestCase):
     """Prove formula resolution, tournament closure, and terminal states."""
+
+    @staticmethod
+    def _write_history_generation(
+        root: Path,
+        iteration: int,
+        status: str,
+        request_counts: tuple[int, ...] = (),
+        complete: bool = True,
+    ) -> None:
+        """Publish one minimal immutable refinement generation fixture."""
+
+        tag = f"{iteration:03d}"
+        request_count = sum(request_counts)
+        (root / f"iteration-{tag}.report.json").write_text(
+            json.dumps({"status": status, "request_count": request_count}),
+            encoding="utf-8",
+        )
+        (root / f"iteration-{tag}.requests.json").write_text(
+            json.dumps({"requests": [{} for _ in range(request_count)]}),
+            encoding="utf-8",
+        )
+        shard_dir = root / f"iteration-{tag}.shards"
+        shard_dir.mkdir()
+        for shard_index, count in enumerate(request_counts):
+            manifest = shard_dir / f"shard-{shard_index:04d}.requests.json"
+            manifest.write_text(
+                json.dumps({"requests": [{} for _ in range(count)]}),
+                encoding="utf-8",
+            )
+            if complete:
+                manifest.with_suffix("").with_suffix(".csv").write_text(
+                    "header\nrow\n", encoding="utf-8"
+                )
+
+    def test_paired_history_resumes_incomplete_pending_generation(self) -> None:
+        """An interrupted collection reuses its plan and contributes no prefix."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_history_generation(
+                root, 0, "pending", (2, 1), complete=False
+            )
+
+            history = scan_paired_refinement_history(root)
+
+        self.assertEqual(history.mode, "collect")
+        self.assertEqual(history.iteration, 0)
+        self.assertEqual(history.evidence_paths, ())
+
+    def test_paired_history_crosses_repaired_terminal_generation(self) -> None:
+        """A zero-work diagnostic cannot hide a later complete green repair."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_history_generation(root, 0, "pending", (2,))
+            self._write_history_generation(
+                root, 1, "insufficient_cross_validation"
+            )
+            self._write_history_generation(root, 2, "pending", (1,))
+            self._write_history_generation(root, 3, "green")
+
+            history = scan_paired_refinement_history(root)
+
+        self.assertEqual(history.mode, "green")
+        self.assertEqual(history.iteration, 3)
+        self.assertEqual(len(history.evidence_paths), 2)
+        self.assertTrue(all(path.name.endswith(".csv") for path in history.evidence_paths))
+
+    def test_paired_history_rejects_report_gap(self) -> None:
+        """Append-only iteration numbering may not silently omit a generation."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_history_generation(root, 1, "green")
+            with self.assertRaisesRegex(ValueError, "report gap"):
+                scan_paired_refinement_history(root)
 
     def test_parallel_projected_domain_keys_match_serial_order(self) -> None:
         """Parallel precomputation must preserve every projected cache key."""
@@ -258,6 +338,90 @@ class NativeVNNIPairedRequestsTest(unittest.TestCase):
         )
         self.assertNotIn("formula", request.selected_candidate_id)
         self.assertEqual(request.reason, "missing_direct_tournament_edge")
+
+    def test_legacy_cpu_edge_cannot_close_a_promotion_tournament(self) -> None:
+        """An unrecorded socket co-run remains a hint, never direct proof."""
+
+        cuda_corpus, cuda_policy, _ = self._fixture()
+        architecture = "x86_64|build=AVX2|runtime=AVX2|threads=28"
+        cpu_rows = tuple(
+            dataclasses.replace(
+                observation(
+                    source_format=row.source_format,
+                    candidate=row.candidate_id,
+                    family=row.candidate_family,
+                    shape_group=row.shape_group_id,
+                    shape_name=row.shape_name,
+                    n=row.aggregate_n,
+                    k=row.k,
+                    m=row.m,
+                    latency_us=row.median_us,
+                    mode=row.execution_mode,
+                    contract=row.semantic_contract,
+                    backend=Backend.CPU,
+                ),
+                architecture_class=architecture,
+                effective_candidate_id=row.effective_candidate_id,
+                observed_candidate_id=row.effective_candidate_id,
+            )
+            for row in cuda_corpus
+        )
+        corpus = ObservationCorpus(cpu_rows)
+        domain = generic_domain(cpu_rows[0])
+        source_validation = cuda_policy.cross_validation[0]
+        cpu_cell = dataclasses.replace(
+            source_validation.cells[0],
+            runtime_key=runtime_key(cpu_rows[0]),
+        )
+        validation = dataclasses.replace(
+            source_validation,
+            domain=domain,
+            cells=(cpu_cell,),
+            competitive_cells=(cpu_cell,),
+        )
+        policy = GenericPolicy(
+            rules=(),
+            unpromoted_domains=(domain,),
+            cross_validation=(validation,),
+        )
+        key = PairedCellKey(
+            backend="cpu",
+            source_format=cpu_rows[0].source_format,
+            source_codebook=cpu_rows[0].source_codebook_id,
+            execution_codebook=cpu_rows[0].runtime_codebook_id,
+            shape=cpu_rows[0].shape_name,
+            execution_mode=cpu_rows[0].execution_mode.value,
+            m=cpu_rows[0].m,
+            n=cpu_rows[0].aggregate_n,
+            k=cpu_rows[0].k,
+            architecture_class=architecture,
+        )
+        legacy = PairedTimingComparison(
+            key=key,
+            selected_effective_candidate_id=(
+                cpu_rows[0].effective_candidate_id
+            ),
+            exact_effective_candidate_id=cpu_rows[1].effective_candidate_id,
+            selected_to_exact_median_ratio=1.10,
+            pair_count=30,
+        )
+
+        plan = build_paired_request_plan(corpus, policy, {key: (legacy,)})
+
+        self.assertEqual(plan.status, "pending")
+        self.assertTrue(plan.requests)
+        self.assertFalse(plan.confirmed_cv_misses)
+
+        isolated = dataclasses.replace(
+            legacy,
+            timing_scope=CPU_PROCESS_ISOLATED_TIMING_SCOPE,
+            mpi_world_size=1,
+        )
+        isolated_plan = build_paired_request_plan(
+            corpus, policy, {key: (legacy, isolated)}
+        )
+        self.assertFalse(isolated_plan.requests)
+        self.assertEqual(isolated_plan.status, "confirmed_failure")
 
     def test_best_effort_regret_budget_accepts_one_hundred_percent(self) -> None:
         """The turnkey percentage contract includes an explicit 100% budget."""

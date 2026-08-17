@@ -156,6 +156,58 @@ TEST(Test__TQ8Roundtrip, ScalarFull_Quality_128)
     EXPECT_LT(avg_mse, 0.005) << "TQ8 D=128 MSE unexpectedly high";
 }
 
+/**
+ * @brief Prove the serialized reconstruction norm removes finite-D radial error.
+ *
+ * The historical format decoded every selected centroid vector with the
+ * source norm, implicitly assuming its squared norm was exactly `D`.  The
+ * production encoder now stores the least-squares-adjusted norm in the second
+ * scalar.  Replacing it with the historical value forms a deterministic A/B
+ * oracle and must increase aggregate MSE.
+ */
+TEST(Test__TQ8Roundtrip, ReconstructionNormReducesRadialError)
+{
+    constexpr int D = 128;
+    constexpr int N = 1000;
+    TurboQuantContext ctx(D);
+    const auto &head_ctx = ctx.for_layer(0);
+
+    std::mt19937 rng(889);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    double historical_mse = 0.0;
+    double corrected_mse = 0.0;
+
+    for (int trial = 0; trial < N; ++trial)
+    {
+        alignas(64) float input[D], historical[D], corrected[D];
+        alignas(64) float scratch0[D], scratch1[D];
+        for (float &value : input)
+            value = dist(rng);
+
+        TQ8Block_128 block;
+        turboquant_quantize_tq8<D>(
+            input, head_ctx, block, scratch0, scratch1);
+        ASSERT_GT(block.reconstruction_norm, 0.0f);
+        turboquant_dequantize_tq8<D>(
+            block, head_ctx, corrected, scratch0);
+
+        TQ8Block_128 historical_block = block;
+        historical_block.reconstruction_norm = historical_block.norm;
+        turboquant_dequantize_tq8<D>(
+            historical_block, head_ctx, historical, scratch0);
+
+        historical_mse += compute_mse(input, historical, D);
+        corrected_mse += compute_mse(input, corrected, D);
+    }
+
+    historical_mse /= N;
+    corrected_mse /= N;
+    std::cout << "TQ8 reconstruction norm: historical_mse=" << historical_mse
+              << " corrected_mse=" << corrected_mse
+              << " ratio=" << corrected_mse / historical_mse << std::endl;
+    EXPECT_LT(corrected_mse, historical_mse * 0.97);
+}
+
 // ============================================================================
 // TQ8 vs TQ4 quality comparison: TQ8 must be strictly better
 // ============================================================================
@@ -279,7 +331,7 @@ TEST(Test__TQ8Roundtrip, Deterministic_SameInputSameSeed)
 
     // Blocks must be bit-identical
     EXPECT_FLOAT_EQ(block1.norm, block2.norm);
-    EXPECT_FLOAT_EQ(block1.residual_norm, block2.residual_norm);
+    EXPECT_FLOAT_EQ(block1.reconstruction_norm, block2.reconstruction_norm);
     for (int i = 0; i < D; ++i)
         EXPECT_EQ(block1.indices[i], block2.indices[i]) << "Index mismatch at " << i;
 

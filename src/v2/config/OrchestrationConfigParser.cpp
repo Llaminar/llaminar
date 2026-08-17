@@ -166,6 +166,21 @@ namespace llaminar2
             return static_cast<uint64_t>(parsed);
         }
 
+        /** @brief Parse a strictly positive unsigned 64-bit policy value. */
+        uint64_t parsePositiveUint64Value(
+            const std::string &value,
+            const std::string &option_name)
+        {
+            const uint64_t parsed =
+                parseNonNegativeUint64Value(value, option_name);
+            if (parsed == 0u)
+            {
+                throw std::invalid_argument(
+                    option_name + " must be greater than zero");
+            }
+            return parsed;
+        }
+
         uint32_t parseNonNegativeUint32Value(const std::string &value, const std::string &option_name)
         {
             const uint64_t parsed = parseNonNegativeUint64Value(value, option_name);
@@ -204,6 +219,20 @@ namespace llaminar2
             return static_cast<int>(parsed);
         }
 
+        /** @brief Parse a strictly positive signed integer policy value. */
+        int parsePositiveIntValue(
+            const std::string &value,
+            const std::string &option_name)
+        {
+            const int parsed = parseNonNegativeIntValue(value, option_name);
+            if (parsed == 0)
+            {
+                throw std::invalid_argument(
+                    option_name + " must be greater than zero");
+            }
+            return parsed;
+        }
+
         size_t parseMegabytesToBytes(const std::string &value, const std::string &option_name)
         {
             constexpr size_t MiB = 1024ull * 1024ull;
@@ -225,6 +254,32 @@ namespace llaminar2
                     "' (valid: replicated, apportioned, tensor-sharded)");
             }
             return *parsed;
+        }
+
+        RoutedExpertOwnerOrder parseRoutedExpertOwnerOrderValue(
+            const std::string &value)
+        {
+            auto parsed = parseRoutedExpertOwnerOrder(value);
+            if (!parsed)
+            {
+                throw std::invalid_argument(
+                    "Invalid routed-expert owner order: '" + value +
+                    "' (valid: ordinal, random)");
+            }
+            return *parsed;
+        }
+
+        void applyRoutedExpertOwnerOrder(
+            OrchestrationConfig &config,
+            const std::string &value)
+        {
+            config.routed_expert_owner_order =
+                parseRoutedExpertOwnerOrderValue(value);
+            if (config.moe_routed_expert_plan)
+            {
+                config.moe_routed_expert_plan->owner_order =
+                    config.routed_expert_owner_order;
+            }
         }
 
         DenseParallelPolicy parseDenseParallelPolicyValue(const std::string &value)
@@ -318,6 +373,10 @@ namespace llaminar2
             {
                 config.routed_expert_compute_policy = parseRoutedExpertComputePolicyValue(value);
             }
+            else if (normalized_key == "routed_expert_owner_order")
+            {
+                applyRoutedExpertOwnerOrder(config, value);
+            }
             else if (normalized_key == "hot_expert_cache")
             {
                 config.moe_hot_expert_cache = parseMoEHotExpertCacheValue(value);
@@ -338,6 +397,20 @@ namespace llaminar2
             {
                 config.moe_rebalance.window_growth_factor = std::stof(value);
             }
+            else if (normalized_key == "migration_payoff_horizon_tokens")
+            {
+                config.moe_rebalance.migration_payoff_horizon_tokens =
+                    parsePositiveUint64Value(
+                        value,
+                        "moe.migration_payoff_horizon_tokens");
+            }
+            else if (normalized_key == "migration_max_cycles_per_wave")
+            {
+                config.moe_rebalance.migration_max_cycles_per_wave =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe.migration_max_cycles_per_wave");
+            }
             else if (normalized_key ==
                      "routed_prefill_assignment_window_tokens")
             {
@@ -345,6 +418,13 @@ namespace llaminar2
                     parseNonNegativeIntValue(
                         value,
                         "moe.routed_prefill_assignment_window_tokens");
+            }
+            else if (normalized_key == "overlay_prefill_segment_rows")
+            {
+                config.moe_routed_prefill.overlay_segment_rows =
+                    parsePositiveIntValue(
+                        value,
+                        "moe.overlay_prefill_segment_rows");
             }
             else if (normalized_key ==
                      "routed_prefill_least_loaded_min_routed_rows")
@@ -450,12 +530,14 @@ namespace llaminar2
                         value,
                         "moe.device_min_wave_spread_improvement_per_payload_slot");
             }
-            else if (normalized_key == "device_min_foreign_rows_per_transfer")
+            else if (normalized_key ==
+                     "device_min_foreign_rows_per_critical_path_payload_slot")
             {
-                config.moe_rebalance.device_min_foreign_rows_per_transfer =
+                config.moe_rebalance
+                    .device_min_foreign_rows_per_critical_path_payload_slot =
                     parseNonNegativeUint32Value(
                         value,
-                        "moe.device_min_foreign_rows_per_transfer");
+                        "moe.device_min_foreign_rows_per_critical_path_payload_slot");
             }
             else if (normalized_key == "device_min_router_spread_improvement_per_payload_slot")
             {
@@ -646,6 +728,8 @@ namespace llaminar2
             if (!config.moe_routed_expert_plan)
             {
                 config.moe_routed_expert_plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+                config.moe_routed_expert_plan->owner_order =
+                    config.routed_expert_owner_order;
             }
             return config.moe_routed_expert_plan;
         }
@@ -910,6 +994,10 @@ namespace llaminar2
                 else if (key == "residency_mode")
                 {
                     plan->residency_policy = parseRoutedExpertResidencyPolicyValue(value);
+                }
+                else if (key == "owner_order")
+                {
+                    applyRoutedExpertOwnerOrder(config, value);
                 }
             }
         }
@@ -1471,10 +1559,10 @@ namespace llaminar2
             .long_name = "--tp-scope",
             .category = "Tensor Parallelism",
             .value_label = "<scope>",
-            .description = "Scope: auto, local, node_local, global, hybrid",
+            .description = "Scope: auto, rank_local, node_local, global, hybrid",
             .setter = enumSetter(&OrchestrationConfig::tp_scope,
                                  parseTpScope, "--tp-scope",
-                                 "auto, local, node_local, global, hybrid"),
+                                 "auto, rank_local, node_local, global, hybrid"),
         });
         spec.add({
             .long_name = "--tp-devices",
@@ -1524,7 +1612,7 @@ namespace llaminar2
             .long_name = "--define-domain",
             .category = "Named Domains (advanced)",
             .value_label = "<spec>",
-            .description = "Define domain: \"name=dev1,dev2[;weights=w1,w2][;backend=type][;scope=local|node_local|global][;owner=N][;ranks=0,1,...]\"",
+            .description = "Define domain: \"name=dev1,dev2[;weights=w1,w2][;backend=type][;scope=rank_local|node_local|global][;owner=N][;ranks=0,1,...]\"",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1642,6 +1730,18 @@ namespace llaminar2
                 }),
         });
         spec.add({
+            .long_name = "--moe-routed-expert-owner-order",
+            .category = "MoE Configuration",
+            .value_label = "<order>",
+            .description = "Static whole-expert ownership order: ordinal (default), random",
+            .valid_values = {"ordinal", "random"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    applyRoutedExpertOwnerOrder(c, v);
+                }),
+        });
+        spec.add({
             .long_name = "--moe-hot-expert-cache",
             .category = "MoE Configuration",
             .value_label = "<count|percent|off>",
@@ -1698,6 +1798,34 @@ namespace llaminar2
                 }),
         });
         spec.add({
+            .long_name = "--moe-migration-payoff-horizon-tokens",
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description = "Expected routed-token residency lifetime used to amortize measured expert migration cost (default: 2048)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.migration_payoff_horizon_tokens =
+                        parsePositiveUint64Value(
+                            v,
+                            "--moe-migration-payoff-horizon-tokens");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-migration-max-cycles-per-wave",
+            .category = "MoE Configuration",
+            .value_label = "<cycles>",
+            .description = "Maximum closed expert residency migration cycles staged concurrently in one async wave (default: 1)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.migration_max_cycles_per_wave =
+                        parsePositiveUint32Value(
+                            v,
+                            "--moe-migration-max-cycles-per-wave");
+                }),
+        });
+        spec.add({
             .long_name = "--moe-routed-prefill-assignment-window",
             .category = "MoE Configuration",
             .value_label = "<tokens>",
@@ -1709,6 +1837,24 @@ namespace llaminar2
                         parseNonNegativeIntValue(
                             v,
                             "--moe-routed-prefill-assignment-window");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-overlay-prefill-segment-rows",
+            .category = "MoE Configuration",
+            .value_label = "<rows>",
+            .description =
+                "Maximum live token rows in one captured ExpertOverlay prefill "
+                "segment (default: " +
+                std::to_string(kDefaultExpertOverlayPrefillSegmentRows) +
+                "; derived from the retained graph-cache budget)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_routed_prefill.overlay_segment_rows =
+                        parsePositiveIntValue(
+                            v,
+                            "--moe-overlay-prefill-segment-rows");
                 }),
         });
         spec.add({
@@ -1934,17 +2080,18 @@ namespace llaminar2
                 }),
         });
         spec.add({
-            .long_name = "--moe-device-rebalance-min-foreign-rows-per-transfer",
+            .long_name = "--moe-device-rebalance-min-foreign-rows-per-critical-path-payload-slot",
             .category = "MoE Configuration",
             .value_label = "<n>",
-            .description = "Least-loaded device rebalance useful-work floor in foreign routed rows per expert transfer; 0 disables (default: 0)",
+            .description = "Least-loaded device rebalance useful-work floor in foreign routed rows per serialized critical-path payload slot; 0 disables (default: 0)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
-                    c.moe_rebalance.device_min_foreign_rows_per_transfer =
+                    c.moe_rebalance
+                        .device_min_foreign_rows_per_critical_path_payload_slot =
                         parseNonNegativeUint32Value(
                             v,
-                            "--moe-device-rebalance-min-foreign-rows-per-transfer");
+                            "--moe-device-rebalance-min-foreign-rows-per-critical-path-payload-slot");
                 }),
         });
         spec.add({
@@ -2089,7 +2236,7 @@ namespace llaminar2
             .long_name = "--moe-routed-expert-domain",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define a routed-expert domain: \"name=devices;scope=single|local|node-local;backend=type;routed_compute=replicated|apportioned|tensor-sharded[;routed_phase=uniform|prefill-apportioned-decode-replicated][;routed_decode_assignment=static-owner|least-loaded-resident][;routed_prefill_assignment=static-owner|least-loaded-resident][;owner=N][;ranks=0,1]\"",
+            .description = "Define a routed-expert domain: \"name=devices;scope=auto|single|rank-local|node-local;backend=type;routed_compute=replicated|apportioned|tensor-sharded[;routed_phase=uniform|prefill-apportioned-decode-replicated][;routed_decode_assignment=static-owner|least-loaded-resident][;routed_prefill_assignment=static-owner|least-loaded-resident][;owner=N][;ranks=0,0,1]\"; auto binds scope from discovered rank ownership",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -2883,7 +3030,7 @@ namespace llaminar2
 
             // Minimal YAML list support for named-domain configs:
             // domains:
-            //   - "gpu=0:cuda:0;scope=local;owner=0"
+            //   - "gpu=0:cuda:0;scope=rank_local;owner=0"
             // pp_stages:
             //   - "0=gpu:0-11"
             if (trimmed.rfind("-", 0) == 0)
@@ -3139,6 +3286,11 @@ namespace llaminar2
             {
                 config.routed_expert_compute_policy = parseRoutedExpertComputePolicyValue(value);
             }
+            else if (normalized_key == "routed_expert_owner_order" ||
+                     normalized_key == "moe_routed_expert_owner_order")
+            {
+                applyRoutedExpertOwnerOrder(config, value);
+            }
             else if (normalized_key == "moe_hot_expert_cache")
             {
                 config.moe_hot_expert_cache = parseMoEHotExpertCacheValue(value);
@@ -3159,6 +3311,21 @@ namespace llaminar2
             {
                 config.moe_rebalance.window_growth_factor = std::stof(value);
             }
+            else if (normalized_key == "moe_migration_payoff_horizon_tokens")
+            {
+                config.moe_rebalance.migration_payoff_horizon_tokens =
+                    parsePositiveUint64Value(
+                        value,
+                        "moe_migration_payoff_horizon_tokens");
+            }
+            else if (normalized_key ==
+                     "moe_migration_max_cycles_per_wave")
+            {
+                config.moe_rebalance.migration_max_cycles_per_wave =
+                    parsePositiveUint32Value(
+                        value,
+                        "moe_migration_max_cycles_per_wave");
+            }
             else if (normalized_key ==
                      "moe_routed_prefill_assignment_window_tokens")
             {
@@ -3166,6 +3333,14 @@ namespace llaminar2
                     parseNonNegativeIntValue(
                         value,
                         "moe_routed_prefill_assignment_window_tokens");
+            }
+            else if (normalized_key ==
+                     "moe_overlay_prefill_segment_rows")
+            {
+                config.moe_routed_prefill.overlay_segment_rows =
+                    parsePositiveIntValue(
+                        value,
+                        "moe_overlay_prefill_segment_rows");
             }
             else if (normalized_key ==
                      "moe_routed_prefill_least_loaded_min_routed_rows")
@@ -3240,12 +3415,14 @@ namespace llaminar2
                         value,
                         "moe_device_rebalance_min_wave_spread_improvement_per_payload_slot");
             }
-            else if (normalized_key == "moe_device_rebalance_min_foreign_rows_per_transfer")
+            else if (normalized_key ==
+                     "moe_device_rebalance_min_foreign_rows_per_critical_path_payload_slot")
             {
-                config.moe_rebalance.device_min_foreign_rows_per_transfer =
+                config.moe_rebalance
+                    .device_min_foreign_rows_per_critical_path_payload_slot =
                     parseNonNegativeUint32Value(
                         value,
-                        "moe_device_rebalance_min_foreign_rows_per_transfer");
+                        "moe_device_rebalance_min_foreign_rows_per_critical_path_payload_slot");
             }
             else if (normalized_key == "moe_device_rebalance_min_router_spread_improvement_per_payload_slot")
             {

@@ -284,6 +284,31 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
+            try
+            {
+                return executeOnStream(
+                    ExplicitGPUStream{
+                        requireStream("HipBLASGemmKernel::execute")},
+                    d_A, d_B, d_C,
+                    M, N, K,
+                    transA, transB,
+                    alpha, beta);
+            }
+            catch (const std::exception &exception)
+            {
+                HIP_LOG_ERROR(exception.what());
+                return false;
+            }
+        }
+
+        bool HipBLASGemmKernel::executeOnStream(
+            ExplicitGPUStream stream,
+            const float *d_A, const float *d_B, float *d_C,
+            int M, int N, int K,
+            bool transA, bool transB,
+            float alpha, float beta)
+        {
+            std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
             if (!handle_)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute] hipBLAS handle is null");
@@ -295,6 +320,17 @@ namespace llaminar2
             if (hip_err != hipSuccess)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute] Failed to set device: " << hipGetErrorString(hip_err));
+                return false;
+            }
+
+            const hipblasStatus_t stream_status = hipblasSetStream(
+                static_cast<hipblasHandle_t>(handle_),
+                static_cast<hipStream_t>(stream.get()));
+            if (stream_status != HIPBLAS_STATUS_SUCCESS)
+            {
+                HIP_LOG_ERROR(
+                    "[HipBLASGemmKernel::execute] hipblasSetStream failed: "
+                    << static_cast<int>(stream_status));
                 return false;
             }
 
@@ -362,14 +398,54 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
+            try
+            {
+                return executeBatchedOnStream(
+                    ExplicitGPUStream{
+                        requireStream("HipBLASGemmKernel::execute_batched")},
+                    d_A_array, d_B_array, d_C_array,
+                    M, N, K, batch_count,
+                    transA, transB,
+                    alpha, beta);
+            }
+            catch (const std::exception &exception)
+            {
+                HIP_LOG_ERROR(exception.what());
+                return false;
+            }
+        }
+
+        bool HipBLASGemmKernel::executeBatchedOnStream(
+            ExplicitGPUStream stream,
+            const float *const *d_A_array,
+            const float *const *d_B_array,
+            float *const *d_C_array,
+            int M, int N, int K,
+            int batch_count,
+            bool transA, bool transB,
+            float alpha, float beta)
+        {
+            std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
             if (!handle_)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute_batched] hipBLAS handle is null");
                 return false;
             }
+
             if (!d_A_array || !d_B_array || !d_C_array || M <= 0 || N <= 0 || K <= 0 || batch_count <= 0)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute_batched] Invalid arguments");
+                return false;
+            }
+
+            const hipblasStatus_t stream_status = hipblasSetStream(
+                static_cast<hipblasHandle_t>(handle_),
+                static_cast<hipStream_t>(stream.get()));
+            if (stream_status != HIPBLAS_STATUS_SUCCESS)
+            {
+                HIP_LOG_ERROR(
+                    "[HipBLASGemmKernel::execute_batched] hipblasSetStream failed: "
+                    << static_cast<int>(stream_status));
                 return false;
             }
 
@@ -411,6 +487,33 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
+            try
+            {
+                return executeWithBiasOnStream(
+                    ExplicitGPUStream{
+                        requireStream(
+                            "HipBLASGemmKernel::execute_with_bias")},
+                    d_A, d_B, d_C, d_bias,
+                    M, N, K,
+                    transA, transB,
+                    alpha, beta);
+            }
+            catch (const std::exception &exception)
+            {
+                HIP_LOG_ERROR(exception.what());
+                return false;
+            }
+        }
+
+        bool HipBLASGemmKernel::executeWithBiasOnStream(
+            ExplicitGPUStream stream,
+            const float *d_A, const float *d_B, float *d_C,
+            const float *d_bias,
+            int M, int N, int K,
+            bool transA, bool transB,
+            float alpha, float beta)
+        {
+            std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
             if (!lt_handle_)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute_with_bias] hipBLASLt handle is null");
@@ -563,7 +666,7 @@ namespace llaminar2
                                                      d_C, Cdesc, // D (output, same as C)
                                                      &heuristicResult.algo,
                                                      workspace, workspaceSize,
-                                                     static_cast<hipStream_t>(gpu_stream_));
+                                                     static_cast<hipStream_t>(stream.get()));
 
             // Cleanup descriptor state; the graph workspace remains setup-owned.
             hipblasLtMatmulPreferenceDestroy(preference);
@@ -600,6 +703,31 @@ namespace llaminar2
             bool transA, bool transB,
             float alpha, float beta)
         {
+            try
+            {
+                return executeFP16OnStream(
+                    ExplicitGPUStream{
+                        requireStream("HipBLASGemmKernel::execute_fp16")},
+                    d_A, d_B, d_C,
+                    M, N, K,
+                    transA, transB,
+                    alpha, beta);
+            }
+            catch (const std::exception &exception)
+            {
+                HIP_LOG_ERROR(exception.what());
+                return false;
+            }
+        }
+
+        bool HipBLASGemmKernel::executeFP16OnStream(
+            ExplicitGPUStream stream,
+            const void *d_A, const void *d_B, void *d_C,
+            int M, int N, int K,
+            bool transA, bool transB,
+            float alpha, float beta)
+        {
+            std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
             if (!handle_)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute_fp16] hipBLAS handle is null");
@@ -611,6 +739,17 @@ namespace llaminar2
             if (hip_err != hipSuccess)
             {
                 HIP_LOG_ERROR("[HipBLASGemmKernel::execute_fp16] Failed to set device: " << hipGetErrorString(hip_err));
+                return false;
+            }
+
+            const hipblasStatus_t stream_status = hipblasSetStream(
+                static_cast<hipblasHandle_t>(handle_),
+                static_cast<hipStream_t>(stream.get()));
+            if (stream_status != HIPBLAS_STATUS_SUCCESS)
+            {
+                HIP_LOG_ERROR(
+                    "[HipBLASGemmKernel::execute_fp16] hipblasSetStream failed: "
+                    << static_cast<int>(stream_status));
                 return false;
             }
 
@@ -653,11 +792,11 @@ namespace llaminar2
         void HipBLASGemmKernel::bindStream(ExplicitGPUStream stream)
         {
             ROCmKernelBase::bindGPUStream(stream);
-            if (handle_)
-            {
-                hipblasSetStream(static_cast<hipblasHandle_t>(handle_),
-                                 static_cast<hipStream_t>(stream.get()));
-            }
+            /*
+             * The cached handle is shared. Mutating it here would create a
+             * bind/submit race with another floating projection. Every launch
+             * instead binds inside its dispatch lock via an OnStream method.
+             */
         }
 
         void HipBLASGemmKernel::clearStreamBinding() noexcept
@@ -695,12 +834,65 @@ namespace llaminar2
 
         HipBLASGemmKernel::~HipBLASGemmKernel() {}
 
-        HipBLASGemmKernel::HipBLASGemmKernel(HipBLASGemmKernel &&) noexcept = default;
-        HipBLASGemmKernel &HipBLASGemmKernel::operator=(HipBLASGemmKernel &&) noexcept = default;
+        HipBLASGemmKernel::HipBLASGemmKernel(
+            HipBLASGemmKernel &&other) noexcept
+            : handle_(other.handle_),
+              lt_handle_(other.lt_handle_),
+              device_id_(other.device_id_),
+              precision_(other.precision_),
+              owns_handle_(other.owns_handle_),
+              owns_lt_handle_(other.owns_lt_handle_)
+        {
+            other.handle_ = nullptr;
+            other.lt_handle_ = nullptr;
+        }
+
+        HipBLASGemmKernel &HipBLASGemmKernel::operator=(
+            HipBLASGemmKernel &&other) noexcept
+        {
+            if (this != &other)
+            {
+                handle_ = other.handle_;
+                lt_handle_ = other.lt_handle_;
+                device_id_ = other.device_id_;
+                precision_ = other.precision_;
+                owns_handle_ = other.owns_handle_;
+                owns_lt_handle_ = other.owns_lt_handle_;
+                other.handle_ = nullptr;
+                other.lt_handle_ = nullptr;
+            }
+            return *this;
+        }
 
         bool HipBLASGemmKernel::execute(
             const float *, const float *, float *,
             int, int, int,
+            bool, bool, float, float)
+        {
+            return false;
+        }
+
+        bool HipBLASGemmKernel::executeOnStream(
+            ExplicitGPUStream,
+            const float *, const float *, float *,
+            int, int, int,
+            bool, bool, float, float)
+        {
+            return false;
+        }
+
+        bool HipBLASGemmKernel::execute_batched(
+            const float *const *, const float *const *, float *const *,
+            int, int, int, int,
+            bool, bool, float, float)
+        {
+            return false;
+        }
+
+        bool HipBLASGemmKernel::executeBatchedOnStream(
+            ExplicitGPUStream,
+            const float *const *, const float *const *, float *const *,
+            int, int, int, int,
             bool, bool, float, float)
         {
             return false;
@@ -721,7 +913,25 @@ namespace llaminar2
             return false;
         }
 
+        bool HipBLASGemmKernel::executeWithBiasOnStream(
+            ExplicitGPUStream,
+            const float *, const float *, float *, const float *,
+            int, int, int,
+            bool, bool, float, float)
+        {
+            return false;
+        }
+
         bool HipBLASGemmKernel::execute_fp16(
+            const void *, const void *, void *,
+            int, int, int,
+            bool, bool, float, float)
+        {
+            return false;
+        }
+
+        bool HipBLASGemmKernel::executeFP16OnStream(
+            ExplicitGPUStream,
             const void *, const void *, void *,
             int, int, int,
             bool, bool, float, float)

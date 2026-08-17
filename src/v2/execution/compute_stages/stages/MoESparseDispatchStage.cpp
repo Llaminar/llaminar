@@ -159,6 +159,19 @@ namespace llaminar2
             params_.inbound_rows = params_.inbound_rows_lifetime.get();
     }
 
+    /**
+     * @brief Receive the request/chunk identity selected by the overlay runner.
+     *
+     * This is deliberately a scalar host-side update. The stage is a manual
+     * sparse-collective boundary, so the identity is consumed when it creates
+     * its wire packet rather than being uploaded into a captured device graph.
+     */
+    void MoESparseDispatchStage::updateMoEOverlayCollectiveRuntimeParams(
+        const MoEOverlayCollectiveRuntimeParams &params)
+    {
+        runtime_params_ = params;
+    }
+
     bool MoESparseDispatchStage::execute(IDeviceContext *ctx)
     {
         last_collective_result_ = {};
@@ -178,7 +191,100 @@ namespace llaminar2
             return false;
         }
         MoEOverlayCollectiveKey runtime_key = params_.key;
-        runtime_key.step_id = execution_count_++;
+        if (params_.require_explicit_transaction_identity)
+        {
+            /*
+             * Do not derive distributed identity from this object's lifetime.
+             * The continuation graph and a remote participant graph can be
+             * captured or recreated independently, but they still service one
+             * root-published logical chunk.
+             */
+            if (!runtime_params_.valid())
+            {
+                LOG_ERROR("[MoESparseDispatchStage] Distributed graph-native dispatch "
+                          "started without a runner-stamped transaction identity");
+                return false;
+            }
+            runtime_key.generation_id = runtime_params_.generation_id;
+            runtime_key.step_id = runtime_params_.step_id;
+        }
+        else
+        {
+            /* Device-free local fixtures intentionally retain independent steps. */
+            runtime_key.step_id = execution_count_++;
+        }
+        if (params_.require_explicit_execution_semantics)
+        {
+            if (!runtime_params_.valid() ||
+                !runtime_params_.hasExecutionSemantics())
+            {
+                LOG_ERROR("[MoESparseDispatchStage] Production sparse dispatch "
+                          "started without typed execution semantics");
+                return false;
+            }
+            using Semantics =
+                MoEOverlayCollectiveRuntimeParams::ExecutionSemantics;
+            const auto semantics = runtime_params_.execution_semantics;
+            if (semantics == Semantics::Decode ||
+                semantics == Semantics::Prefill)
+            {
+                if (runtime_key.key_namespace !=
+                        MoEOverlayCollectiveNamespace::Main ||
+                    runtime_params_.mtp_depth != -1)
+                {
+                    LOG_ERROR("[MoESparseDispatchStage] Main execution semantics require the Main namespace and mtp_depth=-1");
+                    return false;
+                }
+                runtime_key.histogram_source =
+                    semantics == Semantics::Prefill
+                        ? ExpertHistogramSource::PrefillChunk
+                        : ExpertHistogramSource::DecodeToken;
+            }
+            else if (semantics == Semantics::MTPDraft)
+            {
+                if (runtime_key.key_namespace !=
+                        MoEOverlayCollectiveNamespace::MTP ||
+                    runtime_params_.mtp_depth < 0 ||
+                    runtime_key.mtp_depth != runtime_params_.mtp_depth)
+                {
+                    LOG_ERROR("[MoESparseDispatchStage] MTP draft semantics require the matching retained sidecar namespace depth");
+                    return false;
+                }
+                runtime_key = makeMTPMoEOverlayCollectiveKey(
+                    runtime_key.generation_id,
+                    runtime_key.step_id,
+                    runtime_params_.mtp_depth,
+                    runtime_key.layer_idx,
+                    runtime_key.tier_idx,
+                    runtime_key.domain_id,
+                    runtime_key.participant_id,
+                    runtime_key.direction);
+            }
+            else if (semantics == Semantics::GroupedVerifier)
+            {
+                if (runtime_key.key_namespace !=
+                        MoEOverlayCollectiveNamespace::Main ||
+                    runtime_params_.mtp_depth <= 0)
+                {
+                    LOG_ERROR("[MoESparseDispatchStage] Grouped verifier semantics require a Main graph and positive admitted draft depth");
+                    return false;
+                }
+                runtime_key = makeMTPMoEOverlayCollectiveKey(
+                    runtime_key.generation_id,
+                    runtime_key.step_id,
+                    runtime_params_.mtp_depth,
+                    runtime_key.layer_idx,
+                    runtime_key.tier_idx,
+                    runtime_key.domain_id,
+                    runtime_key.participant_id,
+                    runtime_key.direction);
+            }
+            else
+            {
+                LOG_ERROR("[MoESparseDispatchStage] Unsupported execution semantics");
+                return false;
+            }
+        }
 
         if (runtime_key.direction != MoEOverlayCollectiveDirection::Dispatch || !runtime_key.isValid())
         {
@@ -200,7 +306,26 @@ namespace llaminar2
         const bool is_replicated_hidden_non_root =
             params_.replicated_hidden_export &&
             params_.source_participant != params_.logical_continuation_root_participant;
-        if (is_replicated_hidden_non_root &&
+        const bool is_explicit_empty_participant =
+            params_.payload_publication_role ==
+            PayloadPublicationRole::EmptyCollectiveParticipant;
+        const bool must_publish_empty =
+            is_explicit_empty_participant || is_replicated_hidden_non_root;
+
+        if (is_explicit_empty_participant &&
+            (params_.hidden || params_.routing_indices ||
+             params_.routing_weights || params_.hidden_buffer_id ||
+             params_.routing_indices_buffer_id ||
+             params_.routing_weights_buffer_id || params_.tier_dispatch ||
+             params_.dispatch_output || params_.ticket_storage ||
+             params_.fixed_residency_epoch != 0))
+        {
+            LOG_ERROR(
+                "[MoESparseDispatchStage] Empty collective participant was "
+                "given a payload-producing binding");
+            return false;
+        }
+        if (must_publish_empty &&
             (tierHasPayload(params_.tier_dispatch) || dispatchOutputHasPayloadForNonRoot(params_)))
         {
             LOG_ERROR("[MoESparseDispatchStage] Non-root replicated-hidden continuation participant "
@@ -210,13 +335,43 @@ namespace llaminar2
             return false;
         }
 
-        const MoEExpertTierDispatch *tier = is_replicated_hidden_non_root ? nullptr : resolveTierDispatch(params_);
+        const MoEExpertTierDispatch *tier =
+            must_publish_empty ? nullptr : resolveTierDispatch(params_);
         const bool has_routed_rows = tier && !tier->entries.empty();
+        const uint64_t residency_epoch =
+            params_.dispatch_output
+                ? params_.dispatch_output->residency_epoch
+                : params_.fixed_residency_epoch;
+        if (params_.dispatch_output && residency_epoch == 0)
+        {
+            LOG_ERROR("[MoESparseDispatchStage] Dispatch output is missing its residency epoch");
+            return false;
+        }
+        if (has_routed_rows && residency_epoch == 0)
+        {
+            LOG_ERROR("[MoESparseDispatchStage] Routed sparse payload is missing its residency epoch");
+            return false;
+        }
+        const MoEOverlayDispatchTicket *captured_ticket = nullptr;
+        if (params_.ticket_storage)
+        {
+            captured_ticket = &params_.ticket_storage->ticket();
+            if (!params_.ticket_storage->hasValidBoundIdentity() ||
+                !captured_ticket->isValid() ||
+                captured_ticket->header->bucket_row_capacity != params_.seq_len ||
+                captured_ticket->header->top_k != params_.top_k ||
+                captured_ticket->header->d_model != params_.d_model)
+            {
+                LOG_ERROR("[MoESparseDispatchStage] Captured dispatch ticket identity is invalid");
+                return false;
+            }
+        }
         if (has_routed_rows)
         {
-            if (!validateFP32Matrix(params_.hidden, params_.seq_len, params_.d_model, "hidden") ||
-                !validateFP32Matrix(params_.routing_indices, params_.seq_len, params_.top_k, "routing_indices") ||
-                !validateFP32Matrix(params_.routing_weights, params_.seq_len, params_.top_k, "routing_weights"))
+            if (!captured_ticket &&
+                (!validateFP32Matrix(params_.hidden, params_.seq_len, params_.d_model, "hidden") ||
+                 !validateFP32Matrix(params_.routing_indices, params_.seq_len, params_.top_k, "routing_indices") ||
+                 !validateFP32Matrix(params_.routing_weights, params_.seq_len, params_.top_k, "routing_weights")))
             {
                 return false;
             }
@@ -224,6 +379,7 @@ namespace llaminar2
 
         auto outbound = params_.workspace->localExpertInput(runtime_key.layer_idx, runtime_key.tier_idx);
         outbound.key = runtime_key;
+        outbound.residency_epoch = residency_epoch;
         outbound.source_participant = params_.source_participant;
         outbound.target_participant = params_.target_participant;
         outbound.d_model = params_.d_model;
@@ -233,10 +389,14 @@ namespace llaminar2
         if (outbound.entry_offsets_host && outbound.row_capacity > 0)
             outbound.entry_offsets_host[0] = 0;
 
-        if (has_routed_rows && !is_replicated_hidden_non_root)
+        if (has_routed_rows && !must_publish_empty)
         {
+            const int logical_seq_len =
+                captured_ticket
+                    ? captured_ticket->header->logical_row_count
+                    : params_.seq_len;
             if (!validateTierEntries(*tier,
-                                     params_.seq_len,
+                                     logical_seq_len,
                                      params_.top_k,
                                      outbound.row_capacity,
                                      outbound.entry_capacity))
@@ -244,32 +404,73 @@ namespace llaminar2
                 return false;
             }
 
-            const float *hidden = params_.hidden->data();
-            size_t entry_cursor = 0;
-            for (size_t compact_row = 0; compact_row < tier->token_rows.size(); ++compact_row)
+            const float *hidden = captured_ticket
+                                      ? captured_ticket->hidden_rows_fp32
+                                      : params_.hidden->data();
+            const bool participant_targeted = std::any_of(
+                tier->entries.begin(),
+                tier->entries.end(),
+                [](const MoEExpertDispatchEntry &entry)
+                { return entry.destination_participant >= 0; });
+            const bool has_untargeted_entry = std::any_of(
+                tier->entries.begin(),
+                tier->entries.end(),
+                [](const MoEExpertDispatchEntry &entry)
+                { return entry.destination_participant < 0; });
+            if (participant_targeted && has_untargeted_entry)
             {
-                const int token_row = tier->token_rows[compact_row];
-                outbound.row_ids_host[compact_row] = token_row;
-                std::memcpy(outbound.hidden_rows_fp32 + compact_row * static_cast<size_t>(params_.d_model),
-                            hidden + static_cast<size_t>(token_row) * static_cast<size_t>(params_.d_model),
-                            static_cast<size_t>(params_.d_model) * sizeof(float));
-                outbound.entry_offsets_host[compact_row] = static_cast<int32_t>(entry_cursor);
-
+                LOG_ERROR(
+                    "[MoESparseDispatchStage] Dispatch descriptor mixes owner-filtered and current-batch-targeted routes");
+                return false;
+            }
+            const auto entry_targets_this_participant =
+                [&](const MoEExpertDispatchEntry &entry)
+            {
+                return !participant_targeted ||
+                       entry.destination_participant ==
+                           params_.target_participant;
+            };
+            const size_t expected_entry_count =
+                static_cast<size_t>(std::count_if(
+                    tier->entries.begin(),
+                    tier->entries.end(),
+                    entry_targets_this_participant));
+            size_t entry_cursor = 0;
+            size_t compact_row = 0;
+            for (const int token_row : tier->token_rows)
+            {
+                const size_t row_entry_begin = entry_cursor;
                 for (const auto &entry : tier->entries)
                 {
-                    if (entry.token_row != token_row)
+                    if (entry.token_row != token_row ||
+                        !entry_targets_this_participant(entry))
                         continue;
                     outbound.expert_ids_host[entry_cursor] = entry.expert_id;
                     outbound.route_weights_host[entry_cursor] = entry.route_weight;
                     ++entry_cursor;
                 }
+                if (entry_cursor == row_entry_begin)
+                    continue;
+
+                outbound.row_ids_host[compact_row] = token_row;
+                std::memcpy(
+                    outbound.hidden_rows_fp32 +
+                        compact_row * static_cast<size_t>(params_.d_model),
+                    hidden + static_cast<size_t>(token_row) *
+                                 static_cast<size_t>(params_.d_model),
+                    static_cast<size_t>(params_.d_model) * sizeof(float));
+                outbound.entry_offsets_host[compact_row] =
+                    static_cast<int32_t>(row_entry_begin);
+                ++compact_row;
             }
-            outbound.live_row_count = tier->token_rows.size();
+            outbound.live_row_count = compact_row;
             outbound.live_entry_count = entry_cursor;
-            if (entry_cursor != tier->entries.size())
+            if (entry_cursor != expected_entry_count)
             {
-                LOG_ERROR("[MoESparseDispatchStage] Tier descriptor token_rows did not cover every routed entry: packed="
-                          << entry_cursor << " entries=" << tier->entries.size());
+                LOG_ERROR(
+                    "[MoESparseDispatchStage] Tier descriptor token rows did not cover every target-assigned route: packed="
+                    << entry_cursor
+                    << " expected=" << expected_entry_count);
                 return false;
             }
             outbound.entry_offsets_host[outbound.live_row_count] = static_cast<int32_t>(entry_cursor);
@@ -319,11 +520,11 @@ namespace llaminar2
     StageBufferRequirements MoESparseDispatchStage::getBufferRequirements() const
     {
         StageBufferRequirements reqs;
-        if (params_.hidden)
+        if (!params_.ticket_storage && params_.hidden)
             reqs.addInput("hidden", params_.hidden->shape(), toBufferTensorType(params_.hidden->native_type()));
-        if (params_.routing_indices)
+        if (!params_.ticket_storage && params_.routing_indices)
             reqs.addInput("routing_indices", params_.routing_indices->shape(), toBufferTensorType(params_.routing_indices->native_type()));
-        if (params_.routing_weights)
+        if (!params_.ticket_storage && params_.routing_weights)
             reqs.addInput("routing_weights", params_.routing_weights->shape(), toBufferTensorType(params_.routing_weights->native_type()));
         return reqs;
     }
@@ -331,11 +532,11 @@ namespace llaminar2
     StageBufferContract MoESparseDispatchStage::bufferContract() const
     {
         auto contract = StageBufferContract::build();
-        if (params_.hidden && params_.hidden_buffer_id)
+        if (!params_.ticket_storage && params_.hidden && params_.hidden_buffer_id)
             contract.addInput(*params_.hidden_buffer_id, "FP32");
-        if (params_.routing_indices && params_.routing_indices_buffer_id)
+        if (!params_.ticket_storage && params_.routing_indices && params_.routing_indices_buffer_id)
             contract.addInput(*params_.routing_indices_buffer_id, "FP32");
-        if (params_.routing_weights && params_.routing_weights_buffer_id)
+        if (!params_.ticket_storage && params_.routing_weights && params_.routing_weights_buffer_id)
             contract.addInput(*params_.routing_weights_buffer_id, "FP32");
         return contract;
     }
@@ -355,7 +556,11 @@ namespace llaminar2
         info.addScalarInt("top_k", params_.top_k);
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("tier_index", params_.tier_index);
+        info.addScalarInt(
+            "payload_publication_role",
+            static_cast<int>(params_.payload_publication_role));
         info.addScalarBool("replicated_hidden_export", params_.replicated_hidden_export);
+        info.addScalarBool("captured_ticket", params_.ticket_storage != nullptr);
         info.addScalarInt("logical_continuation_root_participant", params_.logical_continuation_root_participant);
         return info;
     }

@@ -1291,10 +1291,10 @@ namespace llaminar2
      * The source sum is derivable from `qs` and is not consumed by weight GEMM,
      * so the device representation retains only exact values and scale.
      */
-    void Q8_1Tensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    void Q8_1Tensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
     {
-        const size_t linear = vnniLinearIdx(ctx, n, b);
-        const auto *block = &typed_data()[static_cast<size_t>(n) * ctx.blocks_per_row + b];
+        const size_t linear = vnniLinearIdx(ctx, destination_n, b);
+        const auto *block = &typed_data()[static_cast<size_t>(source_n) * ctx.blocks_per_row + b];
         std::memcpy(vnniPayloadDst(ctx, linear), block->qs, 32);
         ctx.scales_array[linear] = block->d;
     }

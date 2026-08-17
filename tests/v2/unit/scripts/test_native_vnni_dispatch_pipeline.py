@@ -241,6 +241,103 @@ def test_cpu_checkpoint_controls_resume_the_same_turnkey_workspace(
     assert len(set(workspaces)) == 1
 
 
+def test_cpu_decode_checkpoint_and_grouped_continuation_share_workspace(
+    tmp_path: Path,
+) -> None:
+    """The two documented CPU phases must address one staging transaction."""
+
+    workspaces = []
+    for phase_control in (
+        "--stop-after-cpu-decode",
+        "--resume-after-cpu-decode",
+    ):
+        result = subprocess.run(
+            (
+                str(PIPELINE),
+                "--backend",
+                "cpu",
+                "--corpus-root",
+                str(tmp_path / "corpora"),
+                "--workspace-root",
+                str(tmp_path / "work"),
+                "--skip-build",
+                "--skip-scorer-tests",
+                "--install",
+                "--dry-run",
+                "--",
+                "--cpu-format-shards",
+                phase_control,
+            ),
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        workspaces.append(next(
+            line for line in result.stdout.splitlines()
+            if line.startswith("dry-run: mkdir -p ")
+            and "collect-cpu-" in line
+        ))
+
+    assert workspaces[0] == workspaces[1]
+
+
+def test_cpu_burned_seal_replay_reopens_the_measurement_workspace(
+    tmp_path: Path,
+) -> None:
+    """Adding failed-seal evidence must not trigger full corpus recollection."""
+
+    workspaces = []
+    argument_sets = (
+        ("--stop-after-cpu-decode",),
+        (
+            "--stop-after-cpu-decode",
+            "--cpu-decode-max-leaves",
+            "32",
+        ),
+        (
+            "--stop-after-cpu-decode",
+            "--cpu-decode-burned-sealed-plan",
+            "/evidence/generation-000/plan.json",
+            "--cpu-decode-burned-sealed-paired-dir",
+            "/evidence/generation-000/paired",
+        ),
+    )
+    for forwarded_arguments in argument_sets:
+        result = subprocess.run(
+            (
+                str(PIPELINE),
+                "--backend",
+                "cpu",
+                "--corpus-root",
+                str(tmp_path / "corpora"),
+                "--workspace-root",
+                str(tmp_path / "work"),
+                "--skip-build",
+                "--skip-scorer-tests",
+                "--install",
+                "--dry-run",
+                "--",
+                *forwarded_arguments,
+            ),
+            cwd=REPOSITORY_ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        workspaces.append(next(
+            line for line in result.stdout.splitlines()
+            if line.startswith("dry-run: mkdir -p ")
+            and "collect-cpu-" in line
+        ))
+
+    assert len(set(workspaces)) == 1
+
+
 def test_turnkey_checks_collection_completeness_before_sealing() -> None:
     """A bounded refresh checkpoint cannot fall through into publication."""
 
@@ -250,7 +347,7 @@ def test_turnkey_checks_collection_completeness_before_sealing() -> None:
     seal_offset = source.index("corpus_bundle seal", complete_offset)
 
     assert refresh_offset < complete_offset < seal_offset
-    assert "collection_status == 1 && cpu_batch_limit > 0" in source
+    assert "cpu_batch_limit > 0 || stop_after_cpu_decode > 0" in source
 
 
 @pytest.mark.parametrize(

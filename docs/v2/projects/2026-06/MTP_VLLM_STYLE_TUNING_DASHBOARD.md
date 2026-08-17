@@ -72,6 +72,33 @@ are isolated; dynamic depth is tuned only after that baseline is sound.
 
 ## Correctness Proof
 
+- The 2026-08-12 Qwen3.6 MoE SingleDevice production-checkpoint campaign is
+  green on CPU, CUDA, and ROCm for fixed depths 1, 2, and 3 plus dynamic depth.
+  The three `ALL_PRECISIONS` campaign targets take `138.14 s`, `104.14 s`, and
+  `112.85 s` respectively from a warm authenticated reference pack: `355.13 s`
+  (`5 min 55.13 s`) for the complete three-backend slice. A forced reference
+  refresh followed by the same CUDA and ROCm runs takes `511.04 s`
+  (`8 min 31.04 s`). The previous CUDA campaign took `1524.20 s`; retaining one
+  graph-native serial oracle and one plan-certified immutable
+  `ModelContext`/`PreparedWeightStore` per campaign removes repeated model
+  loading while every depth still owns fresh request, arena, stream, graph,
+  controller, and prefix state. CUDA and ROCm CSV evidence records full prefill
+  and decode graph capture plus replay, zero segmentation, and prepared-weight
+  reuse only after the first depth. Token traces prove actual depths 1/2/3;
+  dynamic runs begin at depth 3, evaluate and update the device-owned policy,
+  demote once, and finish at depth 2.
+- The same campaign now authenticates `moe_router_snapshot_schema: 1` and MTP
+  sidecar schema 5, so `MOE_ROUTER_OUTPUT` always means the complete
+  post-softmax distribution. Probability checkpoints use direct row-wise
+  symmetric KL rather than an erroneous second softmax. Every active MTP graph
+  context also writes a `counterfactual_vs_mtp_router` row to the existing
+  `mtp_sidecar_snapshot_breakdown.csv`: an independent double-accumulation
+  projection loads the real GGUF gate and evaluates it on the exact live
+  production `FFN_NORM` input. Across all three backends the worst causal
+  relative L2 is below `3.3e-7` and worst symmetric KL below `6.9e-14`, proving
+  the router kernel itself when recurrent upstream drift is larger. The
+  device-free `V2_Unit_SnapshotCapture` gate rejects malformed distributions,
+  proves worst-row behavior, and prevents reintroducing a second softmax.
 - All-format grouped attention, TurboQuant, MoE routing, GDN, short-conv,
   stochastic target preparation, and draft publication sweeps are serial-row
   byte exact on their production backends and M ranges.

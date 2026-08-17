@@ -40,6 +40,40 @@ namespace llaminar2
         return normalized;
     }
 
+    std::vector<int> residentPrefillGraphRowCandidates(
+        const std::vector<int> &buckets,
+        int max_rows)
+    {
+        if (max_rows <= 0)
+            return {};
+
+        std::vector<int> candidates;
+        for (const int bucket : normalizePrefillGraphBuckets(buckets))
+        {
+            if (bucket <= max_rows)
+                candidates.push_back(bucket);
+        }
+        if (candidates.empty())
+            candidates.push_back(max_rows);
+
+        // Admission tries the throughput-favouring shape first and only
+        // reduces residency when the complete physical BOM cannot cover it.
+        std::reverse(candidates.begin(), candidates.end());
+        return candidates;
+    }
+
+    std::vector<int> segmentedPrefillGraphRowCandidates(
+        const std::vector<int> &buckets,
+        int max_context_rows,
+        int max_segment_rows)
+    {
+        if (max_context_rows <= 0 || max_segment_rows <= 0)
+            return {};
+        return residentPrefillGraphRowCandidates(
+            buckets,
+            std::min(max_context_rows, max_segment_rows));
+    }
+
     std::vector<int> prefillGraphBucketsAtOrBelowCapacity(
         const std::vector<int> &buckets,
         int resident_graph_rows)
@@ -57,6 +91,34 @@ namespace llaminar2
         std::sort(bounded.begin(), bounded.end());
         bounded.erase(std::unique(bounded.begin(), bounded.end()), bounded.end());
         return bounded;
+    }
+
+    int effectivePrefillGraphMinimumPaddedBucketSeqLen(
+        int configured_floor,
+        int resident_graph_rows) noexcept
+    {
+        const int positive_floor = std::max(1, configured_floor);
+        if (resident_graph_rows <= 0)
+            return positive_floor;
+
+        // Selection and preflight must see the same reachable lower bound.
+        return std::min(positive_floor, resident_graph_rows);
+    }
+
+    std::vector<int> rawPrefillGraphBucketsForResidentCapacity(
+        const std::vector<int> &configured_buckets,
+        int resident_graph_rows,
+        int configured_floor)
+    {
+        auto buckets = prefillGraphBucketsAtOrBelowCapacity(
+            configured_buckets, resident_graph_rows);
+        const int floor =
+            effectivePrefillGraphMinimumPaddedBucketSeqLen(
+                configured_floor, resident_graph_rows);
+        buckets.erase(
+            buckets.begin(),
+            std::lower_bound(buckets.begin(), buckets.end(), floor));
+        return buckets;
     }
 
     PrefillBucketSelection selectPrefillGraphBucket(

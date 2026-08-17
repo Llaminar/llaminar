@@ -33,6 +33,7 @@
 #       ghcr.io/llaminar/llaminar:latest -d rocm:0 -m /models/<gguf>
 
 ARG CUTLASS_VERSION=v4.2.1
+ARG NINJA_VERSION=1.13.0
 ARG LLAMINAR_BUILD_TYPE=Release
 ARG LLAMINAR_CPU_ISA=AVX512
 ARG LLAMINAR_CUDA_ARCHS="80;86;89;90"
@@ -50,6 +51,7 @@ ARG ROCM_RUNTIME_GPU_TARGETS=
 FROM ubuntu:24.04 AS builder
 
 ARG CUTLASS_VERSION
+ARG NINJA_VERSION
 ARG LLAMINAR_BUILD_TYPE
 ARG LLAMINAR_CPU_ISA
 ARG LLAMINAR_CUDA_ARCHS
@@ -82,7 +84,8 @@ COPY scripts/docker/install-system-deps.sh \
      scripts/docker/install-rocm.sh \
      scripts/docker/install-cutlass.sh \
      /tmp/install-scripts/
-RUN MODE=build  /tmp/install-scripts/install-system-deps.sh
+RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
+    /tmp/install-scripts/install-system-deps.sh
 RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
         MODE=full /tmp/install-scripts/install-cuda.sh; \
     else \

@@ -4,6 +4,7 @@
  */
 
 #include "Qwen35Graph.h"
+#include "../../config/GDNHeadAssignment.h"
 #include "Qwen35Schema.h"
 #include "../../collective/ILocalTPContext.h"
 #include "../../execution/compute_stages/ComputeStages.h"
@@ -145,7 +146,15 @@ namespace llaminar2
             return mpi_ctx->rank() * n_v_heads;
 
         if (config.tp_ctx && config.tp_ctx->degree() > 1)
-            return config.tp_ctx->myIndex() * n_v_heads;
+        {
+            /*
+             * GraphConfig is participant-local: tp_device_idx was bound by
+             * the runner factory for this exact graph instance.  Do not ask a
+             * shared LocalTPContext for mutable "current device" state while
+             * RankOrchestrator builds participant graphs concurrently.
+             */
+            return config.tp_device_idx * n_v_heads;
+        }
 
         return 0;
     }
@@ -161,6 +170,34 @@ namespace llaminar2
         : QwenGraphBase(std::move(model_ctx), std::move(mpi_ctx), config)
     {
         populateHybridAllreducePrecision(config_);
+    }
+
+    Qwen35Graph::ScopedMTPGraphContext::ScopedMTPGraphContext(
+        Qwen35Graph &graph,
+        int depth_idx) noexcept
+        : graph_(graph),
+          previous_active_(graph.mtp_graph_context_active_),
+          previous_depth_idx_(graph.mtp_graph_depth_idx_)
+    {
+        graph_.mtp_graph_context_active_ = true;
+        graph_.mtp_graph_depth_idx_ = depth_idx;
+    }
+
+    Qwen35Graph::ScopedMTPGraphContext::~ScopedMTPGraphContext()
+    {
+        graph_.mtp_graph_context_active_ = previous_active_;
+        graph_.mtp_graph_depth_idx_ = previous_depth_idx_;
+    }
+
+    std::string Qwen35Graph::ffnGraphStagePrefix(int layer_idx) const
+    {
+        if (mtpGraphContextActive())
+        {
+            return "MTP" +
+                   std::to_string(std::max(0, mtpGraphDepthIndex())) +
+                   "_";
+        }
+        return QwenGraphBase::ffnGraphStagePrefix(layer_idx);
     }
 
     Qwen35Graph::Qwen35Graph(
@@ -295,19 +332,34 @@ namespace llaminar2
                                                : config_.local_n_heads;
         if (config_.qkv_column_parallel && resolver_local_n_heads > 0 && config_.n_heads > 0)
         {
-            // V-heads are always sharded
-            n_v_heads_local = n_v_heads_full * resolver_local_n_heads / config_.n_heads;
-            if (n_v_heads_local <= 0)
-                n_v_heads_local = 1;
-
-            // K-heads: replicated for GDN modular repeat, sharded otherwise
-            if (!gdn_modular_repeat)
+            if (config_.default_device.is_cpu())
             {
-                n_k_heads_local = n_k_heads_full * resolver_local_n_heads / config_.n_heads;
-                if (n_k_heads_local <= 0)
-                    n_k_heads_local = 1;
+                const GDNHeadAssignment assignment =
+                    GDNHeadAssignment::fromPartition(
+                        n_k_heads_full,
+                        n_v_heads_full,
+                        config_.head_start,
+                        resolver_local_n_heads,
+                        config_.n_heads);
+                n_k_heads_local = assignment.localKeyHeads();
+                n_v_heads_local = assignment.localValueHeads();
             }
-            // else: n_k_heads_local stays at full count (replicated)
+            else
+            {
+                // GPU phase-split state handoff currently consumes contiguous
+                // V shards and therefore retains its established Q/K layout.
+                n_v_heads_local =
+                    n_v_heads_full * resolver_local_n_heads / config_.n_heads;
+                if (n_v_heads_local <= 0)
+                    n_v_heads_local = 1;
+                if (!gdn_modular_repeat)
+                {
+                    n_k_heads_local =
+                        n_k_heads_full * resolver_local_n_heads / config_.n_heads;
+                    if (n_k_heads_local <= 0)
+                        n_k_heads_local = 1;
+                }
+            }
         }
         const int d_k = config_.gdn.state_size;
         const int key_dim = n_k_heads_local * d_k;
@@ -381,6 +433,7 @@ namespace llaminar2
         const MTPForwardInput &input,
         MTPForwardOutput &output)
     {
+        ScopedMTPGraphContext mtp_graph_context(*this, depth_idx);
         ComputeGraph graph;
         const std::string prefix = "mtp" + std::to_string(depth_idx) + "_";
         const DeviceId device = input.device.is_valid() ? input.device : config_.default_device;
@@ -425,7 +478,7 @@ namespace llaminar2
             weights.fa_block.moe_down_exps;
         const bool mirror_mtp_lm_head =
             !kv_cache_only &&
-            localTPMirroredMTPHeadConfigured();
+            mirroredMTPHeadConfigured();
         MirroredMTPHeadScope mirrored_head_scope(*this, mirror_mtp_lm_head);
         const FinalProjectionPolicy mtp_final_projection =
             kv_cache_only
@@ -439,15 +492,21 @@ namespace llaminar2
                       .force_full_vocabulary_head = mirror_mtp_lm_head,
                       .compute_all_positions = true,
                   });
+        const bool spans_multiple_global_ranks =
+            (config_.tp_ctx != nullptr &&
+             !config_.tp_ctx->isLocal() &&
+             config_.tp_ctx->degree() > 1) ||
+            (config_.tp_ctx == nullptr &&
+             mpi_ctx_ != nullptr &&
+             mpi_ctx_->world_size() > 1);
         const bool gather_global_tp_mtp_logits =
-            !kv_cache_only &&
-            mtp_final_projection.column_parallel &&
-            ((config_.tp_ctx != nullptr &&
-              !config_.tp_ctx->isLocal() &&
-              config_.tp_ctx->degree() > 1) ||
-             (config_.tp_ctx == nullptr &&
-              mpi_ctx_ != nullptr &&
-              mpi_ctx_->world_size() > 1));
+            resolveMTPTerminalLogitsCollective({
+                .layout = config_.mtpTerminalLogitsLayout(),
+                .sidecar_produces_logits = !kv_cache_only,
+                .spans_multiple_global_ranks =
+                    spans_multiple_global_ranks,
+            }) ==
+            MTPTerminalLogitsCollective::GlobalVocabularyAllGather;
 
         if (missing("embedding table", modelEmbeddingTable()) ||
             (!kv_cache_only &&
@@ -789,12 +848,10 @@ namespace llaminar2
         if (gather_global_tp_mtp_logits)
         {
             /*
-             * GlobalTP deliberately keeps the 248k-vocabulary MTP head sharded:
-             * duplicating that projection on every CPU socket would double its
-             * compute and weight traffic.  Stochastic verification nevertheless
-             * needs one exact full distribution.  Gather only the compact
-             * one-to-four sidecar rows after the local projection, matching the
-             * ordinary target-verifier LM-head ownership contract.
+             * This branch is reachable only for the explicit
+             * vocabulary-sharded terminal-head policy. Mirrored ownership is
+             * scope-independent and writes a full distribution on every rank,
+             * so it must never pay this per-draft collective.
              */
             AllGatherStage::Params gather_params;
             gather_params.local_input = output.logits;
@@ -1291,10 +1348,8 @@ namespace llaminar2
         rec_params.verifier_state_capture_rows = verifier_state_capture_rows;
         rec_params.speculative_state_slot_rows = verifier_state_capture_rows;
 
-        // Under TP, V-heads are always sharded (each rank owns a contiguous
-        // slice of global V-heads). The global_v_head_offset tells the
-        // recurrence stage which global V-heads this rank owns, so the
-        // deinterleave helper can select the correct K-heads:
+        // GPU TP retains contiguous V shards, so global_v_head_offset tells
+        // recurrence which global V heads select from its Q/K source:
         //   k_idx = (v_local + offset) % n_k_heads_local
         //
         // This is required in ALL TP modes where V is sharded:
@@ -1306,7 +1361,10 @@ namespace llaminar2
         // V is sharded whenever n_v_heads < n_v_heads_full. Previously the
         // expansion case was missed, leaving rank>0 with offset=0 and reading
         // the wrong K-heads for its V-head slice.
-        if (n_v_heads < n_v_heads_full)
+        // CPU TP instead packs all modulo-linked V spans beside the local Q/K
+        // shard. In that canonical local order, local_v % local_k is already
+        // exact and no global offset belongs in the recurrence contract.
+        if (!device.is_cpu() && n_v_heads < n_v_heads_full)
         {
             rec_params.global_v_head_offset = resolveGDNGlobalVHeadOffset(
                 layer_bindings.attn_gate,

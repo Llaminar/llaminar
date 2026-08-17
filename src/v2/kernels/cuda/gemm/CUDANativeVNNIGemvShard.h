@@ -5,8 +5,9 @@
  * The generated M=1/grouped policy is data, while physical template ownership
  * is build topology.  This ABI keeps those concerns separate: policy refreshes
  * replace one generated include, and eight fixed source shards continue to own
- * exactly two codebooks apiece.  Callers outside the dispatcher must use the
- * ordinary public CUDA NativeVNNI entrypoints.
+ * a small fixed codebook group apiece. The final shard additionally owns the
+ * execution-only expanded asymmetric INT8 representation. Callers outside the
+ * dispatcher must use the ordinary public CUDA NativeVNNI entrypoints.
  */
 
 #pragma once
@@ -28,6 +29,13 @@
         cudaNativeVNNIGemvTuned_queryGeneratedDispatch, INDEX)(        \
         uint8_t, int, int, int, int, int *, int *, int *, int *);       \
     extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
+        cudaNativeVNNIGemvTuned_queryCompleteGeneratedDispatch, INDEX)( \
+        uint8_t, int, int, int, int, int *, int *, int *, int *, int *, \
+        int *, int *, int *);                                           \
+    extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
+        cudaNativeVNNIGemvTuned_queryGeneratedGroupedDispatch, INDEX)( \
+        uint8_t, int, int, int, int, int *, int *);                     \
+    extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
         cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule, INDEX)(      \
         uint8_t, int, int, int, int *, int *);                          \
     extern "C" double LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(               \
@@ -41,11 +49,25 @@
         int, int, float, float, const float *, const float *, uint8_t,  \
         int, void *, CUDAGemvContext *, CUDARowMajorWeights **);        \
     extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
+        cudaNativeVNNIGemvTuned_fp32_withPolicy, INDEX)(                \
+        const int8_t *, const uint8_t *, const uint16_t *,              \
+        const uint16_t *, const uint32_t *, float *, const float *,     \
+        int, int, float, float, const float *, const float *, uint8_t,  \
+        uint8_t, int, void *, CUDAGemvContext *,                        \
+        CUDARowMajorWeights **);                                        \
+    extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
         cudaNativeVNNIGemvTuned_small_m_fp32, INDEX)(                   \
         const int8_t *, const uint8_t *, const uint16_t *,              \
         const uint16_t *, const uint32_t *, float *, const float *,     \
         int, int, int, float, float, const float *, const float *,      \
         uint8_t, int, void *, CUDAGemvContext *,                        \
+        CUDARowMajorWeights **);                                        \
+    extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
+        cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy, INDEX)(        \
+        const int8_t *, const uint8_t *, const uint16_t *,              \
+        const uint16_t *, const uint32_t *, float *, const float *,     \
+        int, int, int, float, float, const float *, const float *,      \
+        uint8_t, uint8_t, int, void *, CUDAGemvContext *,               \
         CUDARowMajorWeights **);                                        \
     extern "C" bool LLAMINAR_CUDA_NVNNI_SHARD_SYMBOL(                  \
         cudaNativeVNNIInitIQGridTables_tuned, INDEX)();                 \

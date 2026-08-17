@@ -4,6 +4,7 @@
  */
 
 #include "GPUExpertTransferBackend.h"
+#include "../../backends/rocm/HipDeviceGuard.h"
 #include "../../utils/Logger.h"
 
 #ifdef HAVE_ROCM
@@ -39,6 +40,19 @@ namespace llaminar2::detail
         }
     }
 
+    int currentROCmDeviceOrdinal() noexcept
+    {
+        int ordinal = -1;
+        return hipGetDevice(&ordinal) == hipSuccess ? ordinal : -1;
+    }
+
+    bool restoreROCmDeviceOrdinal(int ordinal) noexcept
+    {
+        return ordinal >= 0 &&
+               HipDeviceGuard::forceSetDevice(ordinal) ==
+                   static_cast<int>(hipSuccess);
+    }
+
     bool transferExpertROCmBackend(
         const GPUExpertPointers &src_ptrs,
         const GPUExpertPointers &dst_ptrs,
@@ -55,6 +69,16 @@ namespace llaminar2::detail
 
         const int src_ord = src_device.rocm_ordinal();
         const int dst_ord = dst_device.rocm_ordinal();
+
+        /* Peer submissions execute on a destination-owned auxiliary stream;
+         * never inherit an unrelated current device from the caller thread. */
+        hipError_t select_err = hipSetDevice(dst_ord);
+        if (select_err != hipSuccess)
+        {
+            LOG_ERROR("[GPUExpertTransfer] hipSetDevice failed for destination "
+                      << dst_ord << ": " << hipGetErrorString(select_err));
+            return false;
+        }
 
         auto hip_stream = static_cast<hipStream_t>(stream);
         bool success = true;
@@ -78,7 +102,7 @@ namespace llaminar2::detail
             success = false;
 
         if (original_device >= 0)
-            (void)hipSetDevice(original_device);
+            (void)restoreROCmDeviceOrdinal(original_device);
 
         if (success)
         {

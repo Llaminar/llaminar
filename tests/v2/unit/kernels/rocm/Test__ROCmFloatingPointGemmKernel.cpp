@@ -26,11 +26,13 @@
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 #include <chrono>
 #include <numeric>
@@ -40,6 +42,77 @@ using namespace llaminar2::rocm;
 
 namespace
 {
+    /** @brief Test-only gate that keeps one HIP stream occupied. */
+    class HostBlockedHipStream final
+    {
+    public:
+        /** @brief Create a nonblocking stream and park a host function on it. */
+        HostBlockedHipStream()
+        {
+            if (hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking) !=
+                hipSuccess)
+            {
+                throw std::runtime_error(
+                    "Could not create adversarial HIP stream");
+            }
+            if (hipLaunchHostFunc(
+                    stream_,
+                    [](void *opaque)
+                    {
+                        auto *self = static_cast<HostBlockedHipStream *>(opaque);
+                        self->entered_.store(true, std::memory_order_release);
+                        while (!self->release_.load(std::memory_order_acquire))
+                            std::this_thread::yield();
+                    },
+                    this) != hipSuccess)
+            {
+                (void)hipStreamDestroy(stream_);
+                stream_ = nullptr;
+                throw std::runtime_error(
+                    "Could not enqueue adversarial HIP host gate");
+            }
+
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(5);
+            while (!entered_.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::yield();
+            }
+            if (!entered_.load(std::memory_order_acquire))
+            {
+                release_.store(true, std::memory_order_release);
+                (void)hipStreamSynchronize(stream_);
+                (void)hipStreamDestroy(stream_);
+                stream_ = nullptr;
+                throw std::runtime_error(
+                    "Adversarial HIP host gate did not start");
+            }
+        }
+
+        /** @brief Release the gate before destroying its stream. */
+        ~HostBlockedHipStream()
+        {
+            release_.store(true, std::memory_order_release);
+            if (stream_)
+            {
+                (void)hipStreamSynchronize(stream_);
+                (void)hipStreamDestroy(stream_);
+            }
+        }
+
+        HostBlockedHipStream(const HostBlockedHipStream &) = delete;
+        HostBlockedHipStream &operator=(const HostBlockedHipStream &) = delete;
+
+        /** @return Exact non-default stream held behind the host gate. */
+        [[nodiscard]] hipStream_t get() const noexcept { return stream_; }
+
+    private:
+        hipStream_t stream_ = nullptr;
+        std::atomic<bool> entered_{false};
+        std::atomic<bool> release_{false};
+    };
+
     class ScopedEnv
     {
     public:
@@ -92,6 +165,9 @@ protected:
 
         rocm_device_id_ = 0;
         (void)hipSetDevice(rocm_device_id_);
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
+            hipSuccess);
 
         // Get device properties
         hipDeviceProp_t props;
@@ -101,7 +177,12 @@ protected:
 
     void TearDown() override
     {
-        (void)hipDeviceSynchronize();
+        if (stream_)
+        {
+            (void)hipStreamSynchronize(stream_);
+            (void)hipStreamDestroy(stream_);
+            stream_ = nullptr;
+        }
     }
 
     // Reference CPU GEMM for validation: C = A @ B^T (row-major)
@@ -135,6 +216,10 @@ protected:
 
     void copy_from_gpu(float *d_ptr, std::vector<float> &host_data)
     {
+        // The producer stream is deliberately nonblocking.  Wait for that
+        // exact stream before a synchronous host copy; legacy/default-stream
+        // coupling must not provide hidden ordering in this harness.
+        ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
         (void)hipMemcpy(host_data.data(), d_ptr, host_data.size() * sizeof(float), hipMemcpyDeviceToHost);
     }
 
@@ -167,6 +252,7 @@ protected:
     }
 
     int rocm_device_id_ = 0;
+    hipStream_t stream_ = nullptr;
 };
 
 // ============================================================================
@@ -197,6 +283,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_SmallMatrix)
     float *d_C = allocate_and_copy_to_gpu(h_C);
 
     HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
+    kernel.bindStream(ExplicitGPUStream{stream_});
     ASSERT_TRUE(kernel.execute(d_A, d_B, d_C, M, N, K, false, true));
 
     copy_from_gpu(d_C, h_C);
@@ -237,6 +324,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Qwen05B_Sizes)
     float *d_C = allocate_and_copy_to_gpu(h_C);
 
     HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
+    kernel.bindStream(ExplicitGPUStream{stream_});
     ASSERT_TRUE(kernel.execute(d_A, d_B, d_C, M, N, K, false, true));
 
     copy_from_gpu(d_C, h_C);
@@ -277,6 +365,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Qwen14B_Sizes)
     float *d_C = allocate_and_copy_to_gpu(h_C);
 
     HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
+    kernel.bindStream(ExplicitGPUStream{stream_});
     ASSERT_TRUE(kernel.execute(d_A, d_B, d_C, M, N, K, false, true));
 
     copy_from_gpu(d_C, h_C);
@@ -314,6 +403,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Performance)
     float *d_C = allocate_and_copy_to_gpu(h_C);
 
     HipBLASGemmKernel kernel(DeviceId::rocm(rocm_device_id_));
+    kernel.bindStream(ExplicitGPUStream{stream_});
 
     // Warmup
     kernel.execute(d_A, d_B, d_C, M, N, K, false, true);
@@ -373,6 +463,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, TensorInterface_Basic)
 
     // Create kernel
     ROCmFloatingPointGemmKernel kernel(weights.get(), rocm_device_id_);
+    kernel.setGPUStream(stream_);
 
     // Create input/output tensors
     auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K});
@@ -390,7 +481,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, TensorInterface_Basic)
     ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get()));
 
     // Verify output is not all zeros (sanity check)
-    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output);  // Ensure sync back from GPU
+    TransferEngine::publishCurrentDeviceWrite(output, stream_);
     const float *out_data = output->data();
 
     float sum = 0.0f;
@@ -399,6 +490,89 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, TensorInterface_Basic)
 
     EXPECT_GT(sum, 0.0f) << "Output should not be all zeros";
     LOG_INFO("[Test] TensorInterface basic test passed, output sum=" << sum);
+}
+
+/**
+ * @brief Prove one cached hipBLAS handle cannot leak another kernel's stream.
+ *
+ * Both wrappers intentionally share `DeviceKernelCache`'s hipBLAS object. The
+ * second wrapper binds a stream parked behind a test-only host gate before the
+ * first wrapper submits. Correct code carries the first wrapper's exact stream
+ * into the locked bind-and-submit transaction, so its result is observable
+ * without releasing the unrelated stream.
+ */
+TEST_F(
+    Test__ROCmFloatingPointGemmKernel,
+    SharedHipBLASHandleKeepsEachProjectionOnItsExactStream)
+{
+    constexpr std::size_t M = 8;
+    constexpr std::size_t N = 128;
+    constexpr std::size_t K = 128;
+    const DeviceId device = DeviceId::rocm(rocm_device_id_);
+
+    auto input = std::make_unique<FP32Tensor>(
+        std::vector<std::size_t>{M, K});
+    auto weights_a = std::make_unique<FP32Tensor>(
+        std::vector<std::size_t>{N, K});
+    auto weights_b = std::make_unique<FP32Tensor>(
+        std::vector<std::size_t>{N, K});
+    auto output = std::make_unique<FP32Tensor>(
+        std::vector<std::size_t>{M, N});
+
+    std::mt19937 rng(0x51deu);
+    std::uniform_real_distribution<float> distribution(-0.2f, 0.2f);
+    for (std::size_t i = 0; i < M * K; ++i)
+        input->mutable_data()[i] = distribution(rng);
+    for (std::size_t i = 0; i < N * K; ++i)
+    {
+        weights_a->mutable_data()[i] = distribution(rng);
+        weights_b->mutable_data()[i] = distribution(rng);
+    }
+    std::fill(
+        output->mutable_data(),
+        output->mutable_data() + M * N,
+        0.0f);
+
+    std::vector<float> reference(M * N);
+    reference_gemm(
+        input->data(),
+        weights_a->data(),
+        reference.data(),
+        static_cast<int>(M),
+        static_cast<int>(N),
+        static_cast<int>(K),
+        true);
+
+    ASSERT_TRUE(input->ensureOnDevice(device));
+    ASSERT_TRUE(weights_a->ensureOnDevice(device));
+    ASSERT_TRUE(weights_b->ensureOnDevice(device));
+    ASSERT_TRUE(output->ensureOnDevice(device));
+
+    ROCmFloatingPointGemmKernel kernel_a(
+        weights_a.get(), rocm_device_id_);
+    ROCmFloatingPointGemmKernel kernel_b(
+        weights_b.get(), rocm_device_id_);
+    EXPECT_FALSE(kernel_a.multiply_tensor(input.get(), output.get()))
+        << "An unbound floating GEMM must not inherit a cached handle stream";
+
+    HostBlockedHipStream blocked;
+    kernel_a.setGPUStream(stream_);
+    kernel_b.setGPUStream(blocked.get());
+    ASSERT_TRUE(kernel_a.multiply_tensor(input.get(), output.get()));
+
+    std::vector<float> actual(M * N);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            actual.data(),
+            output->gpu_data_ptr(),
+            actual.size() * sizeof(float),
+            hipMemcpyDeviceToHost,
+            stream_),
+        hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+
+    EXPECT_GT(compute_cosine_similarity(reference, actual), 0.99999f);
+    EXPECT_LT(compute_relative_error(reference, actual), 1.0e-3f);
 }
 
 TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionWorkspaceNamesMergeCanonical)
@@ -529,8 +703,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedBatchedFusedProjectionAlp
     ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
-    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
+    TransferEngine::publishCurrentDeviceWrite(output_alpha, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_beta, stream);
     const float *actual_alpha = output_alpha->data();
     const float *actual_beta = output_beta->data();
     std::vector<float> got_alpha(actual_alpha, actual_alpha + M * N);
@@ -654,8 +828,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionVerifierRowsM234
             input.get(), grouped_projections, M, static_cast<int>(K), nullptr, &workspace))
             << "ROCm FP32 grouped verifier projection failed";
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-        TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
-        TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
+        TransferEngine::publishCurrentDeviceWrite(output_alpha, stream);
+        TransferEngine::publishCurrentDeviceWrite(output_beta, stream);
 
         for (int row = 0; row < M; ++row)
         {
@@ -680,8 +854,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionVerifierRowsM234
                 row_input.get(), serial_projections, 1, static_cast<int>(K), nullptr, &workspace))
                 << "ROCm FP32 serial decode projection failed for row " << row;
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            TransferEngine::publishGraphOwnedCurrentDeviceWrite(alpha_serial);
-            TransferEngine::publishGraphOwnedCurrentDeviceWrite(beta_serial);
+            TransferEngine::publishCurrentDeviceWrite(alpha_serial, stream);
+            TransferEngine::publishCurrentDeviceWrite(beta_serial, stream);
 
             EXPECT_EQ(
                 std::memcmp(
@@ -780,8 +954,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FP16BF16VerifierRowsM234MatchSerialDec
 
         ROCmFloatingPointGemmKernel alpha_kernel(weights_alpha.get(), rocm_device_id_, precision);
         ROCmFloatingPointGemmKernel beta_kernel(weights_beta.get(), rocm_device_id_, precision);
-        ASSERT_FALSE(alpha_kernel.supports_fused_projection())
-            << "Generic fused FP16/BF16 projection should stay disabled until the large fused path exists";
+        ASSERT_TRUE(alpha_kernel.supports_fused_projection())
+            << "FP16/BF16 weights must advertise the installed fixed-order grouped projection path";
 
         WorkspaceRequirements reqs;
         reqs.merge(alpha_kernel.getWorkspaceRequirements(4, static_cast<int>(N), static_cast<int>(K)));
@@ -820,8 +994,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FP16BF16VerifierRowsM234MatchSerialDec
                 input.get(), grouped_projections, M, static_cast<int>(K), nullptr, &workspace))
                 << "ROCm " << dtype_tag << " grouped verifier projection failed";
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
-            TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
+            TransferEngine::publishCurrentDeviceWrite(output_alpha, stream);
+            TransferEngine::publishCurrentDeviceWrite(output_beta, stream);
 
             for (int row = 0; row < M; ++row)
             {
@@ -846,8 +1020,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FP16BF16VerifierRowsM234MatchSerialDec
                     row_input.get(), beta_serial.get(), 1, static_cast<int>(N), static_cast<int>(K),
                     true, 1.0f, 0.0f, nullptr, nullptr, -1, &workspace));
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-                TransferEngine::publishGraphOwnedCurrentDeviceWrite(alpha_serial);
-                TransferEngine::publishGraphOwnedCurrentDeviceWrite(beta_serial);
+                TransferEngine::publishCurrentDeviceWrite(alpha_serial, stream);
+                TransferEngine::publishCurrentDeviceWrite(beta_serial, stream);
 
                 EXPECT_EQ(
                     std::memcmp(
@@ -872,7 +1046,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FP16BF16VerifierRowsM234MatchSerialDec
     run_case(false);
     run_case(true);
 
-    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_fp32x16_grouped_verifier_projection_calls"});
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
     uint64_t fp16_calls = 0;
     uint64_t bf16_calls = 0;
     for (const auto &record : records)
@@ -894,8 +1068,10 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FP16BF16VerifierRowsM234MatchSerialDec
         else if (record.tags.at("dtype") == "bf16")
             bf16_calls += record.count;
     }
-    EXPECT_EQ(fp16_calls, verifier_rows.size());
-    EXPECT_EQ(bf16_calls, verifier_rows.size());
+    EXPECT_EQ(fp16_calls, verifier_rows.size())
+        << PerfStatsCollector::summaryString({"kernel"});
+    EXPECT_EQ(bf16_calls, verifier_rows.size())
+        << PerfStatsCollector::summaryString({"kernel"});
 
     PerfStatsCollector::reset();
 }
@@ -984,7 +1160,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FloatingSwiGLUDownVerifierRowsM234Matc
                 1.0f, 0.0f, &workspace))
                 << "ROCm " << dtype_tag << " grouped floating SwiGLU/down failed";
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-            TransferEngine::publishGraphOwnedCurrentDeviceWrite(grouped_down);
+            TransferEngine::publishCurrentDeviceWrite(grouped_down, stream);
 
             for (int row = 0; row < M; ++row)
             {
@@ -1012,7 +1188,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, FloatingSwiGLUDownVerifierRowsM234Matc
                     1.0f, 0.0f, &workspace))
                     << "ROCm " << dtype_tag << " serial floating SwiGLU/down failed for row " << row;
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-                TransferEngine::publishGraphOwnedCurrentDeviceWrite(serial_down);
+                TransferEngine::publishCurrentDeviceWrite(serial_down, stream);
 
                 EXPECT_EQ(
                     std::memcmp(
@@ -1139,8 +1315,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedQwen36AlphaBetaM1MatchesR
     ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
-    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
+    TransferEngine::publishCurrentDeviceWrite(output_alpha, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_beta, stream);
     const float *actual_alpha = output_alpha->data();
     const float *actual_beta = output_beta->data();
     std::vector<float> got_alpha(actual_alpha, actual_alpha + M * N);
@@ -1251,8 +1427,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedQwen36AlphaBetaPrefillM25
     ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
-    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
+    TransferEngine::publishCurrentDeviceWrite(output_alpha, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_beta, stream);
     const float *actual_alpha = output_alpha->data();
     const float *actual_beta = output_beta->data();
     std::vector<float> got_alpha(actual_alpha, actual_alpha + M * N);
@@ -1361,8 +1537,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionRestagesPointers
         input.get(), projections, static_cast<int>(M), static_cast<int>(K), nullptr, &workspace));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_alpha);
-    TransferEngine::publishGraphOwnedCurrentDeviceWrite(output_beta);
+    TransferEngine::publishCurrentDeviceWrite(output_alpha, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_beta, stream);
     const float *actual_alpha = output_alpha->data();
     const float *actual_beta = output_beta->data();
     std::vector<float> got_alpha(actual_alpha, actual_alpha + M * N);
@@ -1459,7 +1635,8 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, MappedOutputRedirectRequiresDeclaredWo
         1.0f,
         0.0f));
 
-    WorkspaceRequirements reqs;
+    WorkspaceRequirements reqs = kernel.getWorkspaceRequirements(
+        static_cast<int>(M), static_cast<int>(N), static_cast<int>(K));
     reqs.buffers.push_back({
         GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT,
         M * N * sizeof(float),

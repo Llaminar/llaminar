@@ -317,7 +317,7 @@ TEST(Test__ConfigValidator, MutualExclusion_Device_SimpleTP)
     EXPECT_TRUE(ruleFiresFor(v, "device-simple-tp-conflict", cfg));
 }
 
-TEST(Test__ConfigValidator, NodeLocalTPAutoPickWithoutDeviceIsValid)
+TEST(Test__ConfigValidator, NodeTPAutoPickWithoutDeviceIsValid)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
@@ -329,7 +329,7 @@ TEST(Test__ConfigValidator, NodeLocalTPAutoPickWithoutDeviceIsValid)
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
-TEST(Test__ConfigValidator, NodeLocalTPWithExplicitCPUDeviceMapIsValid)
+TEST(Test__ConfigValidator, NodeTPWithExplicitCPUDeviceMapIsValid)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
@@ -560,7 +560,7 @@ TEST(Test__ConfigValidator, Consistency_TPScopeLocal_WithTPDevices_OK)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
-    cfg.tp_scope = TPScope::LOCAL;
+    cfg.tp_scope = TPScope::RANK_LOCAL;
     cfg.tp_devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
 
     EXPECT_FALSE(ruleFiresFor(v, "tp-scope-global-tp-devices-conflict", cfg));

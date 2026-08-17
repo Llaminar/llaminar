@@ -90,7 +90,7 @@ namespace
     {
         RoutedExpertDomain domain;
         domain.name = name;
-        domain.scope = ExecutionDomainScope::LOCAL;
+        domain.scope = ExecutionDomainScope::RANK_LOCAL;
         domain.backend = CollectiveBackendType::RCCL;
         domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
         domain.owner_rank = owner_rank;
@@ -104,7 +104,7 @@ namespace
     {
         RoutedExpertDomain domain;
         domain.name = name;
-        domain.scope = ExecutionDomainScope::LOCAL;
+        domain.scope = ExecutionDomainScope::RANK_LOCAL;
         domain.backend = CollectiveBackendType::HOST;
         domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
         domain.owner_rank = owner_rank;
@@ -139,7 +139,10 @@ TEST(Test__OrchestrationRunnerMoEOverlayPlan, FreezesMissingPlacementsFromLoaded
     auto model_ctx = makeMoEModelContext();
     auto requested_plan = makeRequestedOverlayPlan();
 
-    auto frozen_plan = freezeMoEExpertOverlayPlanForModel(*model_ctx, requested_plan);
+    auto frozen_plan = freezeMoEExpertOverlayPlanForModel(
+        *model_ctx,
+        requested_plan,
+        MTPRuntimeConfig{});
 
     ASSERT_NE(frozen_plan, nullptr);
     EXPECT_NE(frozen_plan.get(), requested_plan.get());
@@ -164,15 +167,26 @@ TEST(Test__OrchestrationRunnerMoEOverlayPlan, KeepsExplicitPlacementsFrozen)
         RoutedExpertLayerPlacement{.layer = 2, .routed_expert_tier = {0, 0, 1, 1, 0, 1}},
     };
 
-    auto frozen_plan = freezeMoEExpertOverlayPlanForModel(*model_ctx, explicit_plan);
+    auto frozen_plan = freezeMoEExpertOverlayPlanForModel(
+        *model_ctx,
+        explicit_plan,
+        MTPRuntimeConfig{});
 
-    EXPECT_EQ(frozen_plan, explicit_plan);
+    EXPECT_NE(frozen_plan, explicit_plan)
+        << "topology-derived authority execution is sealed in an immutable clone";
+    EXPECT_EQ(
+        explicit_plan->authority_execution,
+        MoEOverlayAuthorityExecutionKind::Unresolved);
+    EXPECT_EQ(
+        frozen_plan->authority_execution,
+        MoEOverlayAuthorityExecutionKind::HostCoordinated);
     ASSERT_EQ(frozen_plan->placements.size(), 3u);
     EXPECT_EQ(frozen_plan->placements[0].routed_expert_tier,
               (std::vector<int>{0, 1, 0, 1, 0, 1}));
 }
 
-TEST(Test__OrchestrationRunnerMoEOverlayPlan, CpuFallbackParticipantHardFailsUntilRemoteGraphExecutionExists)
+TEST(Test__OrchestrationRunnerMoEOverlayPlan,
+     CpuFallbackParticipantIsAnExecutableAuxiliaryRankRole)
 {
     const auto execution_plan = resolveMoEExpertOverlayExecutionPlan(
         makeHeterogeneousOverlayPlan(),
@@ -187,12 +201,6 @@ TEST(Test__OrchestrationRunnerMoEOverlayPlan, CpuFallbackParticipantHardFailsUnt
     EXPECT_TRUE(rank.hasRole(OverlayRankRole::CpuFallbackParticipant));
     EXPECT_FALSE(rank.builds_root_graph);
 
-    const auto blocker = graphNativeMoEOverlayBuildBlocker(execution_plan);
-    ASSERT_TRUE(blocker.has_value());
-    EXPECT_NE(blocker->find("root-owned local sparse execution path"),
-              std::string::npos)
-        << *blocker;
-    EXPECT_NE(blocker->find("MPI sparse dispatch/local-expert/return-reduce"),
-              std::string::npos)
-        << *blocker;
+    EXPECT_TRUE(rank.loads_expert_weights);
+    EXPECT_FALSE(rank.local_devices.empty());
 }

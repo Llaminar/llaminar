@@ -53,6 +53,17 @@ namespace llaminar2::detail
         }
     }
 
+    int currentCUDADeviceOrdinal() noexcept
+    {
+        int ordinal = -1;
+        return cudaGetDevice(&ordinal) == cudaSuccess ? ordinal : -1;
+    }
+
+    bool restoreCUDADeviceOrdinal(int ordinal) noexcept
+    {
+        return ordinal >= 0 && cudaSetDevice(ordinal) == cudaSuccess;
+    }
+
     bool transferExpertCUDABackend(
         const GPUExpertPointers &src_ptrs,
         const GPUExpertPointers &dst_ptrs,
@@ -69,6 +80,17 @@ namespace llaminar2::detail
 
         const int src_ord = src_device.cuda_ordinal();
         const int dst_ord = dst_device.cuda_ordinal();
+
+        /* The supplied auxiliary stream is destination-owned. Select that
+         * runtime context explicitly so peer submission never depends on the
+         * maintenance thread's incidental current device. */
+        cudaError_t select_err = cudaSetDevice(dst_ord);
+        if (select_err != cudaSuccess)
+        {
+            LOG_ERROR("[GPUExpertTransfer] cudaSetDevice failed for destination "
+                      << dst_ord << ": " << cudaGetErrorString(select_err));
+            return false;
+        }
 
         auto cuda_stream = static_cast<cudaStream_t>(stream);
         bool success = true;

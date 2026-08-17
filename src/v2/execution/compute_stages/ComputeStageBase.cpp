@@ -130,16 +130,44 @@ namespace llaminar2
             return "MOE_SHARED_RANK_BANK_PUBLISH";
         case ComputeStageType::MOE_CANONICAL_PUBLICATION_FINALIZE:
             return "MOE_CANONICAL_PUBLICATION_FINALIZE";
+        case ComputeStageType::MOE_OVERLAY_TICKET_PUBLISH:
+            return "MOE_OVERLAY_TICKET_PUBLISH";
+        case ComputeStageType::MOE_OVERLAY_TICKET_CONSUME:
+            return "MOE_OVERLAY_TICKET_CONSUME";
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_PACK:
+            return "MOE_OVERLAY_ACTIVATION_DISPATCH_PACK";
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_DISPATCH_CONSUME:
+            return "MOE_OVERLAY_ACTIVATION_DISPATCH_CONSUME";
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_RETURN_PACK:
+            return "MOE_OVERLAY_ACTIVATION_RETURN_PACK";
+        case ComputeStageType::MOE_OVERLAY_ACTIVATION_RETURN_CONSUME:
+            return "MOE_OVERLAY_ACTIVATION_RETURN_CONSUME";
         case ComputeStageType::MOE_EXPERT_DISPATCH:
             return "MOE_EXPERT_DISPATCH";
         case ComputeStageType::MOE_SPARSE_DISPATCH:
             return "MOE_SPARSE_DISPATCH";
+        case ComputeStageType::MOE_RANK_BATCH_DISPATCH:
+            return "MOE_RANK_BATCH_DISPATCH";
         case ComputeStageType::MOE_LOCAL_EXPERT:
             return "MOE_LOCAL_EXPERT";
+        case ComputeStageType::MOE_LOCAL_EXPERT_INPUT_PUBLISH:
+            return "MOE_LOCAL_EXPERT_INPUT_PUBLISH";
+        case ComputeStageType::MOE_LOCAL_EXPERT_OUTPUT_PUBLISH:
+            return "MOE_LOCAL_EXPERT_OUTPUT_PUBLISH";
+        case ComputeStageType::MOE_LOCAL_EXPERT_COMPLETION:
+            return "MOE_LOCAL_EXPERT_COMPLETION";
         case ComputeStageType::MOE_SPARSE_RETURN_REDUCE:
             return "MOE_SPARSE_RETURN_REDUCE";
+        case ComputeStageType::MOE_RANK_BATCH_RETURN_REDUCE:
+            return "MOE_RANK_BATCH_RETURN_REDUCE";
         case ComputeStageType::MOE_DEVICE_REBALANCE:
             return "MOE_DEVICE_REBALANCE";
+        case ComputeStageType::MOE_GPU_CURRENT_BATCH_LLEP:
+            return "MOE_GPU_CURRENT_BATCH_LLEP";
+        case ComputeStageType::MOE_DEVICE_DECODE_COMMIT_BOUNDARY:
+            return "MOE_DEVICE_DECODE_COMMIT_BOUNDARY";
+        case ComputeStageType::MOE_CPU_CURRENT_BATCH_LLEP:
+            return "MOE_CPU_CURRENT_BATCH_LLEP";
         case ComputeStageType::ALLREDUCE:
             return "ALLREDUCE";
         case ComputeStageType::ROOTED_COLLECTIVE:
@@ -208,6 +236,8 @@ namespace llaminar2
             return "MTP_CONCAT";
         case ComputeStageType::MTP_DRAFT_TOKEN_PUBLICATION:
             return "MTP_DRAFT_TOKEN_PUBLICATION";
+        case ComputeStageType::MOE_OVERLAY_EPOCH_BOUNDARY:
+            return "MOE_OVERLAY_EPOCH_BOUNDARY";
         case ComputeStageType::MTP_VERIFIER_PREPARATION:
             return "MTP_VERIFIER_PREPARATION";
         case ComputeStageType::MTP_STOCHASTIC_TARGET_DISTRIBUTION:

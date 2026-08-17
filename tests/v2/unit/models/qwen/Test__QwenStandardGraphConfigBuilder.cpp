@@ -129,7 +129,7 @@ namespace
         plan.last_layer = 31;
         plan.has_embedding = true;
         plan.has_lm_head = true;
-        plan.tp_scope = TPScope::LOCAL;
+        plan.tp_scope = TPScope::RANK_LOCAL;
         plan.weight_shard.shard_index = 0;
         plan.weight_shard.total_shards = 1;
         plan.weight_shard.work_fraction = 1.0f;
@@ -412,7 +412,7 @@ protected:
         plan.last_layer = 31;
         plan.has_embedding = true;
         plan.has_lm_head = true;
-        plan.tp_scope = TPScope::LOCAL;
+        plan.tp_scope = TPScope::RANK_LOCAL;
         plan.local_tp_devices = {
             GlobalDeviceAddress::cuda(0),
             GlobalDeviceAddress::cuda(1)};
@@ -434,7 +434,7 @@ protected:
         plan.last_layer = 31;
         plan.has_embedding = true;
         plan.has_lm_head = true;
-        plan.tp_scope = TPScope::LOCAL;
+        plan.tp_scope = TPScope::RANK_LOCAL;
         plan.local_tp_devices = {
             GlobalDeviceAddress::cuda(0), // NVIDIA
             GlobalDeviceAddress::rocm(0)  // AMD

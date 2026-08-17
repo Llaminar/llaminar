@@ -77,6 +77,15 @@ namespace llaminar2
         struct ReplayHooks
         {
             /**
+             * @brief Allocates stable arena addresses before launch preparation.
+             *
+             * This hook is mandatory for first capture. It is allocation-only:
+             * no payload may move and no authority or producer event may be
+             * published. External-input coherence remains ordered at each
+             * segment's execution position through @ref cohere_inputs.
+             */
+            std::function<bool(const DeviceGraphExecutor::GraphSegment &)> prebind_storage;
+            /**
              * @brief Joins every external producer event to the exact graph stream.
              *
              * This hook is mandatory for native capture and diagnostic
@@ -120,6 +129,17 @@ namespace llaminar2
              */
             DeviceGraphExecutor::GraphLaunchDependencyHook launch_dependency;
             /**
+             * @brief Lower graph-only child captures into one retained parent.
+             *
+             * This hook is mandatory exactly when the cache plan policy is
+             * RequireRetainedParentComposition. The controller owns creation,
+             * validation, instantiation, transaction-zero launch, and cache
+             * publication of the destination graph; the hook only adds native
+             * child/timeline nodes.
+             */
+            DeviceGraphExecutor::RetainedParentCompositionHook
+                retained_parent_composer;
+            /**
              * @brief Build the immutable internal-edge ledger for one capture unit.
              *
              * Production executors resolve arena BufferIds to canonical tensor
@@ -129,6 +149,16 @@ namespace llaminar2
             std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
                 const DeviceGraphExecutor::GraphSegment &)>
                 plan_capture_dependencies;
+            /**
+             * @brief Require strict input readiness immediately before replay.
+             *
+             * Steady replay skips the graph-wide arena walk. Transaction zero
+             * of a setup-materialized executable is different: setup bound
+             * addresses without owning request bytes, so each captured segment
+             * must validate its external frontier at its actual execution point.
+             * This remains false after the first launch.
+             */
+            bool require_replay_input_preflight = false;
         };
 
         /**
@@ -335,6 +365,14 @@ namespace llaminar2
             const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
+        /** @brief First-use authority for a newly recorded native child graph. */
+        enum class CapturedUnitFinalization : uint8_t
+        {
+            InstantiateAndLaunch = 0, ///< Ordinary executable owns transaction zero.
+            InstantiateWithoutLaunch, ///< Setup seals the executable; the first admitted transaction launches it later.
+            RetainGraphOnly, ///< Child may only be cloned into a composed parent.
+        };
+
         /**
          * @brief Finalize one captured segment during Phase-2 capture.
          *
@@ -350,6 +388,9 @@ namespace llaminar2
          *        executable-node PerfStats evidence.
          * @param launch_dependency_cb Optional cross-lifetime event join queued
          *        after instantiation and immediately before transaction zero.
+         * @param finalization Whether this unit launches, remains instantiated
+         *        but unlaunched, or remains a graph-only child for the
+         *        cache-owned retained parent.
          */
         static bool finalizeCapturePhaseCapturableSegment(
             ComputeGraph &graph,
@@ -361,7 +402,30 @@ namespace llaminar2
             const std::string &perf_context,
             uint64_t current_step,
             const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
-            const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
+            const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb,
+            CapturedUnitFinalization finalization =
+                CapturedUnitFinalization::InstantiateAndLaunch);
+
+        /**
+         * @brief Compose and instantiate the sole retained parent.
+         *
+         * Called only after every graph-only child and passive capture-wave
+         * rendezvous has completed. The method validates complete graph coverage,
+         * creates the parent on the exact cache stream, invokes the topology
+         * composer, and instantiates the resulting executable. Under the ordinary
+         * submission policy it then applies the one external launch dependency,
+         * launches transaction zero, and publishes every child segment's arena
+         * writes. Setup materialization stops before those three operations.
+         */
+        static bool finalizeRetainedParentTransaction(
+            ComputeGraph &graph,
+            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+            IDeviceContext *ctx,
+            IWorkerGPUContext *gpu_ctx,
+            uint64_t current_step,
+            const ReplayHooks &hooks,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy
+                initial_submission);
 
         /**
          * @brief Execute one manual segment during Phase-2 capture.
@@ -399,6 +463,7 @@ namespace llaminar2
             bool needs_segment_sync,
             bool verify_mode,
             bool recapture_mode,
+            bool require_input_preflight,
             bool full_graph_replay,
             int segment_index,
             uint64_t current_step,
@@ -425,6 +490,7 @@ namespace llaminar2
             bool needs_segment_sync,
             bool verify_mode,
             bool recapture_mode,
+            bool require_input_preflight,
             bool full_graph_replay,
             uint64_t current_step,
             int segment_index,
@@ -441,9 +507,12 @@ namespace llaminar2
         /**
          * @brief Execute full Phase-2 capture over all segments.
          *
-         * Capture, instantiation, launch-dependency publication, and transaction
-         * zero form one atomic first-use operation.  This API never leaves a
-         * materialized-but-unlaunched executable for a caller to repair later.
+         * Capture and executable construction form one atomic first-use
+         * operation. Ordinary inference also publishes the launch dependency and
+         * submits transaction zero. A retained-parent setup caller may explicitly
+         * stop after instantiation; the cache then exposes one typed
+         * MaterializedUnlaunched state whose next ordinary invocation owns the
+         * initial launch. No graph-only or partially instantiated state escapes.
          */
         static CapturePhaseResult executeCapturePhase(
             ComputeGraph &graph,
@@ -452,7 +521,11 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             bool has_collective_nodes,
             uint64_t current_step,
-            const ReplayHooks &hooks);
+            const ReplayHooks &hooks,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy
+                initial_submission =
+                    DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+                        CaptureInstantiateAndLaunch);
 
         /**
          * @brief Execute full replay phase over all segments.
@@ -492,6 +565,19 @@ namespace llaminar2
             uint64_t current_step,
             void *stream,
             const std::function<void(BufferId, DeviceId)> &mark_arena_write_dirty_cb);
+
+        /**
+         * @brief Freeze one segment's arena-write publication manifest.
+         *
+         * Setup-only executable materialization must build the same publication
+         * plan as transaction zero without claiming that any device write has
+         * occurred. This helper performs only the deterministic graph-contract
+         * scan; @ref postCapturedSegmentLaunch performs the later authority
+         * publication after a real launch.
+         */
+        static void cacheCapturedSegmentArenaWrites(
+            ComputeGraph &graph,
+            DeviceGraphExecutor::GraphSegment &segment);
     };
 
 } // namespace llaminar2

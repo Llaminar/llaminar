@@ -195,6 +195,14 @@ namespace llaminar2
             const int *host_row_indices,
             int request_count,
             void *stream = nullptr) override;
+        /**
+         * @brief Expose the selected CPU convolution snapshot as a byte-copy plan.
+         *
+         * The returned span remains owned by this stage's persistent workspace;
+         * the central publisher copies it alongside every other independent
+         * recurrent layer only after the complete transaction validates.
+         */
+        CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override;
         bool restoreVerifierStateCaptureRowFromDeviceIndex(
             const int *device_row_index,
             void *stream) override;

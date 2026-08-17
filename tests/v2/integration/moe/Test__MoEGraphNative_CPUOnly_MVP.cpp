@@ -224,7 +224,10 @@ namespace llaminar2::test
             cpu_ctx_ = std::make_unique<llaminar2::testing::MockDeviceContext>(DeviceId::cpu(), ComputeBackendType::CPU);
             mpi_ctx_ = std::make_shared<MPIContext>(rank_, world_size_, MPI_COMM_WORLD);
             collective_ = std::make_unique<MoEOverlayMPISparseCollectiveContext>(
-                MoEOverlayMPISparseCollectiveContext::Config{.mpi_ctx = mpi_ctx_, .local_participant_id = rank_});
+                MoEOverlayMPISparseCollectiveContext::Config{
+                    .mpi_ctx = mpi_ctx_,
+                    .local_participant_ids = {rank_},
+                });
             workspace_.ensureCapacity(kSeqLen, kSeqLen * kTopK, kDModel, kTopK, DeviceId::cpu());
             workspace_.resetForStep(31, 4);
         }

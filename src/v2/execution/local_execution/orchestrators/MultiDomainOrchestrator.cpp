@@ -126,6 +126,23 @@ namespace llaminar2
         return inner_runner_->forward(tokens, seq_len);
     }
 
+    /**
+     * @brief Preserve the root-authoritative sparse protocol identity through this wrapper.
+     */
+    bool MultiDomainOrchestrator::setMoEOverlayCollectiveRequestGeneration(
+        uint64_t generation_id)
+    {
+        if (!initialized_ || !inner_runner_)
+        {
+            LOG_ERROR(
+                "MultiDomainOrchestrator cannot publish a graph-native MoE "
+                "collective generation before initialization");
+            return false;
+        }
+        return inner_runner_->setMoEOverlayCollectiveRequestGeneration(
+            generation_id);
+    }
+
     const float *MultiDomainOrchestrator::logits() const
     {
         if (!initialized_ || !inner_runner_)

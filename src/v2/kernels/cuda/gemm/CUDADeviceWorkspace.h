@@ -92,6 +92,23 @@ extern "C"
         int *planned_k_partitions);
 
     /**
+     * @brief Plan one prefill launch with distinct decoder and policy IDs.
+     *
+     * The second identifier is the original source codebook retained across
+     * CPU-tier representation normalization. It controls only the serial-M1
+     * arithmetic tree and therefore belongs in workspace identity.
+     */
+    bool cudaNativeVNNIPrefill_getWorkspacePlanWithPolicy(
+        uint8_t codebook_id,
+        uint8_t arithmetic_policy_codebook_id,
+        int M,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *canonical_kpart_partials_bytes,
+        int *planned_k_partitions);
+
+    /**
      * @brief Compute the persistent scratch envelope for a prefill graph family.
      *
      * A captured prefill family can replay any installed exact-overlay bucket
@@ -121,6 +138,18 @@ extern "C"
      */
     bool cudaNativeVNNIPrefill_getWorkspaceEnvelope(
         uint8_t codebook_id,
+        int max_M,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *canonical_kpart_partials_bytes,
+        int *planned_k_partitions,
+        int *planned_rows);
+
+    /** @brief Compute a graph-family envelope for an explicit source policy. */
+    bool cudaNativeVNNIPrefill_getWorkspaceEnvelopeWithPolicy(
+        uint8_t codebook_id,
+        uint8_t arithmetic_policy_codebook_id,
         int max_M,
         int N,
         int K,

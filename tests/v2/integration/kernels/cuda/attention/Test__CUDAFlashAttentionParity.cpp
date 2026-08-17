@@ -4728,6 +4728,145 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Small)
     EXPECT_LE(l2_error, 0.05) << "L2 error too high";
 }
 
+/**
+ * @brief Proves Qwen2 prefill consumes Q8_1 K/V like their dequantized FP32 rows.
+ *
+ * Decode has a dedicated fused Q8_1 kernel, while prefill materializes the
+ * compressed rows into persistent FP32 attention workspace before FA2.  This
+ * covers the production Qwen2 GQA geometry and the device-owned attention
+ * parameter path so decode-only coverage cannot hide a broken prefill edge.
+ */
+TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_Q81KV_Qwen2PrefillParity)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int seq_len = 9;
+    constexpr int n_heads = 14;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr int kv_stride = 512;
+    const size_t q_size =
+        static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size =
+        static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+    const size_t out_size = q_size;
+
+    const auto q_data = randomFP32(q_size);
+    const auto k_data = randomFP32(kv_size);
+    const auto v_data = randomFP32(kv_size);
+    auto k_q81 = Q8_1Tensor::quantize_from_fp32(
+        k_data.data(),
+        {static_cast<size_t>(seq_len),
+         static_cast<size_t>(n_kv_heads * head_dim)});
+    auto v_q81 = Q8_1Tensor::quantize_from_fp32(
+        v_data.data(),
+        {static_cast<size_t>(seq_len),
+         static_cast<size_t>(n_kv_heads * head_dim)});
+    ASSERT_NE(k_q81, nullptr);
+    ASSERT_NE(v_q81, nullptr);
+
+    std::vector<float> cpu_output(out_size, 0.0f);
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    ASSERT_TRUE(cpu_kernel.compute(
+        q_data.data(),
+        k_q81->fp32_data(),
+        v_q81->fp32_data(),
+        cpu_output.data(),
+        seq_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        /*causal=*/true,
+        /*window_size=*/-1,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        /*use_bf16=*/false,
+        &mpi_ctx_,
+        /*device_idx=*/-1));
+
+    FP32Tensor q_tensor({
+        static_cast<size_t>(seq_len),
+        static_cast<size_t>(n_heads * head_dim)});
+    FP32Tensor output_tensor({
+        static_cast<size_t>(seq_len),
+        static_cast<size_t>(n_heads * head_dim)});
+    std::copy(q_data.begin(), q_data.end(), q_tensor.mutable_data());
+    std::fill(
+        output_tensor.mutable_data(),
+        output_tensor.mutable_data() + out_size,
+        0.0f);
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+        cudaSuccess);
+    ASSERT_TRUE(q_tensor.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(k_q81->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(v_q81->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(output_tensor.ensureOnDevice(gpu_device_, stream));
+
+    int *device_cached_tokens = nullptr;
+    ASSERT_EQ(cudaMalloc(&device_cached_tokens, sizeof(int)), cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            device_cached_tokens,
+            &seq_len,
+            sizeof(seq_len),
+            cudaMemcpyHostToDevice,
+            stream),
+        cudaSuccess);
+
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32>
+        cuda_kernel(cuda_ordinal_);
+    auto workspace =
+        bindAttentionWorkspace(cuda_kernel, n_heads, head_dim, stream);
+    ASSERT_NE(workspace, nullptr);
+    ASSERT_TRUE(cuda_kernel.prepareDynamicAttnParamsFromDeviceSequenceState(
+        device_cached_tokens,
+        seq_len,
+        /*query_rows=*/1,
+        stream,
+        kv_stride));
+    ASSERT_TRUE(cuda_kernel.compute_tensor(
+        &q_tensor,
+        k_q81.get(),
+        v_q81.get(),
+        &output_tensor,
+        /*batch_size=*/1,
+        seq_len,
+        seq_len,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        /*causal=*/true,
+        /*window_size=*/-1,
+        nullptr,
+        nullptr,
+        &mpi_ctx_,
+        cuda_ordinal_));
+    TransferEngine::publishCurrentDeviceWrite(&output_tensor, stream);
+    const float *cuda_output = output_tensor.data();
+    ASSERT_NE(cuda_output, nullptr);
+
+    const double cosine =
+        cosineSimilarity(cuda_output, cpu_output.data(), out_size);
+    const double l2_error =
+        relativeL2Error(cuda_output, cpu_output.data(), out_size);
+    printComparisonStats(
+        "FlashAttn2 Q8_1 KV Qwen2 prefill vs CPU dequant",
+        cosine,
+        l2_error,
+        maxAbsError(cuda_output, cpu_output.data(), out_size),
+        out_size);
+    EXPECT_GE(cosine, 0.999);
+    EXPECT_LE(l2_error, 0.02);
+
+    EXPECT_EQ(cudaFree(device_cached_tokens), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
 TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Medium)
 {
     SKIP_IF_NO_CUDA();

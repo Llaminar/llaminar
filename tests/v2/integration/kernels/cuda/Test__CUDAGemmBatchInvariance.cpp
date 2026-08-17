@@ -22,7 +22,9 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/compute_stages/ComputeStageUtils.h"
+#include "transfer/TransferEngine.h"
 #include "../../../utils/TestModelHelper.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
@@ -2038,6 +2040,216 @@ TEST_F(Test__CUDAGemmBatchInvariance, NativeVNNIConcurrentPrefillRepeatsBitwise)
     }
 
     cleanupSharedWorkspace({gate_kernel, up_kernel});
+#endif
+}
+
+/**
+ * @test Captured concurrent QKV prefill joins every bias on the root stream.
+ *
+ * Production prefill records Q/K/V projections on side streams forked from one
+ * graph root.  External bias events must be joined to that root before capture;
+ * asking the dependency ledger to import them on a side stream is an invalid
+ * transaction.  This synthetic real-kernel regression initializes the exact
+ * optimized fan-out eagerly, then records and replays it under the production
+ * dependency ledger and requires byte-identical output.
+ */
+TEST_F(Test__CUDAGemmBatchInvariance,
+       CapturedConcurrentQKVPrefillPrejoinsBiasesOnRootStream)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
+    ScopedDebugEnvOverride concurrent_env(
+        "LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
+    ASSERT_FALSE(debugEnv().gemm.deterministic);
+    ASSERT_TRUE(debugEnv().gemm.cuda_concurrent_prefill);
+
+    constexpr int M = 32;
+    constexpr int N_Q = 256;
+    constexpr int N_KV = 128;
+    constexpr int K = 256;
+
+    auto wq = TestTensorFactory::createQ4_0Random({N_Q, K}, 9311u);
+    auto wk = TestTensorFactory::createQ4_0Random({N_KV, K}, 9312u);
+    auto wv = TestTensorFactory::createQ4_0Random({N_KV, K}, 9313u);
+    void *const root_stream = explicitProducerStream();
+    ASSERT_TRUE(wq->ensureOnDevice(gpu_device_, root_stream));
+    ASSERT_TRUE(wk->ensureOnDevice(gpu_device_, root_stream));
+    ASSERT_TRUE(wv->ensureOnDevice(gpu_device_, root_stream));
+
+    auto *q_kernel = getPreparedKernel(wq.get(), gpu_device_);
+    auto *k_kernel = getPreparedKernel(wk.get(), gpu_device_);
+    auto *v_kernel = getPreparedKernel(wv.get(), gpu_device_);
+    ASSERT_NE(q_kernel, nullptr);
+    ASSERT_NE(k_kernel, nullptr);
+    ASSERT_NE(v_kernel, nullptr);
+    ASSERT_TRUE(setupSharedWorkspace(
+        {q_kernel, k_kernel, v_kernel},
+        M,
+        {N_Q, N_KV, N_KV},
+        K));
+
+    auto input = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{M, K});
+    auto bias_q = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{N_Q});
+    auto bias_k = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{N_KV});
+    auto bias_v = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{N_KV});
+    for (size_t i = 0; i < input->numel(); ++i)
+        input->mutable_data()[i] = dist_(rng_);
+    for (size_t i = 0; i < bias_q->numel(); ++i)
+        bias_q->mutable_data()[i] = 0.001f * static_cast<float>((i % 17) - 8);
+    for (size_t i = 0; i < bias_k->numel(); ++i)
+        bias_k->mutable_data()[i] = 0.002f * static_cast<float>((i % 13) - 6);
+    for (size_t i = 0; i < bias_v->numel(); ++i)
+        bias_v->mutable_data()[i] = 0.003f * static_cast<float>((i % 11) - 5);
+
+    auto output_q = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{M, N_Q});
+    auto output_k = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{M, N_KV});
+    auto output_v = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{M, N_KV});
+    for (TensorBase *tensor : {
+             static_cast<TensorBase *>(input.get()),
+             static_cast<TensorBase *>(bias_q.get()),
+             static_cast<TensorBase *>(bias_k.get()),
+             static_cast<TensorBase *>(bias_v.get()),
+             static_cast<TensorBase *>(output_q.get()),
+             static_cast<TensorBase *>(output_k.get()),
+             static_cast<TensorBase *>(output_v.get())})
+    {
+        ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_, root_stream));
+    }
+
+    std::vector<TensorProjectionDesc> projections = {
+        {q_kernel, output_q.get(), N_Q, bias_q.get(), "Q"},
+        {k_kernel, output_k.get(), N_KV, bias_k.get(), "K"},
+        {v_kernel, output_v.get(), N_KV, bias_v.get(), "V"},
+    };
+
+    /*
+     * The warmup is part of the contract: it creates the persistent side-stream
+     * pool and resolves all prepared-weight state before native capture begins.
+     */
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {input.get(), bias_q.get(), bias_k.get(), bias_v.get()},
+        {output_q.get(), output_k.get(), output_v.get()},
+        root_stream,
+        [&]
+        {
+            return q_kernel->multiply_fused_tensor(
+                input.get(), projections, M, K, nullptr, workspace_.get());
+        }));
+    auto stream = static_cast<cudaStream_t>(root_stream);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::vector<float> expected_q(static_cast<size_t>(M) * N_Q);
+    std::vector<float> expected_k(static_cast<size_t>(M) * N_KV);
+    std::vector<float> expected_v(static_cast<size_t>(M) * N_KV);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  expected_q.data(), output_q->gpu_data_ptr(),
+                  expected_q.size() * sizeof(float), cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  expected_k.data(), output_k->gpu_data_ptr(),
+                  expected_k.size() * sizeof(float), cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  expected_v.data(), output_v->gpu_data_ptr(),
+                  expected_v.size() * sizeof(float), cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    for (TensorBase *external : {
+             static_cast<TensorBase *>(input.get()),
+             static_cast<TensorBase *>(bias_q.get()),
+             static_cast<TensorBase *>(bias_k.get()),
+             static_cast<TensorBase *>(bias_v.get())})
+    {
+        TransferEngine::requireDeviceInput(
+            external, gpu_device_, root_stream);
+    }
+
+    int stage_identity = 0;
+    GraphCaptureDependencyLedger::StagePlan stage_plan{
+        .stage_identity = &stage_identity,
+        .stage_name = "captured_concurrent_qkv_bias",
+        .external_inputs = {
+            input.get(), bias_q.get(), bias_k.get(), bias_v.get()},
+        .internal_inputs = {},
+        .outputs = {output_q.get(), output_k.get(), output_v.get()},
+    };
+    GraphCaptureDependencyLedger ledger(
+        gpu_device_,
+        root_stream,
+        {std::move(stage_plan)},
+        "CUDA concurrent QKV bias regression");
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(
+        cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+        cudaSuccess);
+    bool capture_body_ok = false;
+    std::string capture_error;
+    try
+    {
+        GraphCaptureGuard guard(&ledger);
+        ScopedGraphCaptureStage stage_scope(&stage_identity);
+        capture_body_ok = q_kernel->multiply_fused_tensor(
+            input.get(), projections, M, K, nullptr, workspace_.get());
+        if (capture_body_ok)
+            stage_scope.complete();
+    }
+    catch (const std::exception &error)
+    {
+        capture_error = error.what();
+    }
+    const cudaError_t capture_end = cudaStreamEndCapture(stream, &graph);
+    ASSERT_TRUE(capture_error.empty()) << capture_error;
+    ASSERT_TRUE(capture_body_ok);
+    ASSERT_EQ(capture_end, cudaSuccess);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(
+        cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+        cudaSuccess);
+    ASSERT_NE(graph_exec, nullptr);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::vector<float> actual_q(expected_q.size());
+    std::vector<float> actual_k(expected_k.size());
+    std::vector<float> actual_v(expected_v.size());
+    ASSERT_EQ(cudaMemcpyAsync(
+                  actual_q.data(), output_q->gpu_data_ptr(),
+                  actual_q.size() * sizeof(float), cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  actual_k.data(), output_k->gpu_data_ptr(),
+                  actual_k.size() * sizeof(float), cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  actual_v.data(), output_v->gpu_data_ptr(),
+                  actual_v.size() * sizeof(float), cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    expectBitwiseEqual(actual_q, expected_q, "captured concurrent Q bias");
+    expectBitwiseEqual(actual_k, expected_k, "captured concurrent K bias");
+    expectBitwiseEqual(actual_v, expected_v, "captured concurrent V bias");
+
+    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    cleanupSharedWorkspace({q_kernel, k_kernel, v_kernel});
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(wq.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(wk.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(wv.get());
 #endif
 }
 

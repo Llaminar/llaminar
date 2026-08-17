@@ -201,6 +201,237 @@ namespace llaminar2
             params_.decode_histogram->recordTokenBoundary(params_.layer_idx);
     }
 
+    bool MoERoutingStage::publishCPUGroupedRoutingEvidence(
+        ExpertHistogramSource source) const
+    {
+        if (!params_.decode_histogram)
+            return true;
+        if (source == ExpertHistogramSource::GroupedVerifier)
+        {
+            LOG_ERROR("[MoERoutingStage] CPU grouped-verifier demand must be "
+                      "published by the accepted-state transaction");
+            return false;
+        }
+        if (!params_.device_id.is_cpu())
+        {
+            LOG_ERROR("[MoERoutingStage] Host grouped-routing evidence is CPU-only; "
+                      "GPU evidence must remain device-owned"
+                      << " device=" << params_.device_id.toString()
+                      << " layer=" << params_.layer_idx);
+            return false;
+        }
+        if (params_.layer_idx < 0)
+        {
+            LOG_ERROR("[MoERoutingStage] CPU grouped-routing evidence requires a valid layer index");
+            return false;
+        }
+
+        const int logical_rows =
+            params_.host_logical_row_count > 0
+                ? params_.host_logical_row_count
+                : params_.seq_len == 1
+                      ? 1
+                      : 0;
+        if (logical_rows <= 0 || logical_rows > params_.seq_len)
+        {
+            LOG_ERROR("[MoERoutingStage] CPU grouped-routing evidence has invalid logical geometry"
+                      << " logical_rows=" << logical_rows
+                      << " physical_rows=" << params_.seq_len
+                      << " layer=" << params_.layer_idx);
+            return false;
+        }
+
+        const size_t required_routes =
+            static_cast<size_t>(logical_rows) *
+            static_cast<size_t>(params_.top_k);
+        if (cached_routing_.expert_indices.size() < required_routes)
+        {
+            LOG_ERROR("[MoERoutingStage] CPU grouped-routing evidence is incomplete"
+                      << " required_routes=" << required_routes
+                      << " available_routes="
+                      << cached_routing_.expert_indices.size()
+                      << " layer=" << params_.layer_idx);
+            return false;
+        }
+
+        const ExpertHistogramMergeResult merged =
+            params_.decode_histogram->mergeRoutedExpertRows(
+                cached_routing_.expert_indices.data(),
+                RoutedExpertHistogramMerge{
+                    .source = source,
+                    .layer_idx = params_.layer_idx,
+                    .real_token_count = logical_rows,
+                    .bucket_token_count = params_.seq_len,
+                    .top_k = params_.top_k,
+                    .route_stride = params_.top_k,
+                    .count_window_tokens = true,
+                });
+        if (!merged)
+        {
+            LOG_ERROR("[MoERoutingStage] CPU grouped-routing evidence publication failed"
+                      << " layer=" << params_.layer_idx
+                      << " logical_rows=" << logical_rows
+                      << " physical_rows=" << params_.seq_len
+                      << " reason=" << merged.error);
+            return false;
+        }
+
+        if (PerfStatsCollector::isDomainEnabled("moe"))
+        {
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "cpu_grouped_routing_evidence_rows",
+                static_cast<double>(logical_rows),
+                source == ExpertHistogramSource::GroupedVerifier
+                    ? "verifier"
+                    : "prefill",
+                params_.device_id.toString(),
+                PerfStatsCollector::Tags{
+                    {"layer", std::to_string(params_.layer_idx)},
+                    {"physical_rows", std::to_string(params_.seq_len)}});
+        }
+        return true;
+    }
+
+    bool MoERoutingStage::validateHostGroupedVerifierHistogramPublication(
+        const int32_t *accepted_state_counts,
+        int request_count,
+        int rows_per_request,
+        std::string *error) const
+    {
+        auto fail = [&](std::string reason) -> bool
+        {
+            if (error)
+                *error = std::move(reason);
+            return false;
+        };
+
+        if (!requiresHostGroupedVerifierHistogramPublication())
+        {
+            return fail(
+                "router does not own deferred CPU grouped-verifier demand");
+        }
+        if (!accepted_state_counts)
+            return fail("accepted_state_counts must not be null");
+        if (params_.layer_idx < 0)
+            return fail("routed layer index must be non-negative");
+        if (request_count <= 0 || rows_per_request <= 0)
+            return fail("request geometry must be positive");
+        if (params_.seq_len != request_count * rows_per_request)
+        {
+            std::ostringstream msg;
+            msg << "router row geometry does not match request-major verifier shape"
+                << " stage_rows=" << params_.seq_len
+                << " request_count=" << request_count
+                << " rows_per_request=" << rows_per_request;
+            return fail(msg.str());
+        }
+        if (params_.host_logical_row_count != params_.seq_len)
+        {
+            std::ostringstream msg;
+            msg << "CPU verifier router must retain every physical request row"
+                << " logical_rows=" << params_.host_logical_row_count
+                << " stage_rows=" << params_.seq_len;
+            return fail(msg.str());
+        }
+        if (params_.top_k <= 0)
+            return fail("router top_k must be positive");
+
+        for (int request = 0; request < request_count; ++request)
+        {
+            const int accepted = accepted_state_counts[request];
+            if (accepted < 0 || accepted > rows_per_request)
+            {
+                std::ostringstream msg;
+                msg << "accepted row count is outside its verifier group"
+                    << " request=" << request
+                    << " accepted=" << accepted
+                    << " rows_per_request=" << rows_per_request;
+                return fail(msg.str());
+            }
+        }
+
+        const size_t required_routes =
+            static_cast<size_t>(params_.seq_len) *
+            static_cast<size_t>(params_.top_k);
+        if (cached_routing_.expert_indices.size() < required_routes)
+        {
+            std::ostringstream msg;
+            msg << "retained CPU verifier routes are incomplete"
+                << " available=" << cached_routing_.expert_indices.size()
+                << " required=" << required_routes;
+            return fail(msg.str());
+        }
+        return true;
+    }
+
+    bool MoERoutingStage::publishHostGroupedVerifierHistograms(
+        const int32_t *accepted_state_counts,
+        int request_count,
+        int rows_per_request,
+        std::string *error)
+    {
+        if (!validateHostGroupedVerifierHistogramPublication(
+                accepted_state_counts,
+                request_count,
+                rows_per_request,
+                error))
+        {
+            return false;
+        }
+
+        uint64_t accepted_rows = 0;
+        for (int request = 0; request < request_count; ++request)
+        {
+            const int accepted = accepted_state_counts[request];
+            if (accepted == 0)
+                continue;
+
+            const size_t route_offset =
+                static_cast<size_t>(request) *
+                static_cast<size_t>(rows_per_request) *
+                static_cast<size_t>(params_.top_k);
+            const ExpertHistogramMergeResult merged =
+                params_.decode_histogram->mergeRoutedExpertRows(
+                    cached_routing_.expert_indices.data() + route_offset,
+                    RoutedExpertHistogramMerge{
+                        .source = ExpertHistogramSource::GroupedVerifier,
+                        .layer_idx = params_.layer_idx,
+                        .real_token_count = accepted,
+                        .bucket_token_count = rows_per_request,
+                        .top_k = params_.top_k,
+                        .route_stride = params_.top_k,
+                        .count_window_tokens = true,
+                    });
+            if (!merged)
+            {
+                if (error)
+                {
+                    std::ostringstream msg;
+                    msg << "histogram rejected accepted verifier prefix"
+                        << " layer=" << params_.layer_idx
+                        << " request=" << request
+                        << " accepted=" << accepted
+                        << " reason=" << merged.error;
+                    *error = msg.str();
+                }
+                return false;
+            }
+            accepted_rows += static_cast<uint64_t>(accepted);
+        }
+
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "cpu_committed_grouped_verifier_histogram_rows",
+            static_cast<double>(accepted_rows),
+            "verifier",
+            params_.device_id.toString(),
+            {{"layer", std::to_string(params_.layer_idx)},
+             {"requests", std::to_string(request_count)},
+             {"rows_per_request", std::to_string(rows_per_request)}});
+        return true;
+    }
+
     bool MoERoutingStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
     {
         (void)ctx;
@@ -270,7 +501,7 @@ namespace llaminar2
         }
 
         if (params_.seq_len > 1 && params_.active_row_count_device &&
-            PerfStatsCollector::isEnabled())
+            PerfStatsCollector::isDomainEnabled("moe"))
         {
             PerfStatsCollector::addCounter(
                 "moe",
@@ -411,7 +642,10 @@ namespace llaminar2
                     params_.norm_topk_prob,
                     full_indices,
                     full_output_weights,
-                    params_.active_row_count_device))
+                    params_.active_row_count_device,
+                    params_.defer_overlay_grouped_verifier_histogram_publication
+                        ? moe_runtime_layer_
+                        : nullptr))
             {
                 LOG_ERROR("[MoERoutingStage] Decode-equivalent GPU verifier row routing failed "
                           "for layer " << params_.layer_idx);
@@ -498,6 +732,84 @@ namespace llaminar2
              {"route", "grouped_tensor"},
              {"seq_len", std::to_string(seq_len)},
              {"layer", std::to_string(params_.layer_idx)}});
+        /*
+         * Acceptance is produced after the verifier graph completes.  Retain
+         * request-major top-k rows here; DeviceGraphOrchestrator commits only
+         * accepted prefixes as part of the CPU spec-state transaction.
+         */
+        return true;
+    }
+
+    bool MoERoutingStage::enqueueCommittedGroupedVerifierHistograms(
+        const int32_t *accepted_state_counts_device,
+        const int32_t *publication_ok_flags_device,
+        int request_count,
+        int rows_per_request,
+        void *producer_stream)
+    {
+        if (!requiresCommittedGroupedVerifierHistogramPublication())
+        {
+            LOG_ERROR(
+                "[MoERoutingStage] Committed grouped-verifier publication was "
+                "requested from a router that does not own the overlay ticket ledger"
+                << " layer=" << params_.layer_idx);
+            return false;
+        }
+        if (!producer_stream ||
+            !accepted_state_counts_device ||
+            !publication_ok_flags_device ||
+            request_count <= 0 ||
+            rows_per_request <= 0 ||
+            params_.seq_len != request_count * rows_per_request)
+        {
+            LOG_ERROR(
+                "[MoERoutingStage] Invalid committed overlay-verifier histogram shape"
+                << " layer=" << params_.layer_idx
+                << " request_count=" << request_count
+                << " rows_per_request=" << rows_per_request
+                << " stage_rows=" << params_.seq_len
+                << " stream=" << producer_stream);
+            return false;
+        }
+        if (!hasCompleteOverlayVerifierLedgerBinding())
+        {
+            LOG_ERROR(
+                "[MoERoutingStage] Committed overlay-verifier publication has "
+                "no complete per-layer selected-route ledger"
+                << " layer=" << params_.layer_idx);
+            return false;
+        }
+
+        IMoEKernel *kernel = ensureMoEKernel();
+        if (!kernel)
+        {
+            LOG_ERROR(
+                "[MoERoutingStage] Committed overlay-verifier publication "
+                "could not resolve its graph-owned kernel"
+                << " layer=" << params_.layer_idx);
+            return false;
+        }
+
+        const MoEKernelLaunchContext launch{
+            .stream = producer_stream,
+            .workspace = bound_workspace_};
+        if (!kernel->commitGroupedVerifierHistograms(
+                launch,
+                moe_runtime_layer_,
+                accepted_state_counts_device,
+                publication_ok_flags_device,
+                request_count,
+                rows_per_request,
+                params_.seq_len,
+                params_.num_experts,
+                params_.top_k))
+        {
+            LOG_ERROR(
+                "[MoERoutingStage] Backend rejected committed overlay-verifier "
+                "histogram publication"
+                << " layer=" << params_.layer_idx);
+            return false;
+        }
         return true;
     }
 
@@ -536,7 +848,7 @@ namespace llaminar2
         //      No intermediate H2D transfers.
         IMoEKernel *kernel = ensureMoEKernel();
 
-        if (isDeviceRoutedDecodeGraphCapturable())
+        if (isRuntimeTableDecodeGraphCapturable())
         {
             void *route_stream = gpuStream();
             if (!route_stream)
@@ -680,6 +992,43 @@ namespace llaminar2
             return true;
         }
 
+        if (isOverlayTicketDecodeGraphCapturable())
+        {
+            /*
+             * The following captured ticket-publish stage copies these exact
+             * device tensors into its fixed host-visible ABI.  Placement and
+             * histogram ownership live beyond that explicit heterogeneous
+             * boundary, so this route neither creates a host mirror nor
+             * invents a device runtime table whose expert descriptors would
+             * belong to several backends.
+             */
+            if (!kernel->routeWithTensors(
+                    params_.input,
+                    params_.gate_weights,
+                    seq_len,
+                    d_model,
+                    num_experts,
+                    top_k,
+                    params_.norm_topk_prob,
+                    params_.output_indices,
+                    params_.output_weights,
+                    cached_routing_))
+            {
+                LOG_ERROR("[MoERoutingStage] Fixed-capacity ExpertOverlay "
+                          "ticket decode routing failed");
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "moe_overlay",
+                "ticket_decode_route_publications",
+                1.0,
+                "decode",
+                params_.device_id.toString(),
+                {{"layer", std::to_string(params_.layer_idx)},
+                 {"authority", "fixed_capacity_ticket"}});
+            return true;
+        }
+
         if (params_.seq_len == 1 && params_.force_grouped_verifier_prefill_for_decode &&
             !isDeviceRoutedPrefillExecutionSupported())
         {
@@ -709,7 +1058,8 @@ namespace llaminar2
              * route state.
              */
             LOG_ERROR("[MoERoutingStage] GPU single-row MoE routing requires "
-                      "the runtime-table device path on "
+                      "either the runtime-table device path or an explicit "
+                      "fixed-capacity ExpertOverlay ticket on "
                       << params_.device_id.toString());
             return false;
         }
@@ -718,7 +1068,8 @@ namespace llaminar2
             params_.device_id.is_gpu() && seq_len > 1
                 ? params_.active_row_count_device
                 : nullptr;
-        if (device_active_rows && PerfStatsCollector::isEnabled())
+        if (device_active_rows &&
+            PerfStatsCollector::isDomainEnabled("moe"))
         {
             /*
              * The stage deliberately does not read this scalar on the host.
@@ -787,8 +1138,18 @@ namespace llaminar2
         }
 #endif
 
-        // Record routing result in decode histogram (if tracking enabled)
-        if (params_.decode_histogram && params_.layer_idx >= 0 && seq_len == 1)
+        // Publish exact host-owned routing evidence. Multi-row CPU execution
+        // contributes every logical row at once; GPU evidence remains in its
+        // device runtime table until an explicit maintenance boundary.
+        if (params_.decode_histogram && params_.device_id.is_cpu() && seq_len > 1)
+        {
+            if (!publishCPUGroupedRoutingEvidence(
+                    ExpertHistogramSource::PrefillChunk))
+            {
+                return false;
+            }
+        }
+        else if (params_.decode_histogram && params_.layer_idx >= 0 && seq_len == 1)
         {
             if (cached_routing_.expert_indices.size() >= static_cast<size_t>(top_k) &&
                 cached_routing_.expert_weights.size() >= static_cast<size_t>(top_k))
@@ -838,7 +1199,7 @@ namespace llaminar2
         if (params_.force_decode_equivalent_verifier_prefill)
             return isDecodeEquivalentVerifierPrefillGraphCaptureSupported();
 
-        const bool decode_supported =
+        const bool decode_shape_supported =
             !params_.force_grouped_verifier_prefill_for_decode &&
             supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
             params_.seq_len == 1 &&
@@ -850,9 +1211,17 @@ namespace llaminar2
             params_.input &&
             params_.gate_weights &&
             params_.output_indices &&
-            params_.output_weights &&
-            params_.moe_runtime_table &&
-            params_.layer_idx >= 0;
+            params_.output_weights;
+        const bool decode_supported =
+            decode_shape_supported &&
+            ((params_.decode_route_publication ==
+                  MoEDecodeRoutePublicationPolicy::DeviceRuntimeTable &&
+              params_.moe_runtime_table &&
+              params_.layer_idx >= 0) ||
+             (params_.decode_route_publication ==
+                  MoEDecodeRoutePublicationPolicy::FixedCapacityOverlayTicket &&
+              !params_.moe_runtime_table &&
+              params_.layer_idx >= 0));
 
         return decode_supported || isDeviceRoutedPrefillGraphCaptureSupported();
 #endif
@@ -891,6 +1260,11 @@ namespace llaminar2
             << " weights=" << (params_.output_weights ? "true" : "false")
             << " kernel=" << (moe_kernel_ ? "true" : "false")
             << " runtime_table=" << (params_.moe_runtime_table ? "true" : "false")
+            << " decode_route_publication="
+            << (params_.decode_route_publication ==
+                        MoEDecodeRoutePublicationPolicy::DeviceRuntimeTable
+                    ? "device-runtime-table"
+                    : "fixed-capacity-overlay-ticket")
             << " runtime_layer=" << (moe_runtime_layer_ ? "true" : "false")
             << " active_row_count_device="
             << (params_.active_row_count_device ? "true" : "false")
@@ -928,11 +1302,23 @@ namespace llaminar2
 
     bool MoERoutingStage::isDeviceRoutedDecodeGraphCapturable() const
     {
+        return isRuntimeTableDecodeGraphCapturable() ||
+               isOverlayTicketDecodeGraphCapturable();
+    }
+
+    bool MoERoutingStage::isRuntimeTableDecodeGraphCapturable() const
+    {
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
         if (params_.force_decode_equivalent_verifier_prefill)
             return false;
+
+        if (params_.decode_route_publication !=
+            MoEDecodeRoutePublicationPolicy::DeviceRuntimeTable)
+        {
+            return false;
+        }
 
         // Runtime-table decode routing is capture-safe when the GPU backend
         // keeps top-k routing tensors device-resident. Snapshot builds drain
@@ -953,6 +1339,43 @@ namespace llaminar2
                params_.moe_runtime_table &&
                hasInitializedRuntimeTableIfProvided();
 #endif
+    }
+
+    bool MoERoutingStage::isOverlayTicketDecodeGraphCaptureSupported() const
+    {
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
+        return false;
+#else
+        return params_.decode_route_publication ==
+                   MoEDecodeRoutePublicationPolicy::FixedCapacityOverlayTicket &&
+               !params_.force_decode_equivalent_verifier_prefill &&
+               !params_.force_grouped_verifier_prefill_for_decode &&
+               supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+               params_.seq_len == 1 &&
+               params_.d_model > 0 &&
+               params_.num_experts > 0 &&
+               params_.top_k > 0 &&
+               params_.top_k <= params_.num_experts &&
+               params_.top_k <= DecodeExpertHistogram::MAX_TOP_K &&
+               params_.input &&
+               params_.gate_weights &&
+               params_.output_indices &&
+               params_.output_weights &&
+               !params_.moe_runtime_table &&
+               params_.layer_idx >= 0;
+#endif
+    }
+
+    bool MoERoutingStage::isOverlayTicketDecodeGraphCapturable() const
+    {
+        /*
+         * The ticket publisher consumes the ordinary device-authoritative
+         * top-k tensors.  Launch preparation must already have resolved the
+         * backend wrapper and every persistent router scratch address before
+         * this stage can be admitted to a captured segment.
+         */
+        return isOverlayTicketDecodeGraphCaptureSupported() &&
+               moe_kernel_ != nullptr;
     }
 
     bool MoERoutingStage::isDeviceRoutedPrefillExecutionSupported() const
@@ -1005,7 +1428,8 @@ namespace llaminar2
                params_.input &&
                params_.gate_weights &&
                params_.output_indices &&
-               params_.output_weights;
+               params_.output_weights &&
+               hasCompleteOverlayVerifierLedgerBinding();
     }
 
     bool MoERoutingStage::isDecodeEquivalentVerifierPrefillGraphCaptureSupported() const
@@ -1018,6 +1442,33 @@ namespace llaminar2
     {
         return isDecodeEquivalentVerifierPrefillGraphCaptureSupported() &&
                moe_kernel_ != nullptr;
+    }
+
+    bool MoERoutingStage::hasCompleteOverlayVerifierLedgerBinding() const
+    {
+        if (!params_.defer_overlay_grouped_verifier_histogram_publication)
+            return true;
+        if (!params_.device_id.is_gpu() ||
+            !params_.force_decode_equivalent_verifier_prefill ||
+            !params_.moe_runtime_table ||
+            !moe_runtime_layer_ ||
+            params_.layer_idx < 0 ||
+            params_.seq_len <= 1 ||
+            params_.top_k <= 0)
+        {
+            return false;
+        }
+
+        const auto &host_layer =
+            params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+        const uint64_t required_routes =
+            static_cast<uint64_t>(params_.seq_len) *
+            static_cast<uint64_t>(params_.top_k);
+        return host_layer.deferred_verifier_route_expert_ids != nullptr &&
+               host_layer.deferred_verifier_route_participant_ids != nullptr &&
+               static_cast<uint64_t>(
+                   host_layer.deferred_verifier_route_capacity) >=
+                   required_routes;
     }
 
     bool MoERoutingStage::hasInitializedRuntimeTableIfProvided() const
@@ -1095,7 +1546,9 @@ namespace llaminar2
         /*
          * CPU routing may retain host results. GPU routing instead exposes the
          * canonical workspace through a pure-device tensor view so captured
-         * diagnostics copy the exact raw logits D2D on the producer stream.
+         * diagnostics copy the exact post-softmax router probabilities D2D on
+         * the producer stream. The workspace name is historical; every backend
+         * publishes the interface-level probability contract after routing.
          */
         if (router_logits_device_view_)
             info.addOutput("router_logits", router_logits_device_view_.get(),

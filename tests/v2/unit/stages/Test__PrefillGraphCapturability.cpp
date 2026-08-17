@@ -1,6 +1,6 @@
 /**
  * @file Test__PrefillGraphCapturability.cpp
- * @brief Phase 1 acceptance gate tests for prefill GPU graph capturability predicates.
+ * @brief Acceptance gates for grouped prefill and routed decode GPU capture.
  *
  * Tests that isGraphCapturable() returns true for prefill (seq_len > 1) on GPU
  * when all readiness conditions are met, and false when any condition is violated.
@@ -204,12 +204,18 @@ namespace
         mutable int down_table_uploads = 0;
         mutable int route_launch_preparations = 0;
         mutable int verifier_route_calls = 0;
+        mutable int verifier_histogram_commit_calls = 0;
         mutable int runtime_decode_preparations = 0;
         mutable int fused_runtime_decode_calls = 0;
+        mutable int expert_mask_publications = 0;
         mutable ITensor *last_prepared_route_gate = nullptr;
         mutable MoERouteLaunchPlan last_route_launch_plan{};
         mutable MoEDecodeDescriptorSource last_fused_descriptor_source =
             MoEDecodeDescriptorSource::RuntimePlacementTable;
+        mutable DeviceMoELayerRuntime *last_deferred_selected_route_ledger =
+            nullptr;
+        mutable DeviceMoELayerRuntime *last_committed_route_ledger = nullptr;
+        mutable void *last_histogram_commit_stream = nullptr;
 
         bool supports_device(int) const override { return true; }
         bool routeWithTensors(
@@ -245,10 +251,29 @@ namespace
             bool,
             ITensor *,
             ITensor *,
-            const int *) override
+            const int *,
+            DeviceMoELayerRuntime *deferred_selected_route_ledger) override
         {
             ++verifier_route_calls;
+            last_deferred_selected_route_ledger =
+                deferred_selected_route_ledger;
             return true;
+        }
+        bool commitGroupedVerifierHistograms(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoELayerRuntime *runtime_layer,
+            const int32_t *,
+            const int32_t *,
+            int,
+            int,
+            int,
+            int,
+            int) override
+        {
+            ++verifier_histogram_commit_calls;
+            last_committed_route_ledger = runtime_layer;
+            last_histogram_commit_stream = launch.stream;
+            return launch.hasExplicitStream() && runtime_layer != nullptr;
         }
         void gatherTokenBatch(const float *, float *, const int *, int, int) override {}
         void scatterAddWeighted(float *, const float *, const int *, const float *,
@@ -283,6 +308,13 @@ namespace
             ++runtime_decode_preparations;
             last_fused_descriptor_source = descriptor_source;
             return true;
+        }
+        bool updateGroupedPrefillExpertMask(
+            const uint8_t *expert_mask,
+            int num_experts) override
+        {
+            ++expert_mask_publications;
+            return expert_mask != nullptr && num_experts > 0;
         }
         bool groupedExpertDecodeFromRuntime(
             DeviceMoELayerRuntime *,
@@ -340,6 +372,17 @@ namespace
             const float *, const float *,
             float *, float *,
             int, int, int, int, int, bool) override
+        {
+            return true;
+        }
+
+        bool chunkForwardMergedQKV(
+            const float *, int,
+            const float *, const float *,
+            const float *, const float *,
+            float *, float *,
+            int, int, int, int, int,
+            int, int, bool) override
         {
             return true;
         }
@@ -546,6 +589,106 @@ TEST_F(MoERoutingPrefillGraphCapture,
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight())
         << "A reusable padded graph has no legal host-side row-count source.";
     EXPECT_FALSE(stage.supportsPaddedPrefillRealLengthContract());
+}
+
+/**
+ * @brief Lock down the heterogeneous overlay verifier publication protocol.
+ *
+ * The continuation GPU router must retain selected expert IDs in its own
+ * per-layer ledger while routing, then expose that exact ledger to the later
+ * accepted-state transaction.  The unit uses pointer sentinels only: no device
+ * allocation or GPU work is permitted in this protocol-level suite.
+ */
+TEST_F(MoERoutingPrefillGraphCapture,
+       OverlayTicketVerifierRetainsThenCommitsOneTypedLedger)
+{
+#if defined(HAVE_ROCM)
+    const DeviceId device = DeviceId::rocm(0);
+    std::vector<int32_t> retained_experts(
+        static_cast<size_t>(SEQ_LEN * TOP_K), -1);
+    std::vector<int32_t> retained_participants(
+        static_cast<size_t>(SEQ_LEN * TOP_K), -1);
+    MoERuntimeTable runtime_table(
+        DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+    auto &runtime_host = runtime_table.hostLayerState(0);
+    runtime_host.deferred_verifier_route_expert_ids =
+        retained_experts.data();
+    runtime_host.deferred_verifier_route_participant_ids =
+        retained_participants.data();
+    runtime_host.deferred_verifier_route_capacity =
+        static_cast<uint32_t>(retained_experts.size());
+
+    DeviceResidentFP32Tensor input({SEQ_LEN, D_MODEL});
+    DeviceResidentFP32Tensor gate({NUM_EXPERTS, D_MODEL});
+    DeviceResidentFP32Tensor indices({SEQ_LEN * TOP_K, 1});
+    DeviceResidentFP32Tensor weights({SEQ_LEN * TOP_K, 1});
+    input.markResidentForGraphCaptureTest(device);
+    gate.markResidentForGraphCaptureTest(device);
+    indices.markResidentForGraphCaptureTest(device);
+    weights.markResidentForGraphCaptureTest(device);
+
+    auto params = makeValidPrefillParams();
+    params.device_id = device;
+    params.input = &input;
+    params.gate_weights = &gate;
+    params.output_indices = &indices;
+    params.output_weights = &weights;
+    params.layer_idx = 0;
+    params.moe_runtime_table = &runtime_table;
+    params.force_decode_equivalent_verifier_prefill = true;
+    params.defer_overlay_grouped_verifier_histogram_publication = true;
+
+    MoERoutingStage stage(params);
+    stage.setMoEKernelForTesting(&stub_kernel_);
+    void *const route_stream =
+        reinterpret_cast<void *>(uintptr_t{0x5500});
+    void *const publication_stream =
+        reinterpret_cast<void *>(uintptr_t{0x6600});
+    stage.setGPUStream(route_stream);
+    MockDeviceContext ctx(device, ComputeBackendType::GPU_ROCM);
+
+    ASSERT_TRUE(stage.requiresCommittedGroupedVerifierHistogramPublication());
+    ASSERT_TRUE(stage.execute(&ctx));
+    EXPECT_EQ(stub_kernel_.verifier_route_calls, 1);
+    EXPECT_EQ(
+        stub_kernel_.last_deferred_selected_route_ledger,
+        runtime_table.deviceLayerState(0));
+
+    int32_t accepted_rows = SEQ_LEN - 1;
+    int32_t publication_ok = 1;
+    ASSERT_TRUE(stage.enqueueCommittedGroupedVerifierHistograms(
+        &accepted_rows,
+        &publication_ok,
+        /*request_count=*/1,
+        /*rows_per_request=*/SEQ_LEN,
+        publication_stream));
+    EXPECT_EQ(stub_kernel_.verifier_histogram_commit_calls, 1);
+    EXPECT_EQ(
+        stub_kernel_.last_committed_route_ledger,
+        runtime_table.deviceLayerState(0));
+    EXPECT_EQ(
+        stub_kernel_.last_histogram_commit_stream,
+        publication_stream);
+#else
+    GTEST_SKIP() << "ROCm graph-capture path is not compiled in this build";
+#endif
+}
+
+TEST_F(MoERoutingPrefillGraphCapture,
+       OverlayTicketVerifierRejectsIncompleteDeferredLedger)
+{
+    MoERuntimeTable runtime_table(
+        DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+    auto params = makeValidPrefillParams();
+    params.layer_idx = 0;
+    params.moe_runtime_table = &runtime_table;
+    params.force_decode_equivalent_verifier_prefill = true;
+    params.defer_overlay_grouped_verifier_histogram_publication = true;
+
+    MoERoutingStage stage(params);
+    stage.setMoEKernelForTesting(&stub_kernel_);
+    EXPECT_FALSE(stage.supportsGraphCaptureAfterLaunchPreparation());
+    EXPECT_FALSE(stage.isGraphCapturable());
 }
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
@@ -767,6 +910,11 @@ TEST_F(MoERoutingPrefillGraphCapture, DeviceRuntimeHistogramNeedsNoHostReplayCal
     histogram_config.num_layers = 1;
     histogram_config.num_experts = NUM_EXPERTS;
     histogram_config.top_k = TOP_K;
+    histogram_config.sockets = {params.device_id};
+    histogram_config.ownership = MoELayeredExpertOwnership::uniform(
+        /*num_layers=*/1,
+        /*participant_count=*/1,
+        std::vector<int>(NUM_EXPERTS, 0));
     DecodeExpertHistogram histogram(histogram_config);
     params.decode_histogram = &histogram;
 
@@ -1309,6 +1457,84 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsDecodeSeqLen)
         << "seq_len=1 without runtime table should not be capturable via either path";
 }
 
+TEST_F(MoEExpertPrefillGraphCapture,
+       ExplicitRoutingDecodePreparesFusedCaptureWithoutRuntimeTable)
+{
+    ScopedMoEGraphCaptureFlags flags(true, true);
+
+    const auto expect_backend =
+        [&](DeviceId device, bool backend_supported, const char *backend_name)
+    {
+        auto params = makeValidPrefillParams();
+        params.device_id = device;
+        params.seq_len = 1;
+        params.layer_idx = 0;
+        params.moe_runtime_table = nullptr;
+        params.require_device_routing_tensor_decode = true;
+        params.local_expert_count = NUM_EXPERTS / 2;
+        params.expert_mask = {true, true, false, false};
+        params.prepared_gate_gemm[2] = nullptr;
+        params.prepared_up_gemm[2] = nullptr;
+        params.prepared_down_gemm[2] = nullptr;
+        params.prepared_gate_gemm[3] = nullptr;
+        params.prepared_up_gemm[3] = nullptr;
+        params.prepared_down_gemm[3] = nullptr;
+
+        MoEExpertComputeStage stage(params);
+        stage.setMoEKernelForTesting(&stub_kernel_);
+
+        EXPECT_EQ(
+            stage.supportsGraphCaptureAfterLaunchPreparation(),
+            backend_supported)
+            << backend_name
+            << " explicit device routing must be a first-class cold capture route";
+        EXPECT_FALSE(stage.isGraphCapturable())
+            << backend_name
+            << " explicit routing must not capture before descriptors, mask, and "
+               "pointer arrays are published";
+
+        if (!backend_supported)
+            return;
+
+        const int preparations_before =
+            stub_kernel_.runtime_decode_preparations;
+        const int masks_before = stub_kernel_.expert_mask_publications;
+        ASSERT_TRUE(stage.prepareGraphLaunch(nullptr, execution_stream_))
+            << backend_name;
+        EXPECT_TRUE(stage.isGraphCapturable()) << backend_name;
+        EXPECT_EQ(
+            stub_kernel_.runtime_decode_preparations,
+            preparations_before + 1);
+        EXPECT_EQ(stub_kernel_.expert_mask_publications, masks_before + 1);
+        EXPECT_EQ(
+            stub_kernel_.last_fused_descriptor_source,
+            MoEDecodeDescriptorSource::StaticDescriptorTable);
+
+        const std::string readiness =
+            stage.graphCaptureReadinessDebugString();
+        EXPECT_NE(
+            readiness.find("route=explicit_routing_decode"),
+            std::string::npos)
+            << readiness;
+        EXPECT_NE(
+            readiness.find("explicit_decode_ready=true"),
+            std::string::npos)
+            << readiness;
+    };
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true, "CUDA");
+#else
+    expect_backend(DeviceId::cuda(0), false, "CUDA");
+#endif
+
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true, "ROCm");
+#else
+    expect_backend(DeviceId::rocm(0), false, "ROCm");
+#endif
+}
+
 TEST_F(MoEExpertPrefillGraphCapture, DeviceRoutedDecodeRequiresFusedRuntimeWarmupBeforeCapture)
 {
     ScopedMoEGraphCaptureFlags flags(true, true);
@@ -1621,10 +1847,14 @@ TEST_F(MoEExpertPrefillGraphCapture, LaunchPreparationInitializesReplicaRuntimeB
     params.expert_mask = {true, false, true, true};
 
     ExpertReplicaSet replicas;
-    replicas.is_replicated = {false, false, true, true};
-    replicas.owner_socket = {0, 1, 0, 1};
-    replicas.num_replicated = 2;
-    replicas.num_sockets = 2;
+    replicas.base_ownership = MoELayeredExpertOwnership::uniform(
+        1, 2, {0, 1, 0, 1});
+    replicas.replica_participants_by_layer.assign(
+        1,
+        std::vector<std::vector<bool>>(4, std::vector<bool>(2, false)));
+    replicas.setReplicaOnParticipant(0, 2, 1);
+    replicas.setReplicaOnParticipant(0, 3, 0);
+    replicas.rebuildAggregateReplicaFlags();
 
     MoEExpertComputeStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);

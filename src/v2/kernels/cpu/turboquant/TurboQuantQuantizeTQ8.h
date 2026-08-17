@@ -30,6 +30,34 @@ namespace llaminar2
 {
 
     /**
+     * @brief Compute the optimal radial coefficient for selected TQ8 centroids.
+     *
+     * `normalized_rotated` is the encoder vector after multiplying by
+     * `sqrt(D) / ||x||`.  The historic decoder assumed the selected centroid
+     * vector also had norm `sqrt(D)`.  Its finite-D norm varies, leaving a
+     * needless radial error.  Projecting the source onto that exact centroid
+     * vector gives the least-squares norm without changing the block size.
+     */
+    template <int D>
+    inline float tq8_reconstruction_norm(
+        const float *normalized_rotated,
+        const uint8_t *indices,
+        float source_norm)
+    {
+        float source_dot_centroids = 0.0f;
+        float centroid_norm_sq = 0.0f;
+        for (int coordinate = 0; coordinate < D; ++coordinate)
+        {
+            const float centroid = TQ8_CENTROIDS[indices[coordinate]];
+            source_dot_centroids += normalized_rotated[coordinate] * centroid;
+            centroid_norm_sq += centroid * centroid;
+        }
+        return centroid_norm_sq > 0.0f
+                   ? source_norm * source_dot_centroids / centroid_norm_sq
+                   : 0.0f;
+    }
+
+    /**
      * @brief Quantize one FP32 vector to a TQ8 block (scalar-full mode).
      *
      * Path: FP32 → normalize → rotate (Haar Π) → scale (×√D) →
@@ -62,7 +90,7 @@ namespace llaminar2
             norm_sq += input[i] * input[i];
         const float norm = std::sqrt(norm_sq);
         out.norm = norm;
-        out.residual_norm = -1.0f;
+        out.reconstruction_norm = 0.0f;
 
         if (norm < 1e-30f)
         {
@@ -83,6 +111,8 @@ namespace llaminar2
 
         for (int i = 0; i < D; ++i)
             out.indices[i] = tq8_nearest_centroid(scratch0[i]);
+        out.reconstruction_norm =
+            tq8_reconstruction_norm<D>(scratch0, out.indices, norm);
     }
 
 #if defined(__AVX2__)
@@ -107,7 +137,7 @@ namespace llaminar2
         const float norm_sq = avx2::hsum_ps(vacc);
         const float norm = std::sqrt(norm_sq);
         out.norm = norm;
-        out.residual_norm = -1.0f;
+        out.reconstruction_norm = 0.0f;
 
         if (norm < 1e-30f)
         {
@@ -171,6 +201,8 @@ namespace llaminar2
             std::memcpy(out.indices + i, &lo4, 4);
             std::memcpy(out.indices + i + 4, &hi4, 4);
         }
+        out.reconstruction_norm =
+            tq8_reconstruction_norm<D>(scratch0, out.indices, norm);
     }
 #endif
 
@@ -196,7 +228,7 @@ namespace llaminar2
         const float norm_sq = _mm512_reduce_add_ps(vacc);
         const float norm = std::sqrt(norm_sq);
         out.norm = norm;
-        out.residual_norm = -1.0f;
+        out.reconstruction_norm = 0.0f;
 
         if (norm < 1e-30f)
         {
@@ -250,6 +282,8 @@ namespace llaminar2
             __m128i packed = _mm512_cvtepi32_epi8(vidx);
             _mm_storeu_si128(reinterpret_cast<__m128i *>(out.indices + i), packed);
         }
+        out.reconstruction_norm =
+            tq8_reconstruction_norm<D>(scratch0, out.indices, norm);
     }
 #endif
 

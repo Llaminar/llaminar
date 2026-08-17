@@ -1,18 +1,30 @@
 /**
  * @file MoEExpertDispatchStage.cpp
- * @brief Implementation of the host-side routed-row dispatch descriptor stage.
+ * @brief Host-side descriptor and routing-evidence boundary for ExpertOverlay.
+ *
+ * A captured continuation graph publishes one fixed-capacity ticket before
+ * entering this explicitly heterogeneous boundary.  Dispatch validates the
+ * real prefix, binds it to one immutable residency epoch, and constructs the
+ * sparse per-tier work descriptors.  When dynamic residency is enabled, the
+ * same already-host-visible route IDs are merged into the phase-specific
+ * histogram; no additional D2H copy, stream wait, or hot-path allocation is
+ * introduced for that evidence.
  */
 
 #include "MoEExpertDispatchStage.h"
 
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
+#include "../../../execution/moe/MoEOverlaySparseCollective.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace llaminar2
@@ -171,6 +183,46 @@ namespace
         }
     }
 
+    bool sameTierTopology(
+        const std::vector<RoutedExpertTier> &captured,
+        const std::vector<RoutedExpertTier> &published)
+    {
+        if (captured.size() != published.size())
+            return false;
+
+        for (size_t index = 0; index < captured.size(); ++index)
+        {
+            const auto &lhs = captured[index];
+            const auto &rhs = published[index];
+            if (lhs.name != rhs.name ||
+                lhs.domain != rhs.domain ||
+                lhs.priority != rhs.priority ||
+                lhs.max_experts_per_layer != rhs.max_experts_per_layer ||
+                lhs.memory_budget_bytes != rhs.memory_budget_bytes ||
+                lhs.resolved_live_experts_per_layer !=
+                    rhs.resolved_live_experts_per_layer ||
+                lhs.fallback != rhs.fallback)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    const RoutedExpertLayerPlacement *findLayerPlacement(
+        const MoERoutedExpertPlacementPlan &plan,
+        int layer_idx)
+    {
+        const auto found = std::find_if(
+            plan.placements.begin(),
+            plan.placements.end(),
+            [layer_idx](const auto &placement)
+            {
+                return placement.layer == layer_idx;
+            });
+        return found == plan.placements.end() ? nullptr : &*found;
+    }
+
 } // namespace
 
     MoEExpertDispatchStage::MoEExpertDispatchStage(Params params)
@@ -178,6 +230,90 @@ namespace
     {
         if (!params_.output && params_.output_lifetime)
             params_.output = params_.output_lifetime.get();
+
+        if (params_.routing_evidence_publication)
+        {
+            const auto &publication =
+                *params_.routing_evidence_publication;
+            if (!publication.histogram)
+            {
+                throw std::invalid_argument(
+                    "MoE ExpertOverlay routing evidence requires a histogram authority");
+            }
+            if (publication.source == ExpertHistogramSource::SyntheticTest ||
+                publication.source == ExpertHistogramSource::GroupedVerifier)
+            {
+                throw std::invalid_argument(
+                    "MoE ExpertOverlay dispatch may publish only committed decode or real-prefill evidence");
+            }
+            if (!params_.ticket_storage)
+            {
+                throw std::invalid_argument(
+                    "MoE ExpertOverlay routing evidence requires the captured fixed-capacity ticket boundary");
+            }
+            if (params_.seq_len <= 0 || params_.top_k <= 0)
+            {
+                throw std::invalid_argument(
+                    "MoE ExpertOverlay routing evidence requires positive ticket geometry");
+            }
+            const auto row_capacity = static_cast<std::size_t>(params_.seq_len);
+            const auto top_k = static_cast<std::size_t>(params_.top_k);
+            if (row_capacity >
+                std::numeric_limits<std::size_t>::max() / top_k)
+            {
+                throw std::overflow_error(
+                    "MoE ExpertOverlay routing evidence capacity overflows size_t");
+            }
+            routing_evidence_expert_ids_.resize(row_capacity * top_k);
+        }
+    }
+
+    bool MoEExpertDispatchStage::publishRoutingEvidence(
+        int logical_seq_len) const
+    {
+        if (!params_.routing_evidence_publication)
+            return true;
+
+        const auto &publication = *params_.routing_evidence_publication;
+        const ExpertHistogramMergeResult merged =
+            publication.histogram->mergeRoutedExpertRows(
+                routing_evidence_expert_ids_.data(),
+                RoutedExpertHistogramMerge{
+                    .source = publication.source,
+                    .layer_idx = params_.placement->layer,
+                    .real_token_count = logical_seq_len,
+                    .bucket_token_count = params_.seq_len,
+                    .top_k = params_.top_k,
+                    .route_stride = params_.top_k,
+                    .count_window_tokens = true,
+                });
+        if (!merged)
+        {
+            LOG_ERROR(
+                "[MoEExpertDispatchStage] Fixed-capacity ticket routing "
+                "evidence publication failed"
+                << " layer=" << params_.placement->layer
+                << " logical_rows=" << logical_seq_len
+                << " bucket_rows=" << params_.seq_len
+                << " reason=" << merged.error);
+            return false;
+        }
+
+        if (PerfStatsCollector::isDomainEnabled("moe"))
+        {
+            const bool decode =
+                publication.source == ExpertHistogramSource::DecodeToken;
+            PerfStatsCollector::addCounter(
+                "moe_overlay_residency",
+                "ticket_routing_evidence_rows",
+                static_cast<double>(logical_seq_len),
+                decode ? "decode" : "prefill",
+                params_.ticket_storage->sourceDevice().toString(),
+                {{"layer", std::to_string(params_.placement->layer)},
+                 {"bucket_rows", std::to_string(params_.seq_len)},
+                 {"source", decode ? "decode" : "prefill"}});
+        }
+        return true;
     }
 
     bool MoEExpertDispatchStage::execute(IDeviceContext *ctx)
@@ -207,13 +343,151 @@ namespace
             return false;
         }
 
-        if (!validateRoutingTensor(params_.routing_indices, params_.seq_len, params_.top_k, "routing_indices") ||
-            !validateRoutingTensor(params_.routing_weights, params_.seq_len, params_.top_k, "routing_weights"))
+        const RoutedExpertLayerPlacement *effective_placement =
+            &params_.placement.value();
+        const std::vector<RoutedExpertTier> *effective_tiers =
+            &params_.routed_tiers;
+        const MoEExpertOwnerMap *effective_owner_map =
+            params_.owner_map.get();
+        std::shared_ptr<MoEOverlayResidencyAuthority::TicketLease>
+            residency_lease;
+        /*
+         * Immutable static placement is the first published residency
+         * snapshot even when it does not need a lease-holding authority.
+         * Dynamic overlays replace this value with the authority snapshot.
+         */
+        uint64_t residency_epoch = 1;
+        const auto *cpu_llep_state =
+            params_.cpu_current_batch_llep_state.get();
+        if (cpu_llep_state)
+        {
+            if (!cpu_llep_state->active ||
+                !cpu_llep_state->durable_epoch_lease.has_value() ||
+                cpu_llep_state->durable_epoch_lease->purpose() !=
+                    MoEOverlayResidencyAuthority::TicketLeasePurpose::
+                        CurrentBatchLLEP ||
+                cpu_llep_state->durable_parent_epoch == 0 ||
+                cpu_llep_state->durable_epoch_lease->epoch() !=
+                    cpu_llep_state->durable_parent_epoch ||
+                cpu_llep_state->layer_idx != params_.placement->layer ||
+                cpu_llep_state->seq_len != params_.seq_len ||
+                cpu_llep_state->top_k != params_.top_k ||
+                cpu_llep_state->destination_by_flat_route.size() !=
+                    static_cast<size_t>(params_.seq_len) *
+                        static_cast<size_t>(params_.top_k))
+            {
+                LOG_ERROR(
+                    "[MoEExpertDispatchStage] CPU LLEP dispatch has no complete active child publication");
+                return false;
+            }
+            const auto &snapshot =
+                **cpu_llep_state->durable_epoch_lease;
+            if (!snapshot.valid() || !snapshot.placement_plan ||
+                !sameTierTopology(
+                    params_.routed_tiers,
+                    snapshot.placement_plan->routed_tiers) ||
+                (!params_.continuation_domain.empty() &&
+                 snapshot.placement_plan->continuation_domain !=
+                     params_.continuation_domain))
+            {
+                LOG_ERROR(
+                    "[MoEExpertDispatchStage] CPU LLEP parent epoch changed graph-frozen topology");
+                return false;
+            }
+            effective_placement = findLayerPlacement(
+                *snapshot.placement_plan,
+                params_.placement->layer);
+            if (!effective_placement)
+            {
+                LOG_ERROR(
+                    "[MoEExpertDispatchStage] CPU LLEP parent epoch has no addressed layer placement");
+                return false;
+            }
+            effective_tiers = &snapshot.placement_plan->routed_tiers;
+            effective_owner_map = &snapshot.owner_map;
+            residency_epoch = snapshot.epoch;
+        }
+        else if (params_.residency_authority)
+        {
+            auto acquired =
+                params_.residency_authority->tryAcquireTicketSnapshot();
+            if (!acquired.has_value())
+            {
+                LOG_ERROR("[MoEExpertDispatchStage] Residency maintenance is active; dispatch admission is closed");
+                return false;
+            }
+            residency_lease =
+                std::make_shared<MoEOverlayResidencyAuthority::TicketLease>(
+                    std::move(*acquired));
+            const auto &snapshot = **residency_lease;
+            if (!snapshot.valid() || !snapshot.placement_plan)
+            {
+                LOG_ERROR("[MoEExpertDispatchStage] Acquired invalid residency snapshot");
+                return false;
+            }
+            if (!sameTierTopology(
+                    params_.routed_tiers,
+                    snapshot.placement_plan->routed_tiers))
+            {
+                LOG_ERROR("[MoEExpertDispatchStage] Published residency changed graph-frozen routed-tier topology");
+                return false;
+            }
+            if (!params_.continuation_domain.empty() &&
+                snapshot.placement_plan->continuation_domain !=
+                    params_.continuation_domain)
+            {
+                LOG_ERROR("[MoEExpertDispatchStage] Published residency changed the graph-frozen continuation domain");
+                return false;
+            }
+
+            effective_placement = findLayerPlacement(
+                *snapshot.placement_plan,
+                params_.placement->layer);
+            if (!effective_placement)
+            {
+                LOG_ERROR("[MoEExpertDispatchStage] Published residency has no placement for layer "
+                          << params_.placement->layer);
+                return false;
+            }
+            effective_tiers = &snapshot.placement_plan->routed_tiers;
+            effective_owner_map = &snapshot.owner_map;
+            residency_epoch = snapshot.epoch;
+        }
+
+        const float *indices = nullptr;
+        const float *weights = nullptr;
+        int logical_seq_len = params_.seq_len;
+        if (params_.ticket_storage)
+        {
+            const auto &ticket = params_.ticket_storage->ticket();
+            if (!params_.ticket_storage->hasValidBoundIdentity() ||
+                !ticket.isValid() ||
+                ticket.header->layer_idx != effective_placement->layer ||
+                ticket.header->bucket_row_capacity != params_.seq_len ||
+                ticket.header->top_k != params_.top_k ||
+                ticket.header->d_model != params_.d_model)
+            {
+                LOG_ERROR("[MoEExpertDispatchStage] Captured dispatch ticket identity or logical row count is invalid");
+                return false;
+            }
+            logical_seq_len = ticket.header->logical_row_count;
+            ticket.header->return_logical_row_count = 0;
+            indices = ticket.routing_indices_fp32;
+            weights = ticket.routing_weights_fp32;
+        }
+        else if (!validateRoutingTensor(params_.routing_indices, params_.seq_len, params_.top_k, "routing_indices") ||
+                 !validateRoutingTensor(params_.routing_weights, params_.seq_len, params_.top_k, "routing_weights"))
         {
             return false;
         }
+        else
+        {
+            indices = params_.routing_indices->data();
+            weights = params_.routing_weights->data();
+        }
 
-        const auto &placement = params_.placement.value();
+        const auto &placement = *effective_placement;
+        const auto &routed_tiers = *effective_tiers;
         if (placement.routed_expert_tier.empty())
         {
             LOG_ERROR("[MoEExpertDispatchStage] Placement for layer " << placement.layer
@@ -223,13 +497,17 @@ namespace
 
         MoEExpertDispatchOutput result;
         result.seq_len = params_.seq_len;
+        result.logical_seq_len = logical_seq_len;
         result.top_k = params_.top_k;
         result.d_model = params_.d_model;
         result.continuation_domain = params_.continuation_domain;
-        result.tiers.reserve(params_.routed_tiers.size());
-        for (size_t tier_index = 0; tier_index < params_.routed_tiers.size(); ++tier_index)
+        result.ticket_lifetime = params_.ticket_storage;
+        result.residency_epoch = residency_epoch;
+        result.residency_lease = std::move(residency_lease);
+        result.tiers.reserve(routed_tiers.size());
+        for (size_t tier_index = 0; tier_index < routed_tiers.size(); ++tier_index)
         {
-            const auto &tier = params_.routed_tiers[tier_index];
+            const auto &tier = routed_tiers[tier_index];
             MoEExpertTierDispatch tier_dispatch;
             tier_dispatch.tier_index = static_cast<int>(tier_index);
             tier_dispatch.tier_name = tier.name;
@@ -239,13 +517,10 @@ namespace
         }
 
         std::vector<std::vector<unsigned char>> seen_token_rows(
-            params_.routed_tiers.size(),
-            std::vector<unsigned char>(static_cast<size_t>(params_.seq_len), 0));
+            routed_tiers.size(),
+            std::vector<unsigned char>(static_cast<size_t>(logical_seq_len), 0));
 
-        const float *indices = params_.routing_indices->data();
-        const float *weights = params_.routing_weights->data();
-
-        for (int token_row = 0; token_row < params_.seq_len; ++token_row)
+        for (int token_row = 0; token_row < logical_seq_len; ++token_row)
         {
             for (int route_slot = 0; route_slot < params_.top_k; ++route_slot)
             {
@@ -268,7 +543,7 @@ namespace
                 }
 
                 const int tier_index = placement.routed_expert_tier[static_cast<size_t>(expert_id)];
-                if (tier_index < 0 || tier_index >= static_cast<int>(params_.routed_tiers.size()))
+                if (tier_index < 0 || tier_index >= static_cast<int>(routed_tiers.size()))
                 {
                     LOG_ERROR("[MoEExpertDispatchStage] Expert id " << expert_id
                                                                      << " maps to invalid tier index " << tier_index
@@ -284,13 +559,57 @@ namespace
                     return false;
                 }
 
+                int destination_participant = -1;
+                if (cpu_llep_state)
+                {
+                    destination_participant =
+                        route_weight == 0.0f
+                            ? static_cast<int>(
+                                  cpu_llep_state->owner_participants[
+                                      static_cast<size_t>(expert_id)])
+                            : static_cast<int>(
+                                  cpu_llep_state->destinationForFlatRoute(
+                                      offset));
+                    if (destination_participant < 0 ||
+                        destination_participant >=
+                            cpu_llep_state->participant_count)
+                    {
+                        LOG_ERROR(
+                            "[MoEExpertDispatchStage] CPU LLEP route has an invalid destination participant");
+                        return false;
+                    }
+                }
+                else if (effective_owner_map)
+                {
+                    const auto *owner = effective_owner_map->ownerFor(
+                        placement.layer, expert_id);
+                    if (!owner || !owner->resident ||
+                        owner->tier_idx != tier_index ||
+                        owner->owner_participant < 0)
+                    {
+                        LOG_ERROR(
+                            "[MoEExpertDispatchStage] Active residency epoch has no valid physical owner for layer="
+                            << placement.layer << " expert=" << expert_id
+                            << " tier=" << tier_index);
+                        return false;
+                    }
+                    destination_participant =
+                        owner->owner_participant;
+                }
+
                 auto &tier_dispatch = result.tiers[static_cast<size_t>(tier_index)];
                 tier_dispatch.entries.push_back(MoEExpertDispatchEntry{
                     .token_row = token_row,
                     .route_slot = route_slot,
                     .expert_id = expert_id,
                     .route_weight = route_weight,
+                    .destination_participant = destination_participant,
                 });
+
+                if (params_.routing_evidence_publication)
+                {
+                    routing_evidence_expert_ids_[offset] = expert_id;
+                }
 
                 auto &seen = seen_token_rows[static_cast<size_t>(tier_index)][static_cast<size_t>(token_row)];
                 if (!seen)
@@ -305,7 +624,7 @@ namespace
         for (size_t tier_index = 0; tier_index < result.tiers.size(); ++tier_index)
         {
             auto &tier_dispatch = result.tiers[tier_index];
-            const auto &tier = params_.routed_tiers[tier_index];
+            const auto &tier = routed_tiers[tier_index];
             tier_dispatch.transfer_required =
                 has_continuation_domain &&
                 (tier_dispatch.domain != params_.continuation_domain || tier.fallback);
@@ -314,7 +633,7 @@ namespace
             {
                 tier_dispatch.transfer_mode = MoEExpertTransferMode::None;
                 tier_dispatch.transfer_volume = MoEExpertTokenRowTransfer::estimateVolume(
-                    params_.seq_len,
+                    logical_seq_len,
                     params_.top_k,
                     params_.d_model,
                     tier_dispatch.token_rows.size(),
@@ -324,7 +643,7 @@ namespace
 
             const auto resolved_mode = resolveTierTransferMode(
                 params_.transfer_mode,
-                params_.seq_len,
+                logical_seq_len,
                 tier_dispatch.token_rows.size());
             if (resolved_mode == MoEExpertTransferMode::None ||
                 resolved_mode == MoEExpertTransferMode::Auto)
@@ -335,7 +654,7 @@ namespace
                 return false;
             }
             if (resolved_mode == MoEExpertTransferMode::DecodeOneToken &&
-                !(params_.seq_len == 1 && tier_dispatch.token_rows.size() == 1))
+                !(logical_seq_len == 1 && tier_dispatch.token_rows.size() == 1))
             {
                 LOG_ERROR("[MoEExpertDispatchStage] DecodeOneToken transfer requires exactly one selected row");
                 return false;
@@ -343,7 +662,7 @@ namespace
 
             tier_dispatch.transfer_mode = resolved_mode;
             tier_dispatch.transfer_volume = MoEExpertTokenRowTransfer::estimateVolume(
-                params_.seq_len,
+                logical_seq_len,
                 params_.top_k,
                 params_.d_model,
                 tier_dispatch.token_rows.size(),
@@ -351,8 +670,88 @@ namespace
         }
 
         traceDispatchOutput(result, placement.layer);
-    dumpPlacementIfRequested(placement, params_.routed_tiers);
-    MoEExpertOverlayProfiler::recordDispatch(placement.layer, result, placement, params_.routed_tiers);
+        dumpPlacementIfRequested(placement, routed_tiers);
+        MoEExpertOverlayProfiler::recordDispatch(
+            placement.layer, result, placement, routed_tiers);
+
+        /*
+         * Publish only after every route in the real prefix has validated.
+         * A malformed late row must not leave a partial history update behind.
+         */
+        if (!publishRoutingEvidence(logical_seq_len))
+            return false;
+
+        if (params_.ticket_storage)
+        {
+            /*
+             * The present host-dispatch producer acquires the epoch here.  The
+             * captured continuation-local branch will instead populate this
+             * same ABI field from its device epoch slot and use the exact-epoch
+             * authority overload; keeping the field explicit prevents a later
+             * stage from silently consulting a newer publication.
+             */
+            params_.ticket_storage->ticket().header->residency_epoch =
+                result.residency_epoch;
+        }
+
+        if (result.residency_lease && PerfStatsCollector::isEnabled())
+        {
+            const auto current_snapshot =
+                params_.residency_authority->snapshot();
+            const auto *first_owner = current_snapshot
+                                          ? current_snapshot->owner_map.ownerFor(
+                                                placement.layer,
+                                                0)
+                                          : nullptr;
+            PerfStatsCollector::addCounter(
+                "moe_overlay_residency",
+                "dispatch_epoch_leases",
+                1.0,
+                logical_seq_len == 1 ? "decode" : "prefill",
+                first_owner ? first_owner->device.toString()
+                            : params_.device_id.toString(),
+                {
+                    {"epoch", std::to_string(result.residency_epoch)},
+                    {"layer", std::to_string(placement.layer)},
+                });
+        }
+
+        if (params_.ticket_storage && PerfStatsCollector::isEnabled())
+        {
+            const auto &ticket = params_.ticket_storage->ticket();
+            const bool decode_phase =
+                params_.routing_evidence_publication &&
+                params_.routing_evidence_publication->source ==
+                    ExpertHistogramSource::DecodeToken;
+            const PerfStatsCollector::Tags tags{
+                {"layer", std::to_string(placement.layer)},
+                {"source_device",
+                 params_.ticket_storage->sourceDevice().toString()},
+                {"workspace_generation",
+                 std::to_string(ticket.header->workspace_generation)},
+            };
+            PerfStatsCollector::addCounter(
+                "moe_overlay",
+                "ticket_dispatch_transactions",
+                1.0,
+                decode_phase ? "decode" : "prefill",
+                params_.ticket_storage->sourceDevice().toString(),
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_overlay",
+                "ticket_dispatch_logical_rows",
+                static_cast<double>(logical_seq_len),
+                decode_phase ? "decode" : "prefill",
+                params_.ticket_storage->sourceDevice().toString(),
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_overlay",
+                "ticket_dispatch_padding_rows",
+                static_cast<double>(params_.seq_len - logical_seq_len),
+                decode_phase ? "decode" : "prefill",
+                params_.ticket_storage->sourceDevice().toString(),
+                tags);
+        }
 
         *params_.output = std::move(result);
         return true;
@@ -366,11 +765,11 @@ namespace
     StageBufferRequirements MoEExpertDispatchStage::getBufferRequirements() const
     {
         StageBufferRequirements reqs;
-        if (params_.routing_indices)
+        if (!params_.ticket_storage && params_.routing_indices)
             reqs.addInput("routing_indices", params_.routing_indices->shape(), toBufferTensorType(params_.routing_indices->native_type()));
-        if (params_.routing_weights)
+        if (!params_.ticket_storage && params_.routing_weights)
             reqs.addInput("routing_weights", params_.routing_weights->shape(), toBufferTensorType(params_.routing_weights->native_type()));
-        if (params_.hidden)
+        if (!params_.ticket_storage && params_.hidden)
             reqs.addInput("hidden", params_.hidden->shape(), toBufferTensorType(params_.hidden->native_type()));
         return reqs;
     }
@@ -378,11 +777,11 @@ namespace
     StageBufferContract MoEExpertDispatchStage::bufferContract() const
     {
         auto contract = StageBufferContract::build();
-        if (params_.routing_indices && params_.routing_indices_buffer_id)
+        if (!params_.ticket_storage && params_.routing_indices && params_.routing_indices_buffer_id)
             contract.addInput(*params_.routing_indices_buffer_id, "FP32");
-        if (params_.routing_weights && params_.routing_weights_buffer_id)
+        if (!params_.ticket_storage && params_.routing_weights && params_.routing_weights_buffer_id)
             contract.addInput(*params_.routing_weights_buffer_id, "FP32");
-        if (params_.hidden && params_.hidden_buffer_id)
+        if (!params_.ticket_storage && params_.hidden && params_.hidden_buffer_id)
             contract.addInput(*params_.hidden_buffer_id, "FP32");
         return contract;
     }
@@ -406,6 +805,8 @@ namespace
         info.addScalarBool("has_continuation_domain", !params_.continuation_domain.empty());
         info.addScalarInt("transfer_mode", static_cast<int>(params_.transfer_mode));
         info.addScalarInt("routed_tier_count", static_cast<int>(params_.routed_tiers.size()));
+        info.addScalarBool("captured_ticket", params_.ticket_storage != nullptr);
+        info.addScalarBool("live_residency_authority", params_.residency_authority != nullptr);
         if (params_.placement)
         {
             info.addScalarInt("layer", params_.placement->layer);

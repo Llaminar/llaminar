@@ -3,8 +3,8 @@
  * @brief ROCm/HIP ring buffer KV cache with TurboQuant compression
  * @author David Sanftenberg
  *
- * HIP mirror of CUDARingKVCacheTQ with immutable TQ8-K/TQ4-V or
- * TQ8-K/TQ8-V storage selected before graph capture.
+ * HIP mirror of CUDARingKVCacheTQ with immutable AQ8-K/TQ4-V or
+ * AQ8-K/TQ8-V storage selected before graph capture.
  */
 
 #pragma once
@@ -33,10 +33,10 @@ namespace llaminar2
                           int n_kv_heads, int head_dim,
                           const TurboQuantContext *tq_ctx,
                           int device_id,
-                          TurboQuantKVMode mode = TurboQuantKVMode::TQ8_K_TQ4_V);
+                           TurboQuantKVMode mode = TurboQuantKVMode::AQ8_K_TQ4_V);
 
         /**
-         * @brief Construct a LocalTP TQ8-K/TQ4-V cache shard.
+         * @brief Construct a LocalTP AQ8-K/TQ4-or-TQ8-V cache shard.
          *
          * The local cache stores only `local_n_kv_heads` and builds rotations
          * for their global head IDs, preserving replicated-cache mathematics
@@ -46,7 +46,7 @@ namespace llaminar2
                           int n_kv_heads, int local_n_kv_heads, int kv_head_start,
                           int head_dim, const TurboQuantContext *tq_ctx,
                           int device_id,
-                          TurboQuantKVMode mode = TurboQuantKVMode::TQ8_K_TQ4_V);
+                           TurboQuantKVMode mode = TurboQuantKVMode::AQ8_K_TQ4_V);
 
         ~ROCmRingKVCacheTQ() override;
 
@@ -58,7 +58,7 @@ namespace llaminar2
         // IKVCache Interface
         // =====================================================================
 
-        ActivationPrecision k_precision() const override { return ActivationPrecision::TQ8; }
+        ActivationPrecision k_precision() const override { return ActivationPrecision::AQ8; }
         ActivationPrecision v_precision() const override
         {
             return turboQuantValuePrecision(mode_);
@@ -169,6 +169,35 @@ namespace llaminar2
         // ROCm-Specific Accessors
         // =====================================================================
 
+        /**
+         * @brief Return the immutable physical AQ8 key ring for diagnostics and fused attention.
+         * @param layer Local layer index.
+         * @param seq_idx Request slot within the cache batch.
+         * @return Device pointer to the first compressed key block.
+         *
+         * The pointer remains stable for the cache lifetime. Callers must use
+         * the exact stream/event that published the corresponding cache data;
+         * this accessor does not introduce an ordering edge.
+         */
+        const void *raw_k_cache(int layer, int seq_idx = 0) const
+        {
+            return entries_[layer][seq_idx].d_K;
+        }
+
+        /**
+         * @brief Return the immutable physical compressed-value ring.
+         * @param layer Local layer index.
+         * @param seq_idx Request slot within the cache batch.
+         * @return Device pointer to TQ4, TQ8, or Q8_1 blocks selected by `mode_`.
+         *
+         * This diagnostic/fused-kernel view exposes storage without
+         * materializing a host shadow. The cache retains ownership.
+         */
+        const void *raw_v_cache(int layer, int seq_idx = 0) const
+        {
+            return entries_[layer][seq_idx].d_V;
+        }
+
         const ROCmTurboQuantRotations &rotations() const { return rotations_; }
 
         // Eviction
@@ -188,8 +217,9 @@ namespace llaminar2
     private:
         struct TQEntry
         {
-            void *d_K = nullptr; // TQ8Block ring buffer
+            void *d_K = nullptr; // AttentionKeyQ8Block ring buffer
             void *d_V = nullptr; // TQ4Block ring buffer
+            float *d_K_anchor = nullptr; ///< Exact first-key basis for AQ8 residuals.
         };
 
         struct ScratchBuffer
@@ -214,7 +244,7 @@ namespace llaminar2
         /// @brief Resolve the last explicit stream for diagnostic-only reads.
         hipStream_t clearStream() const;
 
-        size_t tq8_block_size_;
+        size_t k_block_size_; ///< sizeof(AttentionKeyQ8Block<head_dim>)
         size_t v_block_size_;
 
         int local_n_kv_heads_; ///< Heads physically stored by this ROCm shard.
@@ -228,6 +258,7 @@ namespace llaminar2
         /// Cache-owned immutable `[layer, request]` compressed-ring topology.
         void **d_batched_k_entry_table_ = nullptr;
         void **d_batched_v_entry_table_ = nullptr;
+        void **d_batched_k_anchor_table_ = nullptr;
         /// Stable wrappers over grouped FP16 layer scratch.
         std::unique_ptr<ITensor> batched_k_view_;
         std::unique_ptr<ITensor> batched_v_view_;

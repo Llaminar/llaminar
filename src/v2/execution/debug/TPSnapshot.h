@@ -11,6 +11,10 @@
  * - **Column-parallel**: Output split on output dimension (heads, d_ff)
  *   Examples: Q/K/V projections, FFN_GATE, FFN_UP, ATTENTION_CONTEXT
  *
+ * - **Packed column-parallel**: Each participant row packs several semantic
+ *   groups, and each group is independently partitioned or replicated.
+ *   Example: GDN `[Q_local | K_local | V_local]` projections.
+ *
  * - **Row-parallel**: Input split on input dimension, combined via AllReduce
  *   Examples: ATTENTION_OUTPUT (Wo), FFN_DOWN
  *
@@ -30,11 +34,13 @@
 #include "../mpi_orchestration/DeviceInventory.h"
 #include <vector>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <cstddef>
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace llaminar2
 {
@@ -44,21 +50,97 @@ namespace llaminar2
     // =========================================================================
 
     /**
+     * @brief Locate the semantic stage following the last MTP depth qualifier.
+     * @param key Snapshot key that may contain `MTP<depth>_<stage>`.
+     * @return Offset of the semantic stage, or `npos` for an operational/non-MTP key.
+     */
+    inline size_t mtpSnapshotSemanticStageOffset(std::string_view key)
+    {
+        size_t search_from = 0;
+        size_t semantic_start = std::string_view::npos;
+        while (search_from < key.size())
+        {
+            const size_t marker = key.find("MTP", search_from);
+            if (marker == std::string_view::npos)
+                break;
+            const bool token_boundary =
+                marker == 0 || key[marker - 1] == '_';
+            size_t cursor = marker + 3;
+            const size_t first_digit = cursor;
+            while (cursor < key.size() && key[cursor] >= '0' &&
+                   key[cursor] <= '9')
+            {
+                ++cursor;
+            }
+            if (token_boundary && cursor > first_digit &&
+                cursor < key.size() && key[cursor] == '_' &&
+                cursor + 1 < key.size())
+            {
+                semantic_start = cursor + 1;
+            }
+            search_from = marker + 1;
+        }
+        return semantic_start;
+    }
+
+    /** @brief Return whether a snapshot key names a depth-qualified MTP model stage. */
+    inline bool isMTPDepthQualifiedSnapshot(std::string_view key)
+    {
+        return mtpSnapshotSemanticStageOffset(key) != std::string_view::npos;
+    }
+
+    /**
      * @brief Extract stage type suffix from a snapshot key
      *
-     * Strips the "layerN_" prefix if present.
-     * E.g., "layer0_ATTENTION_CONTEXT" → "ATTENTION_CONTEXT", "LM_HEAD" → "LM_HEAD"
+     * Strips a case-insensitive `layerN_` prefix if present.  SnapshotCapture
+     * uses lower-case prefixes for ordinary graph stages, while several
+     * graph-native collective diagnostics deliberately publish upper-case
+     * `LAYERN_` names.  Both spellings describe the same model layer and must
+     * resolve through one schema entry.
+     *
+     * @param stage_key Raw snapshot key.
+     * @return Schema-facing semantic stage name.
      */
     inline std::string extractStageType(const std::string &stage_key)
     {
         std::string stage_type = stage_key;
-        if (stage_key.substr(0, 5) == "layer")
+        const bool has_layer_word =
+            stage_key.starts_with("layer") || stage_key.starts_with("LAYER");
+        if (has_layer_word)
         {
-            auto underscore_pos = stage_key.find('_');
-            if (underscore_pos != std::string::npos)
+            size_t cursor = 5;
+            const size_t first_digit = cursor;
+            while (cursor < stage_key.size() &&
+                   stage_key[cursor] >= '0' && stage_key[cursor] <= '9')
             {
-                stage_type = stage_key.substr(underscore_pos + 1);
+                ++cursor;
             }
+            if (cursor > first_digit && cursor < stage_key.size() &&
+                stage_key[cursor] == '_' && cursor + 1 < stage_key.size())
+            {
+                stage_type = stage_key.substr(cursor + 1);
+            }
+        }
+
+        /*
+         * MTP snapshot qualifiers identify the live input authority and graph
+         * instance; neither changes the tensor's TP layout.  Find the last
+         * `MTP<depth>_` boundary so both unqualified `MTP0_FFN_NORM` and
+         * context-qualified `MTP_DECODE_SIDECAR_..._MTP2_FFN_NORM` resolve to
+         * the schema-owned `FFN_NORM` entry.  Requiring a numeric depth avoids
+         * mistaking operational names such as MTP_REQUEST_BATCH_CONDITION for
+         * model checkpoints.
+         */
+        const size_t semantic_start =
+            mtpSnapshotSemanticStageOffset(stage_type);
+        if (semantic_start != std::string_view::npos)
+            stage_type = stage_type.substr(semantic_start);
+        else if (const size_t selector =
+                     stage_type.rfind("MTP_TERMINAL_HIDDEN_ROW_SELECT");
+                 selector != std::string::npos &&
+                 (selector == 0 || stage_type[selector - 1] == '_'))
+        {
+            stage_type = stage_type.substr(selector);
         }
         return stage_type;
     }
@@ -136,16 +218,9 @@ namespace llaminar2
      */
     inline SnapshotShardingMode getStageShardingMode(const std::string &stage_key)
     {
-        // Extract stage type from key (remove layerN_ prefix if present)
-        std::string stage_type = stage_key;
-        if (stage_key.substr(0, 5) == "layer")
-        {
-            auto underscore_pos = stage_key.find('_');
-            if (underscore_pos != std::string::npos)
-            {
-                stage_type = stage_key.substr(underscore_pos + 1);
-            }
-        }
+        // Reuse the schema-facing parser so legacy diagnostics obey the same
+        // exact layer grammar and MTP qualifier semantics as production.
+        const std::string stage_type = extractStageType(stage_key);
 
         // Static mapping of stage types to sharding modes
         // Note: These match the Megatron-style tensor parallelism sharding
@@ -264,6 +339,34 @@ namespace llaminar2
         }
     };
 
+    /**
+     * @brief Ownership rule for one semantic group inside a packed TP row.
+     */
+    enum class SnapshotColumnGroupMode
+    {
+        PARTITIONED, ///< Participant slices concatenate in TP-index order.
+        REPLICATED   ///< Every participant publishes the complete group.
+    };
+
+    /**
+     * @brief Exact layout of one semantic group in a packed column-parallel row.
+     *
+     * `participant_cols[rank]` is the width of this group inside participant
+     * `rank`'s local packed row.  A partitioned group must sum to
+     * `global_cols`; a replicated group must publish `global_cols` on every
+     * participant.  Keeping the widths explicit supports proportional TP and
+     * prevents the diagnostic path from inventing an equal split that differs
+     * from the production weight assignment.
+     */
+    struct SnapshotColumnGroup
+    {
+        std::string name; ///< Human-readable semantic group, such as Q, K, or V.
+        size_t global_cols = 0; ///< Width of the group in the combined row.
+        SnapshotColumnGroupMode mode =
+            SnapshotColumnGroupMode::PARTITIONED; ///< Group ownership rule.
+        std::vector<size_t> participant_cols; ///< Local width indexed by TP participant.
+    };
+
     // =========================================================================
     // Complete TP-Aware Snapshot
     // =========================================================================
@@ -282,6 +385,15 @@ namespace llaminar2
         /// Per-device snapshots (indexed by device position in TP group)
         std::vector<DeviceSnapshotData> device_data;
 
+        /**
+         * @brief Semantic groups for PACKED_COLUMN_PARALLEL combination.
+         *
+         * Groups appear in the order expected by the full-model reference.
+         * Every local row contains those same groups in the same order, but a
+         * group's participant-local width is described by SnapshotColumnGroup.
+         */
+        std::vector<SnapshotColumnGroup> column_groups;
+
         // Combined view (computed lazily or on demand)
         bool combined_valid = false;      ///< Whether combined data is computed
         std::vector<float> combined_data; ///< Concatenated/verified combined result
@@ -292,9 +404,12 @@ namespace llaminar2
          * @brief Compute the combined view from per-device data
          *
          * For COLUMN_PARALLEL: Concatenates device outputs along column dimension
+         * For PACKED_COLUMN_PARALLEL: Reassembles semantic groups first, then
+         *   concatenates participant slices within each group
          * For ROW_PARALLEL: Sums same-shaped per-device partials
          * For REPLICATED: Verifies every device published the same full output,
          * then uses the first full-device output as the combined view
+         * For ROOT_ONLY: Requires and selects the sole root-published output
          * For GATHERED: Uses already-gathered combined output
          * For UNKNOWN: Fails explicitly; callers must extend the schema/runtime
          *   sharding contract before comparing a multi-device semantic snapshot.
@@ -303,13 +418,220 @@ namespace llaminar2
          */
         bool computeCombined()
         {
-            if (device_data.empty())
+            const auto fail = [this]()
             {
                 combined_valid = false;
+                combined_data.clear();
+                combined_rows = 0;
+                combined_cols = 0;
                 return false;
+            };
+
+            if (device_data.empty())
+            {
+                return fail();
             }
 
-            if (mode == SnapshotShardingMode::COLUMN_PARALLEL)
+            if (mode == SnapshotShardingMode::PACKED_COLUMN_PARALLEL)
+            {
+                /*
+                 * A packed GDN row is `[Q_local | K_local | V_local]` on each
+                 * participant. Concatenating whole rows would produce
+                 * `[Q0,K0,V0,Q1,K1,V1]`; the model-wide checkpoint is
+                 * `[Q0,Q1,K0,K1,V0,V1]`. Authenticate the complete typed layout
+                 * before moving a byte so missing participants, duplicate TP
+                 * indices, stale shapes, or an incomplete group fail closed.
+                 */
+                if (tp_degree <= 0 ||
+                    device_data.size() != static_cast<size_t>(tp_degree) ||
+                    column_groups.empty())
+                {
+                    return fail();
+                }
+
+                std::vector<const DeviceSnapshotData *> participants(
+                    static_cast<size_t>(tp_degree), nullptr);
+                for (const auto &device : device_data)
+                {
+                    if (device.device_index < 0 ||
+                        device.device_index >= tp_degree ||
+                        participants[static_cast<size_t>(device.device_index)] != nullptr ||
+                        device.data.size() != device.rows * device.cols)
+                    {
+                        return fail();
+                    }
+                    participants[static_cast<size_t>(device.device_index)] = &device;
+                }
+                if (std::any_of(
+                        participants.begin(), participants.end(),
+                        [](const DeviceSnapshotData *device)
+                        {
+                            return device == nullptr;
+                        }))
+                {
+                    return fail();
+                }
+
+                combined_rows = participants.front()->rows;
+                for (const DeviceSnapshotData *device : participants)
+                {
+                    if (device->rows != combined_rows)
+                        return fail();
+                }
+
+                combined_cols = 0;
+                std::vector<size_t> authenticated_local_cols(
+                    static_cast<size_t>(tp_degree), 0);
+                for (const auto &group : column_groups)
+                {
+                    if (group.global_cols == 0 ||
+                        group.participant_cols.size() !=
+                            static_cast<size_t>(tp_degree) ||
+                        group.global_cols >
+                            std::numeric_limits<size_t>::max() - combined_cols)
+                    {
+                        return fail();
+                    }
+
+                    size_t partitioned_cols = 0;
+                    for (size_t participant = 0;
+                         participant < group.participant_cols.size();
+                         ++participant)
+                    {
+                        const size_t local_cols =
+                            group.participant_cols[participant];
+                        if (local_cols > std::numeric_limits<size_t>::max() -
+                                             authenticated_local_cols[participant])
+                        {
+                            return fail();
+                        }
+                        authenticated_local_cols[participant] += local_cols;
+                        if (group.mode ==
+                            SnapshotColumnGroupMode::PARTITIONED)
+                        {
+                            if (local_cols >
+                                std::numeric_limits<size_t>::max() - partitioned_cols)
+                            {
+                                return fail();
+                            }
+                            partitioned_cols += local_cols;
+                        }
+                        else if (local_cols != group.global_cols)
+                        {
+                            return fail();
+                        }
+                    }
+                    if (group.mode == SnapshotColumnGroupMode::PARTITIONED &&
+                        partitioned_cols != group.global_cols)
+                    {
+                        return fail();
+                    }
+                    combined_cols += group.global_cols;
+                }
+
+                for (size_t participant = 0;
+                     participant < participants.size(); ++participant)
+                {
+                    if (authenticated_local_cols[participant] !=
+                        participants[participant]->cols)
+                    {
+                        return fail();
+                    }
+                }
+                if (combined_rows > 0 &&
+                    combined_cols > std::numeric_limits<size_t>::max() /
+                                        combined_rows)
+                {
+                    return fail();
+                }
+
+                combined_data.assign(combined_rows * combined_cols, 0.0f);
+                constexpr float kReplicatedAbsTolerance = 1.0e-5f;
+                constexpr float kReplicatedRelTolerance = 1.0e-6f;
+                for (size_t row = 0; row < combined_rows; ++row)
+                {
+                    std::vector<size_t> local_offsets(
+                        static_cast<size_t>(tp_degree), 0);
+                    size_t combined_group_offset = 0;
+                    for (const auto &group : column_groups)
+                    {
+                        float *destination = combined_data.data() +
+                                             row * combined_cols +
+                                             combined_group_offset;
+                        if (group.mode ==
+                            SnapshotColumnGroupMode::PARTITIONED)
+                        {
+                            size_t group_output_offset = 0;
+                            for (size_t participant = 0;
+                                 participant < participants.size();
+                                 ++participant)
+                            {
+                                const size_t local_cols =
+                                    group.participant_cols[participant];
+                                const auto *device = participants[participant];
+                                const float *source = device->data.data() +
+                                                      row * device->cols +
+                                                      local_offsets[participant];
+                                std::memcpy(
+                                    destination + group_output_offset,
+                                    source,
+                                    local_cols * sizeof(float));
+                                group_output_offset += local_cols;
+                                local_offsets[participant] += local_cols;
+                            }
+                        }
+                        else
+                        {
+                            const auto *root = participants.front();
+                            const float *root_source = root->data.data() +
+                                                       row * root->cols +
+                                                       local_offsets.front();
+                            std::memcpy(
+                                destination,
+                                root_source,
+                                group.global_cols * sizeof(float));
+                            local_offsets.front() += group.global_cols;
+
+                            /*
+                             * A replicated group contributes once, but every
+                             * replica is still evidence. Verify it here so the
+                             * combined checkpoint cannot hide a divergent Q/K
+                             * replica by selecting participant zero.
+                             */
+                            for (size_t participant = 1;
+                                 participant < participants.size();
+                                 ++participant)
+                            {
+                                const auto *device = participants[participant];
+                                const float *source = device->data.data() +
+                                                      row * device->cols +
+                                                      local_offsets[participant];
+                                for (size_t column = 0;
+                                     column < group.global_cols; ++column)
+                                {
+                                    const float a = root_source[column];
+                                    const float b = source[column];
+                                    const float difference = std::fabs(a - b);
+                                    const float scale =
+                                        std::max(std::fabs(a), std::fabs(b));
+                                    if (difference > kReplicatedAbsTolerance &&
+                                        difference >
+                                            scale * kReplicatedRelTolerance)
+                                    {
+                                        return fail();
+                                    }
+                                }
+                                local_offsets[participant] += group.global_cols;
+                            }
+                        }
+                        combined_group_offset += group.global_cols;
+                    }
+                }
+
+                combined_valid = true;
+                return true;
+            }
+            else if (mode == SnapshotShardingMode::COLUMN_PARALLEL)
             {
                 // Concatenate along columns
                 combined_rows = device_data[0].rows;
@@ -409,6 +731,38 @@ namespace llaminar2
                     }
                 }
                 combined_data = first.data;
+                combined_valid = true;
+                return true;
+            }
+            else if (mode == SnapshotShardingMode::ROOT_ONLY)
+            {
+                /*
+                 * A rooted reduction's contributor stages expose inputs only;
+                 * exactly one participant exposes the complete post-reduction
+                 * output.  Requiring a sole publisher prevents an incorrect
+                 * root role or duplicate output capture from being hidden by
+                 * arbitrarily choosing one device.
+                 */
+                if (device_data.size() != 1)
+                {
+                    combined_valid = false;
+                    combined_data.clear();
+                    combined_rows = 0;
+                    combined_cols = 0;
+                    return false;
+                }
+                const auto &root = device_data.front();
+                if (root.data.size() != root.rows * root.cols)
+                {
+                    combined_valid = false;
+                    combined_data.clear();
+                    combined_rows = 0;
+                    combined_cols = 0;
+                    return false;
+                }
+                combined_rows = root.rows;
+                combined_cols = root.cols;
+                combined_data = root.data;
                 combined_valid = true;
                 return true;
             }

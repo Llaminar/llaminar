@@ -204,7 +204,8 @@ namespace llaminar2
          */
         static bool isEnabled()
         {
-            return debugEnv().profile.enabled || PerfStatsCollector::isEnabled();
+            return debugEnv().profile.enabled ||
+                   PerfStatsCollector::isDomainEnabled("transfer");
         }
 
         /**
@@ -675,11 +676,11 @@ namespace llaminar2
          */
         static bool isEnabled()
         {
-            // Structured perf export alone must stay passive. Kernel/forward
-            // timing changes hot execution paths and is opt-in through the
-            // graph-safe PerfStats GPU timing request or the explicit legacy
-            // LLAMINAR_PROFILE_KERNELS switch.
-            return debugEnv().profile.enabled || PerfStatsCollector::gpuStageEventTimingEnabled();
+            // A broad structured export remains passive, while an explicit
+            // `kernel` filter is a first-class request for this instrumentation.
+            return debugEnv().profile.enabled ||
+                   PerfStatsCollector::isDomainEnabled("kernel") ||
+                   PerfStatsCollector::gpuStageEventTimingEnabled();
         }
 
         /**
@@ -1217,7 +1218,7 @@ namespace llaminar2
 
         static void recordUnified(KernelType type, uint64_t duration_ns, std::string device_key)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled("kernel"))
                 return;
             if (device_key.empty() && ProfilingContext::hasDeviceContext())
                 device_key = ProfilingContext::getCurrentDeviceKey();

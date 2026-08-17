@@ -106,13 +106,7 @@
     ],
     "containerEnv": {
         "VIRTUAL_ENV": "/workspaces/llaminar/.venv",
-        "HSA_OVERRIDE_GFX_VERSION": "9.0.6",
-        "CCACHE_DIR": "/home/vscode/.ccache",
-        "CCACHE_MAXSIZE": "50G",
-        "CCACHE_COMPRESS": "1",
-        "CCACHE_COMPRESSLEVEL": "6",
-        "CCACHE_BASEDIR": "/workspaces/llaminar",
-        "CCACHE_NOHASHDIR": "1"
+        "HSA_OVERRIDE_GFX_VERSION": "9.0.6"
     },
     "mounts": [
         "source=/opt/llaminar-models,target=/opt/llaminar-models,type=bind,consistency=cached"

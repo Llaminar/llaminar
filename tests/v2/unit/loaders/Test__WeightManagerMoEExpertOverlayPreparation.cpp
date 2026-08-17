@@ -1,3 +1,13 @@
+/**
+ * @file Test__WeightManagerMoEExpertOverlayPreparation.cpp
+ * @brief Device-free ownership and preparation tests for ExpertOverlay weights.
+ *
+ * These cases validate that the preparation request is exact in both logical
+ * expert identity and MPI ownership before any device packing occurs.  The
+ * real-weight integration campaigns rely on this layer to prevent a rank from
+ * loading a remote CPU/accelerator participant's expert slice.
+ */
+
 #include <gtest/gtest.h>
 
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
@@ -68,7 +78,7 @@ namespace
                        {GlobalDeviceAddress::cuda(0)},
                        RoutedExpertComputePolicy::Apportioned,
                        CollectiveBackendType::NCCL),
-            domainWith("rocm_warm", ExecutionDomainScope::LOCAL,
+            domainWith("rocm_warm", ExecutionDomainScope::RANK_LOCAL,
                        {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
                        RoutedExpertComputePolicy::Apportioned,
                        CollectiveBackendType::RCCL),
@@ -165,7 +175,13 @@ namespace
                           createQ4_0WithData({intermediate, d_model, num_experts}, 103));
     }
 
-    std::shared_ptr<MoERoutedExpertPlacementPlan> singleLayerCpuColdReplicatedPlan(size_t num_experts)
+    /**
+     * @brief Build a one-layer distributed CPU cold tier for registry tests.
+     *
+     * The production NodeTP arrangement gives each MPI rank its own
+     * WeightManager and one exact half of the expert range.
+     */
+    std::shared_ptr<MoERoutedExpertPlacementPlan> singleLayerCpuColdPlan(size_t num_experts)
     {
         auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
         plan->enabled = true;
@@ -185,6 +201,46 @@ namespace
         };
         plan->placements = {
             RoutedExpertLayerPlacement{.layer = 0, .routed_expert_tier = std::vector<int>(num_experts, 0)},
+        };
+        return plan;
+    }
+
+    /**
+     * @brief Build a host-qualified NodeTP plan with one CPU endpoint per rank.
+     *
+     * Concrete host names emulate inventory binding.  They ensure the runtime
+     * resolver exposes only the endpoint owned by the current rank rather than
+     * treating both portable `localhost` addresses as process-local.
+     */
+    std::shared_ptr<MoERoutedExpertPlacementPlan>
+    distributedCpuColdPlan(int num_experts)
+    {
+        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+        plan->enabled = true;
+        plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan->continuation_domain = "cpu_cold";
+        plan->shared_expert_domain = "cpu_cold";
+        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
+        plan->domains = {
+            domainWith(
+                "cpu_cold",
+                ExecutionDomainScope::NODE_LOCAL,
+                {
+                    GlobalDeviceAddress::cpu(/*numa=*/0, "bound-node"),
+                    GlobalDeviceAddress::cpu(/*numa=*/1, "bound-node"),
+                },
+                RoutedExpertComputePolicy::Apportioned,
+                CollectiveBackendType::UPI),
+        };
+        plan->domains.front().world_ranks = {0, 1};
+        plan->routed_tiers = {
+            tier("cold", "cpu_cold", 0, true),
+        };
+        plan->placements = {
+            RoutedExpertLayerPlacement{
+                .layer = 0,
+                .routed_expert_tier = std::vector<int>(
+                    static_cast<size_t>(num_experts), 0)},
         };
         return plan;
     }
@@ -208,7 +264,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, BuildsTierAwareRequestsAndD
     EXPECT_FALSE(prep.shouldPrepare(DeviceId::rocm(0), 0, 4, Role::UP));
     EXPECT_TRUE(prep.shouldPrepare(DeviceId::rocm(1), 0, 4, Role::UP));
     EXPECT_TRUE(prep.shouldPrepare(DeviceId::cpu(), 0, 2, Role::GATE));
-    EXPECT_TRUE(prep.shouldPrepare(DeviceId::cpu(), 0, 5, Role::GATE));
+    EXPECT_FALSE(prep.shouldPrepare(DeviceId::cpu(), 0, 5, Role::GATE));
     EXPECT_TRUE(prep.hasCpuRoutedAssignments());
 
     const auto devices = prep.acceleratorDevices();
@@ -241,22 +297,37 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, BuildsTierAwareRequestsAndD
     const auto *cpu_rank0_stats = prep.diagnostics().domainStats("cpu_cold", DeviceId::cpu(), 0, 0);
     const auto *cpu_rank1_stats = prep.diagnostics().domainStats("cpu_cold", DeviceId::cpu(), 1, 1);
     ASSERT_NE(cpu_rank0_stats, nullptr);
-    ASSERT_NE(cpu_rank1_stats, nullptr);
     EXPECT_EQ(cpu_rank0_stats->residency_category, WeightResidencyCategory::CpuFallbackExpert);
-    EXPECT_EQ(cpu_rank1_stats->residency_category, WeightResidencyCategory::CpuFallbackExpert);
-    EXPECT_EQ(cpu_rank0_stats->assigned_routed_experts, cpu_rank1_stats->assigned_routed_experts);
+    EXPECT_EQ(cpu_rank1_stats, nullptr);
     EXPECT_NE(prep.diagnostics().render().find("memory_by_role"), std::string::npos);
     EXPECT_NE(prep.diagnostics().render().find("routed_tier="), std::string::npos);
     EXPECT_NE(prep.diagnostics().render().find("fallback="), std::string::npos);
 }
 
-TEST(Test__WeightManagerMoEExpertOverlayPreparation, FiltersRequestsByOverlayRankRoleAndParticipant)
+/**
+ * @brief Verify rank filtering preserves the already-local CPU request set.
+ *
+ * Each MPI process builds its own preparation plan.  Rank filtering may change
+ * the worker residency category, but it must not require a root process to
+ * synthesize a remote rank's expert requests.
+ */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     FiltersRankLocalRequestsByOverlayRankRoleAndParticipant)
 {
-    auto plan = std::make_shared<MoERoutedExpertPlacementPlan>(threeTierPlan({
-        RoutedExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 1, 2, 0, 1, 2}},
-    }));
-    auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
-    const auto prep = MoEExpertOverlayPreparationPlan::build(*runtime_plan, 2048);
+    const auto plan = distributedCpuColdPlan(/*num_experts=*/8);
+    const auto root_runtime = resolveMoEExpertOverlayRuntimePlan(
+        plan,
+        MoEExpertOverlayRuntimeResolverOptions{
+            .current_world_rank = 0,
+        });
+    const auto worker_runtime = resolveMoEExpertOverlayRuntimePlan(
+        plan,
+        MoEExpertOverlayRuntimeResolverOptions{
+            .current_world_rank = 1,
+            .validate_mvp_root_reachability = false,
+        });
+    const auto root_prep = MoEExpertOverlayPreparationPlan::build(*root_runtime, 2048);
+    const auto worker_prep = MoEExpertOverlayPreparationPlan::build(*worker_runtime, 2048);
     const auto execution_plan = resolveMoEExpertOverlayExecutionPlan(
         plan,
         MoEExpertOverlayExecutionPlanResolverOptions{
@@ -269,30 +340,88 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, FiltersRequestsByOverlayRan
     ASSERT_NE(rank0, nullptr);
     ASSERT_NE(rank1, nullptr);
 
-    const auto root_filtered = prep.filteredForRank(*rank0);
-    EXPECT_TRUE(root_filtered.hasAcceleratorRequests());
-    EXPECT_TRUE(root_filtered.shouldPrepare(DeviceId::cuda(0), 0, 0, Role::GATE));
-    EXPECT_TRUE(root_filtered.shouldPrepare(DeviceId::rocm(0), 0, 1, Role::GATE));
-    EXPECT_FALSE(root_filtered.shouldPrepare(DeviceId::rocm(1), 0, 1, Role::GATE));
-    EXPECT_FALSE(root_filtered.shouldPrepare(DeviceId::rocm(0), 0, 4, Role::GATE));
-    EXPECT_TRUE(root_filtered.shouldPrepare(DeviceId::rocm(1), 0, 4, Role::GATE));
-    EXPECT_TRUE(root_filtered.shouldPrepare(DeviceId::cpu(), 0, 2, Role::GATE));
-    EXPECT_FALSE(root_filtered.shouldPrepare(DeviceId::cpu(), 0, 5, Role::GATE));
-    EXPECT_NE(root_filtered.requestForParticipant("cpu_cold", DeviceId::cpu(), 0, 0, 0, 2, Role::GATE), nullptr);
-    EXPECT_EQ(root_filtered.requestForParticipant("cpu_cold", DeviceId::cpu(), 1, 1, 0, 2, Role::GATE), nullptr);
+    const auto root_filtered = root_prep.filteredForRank(*rank0);
+    EXPECT_FALSE(root_filtered.hasAcceleratorRequests());
+    EXPECT_TRUE(root_filtered.hasCpuRoutedAssignments());
+    EXPECT_TRUE(root_filtered.shouldPrepare(DeviceId::cpu(), 0, 3, Role::GATE));
+    EXPECT_FALSE(root_filtered.shouldPrepare(DeviceId::cpu(), 0, 4, Role::GATE));
+    const auto *root_request = root_filtered.requestForParticipant(
+        "cpu_cold", DeviceId::cpu(), 0, 0, 0, 3, Role::GATE);
+    ASSERT_NE(root_request, nullptr);
+    EXPECT_EQ(root_request->residency_category, WeightResidencyCategory::CpuFallbackExpert);
 
-    const auto worker_filtered = prep.filteredForRank(*rank1);
+    const auto worker_filtered = worker_prep.filteredForRank(*rank1);
     EXPECT_FALSE(worker_filtered.hasAcceleratorRequests());
     EXPECT_TRUE(worker_filtered.hasCpuRoutedAssignments());
-    EXPECT_FALSE(worker_filtered.shouldPrepare(DeviceId::cuda(0), 0, 0, Role::GATE));
-    EXPECT_FALSE(worker_filtered.shouldPrepare(DeviceId::rocm(0), 0, 1, Role::GATE));
-    EXPECT_FALSE(worker_filtered.shouldPrepare(DeviceId::cpu(), 0, 2, Role::GATE));
-    EXPECT_TRUE(worker_filtered.shouldPrepare(DeviceId::cpu(), 0, 5, Role::GATE));
-    const auto *worker_request = worker_filtered.requestForParticipant("cpu_cold", DeviceId::cpu(), 1, 1, 0, 5, Role::GATE);
+    EXPECT_FALSE(worker_filtered.shouldPrepare(DeviceId::cpu(), 0, 3, Role::GATE));
+    EXPECT_TRUE(worker_filtered.shouldPrepare(DeviceId::cpu(), 0, 4, Role::GATE));
+    const auto *worker_request = worker_filtered.requestForParticipant(
+        "cpu_cold", DeviceId::cpu(), 1, 1, 0, 4, Role::GATE);
     ASSERT_NE(worker_request, nullptr);
     EXPECT_EQ(worker_request->residency_category, WeightResidencyCategory::WorkerFallbackExpert);
     EXPECT_NE(worker_filtered.diagnostics().render().find("worker="), std::string::npos);
     EXPECT_EQ(worker_filtered.diagnostics().render().find("AcceleratorRoutedExpert"), std::string::npos);
+}
+
+/**
+ * @brief Prove each MPI rank prepares only its apportioned CPU NodeTP slice.
+ *
+ * This regression uses inventory-bound hostnames so a rank cannot accidentally
+ * see another rank's CPU endpoint as a local `localhost` device.
+ */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     DistributedNodeTPPreparesOnlyExpertsOwnedByThisRank)
+{
+    constexpr int kExperts = 8;
+    const auto plan = distributedCpuColdPlan(kExperts);
+
+    const auto rank_zero_runtime = resolveMoEExpertOverlayRuntimePlan(
+        plan,
+        MoEExpertOverlayRuntimeResolverOptions{
+            .current_world_rank = 0,
+        });
+    const auto rank_one_runtime = resolveMoEExpertOverlayRuntimePlan(
+        plan,
+        MoEExpertOverlayRuntimeResolverOptions{
+            .current_world_rank = 1,
+            .validate_mvp_root_reachability = false,
+        });
+
+    const auto rank_zero_prep =
+        MoEExpertOverlayPreparationPlan::build(*rank_zero_runtime, 128);
+    const auto rank_one_prep =
+        MoEExpertOverlayPreparationPlan::build(*rank_one_runtime, 128);
+
+    std::vector<int> rank_zero_experts;
+    std::vector<int> rank_one_experts;
+    for (const auto &request : rank_zero_prep.requests())
+    {
+        if (request.role == Role::GATE)
+            rank_zero_experts.push_back(request.expert_id);
+        EXPECT_EQ(request.participant_world_rank, 0);
+        EXPECT_EQ(request.participant_index, 0);
+    }
+    for (const auto &request : rank_one_prep.requests())
+    {
+        if (request.role == Role::GATE)
+            rank_one_experts.push_back(request.expert_id);
+        EXPECT_EQ(request.participant_world_rank, 1);
+        EXPECT_EQ(request.participant_index, 1);
+    }
+
+    EXPECT_EQ(rank_zero_experts, (std::vector<int>{0, 1, 2, 3}));
+    EXPECT_EQ(rank_one_experts, (std::vector<int>{4, 5, 6, 7}));
+    EXPECT_FALSE(rank_zero_prep.shouldPrepare(DeviceId::cpu(), 0, 4, Role::GATE));
+    EXPECT_FALSE(rank_one_prep.shouldPrepare(DeviceId::cpu(), 0, 3, Role::GATE));
+
+    const auto *rank_zero_stats = rank_zero_prep.diagnostics().domainStats(
+        "cpu_cold", DeviceId::cpu(), 0, 0);
+    const auto *rank_one_stats = rank_one_prep.diagnostics().domainStats(
+        "cpu_cold", DeviceId::cpu(), 1, 1);
+    ASSERT_NE(rank_zero_stats, nullptr);
+    ASSERT_NE(rank_one_stats, nullptr);
+    EXPECT_EQ(rank_zero_stats->assigned_routed_experts, 4u);
+    EXPECT_EQ(rank_one_stats->assigned_routed_experts, 4u);
 }
 
 TEST(Test__WeightManagerMoEExpertOverlayPreparation, FiltersRequestsToOneGraphParticipantDevice)
@@ -448,29 +577,41 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, AcceleratorPreparationRejec
         *runtime_plan, DeviceId::cuda(0)));
 }
 
-TEST(Test__WeightManagerMoEExpertOverlayPreparation, PreparesCpuFallbackExpertsIntoRegistry)
+/**
+ * @brief Prove independent MPI-rank registries contain only their owned experts.
+ */
+TEST(Test__WeightManagerMoEExpertOverlayPreparation,
+     PreparesCpuFallbackExpertsIntoRankLocalRegistry)
 {
-    auto loader = MockModelLoader::createMinimal();
     const size_t d_model = 64;
     const size_t intermediate = 32;
     const size_t num_experts = 4;
-    addSingleLayerExpertParents(loader, d_model, intermediate, num_experts);
+    const auto plan = singleLayerCpuColdPlan(num_experts);
+    const auto rank_zero_runtime = resolveMoEExpertOverlayRuntimePlan(
+        plan,
+        MoEExpertOverlayRuntimeResolverOptions{
+            .current_world_rank = 0,
+        });
+    const auto rank_one_runtime = resolveMoEExpertOverlayRuntimePlan(
+        plan,
+        MoEExpertOverlayRuntimeResolverOptions{
+            .current_world_rank = 1,
+            .validate_mvp_root_reachability = false,
+        });
 
-    WeightManager manager(*loader);
-    ASSERT_NE(manager.getWeightForDevice("blk.0.ffn_gate_exps.weight"), nullptr);
-    ASSERT_NE(manager.getWeightForDevice("blk.0.ffn_up_exps.weight"), nullptr);
-    ASSERT_NE(manager.getWeightForDevice("blk.0.ffn_down_exps.weight"), nullptr);
-
-    auto plan = singleLayerCpuColdReplicatedPlan(num_experts);
-
-    auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
-    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
-        *runtime_plan, DeviceId::cpu()));
+    auto rank_zero_loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(rank_zero_loader, d_model, intermediate, num_experts);
+    WeightManager rank_zero_manager(*rank_zero_loader);
+    ASSERT_NE(rank_zero_manager.getWeightForDevice("blk.0.ffn_gate_exps.weight"), nullptr);
+    ASSERT_NE(rank_zero_manager.getWeightForDevice("blk.0.ffn_up_exps.weight"), nullptr);
+    ASSERT_NE(rank_zero_manager.getWeightForDevice("blk.0.ffn_down_exps.weight"), nullptr);
+    ASSERT_TRUE(rank_zero_manager.prepareMoEExpertOverlayWeights(
+        *rank_zero_runtime, DeviceId::cpu()));
 
     std::vector<ITensorGemm *> gate;
     std::vector<ITensorGemm *> up;
     std::vector<ITensorGemm *> down;
-    EXPECT_FALSE(manager.expertGemmRegistry().populateExpertEnginesForParticipant(
+    EXPECT_FALSE(rank_zero_manager.expertGemmRegistry().populateExpertEnginesForParticipant(
         "cpu_cold", DeviceId::cpu(), 0, 0, 0, static_cast<int>(num_experts), gate, up, down));
     for (size_t expert = 0; expert < num_experts; ++expert)
     {
@@ -480,7 +621,31 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, PreparesCpuFallbackExpertsI
         EXPECT_EQ(down[expert] != nullptr, owned_by_participant) << "expert=" << expert;
     }
 
-    EXPECT_FALSE(manager.expertGemmRegistry().populateExpertEnginesForParticipant(
+    EXPECT_FALSE(rank_zero_manager.expertGemmRegistry().populateExpertEnginesForParticipant(
+        "cpu_cold", DeviceId::cpu(), 1, 1, 0, static_cast<int>(num_experts), gate, up, down));
+    for (size_t expert = 0; expert < num_experts; ++expert)
+    {
+        EXPECT_EQ(gate[expert], nullptr) << "expert=" << expert;
+        EXPECT_EQ(up[expert], nullptr) << "expert=" << expert;
+        EXPECT_EQ(down[expert], nullptr) << "expert=" << expert;
+    }
+
+    auto rank_one_loader = MockModelLoader::createMinimal();
+    addSingleLayerExpertParents(rank_one_loader, d_model, intermediate, num_experts);
+    WeightManager rank_one_manager(*rank_one_loader);
+    ASSERT_TRUE(rank_one_manager.prepareMoEExpertOverlayWeights(
+        *rank_one_runtime, DeviceId::cpu()));
+
+    EXPECT_FALSE(rank_one_manager.expertGemmRegistry().populateExpertEnginesForParticipant(
+        "cpu_cold", DeviceId::cpu(), 0, 0, 0, static_cast<int>(num_experts), gate, up, down));
+    for (size_t expert = 0; expert < num_experts; ++expert)
+    {
+        EXPECT_EQ(gate[expert], nullptr) << "expert=" << expert;
+        EXPECT_EQ(up[expert], nullptr) << "expert=" << expert;
+        EXPECT_EQ(down[expert], nullptr) << "expert=" << expert;
+    }
+
+    EXPECT_FALSE(rank_one_manager.expertGemmRegistry().populateExpertEnginesForParticipant(
         "cpu_cold", DeviceId::cpu(), 1, 1, 0, static_cast<int>(num_experts), gate, up, down));
     for (size_t expert = 0; expert < num_experts; ++expert)
     {
@@ -501,7 +666,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, HydratesCpuFallbackParentsW
 
     WeightManager manager(*loader);
 
-    auto plan = singleLayerCpuColdReplicatedPlan(num_experts);
+    auto plan = singleLayerCpuColdPlan(num_experts);
     auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
     ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(
         *runtime_plan, DeviceId::cpu()));

@@ -170,6 +170,20 @@ namespace llaminar2
         void resetSessionStatePreservingCapturedReplay() override;
         void resetSessionStatePreservingLazyInitialization() override;
 
+        /**
+         * @brief Provision fused-projection backend resources before graph capture.
+         *
+         * Exact-shape prefill can legitimately avoid the concurrent projection
+         * route even when decode uses it. This capture-only preparation makes
+         * decode independent of whether an earlier warmup happened to create
+         * the shared stream/event pool.
+         */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return GraphLaunchPreparationPolicy::CaptureOnly;
+        }
+
     private:
         Params params_;
 

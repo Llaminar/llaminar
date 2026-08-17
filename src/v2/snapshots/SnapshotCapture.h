@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -34,6 +35,53 @@ namespace llaminar2
     };
 
     /**
+     * @brief Immutable ownership handle for one captured diagnostic tensor.
+     *
+     * Snapshot callbacks replace a semantic key when a later graph execution
+     * publishes a newer value.  A reader must therefore retain this handle,
+     * rather than a raw pointer into the capture map, while it copies or
+     * compares the data.  The pointed-to snapshot is immutable after
+     * publication, so map replacement and clear can safely proceed without
+     * invalidating a reader that already acquired a handle.
+     */
+    using StoredSnapshotHandle = std::shared_ptr<const StoredSnapshot>;
+
+    /**
+     * @brief Describe one ordered, logical prefill chunk retained for diagnostics.
+     *
+     * Captured GPU prefill executes a fixed physical bucket, while parity only
+     * compares the real prefix of that bucket.  The graph executor projects
+     * those live rows before publishing a snapshot.  This descriptor records
+     * the stable callback namespace and its expected logical row count so the
+     * snapshot owner can reconstruct one prompt-wide checkpoint after all
+     * chunks have completed.
+     */
+    struct SnapshotChunkSequencePart
+    {
+        std::string context;   ///< Callback namespace for this chunk.
+        size_t logical_rows{}; ///< Number of real rows represented by the namespace.
+    };
+
+    /**
+     * @brief Outcome of joining context-scoped prefill snapshots into sequences.
+     *
+     * A checkpoint is sequence-shaped only when every chunk published the same
+     * column geometry and each chunk's row count equals its real-token count.
+     * Terminal-only values such as last-token logits intentionally remain as
+     * the final chunk's ordinary snapshot rather than being falsely expanded.
+     */
+    struct SnapshotChunkSequenceAggregation
+    {
+        bool ok = false;                       ///< True when no sequence checkpoint was malformed.
+        size_t aggregated_sequence_keys = 0;   ///< Number of prompt-wide semantic snapshots published.
+        size_t terminal_or_nonsequence_keys = 0; ///< Context keys intentionally kept as final-value snapshots.
+        std::string error;                     ///< Failure reason for a malformed sequence checkpoint.
+
+        /** @brief Allow idiomatic success checks without conflating an empty capture with failure. */
+        explicit operator bool() const noexcept { return ok; }
+    };
+
+    /**
      * @brief Captures and stores intermediate activation snapshots for parity testing
      *
      * This class owns the snapshot storage and routing logic previously inline
@@ -42,13 +90,18 @@ namespace llaminar2
      * - FP32 extraction from quantized formats (Q8_1, Q16_1, BF16, FP16)
      * - Stage name → snapshot key conversion
      *
-     * Thread safety: capture/clear are safe for concurrent executor callbacks.
-     * Accessors returning raw pointers/references should be used after capture
-     * callbacks have quiesced.
+     * Thread safety: capture, clear, and handle-based reads are safe for
+     * concurrent executor callbacks.  Handle-based reads are the production
+     * diagnostic contract: the returned immutable object remains alive even
+     * when a later graph replaces the key or clears the capture bank.  The
+     * legacy raw-pointer accessor remains only for older test helpers and is
+     * valid only while the caller has independently quiesced capture/reset.
      */
     class SnapshotCapture
     {
     public:
+        using SnapshotMap = std::unordered_map<std::string, StoredSnapshotHandle>;
+
         SnapshotCapture() = default;
         SnapshotCapture(const SnapshotCapture &other)
         {
@@ -86,6 +139,25 @@ namespace llaminar2
         void captureStage(const std::string &name, const StageDumpInfo &dump);
 
         /**
+         * @brief Replace bare semantic keys with complete ordered prefill sequences.
+         *
+         * During a segmented request, DeviceGraphOrchestrator publishes both a
+         * context-qualified copy (for per-chunk diagnosis) and the historical
+         * bare semantic key (which naturally contains only the most recent
+         * chunk).  This diagnostic-only method validates the qualified row
+         * geometry, concatenates every sequence-shaped checkpoint in request
+         * order, and writes that complete value back under the bare key used by
+         * existing parity comparison and CSV code.  It never touches live
+         * device state or inserts work into the captured graph.
+         *
+         * @param chunks Ordered real-row descriptors from the prefill scheduler.
+         * @return Aggregation counts, or a precise error when a checkpoint that
+         *         began as sequence-shaped is incomplete or malformed.
+         */
+        SnapshotChunkSequenceAggregation aggregateSequentialChunkSnapshots(
+            const std::vector<SnapshotChunkSequencePart> &chunks);
+
+        /**
          * @brief Clear all stored snapshots
          */
         void clear()
@@ -95,21 +167,61 @@ namespace llaminar2
         }
 
         /**
-         * @brief Retrieve a snapshot by key
+         * @brief Retrieve a snapshot by key with explicit lifetime ownership.
          * @param key Snapshot key (e.g., "layer0_Q_PROJECTION")
-         * @return Pointer to StoredSnapshot, or nullptr if not found
+         * @return Immutable snapshot handle, or an empty handle when absent.
+         *
+         * The map lock protects only the lookup.  Returning a shared handle
+         * then keeps this exact publication alive after the lock is released,
+         * which lets parity copy it outside the executor callback timeline.
          */
-        const StoredSnapshot *get(const std::string &key) const
+        StoredSnapshotHandle getShared(const std::string &key) const
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = snapshots_.find(key);
-            return it != snapshots_.end() ? &it->second : nullptr;
+            return it != snapshots_.end() ? it->second : StoredSnapshotHandle{};
         }
 
         /**
-         * @brief Get all stored snapshots
+         * @brief Retrieve a legacy raw view of one snapshot.
+         * @param key Snapshot key (e.g., "layer0_Q_PROJECTION")
+         * @return Pointer to the map-owned snapshot, or nullptr if absent.
+         *
+         * New production diagnostic code must use getShared().  This adapter
+         * exists for older unit fixtures that deliberately read after capture
+         * callbacks have quiesced; clear() or replacement may invalidate it.
          */
-        const std::unordered_map<std::string, StoredSnapshot> &all() const { return snapshots_; }
+        const StoredSnapshot *get(const std::string &key) const
+        {
+            const StoredSnapshotHandle snapshot = getShared(key);
+            return snapshot ? snapshot.get() : nullptr;
+        }
+
+        /**
+         * @brief Return an immutable-handle copy of the complete capture bank.
+         *
+         * Returning the map by value is intentional.  Exposing a reference to
+         * the mutable hash table would let a reader race a graph callback that
+         * inserts, replaces, or clears snapshots.  Copying shared handles is
+         * cheap and preserves each published tensor's lifetime.
+         */
+        SnapshotMap all() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return snapshots_;
+        }
+
+        /**
+         * @brief Return the current number of semantic snapshot keys.
+         *
+         * This is a locked count for diagnostics that need to report an absent
+         * key without taking a copy of the entire capture bank.
+         */
+        size_t size() const
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return snapshots_.size();
+        }
 
         /**
          * @brief Get list of all snapshot keys
@@ -165,10 +277,35 @@ namespace llaminar2
             const StageDumpInfo &dump_info);
 
     private:
+        /**
+         * @brief Publish one immutable FP32 snapshot while the capture lock is held.
+         *
+         * Every write allocates a new immutable object instead of modifying an
+         * existing vector in place.  Readers holding an older handle therefore
+         * observe a complete old publication, never a vector being reallocated
+         * by a later callback.
+         *
+         * @param key Semantic diagnostic key.
+         * @param data Fully materialized FP32 values.
+         * @param rows Logical row count reported by the producing stage.
+         * @param cols Logical column count reported by the producing stage.
+         */
+        void storeSnapshot(
+            const std::string &key,
+            std::vector<float> data,
+            size_t rows,
+            size_t cols);
+
+        /**
+         * @brief Extract and publish one stage output while the capture lock is held.
+         *
+         * This helper keeps dtype conversion in one place and delegates the
+         * replacement/lifetime rule to storeSnapshot().
+         */
         void storeOutput(const std::string &key, const StageDumpInfo::OutputBuffer &out);
 
         mutable std::mutex mutex_;
-        std::unordered_map<std::string, StoredSnapshot> snapshots_;
+        SnapshotMap snapshots_;
     };
 
 } // namespace llaminar2

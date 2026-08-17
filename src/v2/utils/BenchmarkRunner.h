@@ -11,14 +11,13 @@
  * - Greedy sampling for deterministic, reproducible results
  *
  * Usage:
- *   BenchmarkRunner runner(pipeline, tokenizer, mpi_ctx);
+ *   BenchmarkRunner runner(pipeline, tokenizer);
  *   BenchmarkResult result = runner.run(args);
  *   runner.printResults(result);
  */
 
 #pragma once
 
-#include "MPIContext.h"
 #include "Tokenizer.h"
 #include "Sampler.h"
 #include "../execution/local_execution/orchestrators/IInferenceRunner.h"
@@ -172,7 +171,7 @@ namespace llaminar2
      * Features:
      * - Clean output with minimal logging during measurement
      * - Greedy sampling for deterministic results
-     * - MPI-aware (all ranks participate, rank 0 reports)
+     * - Compatible with an MPI-coordinated runner owned by one request controller
      * - Professional formatted output with box drawing
      */
     class BenchmarkRunner
@@ -182,12 +181,14 @@ namespace llaminar2
          * @brief Construct benchmark runner
          * @param runner Initialized inference runner for inference
          * @param tokenizer Tokenizer for encode/decode
-         * @param mpi_ctx MPI context for distributed execution
+         *
+         * Distributed participation belongs to the supplied inference runner:
+         * the application executes one BenchmarkRunner on the coordinated root
+         * while non-root ranks remain in the runner's production worker loop.
          */
         BenchmarkRunner(
             std::shared_ptr<IInferenceRunner> runner,
-            std::shared_ptr<ITokenizer> tokenizer,
-            std::shared_ptr<IMPIContext> mpi_ctx);
+            std::shared_ptr<ITokenizer> tokenizer);
 
         /**
          * @brief Run the benchmark
@@ -221,21 +222,12 @@ namespace llaminar2
     private:
         std::shared_ptr<IInferenceRunner> runner_;
         std::shared_ptr<ITokenizer> tokenizer_;
-        std::shared_ptr<IMPIContext> mpi_ctx_;
         std::function<void()> post_warmup_cb_;
         std::function<void()> decode_step_cb_;
         DecodeLoopProfile decode_loop_profile_; ///< Accumulated across benchmark iterations
         SamplingParams decode_sampling_params_; ///< Sampling params used by orchestrated decodeStep()
         int decode_request_batch_ = 1;          ///< Active logical request batch for MTP benchmark decode.
         std::string last_failure_reason_;
-
-        /**
-         * @brief Synchronize rank-local success across all benchmark ranks
-         * @param local_success Whether this rank completed the phase locally
-         * @param phase Human-readable phase name for diagnostics
-         * @return true only if every rank reported success
-         */
-        bool synchronizeSuccess(bool local_success, const char *phase) const;
 
         /**
          * @brief Run prefill phase and measure timing

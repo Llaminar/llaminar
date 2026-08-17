@@ -38,6 +38,7 @@
 #include "backends/cuda/CUDAGraphCapture.h"
 #endif
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/mtp/MTPRejectionSampler.h"
 #include "execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "execution/compute_stages/stages/MTPDraftTokenPublicationStage.h"
@@ -2493,8 +2494,9 @@ namespace
      * predicate word, the identical executable must run the tail exactly once.
      * This is the focused contract used to omit non-due Dynamic maintenance and
      * its collective without host scheduling or graph recapture. Running the
-     * same contract through WHILE and SWITCH/WHILE also proves fixed and
-     * dynamic depth share one fragment-execution policy.
+     * same contract through one-shot, WHILE, and SWITCH/WHILE composition also
+     * proves sparse maintenance and fixed/dynamic MTP share one fragment-
+     * execution policy.
      */
     TEST_P(
         GPUSamplingTest,
@@ -2594,17 +2596,6 @@ namespace
                         static_cast<const uint32_t *>(d_condition),
                 },
             }};
-            ASSERT_TRUE(parent->buildDeviceControlledWhileLoop(
-                fragments,
-                DeviceControlledLoopPredicate{
-                    .control_rows_device =
-                        static_cast<const int *>(d_control),
-                    .control_stride = control_stride,
-                    .request_count = 1,
-                    .healthy_index = healthy_index,
-                    .complete_index = complete_index,
-                }));
-            ASSERT_TRUE(parent->instantiate());
 
             auto run_case = [&](uint32_t condition, int expected_trace)
             {
@@ -2640,6 +2631,23 @@ namespace
                 EXPECT_EQ(actual_trace, expected_trace);
             };
 
+            ASSERT_TRUE(parent->supportsDeviceControlledTransaction());
+            ASSERT_TRUE(parent->buildDeviceControlledTransaction(fragments));
+            ASSERT_TRUE(parent->instantiate());
+            run_case(condition_clear, trace_sentinel);
+            run_case(condition_set, trace_publication);
+
+            ASSERT_TRUE(parent->buildDeviceControlledWhileLoop(
+                fragments,
+                DeviceControlledLoopPredicate{
+                    .control_rows_device =
+                        static_cast<const int *>(d_control),
+                    .control_stride = control_stride,
+                    .request_count = 1,
+                    .healthy_index = healthy_index,
+                    .complete_index = complete_index,
+                }));
+            ASSERT_TRUE(parent->instantiate());
             run_case(condition_clear, trace_sentinel);
             run_case(condition_set, trace_publication);
 
@@ -2683,6 +2691,416 @@ namespace
             cuda_context.destroyStream(transaction_stream);
             cuda_context.destroyStream(parent_stream);
         });
+
+        for (void *allocation : allocations)
+            backend_->free(allocation, device_id_);
+    }
+
+    /**
+     * @brief Prove ordinary decode publishes cadence without crossing a due edge.
+     *
+     * The exact same one-node capture is replayed for every boundary. The
+     * publisher and final acknowledgement must advance ordinary non-due edges
+     * once, publish maintenance exactly on replay three, and leave replay four
+     * pinned at that unconsumed due edge instead of crossing it.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        SerialDecodeCommitBoundaryPublisherIsCapturedAndOnceOnly)
+    {
+        enum Word : size_t
+        {
+            Committed,
+            Remaining,
+            Due,
+            Advanced,
+            Count,
+        };
+        const std::array<uint32_t, Count> initial = {0u, 3u, 0u, 0u};
+        const std::array<uint32_t, Count> mtp_non_due = {2u, 1u, 0u, 1u};
+        const std::array<uint32_t, Count> mtp_due = {3u, 0u, 1u, 1u};
+        std::array<uint32_t, Count> due_state{};
+        std::array<uint32_t, Count> repeated_due_state{};
+        std::array<uint32_t, Count> mtp_non_due_state{};
+        std::array<uint32_t, Count> mtp_due_state{};
+        auto *const device_words = static_cast<uint32_t *>(
+            backend_->allocate(sizeof(initial), device_id_));
+        ASSERT_NE(device_words, nullptr);
+
+        const auto run_capture = [&](IWorkerGPUContext &context)
+        {
+            context.submitAndWait([&]()
+            {
+                void *const stream = context.createStream();
+                ASSERT_NE(stream, nullptr);
+                ASSERT_TRUE(copyHostToDevice(
+                    device_words,
+                    initial.data(),
+                    sizeof(initial),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                auto publisher = context.createGraphCapture(stream);
+                ASSERT_NE(publisher, nullptr);
+                ASSERT_TRUE(publisher->beginCapture());
+                ASSERT_TRUE(
+                    backend_->enqueuePublishSerialDecodeCommitBoundary(
+                        device_words + Committed,
+                        device_words + Remaining,
+                        device_words + Due,
+                        device_words + Advanced,
+                        device_id_,
+                        stream));
+                ASSERT_TRUE(
+                    backend_->enqueueAcknowledgeDecodeCommitBoundary(
+                        device_words + Remaining,
+                        device_words + Due,
+                        device_words + Advanced,
+                        device_id_,
+                        stream));
+                ASSERT_TRUE(publisher->endCapture());
+                ASSERT_TRUE(publisher->instantiate());
+
+                ASSERT_TRUE(publisher->launch());
+                ASSERT_TRUE(publisher->launch());
+                ASSERT_TRUE(publisher->launch());
+                ASSERT_TRUE(copyDeviceToHost(
+                    due_state.data(),
+                    device_words,
+                    sizeof(due_state),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                ASSERT_TRUE(copyHostToDevice(
+                    device_words,
+                    mtp_non_due.data(),
+                    sizeof(mtp_non_due),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(publisher->launch());
+                ASSERT_TRUE(copyDeviceToHost(
+                    mtp_non_due_state.data(),
+                    device_words,
+                    sizeof(mtp_non_due_state),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                ASSERT_TRUE(copyHostToDevice(
+                    device_words,
+                    mtp_due.data(),
+                    sizeof(mtp_due),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(publisher->launch());
+                ASSERT_TRUE(copyDeviceToHost(
+                    mtp_due_state.data(),
+                    device_words,
+                    sizeof(mtp_due_state),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                ASSERT_TRUE(copyHostToDevice(
+                    device_words,
+                    due_state.data(),
+                    sizeof(due_state),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(publisher->launch());
+                ASSERT_TRUE(copyDeviceToHost(
+                    repeated_due_state.data(),
+                    device_words,
+                    sizeof(repeated_due_state),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                publisher.reset();
+                context.destroyStream(stream);
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &context =
+                GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(context);
+        }
+        else
+        {
+            auto &context =
+                GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(context);
+        }
+
+        EXPECT_EQ(due_state[Committed], 3u);
+        EXPECT_EQ(due_state[Remaining], 0u);
+        EXPECT_EQ(due_state[Due], 1u);
+        EXPECT_EQ(due_state[Advanced], 1u);
+        EXPECT_EQ(repeated_due_state[Committed], 3u);
+        EXPECT_EQ(repeated_due_state[Remaining], 0u);
+        EXPECT_EQ(repeated_due_state[Due], 1u);
+        EXPECT_EQ(repeated_due_state[Advanced], 1u);
+        EXPECT_EQ(mtp_non_due_state[Committed], 2u);
+        EXPECT_EQ(mtp_non_due_state[Remaining], 1u);
+        EXPECT_EQ(mtp_non_due_state[Due], 0u);
+        EXPECT_EQ(mtp_non_due_state[Advanced], 0u);
+        EXPECT_EQ(mtp_due_state[Committed], 3u);
+        EXPECT_EQ(mtp_due_state[Remaining], 0u);
+        EXPECT_EQ(mtp_due_state[Due], 1u);
+        EXPECT_EQ(mtp_due_state[Advanced], 1u);
+
+        backend_->free(device_words, device_id_);
+    }
+
+    /**
+     * @brief Exercise the exact sparse-maintenance transaction used by CUDA.
+     *
+     * Two parent launches publish and acknowledge ordinary non-due edges. The
+     * third launch makes the device word non-zero, executes a captured stand-in
+     * for the complete maintenance child, and rearms the period. A fourth launch
+     * must then advance the new epoch rather than retaining stale due state.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        DeviceControlledTransactionGatesSerialMaintenanceCadence)
+    {
+        if (GetParam() != "CUDA")
+            GTEST_SKIP() << "CUDA native conditional transaction coverage";
+
+        enum Word : size_t
+        {
+            Committed,
+            Remaining,
+            Due,
+            Advanced,
+            Count,
+        };
+        const std::array<uint32_t, Count> initial = {0u, 3u, 0u, 0u};
+        constexpr uint32_t reset_remaining = 3u;
+        constexpr uint32_t zero = 0u;
+        constexpr uint32_t trace_sentinel = 0u;
+        constexpr uint32_t trace_maintenance = 0xcade1234u;
+        std::array<uint32_t, Count> after_two{};
+        std::array<uint32_t, Count> after_three{};
+        std::array<uint32_t, Count> after_four{};
+        uint32_t trace_after_two = 0u;
+        uint32_t trace_after_three = 0u;
+
+        auto *const device_words = static_cast<uint32_t *>(
+            backend_->allocate(sizeof(initial), device_id_));
+        void *const device_reset_remaining =
+            backend_->allocate(sizeof(reset_remaining), device_id_);
+        void *const device_zero = backend_->allocate(sizeof(zero), device_id_);
+        void *const device_trace =
+            backend_->allocate(sizeof(trace_sentinel), device_id_);
+        void *const device_trace_maintenance =
+            backend_->allocate(sizeof(trace_maintenance), device_id_);
+        const std::array<void *, 5> allocations = {
+            device_words,
+            device_reset_remaining,
+            device_zero,
+            device_trace,
+            device_trace_maintenance};
+        for (void *allocation : allocations)
+            ASSERT_NE(allocation, nullptr);
+
+        auto &context =
+            GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+        context.submitAndWait([&]()
+        {
+            void *const parent_stream = context.createStream();
+            void *const publication_stream = context.createStream();
+            void *const maintenance_stream = context.createStream();
+            void *const acknowledgement_stream = context.createStream();
+            ASSERT_NE(parent_stream, nullptr);
+            ASSERT_NE(publication_stream, nullptr);
+            ASSERT_NE(maintenance_stream, nullptr);
+            ASSERT_NE(acknowledgement_stream, nullptr);
+
+            ASSERT_TRUE(copyHostToDevice(
+                device_words,
+                initial.data(),
+                sizeof(initial),
+                device_id_,
+                parent_stream));
+            ASSERT_TRUE(copyHostToDevice(
+                device_reset_remaining,
+                &reset_remaining,
+                sizeof(reset_remaining),
+                device_id_,
+                parent_stream));
+            ASSERT_TRUE(copyHostToDevice(
+                device_zero,
+                &zero,
+                sizeof(zero),
+                device_id_,
+                parent_stream));
+            ASSERT_TRUE(copyHostToDevice(
+                device_trace,
+                &trace_sentinel,
+                sizeof(trace_sentinel),
+                device_id_,
+                parent_stream));
+            ASSERT_TRUE(copyHostToDevice(
+                device_trace_maintenance,
+                &trace_maintenance,
+                sizeof(trace_maintenance),
+                device_id_,
+                parent_stream));
+            ASSERT_TRUE(
+                backend_->synchronizeStream(parent_stream, device_id_));
+
+            auto publication =
+                context.createGraphCapture(publication_stream);
+            ASSERT_NE(publication, nullptr);
+            ASSERT_TRUE(publication->beginCapture());
+            ASSERT_TRUE(
+                backend_->enqueuePublishSerialDecodeCommitBoundary(
+                    device_words + Committed,
+                    device_words + Remaining,
+                    device_words + Due,
+                    device_words + Advanced,
+                    device_id_,
+                    publication_stream));
+            ASSERT_TRUE(publication->endCapture());
+
+            auto maintenance =
+                context.createGraphCapture(maintenance_stream);
+            ASSERT_NE(maintenance, nullptr);
+            ASSERT_TRUE(maintenance->beginCapture());
+            ASSERT_TRUE(backend_->deviceCopyAsync(
+                device_words + Remaining,
+                device_reset_remaining,
+                sizeof(uint32_t),
+                device_id_,
+                maintenance_stream));
+            ASSERT_TRUE(backend_->deviceCopyAsync(
+                device_words + Due,
+                device_zero,
+                sizeof(uint32_t),
+                device_id_,
+                maintenance_stream));
+            ASSERT_TRUE(backend_->deviceCopyAsync(
+                device_words + Advanced,
+                device_zero,
+                sizeof(uint32_t),
+                device_id_,
+                maintenance_stream));
+            ASSERT_TRUE(backend_->deviceCopyAsync(
+                device_trace,
+                device_trace_maintenance,
+                sizeof(uint32_t),
+                device_id_,
+                maintenance_stream));
+            ASSERT_TRUE(maintenance->endCapture());
+
+            auto acknowledgement =
+                context.createGraphCapture(acknowledgement_stream);
+            ASSERT_NE(acknowledgement, nullptr);
+            ASSERT_TRUE(acknowledgement->beginCapture());
+            ASSERT_TRUE(
+                backend_->enqueueAcknowledgeDecodeCommitBoundary(
+                    device_words + Remaining,
+                    device_words + Due,
+                    device_words + Advanced,
+                    device_id_,
+                    acknowledgement_stream));
+            ASSERT_TRUE(acknowledgement->endCapture());
+
+            auto parent = context.createGraphCapture(parent_stream);
+            ASSERT_NE(parent, nullptr);
+            const std::array<DeviceControlledLoopFragment, 3> fragments = {{
+                {
+                    .name = "decode boundary publication",
+                    .capture = publication.get(),
+                },
+                {
+                    .name = "conditional maintenance",
+                    .capture = maintenance.get(),
+                    .execution =
+                        DeviceControlledLoopFragmentExecution::
+                            IfDeviceWordNonZero,
+                    .condition_word_device = device_words + Due,
+                },
+                {
+                    .name = "decode boundary acknowledgement",
+                    .capture = acknowledgement.get(),
+                },
+            }};
+            ASSERT_TRUE(parent->buildDeviceControlledTransaction(fragments));
+            ASSERT_TRUE(parent->instantiate());
+
+            ASSERT_TRUE(parent->launch());
+            ASSERT_TRUE(parent->launch());
+            ASSERT_TRUE(copyDeviceToHost(
+                after_two.data(),
+                device_words,
+                sizeof(after_two),
+                device_id_,
+                parent_stream));
+            ASSERT_TRUE(copyDeviceToHost(
+                &trace_after_two,
+                device_trace,
+                sizeof(trace_after_two),
+                device_id_,
+                parent_stream));
+            ASSERT_TRUE(
+                backend_->synchronizeStream(parent_stream, device_id_));
+
+            ASSERT_TRUE(parent->launch());
+            ASSERT_TRUE(copyDeviceToHost(
+                after_three.data(),
+                device_words,
+                sizeof(after_three),
+                device_id_,
+                parent_stream));
+            ASSERT_TRUE(copyDeviceToHost(
+                &trace_after_three,
+                device_trace,
+                sizeof(trace_after_three),
+                device_id_,
+                parent_stream));
+            ASSERT_TRUE(
+                backend_->synchronizeStream(parent_stream, device_id_));
+
+            ASSERT_TRUE(parent->launch());
+            ASSERT_TRUE(copyDeviceToHost(
+                after_four.data(),
+                device_words,
+                sizeof(after_four),
+                device_id_,
+                parent_stream));
+            ASSERT_TRUE(
+                backend_->synchronizeStream(parent_stream, device_id_));
+
+            parent.reset();
+            acknowledgement.reset();
+            maintenance.reset();
+            publication.reset();
+            context.destroyStream(acknowledgement_stream);
+            context.destroyStream(maintenance_stream);
+            context.destroyStream(publication_stream);
+            context.destroyStream(parent_stream);
+        });
+
+        EXPECT_EQ(after_two[Committed], 2u);
+        EXPECT_EQ(after_two[Remaining], 1u);
+        EXPECT_EQ(after_two[Due], 0u);
+        EXPECT_EQ(after_two[Advanced], 0u);
+        EXPECT_EQ(trace_after_two, trace_sentinel);
+        EXPECT_EQ(after_three[Committed], 3u);
+        EXPECT_EQ(after_three[Remaining], reset_remaining);
+        EXPECT_EQ(after_three[Due], 0u);
+        EXPECT_EQ(after_three[Advanced], 0u);
+        EXPECT_EQ(trace_after_three, trace_maintenance);
+        EXPECT_EQ(after_four[Committed], 4u);
+        EXPECT_EQ(after_four[Remaining], 2u);
+        EXPECT_EQ(after_four[Due], 0u);
+        EXPECT_EQ(after_four[Advanced], 0u);
 
         for (void *allocation : allocations)
             backend_->free(allocation, device_id_);
@@ -17533,6 +17951,202 @@ namespace
         backend_->free(maintenance_due_device, device_id_);
         backend_->free(ticket_device, device_id_);
         backend_->free(control_device, device_id_);
+    }
+
+    /**
+     * @brief Prove the narrow MoE ticket follows replay-time cadence state.
+     *
+     * The combined boundary/ticket publisher is captured on the fixture stream
+     * and replayed on a distinct scheduler stream.  The first boundary is
+     * non-due and must be acknowledged before the second replay publishes a
+     * due decision.  A ticket published between those operations proves an
+     * already-acknowledged idle snapshot remains authenticated; this is what a
+     * conservative HIP observation sees after the prefill-derived first token.
+     * No host-authored ticket is ever uploaded.
+     */
+    TEST_P(
+        GPUSamplingTest,
+        DeviceMoERebalanceDispatchTicketIsCapturedAuthenticatedAndDue)
+    {
+        constexpr uint64_t session_epoch = 0x1020304050607080ull;
+        constexpr uint64_t workspace_generation = 0x8877665544332211ull;
+        constexpr uint32_t participant_id = 1u;
+        constexpr uint32_t participant_count = 2u;
+
+        DeviceMoERebalanceGraphControllerState controller{};
+        controller.magic = kDeviceMoERebalanceMagic;
+        controller.version = kDeviceMoERebalanceVersion;
+        controller.participant_id = participant_id;
+        controller.participant_count = participant_count;
+        controller.decode_rounds_committed = 0u;
+        controller.decode_rounds_until_maintenance = 2u;
+        controller.maintenance_period_rounds = 2u;
+        controller.maintenance_due = 0u;
+        controller.decode_boundary_advanced = 0u;
+
+        void *const controller_device = backend_->allocate(
+            sizeof(controller), device_id_);
+        ASSERT_NE(controller_device, nullptr);
+        ASSERT_TRUE(copyHostToDevice(
+            controller_device,
+            &controller,
+            sizeof(controller),
+            device_id_,
+            stream_));
+
+        auto *const controller_bytes =
+            static_cast<std::byte *>(controller_device);
+        auto *const magic = reinterpret_cast<uint32_t *>(
+            controller_bytes +
+            offsetof(DeviceMoERebalanceGraphControllerState, magic));
+        auto *const version = reinterpret_cast<uint32_t *>(
+            controller_bytes +
+            offsetof(DeviceMoERebalanceGraphControllerState, version));
+        auto *const error = reinterpret_cast<uint32_t *>(
+            controller_bytes +
+            offsetof(
+                DeviceMoERebalanceGraphControllerState,
+                last_error_code));
+        auto *const committed = reinterpret_cast<uint32_t *>(
+            controller_bytes +
+            offsetof(
+                DeviceMoERebalanceGraphControllerState,
+                decode_rounds_committed));
+        auto *const remaining = reinterpret_cast<uint32_t *>(
+            controller_bytes +
+            offsetof(
+                DeviceMoERebalanceGraphControllerState,
+                decode_rounds_until_maintenance));
+        auto *const due = reinterpret_cast<uint32_t *>(
+            controller_bytes +
+            offsetof(
+                DeviceMoERebalanceGraphControllerState,
+                maintenance_due));
+        auto *const advanced = reinterpret_cast<uint32_t *>(
+            controller_bytes +
+            offsetof(
+                DeviceMoERebalanceGraphControllerState,
+                decode_boundary_advanced));
+        auto *const ticket =
+            reinterpret_cast<DeviceMoERebalanceDispatchTicket *>(
+                controller_bytes +
+                offsetof(
+                    DeviceMoERebalanceGraphControllerState,
+                    dispatch_ticket));
+
+        ASSERT_TRUE(
+            backend_->enqueueInitializeDeviceMoERebalanceDispatchTicket(
+                session_epoch,
+                workspace_generation,
+                participant_id,
+                participant_count,
+                ticket,
+                device_id_,
+                stream_));
+
+        const DeviceId device =
+            GetParam() == "CUDA" ? DeviceId::cuda(device_id_)
+                                 : DeviceId::rocm(device_id_);
+        auto &context = GPUDeviceContextPool::instance().getContext(device);
+        auto publication = context.createGraphCapture(stream_);
+        ASSERT_NE(publication, nullptr);
+        ASSERT_TRUE(publication->beginCapture());
+        ASSERT_TRUE(backend_->enqueuePublishSerialDecodeCommitBoundary(
+            committed,
+            remaining,
+            due,
+            advanced,
+            device_id_,
+            stream_));
+        ASSERT_TRUE(
+            backend_->enqueuePublishDeviceMoERebalanceDispatchTicket(
+                magic,
+                version,
+                error,
+                committed,
+                remaining,
+                due,
+                advanced,
+                ticket,
+                device_id_,
+                stream_));
+        ASSERT_TRUE(publication->endCapture());
+        ASSERT_TRUE(publication->instantiate());
+
+        void *const scheduler_stream = backend_->createStream(device_id_);
+        ASSERT_NE(scheduler_stream, nullptr);
+        ASSERT_TRUE(publication->launchOnStream(scheduler_stream));
+
+        DeviceMoERebalanceDispatchTicket observed{};
+        ASSERT_TRUE(copyDeviceToHost(
+            &observed,
+            ticket,
+            sizeof(observed),
+            device_id_,
+            scheduler_stream));
+        EXPECT_TRUE(observed.matchesLifecycle(
+            session_epoch,
+            workspace_generation,
+            participant_id,
+            participant_count));
+        EXPECT_EQ(observed.decode_rounds_committed, 1u);
+        EXPECT_EQ(observed.decode_rounds_until_maintenance, 1u);
+        EXPECT_EQ(observed.maintenance_due, 0u);
+
+        ASSERT_TRUE(backend_->enqueueAcknowledgeDecodeCommitBoundary(
+            remaining,
+            due,
+            advanced,
+            device_id_,
+            scheduler_stream));
+        ASSERT_TRUE(
+            backend_->enqueuePublishDeviceMoERebalanceDispatchTicket(
+                magic,
+                version,
+                error,
+                committed,
+                remaining,
+                due,
+                advanced,
+                ticket,
+                device_id_,
+                scheduler_stream));
+        ASSERT_TRUE(copyDeviceToHost(
+            &observed,
+            ticket,
+            sizeof(observed),
+            device_id_,
+            scheduler_stream));
+        EXPECT_TRUE(observed.matchesLifecycle(
+            session_epoch,
+            workspace_generation,
+            participant_id,
+            participant_count));
+        EXPECT_EQ(observed.healthy, 1u);
+        EXPECT_EQ(observed.decode_rounds_committed, 1u);
+        EXPECT_EQ(observed.decode_rounds_until_maintenance, 1u);
+        EXPECT_EQ(observed.maintenance_due, 0u);
+        EXPECT_EQ(observed.decode_boundary_advanced, 0u);
+
+        ASSERT_TRUE(publication->launchOnStream(scheduler_stream));
+        ASSERT_TRUE(copyDeviceToHost(
+            &observed,
+            ticket,
+            sizeof(observed),
+            device_id_,
+            scheduler_stream));
+        EXPECT_TRUE(observed.matchesLifecycle(
+            session_epoch,
+            workspace_generation,
+            participant_id,
+            participant_count));
+        EXPECT_EQ(observed.decode_rounds_committed, 2u);
+        EXPECT_EQ(observed.decode_rounds_until_maintenance, 0u);
+        EXPECT_EQ(observed.maintenance_due, 1u);
+        EXPECT_EQ(observed.decode_boundary_advanced, 1u);
+
+        backend_->destroyStream(scheduler_stream, device_id_);
+        backend_->free(controller_device, device_id_);
     }
 
 } // anonymous namespace

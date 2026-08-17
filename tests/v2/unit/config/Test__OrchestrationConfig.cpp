@@ -16,6 +16,8 @@
 #include <gtest/gtest.h>
 #include "config/OrchestrationConfig.h"
 
+#include <algorithm>
+
 using namespace llaminar2;
 
 // ============================================================================
@@ -25,7 +27,7 @@ using namespace llaminar2;
 TEST(Test__OrchestrationConfig, TPScopeToString)
 {
     EXPECT_STREQ(tpScopeToString(TPScope::AUTO), "auto");
-    EXPECT_STREQ(tpScopeToString(TPScope::LOCAL), "local");
+    EXPECT_STREQ(tpScopeToString(TPScope::RANK_LOCAL), "rank_local");
     EXPECT_STREQ(tpScopeToString(TPScope::GLOBAL), "global");
     EXPECT_STREQ(tpScopeToString(TPScope::HYBRID), "hybrid");
 }
@@ -34,7 +36,7 @@ TEST(Test__OrchestrationConfig, ParseTpScope)
 {
     EXPECT_EQ(parseTpScope("auto"), TPScope::AUTO);
     EXPECT_EQ(parseTpScope("AUTO"), TPScope::AUTO);
-    EXPECT_EQ(parseTpScope("local"), TPScope::LOCAL);
+    EXPECT_EQ(parseTpScope("rank_local"), TPScope::RANK_LOCAL);
     EXPECT_EQ(parseTpScope("global"), TPScope::GLOBAL);
     EXPECT_EQ(parseTpScope("hybrid"), TPScope::HYBRID);
     EXPECT_FALSE(parseTpScope("invalid").has_value());
@@ -447,6 +449,22 @@ TEST(Test__OrchestrationConfig, Validate_DefaultConfig_ReturnsEmpty)
     EXPECT_TRUE(errors.empty());
 }
 
+TEST(Test__OrchestrationConfig, Validate_ZeroMigrationCyclesPerWaveReturnsError)
+{
+    auto config = OrchestrationConfig::defaults();
+    config.moe_rebalance.migration_max_cycles_per_wave = 0;
+
+    const auto errors = config.validate();
+    EXPECT_TRUE(std::any_of(
+        errors.begin(),
+        errors.end(),
+        [](const std::string &error)
+        {
+            return error.find("migration max cycles per wave") !=
+                   std::string::npos;
+        }));
+}
+
 TEST(Test__OrchestrationConfig, Validate_InvalidTPDegree_ReturnsError)
 {
     OrchestrationConfig config;
@@ -588,9 +606,9 @@ TEST(Test__OrchestrationConfig, ToString_ContainsRelevantInfo)
 
 TEST(Test__DomainDefinition, Parse_WithScopeLocal)
 {
-    auto def = DomainDefinition::parse("rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0");
+    auto def = DomainDefinition::parse("rocm_socket0=0:rocm:0,0:rocm:1;scope=rank_local;backend=rccl;owner=0");
     EXPECT_EQ(def.name, "rocm_socket0");
-    EXPECT_EQ(def.scope, TPScope::LOCAL);
+    EXPECT_EQ(def.scope, TPScope::RANK_LOCAL);
     EXPECT_TRUE(def.owner_rank.has_value());
     EXPECT_EQ(*def.owner_rank, 0);
     EXPECT_EQ(def.backend, CollectiveBackendType::RCCL);
@@ -625,14 +643,14 @@ TEST(Test__DomainDefinition, TryParse_ScopeHybrid_ReturnsNullopt)
 
 TEST(Test__DomainDefinition, Validate_ScopeLocalWithExplicitRanks_ReturnsError)
 {
-    auto def = DomainDefinition::parse("d=cuda:0;scope=local;ranks=0,1");
+    auto def = DomainDefinition::parse("d=cuda:0;scope=rank_local;ranks=0,1");
     auto errors = def.validate();
     EXPECT_FALSE(errors.empty());
 }
 
 TEST(Test__DomainDefinition, Validate_ScopeLocalWithOwnerRank_OK)
 {
-    auto def = DomainDefinition::parse("d=cuda:0;scope=local;owner=0");
+    auto def = DomainDefinition::parse("d=cuda:0;scope=rank_local;owner=0");
     auto errors = def.validate();
     EXPECT_TRUE(errors.empty());
 }

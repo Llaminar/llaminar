@@ -288,7 +288,7 @@ def plan_llep(
     lambda_numerator: int,
     lambda_denominator: int,
     min_spread_improvement: int,
-    min_spread_improvement_per_transfer: int,
+    min_spread_improvement_per_critical_path_slot: int,
     enable_balanced_skip: bool,
 ) -> dict[str, Any]:
     status: Counter[str] = Counter()
@@ -392,10 +392,17 @@ def plan_llep(
 
     status["span_count"] = len(spans)
     status["weight_transfer_count"] = len(transfers)
+    outgoing = Counter(transfer[1] for transfer in transfers)
+    incoming = Counter(transfer[2] for transfer in transfers)
+    critical_path_transfer_slots = max(
+        [0, *outgoing.values(), *incoming.values()]
+    )
+    status["critical_path_transfer_slots"] = critical_path_transfer_slots
     planned = load_stats(assigned)
     improvement = max(0, standard["spread"] - planned["spread"])
     required_improvement = max(0, min_spread_improvement) + (
-        max(0, min_spread_improvement_per_transfer) * len(transfers)
+        max(0, min_spread_improvement_per_critical_path_slot)
+        * critical_path_transfer_slots
     )
     status["required_spread_improvement"] = required_improvement
     status["assigned_load_spread_improvement"] = improvement
@@ -505,7 +512,9 @@ def evaluate_trace_window(
         lambda_numerator=args.lambda_numerator,
         lambda_denominator=args.lambda_denominator,
         min_spread_improvement=args.min_spread_improvement,
-        min_spread_improvement_per_transfer=args.min_spread_improvement_per_transfer,
+        min_spread_improvement_per_critical_path_slot=(
+            args.min_spread_improvement_per_critical_path_slot
+        ),
         enable_balanced_skip=not args.disable_balanced_skip,
     )
     llep = load_stats(plan["post_loads"])
@@ -543,19 +552,22 @@ def evaluate_trace_window(
         "spread_improvement_fraction": (
             "" if standard["spread"] <= 0 else f"{improvement / standard['spread']:.9g}"
         ),
-        "spread_improvement_per_transfer": (
+        "spread_improvement_per_critical_path_slot": (
             ""
-            if plan_status["weight_transfer_count"] <= 0
-            else f"{improvement / plan_status['weight_transfer_count']:.9g}"
+            if plan_status["critical_path_transfer_slots"] <= 0
+            else f"{improvement / plan_status['critical_path_transfer_slots']:.9g}"
         ),
         "required_spread_improvement": plan_status["required_spread_improvement"],
         "min_spread_improvement": max(0, args.min_spread_improvement),
-        "min_spread_improvement_per_transfer": max(
-            0, args.min_spread_improvement_per_transfer
+        "min_spread_improvement_per_critical_path_slot": max(
+            0, args.min_spread_improvement_per_critical_path_slot
         ),
         "capacity_per_participant": plan_status["capacity_per_participant"],
         "span_count": plan_status["span_count"],
         "weight_transfer_count": plan_status["weight_transfer_count"],
+        "critical_path_transfer_slots": plan_status[
+            "critical_path_transfer_slots"
+        ],
         "spilled_rows": plan_status["spilled_rows"],
         "native_rows": plan_status["native_rows"],
         "min_chunk_skips": plan_status["min_chunk_skips"],
@@ -633,6 +645,9 @@ def build_tables(
                 aggregate["llep_load_spread"] += row["llep_load_spread"]
                 aggregate["spread_improvement"] += row["spread_improvement"]
                 aggregate["weight_transfer_count"] += row["weight_transfer_count"]
+                aggregate["critical_path_transfer_slots"] += row[
+                    "critical_path_transfer_slots"
+                ]
                 aggregate["required_spread_improvement"] += row[
                     "required_spread_improvement"
                 ]
@@ -683,13 +698,16 @@ def build_tables(
                     if standard_spread <= 0
                     else f"{aggregate['spread_improvement'] / standard_spread:.9g}"
                 ),
-                "spread_improvement_per_transfer": (
+                "spread_improvement_per_critical_path_slot": (
                     ""
-                    if aggregate["weight_transfer_count"] <= 0
-                    else f"{aggregate['spread_improvement'] / aggregate['weight_transfer_count']:.9g}"
+                    if aggregate["critical_path_transfer_slots"] <= 0
+                    else f"{aggregate['spread_improvement'] / aggregate['critical_path_transfer_slots']:.9g}"
                 ),
                 "required_spread_improvement": aggregate["required_spread_improvement"],
                 "weight_transfer_count": aggregate["weight_transfer_count"],
+                "critical_path_transfer_slots": aggregate[
+                    "critical_path_transfer_slots"
+                ],
                 "spilled_rows": aggregate["spilled_rows"],
                 "native_rows": aggregate["native_rows"],
                 "span_count": aggregate["span_count"],
@@ -743,15 +761,18 @@ def grouped_summary(run_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "spread_improvement_fraction": (
                     "" if standard_spread <= 0 else f"{improvement / standard_spread:.9g}"
                 ),
-                "spread_improvement_per_transfer": (
+                "spread_improvement_per_critical_path_slot": (
                     ""
-                    if sum(row["weight_transfer_count"] for row in rows) <= 0
-                    else f"{improvement / sum(row['weight_transfer_count'] for row in rows):.9g}"
+                    if sum(row["critical_path_transfer_slots"] for row in rows) <= 0
+                    else f"{improvement / sum(row['critical_path_transfer_slots'] for row in rows):.9g}"
                 ),
                 "required_spread_improvement": sum(
                     row["required_spread_improvement"] for row in rows
                 ),
                 "weight_transfer_count": sum(row["weight_transfer_count"] for row in rows),
+                "critical_path_transfer_slots": sum(
+                    row["critical_path_transfer_slots"] for row in rows
+                ),
                 "spilled_rows": sum(row["spilled_rows"] for row in rows),
                 "skipped_insufficient_spread_improvement": sum(
                     row["skipped_insufficient_spread_improvement"] for row in rows
@@ -767,19 +788,22 @@ def grouped_summary(run_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def build_roi_sweep(
     corpus_dir: Path,
     args: argparse.Namespace,
-    per_transfer_thresholds: list[int],
+    per_critical_path_slot_thresholds: list[int],
 ) -> list[dict[str, Any]]:
     sweep_rows: list[dict[str, Any]] = []
-    for threshold in per_transfer_thresholds:
+    for threshold in per_critical_path_slot_thresholds:
         sweep_args = argparse.Namespace(**vars(args))
-        sweep_args.min_spread_improvement_per_transfer = threshold
+        sweep_args.min_spread_improvement_per_critical_path_slot = threshold
         run_rows, _window_rows, split_rows = build_tables(corpus_dir, sweep_args)
         for row in split_rows:
             transfers = row["weight_transfer_count"]
+            critical_path_slots = row["critical_path_transfer_slots"]
             improvement = row["spread_improvement"]
             sweep_rows.append(
                 {
-                    "min_spread_improvement_per_transfer": max(0, threshold),
+                    "min_spread_improvement_per_critical_path_slot": max(
+                        0, threshold
+                    ),
                     "backend": row["backend"],
                     "n_predict": row["n_predict"],
                     "split": row["split"],
@@ -791,8 +815,11 @@ def build_roi_sweep(
                     "spread_improvement": improvement,
                     "spread_improvement_fraction": row["spread_improvement_fraction"],
                     "weight_transfer_count": transfers,
-                    "spread_improvement_per_transfer": (
-                        "" if transfers <= 0 else f"{improvement / transfers:.9g}"
+                    "critical_path_transfer_slots": critical_path_slots,
+                    "spread_improvement_per_critical_path_slot": (
+                        ""
+                        if critical_path_slots <= 0
+                        else f"{improvement / critical_path_slots:.9g}"
                     ),
                     "spilled_rows": row["spilled_rows"],
                     "skipped_insufficient_spread_improvement": row[
@@ -804,7 +831,9 @@ def build_roi_sweep(
         if not run_rows:
             sweep_rows.append(
                 {
-                    "min_spread_improvement_per_transfer": max(0, threshold),
+                    "min_spread_improvement_per_critical_path_slot": max(
+                        0, threshold
+                    ),
                     "backend": "",
                     "n_predict": 0,
                     "split": "",
@@ -816,7 +845,8 @@ def build_roi_sweep(
                     "spread_improvement": 0,
                     "spread_improvement_fraction": "",
                     "weight_transfer_count": 0,
-                    "spread_improvement_per_transfer": "",
+                    "critical_path_transfer_slots": 0,
+                    "spread_improvement_per_critical_path_slot": "",
                     "spilled_rows": 0,
                     "skipped_insufficient_spread_improvement": 0,
                 }
@@ -865,11 +895,18 @@ def main() -> int:
     parser.add_argument("--lambda-numerator", type=int, default=13)
     parser.add_argument("--lambda-denominator", type=int, default=10)
     parser.add_argument("--min-spread-improvement", type=int, default=0)
-    parser.add_argument("--min-spread-improvement-per-transfer", type=int, default=0)
     parser.add_argument(
-        "--sweep-min-spread-improvement-per-transfer",
+        "--min-spread-improvement-per-critical-path-slot",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--sweep-min-spread-improvement-per-critical-path-slot",
         default="",
-        help="Comma-separated per-transfer ROI thresholds to evaluate into roi_sweep.csv",
+        help=(
+            "Comma-separated per-critical-path-slot ROI thresholds to evaluate "
+            "into roi_sweep.csv"
+        ),
     )
     parser.add_argument("--disable-balanced-skip", action="store_true")
     parser.add_argument("--print-summary", action="store_true")
@@ -880,8 +917,10 @@ def main() -> int:
     write_csv(output_dir / "run_summary.csv", run_rows)
     write_csv(output_dir / "window_llep.csv", window_rows)
     write_csv(output_dir / "split_summary.csv", split_rows)
-    if args.sweep_min_spread_improvement_per_transfer:
-        thresholds = parse_int_list(args.sweep_min_spread_improvement_per_transfer)
+    if args.sweep_min_spread_improvement_per_critical_path_slot:
+        thresholds = parse_int_list(
+            args.sweep_min_spread_improvement_per_critical_path_slot
+        )
         write_csv(
             output_dir / "roi_sweep.csv",
             build_roi_sweep(args.corpus_dir, args, thresholds),

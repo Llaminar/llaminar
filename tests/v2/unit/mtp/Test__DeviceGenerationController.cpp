@@ -474,6 +474,8 @@ TEST(Test__DeviceGenerationController,
     EXPECT_EQ(control[kDeviceGenerationControlTransactionCount], 2);
     EXPECT_EQ(control[kDeviceGenerationControlAttemptedDraftTokenCount], 5);
     EXPECT_EQ(control[kDeviceGenerationControlVerifierTokenCount], 7);
+    EXPECT_EQ(control[kDeviceGenerationControlLastTransactionDraftDepth], 3);
+    EXPECT_EQ(control[kDeviceGenerationControlLastTransactionEmittedTokenCount], 4);
     EXPECT_EQ(control[kDeviceGenerationControlCurrentDraftDepth], 4);
     EXPECT_EQ(control[kDeviceGenerationControlDepthUpdates], 2);
     EXPECT_EQ(control[kDeviceGenerationControlDepthPromotions], 2);
@@ -655,6 +657,8 @@ TEST(Test__DeviceGenerationController, RejectCarryAndStopMatchSerialResponseByte
         6);
     EXPECT_EQ(control[kDeviceGenerationControlAttemptedDraftTokenCount], 9);
     EXPECT_EQ(control[kDeviceGenerationControlVerifierTokenCount], 12);
+    EXPECT_EQ(control[kDeviceGenerationControlLastTransactionDraftDepth], 3);
+    EXPECT_EQ(control[kDeviceGenerationControlLastTransactionEmittedTokenCount], 1);
 
     const ControlRow terminal_control = control;
     const auto terminal_response = response;

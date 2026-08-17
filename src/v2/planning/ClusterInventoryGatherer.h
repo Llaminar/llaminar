@@ -24,7 +24,9 @@ namespace llaminar2
 {
 
 /// Gather cluster-wide device inventory from all MPI ranks.
-/// Single-rank path: returns local devices only (no MPI).
+/// Single-rank path: returns every device on the local host (no MPI), because
+/// one process owns every NUMA domain. Multi-rank discovery retains rank-local
+/// NUMA filtering so hardware binding can select the closest owner rank.
 /// Multi-rank path: MPI_Allgatherv exchange of serialized RankInventory.
 ///
 /// @param mpi_ctx MPI context (nullptr or world_size==1 → local only)

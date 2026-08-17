@@ -258,6 +258,8 @@ namespace llaminar2
                 config_.prefix_cache,
                 config_.mtp,
                 config_.tp_allreduce_precision_override);
+            runtime_cfg.routed_expert_owner_order =
+                config_.routed_expert_owner_order;
             InferenceRunnerConfig base_runner_cfg;
             base_runner_cfg.max_seq_len = runtime_cfg.max_seq_len;
             base_runner_cfg.batch_size = runtime_cfg.batch_size;
@@ -267,6 +269,8 @@ namespace llaminar2
                 runtime_cfg.tp_allreduce_precision_override;
             base_runner_cfg.fused_attention_backend = runtime_cfg.fused_attention_backend;
             base_runner_cfg.routed_expert_compute_policy = runtime_cfg.routed_expert_compute_policy;
+            base_runner_cfg.routed_expert_owner_order =
+                runtime_cfg.routed_expert_owner_order;
             base_runner_cfg.moe_hot_expert_cache = runtime_cfg.moe_hot_expert_cache;
             base_runner_cfg.moe_routed_prefill = runtime_cfg.moe_routed_prefill;
             base_runner_cfg.moe_rebalance = runtime_cfg.moe_rebalance;

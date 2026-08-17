@@ -20,10 +20,15 @@ GGUF specifics:
 @author David Sanftenberg
 """
 
+import copy
+import re
+from pathlib import Path
 from typing import Optional
 from abc import abstractmethod
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 
 from .base import HuggingFaceReferenceModel
 from .pipeline_stages import PipelineStage
@@ -113,6 +118,460 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
 
     def _tokenizer_fallbacks(self) -> list[str]:
         return ["Qwen/Qwen3.5-0.8B", "Qwen/Qwen3.5-0.8B-Instruct"]
+
+    # ------------------------------------------------------------------
+    # Qwen3.6 next-token-prediction sidecar reference
+    # ------------------------------------------------------------------
+
+    def _prepare_gguf_state_dict(self, config_dict: dict, state_dict: dict) -> dict:
+        """Retain the trailing Qwen3.6 ``nextn`` block outside the main graph.
+
+        The GGUF parser deliberately excludes a real next-token-prediction
+        block from ``num_hidden_layers`` so Hugging Face does not execute it as
+        an ordinary decoder layer.  Its tensors remain in the state inventory,
+        however, and form an independent real-weight oracle for production MTP
+        checkpoint tests.
+        """
+        del config_dict
+        self._capture_mtp_sidecar_state(state_dict)
+        return state_dict
+
+    def _capture_mtp_sidecar_state(self, state_dict: dict) -> None:
+        """Retain only tensors owned by the first trailing ``nextn`` block."""
+        nextn_layers = []
+        for key in state_dict:
+            match = re.match(r"blk\.(\d+)\.nextn\.eh_proj\.weight$", key)
+            if match:
+                nextn_layers.append(int(match.group(1)))
+
+        nextn_layers = sorted(set(nextn_layers))
+        self._mtp_sidecar_source_layer = nextn_layers[0] if nextn_layers else None
+        self._mtp_sidecar_state = {}
+        if self._mtp_sidecar_source_layer is None:
+            return
+
+        source = self._mtp_sidecar_source_layer
+        raw_prefix = f"blk.{source}.nextn."
+        layer_prefix = f"model.layers.{source}."
+        for key, tensor in state_dict.items():
+            if key.startswith(raw_prefix) or key.startswith(layer_prefix):
+                # Retaining the immutable loader tensor avoids a second copy of
+                # the sizeable dense sidecar FFN. ``load_state_dict`` reads but
+                # does not mutate these source tensors.
+                self._mtp_sidecar_state[key] = tensor.detach()
+
+    @staticmethod
+    def _mtp_rms_norm(
+        value: torch.Tensor,
+        gamma: torch.Tensor,
+        eps: float,
+        *,
+        pre_rmsnorm_1p: bool = False,
+    ) -> torch.Tensor:
+        """Apply the exact GGUF/Hugging Face RMSNorm weight convention."""
+        variance = value.float().pow(2).mean(dim=-1, keepdim=True)
+        normalized = value * torch.rsqrt(variance + eps).to(dtype=value.dtype)
+        effective_gamma = gamma.to(device=value.device, dtype=value.dtype)
+        if pre_rmsnorm_1p:
+            effective_gamma = effective_gamma + 1.0
+        return normalized * effective_gamma
+
+    @staticmethod
+    def _mtp_snapshot_array(tensor: torch.Tensor) -> np.ndarray:
+        """Detach one sidecar boundary in the canonical row-major FP32 form."""
+        if tensor.dim() == 3 and tensor.shape[0] == 1:
+            tensor = tensor.squeeze(0)
+        return tensor.detach().cpu().float().numpy()
+
+    def _mtp_tensor(self, suffix: str) -> torch.Tensor:
+        """Resolve one nextn projection tensor from the retained GGUF state."""
+        source = self._mtp_sidecar_source_layer
+        key = f"blk.{source}.nextn.{suffix}"
+        if key not in self._mtp_sidecar_state:
+            raise RuntimeError(f"Missing dense MTP sidecar tensor {key}")
+        return self._mtp_sidecar_state[key].to(self.device)
+
+    def _make_mtp_sidecar_layer(self):
+        """Build the single full-attention dense predictor layer from GGUF."""
+        if not getattr(self, "_mtp_sidecar_state", None):
+            return None
+
+        from transformers.initialization import no_init_weights
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+
+        config = copy.deepcopy(self.hf_config)
+        config.num_hidden_layers = 1
+        config.layer_types = ["full_attention"]
+        with no_init_weights():
+            layer = Qwen3_5DecoderLayer(config, 0)
+
+        source = self._mtp_sidecar_source_layer
+        layer_prefix = f"model.layers.{source}."
+        layer_state = {
+            key[len(layer_prefix):]: tensor
+            for key, tensor in self._mtp_sidecar_state.items()
+            if key.startswith(layer_prefix)
+        }
+        missing, unexpected = layer.load_state_dict(layer_state, strict=False)
+        if missing:
+            raise RuntimeError(
+                f"Dense MTP sidecar reference layer missing weights: {missing}"
+            )
+        if unexpected:
+            raise RuntimeError(
+                f"Dense MTP sidecar reference layer had unexpected weights: {unexpected}"
+            )
+        layer._llaminar_mtp_config = config
+        return layer.to(self.device).eval()
+
+    def generate_mtp_sidecar_decode_snapshots(
+        self,
+        prompt: str,
+        decode_steps: int,
+        output_dir,
+        max_draft_depth: int = 3,
+        verbose: bool = False,
+    ) -> int:
+        """Generate recursive MTP0..MTP2 checkpoints from real dense weights.
+
+        The reference follows production's shifted-cache contract.  Depth zero
+        consumes the sampled main-model condition token; each deeper predictor
+        consumes the previous predictor's shared-head-normalized hidden state
+        and greedy token.  Only depth zero is committed to the cache before the
+        next main-model row, while deeper speculative rows are cropped.
+        """
+        if not getattr(self, "_mtp_sidecar_state", None):
+            raise RuntimeError(
+                "The dense GGUF has no retained Qwen3.6 nextn/MTP sidecar"
+            )
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer not loaded")
+        if max_draft_depth < 1 or max_draft_depth > 3:
+            raise ValueError("max_draft_depth must be in [1, 3]")
+        if decode_steps <= 0:
+            return 0
+
+        from transformers.cache_utils import DynamicCache
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        last_main_layer = self.hf_config.num_hidden_layers - 1
+        sidecar_layer = self._make_mtp_sidecar_layer()
+        if sidecar_layer is None:
+            raise RuntimeError("Dense MTP sidecar layer could not be constructed")
+        sidecar_cache = DynamicCache(config=sidecar_layer._llaminar_mtp_config)
+
+        hnorm = self._mtp_tensor("hnorm.weight")
+        enorm = self._mtp_tensor("enorm.weight")
+        eh_proj = self._mtp_tensor("eh_proj.weight")
+        shared_head_norm = self._mtp_tensor("shared_head_norm.weight")
+
+        encoding = self.tokenizer(prompt, return_tensors="pt")
+        token_ids = encoding["input_ids"][0].tolist()
+        if len(token_ids) < 2:
+            raise RuntimeError("Dense MTP reference requires at least two prompt tokens")
+
+        result = self.forward(
+            token_ids,
+            clear_snapshots=True,
+            use_cache=True,
+            capture_stages=[PipelineStage.FFN_RESIDUAL],
+        )
+        main_cache = result["past_key_values"]
+        last_hidden = torch.from_numpy(
+            self.snapshots[(PipelineStage.FFN_RESIDUAL, last_main_layer)]
+        ).to(self.device)
+        if last_hidden.dim() == 2:
+            last_hidden = last_hidden.unsqueeze(0)
+
+        def project_sidecar_hidden(
+            terminal_hidden: torch.Tensor,
+            token_id: int,
+            depth_index: int,
+        ) -> dict[str, torch.Tensor]:
+            prefix = f"MTP{depth_index}_"
+            token = torch.tensor([[token_id]], device=self.device, dtype=torch.long)
+            embedding = self.hf_model.model.embed_tokens(token)
+            norm_hidden = self._mtp_rms_norm(
+                terminal_hidden,
+                hnorm,
+                self.hf_config.rms_norm_eps,
+                pre_rmsnorm_1p=True,
+            )
+            norm_embedding = self._mtp_rms_norm(
+                embedding,
+                enorm,
+                self.hf_config.rms_norm_eps,
+                pre_rmsnorm_1p=True,
+            )
+            concat = torch.cat([norm_embedding, norm_hidden], dim=-1)
+            projected = F.linear(concat, eh_proj)
+            return {
+                f"{prefix}TERMINAL_HIDDEN_ROW_SELECT": terminal_hidden,
+                f"{prefix}EMBEDDING": embedding,
+                f"{prefix}NORM_HIDDEN": norm_hidden,
+                f"{prefix}NORM_EMBEDDING": norm_embedding,
+                f"{prefix}CONCAT": concat,
+                f"{prefix}FC": projected,
+            }
+
+        def capture(captures: dict, key: str, tensor: torch.Tensor) -> None:
+            captures[key] = self._mtp_snapshot_array(tensor)
+
+        def flatten_seq_heads(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor.dim() == 4:
+                return tensor.contiguous().reshape(
+                    tensor.shape[0], tensor.shape[1], -1
+                )
+            return tensor
+
+        def install_capture_hooks(captures: dict, depth_index: int) -> list:
+            handles = []
+            runtime = {}
+            prefix = f"MTP{depth_index}_"
+            key = lambda suffix: f"{prefix}{suffix}"
+
+            handles.append(
+                sidecar_layer.input_layernorm.register_forward_hook(
+                    lambda _module, _inputs, output: capture(
+                        captures, key("ATTENTION_NORM"), output
+                    )
+                )
+            )
+
+            attention = sidecar_layer.self_attn
+
+            def q_projection(_module, _inputs, output):
+                capture(captures, key("Q_PROJECTION"), output)
+                head_dim = getattr(attention, "head_dim", self.hf_config.head_dim)
+                q_gate = output.view(*output.shape[:-1], -1, head_dim * 2)
+                _, gate = torch.chunk(q_gate, 2, dim=-1)
+                runtime["fa_gate"] = gate.reshape(*output.shape[:-1], -1).detach()
+                capture(captures, key("FA_GATE"), runtime["fa_gate"])
+
+            handles.append(attention.q_proj.register_forward_hook(q_projection))
+            handles.append(
+                attention.k_proj.register_forward_hook(
+                    lambda _module, _inputs, output: capture(
+                        captures, key("K_PROJECTION"), output
+                    )
+                )
+            )
+            handles.append(
+                attention.v_proj.register_forward_hook(
+                    lambda _module, _inputs, output: capture(
+                        captures, key("V_PROJECTION"), output
+                    )
+                )
+            )
+            handles.append(
+                attention.q_norm.register_forward_hook(
+                    lambda _module, _inputs, output: capture(
+                        captures, key("Q_NORM"), flatten_seq_heads(output)
+                    )
+                )
+            )
+            handles.append(
+                attention.k_norm.register_forward_hook(
+                    lambda _module, _inputs, output: capture(
+                        captures, key("K_NORM"), flatten_seq_heads(output)
+                    )
+                )
+            )
+
+            def attention_context(_module, inputs):
+                gated = inputs[0] if isinstance(inputs, tuple) else inputs
+                capture(captures, key("ATTENTION_CONTEXT_GATED"), gated)
+                gate = runtime.get("fa_gate")
+                if gate is not None:
+                    raw = gated / torch.sigmoid(
+                        gate.to(device=gated.device, dtype=gated.dtype)
+                    ).clamp_min(1e-12)
+                    capture(captures, key("ATTENTION_CONTEXT"), raw)
+
+            handles.append(attention.o_proj.register_forward_pre_hook(attention_context))
+            handles.append(
+                attention.register_forward_hook(
+                    lambda _module, _inputs, output: capture(
+                        captures,
+                        key("ATTENTION_OUTPUT"),
+                        output[0] if isinstance(output, tuple) else output,
+                    )
+                )
+            )
+            handles.append(
+                sidecar_layer.post_attention_layernorm.register_forward_hook(
+                    lambda _module, _inputs, output: capture(
+                        captures, key("FFN_NORM"), output
+                    )
+                )
+            )
+
+            mlp = sidecar_layer.mlp
+            handles.append(
+                mlp.gate_proj.register_forward_hook(
+                    lambda _module, _inputs, output: capture(
+                        captures, key("FFN_GATE"), output
+                    )
+                )
+            )
+            handles.append(
+                mlp.up_proj.register_forward_hook(
+                    lambda _module, _inputs, output: capture(
+                        captures, key("FFN_UP"), output
+                    )
+                )
+            )
+            handles.append(
+                mlp.down_proj.register_forward_pre_hook(
+                    lambda _module, inputs: capture(
+                        captures,
+                        key("FFN_SWIGLU"),
+                        inputs[0] if isinstance(inputs, tuple) else inputs,
+                    )
+                )
+            )
+            handles.append(
+                mlp.down_proj.register_forward_hook(
+                    lambda _module, _inputs, output: capture(
+                        captures, key("FFN_DOWN"), output
+                    )
+                )
+            )
+            handles.append(
+                sidecar_layer.register_forward_hook(
+                    lambda _module, _inputs, output: capture(
+                        captures,
+                        key("FFN_RESIDUAL"),
+                        output[0] if isinstance(output, tuple) else output,
+                    )
+                )
+            )
+            return handles
+
+        def sidecar_forward(
+            projected: torch.Tensor,
+            position: int,
+            cache,
+            depth_index: int = 0,
+            captures: Optional[dict] = None,
+        ) -> tuple[torch.Tensor, object]:
+            text_positions = torch.tensor(
+                [[position]], device=self.device, dtype=torch.long
+            )
+            rope_positions = text_positions[None, ...].expand(3, 1, 1)
+            position_embeddings = self.hf_model.model.rotary_emb(
+                projected, rope_positions
+            )
+            handles = (
+                install_capture_hooks(captures, depth_index)
+                if captures is not None
+                else []
+            )
+            try:
+                hidden = sidecar_layer(
+                    projected,
+                    position_embeddings=position_embeddings,
+                    attention_mask=None,
+                    position_ids=text_positions,
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+            finally:
+                for handle in handles:
+                    handle.remove()
+            return hidden, cache
+
+        with torch.no_grad():
+            # Shift the prompt into the sidecar KV cache. Row N consumes the
+            # next prompt token and terminal main hidden row N-1.
+            for row in range(len(token_ids) - 1):
+                pieces = project_sidecar_hidden(
+                    last_hidden[:, row:row + 1, :], token_ids[row + 1], 0
+                )
+                _, sidecar_cache = sidecar_forward(
+                    pieces["MTP0_FC"], row + 1, sidecar_cache
+                )
+
+            next_token = int(result["logits"][0, -1, :].argmax())
+            total = 0
+            for step in range(decode_steps):
+                committed_cache_length = sidecar_cache.get_seq_length()
+                draft_hidden = last_hidden[:, -1:, :]
+                draft_condition_token = next_token
+                for depth_index in range(max_draft_depth):
+                    prefix = f"MTP{depth_index}_"
+                    pieces = project_sidecar_hidden(
+                        draft_hidden, draft_condition_token, depth_index
+                    )
+                    sidecar_captures = {}
+                    hidden, sidecar_cache = sidecar_forward(
+                        pieces[f"{prefix}FC"],
+                        len(token_ids) + step + depth_index,
+                        sidecar_cache,
+                        depth_index,
+                        sidecar_captures,
+                    )
+                    final_hidden = self._mtp_rms_norm(
+                        hidden,
+                        shared_head_norm,
+                        self.hf_config.rms_norm_eps,
+                        pre_rmsnorm_1p=True,
+                    )
+                    logits = self.hf_model.lm_head(final_hidden)
+
+                    snapshots = {
+                        key: self._mtp_snapshot_array(value)
+                        for key, value in pieces.items()
+                    }
+                    snapshots.update(sidecar_captures)
+                    snapshots[f"{prefix}FFN_RESIDUAL"] = self._mtp_snapshot_array(
+                        hidden
+                    )
+                    snapshots[f"{prefix}FINAL_NORM"] = self._mtp_snapshot_array(
+                        final_hidden
+                    )
+                    snapshots[f"{prefix}LM_HEAD"] = self._mtp_snapshot_array(logits)
+                    if depth_index == 0:
+                        snapshots["MTP_TERMINAL_HIDDEN_ROW_SELECT"] = snapshots[
+                            "MTP0_TERMINAL_HIDDEN_ROW_SELECT"
+                        ]
+
+                    for snapshot_key, payload in snapshots.items():
+                        np.save(
+                            output_dir / f"decode_step{step}_{snapshot_key}.npy",
+                            payload,
+                        )
+                        total += 1
+                        if verbose:
+                            print(
+                                f"  Saved decode_step{step}_{snapshot_key}: "
+                                f"shape={list(payload.shape)}"
+                            )
+
+                    draft_condition_token = int(logits[0, -1, :].argmax())
+                    draft_hidden = final_hidden
+
+                # Depth zero is the sole committed shifted-MTP row. Deeper
+                # recursive predictions are discarded with their cache state.
+                sidecar_cache.crop(committed_cache_length + 1)
+
+                result = self.forward(
+                    [next_token],
+                    clear_snapshots=True,
+                    past_key_values=main_cache,
+                    use_cache=True,
+                    capture_stages=[PipelineStage.FFN_RESIDUAL],
+                )
+                main_cache = result["past_key_values"]
+                last_hidden = torch.from_numpy(
+                    self.snapshots[(PipelineStage.FFN_RESIDUAL, last_main_layer)]
+                ).to(self.device)
+                if last_hidden.dim() == 2:
+                    last_hidden = last_hidden.unsqueeze(0)
+                next_token = int(result["logits"][0, -1, :].argmax())
+
+        return total
 
     # ------------------------------------------------------------------
     # Hook registration for heterogeneous layers

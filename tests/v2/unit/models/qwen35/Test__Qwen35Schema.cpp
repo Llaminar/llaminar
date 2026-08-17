@@ -77,6 +77,13 @@ namespace
         {
             return true;
         }
+        bool chunkForwardMergedQKV(
+            const float *, int,
+            const float *, const float *, const float *, const float *,
+            float *, float *, int, int, int, int, int, int, int, bool) override
+        {
+            return true;
+        }
         bool recurrent_step(const float *, const float *, const float *,
                             const float *, const float *, const float *, const float *,
                             float *, float *, int, int, int, bool) override
@@ -360,7 +367,12 @@ TEST(Test__Qwen35Schema, SnapshotShardingDeclaresCapturedDenseSemanticKeys)
     EXPECT_EQ(sharding.at("GDN_Z_PROJECTION"), SnapshotShardingMode::COLUMN_PARALLEL);
     EXPECT_EQ(sharding.at("GDN_ALPHA"), SnapshotShardingMode::COLUMN_PARALLEL);
     EXPECT_EQ(sharding.at("GDN_BETA"), SnapshotShardingMode::COLUMN_PARALLEL);
-    EXPECT_EQ(sharding.at("GDN_CONV1D_OUTPUT"), SnapshotShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(
+        sharding.at("QKV_PROJECTION"),
+        SnapshotShardingMode::PACKED_COLUMN_PARALLEL);
+    EXPECT_EQ(
+        sharding.at("GDN_CONV1D_OUTPUT"),
+        SnapshotShardingMode::PACKED_COLUMN_PARALLEL);
     EXPECT_EQ(sharding.at("GDN_DELTA_RULE_OUTPUT"), SnapshotShardingMode::COLUMN_PARALLEL);
     EXPECT_EQ(sharding.at("GDN_NORM_GATE_OUTPUT"), SnapshotShardingMode::COLUMN_PARALLEL);
 }

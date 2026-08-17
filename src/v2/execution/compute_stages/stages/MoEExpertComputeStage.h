@@ -26,9 +26,11 @@
 #include "../../moe/MoEExpertWeightService.h"
 #include "../../moe/MoERuntimeTable.h"
 #include "../../moe/DeviceMoERebalanceController.h"
+#include "../../moe/IMoEGroupedVerifierHistogramPublisher.h"
 
 #include <memory>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -45,8 +47,10 @@ namespace llaminar2
     class ExpertGemmRegistry;
     class GpuExpertSlotPool;
     class GpuExpertTransferStagingPool;
+    class ITPContext;
     class ILocalTPContext;
     class DeviceMoERebalanceTransferState;
+    class MoEOverlayNodeLocalRouteExchange;
 
     /**
      * @brief Select how a grouped LLEP invocation assigns the current batch.
@@ -62,7 +66,7 @@ namespace llaminar2
      * handful of speculative rows costs far more than executing those rows on
      * an existing owner or replica, and it would place a payload collective in
      * every MoE layer of every verifier replay. Long prefill may select
-     * @ref TransferBackedCurrentBatch after its routed-row economy gate has
+     * @ref GraphPhasedCurrentBatch after its routed-row economy gate has
      * passed.
      */
     enum class PrefillLLEPAssignmentMode : uint8_t
@@ -77,67 +81,30 @@ namespace llaminar2
         LogicalPositionResidentOnly = 0,
 
         /**
-         * Plan missing arrivals, execute compact payload collectives, publish
-         * the resulting runtime bank, and then apply the assignment spans.
+         * Consume assignments published by explicit plan/sideband/apply graph
+         * stages before this expert-compute node executes.
          *
          * Graph construction may select this only for an amortizable long
-         * prefill in a homogeneous graph-capturable LocalTP domain.
+         * prefill in a homogeneous graph-capturable LocalTP domain. The expert
+         * stage never launches the payload collective in this mode.
          */
-        TransferBackedCurrentBatch = 1,
+        GraphPhasedCurrentBatch = 1,
     };
 
     /**
-     * @brief Identify why a captured LLEP payload transaction is executing.
+     * @brief Select the authority that publishes CPU NativeVNNI input rows.
      *
-     * Current-batch movement consumes the routing evidence that selected the
-     * new placement and therefore starts a new histogram window after apply.
-     * Prefix-runtime rehydration has different semantics: it reconstructs
-     * payload bytes for placement and evidence already restored from a
-     * portable prefix snapshot. Erasing that evidence would make the first
-     * maintenance decision after a cache hit differ from uninterrupted
-     * execution.
-     *
-     * The purpose is a required method argument rather than inferred from
-     * pointer identity or mutable runtime state. This keeps graph construction
-     * declarative and makes an ambiguous payload publication unrepresentable.
+     * Ordinary CPU graphs require the immediately preceding CPU router to own
+     * the canonical Q8_1 publication. A heterogeneous ExpertOverlay participant
+     * instead receives authoritative FP32 rows through its fixed ticket and
+     * explicitly publishes the same canonical CPU representation at that
+     * declared transport boundary.
      */
-    enum class PrefillLLEPTransferPurpose : uint8_t
+    enum class CPURouterQ8InputPublicationPolicy : uint8_t
     {
-        CurrentBatchMovement = 0,
-        PrefixRuntimeRehydration = 1,
+        RequireRouterStage = 0,
+        PublishTransportedRows = 1,
     };
-
-    /**
-     * @brief Derive the immutable apply policy for one LLEP transaction.
-     *
-     * @param base_config Graph-owned rebalance policy shared by both captured
-     *                    transaction shapes.
-     * @param purpose     Semantic owner of this transaction.
-     * @return A value copy whose histogram lifecycle matches @p purpose.
-     */
-    [[nodiscard]] inline DeviceMoERebalanceConfig
-    prefillLLEPTransferConfig(
-        const DeviceMoERebalanceConfig &base_config,
-        PrefillLLEPTransferPurpose purpose)
-    {
-        DeviceMoERebalanceConfig result = base_config;
-        const uint32_t reset_histograms =
-            static_cast<uint32_t>(
-                DeviceMoERebalanceFlags::ResetHistogramsAfterApply);
-        switch (purpose)
-        {
-        case PrefillLLEPTransferPurpose::CurrentBatchMovement:
-            result.flags |= reset_histograms;
-            break;
-        case PrefillLLEPTransferPurpose::PrefixRuntimeRehydration:
-            result.flags &= ~reset_histograms;
-            break;
-        default:
-            throw std::invalid_argument(
-                "Unknown prefill LLEP transfer purpose");
-        }
-        return result;
-    }
 
     /**
      * @brief Unified MoE FFN stage (router + expert execution + combine)
@@ -149,7 +116,9 @@ namespace llaminar2
      * Expert views are pre-extracted at graph build time to avoid
      * runtime 3D tensor slicing overhead.
      */
-    class MoEExpertComputeStage : public IComputeStage, public IWorkspaceConsumer
+    class MoEExpertComputeStage : public IComputeStage,
+                                  public IWorkspaceConsumer,
+                                  public IMoEGroupedVerifierHistogramPublisher
     {
     public:
         struct Params
@@ -172,6 +141,19 @@ namespace llaminar2
              * rebalance maintenance each receive different owners.
              */
             std::shared_ptr<MoERoutedPipelineKernelOwner> routed_pipeline_kernel_owner;
+
+            /**
+             * @brief Authority for the CPU NativeVNNI hidden-row publication.
+             *
+             * Graph-native heterogeneous local-expert stages set
+             * PublishTransportedRows after compact ticket dispatch. Both the
+             * serial one-row and grouped-row NativeVNNI paths publish the
+             * transported bytes before consuming them. Every ordinary CPU
+             * graph retains RequireRouterStage and fails if its router/expert
+             * publication edge is missing.
+             */
+            CPURouterQ8InputPublicationPolicy cpu_router_q8_input_publication =
+                CPURouterQ8InputPublicationPolicy::RequireRouterStage;
 
             // Expert weights (3D packed tensors) — used by CPU path
             TensorBase *gate_exps = nullptr; ///< [num_experts, intermediate, d_model]
@@ -343,12 +325,23 @@ namespace llaminar2
             /**
              * @brief Optional ownership-invariant LocalTP publication target.
              *
-             * GPU fused decode and grouped-prefill kernels write one weighted
-             * row per original router slot into `[seq_len, top_k, d_model]`.
-             * They do not collapse participant-local routes into @ref output;
-             * a following FP32 collective and canonical reducer own that sum.
+             * The graph-selected publication layout determines whether this is
+             * a dense original-slot tensor or an indexed packed-record buffer.
+             * The accompanying arithmetic policy states whether rows are
+             * already weighted or remain raw expert outputs. The stage never
+             * collapses participant-local routes into @ref output when this
+             * target is present; a following collective and canonical reducer
+             * own the globally ordered fold.
              */
             TensorBase *canonical_route_contributions = nullptr;
+
+            /** Arithmetic represented by each canonical route slot. */
+            MoECanonicalRouteArithmeticPolicy canonical_route_arithmetic =
+                MoECanonicalRouteArithmeticPolicy::Unspecified;
+
+            /** Physical storage/wire layout of canonical route evidence. */
+            MoECanonicalRoutePublicationLayout canonical_route_layout =
+                MoECanonicalRoutePublicationLayout::Unspecified;
 
             // Buffer IDs for coherence
             BufferId input_buffer_id = BufferId::NORMALIZED;
@@ -376,16 +369,14 @@ namespace llaminar2
              */
             bool use_runtime_row_grouping = false;
 
-            /// LocalTP context for future full LLEP current-batch row exchange.
-            /// Required by graph-capturable homogeneous GPU LLEP prefill once
-            /// assignment spans are promoted from planning to execution.
+            /// LocalTP context for prefix-runtime payload rehydration.
+            /// Current-batch LLEP transport belongs to explicit graph stages
+            /// and deliberately does not bind its collective to this stage.
             ILocalTPContext *prefill_llep_tp_ctx = nullptr;
 
-            /// Optional graph-owned transfer backing for full LLEP prefill.
-            /// These handles let current-batch assignment spans import missing
-            /// expert descriptors on device before route_participant_ids are
-            /// rewritten. The expert stage borrows this memory; it never owns
-            /// or allocates transfer slots.
+            /// Optional graph-owned transfer backing for prefix rehydration.
+            /// Current-batch plan/apply stages borrow the same physical slot
+            /// directory directly rather than routing it through expert compute.
             DeviceMoEExpertDirectoryEntry *prefill_llep_transfer_slots = nullptr;
             uint32_t prefill_llep_transfer_slot_count = 0;
             uint64_t prefill_llep_payload_slot_bytes = 0;
@@ -416,11 +407,9 @@ namespace llaminar2
             /**
              * @brief Event identity dedicated to restore-time payload movement.
              *
-             * A restored suffix can execute rehydration and a new current-batch
-             * LLEP movement in the same layer graph. They share one serialized
-             * transfer stream/workspace lane, but must not alias event objects:
-             * two records of one event inside one captured graph make dependency
-             * ownership ambiguous on CUDA and HIP.
+             * Rehydration still uses a dedicated transfer stream. Current-batch
+             * movement now runs as explicit same-stream graph phases around a
+             * sidebanded model collective and therefore owns no event pair here.
              */
             std::shared_ptr<DeviceMoERebalanceTransferState>
                 prefix_runtime_rehydration_transfer_state;
@@ -451,6 +440,66 @@ namespace llaminar2
         };
 
         explicit MoEExpertComputeStage(Params params);
+
+        /**
+         * @brief One allocation-free invocation binding for a sparse overlay endpoint.
+         *
+         * Heterogeneous ExpertOverlay compacts each input row once and preserves
+         * that participant's selected experts in original router order along
+         * the top-k axis. The enclosing participant stage owns the tensors and
+         * immutable residency bank; this structure only lends their stable
+         * addresses and fixed-size prepared-engine tables to a persistent nested
+         * executor.
+         *
+         * The binding may change the live row count, compact tensor family, or
+         * residency epoch between serial transactions. It never changes the
+         * model geometry, device, layer, or vector capacities established at
+         * construction.
+         */
+        /** @brief Lifecycle authority represented by a sparse engine binding. */
+        enum class SparseOverlayBindingKind : uint8_t
+        {
+            ResidencyPublication = 0, ///< Live non-zero overlay authority epoch.
+            SetupPriming,             ///< One pre-capture construction binding.
+        };
+
+        struct SparseOverlayInvocation
+        {
+            TensorBase *input = nullptr;            ///< Compact FP32 hidden rows.
+            TensorBase *routing_indices = nullptr;  ///< Row-major local top-k expert ids.
+            TensorBase *routing_weights = nullptr;  ///< Row-major local top-k weights.
+            TensorBase *output = nullptr;           ///< Locally aggregated expert rows.
+            int live_rows = 0;                      ///< Positive live compact row count.
+            SparseOverlayBindingKind binding_kind =
+                SparseOverlayBindingKind::ResidencyPublication;
+            /**
+             * Monotonic immutable residency publication represented by the
+             * mask and three prepared-engine tables below. Reusing a value is
+             * a promise from the overlay authority that those tables are
+             * unchanged; changing any table requires a new non-zero value.
+             * Setup priming is the sole typed exception and requires zero.
+             */
+            uint64_t engine_binding_generation = 0;
+            const std::vector<bool> *expert_mask = nullptr; ///< Exact immutable bank mask.
+            std::span<ITensorGemm *const> gate_engines;     ///< Global-id-indexed gate engines.
+            std::span<ITensorGemm *const> up_engines;       ///< Global-id-indexed up engines.
+            std::span<ITensorGemm *const> down_engines;     ///< Global-id-indexed down engines.
+        };
+
+        /**
+         * @brief Rebind a persistent executor to one serial sparse-overlay packet.
+         *
+         * This is a manual heterogeneous-boundary API, not a mutable captured
+         * graph API. The method copies into construction-sized tables and
+         * invalidates device descriptor tables only when prepared engine
+         * addresses actually changed. It performs no allocation when the
+         * constructor established a valid expert geometry.
+         *
+         * @param invocation Exact compact tensors, live rows, mask, and engines.
+         * @return True when the complete invocation was accepted.
+         */
+        bool bindSparseOverlayInvocation(
+            const SparseOverlayInvocation &invocation);
 
         bool execute(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
@@ -494,6 +543,18 @@ namespace llaminar2
         /// graph recapture.
         bool usesGraphStableMoEPlacement() const;
 
+        /**
+         * @brief Test whether an ownership publication would change this stage.
+         *
+         * CPU dynamic ownership updates use this predicate to avoid releasing,
+         * rebuilding, and rebinding every model layer when a migration wave
+         * changes only a sparse set of exact `(layer, expert)` owners.
+         *
+         * @param candidate Exact expert residency mask proposed for this layer.
+         * @return `true` when the stage already owns the candidate mask.
+         */
+        bool expertMaskMatches(const std::vector<bool> &candidate) const noexcept;
+
         MoEDecodeDescriptorSource runtimeDecodeDescriptorSourceForTesting() const
         {
             return params_.runtime_decode_uses_mutable_descriptors
@@ -513,6 +574,34 @@ namespace llaminar2
         {
             return params_.routed_row_execution_policy;
         }
+        /**
+         * @brief Report whether this stage publishes original router slots.
+         * @return `true` when a following collective owns route transport.
+         *
+         * This diagnostic exists so graph-construction tests can distinguish
+         * the ownership-invariant publication contract from the obsolete
+         * participant-local compact accumulation contract without exposing a
+         * mutable parameter object.
+         */
+        bool publishesCanonicalRouteContributionsForTesting() const noexcept
+        {
+            return params_.canonical_route_contributions != nullptr;
+        }
+        /**
+         * @brief Return the arithmetic represented by each published route.
+         * @return Immutable graph-selected canonical route arithmetic policy.
+         */
+        MoECanonicalRouteArithmeticPolicy
+        canonicalRouteArithmeticPolicyForTesting() const noexcept
+        {
+            return params_.canonical_route_arithmetic;
+        }
+        /** @brief Return the immutable canonical publication wire layout. */
+        MoECanonicalRoutePublicationLayout
+        canonicalRoutePublicationLayoutForTesting() const noexcept
+        {
+            return params_.canonical_route_layout;
+        }
         bool usesRuntimeRowGroupingForTesting() const
         {
             return params_.use_runtime_row_grouping;
@@ -522,8 +611,23 @@ namespace llaminar2
             return supportsRequestedRoutedAssignmentPolicy();
         }
         bool hasMoERuntimeTableForTesting() const { return params_.moe_runtime_table != nullptr; }
+        /**
+         * @brief Expose the immutable runtime-table binding to graph tests.
+         *
+         * Production lowering tests use this read-only pointer to prove that a
+         * current-batch LLEP stage owns a distinct request-local child while
+         * sharing the canonical ExpertOverlay ticket and placement source.
+         * Runtime code must not use this diagnostic accessor for publication.
+         */
+        const IMoERuntimeTable *moeRuntimeTableForTesting() const noexcept
+        {
+            return params_.moe_runtime_table;
+        }
         bool hasPrefillLLEPTPContextForTesting() const { return params_.prefill_llep_tp_ctx != nullptr; }
-        bool hasTransferBackedPrefillLLEPForTesting() const { return hasTransferBackedPrefillLLEP(); }
+        bool usesGraphPhasedCurrentBatchLLEPForTesting() const
+        {
+            return usesGraphPhasedCurrentBatchPrefillLLEP();
+        }
         PrefillLLEPAssignmentMode prefillLLEPAssignmentModeForTesting() const noexcept
         {
             return params_.prefill_llep_assignment_mode;
@@ -581,17 +685,21 @@ namespace llaminar2
              * or replica must be resident. A mask may intentionally contain
              * additional cache residents that are not eligible for assignment.
              */
-            for (size_t expert = 0; expert < normalized_replicas.owner_socket.size(); ++expert)
+            for (int expert = 0;
+                 expert < normalized_replicas.base_ownership.expertCount();
+                 ++expert)
             {
                 const bool is_owner =
-                    normalized_replicas.owner_socket[expert] == socket_id;
+                    normalized_replicas.ownerParticipant(
+                        params_.layer_idx, expert) == socket_id;
                 const bool is_replica =
                     normalized_replicas.hasReplicaOnParticipant(
                         params_.layer_idx,
-                        static_cast<int>(expert),
+                        expert,
                         socket_id);
                 if ((!is_owner && !is_replica) ||
-                    (expert < params_.expert_mask.size() && params_.expert_mask[expert]))
+                    (static_cast<size_t>(expert) < params_.expert_mask.size() &&
+                     params_.expert_mask[static_cast<size_t>(expert)]))
                 {
                     continue;
                 }
@@ -622,11 +730,21 @@ namespace llaminar2
             }
         }
 
-        /// Detach and serialize packed weights for a departing expert.
-        /// Returns serialized gate/up/down blobs. After this call, the expert's
-        /// GEMM engines have empty weights (will be cleaned up in Phase 1 of
-        /// updateExpertMaskAndPrepareEngines).
-        ExpertWeightBlobs detachAndSerializeExpert(int expert_id);
+        /**
+         * @brief Detach final packed projections for direct CPU ownership movement.
+         *
+         * The source engines become weightless. The returned native allocations
+         * are sent directly into final destination storage without wire blobs.
+         */
+        ExpertPackedWeights detachPreparedExpert(int expert_id);
+
+        /**
+         * @brief Clone final packed projections for direct CPU replica movement.
+         *
+         * The source engines remain valid while the returned explicit copies
+         * become the destination participant's final packed allocations.
+         */
+        ExpertPackedWeights clonePreparedExpert(int expert_id) const;
 
         /// Serialize packed weights for an expert without detaching.
         /// The owner keeps its GEMM engines intact. Used for replica transfers
@@ -683,7 +801,9 @@ namespace llaminar2
         /// tensor views.
         bool registerAndPrepareNewExperts(
             const std::vector<bool> &new_mask,
-            const std::unordered_map<int, ExpertWeightBlobs> *received_weights);
+            const std::unordered_map<int, ExpertWeightBlobs> *received_weights,
+            const std::unordered_map<int, PreparedExpertEngines> *
+                received_prepared_experts = nullptr);
 
         /// Phase 3: Apply the new expert mask and invalidate cached engine vectors.
         void applyExpertMask(const std::vector<bool> &new_mask);
@@ -716,11 +836,15 @@ namespace llaminar2
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
         {
-            return supportsGraphCaptureAfterLaunchPreparation() ||
-                           requestsTransferBackedCurrentBatchPrefillLLEP() ||
-                           params_.prefix_runtime_device_rehydration
-                       ? GraphLaunchPreparationPolicy::CaptureOnly
-                       : GraphLaunchPreparationPolicy::None;
+            if (!(supportsGraphCaptureAfterLaunchPreparation() ||
+                  params_.prefix_runtime_device_rehydration))
+            {
+                return GraphLaunchPreparationPolicy::None;
+            }
+            return sparse_overlay_invocation_bound_ &&
+                           sparse_overlay_launch_metadata_dirty_
+                       ? GraphLaunchPreparationPolicy::CaptureAndReplay
+                       : GraphLaunchPreparationPolicy::CaptureOnly;
         }
         /**
          * @brief Drop per-request fused decode warmup state.
@@ -762,11 +886,15 @@ namespace llaminar2
             grouped_gateup_desc_table_num_experts_ = 0;
             grouped_gateup_desc_table_d_model_ = 0;
             grouped_gateup_desc_table_intermediate_ = 0;
+            grouped_gateup_desc_table_weight_format_ =
+                DeviceMoEWeightFormat::NativeVNNI;
             grouped_gateup_desc_table_dirty_ = false;
             grouped_down_desc_table_id_ = -1;
             grouped_down_desc_table_num_experts_ = 0;
             grouped_down_desc_table_d_model_ = 0;
             grouped_down_desc_table_intermediate_ = 0;
+            grouped_down_desc_table_weight_format_ =
+                DeviceMoEWeightFormat::NativeVNNI;
             grouped_down_desc_table_dirty_ = false;
             combined_shared_gateup_desc_table_id_ = -1;
             combined_shared_gateup_desc_table_d_model_ = 0;
@@ -778,6 +906,8 @@ namespace llaminar2
             combined_shared_desc_table_intermediate_ = 0;
             runtime_grouped_decode_launch_state_prepared_ = false;
             invalidateFixedTopologyMaskPublication();
+            sparse_overlay_launch_metadata_dirty_ =
+                sparse_overlay_invocation_bound_;
         }
 
         /**
@@ -862,10 +992,24 @@ namespace llaminar2
          * that commit.
          */
         [[nodiscard]] bool
-        requiresCommittedGroupedVerifierHistogramPublication() const noexcept
+        requiresCommittedGroupedVerifierHistogramPublication() const noexcept override
         {
             return params_.device_id.is_gpu() &&
                    params_.defer_grouped_verifier_histogram_publication;
+        }
+
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        [[nodiscard]] int
+        groupedVerifierHistogramLayerIndex() const noexcept override
+        {
+            return params_.layer_idx;
+        }
+
+        /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
+        [[nodiscard]] std::string_view
+        groupedVerifierHistogramPublisherName() const noexcept override
+        {
+            return "moe_ffn";
         }
 
         /**
@@ -908,7 +1052,7 @@ namespace llaminar2
             const int32_t *publication_ok_flags_device,
             int request_count,
             int rows_per_request,
-            void *producer_stream);
+            void *producer_stream) override;
 
         // Test accessor
         void setMoEKernelForTesting(IMoEKernel *kernel)
@@ -1002,6 +1146,37 @@ namespace llaminar2
             Published,
         };
 
+        /**
+         * @brief Name the semantic owner of one CPU grouped-row invocation.
+         *
+         * Ordinary prefill and MTP verification share the same economical,
+         * serial-row-equivalent expert kernels.  They differ only in replica
+         * assignment and observability.  Carrying that distinction as a
+         * scoped enum prevents the executor from inferring lifecycle policy
+         * from a mutable test flag or from runtime M.
+         */
+        enum class CPUGroupedRowsPurpose : uint8_t
+        {
+            OrdinaryPrefill,
+            MTPVerifier,
+        };
+
+        /**
+         * @brief One locally owned route slot in original row/top-k order.
+         *
+         * Expert execution is reordered into contiguous expert batches for
+         * economy.  This record retains the logical slot identity so the final
+         * weighted accumulation can replay the original top-k order exactly,
+         * preserving serial-decode FP32 parenthesization byte-for-byte.
+         */
+        struct CPUGroupedRouteSlot
+        {
+            int row = 0;       ///< Source/output row in the runtime batch.
+            int route = 0;     ///< Original top-k position within @ref row.
+            int expert_id = 0; ///< Routed expert owning this work item.
+            float weight = 0.0f; ///< Normalized router weight.
+        };
+
         Params params_;
         bool raw_weights_released_ = false;                       ///< Set by releaseRawExpertWeights()
         DeviceWorkspaceManager *bound_workspace_ = nullptr;       ///< Workspace for expert GEMM engines
@@ -1012,7 +1187,14 @@ namespace llaminar2
         mutable std::vector<ITensorGemm *> cached_up_gemm_;
         mutable std::vector<ITensorGemm *> cached_down_gemm_;
 
-        /// Reusable scratch tensors (allocated on first use, grown if needed)
+        /**
+         * @brief Reusable host scratch for CPU routed-expert execution.
+         *
+         * Fixed-M verifier stages bind their complete bounded capacity during
+         * construction so request execution never allocates or changes memory
+         * topology. Ordinary large-prefill stages currently grow these buffers
+         * on first use pending graph-level cross-layer scratch sharing.
+         */
         mutable std::shared_ptr<FP32Tensor> scratch_batch_;
         mutable std::shared_ptr<FP32Tensor> scratch_gate_;
         mutable std::shared_ptr<FP32Tensor> scratch_up_;
@@ -1033,6 +1215,52 @@ namespace llaminar2
         /// Reusable projection descriptor vector (avoids per-call heap alloc)
         mutable std::vector<ITensorGemm::TensorProjectionDesc> batch_projections_;
 
+        /** @brief Flat locally-owned route slots in original row/top-k order. */
+        mutable std::vector<CPUGroupedRouteSlot> cpu_grouped_route_slots_;
+
+        /** @brief Original flat route slot to local-slot index, or -1 when remote. */
+        mutable std::vector<int> cpu_grouped_original_to_local_;
+
+        /** @brief Number of locally owned route rows assigned to each expert. */
+        mutable std::vector<int> cpu_grouped_expert_counts_;
+
+        /** @brief CSR offsets delimiting each expert's flat local-slot span. */
+        mutable std::vector<int> cpu_grouped_expert_offsets_;
+
+        /** @brief Reusable CSR construction cursors. */
+        mutable std::vector<int> cpu_grouped_expert_write_offsets_;
+
+        /** @brief Local-slot indices grouped by expert while retaining slot order. */
+        mutable std::vector<int> cpu_grouped_expert_local_slots_;
+
+        /**
+         * @brief Local logical slot to its expert-major output row.
+         *
+         * NativeVNNI computes every active expert into one contiguous
+         * expert-major layer buffer. This inverse map lets the final
+         * row-owned accumulation restore original router order without an
+         * intermediate output copy.
+         */
+        mutable std::vector<int> cpu_grouped_local_to_expert_position_;
+
+        /** @brief Ascending IDs of experts with at least one local route row. */
+        mutable std::vector<int> cpu_grouped_active_experts_;
+
+        /** @brief Gather indices reused for each complete expert batch. */
+        mutable std::vector<int> cpu_grouped_token_indices_;
+
+        /** @brief Canonical router-Q8 rows gathered in expert-major layer order. */
+        mutable std::vector<Q8_1Block> cpu_grouped_router_q8_;
+
+        /** @brief Pre-quantized SwiGLU rows for the batched expert down phase. */
+        mutable std::vector<Q8_1Block> cpu_grouped_swiglu_q8_;
+
+        /** @brief Floating-format expert outputs indexed by local logical route slot. */
+        mutable std::vector<float> cpu_grouped_route_outputs_;
+
+        /** @brief Per-expert route counts used only while PerfStats is enabled. */
+        mutable std::vector<uint32_t> cpu_grouped_routed_rows_by_expert_;
+
         /// Reusable expert-id list for full-local grouped decode descriptor preparation.
         mutable std::vector<int> all_expert_ids_;
 
@@ -1048,20 +1276,45 @@ namespace llaminar2
         mutable IMoEKernel *moe_kernel_ = nullptr;
 
         /**
-         * @brief True after routed single-token fused decode has staged runtime pointer arrays.
+         * @brief True after routed single-token fused decode has staged pointer arrays.
          *
          * CUDA and ROCm fused MoE decode read device-side pointer tables for the
-         * gate/up and down scratch slots during graph replay.  Those tables are
-         * populated by an eager warmup run because graph capture must not contain
-         * the host-to-device metadata uploads.  Keep this flag tied to the current
-         * workspace, descriptor tables, and runtime layer so capture can only
-         * start after that exact route has succeeded.
+         * gate/up and down scratch slots during graph replay. Runtime-table and
+         * explicit-routing decode share those immutable arrays; only their
+         * device-owned source of expert ids and weights differs. Preparation is
+         * performed outside capture because the pointer-table publication is a
+         * host-to-device metadata upload. Keep this flag tied to the current
+         * workspace and descriptor tables so capture can only begin after the
+         * exact selected route has been prepared.
          */
         mutable bool runtime_grouped_decode_launch_state_prepared_ = false;
 
         /// Explicit publication state for the backend-owned fixed-topology mask.
         FixedTopologyMaskPublicationState fixed_topology_mask_publication_state_ =
             FixedTopologyMaskPublicationState::NotRequired;
+        /**
+         * @brief Whether a host-authoritative heterogeneous boundary rebinds placement.
+         *
+         * Such a stage retains one native graph but may receive a new immutable
+         * residency bank between launches. Graph launch preparation therefore
+         * republishes only dirty descriptor/mask bytes before every replay;
+         * ordinary homogeneous graphs keep their capture-only preparation.
+         */
+        bool sparse_overlay_invocation_bound_ = false;
+        /** @brief Residency generation currently certified by the bound tables. */
+        uint64_t sparse_overlay_engine_binding_generation_ = 0;
+        /**
+         * @brief Whether the next sparse replay must republish placement metadata.
+         *
+         * A retained endpoint executable embeds stable tensor addresses and
+         * consumes backend-owned descriptor/mask tables. Revalidating and
+         * rebuilding those tables for every unchanged packet is both
+         * allocation-heavy and semantically misleading. Binding a different
+         * engine or mask sets this bit; successful launch preparation clears
+         * it. The policy method above therefore exposes replay preparation
+         * only while an actual publication is pending.
+         */
+        bool sparse_overlay_launch_metadata_dirty_ = false;
 
         /**
          * @brief Resolve the sole output owned by this routed-expert producer.
@@ -1098,25 +1351,33 @@ namespace llaminar2
          *
          * MTP state publication restores live KV/GDN/conv state from a selected
          * verifier row.  That remains sound only when each grouped row is
-         * numerically equivalent to ordinary one-token decode.  M=1 therefore
-         * enters the normal decode route, while M=2..4 must use grouped
-         * verifier implementations that preserve per-row projection math and
-         * top-k accumulation order.  This function refuses unsupported GPU
+         * numerically equivalent to ordinary one-token decode. M=1 therefore
+         * enters the normal decode route, while every positive multi-row M
+         * uses grouped implementations that preserve per-row projection math
+         * and top-k accumulation order. This function refuses unsupported GPU
          * requests rather than hiding them behind row replay.
          */
         bool executeDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
 
         /**
-         * @brief CPU grouped verifier executor for routed MoE experts.
+         * @brief Execute all CPU multi-row routed work through grouped exact kernels.
          *
-         * The CPU route keeps sparse MoE economics by batching route slots by
-         * expert, using the CPU NativeVNNI/floating grouped verifier GEMV hooks
-         * for gate/up and SwiGLU/down work.  It stores every route-slot result
-         * separately and performs the final row accumulation in original top-k
-         * order so the output is serial-decode equivalent without calling the
-         * single-row stage in a loop.
+         * The executor builds a flat CSR schedule without per-expert heap
+         * objects, consumes the router's canonical Q8 publication for every
+         * NativeVNNI expert bundle, and invokes one runtime-M gate/up and down
+         * operation per active expert.  Expert outputs remain separate until
+         * they are accumulated in original row/top-k order, so ordinary
+         * prefill and MTP verification are both serial-row byte-equivalent.
+         *
+         * @param ctx Active CPU device context.
+         * @param purpose Lifecycle policy selecting ordinary-prefill ownership
+         *                or verifier replica assignment and PerfStats labels.
+         * @return true after every local route slot has been computed and
+         *         accumulated; false on any invalid or unsupported contract.
          */
-        bool executeCPUGroupedDecodeEquivalentVerifierPrefill(IDeviceContext *ctx);
+        bool executeCPUGroupedDecodeEquivalentRows(
+            IDeviceContext *ctx,
+            CPUGroupedRowsPurpose purpose);
 
         void ensureGemmEnginesCached();
         bool ensureGemmEnginesForExperts(const std::vector<int> &expert_ids);
@@ -1142,6 +1403,36 @@ namespace llaminar2
          */
         bool refreshRuntimeGroupedDecodePlacement(bool preserve_capture_ready);
         bool refreshFixedTopologyGroupedPrefillPlacement();
+        /**
+         * @brief Validate the cold explicit-routing one-token capture contract.
+         *
+         * Heterogeneous ExpertOverlay followers receive router ids and weights
+         * directly in participant-local device tensors. They intentionally have
+         * no host mirror or MoE runtime table. This predicate admits that typed
+         * route only when fused mask-aware execution has every stable tensor and
+         * local expert engine it needs; it does not claim that pointer arrays or
+         * the immutable ownership mask have already been published.
+         */
+        bool supportsExplicitRoutingDecodeGraphCapturePreflight() const;
+
+        /**
+         * @brief Return whether explicit-routing fused decode is capture-ready.
+         *
+         * @return true after descriptor tables, scratch pointer arrays, and any
+         * participant ownership mask have been published on the exact graph
+         * stream.
+         */
+        bool isExplicitRoutingDecodeGraphCapturable() const;
+
+        /**
+         * @brief Publish graph-stable state for explicit-routing fused decode.
+         *
+         * This operation runs only before capture. It builds sparse global
+         * descriptor tables with entries for participant-local experts, uploads
+         * the immutable local ownership mask, and stages the backend's reusable
+         * gate/up and down pointer arrays. No routing values are read on the host.
+         */
+        bool prepareExplicitRoutingDecodeLaunchState(IMoEKernel *kernel);
         /**
          * @brief Mark the current fixed-topology mask as requiring publication.
          *
@@ -1184,14 +1475,12 @@ namespace llaminar2
         TensorBase *effectiveSafeCompositeSharedGateInput() const;
         bool executeSafeCombinedSharedVerifierComposite(IMoEKernel *kernel) const;
         bool executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens);
-        bool requestsTransferBackedCurrentBatchPrefillLLEP() const noexcept;
+        bool usesGraphPhasedCurrentBatchPrefillLLEP() const noexcept;
         bool hasValidCompactLLEPTransferBinding() const;
-        bool hasTransferBackedPrefillLLEP() const;
-        bool executeTransferBackedPrefillLLEPMovement(
+        bool executePrefixRuntimeRehydrationPayloadMovement(
             IMoEKernel *kernel,
             DeviceMoERebalanceStatus **transfer_status_out,
             DeviceMoERebalanceApplyStatus **apply_status_out,
-            PrefillLLEPTransferPurpose purpose,
             DeviceMoERebalanceTransferState *transfer_state_override =
                 nullptr) const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
@@ -1243,12 +1532,16 @@ namespace llaminar2
         mutable int grouped_gateup_desc_table_num_experts_ = 0;
         mutable int grouped_gateup_desc_table_d_model_ = 0;
         mutable int grouped_gateup_desc_table_intermediate_ = 0;
+        mutable DeviceMoEWeightFormat grouped_gateup_desc_table_weight_format_ =
+            DeviceMoEWeightFormat::NativeVNNI;
         bool grouped_gateup_desc_table_dirty_ = false;
 
         mutable int grouped_down_desc_table_id_ = -1;
         mutable int grouped_down_desc_table_num_experts_ = 0;
         mutable int grouped_down_desc_table_d_model_ = 0;
         mutable int grouped_down_desc_table_intermediate_ = 0;
+        mutable DeviceMoEWeightFormat grouped_down_desc_table_weight_format_ =
+            DeviceMoEWeightFormat::NativeVNNI;
         bool grouped_down_desc_table_dirty_ = false;
 
         mutable int combined_shared_desc_table_d_model_ = 0;
@@ -1515,13 +1808,45 @@ namespace llaminar2
          */
         mutable bool grouped_decode_launch_state_prepared_ = false;
 
+        /**
+         * @brief Resolve the three immutable prepared shared-expert GEMM engines.
+         *
+         * Resolution is allocation-free and may happen before a GPU stream is
+         * assigned. The engines receive the stage's exact stream immediately
+         * before launch preparation or arithmetic execution.
+         */
         void ensureGemmEnginesCached() const;
+        /**
+         * @brief Publish the one-entry typed gate/up table used by grouped decode.
+         *
+         * The prepared gate, up, and down engines are validated as one uniform
+         * NativeVNNI or FP16/BF16/FP32 family before the backend receives any
+         * descriptor. The backend owns the resulting graph-stable table.
+         *
+         * @param kernel Exact-stream-bound backend MoE kernel.
+         * @param d_model Gate/up reduction width.
+         * @param intermediate Gate/up output width.
+         * @return True when the immutable table is available for capture.
+         */
         bool ensureSharedGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
+        /**
+         * @brief Publish the one-entry typed down table used by grouped decode.
+         *
+         * @param kernel Exact-stream-bound backend MoE kernel.
+         * @param d_model Down-projection output width.
+         * @param intermediate Down-projection reduction width.
+         * @return True when the immutable table is available for capture.
+         */
         bool ensureSharedGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
+        /** @return Whether this stage is a GPU grouped-verifier prefill launch. */
         bool shouldUseGroupedVerifierPrefillRoute() const;
+        /** @return Whether verifier rows must use the serial decode oracle. */
         bool shouldUseDecodeEquivalentVerifierPrefill() const;
+        /** @return Whether ordinary single-row execution uses grouped tables. */
         bool shouldUseGroupedDecodeRoute() const;
+        /** @brief Execute the grouped verifier-prefill route when selected. */
         bool tryGroupedVerifierPrefill(IMoEKernel *kernel, int d_model, int intermediate) const;
+        /** @brief Execute the grouped single-row route when selected. */
         bool tryGroupedDecode(IMoEKernel *kernel, int d_model, int intermediate) const;
         /**
          * @brief Validate the graph-owned scratch capacity before execution.
@@ -1587,6 +1912,21 @@ namespace llaminar2
     class SharedExpertGateStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
+        /**
+         * @brief Immutable ownership of the shared-gate arithmetic.
+         *
+         * A normal all-reduce leaves a complete row on every participant, so
+         * each graph owns its local gate. A rooted reduction leaves valid bytes
+         * only on its fixed root; the sibling node must then remain a capture-
+         * symmetric no-op until the root broadcasts the final combined row.
+         */
+        enum class ExecutionRole
+        {
+            ReplicatedOwner, ///< Every graph owns a complete shared row.
+            RootOwner,       ///< This graph owns the rooted reduction result.
+            NonRootObserver  ///< Symmetric graph node with no tensor authority.
+        };
+
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -1613,6 +1953,9 @@ namespace llaminar2
              * capture and replay; the stage never mirrors or uploads its value.
              */
             const int32_t *active_row_count_device = nullptr;
+
+            /** Typed arithmetic authority selected by graph lowering. */
+            ExecutionRole execution_role = ExecutionRole::ReplicatedOwner;
 
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
@@ -1655,6 +1998,12 @@ namespace llaminar2
         }
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
+        CoherencePolicy coherencePolicy() const override
+        {
+            return params_.execution_role == ExecutionRole::NonRootObserver
+                       ? CoherencePolicy::NONE
+                       : CoherencePolicy::FULL;
+        }
         StageDumpInfo buildDumpInfoImpl() const override;
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;
@@ -1663,12 +2012,30 @@ namespace llaminar2
         DeviceWorkspaceManager *getWorkspace() const override;
 
         /**
+         * @return Immutable graph-local arithmetic authority selected during lowering.
+         *
+         * Graph validators use this typed view to prove that a non-root
+         * participant's symmetric stage cannot read or write root-owned
+         * shared/routed tensors.
+         */
+        [[nodiscard]] ExecutionRole executionRole() const noexcept
+        {
+            return params_.execution_role;
+        }
+
+        /**
          * @brief Reset the private backend object after a hard graph reset.
          */
         void invalidateKernelDynamicState() override;
 
     private:
         Params params_;
+
+        /** @return Whether this graph owns and may mutate the shared row. */
+        [[nodiscard]] bool ownsGateArithmetic() const noexcept
+        {
+            return params_.execution_role != ExecutionRole::NonRootObserver;
+        }
 
         TensorBase *effectiveGateInput() const;
         bool gateInputReadyForGraphCapture() const;
@@ -1708,7 +2075,10 @@ namespace llaminar2
     {
         Unspecified,
         RootOwner,
-        NonRootParticipant
+        NonRootParticipant,
+
+        /** Every participant owns reduction after an allreduce of route slots. */
+        AllreduceParticipant,
     };
 
     /**
@@ -1732,15 +2102,36 @@ namespace llaminar2
             STAGE_PARAMS_COMMON_FIELDS;
 
             TensorBase *canonical_route_contributions = nullptr;
+            /** Router weights required by unweighted CPU canonical slots. */
+            TensorBase *routing_weights = nullptr;
             TensorBase *output = nullptr;
             int seq_len = 0;
             int top_k = 0;
             int d_model = 0;
+            /** Exact arithmetic encoded by canonical route slots. */
+            MoECanonicalRouteArithmeticPolicy canonical_route_arithmetic =
+                MoECanonicalRouteArithmeticPolicy::Unspecified;
+            /** Dense GPU slots or packed indexed CPU records. */
+            MoECanonicalRoutePublicationLayout canonical_route_layout =
+                MoECanonicalRoutePublicationLayout::Unspecified;
             /** Explicit graph-local arithmetic ownership; never inferred. */
             MoECanonicalRouteReductionRole reduction_role =
                 MoECanonicalRouteReductionRole::Unspecified;
+            /**
+             * Optional production sparse fabric replacing a dense LocalTP
+             * route-slot reduction. Presence makes every continuation
+             * participant active: peers publish assigned slots and the root
+             * acquires/folds them in original router order.
+             */
+            std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
+                node_local_route_exchange;
+            /** Stable device pointer to the authoritative per-slot owner ids. */
+            const std::int32_t *route_participant_ids = nullptr;
+            /** Stable logical participant represented by this device graph. */
+            int route_participant_id = -1;
             BufferId canonical_route_contributions_buffer_id =
                 BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+            BufferId routing_weights_buffer_id = BufferId::MOE_EXPERT_WEIGHTS;
             BufferId output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
         };
 
@@ -1758,6 +2149,20 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
+        /**
+         * @brief Certify the statically non-owning rooted-reduction role.
+         *
+         * A `NonRootParticipant` never reads, writes, publishes, or launches a
+         * reducer; it waits for the following rooted broadcast. This immutable
+         * role can therefore join the root's reduction capture wave passively
+         * without recording an empty backend graph.
+         */
+        bool isPassiveGraphCaptureNoOp() const override
+        {
+            return !params_.node_local_route_exchange &&
+                   params_.reduction_role ==
+                   MoECanonicalRouteReductionRole::NonRootParticipant;
+        }
         bool supportsGraphCaptureAfterLaunchPreparation() const override;
         /**
          * @brief Admit cold exact-shape prefill before the reducer owns its kernel wrapper.
@@ -1795,18 +2200,22 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         /**
-         * @brief Declare coherence only on the participant that runs arithmetic.
+         * @brief Declare coherence on every participant that runs arithmetic.
          *
-         * The non-root node exists solely to keep the LocalTP DAG symmetric. It
-         * owns no buffers and performs no memory access, so asking the executor
-         * to apply FULL coherence there would contradict its empty declarative
-         * contract. The root retains ordinary input/output coherence around the
-         * production reduction kernel.
+         * A rooted GPU transaction executes arithmetic only on `RootOwner`;
+         * its non-root nodes are symmetric declarative no-ops. A CPU route-slot
+         * allreduce leaves a complete slot tensor on every participant, so each
+         * `AllreduceParticipant` performs the ordered FMA fold and owns normal
+         * input/output coherence as well.
          */
         CoherencePolicy coherencePolicy() const override
         {
-            return params_.reduction_role ==
-                           MoECanonicalRouteReductionRole::RootOwner
+            return params_.node_local_route_exchange ||
+                           params_.reduction_role ==
+                           MoECanonicalRouteReductionRole::RootOwner ||
+                           params_.reduction_role ==
+                               MoECanonicalRouteReductionRole::
+                                   AllreduceParticipant
                        ? CoherencePolicy::FULL
                        : CoherencePolicy::NONE;
         }
@@ -1820,8 +2229,132 @@ namespace llaminar2
 
     private:
         Params params_;
+        /**
+         * Root-owned record lookup allocated once with graph construction.
+         * Entry `i` is the gathered record containing original route slot `i`.
+         */
+        std::vector<int32_t> packed_record_for_route_slot_;
+        /** Root-device copy of endpoint-correct mapped peer descriptors. */
+        std::unique_ptr<TensorBase> node_local_peer_bindings_storage_;
+        /** Root-device semantic status shared by acquire/validate/fold nodes. */
+        std::unique_ptr<TensorBase> node_local_validation_storage_;
+        /** Capture-stable producer alias for a non-root participant. */
+        MoENodeLocalRoutePeerDeviceBinding node_local_producer_binding_{};
+        /** Number of descriptors in root storage; zero on producer graphs. */
+        std::uint32_t node_local_peer_count_ = 0u;
         mutable std::unique_ptr<IMoEKernel> owned_moe_kernel_;
         mutable IMoEKernel *moe_kernel_ = nullptr;
+    };
+
+    /**
+     * @brief Gather sparse indexed CPU route rows to one fixed TP root.
+     *
+     * The preceding expert stage writes allocation-free packed records into the
+     * canonical publication tensor. This stage gathers only those active
+     * records through the cross-rank CPU TP communicator and publishes the
+     * gathered record count in the same fixed trailer. Non-root participants
+     * retain their local bytes but do not read them after this node.
+     */
+    class MoECanonicalRouteGatherStage final : public IComputeStage
+    {
+    public:
+        /** @brief Immutable graph-bound packed-gather parameters. */
+        struct Params
+        {
+            STAGE_PARAMS_COMMON_FIELDS;
+
+            ITPContext *tp_ctx = nullptr;
+            TensorBase *packed_route_records = nullptr;
+            int seq_len = 0;
+            int top_k = 0;
+            int d_model = 0;
+            int root_participant = 0;
+            std::string stage_name;
+            BufferId packed_route_records_buffer_id =
+                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
+        };
+
+        explicit MoECanonicalRouteGatherStage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::ROOTED_COLLECTIVE;
+        }
+        std::string name() const override
+        {
+            return "moe_canonical_route_gather";
+        }
+        size_t estimatedFlops() const override { return 0u; }
+        bool supportsBackend(ComputeBackendType backend) const override;
+        bool isGraphCapturable() const override { return false; }
+        StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::FULL;
+        }
+        StageDumpInfo buildDumpInfoImpl() const override;
+
+        /** @brief Return immutable graph parameters for focused tests. */
+        [[nodiscard]] const Params &params() const noexcept { return params_; }
+
+    private:
+        Params params_;
+    };
+
+    /**
+     * @brief Broadcast the compact canonical CPU MoE result from its root.
+     *
+     * Only the exact active `[seq_len, d_model]` prefix is transported. The
+     * stage follows the root-only ordered reducer explicitly in the graph, so
+     * every participant consumes the same ownership-invariant bytes without
+     * broadcasting bucket-capacity tail storage.
+     */
+    class MoECanonicalOutputBroadcastStage final : public IComputeStage
+    {
+    public:
+        /** @brief Immutable graph-bound compact-broadcast parameters. */
+        struct Params
+        {
+            STAGE_PARAMS_COMMON_FIELDS;
+
+            ITPContext *tp_ctx = nullptr;
+            TensorBase *output = nullptr;
+            int seq_len = 0;
+            int d_model = 0;
+            int root_participant = 0;
+            std::string stage_name;
+            BufferId output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+        };
+
+        explicit MoECanonicalOutputBroadcastStage(Params params);
+
+        bool execute(IDeviceContext *ctx) override;
+        ComputeStageType type() const override
+        {
+            return ComputeStageType::ROOTED_COLLECTIVE;
+        }
+        std::string name() const override
+        {
+            return "moe_canonical_output_broadcast";
+        }
+        size_t estimatedFlops() const override { return 0u; }
+        bool supportsBackend(ComputeBackendType backend) const override;
+        bool isGraphCapturable() const override { return false; }
+        StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
+        CoherencePolicy coherencePolicy() const override
+        {
+            return CoherencePolicy::FULL;
+        }
+        StageDumpInfo buildDumpInfoImpl() const override;
+
+        /** @brief Return immutable graph parameters for focused tests. */
+        [[nodiscard]] const Params &params() const noexcept { return params_; }
+
+    private:
+        Params params_;
     };
 
     /**

@@ -1,18 +1,18 @@
 /**
  * @file CUDARingKVCacheTQ.h
- * @brief CUDA ring KV cache with selectable TQ8-K/TQ4-V or TQ8-K/TQ8-V storage.
+ * @brief CUDA ring KV cache with AQ8 keys and selectable TQ4/TQ8 values.
  * @author David Sanftenberg
  *
  * Asymmetric precision ring buffer cache:
- * - K projections stored as TQ8Block (8-bit Lloyd-Max, 256 centroids)
+ * - K projections stored as AttentionKeyQ8Block (cubic-companded signed int8)
  * - V projections stored as TQ4Block (4-bit Lloyd-Max, 16 centroids)
  *
- * Quantization happens on-GPU during append (FP32 → TQ8/TQ4).
- * Dequantization happens on-GPU during read (TQ8/TQ4 → FP32) with
+ * Quantization happens on-GPU during append (FP32 → AQ8/TQ4-or-TQ8).
+ * Dequantization happens on-GPU during read with optional fused RoPE for K.
  * optional fused RoPE for K.
  *
  * Memory layout per position:
- *   K: [n_kv_heads] TQ8Block<D>  (72 bytes each for D=64)
+ *   K: [n_kv_heads] AttentionKeyQ8Block<D>  (68 bytes each for D=64)
  *   V: [n_kv_heads] TQ4Block<D>  (40 bytes each for D=64)
  *
  * vs FP16 cache:
@@ -51,7 +51,7 @@ namespace llaminar2
     /**
      * @brief CUDA ring buffer KV cache with TurboQuant asymmetric precision.
      *
-     * K is stored as TQ8Block<D>, V as TQ4Block<D>.
+     * K is stored as AttentionKeyQ8Block<D>; V uses TQ4Block<D> or TQ8Block<D>.
      * Implements IKVCache for integration with the pipeline.
      */
     class CUDARingKVCacheTQ : public CUDARingKVCacheBase,
@@ -73,7 +73,7 @@ namespace llaminar2
                           int n_kv_heads, int head_dim,
                           const TurboQuantContext *tq_ctx,
                           int device_id = 0,
-                          TurboQuantKVMode mode = TurboQuantKVMode::TQ8_K_TQ4_V);
+                          TurboQuantKVMode mode = TurboQuantKVMode::AQ8_K_TQ4_V);
 
         /**
          * @brief Construct a LocalTP shard of the asymmetric TQ cache.
@@ -98,7 +98,7 @@ namespace llaminar2
                           int n_kv_heads, int local_n_kv_heads, int kv_head_start,
                           int head_dim, const TurboQuantContext *tq_ctx,
                           int device_id = 0,
-                          TurboQuantKVMode mode = TurboQuantKVMode::TQ8_K_TQ4_V);
+                          TurboQuantKVMode mode = TurboQuantKVMode::AQ8_K_TQ4_V);
 
         ~CUDARingKVCacheTQ();
 
@@ -110,7 +110,7 @@ namespace llaminar2
         // IKVCache Interface
         // =====================================================================
 
-        ActivationPrecision k_precision() const override { return ActivationPrecision::TQ8; }
+        ActivationPrecision k_precision() const override { return ActivationPrecision::AQ8; }
         ActivationPrecision v_precision() const override
         {
             return turboQuantValuePrecision(mode_);
@@ -156,7 +156,7 @@ namespace llaminar2
             ITensor **out_v,
             const KVReadParams &read) override;
 
-        // Append (quantizes FP32 input to TQ8/TQ4 on GPU)
+        // Append (quantizes FP32 input to AQ8/TQ4-or-TQ8 on GPU)
         bool append(int layer, int seq_idx,
                     const ITensor *K, const ITensor *V,
                     int num_tokens) override;
@@ -166,7 +166,7 @@ namespace llaminar2
                               int num_tokens, void *gpu_stream) override;
 
         /**
-         * @brief Publish FP32 MTP verifier rows directly into TQ8/TQ4 storage.
+         * @brief Publish FP32 MTP verifier rows directly into AQ8/TQ storage.
          *
          * This is a true grouped implementation: one fused CUDA grid quantizes
          * all K and V rows and writes their wrapped ring destinations.  During
@@ -239,7 +239,7 @@ namespace llaminar2
         /// Get the GPU rotation matrices
         const CUDATurboQuantRotations &rotations() const { return rotations_; }
 
-        /// Get raw TQ8 K ring buffer for a layer/seq (for fused attention)
+        /// Get raw AQ8 K ring buffer for a layer/seq (for fused attention)
         const void *raw_k_cache(int layer, int seq_idx = 0) const { return entries_[layer][seq_idx].d_K; }
         /// Get raw TQ4 V ring buffer for a layer/seq (for fused attention)
         const void *raw_v_cache(int layer, int seq_idx = 0) const { return entries_[layer][seq_idx].d_V; }
@@ -256,7 +256,7 @@ namespace llaminar2
                        ? (state.implementation_head - state.cached_tokens + max_seq_len_) % max_seq_len_
                        : state.implementation_head;
         }
-        /// Get K block size (bytes per TQ8Block<D>)
+        /// Get K block size (bytes per AttentionKeyQ8Block<D>)
         size_t k_block_size() const { return k_block_size_; }
         /// Get V block size (bytes per TQ4Block<D>)
         size_t v_block_size() const { return v_block_size_; }
@@ -265,8 +265,8 @@ namespace llaminar2
         // TQ-specific members (core params are in CUDARingKVCacheBase)
 
         // Block sizes (depends on head_dim)
-        size_t k_block_size_; ///< sizeof(TQ8Block<D>)
-        size_t v_block_size_; ///< sizeof(TQ4Block<D>)
+        size_t k_block_size_; ///< sizeof(AttentionKeyQ8Block<D>)
+        size_t v_block_size_; ///< sizeof(TQ4Block<D>) or sizeof(TQ8Block<D>)
 
         // Per-position storage units
         size_t k_pos_bytes_; ///< n_kv_heads * k_block_size
@@ -287,8 +287,9 @@ namespace llaminar2
         // =====================================================================
         struct TQEntry
         {
-            void *d_K = nullptr; ///< TQ8 blocks: [max_seq_len * n_kv_heads] TQ8Block<D>
+            void *d_K = nullptr; ///< AQ8 blocks: [max_seq_len * n_kv_heads] AttentionKeyQ8Block<D>
             void *d_V = nullptr; ///< TQ4 blocks: [max_seq_len * n_kv_heads] TQ4Block<D>
+            float *d_K_anchor = nullptr; ///< Request-local pre-RoPE key basis: [n_kv_heads, D].
         };
 
         // [n_layers][batch_size]
@@ -297,6 +298,7 @@ namespace llaminar2
         /// Cache-owned immutable entry topology for grouped device reads.
         void **d_batched_k_entry_table_ = nullptr;
         void **d_batched_v_entry_table_ = nullptr;
+        void **d_batched_k_anchor_table_ = nullptr;
         /// Stable wrappers over the grouped FP16 payload in layer scratch.
         std::unique_ptr<ITensor> batched_k_view_;
         std::unique_ptr<ITensor> batched_v_view_;

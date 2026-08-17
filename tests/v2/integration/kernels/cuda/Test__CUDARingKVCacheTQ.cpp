@@ -33,10 +33,10 @@
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "kernels/cuda/kvcache/CUDARingKVCacheTQ.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
+#include "kernels/cpu/turboquant/TurboQuantDequantizeTQ8.h"
+#include "kernels/cpu/turboquant/TurboQuantQuantizeTQ8.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/Tensors.h"
-#include "tensors/TQ8Tensor.h"
-#include "tensors/TQ4Tensor.h"
 #include "tensors/GpuTensorView.h"
 #include "utils/Logger.h"
 
@@ -136,6 +136,14 @@ namespace
             sum += diff * diff;
         }
         return static_cast<float>(sum / n);
+    }
+
+    /** @brief Map IEEE FP16 bits to adjacent monotonic integer codes. */
+    int fp16OrderedCode(uint16_t bits)
+    {
+        return (bits & 0x8000U) != 0
+                   ? 0x8000 - static_cast<int>(bits & 0x7fffU)
+                   : 0x8000 + static_cast<int>(bits);
     }
 
     // Upload FP32 host vector to GPU, returning device pointer
@@ -1154,107 +1162,116 @@ TEST(Test__CUDARingKVCacheTQ, HostCreatedTensorIsPreparedOnDeviceBeforeAppend)
     EXPECT_GT(cos_k, 0.94f) << "Prepared device append quality too low";
 }
 
-// =============================================================================
-// 15. Cross-Path: CPU TQ Quantize → GPU Ring Buffer → GPU Dequant
-// =============================================================================
-
-TEST(Test__CUDARingKVCacheTQ, CrossPath_CPUQuantize_GPUDequant)
+/**
+ * @brief Compare production fused TQ8-value append bytes with the scalar codec.
+ *
+ * Grouped cache tests compare CUDA against another CUDA path and therefore
+ * cannot detect a backend-wide encoder defect.  This regression reads the
+ * physical value blocks written by the real ring append and checks every
+ * Lloyd-Max index against the scalar mathematical oracle using the same
+ * deterministic layer/head rotation hierarchy.
+ */
+TEST(Test__CUDARingKVCacheTQ, TQ8ValuePhysicalCodecMatchesScalarOracle)
 {
     if (!hasCUDA())
         GTEST_SKIP() << "CUDA not available";
 
-    // This test exercises prepared device TQ payload publication:
-    // FP32 → CPU TQ8 quantize → explicit device preparation → D2D ring publish → GPU dequant → FP16
-    // and compares against CPU round-trip:
-    // FP32 → CPU TQ8 quantize → CPU TQ8 dequant → FP32
-
-    const int num_tokens = 10;
-    const int n_kv_heads = 2;
-    const int head_dim = 64;
-    const int kv_dim = n_kv_heads * head_dim;
+    constexpr int num_tokens = 7;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 128;
+    constexpr int kv_dim = n_kv_heads * head_dim;
 
     TurboQuantContext tq_ctx(head_dim, 42);
-    CUDARingKVCacheTQ cache(1, 1, 64, n_kv_heads, head_dim, &tq_ctx, 0);
+    CUDARingKVCacheTQ cache(
+        /*n_layers=*/1, /*batch_size=*/1, /*max_seq_len=*/16,
+        n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0,
+        TurboQuantKVMode::AQ8_K_TQ8_V);
     KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
     ScopedCudaStream stream;
 
-    // Generate random FP32 data
-    auto h_K = generateRandomFP32(num_tokens * kv_dim, 777);
-    auto h_V = generateRandomFP32(num_tokens * kv_dim, 888);
-
-    // --- CPU quantize K to TQ8, V to TQ4 ---
-    std::vector<size_t> shape{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)};
-    auto k_tq8 = std::make_shared<TQ8Tensor>(shape, head_dim);
-    auto v_tq4 = std::make_shared<TQ4Tensor>(shape, head_dim);
-
-    const auto &layer_ctx = tq_ctx.for_layer(0); // layer 0
-    k_tq8->copyFrom_fp32_rows(h_K.data(), num_tokens, layer_ctx);
-    v_tq4->copyFrom_fp32_rows(h_V.data(), num_tokens, layer_ctx);
-
-    // --- CPU dequant (reference) ---
-    std::vector<float> k_cpu_deq(num_tokens * kv_dim);
-    k_tq8->dequantize_to_fp32(k_cpu_deq.data(), layer_ctx);
-
-    // --- GPU path: prepare and publish TQ8/TQ4 blocks through one D2D kernel ---
-    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k_tq8.get(), v_tq4.get(), num_tokens, stream));
+    const auto host_k = generateRandomFP32(num_tokens * kv_dim, 771);
+    const auto host_v = generateRandomFP32(num_tokens * kv_dim, 772);
+    float *device_k = uploadToGPU(host_k);
+    float *device_v = uploadToGPU(host_v);
+    GpuTensorView k_view(
+        device_k, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    GpuTensorView v_view(
+        device_v, num_tokens, kv_dim, TensorType::FP32, DeviceId::cuda(0));
+    ASSERT_TRUE(appendWithTestStream(
+        cache, /*layer=*/0, /*seq_idx=*/0,
+        &k_view, &v_view, num_tokens, stream));
     stream.synchronize();
-    EXPECT_EQ(cache.get_cached_tokens(0, 0), num_tokens);
 
-    // --- GPU dequant via get_k ---
-    const ITensor *out_k = cache.get_k(0, 0);
-    ASSERT_NE(out_k, nullptr);
-    auto k_gpu_deq = downloadFP16ToFP32(out_k->gpu_data_ptr(), num_tokens * kv_dim);
+    std::vector<TQ8Block_128> actual(num_tokens * n_kv_heads);
+    ASSERT_EQ(
+        cudaMemcpy(actual.data(), cache.raw_v_cache(/*layer=*/0),
+                   actual.size() * sizeof(TQ8Block_128),
+                   cudaMemcpyDeviceToHost),
+        cudaSuccess);
 
-    // --- Compare: Original FP32 vs CPU dequant ---
-    float cos_orig_cpu = computeCosineSimilarity(h_K.data(), k_cpu_deq.data(), num_tokens * kv_dim);
-    // --- Compare: Original FP32 vs GPU dequant ---
-    float cos_orig_gpu = computeCosineSimilarity(h_K.data(), k_gpu_deq.data(), num_tokens * kv_dim);
-    // --- Compare: CPU dequant vs GPU dequant ---
-    float cos_cpu_gpu = computeCosineSimilarity(k_cpu_deq.data(), k_gpu_deq.data(), num_tokens * kv_dim);
+    const ITensor *decoded_v = cache.get_v(/*layer=*/0, /*seq_idx=*/0);
+    ASSERT_NE(decoded_v, nullptr);
+    stream.synchronize();
+    std::vector<uint16_t> decoded_v_bits(num_tokens * kv_dim);
+    ASSERT_EQ(
+        cudaMemcpy(decoded_v_bits.data(), decoded_v->gpu_data_ptr(),
+                   decoded_v_bits.size() * sizeof(uint16_t),
+                   cudaMemcpyDeviceToHost),
+        cudaSuccess);
 
-    LOG_INFO("[CrossPath] FP32 vs CPU_dequant: " << cos_orig_cpu);
-    LOG_INFO("[CrossPath] FP32 vs GPU_dequant: " << cos_orig_gpu);
-    LOG_INFO("[CrossPath] CPU_dequant vs GPU_dequant: " << cos_cpu_gpu);
-
-    // Per-token breakdown
-    for (int t = 0; t < num_tokens; ++t)
+    alignas(64) float scratch0[head_dim];
+    alignas(64) float scratch1[head_dim];
+    for (int token = 0; token < num_tokens; ++token)
     {
-        float cos_cpu = computeCosineSimilarity(
-            h_K.data() + t * kv_dim, k_cpu_deq.data() + t * kv_dim, kv_dim);
-        float cos_gpu = computeCosineSimilarity(
-            h_K.data() + t * kv_dim, k_gpu_deq.data() + t * kv_dim, kv_dim);
-        float cos_xp = computeCosineSimilarity(
-            k_cpu_deq.data() + t * kv_dim, k_gpu_deq.data() + t * kv_dim, kv_dim);
-        LOG_INFO("[CrossPath] token=" << t
-                                      << " orig_vs_cpu=" << cos_cpu
-                                      << " orig_vs_gpu=" << cos_gpu
-                                      << " cpu_vs_gpu=" << cos_xp);
+        for (int head = 0; head < n_kv_heads; ++head)
+        {
+            const auto &head_ctx =
+                tq_ctx.for_layer(/*layer=*/0).for_layer(head);
+            TQ8Block_128 expected{};
+            turboquant_quantize_tq8_scalar<head_dim>(
+                host_v.data() +
+                    (static_cast<size_t>(token) * n_kv_heads + head) * head_dim,
+                head_ctx, expected, scratch0, scratch1);
+            const auto &observed =
+                actual[static_cast<size_t>(token) * n_kv_heads + head];
+            EXPECT_NEAR(observed.norm, expected.norm, 2.0e-6f)
+                << "token=" << token << " head=" << head;
+            EXPECT_NEAR(
+                observed.reconstruction_norm,
+                expected.reconstruction_norm,
+                2.0e-6f)
+                << "token=" << token << " head=" << head;
+            for (int coordinate = 0; coordinate < head_dim; ++coordinate)
+            {
+                EXPECT_EQ(observed.indices[coordinate], expected.indices[coordinate])
+                    << "token=" << token << " head=" << head
+                    << " coordinate=" << coordinate;
+            }
+
+
+            alignas(64) float expected_decoded[head_dim];
+            turboquant_dequantize_tq8_scalar<head_dim>(
+                observed, head_ctx, expected_decoded, scratch0);
+            for (int coordinate = 0; coordinate < head_dim; ++coordinate)
+            {
+                const uint16_t expected_bits = __half_as_ushort(
+                    __float2half_rn(expected_decoded[coordinate]));
+                const size_t output_index =
+                    (static_cast<size_t>(token) * n_kv_heads + head) *
+                        head_dim +
+                    coordinate;
+                const int fp16_ulp_distance = std::abs(
+                    fp16OrderedCode(decoded_v_bits[output_index]) -
+                    fp16OrderedCode(expected_bits));
+                EXPECT_LE(fp16_ulp_distance, 1)
+                    << "decoded token=" << token << " head=" << head
+                    << " coordinate=" << coordinate;
+            }
+        }
     }
 
-    // Print first few values for manual comparison
-    LOG_INFO("[CrossPath] First 8 FP32 values: "
-             << h_K[0] << "," << h_K[1] << "," << h_K[2] << "," << h_K[3]
-             << "," << h_K[4] << "," << h_K[5] << "," << h_K[6] << "," << h_K[7]);
-    LOG_INFO("[CrossPath] First 8 CPU dequant: "
-             << k_cpu_deq[0] << "," << k_cpu_deq[1] << "," << k_cpu_deq[2] << "," << k_cpu_deq[3]
-             << "," << k_cpu_deq[4] << "," << k_cpu_deq[5] << "," << k_cpu_deq[6] << "," << k_cpu_deq[7]);
-    LOG_INFO("[CrossPath] First 8 GPU dequant: "
-             << k_gpu_deq[0] << "," << k_gpu_deq[1] << "," << k_gpu_deq[2] << "," << k_gpu_deq[3]
-             << "," << k_gpu_deq[4] << "," << k_gpu_deq[5] << "," << k_gpu_deq[6] << "," << k_gpu_deq[7]);
-
-    // CPU dequant vs GPU dequant should be very close (both dequant same blocks)
-    EXPECT_GT(cos_cpu_gpu, 0.999f)
-        << "CPU dequant and GPU dequant of SAME TQ8 blocks should match closely";
-
-    // Both paths should have similar quality vs original
-    EXPECT_GT(cos_orig_cpu, 0.97f) << "CPU TQ8 round-trip quality too low";
-    EXPECT_GT(cos_orig_gpu, 0.97f) << "GPU TQ8 cross-path quality too low";
-
-    // Quality gap should be small (< 0.02)
-    float quality_gap = std::abs(cos_orig_cpu - cos_orig_gpu);
-    EXPECT_LT(quality_gap, 0.02f)
-        << "Quality gap between CPU and GPU dequant paths is too large: "
-        << cos_orig_cpu << " vs " << cos_orig_gpu;
+    ASSERT_EQ(cudaFree(device_k), cudaSuccess);
+    ASSERT_EQ(cudaFree(device_v), cudaSuccess);
 }
 
 /**
@@ -1280,14 +1297,23 @@ TEST(Test__CUDARingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBy
     constexpr int n_kv_heads = 2;
     constexpr std::array<int, batch_size> expected_counts{6, 4};
 
-    for (const int head_dim : {64, 128})
+    for (const TurboQuantKVMode mode : {
+             TurboQuantKVMode::AQ8_K_Q8_1_V,
+             TurboQuantKVMode::AQ8_K_TQ8_V,
+             TurboQuantKVMode::AQ8_K_TQ4_V})
     {
-        SCOPED_TRACE("head_dim=" + std::to_string(head_dim));
+      for (const int head_dim : {64, 128})
+      {
+        SCOPED_TRACE(
+            std::string("mode=") + turboQuantKVModeName(mode) +
+            " head_dim=" + std::to_string(head_dim));
         const int kv_dim = n_kv_heads * head_dim;
         TurboQuantContext tq_ctx(head_dim, 42);
         CUDARingKVCacheTQ cache(
             /*n_layers=*/1, batch_size, max_seq_len,
-            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+            n_kv_heads, head_dim,
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
+            /*device_id=*/0, mode);
         KVCacheTestWorkspaceBinding workspace(cache, DeviceId::cuda(0));
         ScopedCudaStream stream;
         std::vector<float *> allocations;
@@ -1404,17 +1430,19 @@ TEST(Test__CUDARingKVCacheTQ, CapturedResidentRequestBatchMatchesScalarDequantBy
                             scalar_k[request].data(),
                             live_elements * sizeof(uint16_t)),
                 0)
-                << "TQ8 K grouped bytes differ for request " << request;
+                << "AQ8 K grouped bytes differ for request " << request;
             EXPECT_EQ(
                 std::memcmp(actual_v.data() + request_offset,
                             scalar_v[request].data(),
                             live_elements * sizeof(uint16_t)),
                 0)
-                << "TQ4 V grouped bytes differ for request " << request;
+                << turboQuantKVModeName(mode)
+                << " V grouped bytes differ for request " << request;
         }
 
         ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
         ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+      }
     }
 }
 
@@ -1441,9 +1469,16 @@ TEST(Test__CUDARingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
     constexpr std::array<int, batch_size> initial_counts{captured_rows, 5};
     constexpr std::array<int, batch_size> final_counts{captured_rows + 1, 6};
 
-    for (const int head_dim : {64, 128})
+    for (const TurboQuantKVMode mode : {
+             TurboQuantKVMode::AQ8_K_Q8_1_V,
+             TurboQuantKVMode::AQ8_K_TQ8_V,
+             TurboQuantKVMode::AQ8_K_TQ4_V})
     {
-        SCOPED_TRACE("head_dim=" + std::to_string(head_dim));
+      for (const int head_dim : {64, 128})
+      {
+        SCOPED_TRACE(
+            std::string("mode=") + turboQuantKVModeName(mode) +
+            " head_dim=" + std::to_string(head_dim));
         const int kv_dim = n_kv_heads * head_dim;
         const size_t source_elements =
             static_cast<size_t>(batch_size) * captured_rows * kv_dim;
@@ -1473,10 +1508,14 @@ TEST(Test__CUDARingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
         ScopedCudaStream stream;
         CUDARingKVCacheTQ actual(
             /*n_layers=*/1, batch_size, max_seq_len,
-            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+            n_kv_heads, head_dim,
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
+            /*device_id=*/0, mode);
         CUDARingKVCacheTQ reference(
             /*n_layers=*/1, batch_size, max_seq_len,
-            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+            n_kv_heads, head_dim,
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
+            /*device_id=*/0, mode);
         KVCacheTestWorkspaceBinding actual_workspace(
             actual, DeviceId::cuda(0));
         KVCacheTestWorkspaceBinding reference_workspace(
@@ -1511,7 +1550,8 @@ TEST(Test__CUDARingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
             .seq_len = captured_rows,
             .request_sequence_lengths_device = device_lengths,
             .head_dim = head_dim,
-            .turboquant_ctx = &tq_ctx,
+            .turboquant_ctx =
+                turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
         });
         append_stage.setGPUStream(stream.opaque());
         append_stage.updateDynamicParams(/*pos_offset=*/0, captured_rows);
@@ -1662,17 +1702,19 @@ TEST(Test__CUDARingKVCacheTQ, CapturedUnequalRequestLengthsPreserveContinuationB
                 std::memcmp(
                     actual_k_bytes.data(), reference_k_bytes.data(), bytes),
                 0)
-                << "captured TQ8 K continuation changed live bytes";
+                << "captured AQ8 K continuation changed live bytes";
             EXPECT_EQ(
                 std::memcmp(
                     actual_v_bytes.data(), reference_v_bytes.data(), bytes),
                 0)
-                << "captured TQ4 V continuation changed live bytes";
+                << "captured " << turboQuantKVModeName(mode)
+                << " V continuation changed live bytes";
         }
 
         ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
         ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
         ASSERT_EQ(cudaFree(device_lengths), cudaSuccess);
+      }
     }
 }
 
@@ -1698,9 +1740,16 @@ TEST(Test__CUDARingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
     constexpr float rope_theta = 10000.0f;
     constexpr int position_start = 3;
 
-    for (const int head_dim : {64, 128})
+    for (const TurboQuantKVMode mode : {
+             TurboQuantKVMode::AQ8_K_Q8_1_V,
+             TurboQuantKVMode::AQ8_K_TQ8_V,
+             TurboQuantKVMode::AQ8_K_TQ4_V})
     {
-        SCOPED_TRACE("head_dim=" + std::to_string(head_dim));
+      for (const int head_dim : {64, 128})
+      {
+        SCOPED_TRACE(
+            std::string("mode=") + turboQuantKVModeName(mode) +
+            " head_dim=" + std::to_string(head_dim));
         const int kv_dim = n_kv_heads * head_dim;
         auto history_k_values = generateRandomFP32(
             static_cast<size_t>(history_rows) * kv_dim, 2701 + head_dim);
@@ -1721,10 +1770,14 @@ TEST(Test__CUDARingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
         ScopedCudaStream stream;
         CUDARingKVCacheTQ actual(
             /*n_layers=*/1, /*batch_size=*/1, max_seq_len,
-            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+            n_kv_heads, head_dim,
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
+            /*device_id=*/0, mode);
         CUDARingKVCacheTQ reference(
             /*n_layers=*/1, /*batch_size=*/1, max_seq_len,
-            n_kv_heads, head_dim, &tq_ctx, /*device_id=*/0);
+            n_kv_heads, head_dim,
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
+            /*device_id=*/0, mode);
         KVCacheTestWorkspaceBinding actual_workspace(
             actual, DeviceId::cuda(0));
         KVCacheTestWorkspaceBinding reference_workspace(
@@ -1745,7 +1798,8 @@ TEST(Test__CUDARingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
         read_params.n_kv_heads = n_kv_heads;
         read_params.head_dim = head_dim;
         read_params.rope_dim = head_dim;
-        read_params.turboquant_ctx = &tq_ctx;
+        read_params.turboquant_ctx =
+            turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr;
         read_params.gpu_stream = stream.opaque();
 
         KVCacheAppendStage append_stage({
@@ -1759,7 +1813,8 @@ TEST(Test__CUDARingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
             .batch_size = 1,
             .seq_len = 1,
             .head_dim = head_dim,
-            .turboquant_ctx = &tq_ctx,
+            .turboquant_ctx =
+                turboQuantValueUsesRotation(mode) ? &tq_ctx : nullptr,
         });
         append_stage.setGPUStream(stream.opaque());
         append_stage.updateDynamicDevicePositionIds(
@@ -1890,14 +1945,15 @@ TEST(Test__CUDARingKVCacheTQ, CapturedGroupedDequantReadsPostAppendDeviceState)
         };
         expectFP16WordsEqual(
             actual_k_bytes, reference_k_bytes,
-            "captured device-owned TQ8 K dequant");
+            "captured device-owned AQ8 K dequant");
         expectFP16WordsEqual(
             actual_v_bytes, reference_v_bytes,
-            "captured device-owned TQ4 V dequant");
+            "captured device-owned compressed V dequant");
 
         EXPECT_EQ(actual.get_cached_tokens(0, 0), final_rows);
         EXPECT_EQ(actual.ring_head(0, 0), final_rows);
         ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
         ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+      }
     }
 }

@@ -44,6 +44,12 @@ namespace llaminar2
         constexpr const char *DECODE_SWIGLU_SCALES = "moe_decode_swiglu_scales";
         constexpr const char *DECODE_EXPERT_IDS = "moe_grouped_decode_expert_ids";
         constexpr const char *DECODE_WEIGHTS = "moe_grouped_decode_weights";
+        constexpr const char *FIXED_DECODE_GATEUP_EXPERT_IDS =
+            "moe_fixed_decode_gateup_expert_ids";
+        constexpr const char *FIXED_DECODE_DOWN_EXPERT_IDS =
+            "moe_fixed_decode_down_expert_ids";
+        constexpr const char *FIXED_DECODE_DOWN_WEIGHTS =
+            "moe_fixed_decode_down_weights";
         constexpr const char *CUDA_ROUTING_DECODE_EXPERT_IDS = "cuda_moe_routing_decode_expert_ids";
         constexpr const char *CUDA_DECODE_GATEUP_GATE_PTRS = "cuda_moe_decode_gateup_gate_ptrs";
         constexpr const char *CUDA_DECODE_GATEUP_UP_PTRS = "cuda_moe_decode_gateup_up_ptrs";
@@ -107,6 +113,13 @@ namespace llaminar2
         constexpr int kGroupedDescriptorTableSlots =
             kMaximumMoELayersPerDevice *
             kMaximumGroupedDescriptorOwnersPerMoELayer;
+        /**
+         * @brief Maximum logical descriptor identities addressable in one route scope.
+         *
+         * This bounds the per-kernel lookup key only. Physical pointer arrays
+         * are assigned by exclusive graph-owner leases and deliberately do not
+         * reuse the immutable descriptor publication's numeric slot.
+         */
         constexpr int kRuntimePointerTableSlots = kGroupedDescriptorTableSlots;
         constexpr int kRuntimePointerWorkspaceScopes = 3;
         constexpr int kRuntimePointerWorkspaceEntries =
@@ -123,7 +136,7 @@ namespace llaminar2
         constexpr int kRouterGateCacheSlots = kMaximumMoELayersPerDevice;
         static_assert(
             kGroupedDescriptorTableSlots <= kRuntimePointerTableSlots,
-            "Every persistent descriptor identity needs a matching runtime pointer-table identity");
+            "Every descriptor identity must fit in the graph-owner pointer lookup key");
         /**
          * @brief Reusable row tile used by verifier split-K partial buffers.
          *
@@ -300,6 +313,21 @@ namespace llaminar2
                 decode_slots * static_cast<std::size_t>(intermediate_blocks) * sizeof(float));
             add(reqs, DECODE_EXPERT_IDS, decode_slots * sizeof(int));
             add(reqs, DECODE_WEIGHTS, decode_slots * sizeof(float));
+            /*
+             * Fixed-table graph metadata is immutable for one graph owner and
+             * cannot share request-routed decode scratch. The slot stride is
+             * the complete supported top-k so narrow singleton shared experts
+             * remain isolated from routed table owners.
+             */
+            const std::size_t fixed_decode_metadata_elements =
+                static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
+                kRuntimePointerArrayMaxTopK;
+            add(reqs, FIXED_DECODE_GATEUP_EXPERT_IDS,
+                fixed_decode_metadata_elements * sizeof(int));
+            add(reqs, FIXED_DECODE_DOWN_EXPERT_IDS,
+                fixed_decode_metadata_elements * sizeof(int));
+            add(reqs, FIXED_DECODE_DOWN_WEIGHTS,
+                fixed_decode_metadata_elements * sizeof(float));
             add(reqs, CUDA_ROUTING_DECODE_EXPERT_IDS, decode_slots * sizeof(int));
             add(reqs, CUDA_DECODE_GATEUP_GATE_PTRS,
                 static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *
@@ -418,10 +446,10 @@ namespace llaminar2
                     static_cast<std::size_t>(num_experts)) * sizeof(uint32_t));
             /*
              * Grouped decode pointer arrays are captured by value as device
-             * addresses. A full decode graph contains many MoE stages, so ROCm
-             * reserves deterministic graph-owned pointer slots; one mutable slot
-             * would make all captured stages replay the last staged scratch
-             * pointer set.
+             * addresses. A full decode graph contains many MoE stages, so each
+             * graph-local kernel retains an exclusive RAII slot. Immutable
+             * descriptor tables remain shareable without making captured stages
+             * replay another owner's last staged scratch pointers.
              */
             add(reqs, ROCM_DECODE_GATE_PTRS,
                 static_cast<std::size_t>(kRuntimePointerWorkspaceEntries) *

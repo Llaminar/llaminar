@@ -140,6 +140,10 @@ namespace llaminar2
          */
         bool forward(const int *tokens, int seq_len) override;
 
+        /** @brief Forward the sparse MoE request generation to the owned graph runner. */
+        bool setMoEOverlayCollectiveRequestGeneration(
+            uint64_t generation_id) override;
+
         /**
          * @brief Get logits from last forward pass
          * @return Pointer to logits [vocab_size], or nullptr if unavailable

@@ -30,7 +30,6 @@
 #include "config/OrchestrationConfig.h"
 #include "backends/DeviceId.h"
 #include "mocks/MockOrchestrationRunner.h"
-#include "mocks/MockMPIContext.h"
 #include "mocks/MockTokenizer.h"
 #include "nlohmann/json.hpp"
 
@@ -834,9 +833,8 @@ TEST(Test__BenchmarkRunnerCPU, DoesNotSkipLogitsGatherOnCPU)
 {
     auto runner = std::make_shared<MockCPUInferenceRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -864,9 +862,8 @@ TEST(Test__BenchmarkRunnerCPU, EnablesSkipLogitsGatherOnGPU)
 {
     auto runner = std::make_shared<MockGPUInferenceRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -899,9 +896,8 @@ TEST(Test__BenchmarkRunnerCPU, GPUPrefillTimingWaitsForDurableTerminalEvent)
     auto runner = std::make_shared<MockGPUInferenceRunner>();
     runner->setCompletionDelay(std::chrono::milliseconds(5));
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -927,9 +923,8 @@ TEST(Test__BenchmarkRunnerCPU, CPUDecodeSucceedsWithHostArgmax)
 {
     auto runner = std::make_shared<MockCPUInferenceRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -953,9 +948,8 @@ TEST(Test__BenchmarkRunnerCPU, GPUDecodeSucceedsWithDeviceArgmax)
 {
     auto runner = std::make_shared<MockGPUInferenceRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -975,9 +969,8 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureFailsWhenProbeNeverCap
     ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
     auto runner = std::make_shared<MockGPUInferenceRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1007,9 +1000,8 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureAcceptsCapturedProbe)
     runner->setAdvancePrefillGraphOnForward(true);
 
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1052,8 +1044,7 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphReplayRejectsMeasuredCapture)
     runner->setCaptureOnForward(8);
 
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1073,9 +1064,8 @@ TEST(Test__BenchmarkRunnerCPU, GPUDecodeFailsHardWhenDeviceArgmaxFails)
     auto runner = std::make_shared<MockGPUInferenceRunner>();
     runner->setDeviceArgmaxAvailable(false);
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1097,9 +1087,8 @@ TEST(Test__BenchmarkRunnerCPU, FailsBeforePrefillWhenPromptExceedsContext)
     auto tokenizer = createMockTokenizer();
     ON_CALL(*tokenizer, encode(_, _, _))
         .WillByDefault(Return(std::vector<int>{1, 2, 3, 4, 5, 6}));
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "This prompt intentionally does not fit";
@@ -1121,9 +1110,8 @@ TEST(Test__BenchmarkRunnerCPU, FailsBeforePrefillWhenPromptPlusDecodeExceedsCont
 {
     auto runner = std::make_shared<MockCPUInferenceRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Prompt fits, decode does not";
@@ -1146,9 +1134,8 @@ TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
 {
     auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1187,9 +1174,8 @@ TEST(Test__BenchmarkRunnerCPU, DeprecatedProfilerRecordsOrchestratedDecodeStepPe
 
     auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1224,9 +1210,8 @@ TEST(Test__BenchmarkRunnerCPU, PostWarmupCallbackSeesDecodeHistogramBeforePrefil
     ScopedGpuGraphsSetting force_gpu_graph_warmup(true);
     auto runner = std::make_shared<MockBenchmarkEventOrderRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
     bench.setPostWarmupCallback([runner]() {
         runner->recordCallback();
     });
@@ -1282,9 +1267,8 @@ TEST(Test__BenchmarkRunnerCPU, PerfStatsResetDropsPostWarmupMoEStatsBeforeMeasur
 
     auto runner = std::make_shared<MockPerfStatsMaintenanceRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
     bench.setPostWarmupCallback([]() {
         PerfStatsCollector::addCounter(
             "moe_rebalance",
@@ -1334,9 +1318,8 @@ TEST(Test__BenchmarkRunnerCPU, StaticWarmupRearmsPrefillGraphAfterDecodeWorkspac
     ScopedGpuGraphsSetting force_gpu_graph_warmup(true);
     auto runner = std::make_shared<MockBenchmarkEventOrderRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1381,9 +1364,8 @@ TEST(Test__BenchmarkRunnerCPU, PrefillOnlyBenchmarkSkipsDecodeHistogramCallback)
     ScopedGpuGraphsSetting force_gpu_graph_warmup(true);
     auto runner = std::make_shared<MockBenchmarkEventOrderRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
     bench.setPostWarmupCallback([runner]() {
         runner->recordCallback();
     });
@@ -1412,9 +1394,8 @@ TEST(Test__BenchmarkRunnerCPU, UsesRequestBatchedDecodeStepWhenMTPBatchRequested
 {
     auto runner = std::make_shared<MockBatchedOrchestratedDecodeRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1459,9 +1440,8 @@ TEST(Test__BenchmarkRunnerCPU, DeprecatedProfilerRecordsRequestBatchedDecodePerf
 
     auto runner = std::make_shared<MockBatchedOrchestratedDecodeRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1497,9 +1477,8 @@ TEST(Test__BenchmarkRunnerCPU, FailsRequestBatchedPrefillWhenRunnerDoesNotOptIn)
 {
     auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1524,9 +1503,8 @@ TEST(Test__BenchmarkRunnerCPU, FailsRequestBatchedDecodeWhenRunnerDoesNotOptIn)
 {
     auto runner = std::make_shared<MockBatchPrefillOnlyRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1614,9 +1592,8 @@ TEST(Test__BenchmarkRunnerCPU, UsesRequestedSamplingParamsForSpeculativeMTPBench
 {
     auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1643,9 +1620,8 @@ TEST(Test__BenchmarkRunnerCPU, AggregatesMeasuredIterationMTPStats)
 {
     auto runner = std::make_shared<MockMeasuredMTPStatsRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -1780,9 +1756,8 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     runner->snapshot.prefill_chunk_failures = 1;
 
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";
@@ -2161,14 +2136,17 @@ TEST(Test__BenchmarkRunnerCPU, RuntimeDebugParsesBenchmarkIterationOverrides)
     {
         ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
         ScopedEnv warmups("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+        ScopedEnv profiler_exit("LLAMINAR_PROFILER_NORMAL_EXIT", "1");
         mutableDebugEnv().runtime_debug.reload();
 
         EXPECT_EQ(debugEnv().runtime_debug.benchmark_iterations, 1);
         EXPECT_EQ(debugEnv().runtime_debug.benchmark_warmup_iterations, 0);
+        EXPECT_TRUE(debugEnv().runtime_debug.profiler_normal_exit);
     }
     mutableDebugEnv().runtime_debug.reload();
     EXPECT_EQ(debugEnv().runtime_debug.benchmark_iterations, 3);
     EXPECT_EQ(debugEnv().runtime_debug.benchmark_warmup_iterations, 1);
+    EXPECT_FALSE(debugEnv().runtime_debug.profiler_normal_exit);
 }
 
 TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredReset)
@@ -2234,9 +2212,8 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
 
     auto runner = std::make_shared<MockCPUInferenceRunner>();
     auto tokenizer = createMockTokenizer();
-    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
 
-    BenchmarkRunner bench(runner, tokenizer, mpi);
+    BenchmarkRunner bench(runner, tokenizer);
 
     OrchestrationConfig config;
     config.prompt = "Hello world";

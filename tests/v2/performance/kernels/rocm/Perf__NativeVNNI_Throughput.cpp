@@ -1158,7 +1158,7 @@ namespace
 
         for (int n = 0; n < N; ++n)
             for (int b = 0; b < blocks_per_row; ++b)
-                unpackable->packVnniBlock(ctx, n, b);
+                unpackable->packVnniBlock(ctx, n, n, b);
 
         return true;
     }

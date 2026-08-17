@@ -6,6 +6,7 @@
 #include "MoERuntimeTable.h"
 
 #include "DecodeExpertHistogram.h"
+#include "DeviceMoEOverlayEpochArena.h"
 #include "../../backends/BackendManager.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -28,7 +29,7 @@ namespace llaminar2
     {
         bool descriptorReady(const DeviceMoEExpertDescriptor &desc)
         {
-            return desc.gate.valid() && desc.up.valid() && desc.down.valid();
+            return desc.weightsReady();
         }
 
         uint32_t portableMoEExpertFlags(uint32_t flags) noexcept
@@ -466,6 +467,16 @@ namespace llaminar2
             return synthesizedResidentParticipantMask(update, expert);
         }
 
+        /** @return Exact overlay-wide packet destination for one update entry. */
+        int32_t overlayRouteParticipantForUpdate(
+            const MoEPlacementUpdate &update,
+            uint32_t expert) noexcept
+        {
+            if (!update.overlay_route_participant.empty())
+                return update.overlay_route_participant[expert];
+            return update.experts[expert].owner_participant;
+        }
+
         void resetRouterHotCacheCounters(DeviceMoELayerRuntime &state) noexcept
         {
             state.router_hot_cache_eligible_dispatches = 0;
@@ -500,6 +511,7 @@ namespace llaminar2
             uint32_t prefill_token_capacity = 0;
             uint32_t prefill_route_capacity = 0;
             uint32_t deferred_verifier_route_capacity = 0;
+            const DeviceMoEPlacementBank *overlay_placement_banks = nullptr;
         };
 
         RuntimeScratchBindings captureRuntimeScratchBindings(const DeviceMoELayerRuntime &state) noexcept
@@ -529,6 +541,8 @@ namespace llaminar2
             scratch.prefill_route_capacity = state.prefill_route_capacity;
             scratch.deferred_verifier_route_capacity =
                 state.deferred_verifier_route_capacity;
+            scratch.overlay_placement_banks =
+                state.overlay_placement_banks;
             return scratch;
         }
 
@@ -561,15 +575,37 @@ namespace llaminar2
             state.prefill_route_capacity = scratch.prefill_route_capacity;
             state.deferred_verifier_route_capacity =
                 scratch.deferred_verifier_route_capacity;
+            state.overlay_placement_banks =
+                scratch.overlay_placement_banks;
         }
 
-        void resetPerRequestRuntimeFields(DeviceMoELayerRuntime &state, int num_experts) noexcept
+        /** @brief Clear every exact production-phase routing counter. */
+        void resetRuntimeHistogramFields(
+            DeviceMoELayerRuntime &state,
+            int num_experts) noexcept
         {
             std::fill(state.decode_histogram, state.decode_histogram + num_experts, 0ULL);
             std::fill(state.decode_local_histogram, state.decode_local_histogram + num_experts, 0ULL);
+            std::fill(state.prefill_histogram, state.prefill_histogram + num_experts, 0ULL);
+            std::fill(state.prefill_local_histogram, state.prefill_local_histogram + num_experts, 0ULL);
+            std::fill(state.grouped_verifier_histogram,
+                      state.grouped_verifier_histogram + num_experts,
+                      0ULL);
+            std::fill(state.grouped_verifier_local_histogram,
+                      state.grouped_verifier_local_histogram + num_experts,
+                      0ULL);
+        }
+
+        /** @brief Clear request-local demand, diagnostics, and LLEP evidence. */
+        void resetPerRequestRuntimeFields(DeviceMoELayerRuntime &state, int num_experts) noexcept
+        {
+            resetRuntimeHistogramFields(state, num_experts);
             resetRouterHotCacheCounters(state);
             state.reserved_u64[2] = 0;
             state.reserved_u64[3] = 0;
+            state.current_batch_llep_movement_observed = 0;
+            state.current_batch_llep_non_owner_assignment_observed = 0;
+            state.current_batch_llep_transient_bank_active = 0;
         }
 
         /**
@@ -824,7 +860,10 @@ namespace llaminar2
           deferred_verifier_token_capacity_(
               config.deferred_verifier_token_capacity),
           serial_route_scratch_arena_(
-              std::move(config.serial_route_scratch_arena))
+              std::move(config.serial_route_scratch_arena)),
+          overlay_epoch_arena_(std::move(config.overlay_epoch_arena)),
+          overlay_epoch_ticket_slot_(config.overlay_epoch_ticket_slot),
+          overlay_placement_source_(config.overlay_placement_source)
     {
         if (!device_id_.is_valid())
             throw std::invalid_argument("[MoERuntimeTable] device_id must be valid");
@@ -891,12 +930,72 @@ namespace llaminar2
                  {"layers", std::to_string(num_layers_)},
                  {"ownership", "per_device_serial_graph_domain"}});
         }
+        if (overlay_epoch_arena_)
+        {
+            if (overlay_epoch_arena_->deviceId() != device_id_)
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] ExpertOverlay epoch arena device does "
+                    "not match the runtime table");
+            }
+            if (overlay_epoch_ticket_slot_ >=
+                overlay_epoch_arena_->requestSlotCapacity())
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] ExpertOverlay epoch ticket slot is "
+                    "outside the immutable arena capacity");
+            }
+            PerfStatsCollector::addCounter(
+                "memory",
+                "moe_overlay_epoch_runtime_table_bindings",
+                1.0,
+                "model_setup",
+                device_id_.toString(),
+                {{"layers", std::to_string(num_layers_)},
+                 {"request_slot",
+                  std::to_string(overlay_epoch_ticket_slot_)},
+                 {"arena_bytes",
+                  std::to_string(overlay_epoch_arena_->allocationBytes())}});
+        }
+        else if (overlay_epoch_ticket_slot_ != 0u)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] a nonzero ExpertOverlay ticket slot "
+                "requires an epoch arena");
+        }
+        if (overlay_placement_source_)
+        {
+            if (!overlay_epoch_arena_ || !mirror_to_device_ ||
+                !overlay_placement_source_->isMirroredToDevice() ||
+                overlay_placement_source_->deviceId() != device_id_ ||
+                overlay_placement_source_->layerCount() < num_layers_ ||
+                overlay_placement_source_->expertCount() != num_experts_ ||
+                overlay_placement_source_->topK() != top_k_ ||
+                !overlay_placement_source_->usesOverlayEpochTicket() ||
+                overlay_placement_source_->overlayEpochTicket() !=
+                    overlayEpochTicket() ||
+                overlay_placement_source_->overlayPlacementSource() != nullptr)
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] overlay placement source must be the "
+                    "canonical mirrored main table on the same device, cover "
+                    "every target layer, and share the exact epoch ticket");
+            }
+        }
         (void)checkedRouteCapacity(prefill_token_capacity_, top_k_);
         (void)checkedRouteCapacity(deferred_verifier_token_capacity_, top_k_);
 
         host_layers_.resize(static_cast<size_t>(num_layers_));
-        for (auto &state : host_layers_)
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
             resetLayer(state);
+            if (overlay_placement_source_)
+            {
+                state.overlay_placement_banks =
+                    overlay_placement_source_->devicePlacementBanks(layer_idx);
+            }
+        }
         empty_host_layers_ = host_layers_;
         initial_host_layers_ = empty_host_layers_;
         initial_layer_captured_.assign(host_layers_.size(), 0u);
@@ -951,6 +1050,7 @@ namespace llaminar2
 
     DeviceMoERuntimeTable::~DeviceMoERuntimeTable()
     {
+        releaseRuntimeHistogramDrainResources();
         releaseDeferredVerifierRouteLedger();
         releasePrefillRouteScratch();
         releaseDeviceMirror();
@@ -974,6 +1074,66 @@ namespace llaminar2
     {
         validateLayerIndex(layer_idx);
         return host_layers_[static_cast<size_t>(layer_idx)];
+    }
+
+    const DeviceMoEOverlayEpochTicket *
+    DeviceMoERuntimeTable::overlayEpochTicket() const noexcept
+    {
+        return overlay_epoch_arena_
+                   ? overlay_epoch_arena_->requestTicket(
+                         overlay_epoch_ticket_slot_)
+                   : nullptr;
+    }
+
+    const DeviceMoEPlacementBank *
+    DeviceMoERuntimeTable::devicePlacementBanks(int layer_idx) const
+    {
+        validateLayerIndex(layer_idx);
+        const DeviceMoELayerRuntime *layer =
+            mirror_to_device_
+                ? device_layers_ + layer_idx
+                : host_layers_.data() + layer_idx;
+        return reinterpret_cast<const DeviceMoEPlacementBank *>(
+            reinterpret_cast<const std::byte *>(layer) +
+            offsetof(DeviceMoELayerRuntime, banks));
+    }
+
+    MoEOverlayRoutePlacementDeviceBinding
+    DeviceMoERuntimeTable::overlayRoutePlacementBinding(int layer_idx) const
+    {
+        validateLayerIndex(layer_idx);
+        if (!mirror_to_device_ || !device_id_.is_gpu() ||
+            !usesOverlayEpochTicket())
+        {
+            return {};
+        }
+
+        /*
+         * A sidecar's embedded banks are transient request-local scratch. Its
+         * durable placement authority is the canonical main-model table named
+         * at construction. Resolving that authority here prevents graph builders
+         * from accidentally capturing the child's private bank addresses.
+         */
+        const DeviceMoERuntimeTable *const placement_authority =
+            overlay_placement_source_ ? overlay_placement_source_ : this;
+        const DeviceMoEPlacementBank *const banks =
+            placement_authority->devicePlacementBanks(layer_idx);
+        return {
+            .banks = {
+                MoEOverlayRoutePlacementBankDeviceView{
+                    .route_participants =
+                        banks[0].overlay_route_participant,
+                    .epoch = &banks[0].epoch,
+                },
+                MoEOverlayRoutePlacementBankDeviceView{
+                    .route_participants =
+                        banks[1].overlay_route_participant,
+                    .epoch = &banks[1].epoch,
+                },
+            },
+            .ticket = overlayEpochTicket(),
+            .expert_count = static_cast<uint32_t>(num_experts_),
+        };
     }
 
     bool DeviceMoERuntimeTable::decodeRuntimePublicationRequired(int layer_idx) const
@@ -1028,12 +1188,212 @@ namespace llaminar2
             throw std::invalid_argument(
                 "[MoERuntimeTable] mirrored decode histogram producer stream must be explicit");
         }
+        std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        if (mirror_to_device_ && runtime_histogram_drain_enabled_)
+            registerRuntimeHistogramProducerStreamLocked(stream);
         decode_histogram_producer_stream_ = stream;
     }
 
     void *DeviceMoERuntimeTable::decodeHistogramProducerStream() const
     {
+        std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
         return decode_histogram_producer_stream_;
+    }
+
+    void DeviceMoERuntimeTable::enableAsyncDecodeHistogramDrain(
+        RuntimeExpertHistogramSourceMask sources)
+    {
+        if (std::none_of(sources.begin(), sources.end(), [](bool value)
+                         { return value; }))
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] asynchronous histogram drain must own at least one production phase");
+        }
+
+        std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        if (runtime_histogram_drain_enabled_)
+        {
+            if (runtime_histogram_sources_ != sources)
+            {
+                throw std::logic_error(
+                    "[MoERuntimeTable] asynchronous histogram drain source ownership cannot change after setup");
+            }
+            return;
+        }
+
+        runtime_histogram_sources_ = sources;
+        try
+        {
+            if (mirror_to_device_)
+            {
+                allocateRuntimeHistogramDrainResources();
+
+                /* A setup path may have recorded its graph stream just before
+                 * the histogram owner was attached. Install its event edge
+                 * before publishing the enabled lifecycle state. */
+                if (decode_histogram_producer_stream_)
+                    registerRuntimeHistogramProducerStreamLocked(
+                        decode_histogram_producer_stream_);
+            }
+            runtime_histogram_drain_enabled_ = true;
+        }
+        catch (...)
+        {
+            releaseRuntimeHistogramDrainResources();
+            runtime_histogram_sources_ = {};
+            throw;
+        }
+    }
+
+    RuntimeExpertHistogramDrainResult
+    DeviceMoERuntimeTable::progressAsyncDecodeHistogramDrain(
+        DecodeExpertHistogram &histogram)
+    {
+        std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        if (!runtime_histogram_drain_enabled_)
+        {
+            return RuntimeExpertHistogramDrainResult::failed(
+                "Runtime histogram drain was polled before model-setup enablement");
+        }
+
+        if (!mirror_to_device_)
+        {
+            return syncDecodeHistogramToHost(
+                       histogram,
+                       /*stream=*/nullptr,
+                       /*reset_runtime_counts=*/true)
+                       ? RuntimeExpertHistogramDrainResult::ready()
+                       : RuntimeExpertHistogramDrainResult::failed(
+                             "CPU runtime histogram merge failed");
+        }
+
+        IBackend *backend = mirrorBackend(
+            device_id_,
+            "[MoERuntimeTable] asynchronous runtime histogram drain");
+        const int ordinal = device_id_.toKernelDeviceIndex();
+        if (runtime_histogram_drain_in_flight_)
+        {
+            bool ready = false;
+            if (!backend->queryEvent(
+                    runtime_histogram_drain_complete_event_,
+                    ordinal,
+                    &ready))
+            {
+                return RuntimeExpertHistogramDrainResult::failed(
+                    "Backend failed to query the exact runtime histogram drain event on " +
+                    device_id_.to_string());
+            }
+            if (!ready)
+                return RuntimeExpertHistogramDrainResult::pending();
+            if (!mergeRuntimeHistogramSnapshot(histogram))
+            {
+                return RuntimeExpertHistogramDrainResult::failed(
+                    "Completed runtime histogram snapshot did not match the host histogram geometry");
+            }
+
+            runtime_histogram_drain_in_flight_ = false;
+            PerfStatsCollector::addCounter(
+                "moe_overlay_residency",
+                "runtime_histogram_async_drains_completed",
+                1.0,
+                "maintenance",
+                device_id_.toString(),
+                {{"blocking", "false"},
+                 {"bank", std::to_string(
+                              runtime_histogram_frozen_bank_host_)}});
+            return RuntimeExpertHistogramDrainResult::ready();
+        }
+
+        if (runtime_histogram_producer_streams_.empty())
+        {
+            return RuntimeExpertHistogramDrainResult::failed(
+                "Runtime histogram drain began before any exact producer stream was registered");
+        }
+
+        runtime_histogram_producers_sealed_ = true;
+        const uint32_t frozen_bank = runtime_histogram_active_bank_host_;
+        const uint32_t next_bank = 1u - frozen_bank;
+
+        /* Every producer orders the same idempotent bank publication after its
+         * previous writes. The maintenance stream waits for all arrivals, so
+         * no writer can still target the frozen generation when DMA begins. */
+        for (const auto &producer : runtime_histogram_producer_streams_)
+        {
+            if (!backend->hostToDeviceOnStream(
+                    device_runtime_histogram_active_bank_,
+                    host_runtime_histogram_bank_indices_ + next_bank,
+                    sizeof(uint32_t),
+                    ordinal,
+                    producer.stream) ||
+                !backend->recordEvent(
+                    producer.flip_arrival_event,
+                    ordinal,
+                    producer.stream))
+            {
+                return RuntimeExpertHistogramDrainResult::failed(
+                    "Failed to publish the next runtime histogram bank on an exact producer stream");
+            }
+        }
+        for (const auto &producer : runtime_histogram_producer_streams_)
+        {
+            if (!backend->streamWaitEvent(
+                    runtime_histogram_maintenance_stream_,
+                    producer.flip_arrival_event,
+                    ordinal))
+            {
+                return RuntimeExpertHistogramDrainResult::failed(
+                    "Maintenance stream failed to join a runtime histogram producer event");
+            }
+        }
+
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            auto *source =
+                device_runtime_histogram_banks_ +
+                static_cast<std::size_t>(layer_idx) * 2u + frozen_bank;
+            auto *destination =
+                host_runtime_histogram_snapshot_ +
+                static_cast<std::size_t>(layer_idx);
+            if (!backend->deviceToHostOnStream(
+                    destination,
+                    source,
+                    sizeof(DeviceMoERuntimeHistogramBank),
+                    ordinal,
+                    runtime_histogram_maintenance_stream_) ||
+                !backend->memset(
+                    source,
+                    0,
+                    sizeof(DeviceMoERuntimeHistogramBank),
+                    ordinal,
+                    runtime_histogram_maintenance_stream_))
+            {
+                return RuntimeExpertHistogramDrainResult::failed(
+                    "Failed to enqueue an asynchronous runtime histogram bank drain/reset");
+            }
+        }
+        if (!backend->recordEvent(
+                runtime_histogram_drain_complete_event_,
+                ordinal,
+                runtime_histogram_maintenance_stream_))
+        {
+            return RuntimeExpertHistogramDrainResult::failed(
+                "Failed to record the runtime histogram drain completion event");
+        }
+
+        runtime_histogram_frozen_bank_host_ = frozen_bank;
+        runtime_histogram_active_bank_host_ = next_bank;
+        runtime_histogram_drain_in_flight_ = true;
+        PerfStatsCollector::addCounter(
+            "moe_overlay_residency",
+            "runtime_histogram_async_drains_started",
+            1.0,
+            "maintenance",
+            device_id_.toString(),
+            {{"blocking", "false"},
+             {"producer_streams",
+              std::to_string(runtime_histogram_producer_streams_.size())},
+             {"bank", std::to_string(frozen_bank)}});
+        return RuntimeExpertHistogramDrainResult::pending();
     }
 
     bool DeviceMoERuntimeTable::syncDecodeHistogramToHost(
@@ -1060,57 +1420,180 @@ namespace llaminar2
                 "[MoERuntimeTable] mirrored decode histogram sync requires an explicit stream");
         }
 
-        std::vector<uint64_t> counts(static_cast<size_t>(num_layers_) * static_cast<size_t>(num_experts_), 0);
-        std::vector<uint64_t> local_counts(static_cast<size_t>(num_layers_) * static_cast<size_t>(num_experts_), 0);
+        const std::size_t entry_count =
+            static_cast<size_t>(num_layers_) *
+            static_cast<size_t>(num_experts_);
+        std::array<std::vector<uint64_t>,
+                   kExpertHistogramProductionSourceCount>
+            counts;
+        std::array<std::vector<uint64_t>,
+                   kExpertHistogramProductionSourceCount>
+            local_counts;
+        for (std::size_t source = 0;
+             source < kExpertHistogramProductionSourceCount;
+             ++source)
+        {
+            counts[source].assign(entry_count, 0);
+            local_counts[source].assign(entry_count, 0);
+        }
+        constexpr std::array<ExpertHistogramSource,
+                             kExpertHistogramProductionSourceCount>
+            sources{
+                ExpertHistogramSource::DecodeToken,
+                ExpertHistogramSource::PrefillChunk,
+                ExpertHistogramSource::GroupedVerifier,
+            };
+        constexpr std::array<const char *,
+                             kExpertHistogramProductionSourceCount>
+            source_names{"decode", "prefill", "grouped_verifier"};
 
         if (!mirror_to_device_)
         {
             for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
             {
                 const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
-                auto *dst = counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
-                std::copy(state.decode_histogram,
-                          state.decode_histogram + num_experts_,
-                          dst);
-                auto *local_dst = local_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
-                std::copy(state.decode_local_histogram,
-                          state.decode_local_histogram + num_experts_,
-                          local_dst);
+                const std::array<const uint64_t *,
+                                 kExpertHistogramProductionSourceCount>
+                    selected_sources{
+                        state.decode_histogram,
+                        state.prefill_histogram,
+                        state.grouped_verifier_histogram,
+                    };
+                const std::array<const uint64_t *,
+                                 kExpertHistogramProductionSourceCount>
+                    local_sources{
+                        state.decode_local_histogram,
+                        state.prefill_local_histogram,
+                        state.grouped_verifier_local_histogram,
+                    };
+                const std::size_t layer_offset =
+                    static_cast<size_t>(layer_idx) *
+                    static_cast<size_t>(num_experts_);
+                for (std::size_t source = 0;
+                     source < kExpertHistogramProductionSourceCount;
+                     ++source)
+                {
+                    std::copy(
+                        selected_sources[source],
+                        selected_sources[source] + num_experts_,
+                        counts[source].data() + layer_offset);
+                    std::copy(
+                        local_sources[source],
+                        local_sources[source] + num_experts_,
+                        local_counts[source].data() + layer_offset);
+                }
             }
         }
         else
         {
             for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
             {
-                const auto *src = device_layers_[layer_idx].decode_histogram;
-                auto *dst = counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
-                copyMirrorToHost(device_id_, dst, src,
-                                 static_cast<size_t>(num_experts_) * sizeof(uint64_t),
-                                 stream,
-                                 layerPrefix(layer_idx) + "decode histogram D2H");
-
-                const auto *local_src = device_layers_[layer_idx].decode_local_histogram;
-                auto *local_dst = local_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
-                copyMirrorToHost(device_id_, local_dst, local_src,
-                                 static_cast<size_t>(num_experts_) * sizeof(uint64_t),
-                                 stream,
-                                 layerPrefix(layer_idx) + "decode local histogram D2H");
+                const auto &state = device_layers_[layer_idx];
+                const std::array<const uint64_t *,
+                                 kExpertHistogramProductionSourceCount>
+                    selected_sources{
+                        state.decode_histogram,
+                        state.prefill_histogram,
+                        state.grouped_verifier_histogram,
+                    };
+                const std::array<const uint64_t *,
+                                 kExpertHistogramProductionSourceCount>
+                    local_sources{
+                        state.decode_local_histogram,
+                        state.prefill_local_histogram,
+                        state.grouped_verifier_local_histogram,
+                    };
+                const std::size_t layer_offset =
+                    static_cast<size_t>(layer_idx) *
+                    static_cast<size_t>(num_experts_);
+                for (std::size_t source = 0;
+                     source < kExpertHistogramProductionSourceCount;
+                     ++source)
+                {
+                    copyMirrorToHost(
+                        device_id_,
+                        counts[source].data() + layer_offset,
+                        selected_sources[source],
+                        static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                        stream,
+                        layerPrefix(layer_idx) + " " + source_names[source] +
+                            " selected histogram D2H");
+                    copyMirrorToHost(
+                        device_id_,
+                        local_counts[source].data() + layer_offset,
+                        local_sources[source],
+                        static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                        stream,
+                        layerPrefix(layer_idx) + " " + source_names[source] +
+                            " local histogram D2H");
+                }
             }
         }
 
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
-            const auto *layer_counts = counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
-            histogram.mergeLayerCounts(layer_idx, layer_counts, num_experts_, /*count_window_tokens=*/false);
+            const std::size_t layer_offset =
+                static_cast<size_t>(layer_idx) *
+                static_cast<size_t>(num_experts_);
+            uint64_t selected_slots = 0;
+            uint64_t local_slots = 0;
+            for (std::size_t source = 0;
+                 source < kExpertHistogramProductionSourceCount;
+                 ++source)
+            {
+                const auto *layer_counts =
+                    counts[source].data() + layer_offset;
+                const auto *layer_local_counts =
+                    local_counts[source].data() + layer_offset;
+                histogram.mergeLayerCounts(
+                    layer_idx,
+                    layer_counts,
+                    num_experts_,
+                    /*count_window_tokens=*/
+                        sources[source] !=
+                        ExpertHistogramSource::DecodeToken,
+                    sources[source]);
+                const uint64_t phase_selected_slots = std::accumulate(
+                    layer_counts,
+                    layer_counts + num_experts_,
+                    uint64_t{0});
+                const uint64_t phase_local_slots = std::accumulate(
+                    layer_local_counts,
+                    layer_local_counts + num_experts_,
+                    uint64_t{0});
+                selected_slots += phase_selected_slots;
+                local_slots += phase_local_slots;
+
+                if (PerfStatsCollector::isEnabled())
+                {
+                    const auto &state =
+                        host_layers_[static_cast<size_t>(layer_idx)];
+                    const PerfStatsCollector::Tags phase_tags{
+                        {"layer", std::to_string(layer_idx)},
+                        {"phase", source_names[source]},
+                        {"participant", std::to_string(state.participant_id)},
+                        {"participants", std::to_string(state.participant_count)},
+                        {"active_epoch", std::to_string(state.active_epoch)},
+                        {"reset", reset_runtime_counts ? "true" : "false"}};
+                    PerfStatsCollector::addCounter(
+                        "moe_rebalance",
+                        "runtime_phase_selected_slots",
+                        static_cast<double>(phase_selected_slots),
+                        "rebalance",
+                        device_id_.toString(),
+                        phase_tags);
+                    PerfStatsCollector::addCounter(
+                        "moe_rebalance",
+                        "runtime_phase_local_compute_slots",
+                        static_cast<double>(phase_local_slots),
+                        "rebalance",
+                        device_id_.toString(),
+                        phase_tags);
+                }
+            }
 
             if (PerfStatsCollector::isEnabled())
             {
-                const auto *layer_local_counts =
-                    local_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
-                const uint64_t selected_slots =
-                    std::accumulate(layer_counts, layer_counts + num_experts_, uint64_t{0});
-                const uint64_t local_slots =
-                    std::accumulate(layer_local_counts, layer_local_counts + num_experts_, uint64_t{0});
                 const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
                 const PerfStatsCollector::Tags tags{
                     {"layer", std::to_string(layer_idx)},
@@ -1140,8 +1623,7 @@ namespace llaminar2
 
         for (auto &state : host_layers_)
         {
-            std::fill(state.decode_histogram, state.decode_histogram + num_experts_, 0ULL);
-            std::fill(state.decode_local_histogram, state.decode_local_histogram + num_experts_, 0ULL);
+            resetRuntimeHistogramFields(state, num_experts_);
             resetRouterHotCacheCounters(state);
         }
 
@@ -1150,18 +1632,17 @@ namespace llaminar2
             const size_t counters_offset = offsetof(DeviceMoELayerRuntime, router_hot_cache_eligible_dispatches);
             const size_t counters_bytes =
                 offsetof(DeviceMoELayerRuntime, route_expert_ids) - counters_offset;
+            const size_t histogram_bytes =
+                offsetof(DeviceMoELayerRuntime,
+                         router_hot_cache_eligible_dispatches) -
+                offsetof(DeviceMoELayerRuntime, decode_histogram);
             for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
             {
                 auto *dst = device_layers_[layer_idx].decode_histogram;
                 memsetMirror(device_id_, dst, 0,
-                             static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                             histogram_bytes,
                              stream,
-                             layerPrefix(layer_idx) + "decode histogram reset");
-                auto *local_dst = device_layers_[layer_idx].decode_local_histogram;
-                memsetMirror(device_id_, local_dst, 0,
-                             static_cast<size_t>(num_experts_) * sizeof(uint64_t),
-                             stream,
-                             layerPrefix(layer_idx) + "decode local histogram reset");
+                             layerPrefix(layer_idx) + "all phase histograms reset");
                 auto *counter_dst =
                     reinterpret_cast<std::byte *>(device_layers_ + layer_idx) + counters_offset;
                 memsetMirror(device_id_, counter_dst, 0,
@@ -1252,6 +1733,7 @@ namespace llaminar2
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
             auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            resetRuntimeHistogramFields(state, num_experts_);
             const auto *selected_src =
                 selected_counts + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
             const auto *local_src =
@@ -1271,8 +1753,20 @@ namespace llaminar2
         const size_t counters_offset = offsetof(DeviceMoELayerRuntime, router_hot_cache_eligible_dispatches);
         const size_t counters_bytes =
             offsetof(DeviceMoELayerRuntime, route_expert_ids) - counters_offset;
+        const size_t histogram_bytes =
+            offsetof(DeviceMoELayerRuntime,
+                     router_hot_cache_eligible_dispatches) -
+            offsetof(DeviceMoELayerRuntime, decode_histogram);
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
+            memsetMirror(
+                device_id_,
+                device_layers_[layer_idx].decode_histogram,
+                0,
+                histogram_bytes,
+                stream,
+                layerPrefix(layer_idx) +
+                    "phase histogram restore reset");
             const auto *selected_src =
                 selected_counts + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
             auto *selected_dst = device_layers_[layer_idx].decode_histogram;
@@ -1303,8 +1797,7 @@ namespace llaminar2
     {
         for (auto &state : host_layers_)
         {
-            std::fill(state.decode_histogram, state.decode_histogram + num_experts_, 0ULL);
-            std::fill(state.decode_local_histogram, state.decode_local_histogram + num_experts_, 0ULL);
+            resetRuntimeHistogramFields(state, num_experts_);
             resetRouterHotCacheCounters(state);
         }
 
@@ -1314,18 +1807,17 @@ namespace llaminar2
         const size_t counters_offset = offsetof(DeviceMoELayerRuntime, router_hot_cache_eligible_dispatches);
         const size_t counters_bytes =
             offsetof(DeviceMoELayerRuntime, route_expert_ids) - counters_offset;
+        const size_t histogram_bytes =
+            offsetof(DeviceMoELayerRuntime,
+                     router_hot_cache_eligible_dispatches) -
+            offsetof(DeviceMoELayerRuntime, decode_histogram);
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
             auto *dst = device_layers_[layer_idx].decode_histogram;
             memsetMirror(device_id_, dst, 0,
-                         static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                         histogram_bytes,
                          stream,
-                         layerPrefix(layer_idx) + "decode histogram reset");
-            auto *local_dst = device_layers_[layer_idx].decode_local_histogram;
-            memsetMirror(device_id_, local_dst, 0,
-                         static_cast<size_t>(num_experts_) * sizeof(uint64_t),
-                         stream,
-                         layerPrefix(layer_idx) + "decode local histogram reset");
+                         layerPrefix(layer_idx) + "all phase histograms reset");
             auto *counter_dst =
                 reinterpret_cast<std::byte *>(device_layers_ + layer_idx) + counters_offset;
             memsetMirror(device_id_, counter_dst, 0,
@@ -1658,6 +2150,18 @@ namespace llaminar2
             captured.local_histogram.assign(
                 state.decode_local_histogram,
                 state.decode_local_histogram + num_experts_);
+            captured.prefill_selected_histogram.assign(
+                state.prefill_histogram,
+                state.prefill_histogram + num_experts_);
+            captured.prefill_local_histogram.assign(
+                state.prefill_local_histogram,
+                state.prefill_local_histogram + num_experts_);
+            captured.grouped_verifier_selected_histogram.assign(
+                state.grouped_verifier_histogram,
+                state.grouped_verifier_histogram + num_experts_);
+            captured.grouped_verifier_local_histogram.assign(
+                state.grouped_verifier_local_histogram,
+                state.grouped_verifier_local_histogram + num_experts_);
 
             for (int expert = 0; expert < num_experts_; ++expert)
             {
@@ -1732,7 +2236,15 @@ namespace llaminar2
                 snapshot.top_k != static_cast<uint32_t>(top_k_) ||
                 snapshot.experts.size() != static_cast<size_t>(num_experts_) ||
                 snapshot.selected_histogram.size() != static_cast<size_t>(num_experts_) ||
-                snapshot.local_histogram.size() != static_cast<size_t>(num_experts_))
+                snapshot.local_histogram.size() != static_cast<size_t>(num_experts_) ||
+                snapshot.prefill_selected_histogram.size() !=
+                    static_cast<size_t>(num_experts_) ||
+                snapshot.prefill_local_histogram.size() !=
+                    static_cast<size_t>(num_experts_) ||
+                snapshot.grouped_verifier_selected_histogram.size() !=
+                    static_cast<size_t>(num_experts_) ||
+                snapshot.grouped_verifier_local_histogram.size() !=
+                    static_cast<size_t>(num_experts_))
             {
                 LOG_ERROR("[MoERuntimeTable] layer " << layer_idx
                                                      << ": portable runtime restore metadata mismatch");
@@ -1887,6 +2399,20 @@ namespace llaminar2
                 std::copy(snapshot.local_histogram.begin(),
                           snapshot.local_histogram.end(),
                           state.decode_local_histogram);
+                std::copy(snapshot.prefill_selected_histogram.begin(),
+                          snapshot.prefill_selected_histogram.end(),
+                          state.prefill_histogram);
+                std::copy(snapshot.prefill_local_histogram.begin(),
+                          snapshot.prefill_local_histogram.end(),
+                          state.prefill_local_histogram);
+                std::copy(
+                    snapshot.grouped_verifier_selected_histogram.begin(),
+                    snapshot.grouped_verifier_selected_histogram.end(),
+                    state.grouped_verifier_histogram);
+                std::copy(
+                    snapshot.grouped_verifier_local_histogram.begin(),
+                    snapshot.grouped_verifier_local_histogram.end(),
+                    state.grouped_verifier_local_histogram);
                 resetRouterHotCacheCounters(state);
                 state.reserved_u64[2] = 0u;
                 state.reserved_u64[3] =
@@ -2055,6 +2581,20 @@ namespace llaminar2
             std::copy(snapshot.local_histogram.begin(),
                       snapshot.local_histogram.end(),
                       restored.decode_local_histogram);
+            std::copy(snapshot.prefill_selected_histogram.begin(),
+                      snapshot.prefill_selected_histogram.end(),
+                      restored.prefill_histogram);
+            std::copy(snapshot.prefill_local_histogram.begin(),
+                      snapshot.prefill_local_histogram.end(),
+                      restored.prefill_local_histogram);
+            std::copy(
+                snapshot.grouped_verifier_selected_histogram.begin(),
+                snapshot.grouped_verifier_selected_histogram.end(),
+                restored.grouped_verifier_histogram);
+            std::copy(
+                snapshot.grouped_verifier_local_histogram.begin(),
+                snapshot.grouped_verifier_local_histogram.end(),
+                restored.grouped_verifier_local_histogram);
             resetRouterHotCacheCounters(restored);
             restored.reserved_u64[2] = 0;
             restored.reserved_u64[3] = 0;
@@ -2159,7 +2699,7 @@ namespace llaminar2
         auto &bank = state.banks[inactive_bank];
         state.participant_id = update.participant_id;
         state.participant_count = update.participant_count;
-        bank = {};
+        bank = DeviceMoEPlacementBank{};
         bank.epoch = update.epoch;
         bank.expert_count = update.expert_count;
         bank.transient_placement_observed =
@@ -2172,6 +2712,8 @@ namespace llaminar2
             bank.replica_role[expert] = update.replica_role[expert];
             const uint32_t resident_mask = residentParticipantMaskForUpdate(update, expert);
             bank.resident_participant_mask[expert] = resident_mask;
+            bank.overlay_route_participant[expert] =
+                overlayRouteParticipantForUpdate(update, expert);
             if (participantMaskCount(resident_mask) > 1u)
                 ++bank.multi_resident_expert_count;
             if (hasMoEExpertFlag(
@@ -2240,7 +2782,9 @@ namespace llaminar2
             update.local_compute_mask.size() != update.expert_count ||
             update.replica_role.size() != update.expert_count ||
             (!update.resident_participant_mask.empty() &&
-             update.resident_participant_mask.size() != update.expert_count))
+             update.resident_participant_mask.size() != update.expert_count) ||
+            (!update.overlay_route_participant.empty() &&
+             update.overlay_route_participant.size() != update.expert_count))
         {
             throw std::invalid_argument(layerPrefix(layer_idx) + "placement update vectors must match expert_count");
         }
@@ -2257,6 +2801,12 @@ namespace llaminar2
                 throw std::invalid_argument(layerPrefix(layer_idx) + "local_compute_mask entries must be 0 or 1");
             if (update.replica_role[expert] > static_cast<uint8_t>(DeviceMoEReplicaRole::PreferredReplica))
                 throw std::invalid_argument(layerPrefix(layer_idx) + "replica_role entries must be valid DeviceMoEReplicaRole values");
+            if (overlayRouteParticipantForUpdate(update, expert) < -1)
+            {
+                throw std::invalid_argument(
+                    layerPrefix(layer_idx) +
+                    "overlay_route_participant entries must be -1 or non-negative");
+            }
 
             const uint32_t resident_mask = residentParticipantMaskForUpdate(update, expert);
             if ((resident_mask & ~valid_participant_mask) != 0u)
@@ -2285,13 +2835,16 @@ namespace llaminar2
 
     void DeviceMoERuntimeTable::resetLayer(DeviceMoELayerRuntime &state) const
     {
-        state = {};
+        state = DeviceMoELayerRuntime{};
         state.expert_count = static_cast<uint32_t>(num_experts_);
         state.top_k = static_cast<uint32_t>(top_k_);
         state.participant_id = 0;
         state.participant_count = 1;
         state.banks[0].expert_count = static_cast<uint32_t>(num_experts_);
         state.banks[1].expert_count = static_cast<uint32_t>(num_experts_);
+        /* The ticket address is model topology. Request reset clears routed
+         * data but must never unbind the captured residency authority. */
+        state.overlay_epoch_ticket = overlayEpochTicket();
     }
 
     void DeviceMoERuntimeTable::captureInitialLayerStateIfNeeded(
@@ -2576,6 +3129,346 @@ namespace llaminar2
             releaseDeviceMirror();
             throw;
         }
+    }
+
+    void DeviceMoERuntimeTable::allocateRuntimeHistogramDrainResources()
+    {
+        if (!mirror_to_device_ ||
+            device_runtime_histogram_banks_ ||
+            device_runtime_histogram_active_bank_ ||
+            host_runtime_histogram_snapshot_ ||
+            host_runtime_histogram_bank_indices_ ||
+            runtime_histogram_maintenance_stream_ ||
+            runtime_histogram_initialization_event_ ||
+            runtime_histogram_drain_complete_event_)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] asynchronous histogram resources have an invalid setup lifecycle");
+        }
+
+        IBackend *backend = mirrorBackend(
+            device_id_,
+            "[MoERuntimeTable] asynchronous histogram setup");
+        const int ordinal = device_id_.toKernelDeviceIndex();
+        const std::size_t bank_count =
+            static_cast<std::size_t>(num_layers_) * 2u;
+        const std::size_t device_bytes =
+            bank_count * sizeof(DeviceMoERuntimeHistogramBank);
+        const std::size_t snapshot_bytes =
+            static_cast<std::size_t>(num_layers_) *
+            sizeof(DeviceMoERuntimeHistogramBank);
+
+        try
+        {
+            device_runtime_histogram_banks_ =
+                static_cast<DeviceMoERuntimeHistogramBank *>(
+                    allocateMirror(
+                        device_id_,
+                        device_bytes,
+                        "[MoERuntimeTable] asynchronous histogram banks"));
+            device_runtime_histogram_active_bank_ =
+                static_cast<uint32_t *>(
+                    allocateMirror(
+                        device_id_,
+                        sizeof(uint32_t),
+                        "[MoERuntimeTable] asynchronous histogram active bank"));
+            host_runtime_histogram_snapshot_ =
+                static_cast<DeviceMoERuntimeHistogramBank *>(
+                    backend->allocatePinned(snapshot_bytes, ordinal));
+            host_runtime_histogram_bank_indices_ =
+                static_cast<uint32_t *>(
+                    backend->allocatePinned(2u * sizeof(uint32_t), ordinal));
+            runtime_histogram_maintenance_stream_ =
+                backend->createStream(ordinal);
+            runtime_histogram_initialization_event_ =
+                backend->createEvent(ordinal);
+            runtime_histogram_drain_complete_event_ =
+                backend->createEvent(ordinal);
+            if (!host_runtime_histogram_snapshot_ ||
+                !host_runtime_histogram_bank_indices_ ||
+                !runtime_histogram_maintenance_stream_ ||
+                !runtime_histogram_initialization_event_ ||
+                !runtime_histogram_drain_complete_event_)
+            {
+                throw std::runtime_error(
+                    "[MoERuntimeTable] backend failed to allocate persistent asynchronous histogram resources");
+            }
+
+            host_runtime_histogram_bank_indices_[0] = 0u;
+            host_runtime_histogram_bank_indices_[1] = 1u;
+            runtime_histogram_active_bank_host_ = 0u;
+            runtime_histogram_frozen_bank_host_ = 0u;
+
+            if (!backend->memset(
+                    device_runtime_histogram_banks_,
+                    0,
+                    device_bytes,
+                    ordinal,
+                    runtime_histogram_maintenance_stream_) ||
+                !backend->hostToDeviceOnStream(
+                    device_runtime_histogram_active_bank_,
+                    host_runtime_histogram_bank_indices_,
+                    sizeof(uint32_t),
+                    ordinal,
+                    runtime_histogram_maintenance_stream_) ||
+                !backend->recordEvent(
+                    runtime_histogram_initialization_event_,
+                    ordinal,
+                    runtime_histogram_maintenance_stream_))
+            {
+                throw std::runtime_error(
+                    "[MoERuntimeTable] failed to initialize persistent asynchronous histogram resources");
+            }
+
+            /* The event, rather than a host fence, publishes setup completion.
+             * Producer registration installs a one-time stream wait before any
+             * captured or eager production kernel may write these banks. */
+
+            /* Each layer points at its adjacent two-bank pair. Request-reset
+             * templates receive the same model-lifetime addresses, so a D2D
+             * reset changes request state without erasing routing evidence. */
+            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            {
+                const auto layer_offset =
+                    static_cast<std::size_t>(layer_idx) * 2u;
+                const auto bind = [&](DeviceMoELayerRuntime &state)
+                {
+                    state.runtime_histogram_banks =
+                        device_runtime_histogram_banks_ + layer_offset;
+                    state.runtime_histogram_active_bank =
+                        device_runtime_histogram_active_bank_;
+                };
+                bind(host_layers_[static_cast<std::size_t>(layer_idx)]);
+                bind(initial_host_layers_[static_cast<std::size_t>(layer_idx)]);
+                bind(empty_host_layers_[static_cast<std::size_t>(layer_idx)]);
+            }
+
+            /* Enabling is model-setup only, immediately after construction.
+             * Re-uploading the pristine tables publishes the external pointer
+             * identity before any graph can capture it. */
+            uploadAllLayerStates();
+            PerfStatsCollector::addCounter(
+                "memory",
+                "moe_runtime_async_histogram_bytes",
+                static_cast<double>(
+                    device_bytes + sizeof(uint32_t) + snapshot_bytes +
+                    2u * sizeof(uint32_t)),
+                "model_setup",
+                device_id_.toString(),
+                {{"layers", std::to_string(num_layers_)},
+                 {"banks", "2"},
+                 {"persistent", "true"}});
+        }
+        catch (...)
+        {
+            releaseRuntimeHistogramDrainResources();
+            throw;
+        }
+    }
+
+    void DeviceMoERuntimeTable::registerRuntimeHistogramProducerStreamLocked(
+        void *stream)
+    {
+        if (!stream || !runtime_histogram_initialization_event_)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] runtime histogram producer registration requires an exact stream and a published initialization event");
+        }
+
+        const auto existing = std::find_if(
+            runtime_histogram_producer_streams_.begin(),
+            runtime_histogram_producer_streams_.end(),
+            [stream](const RuntimeHistogramProducerStream &producer)
+            { return producer.stream == stream; });
+        if (existing != runtime_histogram_producer_streams_.end())
+            return;
+        if (runtime_histogram_producers_sealed_)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] a new histogram producer stream appeared after the asynchronous drain topology was sealed");
+        }
+
+        IBackend *backend = mirrorBackend(
+            device_id_,
+            "[MoERuntimeTable] runtime histogram producer registration");
+        const int ordinal = device_id_.toKernelDeviceIndex();
+        void *event = backend->createEvent(ordinal);
+        if (!event)
+        {
+            throw std::runtime_error(
+                "[MoERuntimeTable] failed to allocate an exact histogram producer event on " +
+                device_id_.to_string());
+        }
+        if (!backend->streamWaitEvent(
+                stream,
+                runtime_histogram_initialization_event_,
+                ordinal))
+        {
+            backend->destroyEvent(event, ordinal);
+            throw std::runtime_error(
+                "[MoERuntimeTable] failed to order a histogram producer after asynchronous bank initialization on " +
+                device_id_.to_string());
+        }
+        runtime_histogram_producer_streams_.push_back(
+            {.stream = stream, .flip_arrival_event = event});
+    }
+
+    void DeviceMoERuntimeTable::releaseRuntimeHistogramDrainResources() noexcept
+    {
+        IBackend *backend = nullptr;
+        try
+        {
+            backend = device_id_.is_gpu() ? getBackendFor(device_id_) : nullptr;
+            const int ordinal = device_id_.is_gpu()
+                                    ? device_id_.toKernelDeviceIndex()
+                                    : 0;
+            if (backend && runtime_histogram_maintenance_stream_)
+            {
+                /* Model teardown may block after inference admission has
+                 * stopped; this is not part of a request or migration wave. */
+                if (!backend->synchronizeStream(
+                        runtime_histogram_maintenance_stream_, ordinal))
+                {
+                    LOG_ERROR(
+                        "[MoERuntimeTable] failed to drain histogram maintenance stream during teardown on "
+                        << device_id_.to_string());
+                }
+            }
+            if (backend)
+            {
+                for (auto &producer : runtime_histogram_producer_streams_)
+                {
+                    if (producer.flip_arrival_event)
+                        backend->destroyEvent(
+                            producer.flip_arrival_event, ordinal);
+                }
+                if (runtime_histogram_drain_complete_event_)
+                    backend->destroyEvent(
+                        runtime_histogram_drain_complete_event_, ordinal);
+                if (runtime_histogram_initialization_event_)
+                    backend->destroyEvent(
+                        runtime_histogram_initialization_event_, ordinal);
+                if (runtime_histogram_maintenance_stream_)
+                    backend->destroyStream(
+                        runtime_histogram_maintenance_stream_, ordinal);
+                if (host_runtime_histogram_snapshot_)
+                    backend->freePinned(
+                        host_runtime_histogram_snapshot_, ordinal);
+                if (host_runtime_histogram_bank_indices_)
+                    backend->freePinned(
+                        host_runtime_histogram_bank_indices_, ordinal);
+            }
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[MoERuntimeTable] asynchronous histogram teardown failed on "
+                << device_id_.to_string() << ": " << error.what());
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "[MoERuntimeTable] asynchronous histogram teardown failed on "
+                << device_id_.to_string() << ": unknown exception");
+        }
+
+        runtime_histogram_producer_streams_.clear();
+        runtime_histogram_drain_complete_event_ = nullptr;
+        runtime_histogram_initialization_event_ = nullptr;
+        runtime_histogram_maintenance_stream_ = nullptr;
+        host_runtime_histogram_snapshot_ = nullptr;
+        host_runtime_histogram_bank_indices_ = nullptr;
+        freeMirror(
+            device_id_,
+            device_runtime_histogram_active_bank_,
+            "[MoERuntimeTable] free asynchronous histogram active bank");
+        freeMirror(
+            device_id_,
+            device_runtime_histogram_banks_,
+            "[MoERuntimeTable] free asynchronous histogram banks");
+        device_runtime_histogram_active_bank_ = nullptr;
+        device_runtime_histogram_banks_ = nullptr;
+        runtime_histogram_drain_in_flight_ = false;
+        runtime_histogram_producers_sealed_ = false;
+    }
+
+    bool DeviceMoERuntimeTable::mergeRuntimeHistogramSnapshot(
+        DecodeExpertHistogram &histogram)
+    {
+        const auto &hist_config = histogram.config();
+        if (!host_runtime_histogram_snapshot_ ||
+            hist_config.num_layers != num_layers_ ||
+            hist_config.num_experts != num_experts_ ||
+            hist_config.top_k != top_k_)
+        {
+            return false;
+        }
+
+        constexpr std::array<ExpertHistogramSource,
+                             moe_runtime_abi::kHistogramSourceCount>
+            sources{
+                ExpertHistogramSource::DecodeToken,
+                ExpertHistogramSource::PrefillChunk,
+                ExpertHistogramSource::GroupedVerifier,
+            };
+        constexpr std::array<const char *,
+                             moe_runtime_abi::kHistogramSourceCount>
+            source_names{"decode", "prefill", "grouped_verifier"};
+
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            const auto &bank =
+                host_runtime_histogram_snapshot_[
+                    static_cast<std::size_t>(layer_idx)];
+            for (std::size_t source = 0;
+                 source < moe_runtime_abi::kHistogramSourceCount;
+                 ++source)
+            {
+                if (!runtime_histogram_sources_[source])
+                    continue;
+                histogram.mergeLayerCounts(
+                    layer_idx,
+                    bank.selected[source],
+                    num_experts_,
+                    /*count_window_tokens=*/
+                        sources[source] !=
+                        ExpertHistogramSource::DecodeToken,
+                    sources[source]);
+
+                if (PerfStatsCollector::isEnabled())
+                {
+                    const uint64_t selected_slots = std::accumulate(
+                        bank.selected[source],
+                        bank.selected[source] + num_experts_,
+                        uint64_t{0});
+                    const uint64_t local_slots = std::accumulate(
+                        bank.local[source],
+                        bank.local[source] + num_experts_,
+                        uint64_t{0});
+                    PerfStatsCollector::addCounter(
+                        "moe_rebalance",
+                        "runtime_phase_selected_slots",
+                        static_cast<double>(selected_slots),
+                        "rebalance",
+                        device_id_.toString(),
+                        {{"layer", std::to_string(layer_idx)},
+                         {"phase", source_names[source]},
+                         {"async", "true"},
+                         {"reset", "true"}});
+                    PerfStatsCollector::addCounter(
+                        "moe_rebalance",
+                        "runtime_phase_local_compute_slots",
+                        static_cast<double>(local_slots),
+                        "rebalance",
+                        device_id_.toString(),
+                        {{"layer", std::to_string(layer_idx)},
+                         {"phase", source_names[source]},
+                         {"async", "true"},
+                         {"reset", "true"}});
+                }
+            }
+        }
+        return true;
     }
 
     void DeviceMoERuntimeTable::releaseDeviceMirror() noexcept

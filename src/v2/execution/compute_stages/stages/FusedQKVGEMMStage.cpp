@@ -104,6 +104,50 @@ namespace llaminar2
         resetSessionStatePreservingCapturedReplay();
     }
 
+    bool FusedQKVGEMMStage::prepareGraphLaunch(
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        (void)ctx;
+        if (!stream)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Graph launch preparation requires "
+                      "the exact non-null producer stream");
+            return false;
+        }
+        setGPUStream(stream);
+
+        if (!resolveIndividualKernels("FusedQKVGEMMStage::prepareGraphLaunch"))
+            return false;
+        if (cached_gemm_q_)
+            bindStageStream(cached_gemm_q_);
+        bindStageStream(cached_gemm_k_);
+        bindStageStream(cached_gemm_v_);
+
+        const size_t projection_count = projectionCount();
+        const bool q_ready =
+            !cached_gemm_q_ ||
+            cached_gemm_q_->prepareFusedProjectionGraphCapture(
+                projection_count);
+        const bool k_ready =
+            cached_gemm_k_ &&
+            cached_gemm_k_->prepareFusedProjectionGraphCapture(
+                projection_count);
+        const bool v_ready =
+            cached_gemm_v_ &&
+            cached_gemm_v_->prepareFusedProjectionGraphCapture(
+                projection_count);
+        if (!q_ready || !k_ready || !v_ready)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Failed to provision persistent "
+                      "fused-projection resources before graph capture"
+                      << " device=" << params_.device_id.toString()
+                      << " projections=" << projection_count);
+            return false;
+        }
+        return true;
+    }
+
     bool FusedQKVGEMMStage::validatePreparedWeights(std::string *error) const
     {
         if ((!includesQuery() || !params_.wq) &&

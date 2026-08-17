@@ -439,7 +439,7 @@ class Aime25HttpBenchmarkTest(unittest.TestCase):
                 "value": 11,
                 "tags": {
                     "allow_graph_replay": "true",
-                    "collective_segmented": "false",
+                    "heterogeneous_segmented": "false",
                     "replay_plan_policy": "require_full_graph",
                 },
             },
@@ -633,7 +633,7 @@ class Aime25HttpBenchmarkTest(unittest.TestCase):
                 "value": 2,
                 "tags": {
                     "allow_graph_replay": "true",
-                    "collective_segmented": "false",
+                    "heterogeneous_segmented": "false",
                     "replay_plan_policy": "require_full_graph",
                 },
             },
@@ -660,7 +660,7 @@ class Aime25HttpBenchmarkTest(unittest.TestCase):
                 "name": "decode_capture_policy",
                 "device": "gpu:0",
                 "value": 1,
-                "tags": {"collective_segmented": "true"},
+                "tags": {"heterogeneous_segmented": "true"},
             }, "segmented"),
             ({
                 "domain": "mtp",

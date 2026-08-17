@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstring>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -623,7 +624,7 @@ namespace
         std::cout << "[" << fmt << "/patterned] " << total_checks << " checks PASSED" << std::endl;
     }
 
-    TEST(CPUQuantizedGemmParityRegression, Q5KQwen36NodeLocalTPGDNPrefillShape)
+    TEST(CPUQuantizedGemmParityRegression, Q5KQwen36NodeTPGDNPrefillShape)
     {
         const int M = 9;
         const int N = 7168;
@@ -687,7 +688,17 @@ namespace
     {
         using namespace llaminar2::cpu::native_vnni;
         constexpr int thread_counts[] = {
-            1, 2, 3, 7, 27, 28, 31, 56, 112, 255,
+            1,
+            2,
+            3,
+            7,
+            27,
+            28,
+            31,
+            56,
+            112,
+            255,
+            std::numeric_limits<int>::max(),
         };
         constexpr int m_values[] = {2, 3, 4, 8, 15, 16, 31, 128, 512};
         constexpr int shapes[][2] = {
@@ -696,7 +707,18 @@ namespace
             {5120, 17408},
             {248320, 7168},
         };
-        constexpr int payload_bytes[] = {16, 20, 32, 36};
+        struct PreparedFormatCase
+        {
+            uint8_t codebook;
+            bool asymmetric;
+        };
+        constexpr PreparedFormatCase prepared_formats[] = {
+            {0, false},  // Nibble symmetric: 1280 bytes.
+            {5, true},   // Nibble asymmetric: 1408 bytes.
+            {6, false},  // Expanded INT8 symmetric: 2304 bytes.
+            {7, true},   // Expanded INT8 asymmetric: 2432 bytes.
+            {8, false},  // Native Q6 dual-scale: 1792 bytes.
+        };
 
         for (const int threads : thread_counts)
         {
@@ -704,16 +726,20 @@ namespace
             {
                 for (const auto &shape : shapes)
                 {
-                    for (const int payload : payload_bytes)
+                    for (const PreparedFormatCase format : prepared_formats)
                     {
+                        const NativeVNNIPreparedFootprint footprint =
+                            preparedFootprintForFormat(
+                                format.codebook, format.asymmetric);
                         SCOPED_TRACE(
                             ::testing::Message()
                             << "threads=" << threads << " M=" << M
                             << " N=" << shape[0] << " K=" << shape[1]
-                            << " payload=" << payload);
+                            << " prepared_stride="
+                            << footprint.weight_bytes_per_n_chunk_k_block);
                         const NativeVNNITileConfig config =
                             computeTileConfig(
-                                shape[0], shape[1], M, payload, threads);
+                                shape[0], shape[1], M, footprint, threads);
                         EXPECT_GT(config.n_block_chunks, 0);
                         EXPECT_GE(config.k_tile_blocks, 0);
                         EXPECT_GT(config.m_unroll, 0);
@@ -724,11 +750,165 @@ namespace
             }
         }
 
+        const NativeVNNIPreparedFootprint footprint =
+            preparedFootprintForFormat(/*Q4_0=*/0, false);
         EXPECT_THROW(
-            (void)computeTileConfig(896, 896, 32, 16, 0),
+            (void)computeTileConfig(896, 896, 32, footprint, 0),
             std::invalid_argument);
         EXPECT_THROW(
-            (void)computeTileConfig(896, 896, 32, 16, -1),
+            (void)computeTileConfig(896, 896, 32, footprint, -1),
+            std::invalid_argument);
+    }
+
+    /**
+     * @brief Prove cache tiling uses prepared bytes, encoding, depth, and topology.
+     *
+     * A fixed injected 1 MiB, 16-way L2 makes every expected block count
+     * deterministic. The cases cover all five physical prepared footprints,
+     * the shallow/deep native-Q6 transition, and odd winning tile lengths that
+     * must not be rounded to an invented cross-block alignment.
+     */
+    TEST(CPUQuantizedGemmParityRegression, PrefillTileGeometryUsesExactPreparedFootprint)
+    {
+        using namespace llaminar2::cpu::native_vnni;
+
+        constexpr NativeVNNICacheTopology cache{
+            .private_l2_bytes = 1024u * 1024u,
+            .shared_l3_bytes = 32u * 1024u * 1024u,
+            .private_l2_ways = 16,
+            .shared_l3_ways = 16,
+        };
+        constexpr int N = 4096;
+        constexpr int K = 16384;
+        constexpr int M = 32;
+        constexpr int threads = 28;
+
+        const NativeVNNIPreparedFootprint nibble_symmetric_footprint =
+            preparedFootprintForFormat(/*Q4_0=*/0, false);
+        const NativeVNNIPreparedFootprint nibble_asymmetric_footprint =
+            preparedFootprintForFormat(/*Q4_1=*/5, true);
+        const NativeVNNIPreparedFootprint expanded_symmetric_footprint =
+            preparedFootprintForFormat(/*Q5_0=*/6, false);
+        const NativeVNNIPreparedFootprint expanded_asymmetric_footprint =
+            preparedFootprintForFormat(/*Q5_1=*/7, true);
+        const NativeVNNIPreparedFootprint q6_footprint =
+            preparedFootprintForFormat(/*Q6_K=*/8, false);
+
+        EXPECT_EQ(
+            nibble_symmetric_footprint.encoding,
+            CPUNativeVNNIEncoding::NibbleLUT);
+        EXPECT_FALSE(nibble_symmetric_footprint.is_asymmetric);
+        EXPECT_EQ(
+            nibble_asymmetric_footprint.encoding,
+            CPUNativeVNNIEncoding::NibbleLUT);
+        EXPECT_TRUE(nibble_asymmetric_footprint.is_asymmetric);
+        EXPECT_EQ(
+            expanded_symmetric_footprint.encoding,
+            CPUNativeVNNIEncoding::ExpandedInt8);
+        EXPECT_FALSE(expanded_symmetric_footprint.is_asymmetric);
+        EXPECT_EQ(
+            expanded_asymmetric_footprint.encoding,
+            CPUNativeVNNIEncoding::ExpandedInt8);
+        EXPECT_TRUE(expanded_asymmetric_footprint.is_asymmetric);
+        EXPECT_EQ(
+            q6_footprint.encoding,
+            CPUNativeVNNIEncoding::Q6KNativeDualScale);
+
+        const NativeVNNIPreparedFootprint rotated_nibble =
+            preparedFootprintForFormat(
+                /*Q4_0=*/0, false, /*rotation_enabled=*/true);
+        EXPECT_EQ(
+            rotated_nibble.encoding,
+            CPUNativeVNNIEncoding::ExpandedInt8);
+        EXPECT_FALSE(rotated_nibble.is_asymmetric);
+
+        EXPECT_EQ(
+            prefillL2ResidencyFraction(nibble_symmetric_footprint, M),
+            (NativeVNNIL2ResidencyFraction{1, 4}));
+        EXPECT_EQ(
+            prefillL2ResidencyFraction(q6_footprint, 4),
+            (NativeVNNIL2ResidencyFraction{1, 8}));
+        EXPECT_EQ(
+            prefillL2ResidencyFraction(q6_footprint, 8),
+            (NativeVNNIL2ResidencyFraction{3, 4}));
+
+        const NativeVNNITileConfig nibble_symmetric = computeTileConfig(
+            N,
+            K,
+            M,
+            nibble_symmetric_footprint,
+            threads,
+            cache);
+        const NativeVNNITileConfig nibble_asymmetric = computeTileConfig(
+            N,
+            K,
+            M,
+            nibble_asymmetric_footprint,
+            threads,
+            cache);
+        const NativeVNNITileConfig expanded_symmetric = computeTileConfig(
+            N,
+            K,
+            M,
+            expanded_symmetric_footprint,
+            threads,
+            cache);
+        const NativeVNNITileConfig expanded_asymmetric = computeTileConfig(
+            N,
+            K,
+            M,
+            expanded_asymmetric_footprint,
+            threads,
+            cache);
+        const NativeVNNITileConfig q6_shallow = computeTileConfig(
+            N, K, 4, q6_footprint, threads, cache);
+        const NativeVNNITileConfig q6_deep = computeTileConfig(
+            N, K, M, q6_footprint, threads, cache);
+
+        EXPECT_EQ(nibble_symmetric.k_tile_blocks, 181);
+        EXPECT_EQ(nibble_asymmetric.k_tile_blocks, 165);
+        EXPECT_EQ(expanded_symmetric.k_tile_blocks, 103);
+        EXPECT_EQ(expanded_asymmetric.k_tile_blocks, 97);
+        EXPECT_EQ(q6_shallow.k_tile_blocks, 65);
+        EXPECT_EQ(q6_deep.k_tile_blocks, 395);
+
+        // Small full-K panels remain represented by zero (no tiling).
+        EXPECT_EQ(
+            computeTileConfig(
+                N,
+                /*K=*/1024,
+                M,
+                nibble_symmetric_footprint,
+                threads,
+                cache)
+                .k_tile_blocks,
+            0);
+
+        NativeVNNIPreparedFootprint invalid_footprint{};
+        EXPECT_THROW(
+            (void)computeTileConfig(
+                N, K, M, invalid_footprint, threads, cache),
+            std::invalid_argument);
+
+        NativeVNNIPreparedFootprint invalid_encoding =
+            expanded_symmetric_footprint;
+        invalid_encoding.encoding =
+            static_cast<CPUNativeVNNIEncoding>(255);
+        EXPECT_THROW(
+            (void)computeTileConfig(
+                N, K, M, invalid_encoding, threads, cache),
+            std::invalid_argument);
+
+        NativeVNNICacheTopology invalid_cache = cache;
+        invalid_cache.private_l2_ways = 0;
+        EXPECT_THROW(
+            (void)computeTileConfig(
+                N,
+                K,
+                M,
+                preparedFootprintForFormat(/*Q4_0=*/0, false),
+                threads,
+                invalid_cache),
             std::invalid_argument);
     }
 

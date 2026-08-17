@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 #include "execution/moe/DecodeExpertHistogram.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <numeric>
@@ -13,6 +14,22 @@
 #include <vector>
 
 using namespace llaminar2;
+
+/**
+ * @brief Build a complete ownership table by repeating one static owner row.
+ *
+ * Static ordinal and random placement intentionally start with the same owner
+ * row in every routed layer. Dynamic movement is allowed to diverge from that
+ * initial table layer by layer after histogram evidence is available.
+ */
+static MoELayeredExpertOwnership makeOwnership(
+    int num_layers,
+    int num_sockets,
+    const std::vector<int> &owners)
+{
+    return MoELayeredExpertOwnership::uniform(
+        num_layers, num_sockets, owners);
+}
 
 // ── Helpers ───────────────────────────────────────────
 
@@ -29,10 +46,11 @@ static DecodeExpertHistogramConfig makeConfig(
     for (int s = 0; s < num_sockets; ++s)
         cfg.sockets.push_back(DeviceId(DeviceType::CPU, s));
 
-    // Default: round-robin expert-to-socket
-    cfg.expert_to_socket.resize(num_experts);
+    // Default: repeat one round-robin owner row in every routed layer.
+    std::vector<int> owners(static_cast<size_t>(num_experts));
     for (int e = 0; e < num_experts; ++e)
-        cfg.expert_to_socket[e] = e % num_sockets;
+        owners[static_cast<size_t>(e)] = e % num_sockets;
+    cfg.ownership = makeOwnership(num_layers, num_sockets, owners);
 
     return cfg;
 }
@@ -333,7 +351,7 @@ TEST(Test__DecodeExpertHistogram, TopExperts_RequestMoreThanExist)
     EXPECT_EQ(top.size(), 4u);
 }
 
-TEST(Test__DecodeExpertHistogram, UpdatePlacement_ChangesSocketMapping)
+TEST(Test__DecodeExpertHistogram, UpdateOwnershipChangesExactLayerMapping)
 {
     auto cfg = makeConfig(1, 4, 1, 256, 2);
     // Default: expert 0→sock0, 1→sock1, 2→sock0, 3→sock1
@@ -350,14 +368,14 @@ TEST(Test__DecodeExpertHistogram, UpdatePlacement_ChangesSocketMapping)
     EXPECT_EQ(loads_before[1], 0u);
 
     // Move expert 0 to socket 1
-    std::vector<int> new_placement = {1, 1, 0, 0};
-    hist.updatePlacement(new_placement);
+    const auto new_ownership = makeOwnership(1, 2, {1, 1, 0, 0});
+    hist.updateOwnership(new_ownership);
 
     // After update: same counts, but expert 0 is now on socket 1
     auto loads_after = hist.socketLoads(0);
     EXPECT_EQ(loads_after[0], 0u);
     EXPECT_EQ(loads_after[1], 100u);
-    EXPECT_EQ(hist.config().expert_to_socket, new_placement);
+    EXPECT_EQ(hist.config().ownership, new_ownership);
 }
 
 TEST(Test__DecodeExpertHistogram, ThreadSafety_ConcurrentRecords)
@@ -491,8 +509,10 @@ TEST(Test__DecodeExpertHistogram, PlacementImbalanceScoresArbitraryPlacement)
     const uint64_t counts[] = {10, 8, 1, 1};
     hist.mergeLayerCounts(0, counts, 4);
 
-    const auto overloaded = hist.placementImbalance({0, 0, 1, 1});
-    const auto balanced = hist.placementImbalance({0, 1, 1, 0});
+    const auto overloaded = hist.placementImbalance(
+        makeOwnership(1, 2, {0, 0, 1, 1}));
+    const auto balanced = hist.placementImbalance(
+        makeOwnership(1, 2, {0, 1, 1, 0}));
 
     ASSERT_TRUE(overloaded.valid);
     ASSERT_TRUE(balanced.valid);
@@ -505,7 +525,7 @@ TEST(Test__DecodeExpertHistogram, PlacementImbalanceScoresArbitraryPlacement)
     EXPECT_GT(overloaded.average_spread, balanced.average_spread);
 }
 
-TEST(Test__DecodeExpertHistogram, CurrentPlacementImbalanceFollowsPlacementUpdates)
+TEST(Test__DecodeExpertHistogram, CurrentPlacementImbalanceFollowsOwnershipUpdates)
 {
     auto cfg = makeConfig(1, 4, 1, 256, 2);
     DecodeExpertHistogram hist(cfg);
@@ -514,13 +534,37 @@ TEST(Test__DecodeExpertHistogram, CurrentPlacementImbalanceFollowsPlacementUpdat
     hist.mergeLayerCounts(0, counts, 4);
 
     const auto initial = hist.currentPlacementImbalance();
-    hist.updatePlacement({0, 0, 1, 1});
+    hist.updateOwnership(makeOwnership(1, 2, {0, 0, 1, 1}));
     const auto overloaded = hist.currentPlacementImbalance();
 
     ASSERT_TRUE(initial.valid);
     ASSERT_TRUE(overloaded.valid);
     EXPECT_LT(initial.average_spread, overloaded.average_spread);
     EXPECT_EQ(overloaded.worst_layer, 0);
+}
+
+TEST(Test__DecodeExpertHistogram, OwnershipUpdateIsLayerExact)
+{
+    auto cfg = makeConfig(2, 4, 1, 256, 2);
+    DecodeExpertHistogram hist(cfg);
+
+    const uint64_t counts[] = {10, 1, 1, 1};
+    hist.mergeLayerCounts(0, counts, 4);
+    hist.mergeLayerCounts(1, counts, 4);
+
+    // Move expert zero only in layer one. Layer zero must retain the original
+    // round-robin ownership; a global expert vector could not represent this.
+    const MoELayeredExpertOwnership layered(
+        2,
+        {
+            {0, 1, 0, 1},
+            {1, 1, 0, 0},
+        });
+    hist.updateOwnership(layered);
+
+    EXPECT_EQ(hist.socketLoads(0), (std::vector<uint64_t>{11, 2}));
+    EXPECT_EQ(hist.socketLoads(1), (std::vector<uint64_t>{2, 11}));
+    EXPECT_EQ(hist.config().ownership, layered);
 }
 
 TEST(Test__DecodeExpertHistogram, LayerSummary_Format)
@@ -561,6 +605,77 @@ TEST(Test__DecodeExpertHistogram, MultipleWindowResets)
         EXPECT_EQ(hist.windowTokenCount(), 0u);
     }
     EXPECT_EQ(hist.windowGeneration(), 3u);
+}
+
+TEST(Test__DecodeExpertHistogram, FrozenGenerationSurvivesNewInferenceWrites)
+{
+    auto cfg = makeConfig(1, 4, 1, 5);
+    DecodeExpertHistogram hist(cfg);
+    int old_expert[] = {0};
+    int new_expert[] = {1};
+    float weight[] = {1.0f};
+
+    for (int token = 0; token < 5; ++token)
+        hist.record(0, old_expert, weight, 1);
+
+    const auto frozen = hist.freezeAndRotateWindow();
+    ASSERT_TRUE(frozen.valid());
+    EXPECT_EQ(frozen.generation, 0u);
+    EXPECT_EQ(frozen.token_count, 5u);
+    EXPECT_EQ(frozen.activationCount(0, 0), 5u);
+    EXPECT_EQ(hist.windowGeneration(), 1u);
+    EXPECT_EQ(hist.windowTokenCount(), 0u);
+
+    for (int token = 0; token < 3; ++token)
+        hist.record(0, new_expert, weight, 1);
+
+    EXPECT_EQ(hist.activationCount(0, 0), 0u);
+    EXPECT_EQ(hist.activationCount(0, 1), 3u);
+    EXPECT_EQ(hist.windowTokenCount(), 3u);
+    EXPECT_EQ(frozen.activationCount(0, 0), 5u)
+        << "A long migration retains immutable evidence from its generation";
+    EXPECT_EQ(frozen.activationCount(0, 1), 0u);
+}
+
+TEST(Test__DecodeExpertHistogram, ConcurrentRotationLosesNoInferenceRecords)
+{
+    auto cfg = makeConfig(1, 4, 1, 64);
+    DecodeExpertHistogram hist(cfg);
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> completed_records{0};
+    int expert[] = {2};
+    float weight[] = {1.0f};
+
+    std::thread inference_writer([&]
+                                 {
+        while (!stop.load(std::memory_order_acquire))
+        {
+            hist.record(0, expert, weight, 1);
+            completed_records.fetch_add(1, std::memory_order_release);
+        } });
+
+    while (completed_records.load(std::memory_order_acquire) < 1000)
+        std::this_thread::yield();
+
+    uint64_t frozen_records = 0;
+    for (int generation = 0; generation < 32; ++generation)
+    {
+        const auto window = hist.freezeAndRotateWindow();
+        ASSERT_TRUE(window.valid());
+        frozen_records += window.activationCount(0, 2);
+    }
+
+    stop.store(true, std::memory_order_release);
+    inference_writer.join();
+    const uint64_t expected =
+        completed_records.load(std::memory_order_acquire);
+    const auto final_window = hist.freezeAndRotateWindow();
+    frozen_records += final_window.activationCount(0, 2);
+
+    EXPECT_EQ(frozen_records, expected)
+        << "Each record belongs to exactly one RCU histogram generation";
+    EXPECT_GT(expected, 1000u)
+        << "Inference must continue making progress during maintenance rotation";
 }
 
 TEST(Test__DecodeExpertHistogram, LayerHistogram_ReturnsCorrectSize)
@@ -643,6 +758,59 @@ TEST(Test__DecodeExpertHistogram, RuntimeSyncCallbackMergesOnceAndCanAdvanceWind
     EXPECT_EQ(hist.activationCount(1, 1), 2u);
 }
 
+TEST(Test__DecodeExpertHistogram,
+     AsyncDrainGenerationDoesNotRestartReadySourcesWhilePeerIsPending)
+{
+    auto cfg = makeConfig(1, 4, 1, 1);
+    DecodeExpertHistogram hist(cfg);
+
+    int immediate_calls = 0;
+    int delayed_calls = 0;
+    hist.registerRuntimeHistogramDrain(
+        [&]()
+        {
+            ++immediate_calls;
+            const uint64_t counts[4] = {1, 0, 0, 0};
+            hist.mergeLayerCounts(0, counts, 4);
+            return RuntimeExpertHistogramDrainResult::ready();
+        });
+    hist.registerRuntimeHistogramDrain(
+        [&]()
+        {
+            ++delayed_calls;
+            if (delayed_calls == 1)
+                return RuntimeExpertHistogramDrainResult::pending();
+            const uint64_t counts[4] = {0, 0, 3, 0};
+            hist.mergeLayerCounts(0, counts, 4);
+            return RuntimeExpertHistogramDrainResult::ready();
+        });
+
+    const auto first = hist.progressRuntimeHistogramDrains();
+    EXPECT_EQ(
+        first.progress,
+        RuntimeExpertHistogramDrainProgress::Pending);
+    EXPECT_EQ(immediate_calls, 1);
+    EXPECT_EQ(delayed_calls, 1);
+    EXPECT_THROW(
+        (void)hist.syncRuntimeHistograms(),
+        std::logic_error)
+        << "A blocking sync must not cross an active async generation";
+
+    const auto second = hist.progressRuntimeHistogramDrains();
+    EXPECT_EQ(second.progress, RuntimeExpertHistogramDrainProgress::Ready);
+    EXPECT_EQ(immediate_calls, 1)
+        << "A ready source must not begin generation N+1 early";
+    EXPECT_EQ(delayed_calls, 2);
+    EXPECT_EQ(hist.activationCount(0, 0), 1u);
+    EXPECT_EQ(hist.activationCount(0, 2), 3u);
+
+    const auto third = hist.progressRuntimeHistogramDrains();
+    EXPECT_EQ(third.progress, RuntimeExpertHistogramDrainProgress::Ready);
+    EXPECT_EQ(immediate_calls, 2)
+        << "All sources may begin again only after the prior aggregate completed";
+    EXPECT_EQ(delayed_calls, 3);
+}
+
 TEST(Test__DecodeExpertHistogram, PrefillChunkRouteMergeCountsOnlyRealRows)
 {
     auto cfg = makeConfig(2, 8, 2, 8);
@@ -671,6 +839,12 @@ TEST(Test__DecodeExpertHistogram, PrefillChunkRouteMergeCountsOnlyRealRows)
     EXPECT_EQ(hist.activationCount(1, 2), 2u);
     EXPECT_EQ(hist.activationCount(1, 3), 1u);
     EXPECT_EQ(hist.activationCount(1, 7), 0u);
+    EXPECT_EQ(
+        hist.activationCount(ExpertHistogramSource::PrefillChunk, 1, 1),
+        2u);
+    EXPECT_EQ(
+        hist.activationCount(ExpertHistogramSource::DecodeToken, 1, 1),
+        0u);
 
     const std::vector<int> chunk1_routes = {
         4, 5,
@@ -690,6 +864,70 @@ TEST(Test__DecodeExpertHistogram, PrefillChunkRouteMergeCountsOnlyRealRows)
     EXPECT_EQ(hist.activationCount(1, 5), 2u);
     EXPECT_EQ(hist.activationCount(1, 6), 1u);
     EXPECT_EQ(hist.activationCount(1, 7), 0u);
+}
+
+TEST(Test__DecodeExpertHistogram, FrozenWindowRetainsExactProductionPhaseEvidence)
+{
+    auto cfg = makeConfig(1, 4, 2, 16);
+    DecodeExpertHistogram hist(cfg);
+
+    const int decode_experts[2] = {0, 1};
+    const float decode_weights[2] = {0.75f, 0.25f};
+    hist.record(0, decode_experts, decode_weights, 2);
+
+    const std::vector<int> prefill_routes = {
+        1, 2,
+        1, 3,
+    };
+    const auto prefill_result = hist.mergeRoutedExpertRows(
+        prefill_routes.data(),
+        RoutedExpertHistogramMerge{
+            .source = ExpertHistogramSource::PrefillChunk,
+            .layer_idx = 0,
+            .real_token_count = 2,
+            .bucket_token_count = 2,
+            .top_k = 2,
+            .route_stride = 2,
+            .count_window_tokens = true,
+        });
+    ASSERT_TRUE(prefill_result) << prefill_result.error;
+
+    const std::uint64_t verifier_counts[4] = {0, 0, 3, 1};
+    hist.mergeLayerCounts(
+        0,
+        verifier_counts,
+        4,
+        /*count_window_tokens=*/true,
+        ExpertHistogramSource::GroupedVerifier);
+
+    EXPECT_EQ(hist.windowTokenCount(), 5u);
+    EXPECT_EQ(hist.activationCount(0, 0), 1u);
+    EXPECT_EQ(hist.activationCount(0, 1), 3u);
+    EXPECT_EQ(hist.activationCount(0, 2), 4u);
+    EXPECT_EQ(hist.activationCount(0, 3), 2u);
+    EXPECT_EQ(
+        hist.layerHistogram(ExpertHistogramSource::DecodeToken, 0),
+        (std::vector<std::uint64_t>{1, 1, 0, 0}));
+    EXPECT_EQ(
+        hist.layerHistogram(ExpertHistogramSource::PrefillChunk, 0),
+        (std::vector<std::uint64_t>{0, 2, 1, 1}));
+    EXPECT_EQ(
+        hist.layerHistogram(ExpertHistogramSource::GroupedVerifier, 0),
+        (std::vector<std::uint64_t>{0, 0, 3, 1}));
+
+    const auto frozen = hist.freezeAndRotateWindow();
+    ASSERT_TRUE(frozen.valid());
+    EXPECT_EQ(
+        frozen.source_token_counts,
+        (std::array<std::uint64_t, kExpertHistogramProductionSourceCount>{
+            1, 2, 2}));
+    EXPECT_EQ(
+        frozen.layerHistogram(ExpertHistogramSource::PrefillChunk, 0),
+        (std::vector<std::uint64_t>{0, 2, 1, 1}));
+    EXPECT_THROW(
+        (void)frozen.activationCount(
+            ExpertHistogramSource::SyntheticTest, 0, 0),
+        std::invalid_argument);
 }
 
 TEST(Test__DecodeExpertHistogram, PrefillChunkRouteMergeRejectsInvalidRealRowsBeforeMutation)

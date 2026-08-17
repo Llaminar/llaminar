@@ -101,7 +101,8 @@ namespace llaminar2
 
         static bool isEnabled()
         {
-            return debugEnv().profile.enabled || PerfStatsCollector::isEnabled();
+            return debugEnv().profile.enabled ||
+                   PerfStatsCollector::isDomainEnabled("weight_loading");
         }
 
         static void begin(WeightLoadPhase phase)

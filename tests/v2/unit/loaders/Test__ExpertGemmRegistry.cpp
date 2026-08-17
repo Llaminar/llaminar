@@ -136,6 +136,46 @@ TEST(Test__ExpertGemmRegistry, ParticipantScopedEntriesOnSameDomainDeviceDoNotOv
     EXPECT_EQ(reg.size(), 3u);
 }
 
+TEST(Test__ExpertGemmRegistry,
+     ScopedLifetimeLookupRetainsOnlyTheExactRegisteredEngine)
+{
+    ExpertGemmRegistry reg;
+    const DeviceId device = DeviceId::cpu();
+    auto participant = std::make_shared<MockGemm>(450);
+    reg.registerEngineForParticipant(
+        "cpu_cold",
+        device,
+        1,
+        3,
+        2,
+        7,
+        Role::DOWN,
+        participant.get(),
+        participant);
+
+    auto lifetime = reg.getEngineLifetimeForParticipant(
+        "cpu_cold", device, 1, 3, 2, 7, Role::DOWN);
+    ASSERT_NE(lifetime, nullptr);
+    EXPECT_EQ(lifetime.get(), participant.get());
+    EXPECT_EQ(
+        reg.getEngineLifetimeForDomain(
+            "cpu_cold", device, 2, 7, Role::DOWN),
+        nullptr);
+
+    MockGemm borrowed(451);
+    auto unrelated_owner = std::make_shared<MockGemm>(452);
+    reg.registerEngine(
+        device,
+        2,
+        8,
+        Role::DOWN,
+        &borrowed,
+        unrelated_owner);
+    EXPECT_EQ(
+        reg.getEngineLifetime(device, 2, 8, Role::DOWN),
+        nullptr);
+}
+
 TEST(Test__ExpertGemmRegistry, AliasDomainAndParticipantFromBaseDeviceReusesEngine)
 {
     ExpertGemmRegistry reg;

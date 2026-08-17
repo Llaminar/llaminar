@@ -1,3 +1,8 @@
+/**
+ * @file ExpertGemmRegistry.cpp
+ * @brief Implements scoped prepared MoE GEMM registration and lifetime lookup.
+ */
+
 #include "ExpertGemmRegistry.h"
 
 #include <functional>
@@ -103,6 +108,52 @@ namespace llaminar2
         if (it == engines_.end())
             return nullptr;
         return it->second.engine;
+    }
+
+    std::shared_ptr<ITensorGemm> ExpertGemmRegistry::getEngineLifetime(
+        DeviceId device,
+        int layer,
+        int expert,
+        WeightRole role) const
+    {
+        return getEngineLifetimeForParticipant(
+            {}, device, -1, -1, layer, expert, role);
+    }
+
+    std::shared_ptr<ITensorGemm>
+    ExpertGemmRegistry::getEngineLifetimeForDomain(
+        const std::string &domain_name,
+        DeviceId device,
+        int layer,
+        int expert,
+        WeightRole role) const
+    {
+        return getEngineLifetimeForParticipant(
+            domain_name, device, -1, -1, layer, expert, role);
+    }
+
+    std::shared_ptr<ITensorGemm>
+    ExpertGemmRegistry::getEngineLifetimeForParticipant(
+        const std::string &domain_name,
+        DeviceId device,
+        int participant_world_rank,
+        int participant_index,
+        int layer,
+        int expert,
+        WeightRole role) const
+    {
+        std::shared_lock lock(mutex_);
+        Key key{domain_name, device, layer, expert, role};
+        key.participant_world_rank = participant_world_rank;
+        key.participant_index = participant_index;
+        const auto found = engines_.find(key);
+        if (found == engines_.end() || !found->second.engine ||
+            !found->second.ownership ||
+            found->second.ownership.get() != found->second.engine)
+        {
+            return nullptr;
+        }
+        return found->second.ownership;
     }
 
     bool ExpertGemmRegistry::hasCompleteRole(DeviceId device, int layer, int num_experts, WeightRole role) const

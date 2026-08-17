@@ -66,6 +66,7 @@ struct PackedVnniDestination
     int row_offset;
     int group_rows;
     int blocks_per_row;
+    int allocation_payload_bytes_per_block;
 };
 
 /**
@@ -89,6 +90,33 @@ __device__ __forceinline__ size_t packedVnniLinearIndex(
             static_cast<size_t>(block)) *
                static_cast<size_t>(destination.group_rows) +
            static_cast<size_t>(row_in_group);
+}
+
+/**
+ * @brief Map one logical block to its live bytes inside a recyclable group.
+ *
+ * Each expert remains a tightly packed GEMM matrix. Its group base advances by
+ * the allocation capacity so a later CPU-normalized representation can reuse
+ * the same storage without moving neighboring experts.
+ */
+__device__ __forceinline__ size_t packedVnniPayloadOffset(
+    size_t linear,
+    int live_payload_bytes_per_block,
+    PackedVnniDestination destination)
+{
+    if (destination.group_rows <= 0)
+        return linear * static_cast<size_t>(live_payload_bytes_per_block);
+
+    const size_t blocks_per_group =
+        static_cast<size_t>(destination.blocks_per_row) *
+        static_cast<size_t>(destination.group_rows);
+    const size_t group = linear / blocks_per_group;
+    const size_t within_group = linear % blocks_per_group;
+    return group * blocks_per_group *
+               static_cast<size_t>(
+                   destination.allocation_payload_bytes_per_block) +
+           within_group *
+               static_cast<size_t>(live_payload_bytes_per_block);
 }
 
 /** @brief Copy one aligned raw-INT8 execution block with vectorized stores. */
@@ -164,7 +192,8 @@ __global__ void repack_q4_0_to_vnni(
 
     // Copy 16 bytes of packed nibbles via 4 × uint32 stores
     const uint32_t* src = reinterpret_cast<const uint32_t*>(blk.qs);
-    uint32_t* dst = reinterpret_cast<uint32_t*>(d_payload + linear * 16);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(
+        d_payload + packedVnniPayloadOffset(linear, 16, destination));
     dst[0] = src[0];
     dst[1] = src[1];
     dst[2] = src[2];
@@ -198,7 +227,8 @@ __global__ void repack_q4_1_to_vnni(
 
     // Copy 16 bytes of packed nibbles via 4 × uint32 stores
     const uint32_t* src = reinterpret_cast<const uint32_t*>(blk.qs);
-    uint32_t* dst = reinterpret_cast<uint32_t*>(d_payload + linear * 16);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(
+        d_payload + packedVnniPayloadOffset(linear, 16, destination));
     dst[0] = src[0];
     dst[1] = src[1];
     dst[2] = src[2];
@@ -231,7 +261,7 @@ __global__ void repack_q5_0_to_vnni(
     const size_t linear = packedVnniLinearIndex(n, b, destination);
 
     // Copy 16 bytes of packed nibbles (qs)
-    uint8_t* dst = d_payload + linear * 20;
+    uint8_t* dst = d_payload + packedVnniPayloadOffset(linear, 20, destination);
     const uint32_t* src_qs = reinterpret_cast<const uint32_t*>(blk.qs);
     uint32_t* dst32 = reinterpret_cast<uint32_t*>(dst);
     dst32[0] = src_qs[0];
@@ -271,7 +301,7 @@ __global__ void repack_q5_1_to_vnni(
     const size_t linear = packedVnniLinearIndex(n, b, destination);
 
     // Copy 16 bytes of packed nibbles (qs)
-    uint8_t* dst = d_payload + linear * 20;
+    uint8_t* dst = d_payload + packedVnniPayloadOffset(linear, 20, destination);
     const uint32_t* src_qs = reinterpret_cast<const uint32_t*>(blk.qs);
     uint32_t* dst32 = reinterpret_cast<uint32_t*>(dst);
     dst32[0] = src_qs[0];
@@ -312,7 +342,8 @@ __global__ void repack_q8_0_to_vnni(
 
     // Copy 32 bytes of int8 payload via 8 × uint32 stores
     const uint32_t* src = reinterpret_cast<const uint32_t*>(blk.qs);
-    uint32_t* dst = reinterpret_cast<uint32_t*>(d_payload + linear * 32);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(
+        d_payload + packedVnniPayloadOffset(linear, 32, destination));
     dst[0] = src[0];
     dst[1] = src[1];
     dst[2] = src[2];
@@ -350,7 +381,7 @@ __global__ void repack_q8_1_to_vnni(
 
     const auto& blk = d_raw[n * blocks_per_row + b];
     const size_t linear = packedVnniLinearIndex(n, b, destination);
-    uint8_t* dst = d_payload + linear * 32;
+    uint8_t* dst = d_payload + packedVnniPayloadOffset(linear, 32, destination);
     hip_repack_copy32(dst, blk.qs);
     d_scales[linear] = blk.d;
 }
@@ -380,7 +411,7 @@ __global__ void repack_q8_k_to_vnni(
     const int subblock = b % 8;
     const auto& blk = d_raw[n * superblocks_per_row + superblock];
     const size_t linear = packedVnniLinearIndex(n, b, destination);
-    uint8_t* dst = d_payload + linear * 32;
+    uint8_t* dst = d_payload + packedVnniPayloadOffset(linear, 32, destination);
     const int8_t* src = blk.qs + subblock * 32;
     hip_repack_copy32(dst, src);
     d_scales[linear] = 0x3c00u; // IEEE FP16 1.0.
@@ -428,7 +459,8 @@ __global__ void repack_q4k_to_vnni(
     const size_t linear = packedVnniLinearIndex(n, b, destination);
 
     // Store repacked payload
-    uint32_t* dst = reinterpret_cast<uint32_t*>(d_payload + linear * 16);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(
+        d_payload + packedVnniPayloadOffset(linear, 16, destination));
     const uint32_t* rp = reinterpret_cast<const uint32_t*>(repacked);
     dst[0] = rp[0];
     dst[1] = rp[1];
@@ -494,7 +526,7 @@ __global__ void repack_q5k_to_vnni(
     const size_t linear = packedVnniLinearIndex(n, b, destination);
 
     // Store 20-byte payload: [16B qs] [4B qh]
-    uint8_t* dst = d_payload + linear * 20;
+    uint8_t* dst = d_payload + packedVnniPayloadOffset(linear, 20, destination);
     const uint32_t* rp = reinterpret_cast<const uint32_t*>(repacked_qs);
     uint32_t* dst32 = reinterpret_cast<uint32_t*>(dst);
     dst32[0] = rp[0];
@@ -566,7 +598,8 @@ __global__ void repack_q6k_to_vnni(
     const size_t linear = packedVnniLinearIndex(n, b, destination);
 
     // Store payload via uint32 stores
-    uint32_t* dst32 = reinterpret_cast<uint32_t*>(d_payload + linear * 24);
+    uint32_t* dst32 = reinterpret_cast<uint32_t*>(
+        d_payload + packedVnniPayloadOffset(linear, 24, destination));
     const uint32_t* pp = reinterpret_cast<const uint32_t*>(payload);
     dst32[0] = pp[0]; dst32[1] = pp[1]; dst32[2] = pp[2]; dst32[3] = pp[3];
     dst32[4] = pp[4]; dst32[5] = pp[5];
@@ -636,7 +669,8 @@ __global__ void repack_q3k_to_vnni(
     const size_t linear = packedVnniLinearIndex(n, b, destination);
 
     // Store 12-byte payload
-    uint32_t* dst32 = reinterpret_cast<uint32_t*>(d_payload + linear * 12);
+    uint32_t* dst32 = reinterpret_cast<uint32_t*>(
+        d_payload + packedVnniPayloadOffset(linear, 12, destination));
     const uint32_t* pp = reinterpret_cast<const uint32_t*>(payload_buf);
     dst32[0] = pp[0]; dst32[1] = pp[1]; dst32[2] = pp[2];
 
@@ -717,7 +751,8 @@ __global__ void repack_q2k_to_vnni(
     const size_t linear = packedVnniLinearIndex(n, b, destination);
 
     // Store 8-byte payload
-    uint32_t* dst32 = reinterpret_cast<uint32_t*>(d_payload + linear * 8);
+    uint32_t* dst32 = reinterpret_cast<uint32_t*>(
+        d_payload + packedVnniPayloadOffset(linear, 8, destination));
     const uint32_t* pp = reinterpret_cast<const uint32_t*>(payload_buf);
     dst32[0] = pp[0]; dst32[1] = pp[1];
 
@@ -759,7 +794,8 @@ __global__ void repack_iq4xs_to_vnni(
 
     // Payload: 16 bytes from qs[sub_idx*16]
     const uint32_t* src = reinterpret_cast<const uint32_t*>(blk.qs + sub_idx * 16);
-    uint32_t* dst = reinterpret_cast<uint32_t*>(d_payload + linear * 16);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(
+        d_payload + packedVnniPayloadOffset(linear, 16, destination));
     dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
 
     // Scale: 6-bit from split hi/lo
@@ -792,7 +828,7 @@ __global__ void repack_iq3s_to_vnni(
     const size_t linear = packedVnniLinearIndex(n, b, destination);
 
     // Payload: 8B qs + 1B qh + 4B signs = 13B
-    uint8_t* dst = d_payload + linear * 13;
+    uint8_t* dst = d_payload + packedVnniPayloadOffset(linear, 13, destination);
     const uint32_t* qs_src = reinterpret_cast<const uint32_t*>(blk.qs + sub_idx * 8);
     uint32_t* dst32 = reinterpret_cast<uint32_t*>(dst);
     dst32[0] = qs_src[0]; dst32[1] = qs_src[1];
@@ -846,7 +882,8 @@ __global__ void repack_iq3xxs_to_vnni(
     payload_buf[11] = d_ksigns_iq2xs[(aux32 >> 21) & 127];
 
     // Store 12-byte payload
-    uint32_t* dst32 = reinterpret_cast<uint32_t*>(d_payload + linear * 12);
+    uint32_t* dst32 = reinterpret_cast<uint32_t*>(
+        d_payload + packedVnniPayloadOffset(linear, 12, destination));
     dst32[0] = *reinterpret_cast<uint32_t*>(payload_buf);
     dst32[1] = *reinterpret_cast<uint32_t*>(payload_buf + 4);
     dst32[2] = *reinterpret_cast<uint32_t*>(payload_buf + 8);
@@ -881,7 +918,7 @@ __global__ void repack_iq2s_to_vnni(
     const size_t linear = packedVnniLinearIndex(n, b, destination);
 
     // Payload: 4B qs[sub_idx*4] + 1B qh[sub_idx] + 4B qs[32+sub_idx*4] = 9B
-    uint8_t* dst = d_payload + linear * 9;
+    uint8_t* dst = d_payload + packedVnniPayloadOffset(linear, 9, destination);
     const uint32_t* src1 = reinterpret_cast<const uint32_t*>(blk.qs + sub_idx * 4);
     *reinterpret_cast<uint32_t*>(dst) = src1[0];
     dst[4] = blk.qh[sub_idx];
@@ -930,7 +967,7 @@ __global__ void repack_iq2xs_to_vnni(
     payload_buf[4] = qh_byte;
 
     // Store 9 bytes
-    uint8_t* dst = d_payload + linear * 9;
+    uint8_t* dst = d_payload + packedVnniPayloadOffset(linear, 9, destination);
     *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<uint32_t*>(payload_buf);
     *reinterpret_cast<uint32_t*>(dst + 4) = *reinterpret_cast<uint32_t*>(payload_buf + 4);
     dst[8] = payload_buf[8];
@@ -983,7 +1020,8 @@ __global__ void repack_iq2xxs_to_vnni(
     payload_buf[7] = d_ksigns_iq2xs[(aux32_1 >> 21) & 127];
 
     // Store 8 bytes via 2x uint32
-    uint32_t* dst32 = reinterpret_cast<uint32_t*>(d_payload + linear * 8);
+    uint32_t* dst32 = reinterpret_cast<uint32_t*>(
+        d_payload + packedVnniPayloadOffset(linear, 8, destination));
     dst32[0] = *reinterpret_cast<uint32_t*>(payload_buf);
     dst32[1] = *reinterpret_cast<uint32_t*>(payload_buf + 4);
 
@@ -1028,8 +1066,12 @@ __global__ void repack_iq1s_to_vnni(
     payload_buf[4] = static_cast<uint8_t>(qh_word & 0xFF);
     payload_buf[5] = static_cast<uint8_t>((qh_word >> 8) & 0xFF);
 
-    *reinterpret_cast<uint32_t*>(d_payload + linear * 6) = *reinterpret_cast<uint32_t*>(payload_buf);
-    *reinterpret_cast<uint16_t*>(d_payload + linear * 6 + 4) = *reinterpret_cast<uint16_t*>(payload_buf + 4);
+    uint8_t *payload_destination =
+        d_payload + packedVnniPayloadOffset(linear, 6, destination);
+    *reinterpret_cast<uint32_t*>(payload_destination) =
+        *reinterpret_cast<uint32_t*>(payload_buf);
+    *reinterpret_cast<uint16_t*>(payload_destination + 4) =
+        *reinterpret_cast<uint16_t*>(payload_buf + 4);
 
     // Scale: scale_sel from bits [12:14], delta sign from bit 15
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
@@ -1093,8 +1135,12 @@ __global__ void repack_iq1m_to_vnni(
     payload_buf[4] = qh[0];
     payload_buf[5] = qh[1];
 
-    *reinterpret_cast<uint32_t*>(d_payload + linear * 6) = *reinterpret_cast<uint32_t*>(payload_buf);
-    *reinterpret_cast<uint16_t*>(d_payload + linear * 6 + 4) = *reinterpret_cast<uint16_t*>(payload_buf + 4);
+    uint8_t *payload_destination =
+        d_payload + packedVnniPayloadOffset(linear, 6, destination);
+    *reinterpret_cast<uint32_t*>(payload_destination) =
+        *reinterpret_cast<uint32_t*>(payload_buf);
+    *reinterpret_cast<uint16_t*>(payload_destination + 4) =
+        *reinterpret_cast<uint16_t*>(payload_buf + 4);
 
     d_scales[linear] = __half_as_ushort(__float2half_rn(dl1));
     d_mins[linear]   = __half_as_ushort(__float2half_rn(dl2));
@@ -1115,6 +1161,7 @@ bool launchVnniRepack(
     int output_N,
     int output_row_offset,
     int packed_group_rows,
+    int allocation_payload_bytes_per_block,
     void* stream)
 {
     hipStream_t hip_stream = reinterpret_cast<hipStream_t>(stream);
@@ -1122,6 +1169,8 @@ bool launchVnniRepack(
     if (!stream || N <= 0 || K <= 0 || K % 32 != 0 || output_N <= 0 ||
         N > output_N || output_row_offset < 0 ||
         output_row_offset > output_N - N ||
+        allocation_payload_bytes_per_block <
+            repackPayloadBytesPerBlock(format) ||
         packed_group_rows < 0 ||
         (packed_group_rows > 0 &&
          (packed_group_rows > output_N || output_N % packed_group_rows != 0)))
@@ -1133,6 +1182,8 @@ bool launchVnniRepack(
         .row_offset = output_row_offset,
         .group_rows = packed_group_rows,
         .blocks_per_row = blocks_per_row,
+        .allocation_payload_bytes_per_block =
+            allocation_payload_bytes_per_block,
     };
 
     /*
@@ -1331,10 +1382,11 @@ bool launchVnniRepack(
         std::fprintf(
             stderr,
             "[launchVnniRepack] Kernel launch failed: %s "
-            "(format=%d N=%d K=%d output_N=%d row_offset=%d group_rows=%d "
+            "(format=%d N=%d K=%d output_N=%d row_offset=%d group_rows=%d payload_capacity=%d "
             "device=%d stream=%p)\n",
             hipGetErrorString(err), static_cast<int>(format), N, K, output_N,
-            output_row_offset, packed_group_rows, current_device, stream);
+            output_row_offset, packed_group_rows,
+            allocation_payload_bytes_per_block, current_device, stream);
         reportHipRepackPointer("raw", d_raw_blocks);
         reportHipRepackPointer("payload", d_payload);
         reportHipRepackPointer("scales", d_scales);
@@ -1348,6 +1400,25 @@ bool launchVnniRepack(
 // ============================================================================
 // Host dispatch compatibility wrappers
 // ============================================================================
+
+bool launchVnniRepack(
+    RepackFormat format,
+    const void* d_raw_blocks,
+    uint8_t* d_payload,
+    uint16_t* d_scales,
+    uint16_t* d_mins,
+    uint32_t* d_emins,
+    int N, int K,
+    int output_N,
+    int output_row_offset,
+    int packed_group_rows,
+    void* stream)
+{
+    return launchVnniRepack(
+        format, d_raw_blocks, d_payload, d_scales, d_mins, d_emins,
+        N, K, output_N, output_row_offset, packed_group_rows,
+        repackPayloadBytesPerBlock(format), stream);
+}
 
 bool launchVnniRepack(
     RepackFormat format,

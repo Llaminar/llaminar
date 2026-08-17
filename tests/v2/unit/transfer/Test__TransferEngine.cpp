@@ -1,3 +1,13 @@
+/**
+ * @file Test__TransferEngine.cpp
+ * @brief Unit coverage for transfer planning, coherence, and exact-event ordering.
+ *
+ * GPU behavior is modeled with host allocations so these tests remain
+ * device-free. The event-failure fixture proves that TransferEngine never
+ * substitutes a stream/device synchronization for an exact dependency and
+ * that queued H2D source lifetimes are protected at host reuse boundaries.
+ */
+
 #include <gtest/gtest.h>
 
 #include "tensors/CoherenceState.h"
@@ -13,6 +23,7 @@
 #include "../../mocks/MockWorkerGPUContext.h"
 #include "../../utils/TestTensorFactory.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 
@@ -859,6 +870,48 @@ namespace
     public:
         FailableEventMockBackend() : MockBackend(DeviceType::CUDA) {}
 
+        bool hostToDeviceOnStream(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int device_id,
+            void *stream) override
+        {
+            async_h2d_count_++;
+            return MockBackend::hostToDevice(
+                dst, src, bytes, device_id, stream);
+        }
+
+        bool deviceToHostOnStream(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int device_id,
+            void *stream) override
+        {
+            async_d2h_count_++;
+            return MockBackend::deviceToHost(
+                dst, src, bytes, device_id, stream);
+        }
+
+        /** @brief Allocate stable host storage for typed captured-copy tests. */
+        void *allocatePinned(size_t bytes, int device_id) override
+        {
+            (void)device_id;
+            ++pinned_allocation_count_;
+            return std::malloc(bytes);
+        }
+
+        /** @brief Release one allocation created by @ref allocatePinned. */
+        void freePinned(void *ptr, int device_id) override
+        {
+            (void)device_id;
+            if (!ptr)
+                return;
+            ++pinned_free_count_;
+            std::free(ptr);
+        }
+
         bool waitForEvent(void *event, int device_id) override
         {
             // Still record the operation for test inspection
@@ -914,6 +967,13 @@ namespace
 
         size_t getHostEventWaitCount() const { return host_event_wait_count_; }
         size_t getStreamEventWaitCount() const { return stream_event_wait_count_; }
+        size_t getAsyncH2DCount() const { return async_h2d_count_; }
+        size_t getAsyncD2HCount() const { return async_d2h_count_; }
+        size_t getPinnedAllocationCount() const
+        {
+            return pinned_allocation_count_;
+        }
+        size_t getPinnedFreeCount() const { return pinned_free_count_; }
 
     private:
         bool fail_event_wait_ = false;
@@ -924,6 +984,10 @@ namespace
         size_t sync_fallback_count_ = 0;
         size_t host_event_wait_count_ = 0;
         size_t stream_event_wait_count_ = 0;
+        size_t async_h2d_count_ = 0;
+        size_t async_d2h_count_ = 0;
+        size_t pinned_allocation_count_ = 0;
+        size_t pinned_free_count_ = 0;
     };
 } // namespace
 
@@ -971,7 +1035,7 @@ protected:
 FailableEventMockBackend *Test__TransferEngine_EventFailure::s_failable_mock_ = nullptr;
 
 // -----------------------------------------------------------------------------
-// downloadFull: event wait failure → HARD ERROR (TransferResult::fail)
+// downloadFull: the host observes bytes only after the exact D2H event.
 // -----------------------------------------------------------------------------
 
 TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_ReturnsHardError)
@@ -988,7 +1052,12 @@ TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_ReturnsHard
     // Must be a hard failure — no silent fallback
     EXPECT_FALSE(result.success);
     EXPECT_EQ(result.method_used, TransferMethod::DEVICE_TO_HOST);
-    EXPECT_NE(result.error.find("Event wait failed"), std::string::npos);
+    EXPECT_NE(
+        result.error.find("host-publication event wait failed"),
+        std::string::npos);
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 1u);
+    EXPECT_EQ(mock_->getHostEventWaitCount(), 1u);
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
 }
 
 TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_ErrorMessageMentionsInvalidEvent)
@@ -1007,7 +1076,9 @@ TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_ErrorMessag
     EXPECT_NE(result.error.find("invalid"), std::string::npos);
 }
 
-TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_NoD2HTransferOccurs)
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    DownloadFull_EventWaitFail_QueuesOnlyTheExactD2HBeforeFailing)
 {
     TransferEngine engine(resolver_);
 
@@ -1018,12 +1089,21 @@ TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_NoD2HTransf
 
     engine.downloadFull(tensor.get());
 
-    // The D2H transfer should NOT have occurred — we failed before reaching memcpy
+    // Producer ordering is imported on-device, then only the D2H publication
+    // event is host-observed. A failure at that final boundary cannot undo an
+    // already accepted copy submission.
     auto stats = mock_->getTransferStats();
-    EXPECT_EQ(stats.d2h_count, 0u);
+    EXPECT_EQ(stats.d2h_count, 1u);
+    EXPECT_EQ(mock_->getAsyncD2HCount(), 1u);
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 1u);
+    EXPECT_EQ(mock_->getHostEventWaitCount(), 1u);
+    EXPECT_EQ(mock_->getStreamSyncCount(), 0u);
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
 }
 
-TEST_F(Test__TransferEngine_EventFailure, DownloadFull_ExplicitStreamBypassesStaleCompletionEvent)
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    DownloadFull_ExplicitProducerStreamStillWaitsForD2HPublication)
 {
     TransferEngine engine(resolver_);
 
@@ -1035,12 +1115,15 @@ TEST_F(Test__TransferEngine_EventFailure, DownloadFull_ExplicitStreamBypassesSta
     void *producer_stream = reinterpret_cast<void *>(0x1234);
     auto result = engine.downloadFull(tensor.get(), producer_stream);
 
-    EXPECT_TRUE(result.success)
-        << "An explicit producer stream should order D2H directly and must not "
-           "host-wait a stale graph-capture completion event";
+    EXPECT_FALSE(result.success)
+        << "Host bytes cannot be exposed until the exact D2H publication event.";
     EXPECT_EQ(result.method_used, TransferMethod::DEVICE_TO_HOST);
-    EXPECT_EQ(mock_->getEventWaitCount(), 0u)
-        << "Explicit-stream publication must bypass tensor completion events.";
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 0u)
+        << "The exact producer stream already carries device-side ordering.";
+    EXPECT_EQ(mock_->getHostEventWaitCount(), 1u)
+        << "Only the newly recorded D2H completion event is host-observed.";
+    EXPECT_EQ(mock_->getStreamSyncCount(), 0u);
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
     auto stats = mock_->getTransferStats();
     EXPECT_EQ(stats.d2h_count, 1u);
 }
@@ -1089,43 +1172,49 @@ TEST_F(Test__TransferEngine_EventFailure, DownloadFull_NoEvent_FailsClosedWithou
 }
 
 // -----------------------------------------------------------------------------
-// uploadFull: event wait failure → HARD ERROR (same as downloadFull)
-// No fallback to full device synchronize — invalid events must fail loudly.
+// uploadFull: a resident tensor never turns a dependency into a host wait.
 // -----------------------------------------------------------------------------
 
-TEST_F(Test__TransferEngine_EventFailure, UploadFull_EventWaitFail_ReturnsHardError)
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    UploadFull_ResidentTensorDoesNotHostWaitItsCompletionEvent)
 {
     TransferEngine engine(resolver_);
 
     auto tensor = createTensorOnDeviceWithEvent();
 
-    // Event wait fails — simulates corrupted event from graph capture
+    // A host wait would fail, proving that success cannot be coming from one.
     mock_->setEventWaitFails(true);
 
-    // uploadFull to the SAME device where tensor already resides (triggers event wait path)
+    // No consumer stream was named, so this placement check must retain the
+    // published event for a later exact device consumer.
     auto result = engine.uploadFull(tensor.get(), DeviceId::cuda(0));
 
-    // Must be a hard failure — no silent fallback to synchronize
-    EXPECT_FALSE(result.success);
-    EXPECT_NE(result.error.find("Event wait failed"), std::string::npos);
-
-    // synchronize() must NOT have been called as fallback
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(mock_->getHostEventWaitCount(), 0u);
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 0u);
     EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
 }
 
-TEST_F(Test__TransferEngine_EventFailure, UploadFull_EventWaitFail_ErrorMessageMentionsInvalidEvent)
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    UploadFull_ResidentTensorLeavesDependencyForExactConsumerStream)
 {
     TransferEngine engine(resolver_);
 
     auto tensor = createTensorOnDeviceWithEvent();
-    tensor->setDebugName("test_hidden_state");
-
     mock_->setEventWaitFails(true);
 
     auto result = engine.uploadFull(tensor.get(), DeviceId::cuda(0));
+    ASSERT_TRUE(result.success);
 
-    EXPECT_FALSE(result.success);
-    EXPECT_NE(result.error.find("invalid"), std::string::npos);
+    EXPECT_NO_THROW(
+        TransferEngine::requireDeviceInput(
+            tensor.get(),
+            DeviceId::cuda(0),
+            reinterpret_cast<void *>(0x1234)));
+    EXPECT_EQ(mock_->getStreamEventWaitCount(), 1u);
+    EXPECT_EQ(mock_->getHostEventWaitCount(), 0u);
 }
 
 TEST_F(Test__TransferEngine_EventFailure, UploadFull_StreamWaitFail_DoesNotHostWait)
@@ -1153,7 +1242,7 @@ TEST_F(Test__TransferEngine_EventFailure, PublicationCreateFail_DoesNotPublishDe
 {
     auto tensor = TestTensorFactory::createFP32Ones({4, 4});
     tensor->setBackendForTesting(mock_.get());
-    ASSERT_TRUE(tensor->ensureOnDevice(DeviceId::cuda(0)));
+    TransferEngine::allocateDeviceStorage(tensor.get(), DeviceId::cuda(0));
     const TensorCoherenceState state_before = tensor->coherenceState();
 
     mock_->setEventCreateFails(true);
@@ -1165,6 +1254,74 @@ TEST_F(Test__TransferEngine_EventFailure, PublicationCreateFail_DoesNotPublishDe
         std::runtime_error);
     EXPECT_EQ(tensor->coherenceState(), state_before)
         << "Authority cannot become externally visible without its event.";
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    PrepareDeviceInputQueuesH2DAndPublishesExactEventWithoutHostBlocking)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    void *const consumer_stream = reinterpret_cast<void *>(0xA51C0001);
+
+    mock_->resetTransferStats();
+    mock_->resetEventRecords();
+    TransferEngine::prepareDeviceInput(
+        tensor.get(), DeviceId::cuda(0), consumer_stream);
+
+    EXPECT_EQ(mock_->getAsyncH2DCount(), 1u);
+    EXPECT_EQ(mock_->getEventCreateCount(), 1u);
+    EXPECT_EQ(mock_->getEventRecordCount(), 1u);
+    const auto stream_records =
+        mock_->getEventRecordsForStream(consumer_stream);
+    ASSERT_EQ(stream_records.size(), 1u);
+    EXPECT_EQ(stream_records.front().type, MockBackend::EventRecord::RECORD);
+    EXPECT_EQ(mock_->getHostEventWaitCount(), 0u);
+    EXPECT_EQ(mock_->getStreamSyncCount(), 0u);
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
+    EXPECT_TRUE(tensor->hostValid());
+    EXPECT_TRUE(tensor->deviceValid());
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    MutableHostAccessWaitsOnlyForPendingH2DSourceUse)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    void *const consumer_stream = reinterpret_cast<void *>(0xA51C0002);
+
+    TransferEngine::prepareDeviceInput(
+        tensor.get(), DeviceId::cuda(0), consumer_stream);
+    ASSERT_EQ(mock_->getHostEventWaitCount(), 0u);
+
+    float *const host_data = tensor->mutable_data();
+    ASSERT_NE(host_data, nullptr);
+    EXPECT_EQ(mock_->getHostEventWaitCount(), 1u)
+        << "Host storage reuse must wait only for the queued upload event.";
+    EXPECT_EQ(mock_->getStreamSyncCount(), 0u);
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
+    EXPECT_TRUE(tensor->hostValid());
+    EXPECT_FALSE(tensor->deviceValid());
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    TensorDestructionWaitsOnlyForPendingH2DSourceUse)
+{
+    {
+        auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+        tensor->setBackendForTesting(mock_.get());
+        TransferEngine::prepareDeviceInput(
+            tensor.get(),
+            DeviceId::cuda(0),
+            reinterpret_cast<void *>(0xA51C0003));
+        ASSERT_EQ(mock_->getHostEventWaitCount(), 0u);
+    }
+
+    EXPECT_EQ(mock_->getHostEventWaitCount(), 1u);
+    EXPECT_EQ(mock_->getStreamSyncCount(), 0u);
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
 }
 
 TEST_F(Test__TransferEngine_EventFailure, NullProducerStream_DoesNotPublishDeviceAuthority)
@@ -1461,6 +1618,133 @@ TEST_F(Test__TransferEngine_EventFailure, AllocationOnlyStorageDoesNotPublishAut
 
 TEST_F(
     Test__TransferEngine_EventFailure,
+    PinnedTransferFamilyCapturesBidirectionalCopiesWithoutSynchronization)
+{
+    TransferEngine engine(resolver_);
+    constexpr size_t kTensorBytes = 16u * sizeof(float);
+    constexpr size_t kFamilyBytes = 2u * kTensorBytes;
+    void *const capture_stream = reinterpret_cast<void *>(0xCA970101);
+
+    auto pinned = engine.declarePinnedHostBuffer(
+        kFamilyBytes, DeviceId::cuda(0));
+    ASSERT_NE(pinned, nullptr);
+    EXPECT_FALSE(pinned->isBound());
+    EXPECT_EQ(pinned->sizeBytes(), kFamilyBytes);
+    EXPECT_EQ(pinned->registrationDevice(), DeviceId::cuda(0));
+    EXPECT_TRUE(pinned->contains(kTensorBytes, kTensorBytes));
+    EXPECT_FALSE(pinned->contains(kTensorBytes + 1u, kTensorBytes));
+    EXPECT_THROW((void)pinned->mutableData(), std::out_of_range);
+
+    engine.bindPinnedHostBuffer(*pinned);
+    engine.bindPinnedHostBuffer(*pinned);
+    ASSERT_TRUE(pinned->isBound());
+    EXPECT_EQ(mock_->getPinnedAllocationCount(), 1u)
+        << "Binding a declared graph identity must be idempotent.";
+
+    auto *const source = static_cast<float *>(pinned->mutableData());
+    for (size_t index = 0; index < 16u; ++index)
+        source[index] = static_cast<float>(index) + 0.25f;
+
+    auto tensor = TestTensorFactory::createFP32Zeros({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+    TransferEngine::allocateDeviceStorage(
+        tensor.get(), DeviceId::cuda(0));
+    ASSERT_FALSE(tensor->deviceValid());
+
+    int input_publish_stage = 0;
+    int output_publish_stage = 0;
+    std::vector<GraphCaptureDependencyLedger::StagePlan> stages;
+    stages.push_back({
+        .stage_identity = &input_publish_stage,
+        .stage_name = "captured_pinned_h2d",
+        .outputs = {tensor->transferStorageOwner()},
+    });
+    stages.push_back({
+        .stage_identity = &output_publish_stage,
+        .stage_name = "captured_pinned_d2h",
+        .internal_inputs = {{
+            .tensor = tensor->transferStorageOwner(),
+            .producer_stage_index = 0,
+        }},
+    });
+    GraphCaptureDependencyLedger ledger(
+        DeviceId::cuda(0),
+        capture_stream,
+        std::move(stages),
+        "pinned_bidirectional_transaction");
+
+    mock_->resetTransferStats();
+    mock_->resetEventRecords();
+    {
+        GraphCaptureGuard capture_guard(&ledger);
+        {
+            ScopedGraphCaptureStage input_scope(&input_publish_stage);
+            EXPECT_NO_THROW(engine.enqueuePinnedHostToDevice(
+                *pinned,
+                /*source_offset=*/0,
+                tensor.get(),
+                /*destination_offset=*/0,
+                kTensorBytes,
+                DeviceId::cuda(0),
+                capture_stream));
+            input_scope.complete();
+        }
+        {
+            ScopedGraphCaptureStage output_scope(&output_publish_stage);
+            EXPECT_NO_THROW(engine.enqueueDeviceToPinnedHost(
+                tensor.get(),
+                /*source_offset=*/0,
+                *pinned,
+                /*destination_offset=*/kTensorBytes,
+                kTensorBytes,
+                DeviceId::cuda(0),
+                capture_stream));
+            output_scope.complete();
+        }
+    }
+
+    EXPECT_EQ(mock_->getAsyncH2DCount(), 1u);
+    EXPECT_EQ(mock_->getAsyncD2HCount(), 1u);
+    EXPECT_EQ(mock_->getEventRecordCount(), 0u)
+        << "Captured transfer nodes must use their graph completion event.";
+    EXPECT_EQ(mock_->getStreamSyncCount(), 0u);
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
+    EXPECT_EQ(
+        std::memcmp(
+            pinned->data(/*offset=*/0),
+            pinned->data(/*offset=*/kTensorBytes),
+            kTensorBytes),
+        0);
+    EXPECT_FALSE(tensor->deviceValid())
+        << "Recording a graph transaction must not publish unexecuted bytes.";
+
+    EXPECT_THROW(
+        engine.enqueuePinnedHostToDevice(
+            *pinned,
+            kTensorBytes + 1u,
+            tensor.get(),
+            0,
+            kTensorBytes,
+            DeviceId::cuda(0),
+            capture_stream),
+        std::out_of_range);
+    EXPECT_THROW(
+        engine.enqueueDeviceToPinnedHost(
+            tensor.get(),
+            0,
+            *pinned,
+            kTensorBytes,
+            kTensorBytes,
+            DeviceId::cuda(0),
+            nullptr),
+        std::invalid_argument);
+
+    pinned.reset();
+    EXPECT_EQ(mock_->getPinnedFreeCount(), 1u);
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
     CaptureLedgerAdmitsOnlyAnEarlierRecordedInternalProducer)
 {
     auto internal = TestTensorFactory::createFP32Ones({4, 4});
@@ -1524,6 +1808,109 @@ TEST_F(
             internal.get(), DeviceId::cuda(0), capture_stream),
         std::runtime_error)
         << "The internal-edge proof must not escape its capture transaction";
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    CaptureLedgerAdmitsOnlyTypedRetainedParentImports)
+{
+    auto retained_input = TestTensorFactory::createFP32Ones({4, 4});
+    retained_input->setBackendForTesting(mock_.get());
+    TransferEngine::allocateDeviceStorage(
+        retained_input.get(), DeviceId::cuda(0));
+    ASSERT_FALSE(retained_input->deviceValid());
+
+    int child_consumer_stage = 0;
+    void *const capture_stream = reinterpret_cast<void *>(0xCA970007);
+    void *const unrelated_stream = reinterpret_cast<void *>(0xCA970008);
+    std::vector<GraphCaptureDependencyLedger::StagePlan> stages = {{
+        .stage_identity = &child_consumer_stage,
+        .stage_name = "retained_child_consumer",
+        .retained_parent_inputs = {
+            retained_input->transferStorageOwner()},
+    }};
+    GraphCaptureDependencyLedger ledger(
+        DeviceId::cuda(0),
+        capture_stream,
+        std::move(stages),
+        "retained_parent_import");
+
+    {
+        GraphCaptureGuard capture_guard(&ledger);
+        ScopedGraphCaptureStage consumer_scope(&child_consumer_stage);
+        EXPECT_NO_THROW(TransferEngine::requireDeviceInput(
+            retained_input.get(), DeviceId::cuda(0), capture_stream));
+        EXPECT_THROW(
+            TransferEngine::requireDeviceInput(
+                retained_input.get(),
+                DeviceId::cuda(0),
+                unrelated_stream),
+            std::logic_error)
+            << "A retained-parent proof belongs to one exact capture stream";
+        consumer_scope.complete();
+    }
+
+    EXPECT_FALSE(retained_input->deviceValid())
+        << "A child template must not publish its parent's unexecuted bytes";
+    EXPECT_THROW(
+        TransferEngine::requireDeviceInput(
+            retained_input.get(), DeviceId::cuda(0), capture_stream),
+        std::runtime_error)
+        << "The retained-parent proof must not escape its capture transaction";
+}
+
+TEST_F(
+    Test__TransferEngine_EventFailure,
+    SetupCaptureAdmitsOnlyDeclaredArenaFrontierAddresses)
+{
+    auto declared_frontier = TestTensorFactory::createFP32Ones({4, 4});
+    auto undeclared_metadata = TestTensorFactory::createFP32Ones({4, 4});
+    declared_frontier->setBackendForTesting(mock_.get());
+    undeclared_metadata->setBackendForTesting(mock_.get());
+    TransferEngine::allocateDeviceStorage(
+        declared_frontier.get(), DeviceId::cuda(0));
+    TransferEngine::allocateDeviceStorage(
+        undeclared_metadata.get(), DeviceId::cuda(0));
+    ASSERT_FALSE(declared_frontier->deviceValid());
+    ASSERT_FALSE(undeclared_metadata->deviceValid());
+
+    int setup_stage = 0;
+    void *const capture_stream = reinterpret_cast<void *>(0xCA970009);
+    std::vector<GraphCaptureDependencyLedger::StagePlan> stages = {{
+        .stage_identity = &setup_stage,
+        .stage_name = "setup_frontier_consumer",
+        .external_inputs = {
+            declared_frontier->transferStorageOwner()},
+    }};
+    GraphCaptureDependencyLedger ledger(
+        DeviceId::cuda(0),
+        capture_stream,
+        std::move(stages),
+        "setup_address_only_frontier",
+        GraphCaptureDependencyLedger::ExternalInputAuthority::
+            BindDeclaredAddressesOnly);
+
+    {
+        GraphCaptureGuard capture_guard(&ledger);
+        ScopedGraphCaptureStage stage_scope(&setup_stage);
+        EXPECT_NO_THROW(TransferEngine::requireDeviceInput(
+            declared_frontier.get(), DeviceId::cuda(0), capture_stream));
+        EXPECT_THROW(
+            TransferEngine::requireDeviceInput(
+                undeclared_metadata.get(), DeviceId::cuda(0), capture_stream),
+            std::runtime_error)
+            << "Setup may bind only a typed graph-frontier address; weights "
+               "and undeclared metadata remain strict external inputs";
+        stage_scope.complete();
+    }
+
+    EXPECT_FALSE(declared_frontier->deviceValid())
+        << "Setup recording must not publish request payload authority";
+    EXPECT_THROW(
+        TransferEngine::requireDeviceInput(
+            declared_frontier.get(), DeviceId::cuda(0), capture_stream),
+        std::runtime_error)
+        << "The address-only proof must not escape its setup capture transaction";
 }
 
 TEST_F(

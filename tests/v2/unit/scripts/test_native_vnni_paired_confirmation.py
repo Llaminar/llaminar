@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import math
+import statistics
 import sys
 import tempfile
 import unittest
@@ -17,13 +18,21 @@ if str(KERNEL_PERF_ROOT) not in sys.path:
     sys.path.insert(0, str(KERNEL_PERF_ROOT))
 
 from native_vnni_dispatch.paired_confirmation import (  # noqa: E402
+    CPU_ISOLATED_PAIRED_PROTOCOL_VERSION,
+    CPU_PROCESS_ISOLATED_TIMING_SCOPE,
     CUDA_PAIRED_PROTOCOL_VERSION,
     LEGACY_PAIRED_PROTOCOL_VERSION,
     PAIRED_PROTOCOL_VERSION,
     REQUIRED_COLUMNS,
     REQUIRED_COLUMNS_V1,
+    REQUIRED_COLUMNS_V4,
+    PairedCellEvidence,
+    PairedCellKey,
+    PairedTimingComparison,
     certify_paired_confirmation,
     paired_timing_comparisons,
+    prefer_promotion_eligible_comparisons,
+    promotion_eligible_comparisons,
     read_paired_confirmation_csv,
 )
 from native_vnni_dispatch.schema import P95_REGRET_BUDGET  # noqa: E402
@@ -136,6 +145,95 @@ class NativeVNNIPairedConfirmationTest(unittest.TestCase):
             abs_tol=1.0e-12,
         ))
         report.require_promotable()
+
+    def test_typed_evidence_rejects_incomplete_order_identity(self) -> None:
+        """No fitting caller can construct a partially identified crossover."""
+
+        key = PairedCellKey(
+            backend="cpu",
+            source_format="Q4_0",
+            source_codebook=0,
+            execution_codebook=0,
+            shape="TypedBoundaryRegression",
+            execution_mode="eager",
+            m=1,
+            n=1152,
+            k=5760,
+            architecture_class="avx512",
+        )
+        with self.assertRaisesRegex(ValueError, "invocation-order identity"):
+            PairedCellEvidence(
+                key=key,
+                selected_candidate_id="cpu.selected",
+                exact_candidate_id="cpu.exact",
+                selected_latency_us=(10.0, 10.0),
+                exact_latency_us=(10.0, 10.0),
+                selected_first_count=1,
+                exact_first_count=1,
+                selected_ran_first=(True,),
+            )
+
+    def test_crossover_estimator_cancels_large_invocation_position_bias(self) -> None:
+        """AB/BA strata remove period bias before declaring candidate regret.
+
+        This pattern is a reduced regression for the CPU M=1 evidence that
+        originally produced a false 12.8% miss. Most selected-first ratios are
+        below one and most exact-first ratios are above one because invocation
+        position dominates the candidate difference. The two populations have
+        overlapping tails, so taking one median over their union lands between
+        those tails and reports a false failure. Their order-stratified
+        crossover estimate recovers the intended 3.7% candidate ratio.
+        """
+
+        rows = self._rows(request_id="cpu-pair-position-bias")
+        selected_first_ratios = [0.89] * 14 + [1.13]
+        exact_first_ratios = [1.208] * 14 + [1.126]
+        selected_first_index = 0
+        exact_first_index = 0
+        for pair_index in range(30):
+            pair = [
+                row for row in rows if int(row["pair_index"]) == pair_index
+            ]
+            selected = next(
+                row for row in pair if row["candidate_role"] == "selected"
+            )
+            exact = next(
+                row for row in pair if row["candidate_role"] == "exact"
+            )
+            if selected["within_pair_order"] == "0":
+                ratio = selected_first_ratios[selected_first_index]
+                selected_first_index += 1
+            else:
+                ratio = exact_first_ratios[exact_first_index]
+                exact_first_index += 1
+            exact_latency = 100.0
+            selected_latency = exact_latency * ratio
+            exact["latency_us"] = f"{exact_latency:.9f}"
+            exact["latency_us_hex"] = exact_latency.hex()
+            selected["latency_us"] = f"{selected_latency:.9f}"
+            selected["latency_us_hex"] = selected_latency.hex()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "position-bias.csv"
+            self._write(path, rows)
+            cells = read_paired_confirmation_csv((path,))
+
+        pooled_regret = math.expm1(
+            statistics.median(cells[0].log_latency_ratios)
+        )
+        expected_crossover_regret = math.sqrt(0.89 * 1.208) - 1.0
+        self.assertGreater(pooled_regret, P95_REGRET_BUDGET)
+        self.assertAlmostEqual(
+            cells[0].observed_regret,
+            expected_crossover_regret,
+            places=12,
+        )
+        comparison = next(iter(paired_timing_comparisons(cells).values()))[0]
+        self.assertAlmostEqual(
+            comparison.selected_to_exact_median_ratio,
+            1.0 + expected_crossover_regret,
+            places=12,
+        )
 
     def test_candidates_may_use_distinct_stable_arithmetic_paths(self) -> None:
         """A tournament compares routes; only per-role route drift is invalid."""
@@ -433,7 +531,7 @@ class NativeVNNIPairedConfirmationTest(unittest.TestCase):
         self.assertEqual(cells[0].key.architecture_class, "")
 
     def test_cpu_v3_retains_isa_domain_without_graph_capture(self) -> None:
-        """CPU pairs are eager and retain their build/runtime policy surface."""
+        """Historical CPU pairs remain readable only as development priors."""
 
         rows = self._rows(request_id="cpu-pair-unit")
         for row in rows:
@@ -455,6 +553,94 @@ class NativeVNNIPairedConfirmationTest(unittest.TestCase):
             cells = read_paired_confirmation_csv((path,))
         self.assertEqual(cells[0].key.backend, "cpu")
         self.assertIn("build=AVX512", cells[0].key.architecture_class)
+        self.assertFalse(cells[0].promotion_eligible_timing)
+
+    def test_cpu_v4_requires_and_retains_process_isolation(self) -> None:
+        """Promotion-grade CPU timing proves it had no socket-local co-run peer."""
+
+        rows = self._rows(request_id="cpu-pair-isolated")
+        for row in rows:
+            row.update({
+                "protocol_version": CPU_ISOLATED_PAIRED_PROTOCOL_VERSION,
+                "backend": "cpu",
+                "phase": "decode_m1",
+                "architecture_class": (
+                    "x86_64|build=AVX512|runtime=AVX2|threads=28"
+                ),
+                "timing_scope": CPU_PROCESS_ISOLATED_TIMING_SCOPE,
+                "mpi_world_size": "1",
+                "graph_capture_ok": "0",
+            })
+            row["candidate_id"] = row["candidate_id"].replace(
+                "cuda.test", "cpu.nvnni.decode"
+            )
+            row["observed_candidate_id"] = row["candidate_id"]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cpu-v4.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=sorted(REQUIRED_COLUMNS_V4),
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            cells = read_paired_confirmation_csv((path,))
+        self.assertTrue(cells[0].promotion_eligible_timing)
+        self.assertEqual(cells[0].mpi_world_size, 1)
+
+        for row in rows:
+            row["mpi_world_size"] = "2"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cpu-v4-concurrent.csv"
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=sorted(REQUIRED_COLUMNS_V4),
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+            with self.assertRaisesRegex(ValueError, "used an MPI peer"):
+                read_paired_confirmation_csv((path,))
+
+    def test_isolated_cpu_edge_supersedes_legacy_co_run_evidence(self) -> None:
+        """A clean edge is never averaged with an unrecorded co-run context."""
+
+        key = PairedCellKey(
+            backend="cpu",
+            source_format="IQ4_NL",
+            source_codebook=4,
+            execution_codebook=4,
+            shape="IsolationPreference",
+            execution_mode="eager",
+            m=1,
+            n=1984,
+            k=10624,
+            architecture_class="avx2",
+        )
+        legacy = PairedTimingComparison(
+            key=key,
+            selected_effective_candidate_id="cpu.nbc1",
+            exact_effective_candidate_id="cpu.nbc4",
+            selected_to_exact_median_ratio=1.68,
+            pair_count=30,
+        )
+        isolated = PairedTimingComparison(
+            key=key,
+            selected_effective_candidate_id="cpu.nbc1",
+            exact_effective_candidate_id="cpu.nbc4",
+            selected_to_exact_median_ratio=0.82,
+            pair_count=30,
+            timing_scope=CPU_PROCESS_ISOLATED_TIMING_SCOPE,
+            mpi_world_size=1,
+        )
+        self.assertEqual(
+            prefer_promotion_eligible_comparisons((legacy, isolated)),
+            (isolated,),
+        )
+        self.assertEqual(
+            promotion_eligible_comparisons((legacy, isolated)),
+            (isolated,),
+        )
 
 
 if __name__ == "__main__":

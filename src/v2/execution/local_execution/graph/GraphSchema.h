@@ -376,8 +376,8 @@ namespace llaminar2
         FFNHidden,        ///< FFN hidden dimension (Gate/Up/Down) - uses d_ff_start/d_ff_count
         Vocab,            ///< Vocabulary dimension (LM head) - uses vocab_start/vocab_count
         Bias1D,           ///< 1D bias that follows its weight's dimension type
-        FusedQKVHeads,    ///< Fused QKV: 3 equal sub-blocks [Q|K|V] each split by heads
-        ProportionalHeads ///< Proportional slice using head_start/head_count ratio against totalHeads.
+        FusedQKVHeads,    ///< Fused QKV: independently shard [Q|K|V] sub-blocks.
+        ProportionalHeads ///< Proportional contiguous slice using head_start/head_count against totalHeads.
                           ///< For weights whose output dim != n_heads (e.g. GDN ssm_alpha/beta with
                           ///< n_v_heads != n_heads). Computes: start = total_size * head_start / totalHeads,
                           ///< count = total_size * head_count / totalHeads.

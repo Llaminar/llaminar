@@ -43,62 +43,9 @@ namespace llaminar2::test::parity::qwen35
     protected:
         using Base = ConfigDrivenParityTest<Derived>;
 
-        void SetUp() override
-        {
-            Base::SetUp();
-        }
-
         void applyModelOverrides() override
         {
-            // Apply standard model_path / snapshot_dir overrides from TestConfig
             Base::applyModelOverrides();
-
-            // Qwen3.5 uses a different tokenizer (vocab_size=248320) than Qwen2/3
-            // (vocab_size=151936), so the default hardcoded token_ids are wrong.
-            // Read the actual token_ids used by the PyTorch reference generator.
-            //
-            // CRITICAL: metadata.txt is only written by the snapshot generator,
-            // which normally runs later in the test body. On a fresh checkout
-            // (e.g. CI) the metadata file does not exist yet and we would silently
-            // fall back to Qwen2's default token IDs, embedding the wrong tokens
-            // and producing catastrophic cosine drops (~0.18) at every stage.
-            //
-            // Trigger snapshot regeneration here if metadata is missing or stale
-            // (wrong snapshot_version), so token IDs are always consistent with
-            // what PyTorch will emit. Skip if the model file is missing (the test
-            // will GTEST_SKIP later in ParityTestBase::SetUp).
-            const auto metadata_path = std::filesystem::path(Base::config_.snapshot_dir) /
-                                       "metadata.txt";
-            bool needs_regen = !std::filesystem::exists(metadata_path);
-            if (!needs_regen)
-            {
-                int disk_ver = Base::readSnapshotVersion(metadata_path);
-                if (disk_ver < Base::kRequiredSnapshotVersion)
-                {
-                    LOG_INFO("[Qwen3.5 Parity] Stale snapshots (v" << disk_ver
-                             << " < required v" << Base::kRequiredSnapshotVersion
-                             << ") — regenerating");
-                    needs_regen = true;
-                }
-            }
-            if (needs_regen && std::filesystem::exists(Base::config_.model_path))
-            {
-                LOG_INFO("[Qwen3.5 Parity] Running PyTorch snapshot generator "
-                         "to obtain consistent prefill tokens and up-to-date snapshots");
-                if (!regeneratePyTorchSnapshots())
-                {
-                    LOG_ERROR("[Qwen3.5 Parity] Early snapshot regeneration failed; "
-                              "test will likely fail with stale Qwen2 token IDs");
-                }
-            }
-
-            auto prefill_tokens = Base::readPrefillTokensFromMetadata();
-            if (!prefill_tokens.empty())
-            {
-                Base::config_.token_ids = std::move(prefill_tokens);
-                LOG_INFO("[Qwen3.5 Parity] Loaded " << Base::config_.token_ids.size()
-                                                    << " prefill token IDs from metadata");
-            }
         }
 
         void configureModel(std::shared_ptr<ModelContext> model_ctx) override
@@ -121,13 +68,13 @@ namespace llaminar2::test::parity::qwen35
          * heterogeneous layers (GDN + FA) requiring a dedicated generator
          * that uses the Qwen35ReferenceModel from the Python registry.
          */
-        bool regeneratePyTorchSnapshots()
+        bool regeneratePyTorchSnapshots() override
         {
             LOG_INFO("[" << Base::getBackendName()
                          << " Parity] Regenerating Qwen3.5 PyTorch snapshots from GGUF: "
                          << Base::config_.model_path);
 
-            std::ostringstream cmd;
+            std::ostringstream script;
             // Source devcontainer venv if present, else fall back to system
             // python3 (CI builder image installs deps to system site-packages).
             //
@@ -137,16 +84,18 @@ namespace llaminar2::test::parity::qwen35
             // PyTorch's CPU forward pass to a single thread — catastrophic for large
             // models (e.g., 27B Qwen3.5 prefill takes ~14 min on 1 thread). We unset
             // them and let PyTorch/OpenMP/MKL use all available cores.
-            cmd << "bash -c 'unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
-                << "[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
-                << " python/reference/generate_qwen35_pipeline_snapshots.py"
-                << " --model " << Base::config_.model_path
-                << " --prompt \"" << Base::config_.prompt << "\""
-                << " --output " << Base::config_.snapshot_dir
-                << " --decode-steps " << Base::config_.decode_steps
-                << "' 2>&1";
+            script << "unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
+                   << "if [ -f /workspaces/llaminar/.venv/bin/activate ]; then "
+                   << "source /workspaces/llaminar/.venv/bin/activate; fi; "
+                   << "python3 python/reference/generate_qwen35_pipeline_snapshots.py"
+                   << " --model " << Base::parityShellQuote(Base::config_.model_path)
+                   << " --prompt " << Base::parityShellQuote(Base::config_.prompt)
+                   << " --output " << Base::parityShellQuote(Base::config_.snapshot_dir)
+                   << " --decode-steps " << Base::config_.decode_steps;
+            const std::string command =
+                "bash -c " + Base::parityShellQuote(script.str()) + " 2>&1";
 
-            FILE *pipe = popen(cmd.str().c_str(), "r");
+            FILE *pipe = popen(command.c_str(), "r");
             if (!pipe)
             {
                 LOG_ERROR("[Parity] Failed to execute Qwen3.5 snapshot generator");

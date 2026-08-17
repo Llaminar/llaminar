@@ -89,12 +89,16 @@
 
 // Modern orchestration runner support (for incremental migration)
 #include "utils/TestOrchestrationHelper.h"
+#include "../../utils/ParityGDNHeadPermutation.h"
 #include "../../utils/ParitySnapshotSelection.h"
 #include "execution/runner/IOrchestrationRunner.h"
 #include "kernels/KernelFactory.h"
 #include "backends/BackendManager.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
+#include "utils/Sha256.h"
+#include "utils/ProductionParityEvidence.h"
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -103,6 +107,7 @@
 #endif
 #include "utils/Logger.h"
 #include "utils/MPIContext.h"
+#include "utils/NUMATopology.h"
 #include "backends/DeviceId.h"
 #include "backends/ComputeBackend.h"
 
@@ -183,6 +188,325 @@ namespace llaminar2::test::parity
     };
 
     /**
+     * @brief Structured proof emitted by one live production parity campaign.
+     *
+     * A campaign runs prefill and decode through one production runner.  The
+     * numerical CSVs remain the mathematical oracle; this record separately
+     * proves the backend's complete production generation policy: one native
+     * conditional parent on CUDA, or HIP's authenticated ticket selecting
+     * retained captured transactions. It also records the wall-time target
+     * that makes the matrix practical in CI.
+     */
+    struct ProductionParityEvidence
+    {
+        bool graph_execution = false;
+        bool homogeneous_gpu = false;
+        bool forward_full_graph_capture = false;
+        bool forward_full_graph_replay = false;
+        bool full_graph_capture = false;
+        bool full_graph_replay = false;
+        bool decode_graph_capture = false;
+        bool decode_graph_replay = false;
+        bool device_generation_controller = false;
+        ProductionDeviceGenerationPolicy generation_execution_policy =
+            ProductionDeviceGenerationPolicy::NotObserved;
+        bool native_generation_parent = false;
+        bool hosted_ticket_boundary_certified = false;
+        bool generation_loop_certified = false;
+        std::string generation_certification_detail = "not_observed";
+        bool segmented_plan = false;
+        bool segmented_capture = false;
+        bool segmented_replay = false;
+        bool model_context_reused = false;
+        double elapsed_seconds = 0.0;
+        double target_seconds = 3600.0;
+    };
+
+    /** @brief Resolve the shared soft wall-time target reported by matrix cells. */
+    inline double productionParityTargetSecondsFromEnvironment()
+    {
+        constexpr double default_target_seconds = 3600.0;
+        const char *raw =
+            std::getenv("LLAMINAR_PRODUCTION_PARITY_TARGET_SECONDS");
+        if (!raw || !*raw)
+            return default_target_seconds;
+
+        char *end = nullptr;
+        const double parsed = std::strtod(raw, &end);
+        if (end == raw || *end != '\0' || !std::isfinite(parsed) || parsed <= 0.0)
+        {
+            ADD_FAILURE()
+                << "LLAMINAR_PRODUCTION_PARITY_TARGET_SECONDS must be a "
+                   "finite positive number, got '"
+                << raw << "'";
+            return default_target_seconds;
+        }
+        return parsed;
+    }
+
+    /**
+     * @brief Resolve the aggregate runner's trusted model-digest cache.
+     *
+     * The directory is deliberately optional so a directly invoked campaign
+     * still authenticates the entire GGUF in its own process. The aggregate
+     * runner creates a private, run-scoped directory and sibling campaign
+     * processes coalesce only identical device/inode/size/mtime/ctime keys.
+     */
+    inline std::optional<std::filesystem::path>
+    productionParityDigestCacheFromEnvironment()
+    {
+        const char *raw =
+            std::getenv("LLAMINAR_PRODUCTION_PARITY_DIGEST_CACHE");
+        if (!raw || !*raw)
+            return std::nullopt;
+        return std::filesystem::path(raw);
+    }
+
+    /**
+     * @brief Resolve a declared production GGUF to its authenticated RAM copy.
+     *
+     * The aggregate campaign stages every selected model before any inference
+     * process starts. A test may use either the repository `models` symlink or
+     * the canonical `/opt/llaminar-models` path, so membership is checked by
+     * canonical source identity while the collision-checked basename selects
+     * the staged file. Direct focused invocations have no staging environment
+     * and retain their configured path unchanged.
+     *
+     * @param configured_path Model path selected by the concrete parity case.
+     * @return The tmpfs path during an aggregate campaign, otherwise the input.
+     * @throws std::runtime_error if the aggregate manifest or staged file is
+     *         missing, stale, or does not authorize the configured model.
+     */
+    inline std::string productionParityResolvedModelPath(
+        const std::string &configured_path)
+    {
+        const char *raw_ramdisk =
+            std::getenv("LLAMINAR_PRODUCTION_PARITY_MODEL_RAMDISK");
+        if (!raw_ramdisk || !*raw_ramdisk)
+            return configured_path;
+
+        const char *raw_manifest =
+            std::getenv("LLAMINAR_PRODUCTION_PARITY_DECLARED_MODELS");
+        if (!raw_manifest || !*raw_manifest)
+        {
+            throw std::runtime_error(
+                "RAM-staged production parity has no declared GGUF manifest");
+        }
+
+        std::error_code error;
+        const auto ramdisk = std::filesystem::canonical(raw_ramdisk, error);
+        if (error || !std::filesystem::is_directory(ramdisk))
+        {
+            throw std::runtime_error(
+                "production parity RAM model directory is unavailable: " +
+                std::string(raw_ramdisk));
+        }
+        const auto configured = std::filesystem::canonical(
+            configured_path, error);
+        if (error)
+        {
+            throw std::runtime_error(
+                "cannot canonicalize declared production GGUF '" +
+                configured_path + "': " + error.message());
+        }
+
+        bool declared = false;
+        std::istringstream manifest(raw_manifest);
+        std::string entry;
+        while (std::getline(manifest, entry, '|'))
+        {
+            if (entry.empty())
+                continue;
+            error.clear();
+            const auto candidate = std::filesystem::canonical(entry, error);
+            if (!error &&
+                (candidate == configured ||
+                 (configured.parent_path() == ramdisk &&
+                  candidate.filename() == configured.filename())))
+            {
+                declared = true;
+                break;
+            }
+        }
+        if (!declared)
+        {
+            throw std::runtime_error(
+                "production parity configured an undeclared GGUF: " +
+                configured_path);
+        }
+
+        const auto staged = ramdisk / configured.filename();
+        error.clear();
+        if (!std::filesystem::is_regular_file(staged, error) || error)
+        {
+            throw std::runtime_error(
+                "declared production GGUF was not staged in RAM: " +
+                staged.string());
+        }
+        return staged.string();
+    }
+
+    /** @brief Return whether request-local evidence contains a graph counter. */
+    inline bool parityForwardGraphHasCounter(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &name)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&name](const PerfStatRecord &record)
+            {
+                return record.kind == PerfStatRecord::Kind::Counter &&
+                       record.domain == "forward_graph" &&
+                       record.name == name &&
+                       record.value > 0.0;
+            });
+    }
+
+    /** @brief Return whether decode captured or replayed a native graph phase. */
+    inline bool parityForwardGraphHasDecodePhase(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &capture_phase)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&capture_phase](const PerfStatRecord &record)
+            {
+                if (record.kind != PerfStatRecord::Kind::Counter ||
+                    record.domain != "forward_graph" ||
+                    record.name != "decode_graph_phase" ||
+                    record.phase != "decode" ||
+                    record.value <= 0.0)
+                {
+                    return false;
+                }
+                const auto it = record.tags.find("phase");
+                return it != record.tags.end() &&
+                       it->second == capture_phase;
+            });
+    }
+
+    /** @brief Return whether one exact forward counter ran in a named phase. */
+    inline bool parityForwardGraphHasCounterPhase(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &name,
+        const std::string &phase)
+    {
+        return std::any_of(
+            records.begin(),
+            records.end(),
+            [&name, &phase](const PerfStatRecord &record)
+            {
+                return record.kind == PerfStatRecord::Kind::Counter &&
+                       record.domain == "forward_graph" &&
+                       record.name == name && record.phase == phase &&
+                       record.value > 0.0;
+            });
+    }
+
+    /** @brief Materialize the canonical graph/economy CSV record. */
+    inline ProductionParityEvidence collectProductionParityEvidence(
+        const std::vector<PerfStatRecord> &records,
+        bool graph_execution,
+        bool homogeneous_gpu,
+        bool model_context_reused,
+        double elapsed_seconds)
+    {
+        ProductionParityEvidence evidence;
+        evidence.graph_execution = graph_execution;
+        evidence.homogeneous_gpu = homogeneous_gpu;
+        evidence.forward_full_graph_capture = parityForwardGraphHasCounter(
+            records, "full_graph_capture_executable_nodes");
+        evidence.forward_full_graph_replay = parityForwardGraphHasCounter(
+            records, "full_graph_replay_calls");
+        const ProductionDeviceGenerationEvidence generation_evidence =
+            collectProductionDeviceGenerationEvidence(records);
+        evidence.device_generation_controller =
+            generation_evidence.controller_observed;
+        evidence.generation_execution_policy = generation_evidence.policy;
+        evidence.native_generation_parent =
+            generation_evidence.hasNativeParent();
+        evidence.hosted_ticket_boundary_certified =
+            generation_evidence.hosted_ticket_boundary_certified;
+        evidence.generation_loop_certified =
+            generation_evidence.hasCertifiedGenerationLoop();
+        evidence.generation_certification_detail =
+            generation_evidence.certification_detail;
+        // A captured forward nested inside a host-scheduled MTP transaction is
+        // useful but is not one complete production generation graph. Preserve
+        // the inner-forward fields for diagnosis and make the established
+        // full-graph fields describe the complete request as their name claims.
+        const bool complete_generation_parent =
+            !evidence.device_generation_controller ||
+            evidence.native_generation_parent;
+        evidence.full_graph_capture =
+            evidence.forward_full_graph_capture && complete_generation_parent;
+        evidence.full_graph_replay =
+            evidence.forward_full_graph_replay && complete_generation_parent;
+        evidence.segmented_plan = parityForwardGraphHasCounter(
+            records, "segmented_plan_segments");
+        const bool retained_parent_capture =
+            parityForwardGraphHasCounter(
+                records, "retained_parent_transaction_zero_launches") ||
+            parityForwardGraphHasCounter(
+                records, "retained_parent_transaction_captures");
+        const bool retained_parent_replay =
+            parityForwardGraphHasCounter(records, "retained_parent_replays") ||
+            parityForwardGraphHasCounter(
+                records, "retained_parent_transaction_replays");
+        evidence.decode_graph_capture =
+            parityForwardGraphHasDecodePhase(records, "capture") ||
+            parityForwardGraphHasCounterPhase(
+                records,
+                "retained_parent_transaction_captures",
+                "decode");
+        evidence.decode_graph_replay =
+            parityForwardGraphHasDecodePhase(records, "replay") ||
+            parityForwardGraphHasCounterPhase(
+                records,
+                "retained_parent_transaction_replays",
+                "decode");
+        evidence.segmented_capture =
+            evidence.segmented_plan &&
+            (parityForwardGraphHasCounter(
+                 records, "segmented_graph_capture_executable_nodes") ||
+             retained_parent_capture);
+        evidence.segmented_replay =
+            evidence.segmented_plan &&
+            (parityForwardGraphHasCounter(
+                 records, "segmented_replay_segments") ||
+             retained_parent_replay);
+        evidence.model_context_reused = model_context_reused;
+        evidence.elapsed_seconds = elapsed_seconds;
+        evidence.target_seconds =
+            productionParityTargetSecondsFromEnvironment();
+        return evidence;
+    }
+
+    /**
+     * @brief Return whether the selected generation policy ran captured work.
+     *
+     * A native conditional parent owns the complete generation graph. HIP's
+     * ticket policy has no representable outer graph, so its truthful proof is
+     * the full captured transaction body plus the independently certified
+     * dispatch protocol.
+     */
+    inline bool productionParityHasRequiredGenerationGraph(
+        const ProductionParityEvidence &evidence)
+    {
+        if (evidence.device_generation_controller &&
+            evidence.generation_execution_policy ==
+                ProductionDeviceGenerationPolicy::
+                    HostScheduledCapturedTransactions)
+        {
+            return evidence.forward_full_graph_capture ||
+                   evidence.forward_full_graph_replay;
+        }
+        return evidence.full_graph_capture || evidence.full_graph_replay;
+    }
+
+    /**
      * @brief Configuration for parity test thresholds
      *
      * Different backends (CPU, CUDA, ROCm) may need different thresholds
@@ -218,35 +542,44 @@ namespace llaminar2::test::parity
         /// produce partial outputs that can't be directly compared to full PyTorch outputs.
         std::vector<std::string> excluded_stages;
 
-        /// Stages whose pre-collective snapshots are tensor-parallel partials.
-        /// LocalTP comparisons require the explicit `_ALLREDUCED` snapshot;
-        /// cross-rank TP comparisons sum the partial through MPI. Stages listed
-        /// here should not also be excluded.
+        /// Stages whose semantic values are completed by a production
+        /// collective. The evidence-source policy below selects an explicit
+        /// `_ALLREDUCED` graph snapshot or legacy harness reconstruction.
+        /// Stages listed here should not also be excluded.
         std::vector<std::string> allreduce_stages;
 
         /**
-         * @brief Whether declared reductions execute across devices in this process.
+         * @brief Authority used for completed collective checkpoint evidence.
          *
-         * LocalTP publishes explicit `_ALLREDUCED` graph snapshot slots. Global
-         * and NodeLocal TP publish rank partials that the parity harness sums
-         * through MPI. This bit is copied from the declarative TestConfig so the
-         * model-agnostic comparison loop can select the correct evidence.
+         * Coordinated production runners and LocalTP publish explicit
+         * `_ALLREDUCED` graph slots. Legacy cross-rank fixtures may instead
+         * expose rank partials for evidence-only MPI reconstruction.
          */
-        bool uses_in_process_local_tp = false;
+        ParityCollectiveEvidenceSource collective_evidence_source =
+            ParityCollectiveEvidenceSource::CrossRankPartials;
+
+        /**
+         * @brief Whether MPI ranks own disjoint pipeline layer ranges.
+         *
+         * Cross-rank PP retains rank-local layer and stage diagnostics while
+         * taking embedding evidence from the head and logit evidence from the
+         * tail. This explicit bit prevents generic multi-rank TP campaigns from
+         * being mistaken for PP during artifact aggregation.
+         */
+        bool uses_cross_rank_pipeline = false;
 
         /**
          * @brief Declarative MoE rebalance/migration exercise policy.
          *
          * Parity tests that need to cover dynamic expert movement can opt in
          * here without hand-writing maintenance calls in each fixture. For
-         * graph-owned device-side rebalance, maintenance is exercised by the
-         * decode forward itself. For OrchestrationRunner host-owned rebalance,
-         * the base calls maybeApplyMoERebalance() at declared boundaries.
+         * The base invokes the production ExpertOverlay boundary hook at the
+         * declared cadence; that hook only wakes the asynchronous authority.
          */
         struct MoERebalanceExercise
         {
             bool enabled = false;
-            bool require_device_side_controller = false;
+            bool require_production_overlay_authority = false;
             bool request_after_prefill = false;
             int request_every_decode_steps = 0;
             int min_decode_steps = 0;
@@ -258,6 +591,38 @@ namespace llaminar2::test::parity
         /// production graph replay/capture and collect snapshots from that path.
         ParityGraphSnapshotPolicy graph_snapshot_policy;
     };
+
+    /**
+     * @brief Read the comparison-time GDN layout directly from GGUF metadata.
+     */
+    inline ParityGDNHeadConfig parityGDNHeadConfigFromModel(
+        const ModelContext *model_ctx)
+    {
+        if (!model_ctx)
+            return {};
+
+        const auto &arch = model_ctx->architecture();
+        const auto &meta = model_ctx->model().metadata;
+        const auto get_meta_int = [&](const std::string &suffix) -> int
+        {
+            const auto it = meta.find(arch + "." + suffix);
+            if (it == meta.end())
+                return 0;
+            const auto &value = it->second;
+            if (value.type == GGUFValueType::UINT32)
+                return static_cast<int>(value.asUInt32());
+            if (value.type == GGUFValueType::UINT64)
+                return static_cast<int>(value.asUInt64());
+            return 0;
+        };
+
+        return ParityGDNHeadConfig{
+            .n_k_heads = get_meta_int("ssm.group_count"),
+            .n_v_heads = get_meta_int("ssm.time_step_rank"),
+            .d_state = get_meta_int("ssm.state_size"),
+            .is_moe = get_meta_int("expert_count") > 0,
+        };
+    }
 
     // =============================================================================
     // Result Structures
@@ -361,6 +726,7 @@ namespace llaminar2::test::parity
     struct DecodeStepStats
     {
         int step_idx = 0;
+        bool has_logit_data = false; ///< This PP rank owns the LM-head result for the step
         float cosine_similarity = 0.0f;
         float kl_divergence = 0.0f;
         float top1_overlap = 0.0f;
@@ -393,6 +759,534 @@ namespace llaminar2::test::parity
         bool overall_passed = false;
     };
 
+    /**
+     * @brief Single authority for the numerical CSV contract of parity tests.
+     *
+     * Production-path campaigns and focused diagnostics must emit the same
+     * machine-readable artifacts.  Keeping the serialization independent of a
+     * GTest fixture lets MTP, prefix-cache, and expert-placement runners retain
+     * their production orchestration while publishing the exact schemas used
+     * by the classic PyTorch parity suites.
+     */
+    class ParityCSVArtifactWriter final
+    {
+    public:
+        /**
+         * @brief Return the canonical per-test results directory.
+         *
+         * The identity intentionally matches ParityTestBase exactly so a
+         * production MTP helper and the classic fixture cannot split one test's
+         * artifacts across different directories.
+         */
+        static std::filesystem::path resultsDir()
+        {
+            std::string test_name = "unknown";
+            const auto *info =
+                ::testing::UnitTest::GetInstance()->current_test_info();
+            if (info)
+            {
+                test_name = std::string(
+                                info->test_suite_name()
+                                    ? info->test_suite_name()
+                                    : "") +
+                            "/" +
+                            std::string(info->name() ? info->name() : "");
+            }
+            for (char &character : test_name)
+            {
+                if (character == '/' || character == '\\' ||
+                    character == ':' || character == '*' ||
+                    character == '?' || character == '"' ||
+                    character == '<' || character == '>' ||
+                    character == '|')
+                {
+                    character = '_';
+                }
+            }
+
+            // Aggregate campaigns own a fresh, report-addressable root. This
+            // makes stale files unrepresentable while focused/manual tests
+            // retain the familiar source-tree revision namespace below.
+            if (const char *root = std::getenv(
+                    "LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT"))
+            {
+                const std::filesystem::path explicit_root(root);
+                if (explicit_root.empty() || !explicit_root.is_absolute())
+                {
+                    throw std::runtime_error(
+                        "LLAMINAR_PRODUCTION_PARITY_ARTIFACT_ROOT must be an "
+                        "absolute path");
+                }
+                return explicit_root / test_name;
+            }
+
+#ifdef LLAMINAR_PARITY_SOURCE_DIR
+            const std::filesystem::path parity_dir(LLAMINAR_PARITY_SOURCE_DIR);
+#else
+            const std::filesystem::path parity_dir =
+                std::filesystem::absolute(std::filesystem::path(__FILE__))
+                    .parent_path();
+#endif
+            std::string hash = "unknown";
+            if (FILE *pipe = popen("git rev-parse --short HEAD 2>/dev/null", "r"))
+            {
+                char buffer[64];
+                if (fgets(buffer, sizeof(buffer), pipe))
+                {
+                    hash = buffer;
+                    while (!hash.empty() &&
+                           (hash.back() == '\n' || hash.back() == '\r'))
+                    {
+                        hash.pop_back();
+                    }
+                }
+                pclose(pipe);
+            }
+            return parity_dir / "results" / hash / test_name;
+        }
+
+        /**
+         * @brief Write prefill layer, stage, and aggregate artifacts.
+         * @return true when every required file was written successfully.
+         */
+        static bool writePrefill(
+            const std::filesystem::path &dir,
+            const std::string &backend,
+            const ParityTestSummary &summary)
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec)
+                return false;
+
+            bool ok = true;
+            {
+                std::ofstream out(dir / "prefill_layers.csv", std::ios::trunc);
+                ok = out.is_open() && ok;
+                if (out.is_open())
+                {
+                    out << "backend,layer,avg_cosine,min_cosine,worst_stage,"
+                           "max_cosine_drop,max_drop_stage,stages_compared,"
+                           "max_kurtosis,max_kurtosis_stage,passed\n";
+                    if (summary.embedding_passed ||
+                        summary.embedding_cosine != 0.0f)
+                    {
+                        out << csvEscape(backend) << ",EMBEDDING,"
+                            << summary.embedding_cosine << ",,"
+                            << ",,,,,,"
+                            << boolText(summary.embedding_passed) << '\n';
+                    }
+                    for (const auto &layer : summary.layer_stats)
+                    {
+                        if (layer.stages_compared == 0 &&
+                            layer.stage_results.empty())
+                        {
+                            continue;
+                        }
+                        out << csvEscape(backend) << ','
+                            << layer.layer_idx << ','
+                            << layer.avg_cosine_sim << ','
+                            << layer.min_cosine_sim << ','
+                            << csvEscape(layer.worst_stage) << ','
+                            << layer.max_cosine_drop << ','
+                            << csvEscape(layer.max_drop_stage) << ','
+                            << layer.stages_compared << ','
+                            << layer.max_kurtosis << ','
+                            << csvEscape(layer.max_kurtosis_stage) << ','
+                            << boolText(layer.passed) << '\n';
+                    }
+                    ok = out.good() && ok;
+                }
+            }
+            {
+                std::ofstream out(dir / "prefill_summary.csv", std::ios::trunc);
+                ok = out.is_open() && ok;
+                if (out.is_open())
+                {
+                    out << "backend,lm_head_cosine,lm_head_kl,lm_head_top1,"
+                           "lm_head_top5,lm_head_pytorch_top1_in_topk,"
+                           "early_layers_passed,total_layers_passed,"
+                           "overall_passed\n";
+                    out << csvEscape(backend) << ','
+                        << summary.lm_head_cosine << ','
+                        << summary.lm_head_kl << ','
+                        << summary.lm_head_top1 << ','
+                        << summary.lm_head_top5 << ','
+                        << boolText(summary.lm_head_pytorch_top1_in_top3) << ','
+                        << summary.early_layers_passed << ','
+                        << summary.total_layers_passed << ','
+                        << boolText(summary.overall_passed) << '\n';
+                    ok = out.good() && ok;
+                }
+            }
+            ok = writeStages(
+                     dir / "prefill_stages.csv",
+                     backend,
+                     summary.layer_stats,
+                     std::nullopt) &&
+                 ok;
+            return ok;
+        }
+
+        /**
+         * @brief Write incremental-decode step, layer, and stage artifacts.
+         * @return true when every required file was written successfully.
+         */
+        static bool writeDecode(
+            const std::filesystem::path &dir,
+            const std::string &backend,
+            const DecodeParitySummary &summary)
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec)
+                return false;
+
+            bool ok = true;
+            {
+                std::ofstream out(dir / "decode_steps.csv", std::ios::trunc);
+                ok = out.is_open() && ok;
+                if (out.is_open())
+                {
+                    out << "backend,step,cosine,kl_divergence,top1_overlap,"
+                           "top5_overlap,llaminar_token,pytorch_token,"
+                           "token_match,top3_match,top5_match,passed\n";
+                    for (const auto &step : summary.step_stats)
+                    {
+                        if (!step.has_logit_data)
+                            continue;
+                        out << csvEscape(backend) << ','
+                            << step.step_idx << ','
+                            << step.cosine_similarity << ','
+                            << step.kl_divergence << ','
+                            << step.top1_overlap << ','
+                            << step.top5_overlap << ','
+                            << step.llaminar_token << ','
+                            << step.pytorch_token << ','
+                            << boolText(step.token_match) << ','
+                            << boolText(step.top3_match) << ','
+                            << boolText(step.top5_match) << ','
+                            << boolText(step.passed) << '\n';
+                    }
+                    ok = out.good() && ok;
+                }
+            }
+
+            {
+                std::ofstream out(dir / "decode_layers.csv", std::ios::trunc);
+                ok = out.is_open() && ok;
+                if (out.is_open())
+                {
+                    out << "backend,step,layer,avg_cosine,min_cosine,worst_stage,"
+                           "max_cosine_drop,max_drop_stage,stages_compared,passed\n";
+                    for (const auto &step : summary.step_stats)
+                    {
+                        for (const auto &layer : step.layer_stats)
+                        {
+                            if (layer.stages_compared == 0)
+                                continue;
+                            out << csvEscape(backend) << ','
+                                << step.step_idx << ','
+                                << layer.layer_idx << ','
+                                << layer.avg_cosine_sim << ','
+                                << layer.min_cosine_sim << ','
+                                << csvEscape(layer.worst_stage) << ','
+                                << layer.max_cosine_drop << ','
+                                << csvEscape(layer.max_drop_stage) << ','
+                                << layer.stages_compared << ','
+                                << boolText(layer.passed) << '\n';
+                        }
+                    }
+                    ok = out.good() && ok;
+                }
+            }
+
+            if (summary.step_stats.empty())
+            {
+                ok = writeStages(
+                         dir / "decode_stages.csv",
+                         backend,
+                         {},
+                         0) &&
+                     ok;
+            }
+            for (const auto &step : summary.step_stats)
+            {
+                ok = writeStages(
+                         dir / "decode_stages.csv",
+                         backend,
+                         step.layer_stats,
+                         step.step_idx,
+                         step.step_idx != summary.step_stats.front().step_idx) &&
+                     ok;
+            }
+            return ok;
+        }
+
+        /**
+         * @brief Publish one canonical prefill artifact set from PP rank fragments.
+         *
+         * The aggregate carries head-owned embedding/early-layer counts and
+         * tail-owned LM-head metrics. Layer and stage rows remain rank-local
+         * until this diagnostic-only post-inference merge so production PP
+         * execution itself is unchanged.
+         */
+        static bool mergePipelinePrefill(
+            const std::filesystem::path &dir,
+            const std::string &backend,
+            const ParityTestSummary &aggregate,
+            const std::vector<std::filesystem::path> &rank_dirs)
+        {
+            bool ok = writePrefill(dir, backend, aggregate);
+            ok = mergeCsvFragments(
+                     dir / "prefill_layers.csv",
+                     rank_dirs,
+                     "prefill_layers.csv") &&
+                 ok;
+            ok = mergeCsvFragments(
+                     dir / "prefill_stages.csv",
+                     rank_dirs,
+                     "prefill_stages.csv") &&
+                 ok;
+            return ok;
+        }
+
+        /**
+         * @brief Publish canonical decode artifacts from disjoint PP ranks.
+         *
+         * Only the tail fragment contributes decode-step logits. Every rank
+         * contributes the layer/stage rows for its owned pipeline interval.
+         */
+        static bool mergePipelineDecode(
+            const std::filesystem::path &dir,
+            const std::vector<std::filesystem::path> &rank_dirs)
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec)
+                return false;
+
+            bool ok = mergeCsvFragments(
+                dir / "decode_steps.csv", rank_dirs, "decode_steps.csv");
+            ok = mergeCsvFragments(
+                     dir / "decode_layers.csv",
+                     rank_dirs,
+                     "decode_layers.csv") &&
+                 ok;
+            ok = mergeCsvFragments(
+                     dir / "decode_stages.csv",
+                     rank_dirs,
+                     "decode_stages.csv") &&
+                 ok;
+            return ok;
+        }
+
+        /**
+         * @brief Write the graph-path and economy proof for one matrix cell.
+         */
+        static bool writeProductionPath(
+            const std::filesystem::path &dir,
+            const std::string &backend,
+            const std::string &device,
+            const ProductionParityEvidence &evidence)
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec)
+                return false;
+
+            std::ofstream out(dir / "production_path.csv", std::ios::trunc);
+            if (!out.is_open())
+                return false;
+            out << "backend,device,execution_path,homogeneous_gpu,"
+                   "forward_full_graph_capture,forward_full_graph_replay,"
+                   "full_graph_capture,full_graph_replay,decode_graph_capture,"
+                   "decode_graph_replay,device_generation_controller,"
+                   "generation_execution_policy,native_generation_parent,"
+                   "hosted_ticket_boundary_certified,"
+                   "generation_loop_certified,"
+                   "generation_certification_detail,"
+                   "segmented_plan,segmented_capture,"
+                   "segmented_replay,model_context_reused,elapsed_seconds,"
+                   // Here "budget" is the measured performance target; it is
+                   // not a process or test timeout.
+                   "budget_seconds,within_budget\n";
+            out << csvEscape(backend) << ','
+                << csvEscape(device) << ','
+                << (evidence.graph_execution ? "graph" : "non_graph") << ','
+                << boolText(evidence.homogeneous_gpu) << ','
+                << boolText(evidence.forward_full_graph_capture) << ','
+                << boolText(evidence.forward_full_graph_replay) << ','
+                << boolText(evidence.full_graph_capture) << ','
+                << boolText(evidence.full_graph_replay) << ','
+                << boolText(evidence.decode_graph_capture) << ','
+                << boolText(evidence.decode_graph_replay) << ','
+                << boolText(evidence.device_generation_controller) << ','
+                << productionDeviceGenerationPolicyName(
+                       evidence.generation_execution_policy)
+                << ','
+                << boolText(evidence.native_generation_parent) << ','
+                << boolText(evidence.hosted_ticket_boundary_certified) << ','
+                << boolText(evidence.generation_loop_certified) << ','
+                << csvEscape(evidence.generation_certification_detail) << ','
+                << boolText(evidence.segmented_plan) << ','
+                << boolText(evidence.segmented_capture) << ','
+                << boolText(evidence.segmented_replay) << ','
+                << boolText(evidence.model_context_reused) << ','
+                << evidence.elapsed_seconds << ','
+                << evidence.target_seconds << ','
+                << boolText(evidence.elapsed_seconds <= evidence.target_seconds)
+                << '\n';
+            return out.good();
+        }
+
+    private:
+        static const char *boolText(bool value)
+        {
+            return value ? "true" : "false";
+        }
+
+        static std::string csvEscape(const std::string &value)
+        {
+            if (value.find_first_of(",\"\n\r") == std::string::npos)
+                return value;
+            std::string escaped = "\"";
+            for (const char character : value)
+            {
+                if (character == '"')
+                    escaped.push_back('"');
+                escaped.push_back(character);
+            }
+            escaped.push_back('"');
+            return escaped;
+        }
+
+        /**
+         * @brief Concatenate rank-local CSV bodies after verifying one schema.
+         */
+        static bool mergeCsvFragments(
+            const std::filesystem::path &destination,
+            const std::vector<std::filesystem::path> &rank_dirs,
+            const std::filesystem::path &filename)
+        {
+            std::ofstream output(destination, std::ios::trunc);
+            if (!output.is_open())
+                return false;
+
+            std::string canonical_header;
+            for (const auto &rank_dir : rank_dirs)
+            {
+                std::ifstream input(rank_dir / filename);
+                if (!input.is_open())
+                    return false;
+
+                std::string header;
+                if (!std::getline(input, header) || header.empty())
+                    return false;
+                if (canonical_header.empty())
+                {
+                    canonical_header = header;
+                    output << canonical_header << '\n';
+                }
+                else if (header != canonical_header)
+                {
+                    return false;
+                }
+
+                std::string row;
+                while (std::getline(input, row))
+                {
+                    if (!row.empty())
+                        output << row << '\n';
+                }
+            }
+            return !canonical_header.empty() && output.good();
+        }
+
+        static void writeDistributionHeader(
+            std::ofstream &out,
+            const std::string &prefix)
+        {
+            out << prefix << "min," << prefix << "max,"
+                << prefix << "mean," << prefix << "stddev,"
+                << prefix << "kurtosis," << prefix << "skewness,"
+                << prefix << "p95," << prefix << "p99,"
+                << prefix << "outlier_frac," << prefix << "dynamic_range,"
+                << prefix << "sparsity," << prefix << "zero_frac,"
+                << prefix << "nan_count," << prefix << "inf_count,"
+                << prefix << "elements";
+        }
+
+        static void writeDistribution(
+            std::ofstream &out,
+            const TensorDistributionStats &stats)
+        {
+            out << stats.min << ',' << stats.max << ','
+                << stats.mean << ',' << stats.stddev << ','
+                << stats.kurtosis << ',' << stats.skewness << ','
+                << stats.p95 << ',' << stats.p99 << ','
+                << stats.outlier_fraction << ',' << stats.dynamic_range << ','
+                << stats.sparsity << ',' << stats.zero_fraction << ','
+                << stats.nan_count << ',' << stats.inf_count << ','
+                << stats.element_count;
+        }
+
+        static bool writeStages(
+            const std::filesystem::path &path,
+            const std::string &backend,
+            const std::vector<LayerStats> &layers,
+            std::optional<int> decode_step,
+            bool append = false)
+        {
+            std::ofstream out(
+                path,
+                append ? (std::ios::out | std::ios::app)
+                       : (std::ios::out | std::ios::trunc));
+            if (!out.is_open())
+                return false;
+            if (!append)
+            {
+                out << "backend,";
+                if (decode_step)
+                    out << "step,";
+                out << "layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,"
+                       "snr_db,rmse,error_entropy,is_routing,routing_overlap,"
+                       "routing_top1_match,routing_weight_l1,";
+                writeDistributionHeader(out, "llaminar_");
+                out << ',';
+                writeDistributionHeader(out, "pytorch_");
+                out << '\n';
+            }
+            for (const auto &layer : layers)
+            {
+                for (const auto &stage : layer.stage_results)
+                {
+                    out << csvEscape(backend) << ',';
+                    if (decode_step)
+                        out << *decode_step << ',';
+                    out << layer.layer_idx << ','
+                        << csvEscape(stage.stage_name) << ','
+                        << (stage.is_routing_stage ? "" : std::to_string(stage.cosine_similarity)) << ','
+                        << (stage.is_routing_stage ? "" : std::to_string(stage.cosine_drop)) << ','
+                        << (stage.is_routing_stage ? "" : std::to_string(stage.rel_l2_norm)) << ','
+                        << stage.max_abs_diff << ','
+                        << (stage.is_routing_stage ? "" : std::to_string(stage.snr_db)) << ','
+                        << (stage.is_routing_stage ? "" : std::to_string(stage.rmse)) << ','
+                        << (stage.is_routing_stage ? "" : std::to_string(stage.error_entropy)) << ','
+                        << (stage.is_routing_stage ? "1" : "0") << ','
+                        << (stage.is_routing_stage ? std::to_string(stage.routing_overlap) : "") << ','
+                        << (std::isnan(stage.routing_top1_match) ? "" : std::to_string(stage.routing_top1_match)) << ','
+                        << (std::isnan(stage.routing_weight_l1) ? "" : std::to_string(stage.routing_weight_l1)) << ',';
+                    writeDistribution(out, stage.llaminar_stats);
+                    out << ',';
+                    writeDistribution(out, stage.pytorch_stats);
+                    out << '\n';
+                }
+            }
+            return out.good();
+        }
+    };
+
     // =============================================================================
     // TP-Aware Result Structures
     // =============================================================================
@@ -422,8 +1316,10 @@ namespace llaminar2::test::parity
         std::vector<TPDeviceComparisonResult> device_results;
 
         // Combined result (concatenated partial outputs vs full PyTorch)
+        StageComparisonResult combined_result;
         float combined_cosine = 0.0f;
         size_t combined_elements = 0;
+        size_t reference_elements = 0;
         bool combined_passed = false;
 
         // Overall for this stage
@@ -500,7 +1396,7 @@ namespace llaminar2::test::parity
         None,        ///< Single device, no parallelism
         LocalTP,     ///< Local Tensor Parallelism (multi-device, single process)
         LocalPP,     ///< Local Pipeline Parallelism (multi-device, single process)
-        NodeLocalTP, ///< Node-Local Tensor Parallelism (multi-rank MPI, same node)
+        NodeTP, ///< Node-Local Tensor Parallelism (multi-rank MPI, same node)
         NodeLocalPP, ///< Node-Local Pipeline Parallelism (multi-rank MPI, same node)
         GlobalTP,    ///< Global Tensor Parallelism (multi-rank MPI, cross-node)
     };
@@ -594,8 +1490,8 @@ namespace llaminar2::test::parity
             return "LocalTP";
         case Parallelism::LocalPP:
             return "LocalPP";
-        case Parallelism::NodeLocalTP:
-            return "NodeLocalTP";
+        case Parallelism::NodeTP:
+            return "NodeTP";
         case Parallelism::NodeLocalPP:
             return "NodeLocalPP";
         case Parallelism::GlobalTP:
@@ -694,7 +1590,7 @@ namespace llaminar2::test::parity
         std::vector<ParityDeviceType> devices; ///< Device list (heterogeneous supported)
         Parallelism parallelism;               ///< Parallelism strategy
 
-        /// Collective backend for TP modes (LocalTP, GlobalTP, NodeLocalTP).
+        /// Collective backend for TP modes (LocalTP, GlobalTP, NodeTP).
         /// PP modes should leave this as None — PP transfers are auto-selected
         /// by LocalPPContext based on device vendor types. For hybrid PP+TP,
         /// use tp_collective instead.
@@ -746,21 +1642,51 @@ namespace llaminar2::test::parity
         /// that use runPrefillParity()/runDecodeParity().
         ParityConfig::MoERebalanceExercise moe_rebalance_exercise;
 
+        /// Physical and semantic MoE policy consumed by production runner setup.
+        RoutedExpertComputePolicy routed_expert_compute_policy =
+            RoutedExpertComputePolicy::Apportioned;
+        RoutedExpertOwnerOrder routed_expert_owner_order =
+            RoutedExpertOwnerOrder::Ordinal;
+        MoEHotExpertCacheConfig moe_hot_expert_cache;
+        RoutedExpertPrefillRuntimeConfig moe_routed_prefill;
+        // A parity cell enters durable Dynamic maintenance only by declaring
+        // it. The production runtime default is intentionally dynamic, but
+        // inheriting that default here would route dense/static test cells
+        // through a MoE-only orchestration path and make matrix behavior depend
+        // on which cells happened to run earlier in the process campaign.
+        MoERebalanceRuntimeConfig moe_rebalance{
+            .mode = MoERebalanceRuntimeMode::Off,
+        };
+        std::shared_ptr<MoERoutedExpertPlacementPlan> moe_routed_expert_plan;
+
+        /// Optional model-schema TP transport override used by hybrid GDN/MoE.
+        std::string tp_allreduce_precision_override;
+
         /// Optional graph execution/snapshot contract for parity bodies that
         /// must exercise production graph capture/replay while collecting
         /// snapshots from that path.
         ParityGraphSnapshotPolicy graph_snapshot_policy;
+
+        /**
+         * Optional evidence authority override for stages completed by a
+         * production collective. LocalTP derives post-collective evidence by
+         * default; coordinated NodeTP production campaigns declare the same
+         * authority explicitly so no test-only MPI operation can interleave
+         * with their worker protocol.
+         */
+        std::optional<ParityCollectiveEvidenceSource>
+            collective_evidence_source;
 
         // Derived accessors
         size_t device_count() const { return devices.size(); }
         ParityDeviceType primary_device() const { return devices.empty() ? ParityDeviceType::CPU : devices[0]; }
         bool is_local_tp() const { return parallelism == Parallelism::LocalTP; }
         bool is_local_pp() const { return parallelism == Parallelism::LocalPP; }
-        bool is_node_local_tp() const { return parallelism == Parallelism::NodeLocalTP; }
+        bool is_node_tp() const { return parallelism == Parallelism::NodeTP; }
         bool is_node_local_pp() const { return parallelism == Parallelism::NodeLocalPP; }
         bool is_global_tp() const { return parallelism == Parallelism::GlobalTP; }
         /// Returns true for any cross-rank TP (NodeLocal or Global)
-        bool is_cross_rank_tp() const { return is_node_local_tp() || is_global_tp(); }
+        bool is_cross_rank_tp() const { return is_node_tp() || is_global_tp(); }
         /// Returns true for any cross-rank PP
         bool is_cross_rank_pp() const { return is_node_local_pp(); }
         /// Returns true for any cross-rank parallelism (TP or PP)
@@ -801,7 +1727,7 @@ namespace llaminar2::test::parity
         if (cfg.should_skip())
             return cfg.skip_reason;
 
-        // Check MPI initialization for LocalTP/LocalPP/NodeLocalTP/NodeLocalPP/GlobalTP tests
+        // Check MPI initialization for LocalTP/LocalPP/NodeTP/NodeLocalPP/GlobalTP tests
         if (cfg.is_local_tp() || cfg.is_local_pp() || cfg.is_cross_rank())
         {
             if (!isMpiInitialized())
@@ -820,9 +1746,6 @@ namespace llaminar2::test::parity
             }
         }
 
-        int cuda_count = getCudaDeviceCount();
-        int rocm_count = getRocmDeviceCount();
-
         int required_cuda = 0, required_rocm = 0;
         for (auto dt : cfg.devices)
         {
@@ -831,6 +1754,21 @@ namespace llaminar2::test::parity
             if (dt == ParityDeviceType::ROCm)
                 required_rocm++;
         }
+
+        /*
+         * A production campaign's typed backend signature is also its physical
+         * resource claim.  Constructing the other vendor's backend merely to
+         * discover an irrelevant count initializes that driver and defeats the
+         * aggregate scheduler's CUDA/ROCm isolation.  In particular, concurrent
+         * homogeneous campaigns can then register/free pinned host allocations
+         * through both runtimes.  Probe only a backend the exact cell requires;
+         * a true hybrid cell still probes both and therefore retains production
+         * topology discovery.
+         */
+        const int cuda_count =
+            required_cuda > 0 ? getCudaDeviceCount() : 0;
+        const int rocm_count =
+            required_rocm > 0 ? getRocmDeviceCount() : 0;
 
         if (required_cuda > cuda_count)
             return "Need " + std::to_string(required_cuda) + " CUDA devices, found " + std::to_string(cuda_count);
@@ -1030,6 +1968,108 @@ namespace llaminar2::test::parity
         }
 
         return stats;
+    }
+
+    /**
+     * @brief Compare one live checkpoint with its real-weight reference tensor.
+     *
+     * This is the numerical authority shared by the classic fixture and the
+     * production MTP/MoE artifact recorders.  It deliberately retains all
+     * diagnostics used by the established CSV contract rather than reducing a
+     * checkpoint to a token match or a single cosine value.
+     */
+    inline StageComparisonResult compareParityTensorData(
+        const float *actual,
+        const float *expected,
+        size_t size,
+        const std::string &stage_name,
+        float cosine_threshold)
+    {
+        StageComparisonResult result;
+        result.stage_name = stage_name;
+        result.total_elements = size;
+        if (!actual || !expected || size == 0)
+            return result;
+
+        double sum_sq_diff = 0.0;
+        double sum_sq_expected = 0.0;
+        double dot_product = 0.0;
+        double norm_actual_sq = 0.0;
+        double norm_expected_sq = 0.0;
+        float max_abs_diff = 0.0f;
+#pragma omp parallel for reduction(+ : sum_sq_diff, sum_sq_expected, dot_product, norm_actual_sq, norm_expected_sq) \
+    reduction(max : max_abs_diff) schedule(static) if (size > 8192)
+        for (size_t index = 0; index < size; ++index)
+        {
+            const double actual_value = static_cast<double>(actual[index]);
+            const double expected_value = static_cast<double>(expected[index]);
+            const double difference = actual_value - expected_value;
+            sum_sq_diff += difference * difference;
+            sum_sq_expected += expected_value * expected_value;
+            dot_product += actual_value * expected_value;
+            norm_actual_sq += actual_value * actual_value;
+            norm_expected_sq += expected_value * expected_value;
+            max_abs_diff = std::max(
+                max_abs_diff,
+                std::abs(actual[index] - expected[index]));
+        }
+
+        result.max_abs_diff = max_abs_diff;
+        if (sum_sq_expected > 1.0e-10)
+        {
+            result.rel_l2_norm = static_cast<float>(
+                std::sqrt(sum_sq_diff / sum_sq_expected));
+        }
+        const double norm_product =
+            std::sqrt(norm_actual_sq) * std::sqrt(norm_expected_sq);
+        if (norm_product > 1.0e-10)
+        {
+            result.cosine_similarity = static_cast<float>(
+                dot_product / norm_product);
+        }
+        result.rmse = static_cast<float>(
+            std::sqrt(sum_sq_diff / static_cast<double>(size)));
+        if (sum_sq_diff > 1.0e-30)
+        {
+            result.snr_db = static_cast<float>(
+                10.0 * std::log10(sum_sq_expected / sum_sq_diff));
+        }
+        else if (sum_sq_expected > 1.0e-30)
+        {
+            result.snr_db = 100.0f;
+        }
+
+        constexpr int error_bins = 64;
+        std::array<size_t, error_bins> histogram{};
+        if (max_abs_diff > 1.0e-10f)
+        {
+            const float scale =
+                static_cast<float>(error_bins - 1) / max_abs_diff;
+            for (size_t index = 0; index < size; ++index)
+            {
+                const float error = std::abs(actual[index] - expected[index]);
+                const int bin = std::min(
+                    static_cast<int>(error * scale), error_bins - 1);
+                ++histogram[static_cast<size_t>(bin)];
+            }
+            double entropy = 0.0;
+            for (const size_t count : histogram)
+            {
+                if (count == 0)
+                    continue;
+                const double probability =
+                    static_cast<double>(count) / static_cast<double>(size);
+                entropy -= probability * std::log2(probability);
+            }
+            result.error_entropy = static_cast<float>(entropy);
+        }
+
+        result.llaminar_stats = computeDistributionStats(actual, size);
+        result.pytorch_stats = computeDistributionStats(expected, size);
+        result.passed = result.cosine_similarity >= cosine_threshold &&
+                        result.llaminar_stats.nan_count == 0 &&
+                        result.llaminar_stats.inf_count == 0;
+        return result;
     }
 
     inline float computeCosineSimilarity(const float *a, const float *b, size_t size)
@@ -1379,20 +2419,25 @@ namespace llaminar2::test::parity
         table.column(6).set_cell_text_align(fort::text_align::right);
         table.column(7).set_cell_text_align(fort::text_align::center);
 
-        // Embedding row
-        table << "EMBEDDING"
-              << fmt_f6(summary.embedding_cosine)
-              << fmt_f6(summary.embedding_cosine)
-              << "-"
-              << "-"
-              << "-"
-              << "-"
-              << status_str(summary.embedding_passed)
-              << fort::endr;
+        // Embedding row. PP non-head ranks do not manufacture a zero row.
+        if (summary.embedding_passed || summary.embedding_cosine != 0.0f)
+        {
+            table << "EMBEDDING"
+                  << fmt_f6(summary.embedding_cosine)
+                  << fmt_f6(summary.embedding_cosine)
+                  << "-"
+                  << "-"
+                  << "-"
+                  << "-"
+                  << status_str(summary.embedding_passed)
+                  << fort::endr;
+        }
 
         // Per-layer rows
         for (const auto &stats : summary.layer_stats)
         {
+            if (stats.stages_compared == 0 && stats.stage_results.empty())
+                continue;
             std::ostringstream layer_ss;
             layer_ss << "Layer " << stats.layer_idx;
 
@@ -1424,35 +2469,50 @@ namespace llaminar2::test::parity
                   << fort::endr;
         }
 
-        // Separator before LM_HEAD
-        table << fort::separator;
+        const bool has_lm_head_data =
+            summary.lm_head_passed || summary.lm_head_cosine != 0.0f ||
+            summary.lm_head_kl != 0.0f || summary.lm_head_top1 != 0.0f ||
+            summary.lm_head_top5 != 0.0f;
+        if (has_lm_head_data)
+        {
+            // Separator before LM_HEAD
+            table << fort::separator;
 
-        // LM_HEAD row with extra info
-        std::ostringstream lm_info;
-        lm_info << "KL=" << fmt_f4(summary.lm_head_kl)
-                << " Top1=" << fmt_f1(summary.lm_head_top1 * 100.0f) << "%";
+            // LM_HEAD row with extra info
+            std::ostringstream lm_info;
+            lm_info << "KL=" << fmt_f4(summary.lm_head_kl)
+                    << " Top1=" << fmt_f1(summary.lm_head_top1 * 100.0f) << "%";
 
-        table << "LM_HEAD"
-              << fmt_f6(summary.lm_head_cosine)
-              << fmt_f6(summary.lm_head_cosine)
-              << lm_info.str()
-              << "-"
-              << "-"
-              << "-"
-              << status_str(summary.lm_head_passed)
-              << fort::endr;
+            table << "LM_HEAD"
+                  << fmt_f6(summary.lm_head_cosine)
+                  << fmt_f6(summary.lm_head_cosine)
+                  << lm_info.str()
+                  << "-"
+                  << "-"
+                  << "-"
+                  << status_str(summary.lm_head_passed)
+                  << fort::endr;
+        }
 
         std::cout << table.to_string();
 
         // =========================================================================
         // Summary footer
         // =========================================================================
-        std::cout << "\nLM_HEAD Top-5: " << std::fixed << std::setprecision(1)
-                  << (summary.lm_head_top5 * 100.0f) << "%\n";
+        if (has_lm_head_data)
+        {
+            std::cout << "\nLM_HEAD Top-5: " << std::fixed
+                      << std::setprecision(1)
+                      << (summary.lm_head_top5 * 100.0f) << "%\n";
+        }
         std::cout << "Early layers passed: " << summary.early_layers_passed
                   << "/" << config.early_layers_count << "\n";
-        std::cout << "LM_HEAD KL divergence: " << std::fixed << std::setprecision(4)
-                  << summary.lm_head_kl << " (threshold: " << config.kl_threshold << ")\n";
+        if (has_lm_head_data)
+        {
+            std::cout << "LM_HEAD KL divergence: " << std::fixed
+                      << std::setprecision(4) << summary.lm_head_kl
+                      << " (threshold: " << config.kl_threshold << ")\n";
+        }
     }
 
     /**
@@ -1482,8 +2542,12 @@ namespace llaminar2::test::parity
                 return "R";
             case SnapshotShardingMode::COLUMN_PARALLEL:
                 return "C";
+            case SnapshotShardingMode::PACKED_COLUMN_PARALLEL:
+                return "P";
             case SnapshotShardingMode::ROW_PARALLEL:
                 return "W";
+            case SnapshotShardingMode::ROOT_ONLY:
+                return "O";
             case SnapshotShardingMode::GATHERED:
                 return "G";
             default:
@@ -1639,7 +2703,8 @@ namespace llaminar2::test::parity
         // =========================================================================
         // Summary footer
         // =========================================================================
-        std::cout << "\nSharding modes: R=Replicated, C=Column-parallel, W=roW-parallel, G=Gathered\n";
+        std::cout << "\nSharding modes: R=Replicated, C=Column-parallel, "
+                     "P=Packed-column, W=roW-parallel, O=Root-only, G=Gathered\n";
         std::cout << std::fixed << std::setprecision(4)
                   << "LM_HEAD: KL=" << summary.lm_head_kl
                   << std::setprecision(1)
@@ -1742,7 +2807,12 @@ namespace llaminar2::test::parity
 
         std::string snapshotCacheKey() const
         {
-            return config_.snapshot_dir + "|" + config_.model_path;
+            // Prompt and decode depth are part of the reference-pack identity.
+            // Without them, a parameterized process can incorrectly bless the
+            // first pack for a later case that reuses the same directory.
+            return config_.snapshot_dir + "|" + config_.model_path +
+                   "|prompt=" + config_.prompt +
+                   "|decode_steps=" + std::to_string(config_.decode_steps);
         }
 
         void setParityEnvOverride(const char *name, const std::string &value)
@@ -1891,6 +2961,84 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Capture production parity at the authenticated prompt geometry.
+         *
+         * The serving default pads small prompts to a 256-row graph bucket for
+         * throughput reuse. Stage-by-stage parity materializes every published
+         * row, so comparing the oracle's nine real rows plus 247 known padding
+         * rows multiplies diagnostic transfer and CSV work without adding a
+         * mathematical input. Production campaigns instead declare one exact
+         * graph bucket from authenticated `token_ids`. The graph is still fully
+         * captured/replayed, and the bucket geometry remains part of its cache
+         * identity; this method never permits eager execution or recapture.
+         */
+        void configureExactProductionParityPrefillGraphBucket()
+        {
+            if (!productionParityCampaignEnabled())
+                return;
+            ASSERT_FALSE(config_.token_ids.empty())
+                << "Production parity requires authenticated prompt tokens "
+                   "before graph-bucket configuration";
+            if (config_.token_ids.empty())
+                return;
+
+            const std::string exact_bucket =
+                std::to_string(config_.token_ids.size());
+            setScopedParityEnvOverride(
+                "LLAMINAR_PREFILL_GRAPH_MIN_SEQ",
+                exact_bucket);
+            setScopedParityEnvOverride(
+                "LLAMINAR_PREFILL_GRAPH_BUCKETS",
+                "1");
+            setScopedParityEnvOverride(
+                "LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES",
+                exact_bucket);
+        }
+
+        /**
+         * @brief Deliberately force a bounded captured-prefill campaign shape.
+         *
+         * Ordinary production parity uses the authenticated prompt length as
+         * one exact bucket because that is the cheapest complete checkpoint
+         * comparison. A named segmented-prefill campaign must prove the other
+         * production contract: the same real request is divided into several
+         * fixed captured buckets and its live rows are joined back into the
+         * reference-sized checkpoints. This helper is explicit so no normal
+         * parity cell can accidentally become segmented through ambient shell
+         * configuration.
+         *
+         * @param bucket_rows Positive fixed physical bucket width, smaller than
+         *        the authenticated prompt for the caller's segmented test.
+         */
+        void configureSegmentedProductionParityPrefillGraphBucket(
+            int bucket_rows)
+        {
+            ASSERT_TRUE(productionParityCampaignEnabled())
+                << "Segmented parity buckets are only valid in a production "
+                   "campaign";
+            ASSERT_GT(bucket_rows, 0)
+                << "Segmented production parity requires a positive bucket";
+            ASSERT_FALSE(config_.token_ids.empty())
+                << "Segmented production parity requires authenticated prompt "
+                   "tokens before graph-bucket configuration";
+            if (!productionParityCampaignEnabled() || bucket_rows <= 0 ||
+                config_.token_ids.empty())
+            {
+                return;
+            }
+
+            setScopedParityEnvOverride(
+                "LLAMINAR_PREFILL_GRAPH_MIN_SEQ",
+                std::to_string(bucket_rows));
+            setScopedParityEnvOverride(
+                "LLAMINAR_PREFILL_GRAPH_BUCKETS",
+                "1");
+            setScopedParityEnvOverride(
+                "LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES",
+                std::to_string(bucket_rows));
+        }
+
+        /**
          * @brief Required snapshot version for compatibility.
          *
          * Bump this when the snapshot format or V-head reversal semantics change.
@@ -1900,6 +3048,31 @@ namespace llaminar2::test::parity
          *   v3: Qwen3.5 prefill GDN conv and Q/K norm snapshots match C++ layout
          */
         static constexpr int kRequiredSnapshotVersion = 3;
+
+        static constexpr int kRequiredReferenceIdentityVersion = 1;
+
+        struct ReferenceSnapshotValidation
+        {
+            bool usable = false;
+            std::string reason;
+        };
+
+        /**
+         * @brief Validate model-family checkpoint semantics beyond provenance.
+         *
+         * The common identity authenticates model bytes and inference inputs,
+         * but a model-specific snapshot key can still change meaning without a
+         * file-format change. Specialized parity bases override this hook and
+         * require their own semantic schema marker, preventing an authenticated
+         * but semantically stale reference pack from entering comparison.
+         */
+        virtual ReferenceSnapshotValidation
+        validateModelSpecificReferenceSnapshotMetadata(
+            const std::filesystem::path &metadata_path) const
+        {
+            (void)metadata_path;
+            return {true, {}};
+        }
 
         /**
          * @brief Read snapshot_version from metadata.txt
@@ -1928,6 +3101,252 @@ namespace llaminar2::test::parity
             return 0; // Pre-versioning snapshot (no version line)
         }
 
+        /**
+         * @brief Read and trim one scalar from line-oriented snapshot metadata.
+         */
+        static std::optional<std::string> readSnapshotMetadataValue(
+            const std::filesystem::path &metadata_path,
+            const std::string &key)
+        {
+            std::ifstream file(metadata_path);
+            if (!file.is_open())
+                return std::nullopt;
+
+            const std::string prefix = key + ":";
+            std::string line;
+            while (std::getline(file, line))
+            {
+                if (line.rfind(prefix, 0) != 0)
+                    continue;
+                std::string value = line.substr(prefix.size());
+                const auto first = value.find_first_not_of(" \t\r\n");
+                if (first == std::string::npos)
+                    return std::string{};
+                const auto last = value.find_last_not_of(" \t\r\n");
+                return value.substr(first, last - first + 1);
+            }
+            return std::nullopt;
+        }
+
+        /**
+         * @brief Parse a strict comma-separated token field and canonical form.
+         */
+        static std::optional<std::pair<std::vector<int>, std::string>>
+        readSnapshotTokenIdentity(
+            const std::filesystem::path &metadata_path,
+            const std::string &key)
+        {
+            const auto raw = readSnapshotMetadataValue(metadata_path, key);
+            if (!raw || raw->empty())
+                return std::nullopt;
+
+            std::vector<int> tokens;
+            std::stringstream input(*raw);
+            std::string item;
+            while (std::getline(input, item, ','))
+            {
+                const auto first = item.find_first_not_of(" \t");
+                const auto last = item.find_last_not_of(" \t");
+                if (first == std::string::npos || last == std::string::npos)
+                    return std::nullopt;
+                const std::string trimmed = item.substr(first, last - first + 1);
+                size_t parsed = 0;
+                try
+                {
+                    const int token = std::stoi(trimmed, &parsed);
+                    if (parsed != trimmed.size() || token < 0)
+                        return std::nullopt;
+                    tokens.push_back(token);
+                }
+                catch (...)
+                {
+                    return std::nullopt;
+                }
+            }
+            if (tokens.empty())
+                return std::nullopt;
+
+            std::ostringstream canonical;
+            for (size_t index = 0; index < tokens.size(); ++index)
+            {
+                if (index != 0)
+                    canonical << ',';
+                canonical << tokens[index];
+            }
+            return std::make_pair(std::move(tokens), canonical.str());
+        }
+
+        static bool isSha256Hex(const std::string &value)
+        {
+            return value.size() == 64 &&
+                   std::all_of(
+                       value.begin(),
+                       value.end(),
+                       [](unsigned char character)
+                       {
+                           return (character >= '0' && character <= '9') ||
+                                  (character >= 'a' && character <= 'f');
+                       });
+        }
+
+        /**
+         * @brief Authenticate a reusable CPU-reference pack for this exact case.
+         *
+         * Focused diagnostic tests retain version-only compatibility. Production
+         * campaigns additionally prove that the reference came from the exact
+         * GGUF bytes, exact prompt bytes, CPU/FP32 PyTorch execution, tokenizer
+         * output, and sufficient incremental-decode depth.
+         */
+        ReferenceSnapshotValidation validateReferenceSnapshotMetadata(
+            const std::filesystem::path &metadata_path,
+            bool require_content_identity) const
+        {
+            const int snapshot_version = readSnapshotVersion(metadata_path);
+            if (snapshot_version < kRequiredSnapshotVersion)
+            {
+                return {
+                    false,
+                    "snapshot_version " + std::to_string(snapshot_version) +
+                        " is older than required v" +
+                        std::to_string(kRequiredSnapshotVersion)};
+            }
+            const auto model_specific_validation =
+                validateModelSpecificReferenceSnapshotMetadata(metadata_path);
+            if (!model_specific_validation.usable)
+                return model_specific_validation;
+            if (!require_content_identity)
+                return {true, {}};
+
+            const auto expect_scalar = [&metadata_path](
+                                           const std::string &key,
+                                           const std::string &expected)
+                -> std::optional<std::string>
+            {
+                const auto actual = readSnapshotMetadataValue(metadata_path, key);
+                if (!actual)
+                    return "missing " + key;
+                if (*actual != expected)
+                    return key + " is '" + *actual + "', expected '" + expected + "'";
+                return std::nullopt;
+            };
+
+            if (const auto error = expect_scalar(
+                    "reference_identity_version",
+                    std::to_string(kRequiredReferenceIdentityVersion)))
+                return {false, *error};
+            if (const auto error = expect_scalar("reference_engine", "pytorch"))
+                return {false, *error};
+            if (const auto error = expect_scalar("reference_device", "cpu"))
+                return {false, *error};
+            if (const auto error = expect_scalar("reference_dtype", "float32"))
+                return {false, *error};
+
+            const auto decode_depth = readSnapshotMetadataValue(
+                metadata_path, "decode_steps");
+            if (!decode_depth)
+                return {false, "missing decode_steps"};
+            try
+            {
+                size_t parsed = 0;
+                const int available = std::stoi(*decode_depth, &parsed);
+                if (parsed != decode_depth->size() ||
+                    available < config_.decode_steps)
+                {
+                    return {
+                        false,
+                        "decode_steps does not cover requested depth " +
+                            std::to_string(config_.decode_steps)};
+                }
+            }
+            catch (...)
+            {
+                return {false, "decode_steps is not an integer"};
+            }
+
+            const auto token_identity = readSnapshotTokenIdentity(
+                metadata_path, "token_ids");
+            if (!token_identity)
+                return {false, "token_ids is missing or malformed"};
+            const auto token_digest = readSnapshotMetadataValue(
+                metadata_path, "token_ids_sha256");
+            std::string digest_error;
+            const auto expected_token_digest = sha256BytesHex(
+                token_identity->second, &digest_error);
+            if (!token_digest || !isSha256Hex(*token_digest) ||
+                !expected_token_digest || *token_digest != *expected_token_digest)
+            {
+                return {
+                    false,
+                    "token_ids_sha256 does not authenticate token_ids" +
+                        (digest_error.empty() ? std::string{} : ": " + digest_error)};
+            }
+
+            const auto prompt_digest = readSnapshotMetadataValue(
+                metadata_path, "prompt_sha256");
+            const auto expected_prompt_digest = sha256BytesHex(
+                config_.prompt, &digest_error);
+            if (!prompt_digest || !isSha256Hex(*prompt_digest) ||
+                !expected_prompt_digest || *prompt_digest != *expected_prompt_digest)
+            {
+                return {
+                    false,
+                    "prompt_sha256 does not match the configured prompt" +
+                        (digest_error.empty() ? std::string{} : ": " + digest_error)};
+            }
+
+            const auto model_digest = readSnapshotMetadataValue(
+                metadata_path, "model_sha256");
+            const auto digest_cache =
+                productionParityDigestCacheFromEnvironment();
+            const auto expected_model_digest = digest_cache
+                                                   ? sha256FileHexShared(
+                                                         config_.model_path,
+                                                         *digest_cache,
+                                                         &digest_error)
+                                                   : sha256FileHex(
+                                                         config_.model_path,
+                                                         &digest_error);
+            if (!model_digest || !isSha256Hex(*model_digest) ||
+                !expected_model_digest || *model_digest != *expected_model_digest)
+            {
+                return {
+                    false,
+                    "model_sha256 does not match the live GGUF bytes" +
+                        (digest_error.empty() ? std::string{} : ": " + digest_error)};
+            }
+
+            const auto snapshot_dir = metadata_path.parent_path();
+            if (productionParityRequiresPrefillSnapshots() &&
+                (!std::filesystem::is_regular_file(snapshot_dir / "EMBEDDING.npy") ||
+                 !std::filesystem::is_regular_file(snapshot_dir / "LM_HEAD.npy")))
+            {
+                return {false, "reference pack is missing prefill boundary snapshots"};
+            }
+            if (config_.decode_steps > 0)
+            {
+                const auto decode_tokens = readSnapshotTokenIdentity(
+                    metadata_path, "decode_tokens");
+                if (!decode_tokens ||
+                    decode_tokens->first.size() <
+                        static_cast<size_t>(config_.decode_steps))
+                {
+                    return {false, "decode_tokens does not cover requested depth"};
+                }
+                const auto last_decode =
+                    snapshot_dir /
+                    ("decode_step" + std::to_string(config_.decode_steps - 1) +
+                     "_LM_HEAD.npy");
+                if (!std::filesystem::is_regular_file(last_decode))
+                    return {false, "reference pack is missing the final decode LM_HEAD"};
+            }
+
+            return {true, {}};
+        }
+
+        const std::chrono::steady_clock::time_point parity_fixture_started_at_ =
+            std::chrono::steady_clock::now();
+        bool production_parity_campaign_active_ = false;
+        bool production_parity_model_context_reused_ = false;
         ParityConfig config_;
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<IInferenceRunner> runner_;
@@ -1946,15 +3365,51 @@ namespace llaminar2::test::parity
         // setupPipeline() to initialize runner_ (legacy path).
         std::unique_ptr<IOrchestrationRunner> orch_runner_;
 
+        /**
+         * @brief Authenticated teacher-forced production decode trajectory.
+         *
+         * Quantized logits may legitimately place the reference argmax inside
+         * the accepted top-k without making it local top-1. An autonomous
+         * decode loop would then leave the Hugging Face trajectory and compare
+         * unrelated later checkpoints. Production parity instead uses the
+         * serving `forceDecodeToken()` protocol that also powers constrained
+         * continuations. The first token replaces the ready prefill sample;
+         * each following token forwards its predecessor through the ordinary
+         * captured decode graph and leaves those snapshots for comparison.
+         */
+        std::vector<int32_t> orchestration_parity_decode_trajectory_;
+        size_t orchestration_parity_decode_trajectory_index_ = 0;
+        bool orchestration_parity_forced_decode_armed_ = false;
+
         IInferenceRunner *activeLegacyRunner() const
         {
             return runner_ ? runner_.get() : borrowed_runner_;
         }
 
+        /**
+         * @brief Return the active runner's read-only concrete model metadata.
+         *
+         * Parity layout projection consumes GGUF metadata but must never create
+         * a second model context beside OrchestrationRunner's weight authority.
+         */
+        const ModelContext *activeModelContextForDiagnostics() const
+        {
+            if (model_ctx_)
+                return model_ctx_.get();
+            if (!orch_runner_)
+                return nullptr;
+            return dynamic_cast<const ModelContext *>(
+                orch_runner_->modelContextForDiagnostics());
+        }
+
         int parityLayerCount() const
         {
             if (!model_ctx_)
-                return 0;
+            {
+                return orch_runner_
+                           ? orch_runner_->executionPlan().layerCount()
+                           : 0;
+            }
 
             const int local_layers = model_ctx_->blockCount();
             const int total_layers = model_ctx_->totalBlockCount();
@@ -2007,12 +3462,27 @@ namespace llaminar2::test::parity
         // =============================================================================
 
         /**
-         * @brief Check if this is rank 0 (or single-rank mode)
-         * @return true if rank 0 or no MPI context
+         * @brief Return the rank that owns comparison and CSV artifact output.
+         *
+         * Most parity cells use rank zero. A rank-agnostic heterogeneous graph
+         * may bind its dense continuation and snapshot store to another rank;
+         * that fixture overrides this after its production runner resolves the
+         * topology. Setup-time reference preparation still defaults to zero
+         * before the runner exists.
+         */
+        virtual int parityArtifactAuthorityRank() const
+        {
+            return 0;
+        }
+
+        /**
+         * @brief Check whether this rank owns parity artifacts and assertions.
+         * @return true for the configured artifact authority or single-rank mode.
          */
         bool isRank0() const
         {
-            return !mpi_ctx_ || mpi_ctx_->rank() == 0;
+            return !mpi_ctx_ ||
+                   mpi_ctx_->rank() == parityArtifactAuthorityRank();
         }
 
         /**
@@ -2117,6 +3587,28 @@ namespace llaminar2::test::parity
             return false;
         }
 
+        /**
+         * @brief Load and configure the authoritative model context for a runner.
+         *
+         * Campaign fixtures may override this boundary to retain one immutable
+         * real-weight context while rebuilding precision-specific runners.  The
+         * returned context remains the sole owner of its WeightManager and
+         * PreparedWeightStore; callers must not construct a host mirror.
+         */
+        virtual std::shared_ptr<ModelContext> acquireParityModelContext(
+            WeightDistributionStrategy strategy)
+        {
+            auto context = ModelContext::create(
+                config_.model_path,
+                mpi_ctx_,
+                nullptr,
+                nullptr,
+                strategy);
+            if (context)
+                configureModel(context);
+            return context;
+        }
+
         void borrowParityPipeline(
             std::shared_ptr<ModelContext> model_ctx,
             IInferenceRunner *runner)
@@ -2135,6 +3627,27 @@ namespace llaminar2::test::parity
             model_ctx_.reset();
         }
 
+        /**
+         * @brief Quote one argument for an exact `bash -c` command boundary.
+         *
+         * Prompts may contain newlines, quotes, dollar signs, and shell syntax.
+         * Snapshot generation must receive those bytes unchanged and must never
+         * interpret a model path or prompt as part of the command program.
+         */
+        static std::string parityShellQuote(const std::string &value)
+        {
+            std::string quoted = "'";
+            for (const char character : value)
+            {
+                if (character == '\'')
+                    quoted += "'\"'\"'";
+                else
+                    quoted.push_back(character);
+            }
+            quoted.push_back('\'');
+            return quoted;
+        }
+
         void SetUp() override
         {
             // Model parity is a production-path canary. Do not let an inherited
@@ -2142,6 +3655,77 @@ namespace llaminar2::test::parity
             setenv("LLAMINAR_DETERMINISTIC", "0", 1);
             mutableDebugEnv().reload();
             auto parity_profile_scope = profileParityScope("set_up.total");
+
+            // Resolve only after the derived fixture has selected its exact
+            // model. The RAM copy remains immutable for the complete aggregate
+            // run and is re-authenticated against reference metadata below.
+            if (!config_.model_path.empty())
+            {
+                try
+                {
+                    config_.model_path = productionParityResolvedModelPath(
+                        config_.model_path);
+                }
+                catch (const std::exception &error)
+                {
+                    FAIL() << error.what();
+                }
+            }
+
+            /*
+             * Parity binaries construct production runners directly and therefore
+             * do not pass through RuntimeInitPhase, which normally publishes the
+             * process-wide CPU allocation domain before graph preparation.  A
+             * cross-rank CPU participant owns one exact NUMA domain: packed expert
+             * arrivals and every persistent CPU workspace must be allocated there.
+             * Derive that identity from the process affinity established by the
+             * registered MPI launch, exactly as RuntimeInitPhase does.  An
+             * aggregate backend is valid only for a genuinely single-rank test.
+             */
+            if (!llaminar2::hasCPUBackend())
+            {
+                int backend_numa_node = -1;
+                const bool cross_rank_cpu =
+                    mpi_ctx_ && mpi_ctx_->world_size() > 1 &&
+                    getDeviceForRank().is_cpu();
+                if (cross_rank_cpu)
+                {
+                    const auto numa =
+                        llaminar2::NUMATopology::detectLocalNUMANode();
+                    ASSERT_TRUE(numa.detection_succeeded)
+                        << "Cross-rank CPU production parity requires exact "
+                           "rank-to-NUMA affinity before backend initialization";
+                    ASSERT_GE(numa.local_numa_node, 0)
+                        << "Cross-rank CPU production parity resolved an invalid "
+                           "NUMA node";
+                    backend_numa_node = numa.local_numa_node;
+                }
+                llaminar2::initCPUBackend(backend_numa_node);
+            }
+
+            /*
+             * A commit/test-name directory is reused across invocations. Remove
+             * only this cell's generated directory before opening its log so an
+             * early setup failure cannot leave CSV evidence from a prior run.
+             * Rank zero owns deletion; every other rank waits until that exact
+             * artifact authority has been recreated.
+             */
+            int32_t results_dir_ready = 1;
+            if (isRank0())
+            {
+                const auto dir = getResultsDir();
+                std::error_code ec;
+                std::filesystem::remove_all(dir, ec);
+                if (!ec)
+                    std::filesystem::create_directories(dir, ec);
+                results_dir_ready = ec ? 0 : 1;
+            }
+            if (mpi_ctx_ && mpiWorldSize() > 1)
+                mpi_ctx_->broadcast_int32(&results_dir_ready, 1, 0);
+            mpiBarrier();
+            ASSERT_EQ(results_dir_ready, 1)
+                << "Cannot prepare a fresh parity artifact directory for "
+                << getTestName();
 
             // Start log file capture for this test run (rank 0 only)
             if (isRank0())
@@ -2169,6 +3753,12 @@ namespace llaminar2::test::parity
             // failures inside Python rather than a clear "model not found".
             if (!config_.model_path.empty() && !std::filesystem::exists(config_.model_path))
             {
+                if (productionParityCampaignEnabled())
+                {
+                    FAIL() << "Production parity model file not found: "
+                           << config_.model_path
+                           << " (the real-weight campaign cannot certify a skipped cell)";
+                }
                 GTEST_SKIP() << "Model file not found: " << config_.model_path
                              << " (populate MODELS_DIR on the runner)";
             }
@@ -2181,6 +3771,8 @@ namespace llaminar2::test::parity
             // AND the snapshot version matches the expected version.
             // This is critical for MPI_PROCS>1 tests where popen()/fork() inside
             // an MPI-managed process can crash the HNP event loop.
+            int32_t snapshots_ready = 1;
+            std::string snapshot_failure_reason;
             {
                 auto scope = profileParityScope("set_up.snapshot_ready");
                 if (isRank0())
@@ -2191,25 +3783,39 @@ namespace llaminar2::test::parity
                         need_regen = (s_generated_snapshots_.find(snapshotCacheKey()) == s_generated_snapshots_.end());
                     }
 
-                    if (need_regen)
+                    // Production cells revalidate on every fixture. SHA-256 file
+                    // hashing is cached by canonical path/size/mtime in-process,
+                    // so this catches a changed pack without rescanning weights.
+                    if (need_regen || productionParityCampaignEnabled())
                     {
                         // Check disk first — snapshots may exist from a prior test run
                         auto metadata_path = std::filesystem::path(config_.snapshot_dir) / "metadata.txt";
                         if (std::filesystem::exists(metadata_path))
                         {
-                            int disk_version = readSnapshotVersion(metadata_path);
-                            if (disk_version >= kRequiredSnapshotVersion)
+                            const auto validation = validateReferenceSnapshotMetadata(
+                                metadata_path,
+                                productionParityCampaignEnabled());
+                            if (validation.usable)
                             {
-                                LOG_INFO("[" << getBackendName() << " Parity] Found existing v" << disk_version
-                                             << " snapshots on disk: " << config_.snapshot_dir);
+                                LOG_INFO("[" << getBackendName()
+                                             << " Parity] Found reusable v"
+                                             << readSnapshotVersion(metadata_path)
+                                             << " reference pack on disk: "
+                                             << config_.snapshot_dir);
                                 need_regen = false;
                             }
                             else
                             {
-                                LOG_WARN("[" << getBackendName() << " Parity] Stale snapshots (v"
-                                             << disk_version << " < required v" << kRequiredSnapshotVersion
-                                             << ") — regenerating: " << config_.snapshot_dir);
+                                LOG_WARN("[" << getBackendName()
+                                             << " Parity] Reference pack is stale or unauthenticated ("
+                                             << validation.reason << ") — regenerating: "
+                                             << config_.snapshot_dir);
+                                need_regen = true;
                             }
+                        }
+                        else
+                        {
+                            need_regen = true;
                         }
                     }
 
@@ -2217,25 +3823,54 @@ namespace llaminar2::test::parity
                     {
                         if (!regeneratePyTorchSnapshots())
                         {
-                            FAIL() << "PyTorch snapshot generation failed";
+                            snapshots_ready = 0;
+                            snapshot_failure_reason =
+                                "PyTorch snapshot generation failed";
                         }
-                        // Mark as generated
-                        std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
-                        s_generated_snapshots_.insert(snapshotCacheKey());
+                        else
+                        {
+                            const auto metadata_path =
+                                std::filesystem::path(config_.snapshot_dir) /
+                                "metadata.txt";
+                            const auto validation = validateReferenceSnapshotMetadata(
+                                metadata_path,
+                                productionParityCampaignEnabled());
+                            if (!validation.usable)
+                            {
+                                snapshots_ready = 0;
+                                snapshot_failure_reason =
+                                    "generated reference pack failed validation: " +
+                                    validation.reason;
+                            }
+                        }
                     }
-                    else
+
+                    if (snapshots_ready != 0)
                     {
-                        // Mark in cache so subsequent parameterized cases skip the disk check too
+                        // Mark only a completely generated/validated pack. Later
+                        // production fixtures still revalidate its content identity.
                         std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
                         s_generated_snapshots_.insert(snapshotCacheKey());
-                        LOG_DEBUG("[" << getBackendName() << " Parity] Reusing cached snapshots from: " << config_.snapshot_dir);
+                        if (!need_regen)
+                        {
+                            LOG_DEBUG("[" << getBackendName()
+                                           << " Parity] Reusing cached snapshots from: "
+                                           << config_.snapshot_dir);
+                        }
                     }
                 }
+
+                if (mpi_ctx_ && mpiWorldSize() > 1)
+                    mpi_ctx_->broadcast_int32(&snapshots_ready, 1, 0);
             }
             {
                 auto scope = profileParityScope("set_up.snapshot_barrier");
                 mpiBarrier(); // All ranks wait for snapshots to be ready
             }
+            ASSERT_EQ(snapshots_ready, 1)
+                << (snapshot_failure_reason.empty()
+                        ? "rank 0 failed to prepare the PyTorch reference pack"
+                        : snapshot_failure_reason);
         }
 
         void TearDown() override
@@ -2271,24 +3906,28 @@ namespace llaminar2::test::parity
 #endif
             }
 
-            if (preserveParityPipelineCachesBetweenTests() && borrowed_runner_)
+            const bool preserve_campaign_caches =
+                preserveParityPipelineCachesBetweenTests();
+            if (preserve_campaign_caches)
             {
-                auto scope = profileParityScope("tear_down.reset_borrowed_pipeline");
+                auto scope = profileParityScope("tear_down.reset_campaign_pipeline");
                 activeClearSnapshots();
                 activeClearCache();
-                releaseBorrowedParityPipeline();
             }
-            else
-            {
-                // Destroy graph/stage owners before clearing global kernel caches.
-                // The model context remains alive until after clearCache(), so tensor
-                // cache cleanup can still access tensor-owned packed caches safely.
-                {
-                    auto scope = profileParityScope("tear_down.destroy_runner");
-                    runner_.reset();
-                    orch_runner_.reset();
-                }
 
+            // Destroy graph/stage owners before touching process-wide caches.
+            // A borrowed runner stays owned by its exact-identity pipeline cache;
+            // an ordinary campaign runner is retired between precision cells.
+            {
+                auto scope = profileParityScope("tear_down.destroy_runner");
+                runner_.reset();
+                orch_runner_.reset();
+                if (borrowed_runner_)
+                    releaseBorrowedParityPipeline();
+            }
+
+            if (!preserve_campaign_caches)
+            {
                 // CRITICAL: Clear kernel cache BEFORE destroying model context!
                 // KernelFactory::clearCache() accesses tensor->cache_ (CPU packed weights)
                 // to free resources. If we destroy the tensors first (via model_ctx_.reset()),
@@ -2298,11 +3937,12 @@ namespace llaminar2::test::parity
                     llaminar::v2::kernels::KernelFactory::clearCache();
                 }
 
-                {
-                    auto scope = profileParityScope("tear_down.clear_model_and_snapshots");
-                    model_ctx_.reset();
-                    pytorch_snapshots_.clear();
-                }
+            }
+
+            {
+                auto scope = profileParityScope("tear_down.clear_model_and_snapshots");
+                model_ctx_.reset();
+                pytorch_snapshots_.clear();
             }
 
             // CRITICAL: Synchronize and clear error state on all GPU devices!
@@ -2363,7 +4003,7 @@ namespace llaminar2::test::parity
         {
             LOG_INFO("[" << getBackendName() << " Parity] Regenerating PyTorch snapshots from GGUF: " << config_.model_path);
 
-            std::ostringstream cmd;
+            std::ostringstream script;
             // Source devcontainer venv if present, else fall back to system
             // python3 (which is what the CI builder image uses, where Python
             // deps were installed via `pip install --break-system-packages`).
@@ -2373,16 +4013,18 @@ namespace llaminar2::test::parity
             // Those env vars are inherited by this python3 subprocess, which would pin
             // PyTorch's CPU forward pass to a single thread — catastrophic for large
             // models. We unset them and let PyTorch/OpenMP/MKL use all available cores.
-            cmd << "bash -c 'unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
-                << "[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
-                << " python/reference/generate_qwen_pipeline_snapshots.py"
-                << " --model " << config_.model_path
-                << " --prompt \"" << config_.prompt << "\""
-                << " --output " << config_.snapshot_dir
-                << " --decode-steps " << config_.decode_steps
-                << "' 2>&1";
+            script << "unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
+                   << "if [ -f /workspaces/llaminar/.venv/bin/activate ]; then "
+                   << "source /workspaces/llaminar/.venv/bin/activate; fi; "
+                   << "python3 python/reference/generate_qwen_pipeline_snapshots.py"
+                   << " --model " << parityShellQuote(config_.model_path)
+                   << " --prompt " << parityShellQuote(config_.prompt)
+                   << " --output " << parityShellQuote(config_.snapshot_dir)
+                   << " --decode-steps " << config_.decode_steps;
+            const std::string command =
+                "bash -c " + parityShellQuote(script.str()) + " 2>&1";
 
-            FILE *pipe = popen(cmd.str().c_str(), "r");
+            FILE *pipe = popen(command.c_str(), "r");
             if (!pipe)
             {
                 LOG_ERROR("[Parity] Failed to execute snapshot generator");
@@ -2495,54 +4137,10 @@ namespace llaminar2::test::parity
          * skip reversal, so both sides use tiled order and no permutation
          * is needed at comparison time.
          */
-        struct GDNHeadConfig
+        ParityGDNHeadConfig getGDNHeadConfig() const
         {
-            int n_k_heads = 0;
-            int n_v_heads = 0;
-            int d_state = 0;
-            bool is_moe = false;
-
-            bool needsPermutation() const
-            {
-                // Only MoE models need comparison-time permutation because
-                // the Python GGUF loader reverses V-head tiling for MoE only.
-                // Dense models skip reversal, so both sides match already.
-                return is_moe && n_k_heads > 0 && n_v_heads > 0 && n_k_heads != n_v_heads;
-            }
-
-            int headsPerGroup() const
-            {
-                return n_k_heads > 0 ? n_v_heads / n_k_heads : 1;
-            }
-        };
-
-        GDNHeadConfig getGDNHeadConfig() const
-        {
-            if (!model_ctx_)
-                return {};
-
-            const auto &arch = model_ctx_->architecture();
-            const auto &meta = model_ctx_->model().metadata;
-
-            auto getMetaInt = [&](const std::string &suffix) -> int
-            {
-                auto it = meta.find(arch + "." + suffix);
-                if (it == meta.end())
-                    return 0;
-                const auto &val = it->second;
-                if (val.type == GGUFValueType::UINT32)
-                    return static_cast<int>(val.asUInt32());
-                if (val.type == GGUFValueType::UINT64)
-                    return static_cast<int>(val.asUInt64());
-                return 0;
-            };
-
-            GDNHeadConfig cfg;
-            cfg.n_k_heads = getMetaInt("ssm.group_count");
-            cfg.n_v_heads = getMetaInt("ssm.time_step_rank");
-            cfg.d_state = getMetaInt("ssm.state_size");
-            cfg.is_moe = (getMetaInt("expert_count") > 0);
-            return cfg;
+            return parityGDNHeadConfigFromModel(
+                activeModelContextForDiagnostics());
         }
 
         /**
@@ -2556,11 +4154,13 @@ namespace llaminar2::test::parity
 
         MoEConfig getMoEConfig() const
         {
-            if (!model_ctx_)
+            const ModelContext *model_ctx =
+                activeModelContextForDiagnostics();
+            if (!model_ctx)
                 return {};
 
-            const auto &arch = model_ctx_->architecture();
-            const auto &meta = model_ctx_->model().metadata;
+            const auto &arch = model_ctx->architecture();
+            const auto &meta = model_ctx->model().metadata;
 
             auto getMetaInt = [&](const std::string &suffix) -> int
             {
@@ -2595,87 +4195,13 @@ namespace llaminar2::test::parity
             const float *llaminar_data,
             size_t size,
             const std::string &stage,
-            const GDNHeadConfig &gdn) const
+            const ParityGDNHeadConfig &gdn) const
         {
-            if (!gdn.needsPermutation())
-                return {};
-
-            const int n_k = gdn.n_k_heads;
-            const int n_v = gdn.n_v_heads;
-            const int d = gdn.d_state;
-            const int hpg = gdn.headsPerGroup(); // heads per group (n_v / n_k)
-
-            // Build inverse permutation: inv[pt_head] = ll_head
-            std::vector<int> inv_perm(static_cast<size_t>(n_v));
-            for (int pt_h = 0; pt_h < n_v; ++pt_h)
-            {
-                int ratio = pt_h % hpg;
-                int group = pt_h / hpg;
-                inv_perm[static_cast<size_t>(pt_h)] = ratio * n_k + group;
-            }
-
-            auto permuteHeads = [&](const float *src, size_t total_elements) -> std::vector<float>
-            {
-                const size_t head_dim = static_cast<size_t>(d);
-                const size_t n_heads = static_cast<size_t>(n_v);
-                const size_t tokens = total_elements / (n_heads * head_dim);
-                if (tokens * n_heads * head_dim != total_elements)
-                    return {}; // Size doesn't match expected layout
-
-                std::vector<float> out(total_elements);
-                for (size_t t = 0; t < tokens; ++t)
-                {
-                    for (size_t pt_h = 0; pt_h < n_heads; ++pt_h)
-                    {
-                        size_t ll_h = static_cast<size_t>(inv_perm[pt_h]);
-                        std::memcpy(
-                            &out[(t * n_heads + pt_h) * head_dim],
-                            &src[(t * n_heads + ll_h) * head_dim],
-                            head_dim * sizeof(float));
-                    }
-                }
-                return out;
-            };
-
-            if (stage == "GDN_Z_PROJECTION" ||
-                stage == "GDN_DELTA_RULE_OUTPUT" ||
-                stage == "GDN_NORM_GATE_OUTPUT")
-            {
-                return permuteHeads(llaminar_data, size);
-            }
-
-            if (stage == "QKV_PROJECTION" || stage == "GDN_CONV1D_OUTPUT")
-            {
-                // QKV-like layout: [seq, Q(n_k*d) | K(n_k*d) | V(n_v*d)]
-                // Short-conv preserves this packed layout, so it needs the
-                // same V-head-only permutation as the raw projection snapshot.
-                const size_t q_dim = static_cast<size_t>(n_k * d);
-                const size_t k_dim = static_cast<size_t>(n_k * d);
-                const size_t v_dim = static_cast<size_t>(n_v * d);
-                const size_t qkv_dim = q_dim + k_dim + v_dim;
-                const size_t tokens = size / qkv_dim;
-                if (tokens * qkv_dim != size)
-                    return {}; // Size doesn't match
-
-                // Permute only the V portion
-                std::vector<float> out(llaminar_data, llaminar_data + size); // copy all
-                for (size_t t = 0; t < tokens; ++t)
-                {
-                    const float *v_src = llaminar_data + t * qkv_dim + q_dim + k_dim;
-                    float *v_dst = out.data() + t * qkv_dim + q_dim + k_dim;
-                    for (size_t pt_h = 0; pt_h < static_cast<size_t>(n_v); ++pt_h)
-                    {
-                        size_t ll_h = static_cast<size_t>(inv_perm[pt_h]);
-                        std::memcpy(
-                            &v_dst[pt_h * static_cast<size_t>(d)],
-                            &v_src[ll_h * static_cast<size_t>(d)],
-                            static_cast<size_t>(d) * sizeof(float));
-                    }
-                }
-                return out;
-            }
-
-            return {}; // Not a GDN stage
+            return applyParityGDNHeadPermutation(
+                llaminar_data,
+                size,
+                stage,
+                gdn);
         }
 
         /**
@@ -2687,104 +4213,14 @@ namespace llaminar2::test::parity
             size_t size,
             const std::string &stage_name = "")
         {
-            StageComparisonResult result;
-            result.stage_name = stage_name;
-            result.total_elements = size;
-
             if (expected.empty() || expected.size() != size)
-            {
-                return result;
-            }
-
-            // Fused pass: compute cosine/L2/max_abs_diff and error histogram in one traversal
-            double sum_sq_diff = 0.0;
-            double sum_sq_expected = 0.0;
-            double dot_product = 0.0;
-            double norm_actual_sq = 0.0;
-            double norm_expected_sq = 0.0;
-            float max_abs_diff = 0.0f;
-
-#pragma omp parallel for reduction(+ : sum_sq_diff, sum_sq_expected, dot_product, norm_actual_sq, norm_expected_sq) \
-    reduction(max : max_abs_diff) schedule(static) if (size > 8192)
-            for (size_t i = 0; i < size; ++i)
-            {
-                double a = static_cast<double>(actual[i]);
-                double e = static_cast<double>(expected[i]);
-                double diff = a - e;
-                sum_sq_diff += diff * diff;
-                sum_sq_expected += e * e;
-                dot_product += a * e;
-                norm_actual_sq += a * a;
-                norm_expected_sq += e * e;
-
-                float abs_diff = std::abs(actual[i] - expected[i]);
-                if (abs_diff > max_abs_diff)
-                    max_abs_diff = abs_diff;
-            }
-            result.max_abs_diff = max_abs_diff;
-
-            // Relative L2
-            if (sum_sq_expected > 1e-10)
-            {
-                result.rel_l2_norm = static_cast<float>(std::sqrt(sum_sq_diff / sum_sq_expected));
-            }
-
-            // Cosine similarity
-            double norm_product = std::sqrt(norm_actual_sq) * std::sqrt(norm_expected_sq);
-            if (norm_product > 1e-10)
-            {
-                result.cosine_similarity = static_cast<float>(dot_product / norm_product);
-            }
-
-            // RMSE
-            result.rmse = static_cast<float>(std::sqrt(sum_sq_diff / static_cast<double>(size)));
-
-            // SNR in dB: 10·log10(‖signal‖² / ‖error‖²)
-            if (sum_sq_diff > 1e-30)
-            {
-                result.snr_db = static_cast<float>(10.0 * std::log10(sum_sq_expected / sum_sq_diff));
-            }
-            else if (sum_sq_expected > 1e-30)
-            {
-                result.snr_db = 100.0f; // Perfect match, cap at 100 dB
-            }
-
-            // Error histogram entropy — separate pass needed because max_abs_diff
-            // must be known first for binning
-            {
-                constexpr int N_BINS = 64;
-                std::array<size_t, N_BINS> bins = {};
-                float max_err = result.max_abs_diff;
-                if (max_err > 1e-10f)
-                {
-                    float inv_max = static_cast<float>(N_BINS - 1) / max_err;
-                    // Can't trivially OMP-reduce an array, but this loop is
-                    // cheap compared to distribution stats, so keep it serial
-                    for (size_t i = 0; i < size; ++i)
-                    {
-                        float abs_err = std::abs(actual[i] - expected[i]);
-                        int bin = std::min(static_cast<int>(abs_err * inv_max), N_BINS - 1);
-                        bins[bin]++;
-                    }
-                    double entropy = 0.0;
-                    double n = static_cast<double>(size);
-                    for (int b = 0; b < N_BINS; ++b)
-                    {
-                        if (bins[b] == 0)
-                            continue;
-                        double p = static_cast<double>(bins[b]) / n;
-                        entropy -= p * std::log2(p);
-                    }
-                    result.error_entropy = static_cast<float>(entropy);
-                }
-            }
-
-            // Distribution stats for both tensors
-            result.llaminar_stats = computeDistributionStats(actual, size);
-            result.pytorch_stats = computeDistributionStats(expected.data(), size);
-
-            result.passed = (result.cosine_similarity >= config_.cosine_threshold);
-            return result;
+                return StageComparisonResult{.stage_name = stage_name};
+            return compareParityTensorData(
+                actual,
+                expected.data(),
+                size,
+                stage_name,
+                config_.cosine_threshold);
         }
 
         /**
@@ -2972,6 +4408,7 @@ namespace llaminar2::test::parity
             bool debug_print = (tp_snapshot.key.find("layer0_ATTENTION_CONTEXT") != std::string::npos);
             result.stage_name = tp_snapshot.key;
             result.sharding_mode = tp_snapshot.mode;
+            result.reference_elements = pytorch_data.size();
 
             if (pytorch_data.empty())
             {
@@ -2995,13 +4432,38 @@ namespace llaminar2::test::parity
             // Per-device comparison for column-parallel stages
             if (tp_snapshot.mode == SnapshotShardingMode::COLUMN_PARALLEL)
             {
+                std::vector<size_t> participant_widths;
+                participant_widths.reserve(tp_snapshot.device_data.size());
+                for (const auto &device_data : tp_snapshot.device_data)
+                    participant_widths.push_back(device_data.cols);
+
+                std::vector<ParityTPColumnSlice> slices;
+                try
+                {
+                    slices = makeParityTPColumnSlices(
+                        participant_widths, pytorch_cols);
+                }
+                catch (const std::invalid_argument &error)
+                {
+                    ADD_FAILURE()
+                        << "Invalid column-parallel TP checkpoint geometry for '"
+                        << tp_snapshot.key << "': " << error.what();
+                    return result;
+                }
+
                 for (int dev_idx = 0; dev_idx < tp_degree; ++dev_idx)
                 {
                     const auto &dev_data = tp_snapshot.device_data[dev_idx];
 
-                    // Compute which slice of PyTorch this device should match
-                    size_t slice_start = computeSliceStartCol(dev_idx, tp_degree, pytorch_cols);
-                    size_t slice_cols = computeSliceColCount(dev_idx, tp_degree, pytorch_cols);
+                    // Production partitions attention at whole-head boundaries,
+                    // so a non-divisible head count produces heterogeneous
+                    // shard widths (for example 14 heads across four devices
+                    // becomes 4/4/4/2). Derive each authenticated reference
+                    // interval from the live typed snapshot geometry instead
+                    // of inventing an equal-width test-only partition.
+                    const auto &slice = slices[static_cast<size_t>(dev_idx)];
+                    const size_t slice_start = slice.start_column;
+                    const size_t slice_cols = slice.column_count;
 
                     // Extract PyTorch slice
                     std::vector<float> pytorch_slice = extractColumnSlice(
@@ -3047,6 +4509,10 @@ namespace llaminar2::test::parity
 
                     // Compare device data against slice
                     size_t compare_size = std::min(dev_data.data.size(), pytorch_slice.size());
+                    EXPECT_EQ(dev_data.data.size(), pytorch_slice.size())
+                        << "TP checkpoint '" << tp_snapshot.key << "' device "
+                        << dev_idx << " must exactly match its authenticated "
+                        << "PyTorch shard shape";
                     float cosine = computeCosineSimilarity(
                         dev_data.data.data(), pytorch_slice.data(), compare_size);
 
@@ -3103,6 +4569,21 @@ namespace llaminar2::test::parity
                     result.device_results.push_back(std::move(dev_result));
                 }
             }
+            else if (tp_snapshot.mode ==
+                     SnapshotShardingMode::PACKED_COLUMN_PARALLEL)
+            {
+                /*
+                 * A participant's packed row contains several disjoint
+                 * reference intervals, so comparing it with one contiguous
+                 * PyTorch slice would be mathematically false. The combined
+                 * comparison below still covers every partitioned value, while
+                 * TPSnapshot::computeCombined() separately verifies every
+                 * replicated group before publishing the full row.
+                 */
+                LOG_DEBUG("[TP Parity] Packed checkpoint "
+                          << tp_snapshot.key
+                          << " is certified through typed group reassembly");
+            }
             else
             {
                 // For replicated/row-parallel, each device should match full PyTorch
@@ -3111,6 +4592,10 @@ namespace llaminar2::test::parity
                     const auto &dev_data = tp_snapshot.device_data[dev_idx];
 
                     size_t compare_size = std::min(dev_data.data.size(), pytorch_data.size());
+                    EXPECT_EQ(dev_data.data.size(), pytorch_data.size())
+                        << "TP checkpoint '" << tp_snapshot.key << "' device "
+                        << dev_idx << " must exactly match its authenticated "
+                        << "replicated PyTorch shape";
                     float cosine = computeCosineSimilarity(
                         dev_data.data.data(), pytorch_data.data(), compare_size);
 
@@ -3133,10 +4618,22 @@ namespace llaminar2::test::parity
             if (combined_ptr && combined_size > 0)
             {
                 size_t compare_size = std::min(combined_size, pytorch_data.size());
-                result.combined_cosine = computeCosineSimilarity(
-                    combined_ptr, pytorch_data.data(), compare_size);
+                EXPECT_EQ(combined_size, pytorch_data.size())
+                    << "Combined TP checkpoint '" << tp_snapshot.key
+                    << "' must exactly match the authenticated PyTorch shape";
+                result.combined_result = compareParityTensorData(
+                    combined_ptr,
+                    pytorch_data.data(),
+                    compare_size,
+                    tp_snapshot.key,
+                    config_.cosine_threshold);
+                result.combined_cosine =
+                    result.combined_result.cosine_similarity;
                 result.combined_elements = compare_size;
-                result.combined_passed = (result.combined_cosine >= config_.cosine_threshold);
+                result.combined_passed =
+                    combined_size == pytorch_data.size() &&
+                    result.combined_result.passed;
+                result.combined_result.passed = result.combined_passed;
 
                 LOG_DEBUG("[TP Parity] Combined: size=" << combined_size
                                                         << " pytorch_size=" << pytorch_data.size()
@@ -3166,21 +4663,12 @@ namespace llaminar2::test::parity
             DeviceManager::instance().initialize(-1);
 
             // Load model with MPI context and weight strategy
-            model_ctx_ = ModelContext::create(
-                config_.model_path,
-                mpi_ctx_,           // nullptr for single-rank
-                nullptr,            // placement_map
-                nullptr,            // factory
-                getWeightStrategy() // REPLICATED or SHARDED
-            );
+            model_ctx_ = acquireParityModelContext(getWeightStrategy());
             if (!model_ctx_)
             {
                 LOG_ERROR("[Parity] Failed to load model");
                 return false;
             }
-
-            // Allow subclasses to configure model (e.g., weight sharding schema)
-            configureModel(model_ctx_);
 
             InferenceRunnerConfig inf_config;
             inf_config.max_seq_len = 4096;
@@ -3241,11 +4729,7 @@ namespace llaminar2::test::parity
 
             // Load model with REPLICATED strategy (each stage needs full model access
             // for weight lookup - layer partitioning happens at runtime)
-            model_ctx_ = ModelContext::create(
-                config_.model_path,
-                mpi_ctx_,
-                nullptr,
-                nullptr,
+            model_ctx_ = acquireParityModelContext(
                 WeightDistributionStrategy::REPLICATED);
 
             if (!model_ctx_)
@@ -3410,6 +4894,21 @@ namespace llaminar2::test::parity
         // =========================================================================
 
         /**
+         * @brief Diagnostic graph policy applied after production runner setup.
+         *
+         * Most parity fixtures need checkpoint publication immediately. A
+         * production-path performance phase can instead initialize with the
+         * ordinary graph topology and enable diagnostic nodes only when it
+         * reaches the later numerical-comparison phase. Encoding that choice
+         * as a scoped policy keeps callers from relying on a positional bool.
+         */
+        enum class ParitySnapshotSetupMode
+        {
+            Enabled,
+            Disabled,
+        };
+
+        /**
          * @brief Setup an OrchestrationRunner for parity testing
          *
          * This is the modern alternative to setupPipeline(). Creates an
@@ -3421,18 +4920,43 @@ namespace llaminar2::test::parity
          * - Supports all orchestration features (PP, LOCAL TP, etc.)
          *
          * @param orch_config Pre-configured OrchestrationConfig
+         * @param preloaded_model_context Optional retained immutable model and
+         *        prepared-weight authority; the production runner validates it
+         *        against the newly built plan before graph construction
+         * @param snapshot_mode Whether diagnostic checkpoint nodes are enabled
+         *        immediately after initialization.
          * @return true on success, false on failure
          *
          * @note Call this OR setupPipeline(), not both. The active runner is
          *       whichever was last set up successfully.
          */
-        bool setupOrchestrationRunner(const OrchestrationConfig &orch_config)
+        bool setupOrchestrationRunner(
+            const OrchestrationConfig &orch_config,
+            std::shared_ptr<ModelContext> preloaded_model_context = nullptr,
+            ParitySnapshotSetupMode snapshot_mode =
+                ParitySnapshotSetupMode::Enabled)
         {
-            // Clear any existing runner
+            // Install one runner/model authority.  A stale legacy context must
+            // never shadow the model owned by the modern production runner.
+            runner_.reset();
+            borrowed_runner_ = nullptr;
+            model_ctx_.reset();
             orch_runner_.reset();
+            orchestration_parity_decode_trajectory_.clear();
+            orchestration_parity_decode_trajectory_index_ = 0;
+            orchestration_parity_forced_decode_armed_ = false;
 
             // Create runner via TestOrchestrationHelper
-            orch_runner_ = test::TestOrchestrationHelper::create(orch_config);
+            if (preloaded_model_context)
+            {
+                orch_runner_ = test::TestOrchestrationHelper::create(
+                    orch_config,
+                    std::move(preloaded_model_context));
+            }
+            else
+            {
+                orch_runner_ = test::TestOrchestrationHelper::create(orch_config);
+            }
             if (!orch_runner_)
             {
                 LOG_ERROR("[Parity] Failed to create OrchestrationRunner");
@@ -3447,8 +4971,11 @@ namespace llaminar2::test::parity
                 return false;
             }
 
-            // Enable snapshot capture for parity testing
-            orch_runner_->enableSnapshotCapture();
+            if (snapshot_mode == ParitySnapshotSetupMode::Enabled)
+            {
+                // Diagnostic parity phases compare these graph-published nodes.
+                orch_runner_->enableSnapshotCapture();
+            }
 
             if (isRank0())
             {
@@ -3810,6 +5337,9 @@ namespace llaminar2::test::parity
          */
         void activeClearCache()
         {
+            orchestration_parity_decode_trajectory_.clear();
+            orchestration_parity_decode_trajectory_index_ = 0;
+            orchestration_parity_forced_decode_armed_ = false;
             if (orch_runner_)
             {
                 orch_runner_->clearCache();
@@ -3873,11 +5403,241 @@ namespace llaminar2::test::parity
             return ExecutionPath::GRAPH;
         }
 
+        /**
+         * @brief Return whether this test is the fused live-production gate.
+         *
+         * The environment bit is attached only to `ProductionParity` CTest
+         * registrations.  Legacy focused tests retain their existing isolation
+         * and diagnostics while the campaign gate enforces graph contracts and
+         * reports timing in addition to the same numerical comparisons.
+         */
+        bool productionParityCampaignEnabled() const
+        {
+            return production_parity_campaign_active_ ||
+                   DebugEnv::isTruthyEnv("LLAMINAR_PRODUCTION_PARITY");
+        }
+
+        /**
+         * @brief Resolve the soft whole-matrix wall-time target for reporting.
+         *
+         * Invalid, non-finite, and non-positive overrides are fatal test
+         * configuration errors rather than reasons to omit economy evidence.
+         */
+        double productionParityTargetSeconds() const
+        {
+            return productionParityTargetSecondsFromEnvironment();
+        }
+
+        /**
+         * @brief Return whether every configured participant is the same GPU type.
+         *
+         * Homogeneous GPU cells must execute a certified backend-native
+         * generation policy. CUDA owns one conditional parent; ROCm owns the
+         * authenticated ticket-selected captured-transaction protocol.
+         * Heterogeneous cells may expose explicit graph/collective segmentation.
+         */
+        bool productionParityUsesHomogeneousGPU() const
+        {
+            const auto &devices = cfg().devices;
+            if (devices.empty() || devices.front() == ParityDeviceType::CPU)
+                return false;
+            return std::all_of(
+                devices.begin(),
+                devices.end(),
+                [first = devices.front()](ParityDeviceType device)
+                {
+                    return device == first;
+                });
+        }
+
+        static bool productionParityHasCounter(
+            const std::vector<PerfStatRecord> &records,
+            const std::string &name)
+        {
+            return parityForwardGraphHasCounter(records, name);
+        }
+
+        static bool productionParityHasDecodeGraphPhase(
+            const std::vector<PerfStatRecord> &records,
+            const std::string &capture_phase)
+        {
+            return parityForwardGraphHasDecodePhase(records, capture_phase);
+        }
+
+        /**
+         * @brief Reset request-scoped structured evidence before campaign replay.
+         */
+        void beginProductionParityEvidence()
+        {
+            production_parity_campaign_active_ = true;
+            PerfStatsCollector::reset();
+        }
+
+        /**
+         * @brief Assert that the already-executed prefill published useful slots.
+         *
+         * The full layer comparison remains authoritative.  These checks retain
+         * the old `SnapshotInfrastructure` test's independent contract without a
+         * third model construction and third forward pass.
+         */
+        void assertProductionParitySnapshotInfrastructure()
+        {
+            const auto reference_embedding = loadPyTorchSnapshot("EMBEDDING");
+            EXPECT_FALSE(reference_embedding.empty())
+                << "Failed to load the reference EMBEDDING snapshot";
+
+            const auto keys = activeSnapshotKeys();
+            EXPECT_FALSE(keys.empty()) << "Production forward published no snapshots";
+            if (keys.empty())
+                return;
+
+            const auto has_key = [&keys](const std::string &key)
+            {
+                return std::find(keys.begin(), keys.end(), key) != keys.end();
+            };
+            const bool multi_rank = mpi_ctx_ && mpiWorldSize() > 1;
+            if (!multi_rank)
+            {
+                EXPECT_TRUE(has_key("EMBEDDING")) << "Missing EMBEDDING snapshot";
+                EXPECT_TRUE(has_key("LM_HEAD")) << "Missing LM_HEAD snapshot";
+            }
+
+            EXPECT_TRUE(std::any_of(
+                keys.begin(),
+                keys.end(),
+                [](const std::string &key)
+                {
+                    return key.rfind("layer", 0) == 0;
+                }))
+                << "Production forward published no per-layer snapshot";
+            EXPECT_TRUE(std::any_of(
+                keys.begin(),
+                keys.end(),
+                [](const std::string &key)
+                {
+                    return key.find("FFN_RESIDUAL") != std::string::npos;
+                }))
+                << "Production forward published no FFN_RESIDUAL snapshot";
+        }
+
+        /**
+         * @brief Export graph-path and economy evidence for a campaign.
+         */
+        void finishProductionParityEvidence()
+        {
+            if (!productionParityCampaignEnabled())
+                return;
+
+            const auto records =
+                PerfStatsCollector::snapshot({"forward_graph", "mtp"});
+            const ProductionParityEvidence evidence =
+                collectProductionParityEvidence(
+                    records,
+                    activeExecutionPath() == ExecutionPath::GRAPH,
+                    productionParityUsesHomogeneousGPU(),
+                    production_parity_model_context_reused_,
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now() -
+                        parity_fixture_started_at_)
+                        .count());
+
+            EXPECT_TRUE(evidence.graph_execution)
+                << "Production parity must execute the declarative graph path";
+            if (evidence.homogeneous_gpu)
+            {
+                ASSERT_TRUE(PerfStatsCollector::isEnabled())
+                    << "Homogeneous GPU production parity requires PerfStats graph evidence";
+                EXPECT_TRUE(productionParityHasRequiredGenerationGraph(evidence))
+                    << "Homogeneous GPU parity did not capture/replay the graph body required by policy '"
+                    << productionDeviceGenerationPolicyName(
+                           evidence.generation_execution_policy)
+                    << "'.\n"
+                    << PerfStatsCollector::summaryString({"forward_graph", "mtp"});
+                if (evidence.device_generation_controller)
+                {
+                    EXPECT_TRUE(evidence.generation_loop_certified)
+                        << "Homogeneous GPU MTP parity used outer-loop policy '"
+                        << productionDeviceGenerationPolicyName(
+                               evidence.generation_execution_policy)
+                        << "' without satisfying its backend-specific authority and dispatch proof.\n"
+                        << "Certification detail: "
+                        << evidence.generation_certification_detail << "\n"
+                        << PerfStatsCollector::summaryString(
+                               {"forward_graph", "mtp"});
+                }
+                EXPECT_TRUE(evidence.decode_graph_capture || evidence.decode_graph_replay)
+                    << "Homogeneous GPU decode produced no native graph capture/replay evidence.\n"
+                    << PerfStatsCollector::summaryString({"forward_graph"});
+                EXPECT_FALSE(evidence.segmented_plan)
+                    << "Homogeneous GPU parity planned segmented execution.\n"
+                    << PerfStatsCollector::summaryString({"forward_graph"});
+                EXPECT_FALSE(evidence.segmented_capture)
+                    << "Homogeneous GPU parity captured segmented execution.\n"
+                    << PerfStatsCollector::summaryString({"forward_graph"});
+                EXPECT_FALSE(evidence.segmented_replay)
+                    << "Homogeneous GPU parity replayed segmented execution.\n"
+                    << PerfStatsCollector::summaryString({"forward_graph"});
+            }
+            else if (evidence.segmented_plan)
+            {
+                ASSERT_TRUE(PerfStatsCollector::isEnabled())
+                    << "Heterogeneous segmented production parity requires PerfStats evidence";
+                EXPECT_TRUE(evidence.segmented_capture)
+                    << "Heterogeneous parity planned segments but captured no segmented executable.\n"
+                    << PerfStatsCollector::summaryString({"forward_graph"});
+                EXPECT_TRUE(evidence.decode_graph_capture)
+                    << "Heterogeneous decode produced no segmented graph capture phase.\n"
+                    << PerfStatsCollector::summaryString({"forward_graph"});
+                EXPECT_TRUE(evidence.decode_graph_replay)
+                    << "Heterogeneous decode never reached steady graph replay. Repeated capture "
+                       "does not certify the production hot path.\n"
+                    << PerfStatsCollector::summaryString({"forward_graph"});
+                EXPECT_TRUE(evidence.segmented_replay)
+                    << "Heterogeneous decode published no segmented replay launches.\n"
+                    << PerfStatsCollector::summaryString({"forward_graph"});
+            }
+
+            if (isRank0())
+            {
+                EXPECT_TRUE(ParityCSVArtifactWriter::writeProductionPath(
+                    ensureResultsDir(),
+                    getBackendName(),
+                    activePrimaryDevice().toString(),
+                    evidence))
+                    << "Cannot write production_path.csv";
+            }
+
+            // The one-hour requirement is measured across the aggregate matrix,
+            // including fixture and RAM staging. A cell may finish after that
+            // point and must still publish complete numerical diagnostics; the
+            // aggregate driver reports the performance miss after all cells run.
+        }
+
         virtual ParityGraphSnapshotPolicy parityGraphSnapshotPolicy(
             ParityForwardPhase phase) const
         {
             (void)phase;
-            return config_.graph_snapshot_policy;
+            auto policy = config_.graph_snapshot_policy;
+            if (productionParityCampaignEnabled())
+            {
+                policy.enabled = true;
+                policy.require_graph_execution_on_gpu = true;
+                policy.require_snapshot_publication = true;
+                policy.require_prefill_graph_capture_on_gpu = true;
+                policy.retry_prefill_after_warmup_for_capture = true;
+            }
+            return policy;
+        }
+
+        /**
+         * @brief Whether this campaign consumes prefill reference tensors.
+         *
+         * Decode-only long-context corpora may intentionally retain only the
+         * incremental checkpoints after an authenticated cached prefill.
+         */
+        virtual bool productionParityRequiresPrefillSnapshots() const
+        {
+            return true;
         }
 
         std::vector<int> makeBoundedPrefillTokens(
@@ -3909,6 +5669,14 @@ namespace llaminar2::test::parity
             {
                 if (phase == ParityForwardPhase::Prefill)
                 {
+                    orchestration_parity_decode_trajectory_.clear();
+                    orchestration_parity_decode_trajectory_index_ = 0;
+                    orchestration_parity_forced_decode_armed_ = false;
+                    for (const int token : readDecodeTokensFromMetadata())
+                    {
+                        orchestration_parity_decode_trajectory_.push_back(
+                            static_cast<int32_t>(token));
+                    }
                     std::vector<int32_t> input;
                     input.reserve(static_cast<size_t>(std::max(token_count, 0)));
                     for (int i = 0; i < token_count; ++i)
@@ -3922,9 +5690,92 @@ namespace llaminar2::test::parity
                     return true;
                 }
 
-                LOG_ERROR("[Parity] OrchestrationRunner decode parity execution "
-                          "requires a test-specific executeActiveParityForward() override");
-                return false;
+                if (!tokens || token_count != 1)
+                {
+                    LOG_ERROR("[Parity] OrchestrationRunner scalar decode parity "
+                              "requires exactly one authenticated reference token");
+                    return false;
+                }
+
+                const int32_t reference_token =
+                    static_cast<int32_t>(tokens[0]);
+                const size_t trajectory_index =
+                    orchestration_parity_decode_trajectory_index_;
+                if (trajectory_index >=
+                    orchestration_parity_decode_trajectory_.size())
+                {
+                    LOG_ERROR(
+                        "[Parity] Authenticated production decode trajectory "
+                        "ended before requested step "
+                        << trajectory_index);
+                    return false;
+                }
+                if (orchestration_parity_decode_trajectory_[trajectory_index] !=
+                    reference_token)
+                {
+                    ADD_FAILURE()
+                        << "Production parity requested reference token "
+                        << reference_token << " at trajectory step "
+                        << trajectory_index << " but authenticated metadata "
+                        << "contains "
+                        << orchestration_parity_decode_trajectory_[trajectory_index];
+                    return false;
+                }
+
+                if (!orchestration_parity_forced_decode_armed_)
+                {
+                    /*
+                     * Replace the ready prefill sample without forwarding the
+                     * prompt tail. This is the same request-level constrained
+                     * continuation transaction used by production chat policy.
+                     */
+                    GenerationResult armed =
+                        orch_runner_->forceDecodeToken(reference_token);
+                    if (!armed.success() || armed.tokens.size() != 1 ||
+                        armed.tokens.front() != reference_token)
+                    {
+                        LOG_ERROR(
+                            "[Parity] OrchestrationRunner could not arm the "
+                            "prefill-boundary reference token: "
+                            << armed.error);
+                        return false;
+                    }
+                    orchestration_parity_forced_decode_armed_ = true;
+                }
+
+                const size_t successor_index = trajectory_index + 1;
+                if (successor_index >=
+                    orchestration_parity_decode_trajectory_.size())
+                {
+                    LOG_ERROR(
+                        "[Parity] Authenticated production decode trajectory "
+                        "requires one successor token to forward step "
+                        << trajectory_index);
+                    return false;
+                }
+
+                const int32_t successor_token =
+                    orchestration_parity_decode_trajectory_[successor_index];
+                GenerationResult forwarded =
+                    orch_runner_->forceDecodeToken(successor_token);
+                if (!forwarded.success() || forwarded.tokens.size() != 1)
+                {
+                    LOG_ERROR(
+                        "[Parity] OrchestrationRunner teacher-forced decode "
+                        "transaction failed: "
+                        << forwarded.error);
+                    return false;
+                }
+                if (forwarded.tokens.front() != successor_token)
+                {
+                    LOG_ERROR(
+                        "[Parity] OrchestrationRunner returned a different "
+                        "forced successor token");
+                    return false;
+                }
+                orchestration_parity_decode_trajectory_index_ =
+                    successor_index;
+                return true;
             }
 
             if (auto *runner = activeLegacyRunner())
@@ -4086,13 +5937,13 @@ namespace llaminar2::test::parity
                 parityGraphSnapshotPolicy(phase));
         }
 
-        bool activeUsesDeviceSideMoERebalanceController() const
+        bool activeUsesProductionOverlayAuthority() const
         {
-            if (orch_runner_)
-                return orch_runner_->usesDeviceSideMoERebalanceController();
-            if (auto *runner = activeLegacyRunner())
-                return runner->usesDeviceSideMoERebalanceController();
-            return false;
+            if (!orch_runner_)
+                return false;
+            const auto &plan =
+                orch_runner_->config().moe_routed_expert_plan;
+            return plan && plan->usesExpertOverlayAuthority();
         }
 
         uint64_t activeMoEPlacementEpoch() const
@@ -4135,11 +5986,9 @@ namespace llaminar2::test::parity
         /**
          * @brief Decide whether a committed decode step must enter maintenance.
          *
-         * A device-owned controller uses this hook as a scheduler tick, so
-         * every committed decode transaction must call it and let the captured
-         * scheduler enforce its own launch period. Legacy host controllers
-         * retain the explicit test cadence because their hook performs the
-         * planning/apply operation directly.
+         * The ExpertOverlay hook is wake-only and never performs movement on
+         * the inference thread. Tests retain an explicit cadence to bound
+         * diagnostic work while exercising the same production authority.
          *
          * @param completed_decode_steps One-based count of committed decode
          *        transactions in the parity request.
@@ -4154,8 +6003,6 @@ namespace llaminar2::test::parity
             {
                 return false;
             }
-            if (activeUsesDeviceSideMoERebalanceController())
-                return true;
             return
                 (completed_decode_steps %
                  static_cast<size_t>(
@@ -4170,61 +6017,14 @@ namespace llaminar2::test::parity
             if (!exercise.enabled)
                 return true;
 
-            const bool device_side = activeUsesDeviceSideMoERebalanceController();
-            if (exercise.require_device_side_controller && !device_side)
+            const bool production_overlay =
+                activeUsesProductionOverlayAuthority();
+            if (exercise.require_production_overlay_authority &&
+                !production_overlay)
             {
-                ADD_FAILURE() << "Parity MoE rebalance exercise requires a device-side controller"
+                ADD_FAILURE() << "Parity MoE rebalance exercise requires the production ExpertOverlay authority"
                               << " during " << phase
                               << (decode_step >= 0 ? (" step " + std::to_string(decode_step)) : "");
-                return false;
-            }
-
-            if (device_side)
-            {
-                /*
-                 * Histogram collection and publication are graph-owned, but
-                 * scheduling begins at the committed transaction boundary.
-                 * Raw forward cannot invoke this early because grouped MTP may
-                 * still reject or roll back verifier rows. Enter the same
-                 * boundary used by serving and generation after parity has
-                 * committed this decode step.
-                 */
-                if (orch_runner_)
-                {
-                    if (!orch_runner_->maybeApplyMoERebalance())
-                    {
-                        ADD_FAILURE()
-                            << "Parity device-owned MoE maintenance failed during "
-                            << phase
-                            << (decode_step >= 0
-                                    ? (" step " + std::to_string(decode_step))
-                                    : "")
-                            << ": " << orch_runner_->lastError();
-                        return false;
-                    }
-                    return true;
-                }
-                if (auto *runner = activeLegacyRunner())
-                {
-                    if (!runner->maybeApplyDecodeBoundaryMaintenance())
-                    {
-                        ADD_FAILURE()
-                            << "Parity device-owned MoE maintenance failed during "
-                            << phase
-                            << (decode_step >= 0
-                                    ? (" step " + std::to_string(decode_step))
-                                    : "");
-                        return false;
-                    }
-                    return true;
-                }
-
-                ADD_FAILURE()
-                    << "Parity device-owned MoE maintenance has no active runner during "
-                    << phase
-                    << (decode_step >= 0
-                            ? (" step " + std::to_string(decode_step))
-                            : "");
                 return false;
             }
 
@@ -4241,9 +6041,9 @@ namespace llaminar2::test::parity
                 return true;
             }
 
-            ADD_FAILURE() << "Parity MoE rebalance exercise requested during " << phase
+            ADD_FAILURE() << "Parity ExpertOverlay maintenance requested during " << phase
                           << (decode_step >= 0 ? (" step " + std::to_string(decode_step)) : "")
-                          << ", but the active legacy runner does not expose a host rebalance apply hook";
+                          << ", but the test did not construct the production orchestration runner";
             return false;
         }
 
@@ -4435,11 +6235,11 @@ namespace llaminar2::test::parity
         {
             ParityTestSummary summary;
 
-            // Require runner_ to be already set up
-            if (!activeLegacyRunner())
+            // Require either production runner family to be already set up.
+            if (!orch_runner_ && !activeLegacyRunner())
             {
-                LOG_ERROR("[Parity] runPrefillParity() called but runner_ is null - "
-                          "ensure setupPipeline() or setupLocalPPPipeline() was called first");
+                LOG_ERROR("[Parity] runPrefillParity() has no active runner - "
+                          "ensure setupPipeline() or setupOrchestrationRunner() was called first");
                 return summary;
             }
 
@@ -4457,6 +6257,19 @@ namespace llaminar2::test::parity
             {
                 return summary;
             }
+
+            /*
+             * A segmented captured prefill is numerically meaningful only if
+             * every sequence-shaped checkpoint has been reconstructed to the
+             * authenticated prompt width. Comparing a final short chunk against
+             * a full Hugging Face tensor through min(size) would hide exactly
+             * the broken aggregation this production campaign is intended to
+             * expose. Ordinary exact-bucket and decode paths retain their
+             * historical shape flexibility.
+             */
+            const auto prefill_probe = activePrefixStateProbe();
+            const bool require_complete_segmented_prefill_snapshots =
+                prefill_probe.prefill_chunk_successful_schedules > 0;
 
             int n_layers = parityLayerCount();
 
@@ -4513,6 +6326,14 @@ namespace llaminar2::test::parity
 
                 if (llaminar_data && !pytorch_embedding.empty())
                 {
+                    if (require_complete_segmented_prefill_snapshots)
+                    {
+                        EXPECT_EQ(llaminar_size, pytorch_embedding.size())
+                            << "Segmented prefill EMBEDDING checkpoint must "
+                               "contain every authenticated prompt row";
+                        if (llaminar_size != pytorch_embedding.size())
+                            return summary;
+                    }
                     summary.embedding_cosine = computeCosineSimilarity(
                         llaminar_data, pytorch_embedding.data(),
                         std::min(llaminar_size, pytorch_embedding.size()));
@@ -4566,7 +6387,7 @@ namespace llaminar2::test::parity
                     const auto snapshot_selection = selectParitySnapshot(
                         semantic_key,
                         stage_requires_reduction,
-                        config_.uses_in_process_local_tp);
+                        config_.collective_evidence_source);
                     const std::string &llaminar_key = snapshot_selection.key;
                     const bool requires_cross_rank_sum =
                         snapshot_selection.reduction ==
@@ -4577,7 +6398,7 @@ namespace llaminar2::test::parity
                         snapshot_selection.requires_post_collective_key)
                     {
                         ADD_FAILURE()
-                            << "LocalTP parity requires live post-collective snapshot '"
+                            << "Parity requires live post-collective snapshot '"
                             << llaminar_key << "' for semantic stage '" << semantic_key
                             << "'. The pre-collective partial is not a valid fallback.";
                         continue;
@@ -4603,6 +6424,19 @@ namespace llaminar2::test::parity
                     const float *llaminar_data = activeSnapshot(llaminar_key, llaminar_size);
                     if (!llaminar_data)
                         continue;
+
+                    if (require_complete_segmented_prefill_snapshots &&
+                        llaminar_size != pytorch_data.size())
+                    {
+                        ADD_FAILURE()
+                            << "Segmented prefill checkpoint '" << semantic_key
+                            << "' has " << llaminar_size << " elements, but "
+                            << "the Hugging Face reference has "
+                            << pytorch_data.size()
+                            << ". A final chunk is not a valid replacement "
+                               "for the complete prompt checkpoint.";
+                        continue;
+                    }
 
                     // Apply GDN V-head permutation if needed (Llaminar ratio-grouped → PyTorch interleaved)
                     auto permuted = applyGDNHeadPermutation(llaminar_data, llaminar_size, stage, gdn_cfg);
@@ -4665,7 +6499,7 @@ namespace llaminar2::test::parity
                     {
                         LOG_INFO("[Parity] Layer " << layer_idx << " " << stage
                                                    << (snapshot_selection.requires_post_collective_key
-                                                           ? " (LocalTP post-collective)"
+                                                           ? " (production post-collective)"
                                                            : (did_allreduce
                                                                   ? " (cross-rank summed)"
                                                                   : ""))
@@ -4677,8 +6511,19 @@ namespace llaminar2::test::parity
                     if (stage == "ATTENTION_CONTEXT" && layer_idx == 0)
                     {
                         size_t compare_size = std::min(llaminar_size, pytorch_data.size());
-                        size_t head_dim_val = model_ctx_->model().key_length > 0 ? model_ctx_->model().key_length : (model_ctx_->model().embedding_length / model_ctx_->model().head_count);
-                        size_t n_cols = model_ctx_->model().head_count * head_dim_val;
+                        const ModelContext *model_ctx =
+                            activeModelContextForDiagnostics();
+                        if (!model_ctx)
+                        {
+                            ADD_FAILURE()
+                                << "ATTENTION_CONTEXT diagnostics require active model metadata";
+                            continue;
+                        }
+                        size_t head_dim_val = model_ctx->model().key_length > 0
+                                                  ? model_ctx->model().key_length
+                                                  : (model_ctx->model().embedding_length /
+                                                     model_ctx->model().head_count);
+                        size_t n_cols = model_ctx->model().head_count * head_dim_val;
                         size_t n_rows = compare_size / n_cols;
                         std::stringstream row_cosines;
                         float max_abs_diff = 0.0f;
@@ -4768,7 +6613,8 @@ namespace llaminar2::test::parity
                 const float *llaminar_data = activeSnapshot("LM_HEAD", llaminar_size);
                 if (llaminar_data)
                 {
-                    size_t vocab_size = model_ctx_->model().vocab_size;
+                    size_t vocab_size =
+                        static_cast<size_t>(getActiveVocabSize());
                     size_t llaminar_seq_len = llaminar_size / vocab_size;
                     size_t pytorch_seq_len = pytorch_lm_head.size() / vocab_size;
 
@@ -4909,31 +6755,26 @@ namespace llaminar2::test::parity
             size_t seq_len = config_.token_ids.size();
             size_t d_model = model_ctx_->model().embedding_length;
             size_t n_heads = model_ctx_->headCount();
-            size_t d_ff = model_ctx_->feedForwardLength();
             size_t vocab_size = model_ctx_->model().vocab_size;
 
-            // Stages to compare per layer with their expected dimensions
-            struct StageInfo
-            {
-                std::string name;
-                size_t cols; // Expected columns (may be sharded)
-            };
-            size_t n_kv_heads = model_ctx_->headCountKV();
             size_t head_dim = d_model / n_heads;
-            size_t kv_dim = n_kv_heads * head_dim;
-            std::vector<StageInfo> per_layer_stages = {
-                {"ATTENTION_NORM", d_model},
-                {"Q_PROJECTION", d_model},      // DIAGNOSTIC: check QKV GEMM output
-                {"K_PROJECTION", kv_dim},       // DIAGNOSTIC: check K projection
-                {"V_PROJECTION", kv_dim},       // DIAGNOSTIC: check V projection
-                {"Q_ROPE", d_model},            // DIAGNOSTIC: check RoPE output
-                {"K_ROPE", kv_dim},             // DIAGNOSTIC: check K RoPE output
-                {"ATTENTION_CONTEXT", d_model}, // num_heads * head_dim = d_model
-                {"ATTENTION_OUTPUT", d_model},
-                {"FFN_NORM", d_model},
-                {"FFN_SWIGLU", d_ff},
-                {"FFN_DOWN", d_model},
-                {"FFN_RESIDUAL", d_model}};
+            // The authenticated tensor cardinality below owns each stage's
+            // width. A copied dimension table cannot represent model-specific
+            // fused gates or other widened projections without silently
+            // truncating their comparison.
+            std::vector<std::string> per_layer_stages = {
+                "ATTENTION_NORM",
+                "Q_PROJECTION", // DIAGNOSTIC: check QKV GEMM output
+                "K_PROJECTION", // DIAGNOSTIC: check K projection
+                "V_PROJECTION", // DIAGNOSTIC: check V projection
+                "Q_ROPE",       // DIAGNOSTIC: check RoPE output
+                "K_ROPE",       // DIAGNOSTIC: check K RoPE output
+                "ATTENTION_CONTEXT",
+                "ATTENTION_OUTPUT",
+                "FFN_NORM",
+                "FFN_SWIGLU",
+                "FFN_DOWN",
+                "FFN_RESIDUAL"};
 
             // Get snapshot keys
             auto snapshot_keys = activeSnapshotKeys();
@@ -4953,8 +6794,10 @@ namespace llaminar2::test::parity
             if (available_snapshots.count("EMBEDDING") && !pytorch_embedding.empty())
             {
                 TPSnapshot tp_snap = multi_device->getTPSnapshot("EMBEDDING");
+                const size_t embedding_cols = parityTPReferenceColumnCount(
+                    pytorch_embedding.size(), seq_len);
                 summary.embedding_result = compareTPSnapshot(
-                    tp_snap, pytorch_embedding, seq_len, d_model);
+                    tp_snap, pytorch_embedding, seq_len, embedding_cols);
             }
 
             // Compare each layer
@@ -4966,9 +6809,9 @@ namespace llaminar2::test::parity
 
                 float sum_combined_cosine = 0.0f;
 
-                for (const auto &stage_info : per_layer_stages)
+                for (const auto &stage_name : per_layer_stages)
                 {
-                    std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage_info.name;
+                    std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage_name;
                     std::string pytorch_key = llaminar_key;
 
                     if (!available_snapshots.count(llaminar_key))
@@ -4979,8 +6822,15 @@ namespace llaminar2::test::parity
                         continue;
 
                     TPSnapshot tp_snap = multi_device->getTPSnapshot(llaminar_key);
+                    const size_t reference_cols = parityTPReferenceColumnCount(
+                        pytorch_data.size(), seq_len);
                     auto stage_result = compareTPSnapshot(
-                        tp_snap, pytorch_data, seq_len, stage_info.cols);
+                        tp_snap, pytorch_data, seq_len, reference_cols);
+                    // The TP snapshot key carries its layer prefix for lookup;
+                    // canonical CSV rows already have a layer column and use
+                    // the semantic stage name shared by every other topology.
+                    stage_result.stage_name = stage_name;
+                    stage_result.combined_result.stage_name = stage_name;
 
                     layer_stats.stage_results.push_back(stage_result);
                     layer_stats.stages_compared++;
@@ -4989,7 +6839,7 @@ namespace llaminar2::test::parity
                     if (stage_result.combined_cosine < layer_stats.min_combined_cosine)
                     {
                         layer_stats.min_combined_cosine = stage_result.combined_cosine;
-                        layer_stats.worst_stage = stage_info.name;
+                        layer_stats.worst_stage = stage_name;
                     }
                 }
 
@@ -5364,6 +7214,7 @@ namespace llaminar2::test::parity
                 // Compare with PyTorch
                 DecodeStepStats step_stats;
                 step_stats.step_idx = static_cast<int>(step);
+                step_stats.has_logit_data = true;
 
                 step_stats.cosine_similarity = computeCosineSimilarity(
                     llaminar_logits, pytorch_logits,
@@ -5501,6 +7352,95 @@ namespace llaminar2::test::parity
                 EXPECT_TRUE(summary.lm_head_pytorch_top1_in_top3)
                     << "PyTorch's top-1 token must appear in llaminar's top-" << config_.pytorch_top1_in_topk << " for LM_HEAD";
             }
+
+            exportTPPrefillCSV(summary);
+        }
+
+        /**
+         * @brief Publish shard-aware LocalTP prefill evidence in the canonical CSV schemas.
+         *
+         * LocalTP compares both every participant shard and the reconstructed
+         * semantic tensor.  The canonical parity artifacts describe that
+         * reconstructed tensor, while the assertions above retain the
+         * participant-level proof.  Converting here keeps one serialization
+         * authority for single-device, PP, and TP campaigns and preserves the
+         * full distribution/error diagnostics computed for each combined TP
+         * checkpoint.
+         *
+         * @param summary Shard-aware numerical result produced by the live
+         *                production RankOrchestrator.
+         */
+        void exportTPPrefillCSV(const TPParityTestSummary &summary)
+        {
+            if (!isRank0())
+                return;
+
+            ParityTestSummary canonical;
+            canonical.embedding_cosine =
+                summary.embedding_result.combined_result.cosine_similarity;
+            canonical.embedding_passed =
+                summary.embedding_result.combined_passed;
+            canonical.lm_head_cosine = summary.lm_head_cosine;
+            canonical.lm_head_kl = summary.lm_head_kl;
+            canonical.lm_head_top1 = summary.lm_head_top1;
+            canonical.lm_head_top5 = summary.lm_head_top5;
+            canonical.lm_head_pytorch_top1_in_top3 =
+                summary.lm_head_pytorch_top1_in_top3;
+            canonical.lm_head_passed = summary.lm_head_passed;
+            canonical.early_layers_passed = summary.early_layers_passed;
+            canonical.total_layers_passed = summary.total_layers_passed;
+            canonical.overall_passed = summary.overall_passed;
+
+            canonical.layer_stats.reserve(summary.layer_stats.size());
+            for (const auto &tp_layer : summary.layer_stats)
+            {
+                LayerStats layer;
+                layer.layer_idx = tp_layer.layer_idx;
+                layer.min_cosine_sim = 1.0f;
+                float previous_cosine = 1.0f;
+                float cosine_sum = 0.0f;
+
+                for (const auto &tp_stage : tp_layer.stage_results)
+                {
+                    StageComparisonResult stage = tp_stage.combined_result;
+                    stage.stage_name = tp_stage.stage_name;
+                    stage.cosine_drop = std::max(
+                        0.0f,
+                        previous_cosine - stage.cosine_similarity);
+                    previous_cosine = stage.cosine_similarity;
+
+                    cosine_sum += stage.cosine_similarity;
+                    ++layer.stages_compared;
+                    if (stage.cosine_similarity < layer.min_cosine_sim)
+                    {
+                        layer.min_cosine_sim = stage.cosine_similarity;
+                        layer.worst_stage = stage.stage_name;
+                    }
+                    if (stage.cosine_drop > layer.max_cosine_drop)
+                    {
+                        layer.max_cosine_drop = stage.cosine_drop;
+                        layer.max_drop_stage = stage.stage_name;
+                    }
+                    if (stage.llaminar_stats.kurtosis > layer.max_kurtosis)
+                    {
+                        layer.max_kurtosis = stage.llaminar_stats.kurtosis;
+                        layer.max_kurtosis_stage = stage.stage_name;
+                    }
+                    layer.stage_results.push_back(std::move(stage));
+                }
+
+                if (layer.stages_compared > 0)
+                {
+                    layer.avg_cosine_sim =
+                        cosine_sum / static_cast<float>(layer.stages_compared);
+                }
+                layer.passed = tp_layer.passed;
+                canonical.layer_stats.push_back(std::move(layer));
+            }
+
+            EXPECT_TRUE(ParityCSVArtifactWriter::writePrefill(
+                ensureResultsDir(), getBackendName(), canonical))
+                << "Cannot write one or more LocalTP prefill parity CSV artifacts";
         }
 
         /**
@@ -5538,13 +7478,22 @@ namespace llaminar2::test::parity
                 {
                     return stats.stages_compared > 0;
                 });
+            const bool has_early_layer_comparisons = std::any_of(
+                summary.layer_stats.begin(),
+                summary.layer_stats.end(),
+                [this](const LayerStats &stats)
+                {
+                    return stats.layer_idx < config_.early_layers_count &&
+                           stats.stages_compared > 0;
+                });
             const bool has_early_layer_data =
-                has_layer_comparisons ||
+                has_early_layer_comparisons ||
                 summary.embedding_passed ||
                 summary.embedding_cosine > 0.0f;
             const bool multi_rank = mpi_ctx_ && mpiWorldSize() > 1;
 
-            if (!has_early_layer_data && !has_lm_head_data)
+            if (!has_layer_comparisons && !has_early_layer_data &&
+                !has_lm_head_data)
             {
                 ADD_FAILURE()
                     << "Prefill parity produced no comparable snapshots. "
@@ -5677,11 +7626,11 @@ namespace llaminar2::test::parity
                 return summary;
             }
 
-            // Require runner_ to be already set up
-            if (!activeLegacyRunner())
+            // Require either production runner family to be already set up.
+            if (!orch_runner_ && !activeLegacyRunner())
             {
-                LOG_ERROR("[Parity] runDecodeParity() called but runner_ is null - "
-                          "ensure setupPipeline() or setupLocalPPPipeline() was called first");
+                LOG_ERROR("[Parity] runDecodeParity() has no active runner - "
+                          "ensure setupPipeline() or setupOrchestrationRunner() was called first");
                 return summary;
             }
 
@@ -5701,7 +7650,8 @@ namespace llaminar2::test::parity
                 return summary;
             }
 
-            size_t vocab_size = model_ctx_->model().vocab_size;
+            size_t vocab_size =
+                static_cast<size_t>(getActiveVocabSize());
 
             // Process each decode step
             size_t num_decode_steps = std::min(pytorch_decode_tokens.size(),
@@ -5773,7 +7723,7 @@ namespace llaminar2::test::parity
                 }
 
                 // Get Llaminar's LM_HEAD output
-                size_t decode_logits_size;
+                size_t decode_logits_size = 0;
                 const float *llaminar_logits = nullptr;
                 {
                     auto scope = profileParityScope("decode_parity.step.lookup_lm_head");
@@ -5782,7 +7732,6 @@ namespace llaminar2::test::parity
                 if (!llaminar_logits)
                 {
                     LOG_WARN("No LM_HEAD snapshot for decode step " << step);
-                    continue;
                 }
 
                 // Python decode snapshots may contain the full sequence
@@ -5801,6 +7750,7 @@ namespace llaminar2::test::parity
                 // Compare with PyTorch
                 DecodeStepStats step_stats;
                 step_stats.step_idx = static_cast<int>(step);
+                step_stats.has_logit_data = llaminar_logits != nullptr;
 
                 // ---------------------------------------------------------------
                 // Per-layer cosine similarity comparison for this decode step
@@ -5849,7 +7799,7 @@ namespace llaminar2::test::parity
                             const auto snapshot_selection = selectParitySnapshot(
                                 semantic_key,
                                 stage_requires_reduction,
-                                config_.uses_in_process_local_tp);
+                                config_.collective_evidence_source);
                             const std::string &llaminar_key = snapshot_selection.key;
                             const bool requires_cross_rank_sum =
                                 snapshot_selection.reduction ==
@@ -5860,7 +7810,7 @@ namespace llaminar2::test::parity
                                 snapshot_selection.requires_post_collective_key)
                             {
                                 ADD_FAILURE()
-                                    << "LocalTP decode parity requires live post-collective snapshot '"
+                                    << "Decode parity requires live post-collective snapshot '"
                                     << llaminar_key << "' for semantic stage '"
                                     << semantic_key
                                     << "'. The pre-collective partial is not a valid fallback.";
@@ -5992,6 +7942,16 @@ namespace llaminar2::test::parity
 
                         step_stats.layer_stats.push_back(stats);
                     }
+                }
+
+                // A non-tail PP rank still owns mathematically relevant layer
+                // checkpoints even though it cannot publish LM-head logits.
+                // Preserve those rows for the rank-complete CSV merge, then
+                // leave aggregate logit metrics to the tail rank.
+                if (!step_stats.has_logit_data)
+                {
+                    summary.step_stats.push_back(std::move(step_stats));
+                    continue;
                 }
 
                 {
@@ -6339,13 +8299,20 @@ namespace llaminar2::test::parity
 
             // For cross-rank PP, only the tail rank has valid logits for decode comparison.
             // Detect by checking if any decode step actually produced metrics (not whether they're good).
-            const bool has_logit_data = !summary.step_stats.empty();
+            const bool has_logit_data = std::any_of(
+                summary.step_stats.begin(),
+                summary.step_stats.end(),
+                [](const DecodeStepStats &step)
+                {
+                    return step.has_logit_data;
+                });
 
             // Render table first (rank 0 only)
             if (isRank0())
             {
                 auto render_scope = profileParityScope("assert_decode.render_tables");
-                renderDecodeParityTable(summary, getBackendName());
+                if (has_logit_data)
+                    renderDecodeParityTable(summary, getBackendName());
 
                 // Render layer-by-layer breakdown for the first decode step
                 // (most diagnostic for identifying where divergence originates)
@@ -6361,10 +8328,6 @@ namespace llaminar2::test::parity
                 auto export_scope = profileParityScope("assert_decode.export_csv");
                 exportDecodeCSV(summary);
             }
-
-            // Assertions — skip on ranks that lack logit data (PP non-tail ranks)
-            if (!has_logit_data)
-                return;
 
             // Decode also captures per-layer snapshots when the runner exposes
             // them. Enforce the same early-layer gate used by prefill whenever a
@@ -6394,6 +8357,11 @@ namespace llaminar2::test::parity
                         << step_stats.step_idx << " (cosine >= " << config_.decode_cosine_threshold << ")";
                 }
             }
+
+            // Logit assertions belong only to the pipeline tail. Non-tail
+            // ranks have already enforced their owned layer checkpoints above.
+            if (!has_logit_data)
+                return;
 
             int min_steps_required = static_cast<int>(summary.steps_total * config_.min_decode_pass_rate);
             EXPECT_GE(summary.steps_passed, min_steps_required)
@@ -6464,24 +8432,7 @@ namespace llaminar2::test::parity
          */
         static std::filesystem::path getResultsDir()
         {
-            // Use __FILE__ to find the parity directory
-            std::filesystem::path this_file(__FILE__);
-            std::filesystem::path parity_dir = this_file.parent_path(); // .../tests/v2/integration/parity
-
-            std::string git_hash = getGitHash();
-            std::string test_name = getTestName();
-
-            // Sanitize test_name for filesystem (replace / with _)
-            std::string safe_name;
-            for (char c : test_name)
-            {
-                if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
-                    safe_name += '_';
-                else
-                    safe_name += c;
-            }
-
-            return parity_dir / "results" / git_hash / safe_name;
+            return ParityCSVArtifactWriter::resultsDir();
         }
 
         /**
@@ -6508,76 +8459,148 @@ namespace llaminar2::test::parity
          */
         void exportPrefillCSV(const ParityTestSummary &summary)
         {
-            if (!isRank0())
+            if (!config_.uses_cross_rank_pipeline)
+            {
+                if (!isRank0())
+                    return;
+                EXPECT_TRUE(ParityCSVArtifactWriter::writePrefill(
+                    ensureResultsDir(), getBackendName(), summary))
+                    << "Cannot write one or more prefill parity CSV artifacts";
                 return;
-
-            auto dir = ensureResultsDir();
-            std::string backend = getBackendName();
-
-            // --- prefill_layers.csv ---
-            {
-                auto path = dir / "prefill_layers.csv";
-                std::ofstream f(path);
-                if (!f.is_open())
-                {
-                    LOG_WARN("Cannot write " << path);
-                    return;
-                }
-
-                f << "backend,layer,avg_cosine,min_cosine,worst_stage,max_cosine_drop,max_drop_stage,stages_compared,max_kurtosis,max_kurtosis_stage,passed\n";
-
-                // Embedding row
-                f << backend << ",EMBEDDING,"
-                  << summary.embedding_cosine << ",,"
-                  << ",,,,,,"
-                  << (summary.embedding_passed ? "true" : "false") << "\n";
-
-                for (const auto &ls : summary.layer_stats)
-                {
-                    f << backend << ","
-                      << ls.layer_idx << ","
-                      << ls.avg_cosine_sim << ","
-                      << ls.min_cosine_sim << ","
-                      << ls.worst_stage << ","
-                      << ls.max_cosine_drop << ","
-                      << ls.max_drop_stage << ","
-                      << ls.stages_compared << ","
-                      << ls.max_kurtosis << ","
-                      << ls.max_kurtosis_stage << ","
-                      << (ls.passed ? "true" : "false") << "\n";
-                }
-
-                LOG_INFO("[CSV] Wrote " << path);
             }
 
-            // --- prefill_summary.csv ---
+            ASSERT_NE(mpi_ctx_, nullptr);
+            ASSERT_GT(mpiWorldSize(), 1);
+
+            struct RankPrefillSummary
             {
-                auto path = dir / "prefill_summary.csv";
-                std::ofstream f(path);
-                if (!f.is_open())
+                float embedding_cosine = 0.0f;
+                int32_t embedding_passed = 0;
+                int32_t has_embedding_data = 0;
+                float lm_head_cosine = 0.0f;
+                float lm_head_kl = 0.0f;
+                float lm_head_top1 = 0.0f;
+                float lm_head_top5 = 0.0f;
+                int32_t lm_head_top1_in_topk = 0;
+                int32_t lm_head_passed = 0;
+                int32_t has_lm_head_data = 0;
+                int32_t early_layers_passed = 0;
+                int32_t total_layers_passed = 0;
+            };
+
+            RankPrefillSummary local{};
+            local.embedding_cosine = summary.embedding_cosine;
+            local.embedding_passed = summary.embedding_passed ? 1 : 0;
+            local.has_embedding_data =
+                (summary.embedding_passed || summary.embedding_cosine != 0.0f)
+                    ? 1
+                    : 0;
+            local.lm_head_cosine = summary.lm_head_cosine;
+            local.lm_head_kl = summary.lm_head_kl;
+            local.lm_head_top1 = summary.lm_head_top1;
+            local.lm_head_top5 = summary.lm_head_top5;
+            local.lm_head_top1_in_topk =
+                summary.lm_head_pytorch_top1_in_top3 ? 1 : 0;
+            local.lm_head_passed = summary.lm_head_passed ? 1 : 0;
+            local.has_lm_head_data =
+                (summary.lm_head_passed || summary.lm_head_cosine != 0.0f ||
+                 summary.lm_head_kl != 0.0f || summary.lm_head_top1 != 0.0f ||
+                 summary.lm_head_top5 != 0.0f)
+                    ? 1
+                    : 0;
+            local.early_layers_passed = summary.early_layers_passed;
+            local.total_layers_passed = summary.total_layers_passed;
+
+            std::vector<RankPrefillSummary> rank_summaries(
+                static_cast<size_t>(mpiWorldSize()));
+            mpi_ctx_->allgather_bytes(
+                &local,
+                rank_summaries.data(),
+                sizeof(RankPrefillSummary));
+
+            const auto dir = ensureResultsDir();
+            const auto fragment_dir =
+                dir / (".pipeline_prefill_rank_" + std::to_string(mpiRank()));
+            const int32_t local_write_ok =
+                ParityCSVArtifactWriter::writePrefill(
+                    fragment_dir, getBackendName(), summary)
+                    ? 1
+                    : 0;
+            std::vector<int32_t> write_status(
+                static_cast<size_t>(mpiWorldSize()));
+            mpi_ctx_->allgather_bytes(
+                &local_write_ok,
+                write_status.data(),
+                sizeof(local_write_ok));
+            mpiBarrier();
+
+            int32_t merge_ok = 1;
+            if (isRank0())
+            {
+                ParityTestSummary aggregate;
+                const auto &head = rank_summaries.front();
+                const auto &tail = rank_summaries.back();
+                EXPECT_EQ(head.has_embedding_data, 1)
+                    << "Pipeline head published no embedding comparison";
+                EXPECT_EQ(tail.has_lm_head_data, 1)
+                    << "Pipeline tail published no LM-head comparison";
+
+                aggregate.embedding_cosine = head.embedding_cosine;
+                aggregate.embedding_passed = head.embedding_passed != 0;
+                aggregate.lm_head_cosine = tail.lm_head_cosine;
+                aggregate.lm_head_kl = tail.lm_head_kl;
+                aggregate.lm_head_top1 = tail.lm_head_top1;
+                aggregate.lm_head_top5 = tail.lm_head_top5;
+                aggregate.lm_head_pytorch_top1_in_top3 =
+                    tail.lm_head_top1_in_topk != 0;
+                aggregate.lm_head_passed = tail.lm_head_passed != 0;
+                for (const auto &rank : rank_summaries)
                 {
-                    LOG_WARN("Cannot write " << path);
-                    return;
+                    aggregate.early_layers_passed +=
+                        rank.early_layers_passed;
+                    aggregate.total_layers_passed +=
+                        rank.total_layers_passed;
                 }
+                aggregate.overall_passed =
+                    aggregate.early_layers_passed >=
+                        config_.min_early_layers_passed &&
+                    aggregate.lm_head_passed;
 
-                f << "backend,lm_head_cosine,lm_head_kl,lm_head_top1,lm_head_top5,"
-                  << "lm_head_pytorch_top1_in_topk,early_layers_passed,total_layers_passed,overall_passed\n";
-
-                f << backend << ","
-                  << summary.lm_head_cosine << ","
-                  << summary.lm_head_kl << ","
-                  << summary.lm_head_top1 << ","
-                  << summary.lm_head_top5 << ","
-                  << (summary.lm_head_pytorch_top1_in_top3 ? "true" : "false") << ","
-                  << summary.early_layers_passed << ","
-                  << summary.total_layers_passed << ","
-                  << (summary.overall_passed ? "true" : "false") << "\n";
-
-                LOG_INFO("[CSV] Wrote " << path);
+                std::vector<std::filesystem::path> rank_dirs;
+                rank_dirs.reserve(static_cast<size_t>(mpiWorldSize()));
+                for (int rank = 0; rank < mpiWorldSize(); ++rank)
+                {
+                    rank_dirs.push_back(
+                        dir / (".pipeline_prefill_rank_" +
+                               std::to_string(rank)));
+                }
+                const bool all_fragments_written = std::all_of(
+                    write_status.begin(),
+                    write_status.end(),
+                    [](int32_t status)
+                    {
+                        return status != 0;
+                    });
+                merge_ok =
+                    all_fragments_written &&
+                            ParityCSVArtifactWriter::mergePipelinePrefill(
+                                dir,
+                                getBackendName(),
+                                aggregate,
+                                rank_dirs)
+                        ? 1
+                        : 0;
             }
+            mpi_ctx_->broadcast_int32(&merge_ok, 1, 0);
+            mpiBarrier();
 
-            // --- prefill_stages.csv (detailed per-stage distribution stats) ---
-            exportPrefillStagesCSV(summary);
+            std::error_code cleanup_error;
+            std::filesystem::remove_all(fragment_dir, cleanup_error);
+            EXPECT_FALSE(cleanup_error)
+                << "Cannot remove generated PP prefill fragment directory: "
+                << cleanup_error.message();
+            EXPECT_EQ(merge_ok, 1)
+                << "Cannot merge rank-complete prefill parity CSV artifacts";
         }
 
         /**
@@ -6589,263 +8612,71 @@ namespace llaminar2::test::parity
          */
         void exportDecodeCSV(const DecodeParitySummary &summary)
         {
-            if (!isRank0())
-                return;
-
-            auto dir = ensureResultsDir();
-            std::string backend = getBackendName();
-
-            // --- decode_steps.csv ---
+            if (!config_.uses_cross_rank_pipeline)
             {
-                auto path = dir / "decode_steps.csv";
-                std::ofstream f(path);
-                if (!f.is_open())
-                {
-                    LOG_WARN("Cannot write " << path);
+                if (!isRank0())
                     return;
-                }
-
-                f << "backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,"
-                  << "llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed\n";
-
-                for (const auto &ss : summary.step_stats)
-                {
-                    f << backend << ","
-                      << ss.step_idx << ","
-                      << ss.cosine_similarity << ","
-                      << ss.kl_divergence << ","
-                      << ss.top1_overlap << ","
-                      << ss.top5_overlap << ","
-                      << ss.llaminar_token << ","
-                      << ss.pytorch_token << ","
-                      << (ss.token_match ? "true" : "false") << ","
-                      << (ss.top3_match ? "true" : "false") << ","
-                      << (ss.top5_match ? "true" : "false") << ","
-                      << (ss.passed ? "true" : "false") << "\n";
-                }
-
-                LOG_INFO("[CSV] Wrote " << path);
+                EXPECT_TRUE(ParityCSVArtifactWriter::writeDecode(
+                    ensureResultsDir(), getBackendName(), summary))
+                    << "Cannot write one or more decode parity CSV artifacts";
+                return;
             }
 
-            // --- decode_layers.csv ---
+            ASSERT_NE(mpi_ctx_, nullptr);
+            ASSERT_GT(mpiWorldSize(), 1);
+            const auto dir = ensureResultsDir();
+            const auto fragment_dir =
+                dir / (".pipeline_decode_rank_" + std::to_string(mpiRank()));
+            const int32_t local_write_ok =
+                ParityCSVArtifactWriter::writeDecode(
+                    fragment_dir, getBackendName(), summary)
+                    ? 1
+                    : 0;
+            std::vector<int32_t> write_status(
+                static_cast<size_t>(mpiWorldSize()));
+            mpi_ctx_->allgather_bytes(
+                &local_write_ok,
+                write_status.data(),
+                sizeof(local_write_ok));
+            mpiBarrier();
+
+            int32_t merge_ok = 1;
+            if (isRank0())
             {
-                bool has_layer_data = false;
-                for (const auto &ss : summary.step_stats)
+                std::vector<std::filesystem::path> rank_dirs;
+                rank_dirs.reserve(static_cast<size_t>(mpiWorldSize()));
+                for (int rank = 0; rank < mpiWorldSize(); ++rank)
                 {
-                    if (!ss.layer_stats.empty())
+                    rank_dirs.push_back(
+                        dir / (".pipeline_decode_rank_" +
+                               std::to_string(rank)));
+                }
+                const bool all_fragments_written = std::all_of(
+                    write_status.begin(),
+                    write_status.end(),
+                    [](int32_t status)
                     {
-                        has_layer_data = true;
-                        break;
-                    }
-                }
-
-                if (!has_layer_data)
-                    return;
-
-                auto path = dir / "decode_layers.csv";
-                std::ofstream f(path);
-                if (!f.is_open())
-                {
-                    LOG_WARN("Cannot write " << path);
-                    return;
-                }
-
-                f << "backend,step,layer,avg_cosine,min_cosine,worst_stage,max_cosine_drop,max_drop_stage,stages_compared,passed\n";
-
-                for (const auto &ss : summary.step_stats)
-                {
-                    for (const auto &ls : ss.layer_stats)
-                    {
-                        if (ls.stages_compared == 0)
-                            continue;
-
-                        f << backend << ","
-                          << ss.step_idx << ","
-                          << ls.layer_idx << ","
-                          << ls.avg_cosine_sim << ","
-                          << ls.min_cosine_sim << ","
-                          << ls.worst_stage << ","
-                          << ls.max_cosine_drop << ","
-                          << ls.max_drop_stage << ","
-                          << ls.stages_compared << ","
-                          << (ls.passed ? "true" : "false") << "\n";
-                    }
-                }
-
-                LOG_INFO("[CSV] Wrote " << path);
+                        return status != 0;
+                    });
+                merge_ok =
+                    all_fragments_written &&
+                            ParityCSVArtifactWriter::mergePipelineDecode(
+                                dir, rank_dirs)
+                        ? 1
+                        : 0;
             }
+            mpi_ctx_->broadcast_int32(&merge_ok, 1, 0);
+            mpiBarrier();
 
-            // --- decode_stages.csv (detailed per-stage distribution stats) ---
-            exportDecodeStagesCSV(summary);
+            std::error_code cleanup_error;
+            std::filesystem::remove_all(fragment_dir, cleanup_error);
+            EXPECT_FALSE(cleanup_error)
+                << "Cannot remove generated PP decode fragment directory: "
+                << cleanup_error.message();
+            EXPECT_EQ(merge_ok, 1)
+                << "Cannot merge rank-complete decode parity CSV artifacts";
         }
 
-        /**
-         * @brief Write the CSV header columns for TensorDistributionStats
-         *
-         * Used by both prefill and decode stage CSV writers.
-         * @param prefix "llaminar_" or "pytorch_"
-         */
-        static void writeDistributionStatsHeader(std::ofstream &f, const std::string &prefix)
-        {
-            f << prefix << "min," << prefix << "max,"
-              << prefix << "mean," << prefix << "stddev,"
-              << prefix << "kurtosis," << prefix << "skewness,"
-              << prefix << "p95," << prefix << "p99,"
-              << prefix << "outlier_frac," << prefix << "dynamic_range,"
-              << prefix << "sparsity," << prefix << "zero_frac,"
-              << prefix << "nan_count," << prefix << "inf_count,"
-              << prefix << "elements";
-        }
-
-        /**
-         * @brief Write the CSV data columns for TensorDistributionStats
-         */
-        static void writeDistributionStatsData(std::ofstream &f, const TensorDistributionStats &s)
-        {
-            f << s.min << "," << s.max << ","
-              << s.mean << "," << s.stddev << ","
-              << s.kurtosis << "," << s.skewness << ","
-              << s.p95 << "," << s.p99 << ","
-              << s.outlier_fraction << "," << s.dynamic_range << ","
-              << s.sparsity << "," << s.zero_fraction << ","
-              << s.nan_count << "," << s.inf_count << ","
-              << s.element_count;
-        }
-
-        /**
-         * @brief Export per-stage detailed distribution stats for prefill
-         *
-         * Called from exportPrefillCSV. Writes prefill_stages.csv with
-         * per-tensor (per-stage) numerical analysis of both llaminar and pytorch tensors.
-         */
-        void exportPrefillStagesCSV(const ParityTestSummary &summary)
-        {
-            if (!isRank0())
-                return;
-
-            auto dir = ensureResultsDir();
-            std::string backend = getBackendName();
-
-            auto path = dir / "prefill_stages.csv";
-            std::ofstream f(path);
-            if (!f.is_open())
-            {
-                LOG_WARN("Cannot write " << path);
-                return;
-            }
-
-            f << "backend,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,"
-                 "is_routing,routing_overlap,routing_top1_match,routing_weight_l1,";
-            writeDistributionStatsHeader(f, "llaminar_");
-            f << ",";
-            writeDistributionStatsHeader(f, "pytorch_");
-            f << "\n";
-
-            for (const auto &ls : summary.layer_stats)
-            {
-                for (const auto &sr : ls.stage_results)
-                {
-                    f << backend << ","
-                      << ls.layer_idx << ","
-                      << sr.stage_name << ","
-                      << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_similarity)) << ","
-                      << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_drop)) << ","
-                      << (sr.is_routing_stage ? "" : std::to_string(sr.rel_l2_norm)) << ","
-                      << sr.max_abs_diff << ","
-                      << (sr.is_routing_stage ? "" : std::to_string(sr.snr_db)) << ","
-                      << (sr.is_routing_stage ? "" : std::to_string(sr.rmse)) << ","
-                      << (sr.is_routing_stage ? "" : std::to_string(sr.error_entropy)) << ","
-                      << (sr.is_routing_stage ? "1" : "0") << ","
-                      << (sr.is_routing_stage ? std::to_string(sr.routing_overlap) : "") << ","
-                      << (std::isnan(sr.routing_top1_match) ? "" : std::to_string(sr.routing_top1_match)) << ","
-                      << (std::isnan(sr.routing_weight_l1) ? "" : std::to_string(sr.routing_weight_l1)) << ",";
-                    writeDistributionStatsData(f, sr.llaminar_stats);
-                    f << ",";
-                    writeDistributionStatsData(f, sr.pytorch_stats);
-                    f << "\n";
-                }
-            }
-
-            LOG_INFO("[CSV] Wrote " << path);
-        }
-
-        /**
-         * @brief Export per-stage detailed distribution stats for decode
-         *
-         * Called from exportDecodeCSV. Writes decode_stages.csv with
-         * per-tensor (per-stage) numerical analysis of both llaminar and pytorch tensors.
-         */
-        void exportDecodeStagesCSV(const DecodeParitySummary &summary)
-        {
-            if (!isRank0())
-                return;
-
-            bool has_stage_data = false;
-            for (const auto &ss : summary.step_stats)
-            {
-                for (const auto &ls : ss.layer_stats)
-                {
-                    if (!ls.stage_results.empty())
-                    {
-                        has_stage_data = true;
-                        break;
-                    }
-                }
-                if (has_stage_data)
-                    break;
-            }
-            if (!has_stage_data)
-                return;
-
-            auto dir = ensureResultsDir();
-            std::string backend = getBackendName();
-
-            auto path = dir / "decode_stages.csv";
-            std::ofstream f(path);
-            if (!f.is_open())
-            {
-                LOG_WARN("Cannot write " << path);
-                return;
-            }
-
-            f << "backend,step,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,"
-                 "is_routing,routing_overlap,routing_top1_match,routing_weight_l1,";
-            writeDistributionStatsHeader(f, "llaminar_");
-            f << ",";
-            writeDistributionStatsHeader(f, "pytorch_");
-            f << "\n";
-
-            for (const auto &ss : summary.step_stats)
-            {
-                for (const auto &ls : ss.layer_stats)
-                {
-                    for (const auto &sr : ls.stage_results)
-                    {
-                        f << backend << ","
-                          << ss.step_idx << ","
-                          << ls.layer_idx << ","
-                          << sr.stage_name << ","
-                          << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_similarity)) << ","
-                          << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_drop)) << ","
-                          << (sr.is_routing_stage ? "" : std::to_string(sr.rel_l2_norm)) << ","
-                          << sr.max_abs_diff << ","
-                          << (sr.is_routing_stage ? "" : std::to_string(sr.snr_db)) << ","
-                          << (sr.is_routing_stage ? "" : std::to_string(sr.rmse)) << ","
-                          << (sr.is_routing_stage ? "" : std::to_string(sr.error_entropy)) << ","
-                          << (sr.is_routing_stage ? "1" : "0") << ","
-                          << (sr.is_routing_stage ? std::to_string(sr.routing_overlap) : "") << ","
-                          << (std::isnan(sr.routing_top1_match) ? "" : std::to_string(sr.routing_top1_match)) << ","
-                          << (std::isnan(sr.routing_weight_l1) ? "" : std::to_string(sr.routing_weight_l1)) << ",";
-                        writeDistributionStatsData(f, sr.llaminar_stats);
-                        f << ",";
-                        writeDistributionStatsData(f, sr.pytorch_stats);
-                        f << "\n";
-                    }
-                }
-            }
-
-            LOG_INFO("[CSV] Wrote " << path);
-        }
     };
 
 } // namespace llaminar2::test::parity

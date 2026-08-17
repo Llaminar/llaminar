@@ -147,7 +147,10 @@ namespace llaminar2::test
 
         auto mpi_ctx = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
         MoEOverlayMPISparseCollectiveContext collective(
-            MoEOverlayMPISparseCollectiveContext::Config{.mpi_ctx = mpi_ctx, .local_participant_id = rank});
+            MoEOverlayMPISparseCollectiveContext::Config{
+                .mpi_ctx = mpi_ctx,
+                .local_participant_ids = {rank},
+            });
         auto workspace = makeWorkspace();
 
         const auto dispatch_key = keyFor(MoEOverlayCollectiveDirection::Dispatch, 30);

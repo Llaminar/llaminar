@@ -152,7 +152,8 @@ CATEGORY_REASONS = {
     ),
     "host_dispatch": (
         "HIP conditional-graph substitute returning one authenticated immutable "
-        "dispatch ticket; mutable generation state remains device-owned."
+        "dispatch ticket; mutable generation or controller state remains "
+        "device-owned."
     ),
     "host_result": (
         "Public API whose contract is to return a completed value to the host."
@@ -192,9 +193,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
         "backend_primitive",
         ("src/v2/backends/cuda/CUDABackend.cu", "CUDABackend::argmaxF32", "raw_stream", 1),
         ("src/v2/backends/cuda/CUDABackend.cu", "CUDABackend::argmaxF32BatchedRows", "raw_stream", 1),
-        ("src/v2/backends/cuda/CUDABackend.cu", "CUDABackend::deviceToDevice", "raw_stream", 1),
-        ("src/v2/backends/cuda/CUDABackend.cu", "CUDABackend::deviceToHost", "raw_stream", 1),
-        ("src/v2/backends/cuda/CUDABackend.cu", "CUDABackend::hostToDevice", "raw_stream", 1),
         ("src/v2/backends/cuda/CUDABackend.cu", "CUDABackend::sampleTopKTopPF32", "raw_stream", 1),
         ("src/v2/backends/cuda/CUDABackend.cu", "CUDABackend::streamSynchronize", "raw_stream", 1),
         ("src/v2/backends/cuda/CUDABackend.cu", "CUDABackend::synchronize", "raw_device", 1),
@@ -209,10 +207,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/backends/rocm/AMDDeviceContext.cpp", "AMDDeviceContext::synchronizeStreamChecked", "raw_stream", 1),
         ("src/v2/backends/rocm/ROCmBackend.cpp", "ROCmBackend::argmaxF32", "raw_stream", 1),
         ("src/v2/backends/rocm/ROCmBackend.cpp", "ROCmBackend::argmaxF32BatchedRows", "raw_stream", 1),
-        ("src/v2/backends/rocm/ROCmBackend.cpp", "ROCmBackend::deviceToDevice", "raw_stream", 1),
-        ("src/v2/backends/rocm/ROCmBackend.cpp", "ROCmBackend::deviceToHost", "raw_stream", 1),
-        ("src/v2/backends/rocm/ROCmBackend.cpp", "ROCmBackend::deviceToHostFast", "raw_stream", 1),
-        ("src/v2/backends/rocm/ROCmBackend.cpp", "ROCmBackend::hostToDevice", "raw_stream", 1),
         ("src/v2/backends/rocm/ROCmBackend.cpp", "ROCmBackend::sampleTopKTopPF32", "raw_stream", 1),
         ("src/v2/backends/rocm/ROCmBackend.cpp", "ROCmBackend::streamSynchronize", "raw_stream", 1),
         ("src/v2/backends/rocm/ROCmBackend.cpp", "ROCmBackend::synchronize", "raw_device", 1),
@@ -284,6 +278,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
     *reviewed(
         "graph_ownership",
         ("src/v2/execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp", "DeviceGraphExecutor::GraphSegmentCache::waitForCaptureStreamFence", "worker_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "initializeMoEOverlayEpochExecutionBinding", "backend_event", 1),
     ),
     *reviewed(
         "heterogeneous_staging",
@@ -323,6 +318,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
     *reviewed(
         "host_dispatch",
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::observeDeviceGenerationDispatchTicket", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::observeDeviceMoERebalanceDispatchTicket", "backend_event", 1),
     ),
     *reviewed(
         "host_result",
@@ -342,13 +338,15 @@ ALLOWANCES: tuple[Allowance, ...] = (
     *reviewed(
         "lifecycle",
         ("src/v2/execution/local_execution/engine/ForwardGraphTypes.h", "reset", "worker_stream", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::retirePublishedDeviceWorkBeforeArenaRelease", "backend_event", 1),
+        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::retirePublishedDeviceWorkBeforeArenaRelease", "backend_event", 2),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::retirePendingPrefixPayloadUses", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::synchronizeDevices", "backend_device", 2),
         ("src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp", "RankOrchestrator::synchronizeDevices", "rank_device", 1),
+        ("src/v2/execution/moe/DeviceMoEOverlayEpochArena.cpp", "DeviceMoEOverlayEpochArena::DeviceMoEOverlayEpochArena", "worker_stream", 1),
         ("src/v2/execution/moe/DeviceMoETransferSlotDirectory.cpp", "DeviceMoETransferSlotDirectory::create", "worker_stream", 1),
         ("src/v2/execution/moe/MoEExpertWeightService.cpp", "finish", "worker_stream", 1),
         ("src/v2/execution/moe/MoEExpertWeightService.cpp", "~ScopedGpuDirectTransferStream", "worker_stream", 2),
+        ("src/v2/execution/moe/MoERuntimeTable.cpp", "DeviceMoERuntimeTable::releaseRuntimeHistogramDrainResources", "worker_stream", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "synchronizeMirror", "worker_stream", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "copyHostToMirror", "backend_sync_copy", 1),
         ("src/v2/execution/runner/OrchestrationRunner.cpp", "synchronizeRunnerDevicesBeforeRelease", "backend_device", 1),
@@ -356,14 +354,14 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu", "cudaQuantGemm_uploadRawBytes", "backend_sync_copy", 1),
         ("src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvShardImpl.cu.inc", "cudaRowMajorWeights_create", "raw_stream", 1),
         ("src/v2/kernels/cuda/kvcache/CUDARingKVCache.cu", "CUDARingKVCache<Precision>::initializeBatchedEntryPointerTables", "backend_sync_copy", 2),
-        ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu", "CUDARingKVCacheTQ::CUDARingKVCacheTQ", "raw_stream", 2),
-        ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu", "CUDARingKVCacheTQ::publishBatchedEntryTables", "backend_sync_copy", 2),
+        ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu", "CUDARingKVCacheTQ::CUDARingKVCacheTQ", "raw_stream", 1),
+        ("src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu", "CUDARingKVCacheTQ::publishBatchedEntryTables", "backend_sync_copy", 3),
         ("src/v2/kernels/cuda/kvcache/CUDATurboQuantKernels.cu", "cuda_tq_upload_rope_freqs", "raw_stream", 1),
         ("src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp", "ROCmQuantisedGemmKernel::ensureWeightsConverted", "raw_stream", 1),
         ("src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp", "ROCmRingKVCache<Precision>::allocate_pool", "raw_stream", 1),
         ("src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp", "ROCmRingKVCache<Precision>::initializeBatchedEntryPointerTables", "backend_sync_copy", 2),
         ("src/v2/kernels/rocm/kvcache/ROCmRingKVCacheTQ.hip", "ROCmRingKVCacheTQ::ROCmRingKVCacheTQ", "raw_stream", 1),
-        ("src/v2/kernels/rocm/kvcache/ROCmRingKVCacheTQ.hip", "ROCmRingKVCacheTQ::publishBatchedEntryTables", "backend_sync_copy", 2),
+        ("src/v2/kernels/rocm/kvcache/ROCmRingKVCacheTQ.hip", "ROCmRingKVCacheTQ::publishBatchedEntryTables", "backend_sync_copy", 3),
         ("src/v2/kernels/rocm/kvcache/ROCmTurboQuantKernels.hip", "hip_tq_upload_rope_freqs", "raw_stream", 1),
         ("src/v2/kernels/rocm/gemm/ROCmWeightPacker.cpp", "MoEBatchPackedWeightsROCm::uploadToDevice", "backend_sync_copy", 1),
         ("src/v2/kernels/KernelFactory.cpp", "KernelFactory::prepareEmbeddingHandleLocal", "backend_sync_copy", 1),
@@ -373,8 +371,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/loaders/gpu_pipeline/WeightTranslator.h", "uploadGpuPackedWeights", "backend_sync_copy", 4),
         ("src/v2/loaders/gpu_pipeline/PinnedRingBuffer.cpp", "PinnedRingBuffer::release", "backend_device", 1),
         ("src/v2/loaders/gpu_pipeline/WeightVRAMPool.cpp", "WeightVRAMPool::releaseStaging", "backend_device", 1),
-        ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::downloadFull", "backend_sync_copy", 1),
-        ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::uploadFull", "backend_sync_copy", 1),
     ),
 )
 

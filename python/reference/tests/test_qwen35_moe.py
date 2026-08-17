@@ -24,7 +24,10 @@ from python.reference.loaders.tensor_name_mapper import (
     TensorNameMapper,
     detect_model_type_from_metadata,
 )
-from python.reference.qwen35_moe import Qwen35MoEReferenceModel
+from python.reference.qwen35_moe import (
+    Qwen35MoEReferenceModel,
+    production_router_distribution,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +61,22 @@ def _make_loader():
 def _forward_reorder(tensor, dim, num_k, num_v_per_k, head_dim):
     """Simulate the converter's forward V-head reorder (grouped→tiled)."""
     return GGUFLoader._reorder_v_heads(tensor, dim, num_k, num_v_per_k, head_dim)
+
+
+def test_router_snapshot_uses_live_post_softmax_distribution():
+    """Main and MTP parity must not reconstruct retired raw router logits."""
+
+    probabilities = torch.tensor([[0.1, 0.2, 0.7]], dtype=torch.float32)
+    weights = torch.tensor([[0.7, 0.2]], dtype=torch.float32)
+    indices = torch.tensor([[2, 1]], dtype=torch.int64)
+    observed = production_router_distribution(
+        (probabilities, weights, indices)
+    )
+
+    assert observed is probabilities
+    assert torch.allclose(observed.sum(dim=-1), torch.ones(1))
+    with pytest.raises(RuntimeError, match="probabilities, weights, and indices"):
+        production_router_distribution((probabilities,))
 
 
 def test_moe_snapshot_generator_help_exposes_diagnostic_snapshot_modes():

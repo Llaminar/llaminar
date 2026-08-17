@@ -20,11 +20,13 @@
 #include "../CUDAKernelBase.h"
 #include "../gemm/CUDADeviceWorkspace.h"
 #include "../../../tensors/TensorType.h"
+#include "../../../execution/moe/MoERuntimePointerWorkspaceOwners.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace llaminar2
@@ -49,6 +51,140 @@ namespace llaminar2
 
         /// @brief Clear request-shaped host grouping metadata while retaining device scratch.
         void resetDynamicState() override;
+
+        /** @copydoc IMoEKernel::packMoEOverlayActivationDispatch */
+        bool packMoEOverlayActivationDispatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationDispatchPackLaunch &packet) override;
+
+        /** @copydoc IMoEKernel::consumeMoEOverlayActivationDispatch */
+        bool consumeMoEOverlayActivationDispatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationDispatchConsumeLaunch &packet) override;
+
+        /** @copydoc IMoEKernel::packMoEOverlayActivationReturn */
+        bool packMoEOverlayActivationReturn(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationReturnPackLaunch &packet) override;
+
+        /** @copydoc IMoEKernel::consumeMoEOverlayActivationReturn */
+        bool consumeMoEOverlayActivationReturn(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationReturnConsumeLaunch &packet) override;
+
+        /** @copydoc IMoEKernel::packSingleRowMoEOverlayActivationDispatch */
+        bool packSingleRowMoEOverlayActivationDispatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowDispatchPackLaunch &packet) override;
+
+        /** @copydoc IMoEKernel::consumeSingleRowMoEOverlayActivationDispatch */
+        bool consumeSingleRowMoEOverlayActivationDispatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowDispatchConsumeLaunch &packet) override;
+
+        /** @copydoc IMoEKernel::packSingleRowMoEOverlayActivationReturn */
+        bool packSingleRowMoEOverlayActivationReturn(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowReturnPackLaunch &packet) override;
+
+        /** @copydoc IMoEKernel::consumeSingleRowMoEOverlayActivationReturn */
+        bool consumeSingleRowMoEOverlayActivationReturn(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowReturnConsumeLaunch &packet) override;
+
+        /** @copydoc IMoEKernel::packSingleRowMoEOverlayActivationDispatchBatch */
+        bool packSingleRowMoEOverlayActivationDispatchBatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowDispatchBatchLaunch &packet) override;
+
+        /** @copydoc IMoEKernel::consumeSingleRowMoEOverlayActivationReturnBatch */
+        bool consumeSingleRowMoEOverlayActivationReturnBatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationSingleRowReturnBatchLaunch &packet) override;
+        /** @copydoc IMoEKernel::consumeMultiRowMoEOverlayActivationReturnBatch */
+        bool consumeMultiRowMoEOverlayActivationReturnBatch(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayActivationMultiRowReturnBatchLaunch &packet) override;
+
+        /** @copydoc IMoEKernel::publishNodeLocalCanonicalRoutes */
+        bool publishNodeLocalCanonicalRoutes(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalRoutePublishLaunch &publication) override;
+
+        /** @copydoc IMoEKernel::acquireNodeLocalCanonicalRoutes */
+        bool acquireNodeLocalCanonicalRoutes(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalRouteConsumeLaunch &consumption) override;
+
+        /** @copydoc IMoEKernel::stageNodeLocalCanonicalRoutes */
+        bool stageNodeLocalCanonicalRoutes(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalRouteConsumeLaunch &consumption) override;
+
+        /** @copydoc IMoEKernel::foldNodeLocalCanonicalRoutes */
+        bool foldNodeLocalCanonicalRoutes(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalRouteConsumeLaunch &consumption) override;
+
+        /** @copydoc IMoEKernel::acquireMoEOverlayEpoch */
+        bool acquireMoEOverlayEpoch(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            DeviceMoEOverlayEpochTicket *ticket,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @copydoc IMoEKernel::releaseMoEOverlayEpoch */
+        bool releaseMoEOverlayEpoch(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            DeviceMoEOverlayEpochTicket *ticket,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @copydoc IMoEKernel::reserveMoEOverlayEpochCandidate */
+        bool reserveMoEOverlayEpochCandidate(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @copydoc IMoEKernel::finalizeMoEOverlayRebalancePublication */
+        bool finalizeMoEOverlayRebalancePublication(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoELayerRuntime *runtime_layers,
+            std::uint32_t layer_count,
+            std::uint32_t expert_count,
+            DeviceMoEOverlayEpochControl *control,
+            std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *reservation_and_publication_status,
+            const DeviceMoERebalanceApplyStatus *apply_status) override;
+
+        /** @copydoc IMoEKernel::markMoEOverlayEpochCandidateReady */
+        bool markMoEOverlayEpochCandidateReady(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @copydoc IMoEKernel::publishMoEOverlayEpochCandidate */
+        bool publishMoEOverlayEpochCandidate(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @copydoc IMoEKernel::abortMoEOverlayEpochCandidate */
+        bool abortMoEOverlayEpochCandidate(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *candidate_epoch,
+            DeviceMoEOverlayEpochStatus *status) override;
+
+        /** @copydoc IMoEKernel::retireMoEOverlayEpoch */
+        bool retireMoEOverlayEpoch(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayEpochControl *control,
+            const std::uint64_t *retiring_epoch,
+            DeviceMoEOverlayEpochStatus *status) override;
 
         void gatherTokenBatch(
             const float *hidden,
@@ -94,7 +230,8 @@ namespace llaminar2
             int seq_len, int d_model, int num_experts, int top_k,
             bool normalize_weights,
             ITensor *output_indices, ITensor *output_weights,
-            const int *device_effective_seq_len = nullptr) override;
+            const int *device_effective_seq_len = nullptr,
+            DeviceMoELayerRuntime *deferred_selected_route_ledger = nullptr) override;
 
         /**
          * @brief Bind CUDA router scratch and immutable gate caches before capture.
@@ -306,6 +443,23 @@ namespace llaminar2
             int d_model,
             int intermediate) override;
 
+        /** @copydoc IMoEKernel::uploadGroupedExpertFloatingDownDescriptorTable */
+        int uploadGroupedExpertFloatingDownDescriptorTable(
+            const DeviceMoEFloatingMatrixDesc *down_descs,
+            DeviceMoEWeightFormat weight_format,
+            int num_experts,
+            int d_model,
+            int intermediate) override;
+
+        /** @copydoc IMoEKernel::uploadGroupedExpertFloatingGateUpDescriptorTables */
+        int uploadGroupedExpertFloatingGateUpDescriptorTables(
+            const DeviceMoEFloatingMatrixDesc *gate_descs,
+            const DeviceMoEFloatingMatrixDesc *up_descs,
+            DeviceMoEWeightFormat weight_format,
+            int num_experts,
+            int d_model,
+            int intermediate) override;
+
         bool updateGroupedExpertDownDescriptorTable(
             int descriptor_table_id,
             const DeviceNativeVNNIMatrixDesc *down_descs,
@@ -317,6 +471,25 @@ namespace llaminar2
             int descriptor_table_id,
             const DeviceNativeVNNIMatrixDesc *gate_descs,
             const DeviceNativeVNNIMatrixDesc *up_descs,
+            int num_experts,
+            int d_model,
+            int intermediate) override;
+
+        /** @copydoc IMoEKernel::updateGroupedExpertFloatingDownDescriptorTable */
+        bool updateGroupedExpertFloatingDownDescriptorTable(
+            int descriptor_table_id,
+            const DeviceMoEFloatingMatrixDesc *down_descs,
+            DeviceMoEWeightFormat weight_format,
+            int num_experts,
+            int d_model,
+            int intermediate) override;
+
+        /** @copydoc IMoEKernel::updateGroupedExpertFloatingGateUpDescriptorTables */
+        bool updateGroupedExpertFloatingGateUpDescriptorTables(
+            int descriptor_table_id,
+            const DeviceMoEFloatingMatrixDesc *gate_descs,
+            const DeviceMoEFloatingMatrixDesc *up_descs,
+            DeviceMoEWeightFormat weight_format,
             int num_experts,
             int d_model,
             int intermediate) override;
@@ -570,7 +743,8 @@ namespace llaminar2
             DeviceMoERebalanceWaveState *local_wave_states = nullptr,
             DeviceMoELayerRuntime *runtime_layers = nullptr,
             const DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr,
-            uint32_t local_transfer_slot_count = 0) override;
+            uint32_t local_transfer_slot_count = 0,
+            DeviceMoETransferSlotClaimIndex *transfer_slot_claim_index = nullptr) override;
 
         bool projectPrefillLeastLoadedDomainCommands(
             const MoEKernelLaunchContext &launch,
@@ -586,6 +760,7 @@ namespace llaminar2
             DeviceMoELayerRuntime *runtime_layers,
             const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
             uint32_t local_transfer_slot_count,
+            DeviceMoETransferSlotClaimIndex *transfer_slot_claim_index,
             uint32_t command_buffer_count = 1) override;
 
         bool materializePrefillLeastLoadedTransferCommands(
@@ -600,6 +775,17 @@ namespace llaminar2
             uint32_t payload_slot_capacity,
             uint32_t layer_idx,
             uint32_t command_buffer_count = 1) override;
+
+        bool materializePrefillLeastLoadedMirroredDomainCommands(
+            const MoEKernelLaunchContext &launch,
+            const DeviceMoELayerRuntime *runtime_layer,
+            DeviceMoERebalancePlanEntry *mirrored_plan_entries,
+            DeviceMoERebalanceCommandBufferHeader *mirrored_command_headers,
+            uint32_t plan_capacity,
+            DeviceMoERebalanceStatus *status,
+            const DeviceMoERebalanceConfig &config,
+            uint32_t payload_slot_capacity,
+            uint32_t layer_idx) override;
 
         bool packDeviceRebalanceCompactPayloads(
             const MoEKernelLaunchContext &launch,
@@ -684,7 +870,8 @@ namespace llaminar2
             DeviceMoERebalanceGraphControllerState *controller_state,
             DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
             int target_layer = -1,
-            uint32_t command_buffer_count = 1) override;
+            uint32_t command_buffer_count = 1,
+            const DeviceMoEOverlayEpochStatus *overlay_reservation_status = nullptr) override;
 
         bool applyDeviceRebalanceArrivals(
             const MoEKernelLaunchContext &launch,
@@ -760,12 +947,10 @@ namespace llaminar2
         /**
          * @brief Stable graph-capture slot bands for grouped decode pointer arrays.
          *
-         * The persistent descriptor lease identifies graph ownership across all
-         * MoE kernel objects sharing one device workspace. Table-driven decode,
-         * two-step runtime decode, and fused runtime decode can legally reuse
-         * one descriptor while writing to different scratch/output tensors.
-         * CUDA graphs capture the pointer-array device address, so each semantic
-         * path gets a stable band within that globally leased descriptor slot.
+         * Table-driven decode, two-step runtime decode, and fused runtime decode
+         * can share immutable descriptors while writing different scratch and
+         * output tensors. CUDA graphs capture the pointer-array device address,
+         * so scope participates in each graph-local owner's exclusive lease key.
          */
         enum class RuntimePointerArrayScope : std::size_t
         {
@@ -855,22 +1040,37 @@ namespace llaminar2
          */
         bool ensureGroupedDownKPartScratchCapacity(int k_partitions, int d_model, int slots = 1);
         bool ensureGroupedDownDecodeCapacity(int top_k, int intermediate);
-        /**
-         * @brief Ensure workspace-backed decode metadata buffers exist.
-         *
-         * Routing-tensor decode fills expert ids from a device FP32 index tensor
-         * via cudaMoE_float_to_int(), so it needs capacity without staging host
-         * expert ids.  The older host-table path still uses
-         * ensureGroupedDecodeMetadata() when it intentionally uploads metadata.
-         */
-        bool ensureGroupedDecodeMetadataCapacity(int num_active, bool include_weights);
         /// @brief Ensure a routing-only expert-id buffer that cannot race host-table decode metadata.
         bool ensureRoutingDecodeMetadataCapacity(int num_active);
-        bool ensureGroupedDecodeMetadata(
+        /**
+         * @brief Publish or resolve immutable gate/up expert ids for one graph owner.
+         *
+         * Warmup acquires an exclusive persistent slot associated with the
+         * pointer-table owner and publishes the host ids on the exact CUDA
+         * stream. Capture performs lookup only and therefore cannot allocate or
+         * stage host data in the hot path.
+         */
+        bool resolveFixedTableGateUpMetadata(
+            std::size_t persistent_descriptor_slot,
+            RuntimePointerArrayScope scope,
+            const int *expert_ids,
+            int num_active,
+            const int **device_expert_ids);
+        /**
+         * @brief Publish or resolve immutable down expert ids and weights.
+         *
+         * The returned buffers share the down pointer-table owner's exclusive
+         * physical slot. A different identity for an existing owner is a hard
+         * error; changing routes must use the device-routed decode interface.
+         */
+        bool resolveFixedTableDownMetadata(
+            std::size_t persistent_descriptor_slot,
+            RuntimePointerArrayScope scope,
             const int *expert_ids,
             const float *expert_weights,
             int num_active,
-            bool include_weights);
+            const int **device_expert_ids,
+            const float **device_expert_weights);
         bool groupTokensByExpertDeviceMapped(
             const int *d_routing_indices,
             const float *d_routing_weights,
@@ -900,8 +1100,10 @@ namespace llaminar2
         bool runtimePointerWorkspaceSlot(
             std::size_t persistent_descriptor_slot,
             RuntimePointerArrayScope scope,
+            MoERuntimePointerArrayRole role,
+            MoERuntimePointerWorkspaceAccess access,
             std::size_t *workspace_slot,
-            const char *context) const;
+            const char *context);
         bool bindWorkspaceBuffer(void **ptr, const char *name, size_t bytes, const char *context);
 
         /**
@@ -999,41 +1201,70 @@ namespace llaminar2
         struct GroupedDescriptorWorkspacePublication
         {
             void *ready_event = nullptr;
-            DeviceNativeVNNIMatrixDesc *primary_descs = nullptr;
-            DeviceNativeVNNIMatrixDesc *secondary_descs = nullptr;
+            void *primary_descs = nullptr;
+            void *secondary_descs = nullptr;
             std::size_t workspace_slot = 0;
         };
 
         struct GroupedDownDescriptorTable
         {
             DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+            DeviceMoEFloatingMatrixDesc *device_floating_descs = nullptr;
             std::shared_ptr<GroupedDescriptorWorkspacePublication>
                 workspace_publication;
             std::vector<DeviceNativeVNNIMatrixDesc> host_descs;
+            std::vector<DeviceMoEFloatingMatrixDesc> host_floating_descs;
             std::size_t workspace_slot = 0;
             int num_experts = 0;
             int d_model = 0;
             int intermediate = 0;
             uint8_t codebook_id = 0;
             uint32_t codebook_mask = 0;
+            uint32_t policy_codebook_mask = 0;
+            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
             bool valid = false;
+
+            /** @return Whether the selected descriptor family has device storage. */
+            [[nodiscard]] bool deviceReady() const noexcept
+            {
+                return weight_format == DeviceMoEWeightFormat::NativeVNNI
+                           ? device_descs != nullptr
+                           : deviceMoEWeightFormatIsFloating(weight_format) &&
+                                 device_floating_descs != nullptr;
+            }
         };
 
         struct GroupedGateUpDescriptorTable
         {
             DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
             DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
+            DeviceMoEFloatingMatrixDesc *device_floating_gate_descs = nullptr;
+            DeviceMoEFloatingMatrixDesc *device_floating_up_descs = nullptr;
             std::shared_ptr<GroupedDescriptorWorkspacePublication>
                 workspace_publication;
             std::vector<DeviceNativeVNNIMatrixDesc> host_gate_descs;
             std::vector<DeviceNativeVNNIMatrixDesc> host_up_descs;
+            std::vector<DeviceMoEFloatingMatrixDesc> host_floating_gate_descs;
+            std::vector<DeviceMoEFloatingMatrixDesc> host_floating_up_descs;
             std::size_t workspace_slot = 0;
             int num_experts = 0;
             int d_model = 0;
             int intermediate = 0;
             uint8_t codebook_id = 0;
             uint32_t codebook_mask = 0;
+            uint32_t policy_codebook_mask = 0;
+            DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
             bool valid = false;
+
+            /** @return Whether both selected descriptor tables are resident. */
+            [[nodiscard]] bool deviceReady() const noexcept
+            {
+                return weight_format == DeviceMoEWeightFormat::NativeVNNI
+                           ? device_gate_descs != nullptr && device_up_descs != nullptr
+                           : deviceMoEWeightFormatIsFloating(weight_format) &&
+                                 device_floating_gate_descs != nullptr &&
+                                 device_floating_up_descs != nullptr;
+            }
         };
 
         /**
@@ -1120,16 +1351,33 @@ namespace llaminar2
          * @brief Warmup readiness for graph-owned grouped-decode pointer slots.
          *
          * CUDA graph replay captures the device address of the pointer-array
-         * slot, not the host pointer values used to stage it.  CUDA therefore
-         * follows the ROCm-style deterministic workspace contract, but includes
-         * the decode path scope in the slot key because CUDA fused decode and
-         * two-step decode can share descriptor tables while targeting different
-         * scratch buffers. Warmup stages the scoped slot, and capture refuses to
-         * proceed unless that slot is already ready. No per-pointer cache is
-         * kept on the kernel object.
+         * slot, not the host pointer values used to stage it. Each graph-local
+         * kernel therefore owns an exclusive role-and-scope lease even when its
+         * immutable weight descriptors are shared with another graph. Warmup
+         * stages the leased slot and capture consumes only proven leases.
          */
         std::array<bool, kRuntimePointerArrayWorkspaceEntries> gateup_pointer_slot_ready_{};
         std::array<bool, kRuntimePointerArrayWorkspaceEntries> down_pointer_slot_ready_{};
+        /** Exclusive mutable pointer slots, independent of shared weight descriptors. */
+        MoERuntimePointerWorkspaceOwners runtime_pointer_workspace_owners_;
+
+        /** Host identity retained for one immutable fixed-table gate/up slot. */
+        struct FixedGateUpMetadataState
+        {
+            std::array<int, kRuntimePointerArrayMaxTopK> expert_ids{};
+            int num_active = 0;
+        };
+        /** Host identity retained for one immutable fixed-table down slot. */
+        struct FixedDownMetadataState
+        {
+            std::array<int, kRuntimePointerArrayMaxTopK> expert_ids{};
+            std::array<float, kRuntimePointerArrayMaxTopK> expert_weights{};
+            int num_active = 0;
+        };
+        std::unordered_map<std::size_t, FixedGateUpMetadataState>
+            fixed_gateup_metadata_states_;
+        std::unordered_map<std::size_t, FixedDownMetadataState>
+            fixed_down_metadata_states_;
 
         int8_t *d_prefill_A_int8_ = nullptr;
         float *d_prefill_A_scales_ = nullptr;
@@ -1170,13 +1418,8 @@ namespace llaminar2
         int decode_down_topk_cap_ = 0;
         int decode_down_intermediate_cap_ = 0;
 
-        int *d_grouped_decode_expert_ids_ = nullptr;
-        float *d_grouped_decode_weights_ = nullptr;
         int *d_routing_decode_expert_ids_ = nullptr;
-        int grouped_decode_metadata_cap_ = 0;
         int routing_decode_metadata_cap_ = 0;
-        std::vector<int> grouped_decode_cached_expert_ids_;
-        std::vector<float> grouped_decode_cached_weights_;
 
         // Split-K partials scratch for the grouped SwiGLU down projection.
         // Decode layout: [1][k_partitions][d_model].

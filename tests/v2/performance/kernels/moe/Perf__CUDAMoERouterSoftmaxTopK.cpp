@@ -46,7 +46,8 @@ extern "C" bool cudaMoE_softmax_topk(
     bool normalize_weights,
     int device_idx,
     void *stream,
-    const int *device_effective_seq_len);
+    const int *device_effective_seq_len,
+    void *deferred_selected_route_ledger = nullptr);
 #endif
 
 namespace

@@ -47,6 +47,24 @@ Latest Phase 13.8 dead-code cleanup note, 2026-06-08: the remaining public verif
 
 Latest Phase 13.8 post-cleanup dense benchmark assessment, 2026-06-08: CUDA is not currently accepted-fast on the retained dense path. Fresh clean Qwen3.6 27B Q4_K_S default-lane captures at `benchmark_results/dense_phase138/20260608T124752Z-postcleanup-cuda-rocm-assessment` show CUDA no-MTP 879.86 prefill / 43.74 decode tok/s, CUDA stochastic d1 742.25 / 39.60 at 89.06% acceptance, ROCm no-MTP 233.82 / 30.21, and ROCm stochastic d1 216.96 / 24.79 at 95.31% acceptance. Profiled captures attribute the shared bottleneck to `decode_equivalent_stochastic_forward_one`: about 23.1 ms/call on CUDA and 33.4 ms/call on ROCm. The answer to "is CUDA fast and ROCm slow" for dense retained Phase 13.8 is no: both are speed-negative after removing dead shortcuts, while ROCm is slower because the same verifier replay unit is roughly 45% slower per one-token forward plus similar sidecar/sampling overhead.
 
+Latest Phase 13 production-campaign note, 2026-08-12: the real-weight Qwen3.6
+MoE SingleDevice MTP checkpoint campaigns pass on CPU, CUDA, and ROCm at fixed
+depths 1/2/3 and dynamic depth. Warm authenticated-reference wall times are
+`138.14 s`, `104.14 s`, and `112.85 s`, or `355.13 s` for the complete
+three-backend slice; a forced reference refresh brings the combined sequence to
+`511.04 s`. The previous CUDA campaign took `1524.20 s`. Campaign-local reuse
+is restricted to the graph-native serial oracle and the plan-certified
+immutable model/prepared-weight authority; every cell constructs fresh
+production execution and request state. CUDA/ROCm artifacts prove full graph
+capture/replay with no segmentation, while token traces prove depths 1/2/3 and
+an actual dynamic 3-to-2 demotion. Reference metadata now authenticates the
+post-softmax router boundary and recursive MTP schema. Direct probability KL
+replaces the flattening second-softmax diagnostic, and the existing snapshot
+CSV gains an independent real-GGUF-weight evaluation on each live production
+router input. Its worst cross-backend causal error is below `3.3e-7` relative
+L2 and `6.9e-14` symmetric KL. `V2_Unit_SnapshotCapture` locks down this
+probability metric and fail-closed input validation.
+
 Latest deterministic-mode sidequest note, 2026-06-06: `LLAMINAR_DETERMINISTIC` is now an explicit policy gate for split/concurrent GPU routes that can otherwise change reduction order. CUDA deterministic mode disables concurrent prefill/decode plus MoE split-K routes, and ROCm deterministic mode disables native-VNNI atomic-reduce, concurrent prefill/decode, concurrent M=2 row handling, GDN concurrent decode, and nondeterministic MoE router/down/gate-up routes. ROCm graph capture no longer forces the atomic-reduce GEMV path when deterministic mode is active. Focused validation passed on 2026-06-06: `V2_Unit_DeterministicMode`, `V2_Integration_CUDAGemmNonDeterminism`, and `V2_Integration_ROCm_NativeVNNI_GEMV`.
 
 | Phase | Status | Current Evidence | Remaining Gate |

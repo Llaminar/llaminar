@@ -1844,6 +1844,198 @@ TEST(Test__CUDARingKVCache, GraphCapturedFP32ToFP16FusedAppendReplaysAfterClear)
     EXPECT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 }
 
+/**
+ * @brief Proves a padded captured FP32-to-Q8_1 append preserves every live row.
+ *
+ * Production prefill records a fixed 256-row graph even when only a short
+ * prompt prefix is live.  The Q8_1 adapter first quantizes the fixed input
+ * geometry into cache-owned scratch, then the append and resident gather must
+ * both consume the device-owned real-row count.  This regression validates
+ * that complete chain with non-zero padding so an incorrect full-bucket copy,
+ * row stride, or scratch dependency cannot hide behind zero-filled inputs.
+ */
+TEST(Test__CUDARingKVCache, CapturedPaddedFP32ToQ8AppendAndGatherPreservesLiveRows)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    constexpr int captured_rows = 256;
+    constexpr int live_rows = 9;
+    constexpr int max_seq_len = 512;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr int kv_dim = n_kv_heads * head_dim;
+    constexpr int blocks_per_row =
+        kv_dim / static_cast<int>(Q8_1Block::BLOCK_SIZE);
+
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::Q8_1,
+        /*n_layers=*/1,
+        /*batch_size=*/1,
+        max_seq_len,
+        n_kv_heads,
+        head_dim);
+    ASSERT_NE(cache, nullptr);
+    auto *workspace_consumer =
+        dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    auto workspace = bindRequiredWorkspace(
+        workspace_consumer, captured_rows, /*batch_size=*/1, head_dim);
+    ASSERT_NE(workspace, nullptr);
+
+    auto K = std::make_unique<FP32Tensor>(std::vector<size_t>{
+        captured_rows, static_cast<size_t>(kv_dim)});
+    auto V = std::make_unique<FP32Tensor>(std::vector<size_t>{
+        captured_rows, static_cast<size_t>(kv_dim)});
+    for (int row = 0; row < captured_rows; ++row)
+    {
+        for (int col = 0; col < kv_dim; ++col)
+        {
+            const size_t index = static_cast<size_t>(row) * kv_dim + col;
+            if (row < live_rows)
+            {
+                K->mutable_data()[index] =
+                    0.015625f * static_cast<float>(((row * 37 + col * 13) % 97) - 48);
+                V->mutable_data()[index] =
+                    0.0078125f * static_cast<float>(((row * 19 + col * 29) % 89) - 44);
+            }
+            else
+            {
+                K->mutable_data()[index] = 37.0f + static_cast<float>(row);
+                V->mutable_data()[index] = -41.0f - static_cast<float>(row);
+            }
+        }
+    }
+
+    ScopedCudaStream stream;
+    ASSERT_TRUE(K->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    ASSERT_TRUE(V->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+
+    int32_t *device_live_rows = nullptr;
+    ASSERT_EQ(cudaMalloc(&device_live_rows, sizeof(int32_t)), cudaSuccess);
+    const int32_t host_live_rows = live_rows;
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            device_live_rows,
+            &host_live_rows,
+            sizeof(int32_t),
+            cudaMemcpyHostToDevice,
+            stream.stream()),
+        cudaSuccess);
+    ASSERT_TRUE(cache->bindGraphAppendCountSource(
+        /*layer=*/0,
+        /*seq_idx=*/0,
+        device_live_rows,
+        captured_rows,
+        stream.opaque()));
+
+    ITensor *gathered_k = nullptr;
+    ITensor *gathered_v = nullptr;
+    ASSERT_TRUE(cache->get_kv_batched_device_view(
+        /*layer=*/0,
+        /*first_seq_idx=*/0,
+        /*request_count=*/1,
+        &gathered_k,
+        &gathered_v,
+        stream.opaque()));
+    stream.synchronize();
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(
+        cudaStreamBeginCapture(stream.stream(), cudaStreamCaptureModeGlobal),
+        cudaSuccess);
+    bool capture_ok = false;
+    {
+        GraphCaptureGuard guard;
+        capture_ok = cache->appendWithStream(
+            /*layer=*/0,
+            /*seq_idx=*/0,
+            K.get(),
+            V.get(),
+            captured_rows,
+            stream.opaque());
+        capture_ok = capture_ok && cache->get_kv_batched_device_view(
+                                       /*layer=*/0,
+                                       /*first_seq_idx=*/0,
+                                       /*request_count=*/1,
+                                       &gathered_k,
+                                       &gathered_v,
+                                       stream.opaque());
+    }
+    ASSERT_EQ(cudaStreamEndCapture(stream.stream(), &graph), cudaSuccess);
+    ASSERT_TRUE(capture_ok);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(
+        cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0),
+        cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream.stream()), cudaSuccess);
+    stream.synchronize();
+
+    ASSERT_NE(gathered_k, nullptr);
+    ASSERT_NE(gathered_v, nullptr);
+    const size_t live_block_count =
+        static_cast<size_t>(live_rows) * blocks_per_row;
+    std::vector<Q8_1Block> actual_k(live_block_count);
+    std::vector<Q8_1Block> actual_v(live_block_count);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            actual_k.data(), gathered_k->gpu_data_ptr(),
+            actual_k.size() * sizeof(Q8_1Block),
+            cudaMemcpyDeviceToHost, stream.stream()),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            actual_v.data(), gathered_v->gpu_data_ptr(),
+            actual_v.size() * sizeof(Q8_1Block),
+            cudaMemcpyDeviceToHost, stream.stream()),
+        cudaSuccess);
+    stream.synchronize();
+
+    auto compare_dequantized = [&](const std::vector<Q8_1Block> &blocks,
+                                   const FP32Tensor &reference,
+                                   const char *label)
+    {
+        double dot = 0.0;
+        double actual_norm = 0.0;
+        double reference_norm = 0.0;
+        float max_error = 0.0f;
+        for (int row = 0; row < live_rows; ++row)
+        {
+            for (int col = 0; col < kv_dim; ++col)
+            {
+                const Q8_1Block &block = blocks[
+                    static_cast<size_t>(row) * blocks_per_row +
+                    col / static_cast<int>(Q8_1Block::BLOCK_SIZE)];
+                const float scale = fp16_to_fp32(block.d);
+                const float actual =
+                    scale * static_cast<float>(block.qs[
+                                col % static_cast<int>(Q8_1Block::BLOCK_SIZE)]);
+                const float expected =
+                    reference.data()[static_cast<size_t>(row) * kv_dim + col];
+                dot += static_cast<double>(actual) * expected;
+                actual_norm += static_cast<double>(actual) * actual;
+                reference_norm += static_cast<double>(expected) * expected;
+                max_error = std::max(max_error, std::abs(actual - expected));
+            }
+        }
+        const double cosine = dot / std::sqrt(actual_norm * reference_norm);
+        EXPECT_GT(cosine, 0.9999) << label << " cosine=" << cosine;
+        EXPECT_LT(max_error, 0.01f) << label << " max_error=" << max_error;
+    };
+    compare_dequantized(actual_k, *K, "K");
+    compare_dequantized(actual_v, *V, "V");
+
+    EXPECT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    EXPECT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+    EXPECT_EQ(cudaFree(device_live_rows), cudaSuccess);
+    workspace_consumer->unbindWorkspace();
+}
+
 // =============================================================================
 // Test: Multi-Precision (BF16)
 // =============================================================================

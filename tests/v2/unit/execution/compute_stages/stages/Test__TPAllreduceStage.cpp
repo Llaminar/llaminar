@@ -657,7 +657,7 @@ TEST_F(Test__TPAllreduceStage, DumpInfoIncludesScalarsLocalTP)
         if (scalar.name == std::string_view("tp_scope"))
         {
             found_tp_scope = true;
-            EXPECT_EQ(static_cast<int>(scalar.value), static_cast<int>(TPScope::LOCAL));
+            EXPECT_EQ(static_cast<int>(scalar.value), static_cast<int>(TPScope::RANK_LOCAL));
         }
     }
     EXPECT_TRUE(found_tp_scope);
@@ -783,7 +783,7 @@ TEST_F(Test__TPAllreduceStage, RecordsBillOfMaterialsForMoERoutedAllreduce)
     EXPECT_EQ(bytes->tags.at("precision"), "fp16");
     EXPECT_EQ(bytes->tags.at("requested_transport_precision"), "fp16");
     EXPECT_EQ(bytes->tags.at("transport_precision"), "fp32");
-    EXPECT_EQ(bytes->tags.at("scope"), "local");
+    EXPECT_EQ(bytes->tags.at("scope"), "rank_local");
     EXPECT_EQ(bytes->tags.at("degree"), "1");
     EXPECT_EQ(bytes->tags.at("no_op"), "true");
 

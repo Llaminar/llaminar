@@ -377,7 +377,7 @@ namespace llaminar2
         /**
          * @brief True when every local participant can execute chained MTP drafts.
          *
-         * NodeLocalTP/GlobalTP uses one rank-wide draft token broadcast.  Chained
+         * NodeTP/GlobalTP uses one rank-wide draft token broadcast.  Chained
          * depth-2/3 drafts are safe only when each rank-local participant can
          * consume the previous sidecar hidden state at the same logical shifted
          * MTP position.

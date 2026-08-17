@@ -128,18 +128,50 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Submit work and wait for completion (blocking)
+         * @brief Report whether the caller is this context's owning worker.
          *
-         * The work function is executed on the dedicated worker thread that owns
-         * the GPU context. This method blocks until the work completes.
+         * Resource adapters use this exact identity when setup code is reached
+         * from within a larger device transaction.  A synchronous nested
+         * submission cannot be placed behind the transaction that is currently
+         * running: doing so would make the worker wait for itself.
          *
-         * @param work Function to execute on worker thread
-         * @throws std::runtime_error if worker thread is not running
-         * @thread_safety Thread-safe, can be called from any thread
-         *
-         * @note The work function has access to all worker-thread-only methods
+         * @return `true` only on the dedicated worker thread for this context.
+         * @thread_safety Thread-safe after context construction completes.
          */
-        virtual void submitAndWait(std::function<void()> work) = 0;
+        virtual bool ownsCurrentThread() const noexcept { return false; }
+
+        /**
+         * @brief Submit work and wait for completion without self-deadlocking.
+         *
+         * Calls made by the owning worker execute inline because queueing them
+         * behind the current transaction would be an impossible dependency.
+         * Calls from every other thread use @ref submitAsync and wait on the
+         * returned future.  `future::get()` deliberately propagates setup and
+         * launch exceptions to the submitting authority.
+         *
+         * @param work Function to execute on the owning worker.
+         * @throws std::invalid_argument if @p work is empty.
+         * @throws std::runtime_error if the worker is not running.
+         * @thread_safety Thread-safe, including calls from the owning worker.
+         *
+         * @note The work function has access to all worker-thread-only methods.
+         */
+        virtual void submitAndWait(std::function<void()> work)
+        {
+            if (!work)
+            {
+                throw std::invalid_argument(
+                    "IWorkerGPUContext::submitAndWait requires work");
+            }
+
+            if (ownsCurrentThread())
+            {
+                work();
+                return;
+            }
+
+            submitAsync(std::move(work)).get();
+        }
 
         /**
          * @brief Submit work without waiting (non-blocking)

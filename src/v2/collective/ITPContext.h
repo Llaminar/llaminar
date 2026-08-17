@@ -21,7 +21,7 @@
  *   NodeLocalPipelineParallel(
  *       LocalTP(0:cuda:0, 0:cuda:1, 0:cuda:2, 0:cuda:3),
  *       LocalTP(1:cuda:0, 1:cuda:1, 1:cuda:2, 1:cuda:3),
- *       NodeLocalTP(0:cpu, 1:cpu)
+ *       NodeTP(0:cpu, 1:cpu)
  *   )
  *
  * This interface enables stages like TPAllreduceStage to work with any scope
@@ -52,7 +52,7 @@ namespace llaminar2
      *
      * Provides the minimal common interface shared by all TP context scopes:
      * - ILocalTPContext (LOCAL scope)
-     * - INodeLocalTPContext (NODE_LOCAL scope)
+     * - INodeTPContext (NODE_LOCAL scope)
      * - IGlobalTPContext (GLOBAL scope)
      *
      * Thread safety: All implementations must be thread-safe for collective operations.
@@ -76,11 +76,11 @@ namespace llaminar2
         /**
          * @brief Check if this is a LOCAL TP context (intra-rank)
          *
-         * Convenience method. Equivalent to scope() == TPScope::LOCAL.
+         * Convenience method. Equivalent to scope() == TPScope::RANK_LOCAL.
          * Code needing LOCAL TP-specific features (BAR registration, device lists)
          * should check this before static_cast<ILocalTPContext*>.
          */
-        bool isLocal() const { return scope() == TPScope::LOCAL; }
+        bool isLocal() const { return scope() == TPScope::RANK_LOCAL; }
 
         /**
          * @brief Check if this is a NODE_LOCAL TP context (cross-rank, same node)

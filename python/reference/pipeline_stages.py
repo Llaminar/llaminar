@@ -64,7 +64,7 @@ class PipelineStage(Enum):
     GDN_NORM_GATE_OUTPUT = auto()   # Output of RMSNormGated (norm + SiLU gate with z)
 
     # === Mixture of Experts ===
-    MOE_ROUTER_OUTPUT = auto()      # Router logits [seq_len, num_experts]
+    MOE_ROUTER_OUTPUT = auto()      # Full post-softmax router probabilities [seq_len, num_experts]
     MOE_ROUTING_INDICES = auto()    # Selected expert IDs [seq_len, top_k] (int as float)
     MOE_ROUTING_WEIGHTS = auto()    # Normalized top-k routing weights [seq_len, top_k]
     MOE_EXPERT_OUTPUT = auto()      # Combined routed expert output [seq_len, d_model]

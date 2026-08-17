@@ -91,6 +91,7 @@ namespace llaminar2
                    slice.col_count == 0 &&
                    slice.expert_start == 0 &&
                    slice.expert_count == 0 &&
+                   slice.expert_ids.empty() &&
                    !slice.inner_is_presliced;
         }
 
@@ -103,6 +104,7 @@ namespace llaminar2
                    slice.col_start == 0 &&
                    slice.expert_start == 0 &&
                    slice.expert_count == 0 &&
+                   slice.expert_ids.empty() &&
                    !slice.inner_is_presliced &&
                    slice.row_count == shape[0] &&
                    slice.col_count == shape[1] &&
@@ -133,6 +135,7 @@ namespace llaminar2
                    stored.col_count == requested.col_count &&
                    stored.expert_start == requested.expert_start &&
                    stored.expert_count == requested.expert_count &&
+                   stored.expert_ids == requested.expert_ids &&
                    stored.inner_is_presliced == requested.inner_is_presliced;
         }
 
@@ -274,15 +277,50 @@ namespace llaminar2
     }
 
     bool PreparedWeightStore::adoptPreparedGemmForBinding(
-        const WeightBinding &binding,
+        WeightBinding &binding,
         DeviceId device)
     {
         if (!binding.tensor || !binding.prepared.has_value())
             return false;
 
         std::lock_guard<std::mutex> lock(mutex_);
-        if (entries_.find(keyFor(binding.binding_id, device)) != entries_.end())
+        const auto exact = entries_.find(keyFor(binding.binding_id, device));
+        if (exact != entries_.end())
+        {
+            const Entry &entry = exact->second;
+            const bool same_canonical_name =
+                !entry.binding.identity.canonical_name.empty() &&
+                entry.binding.identity.canonical_name == binding.identity.canonical_name;
+            const bool same_prepared_kind =
+                binding.prepared->kind == PreparedWeightKind::None ||
+                binding.prepared->kind == entry.ref.kind;
+            if (!same_canonical_name ||
+                !same_prepared_kind ||
+                !compatiblePreparedAdoptionBinding(entry.binding, binding))
+            {
+                throw std::runtime_error(
+                    "PreparedWeightStore stable binding identity collision for " +
+                    binding.identity.canonical_name + " on " + device.to_string());
+            }
+
+            /*
+             * The prepared handle is tensor-affine and may outlive any one
+             * graph.  A repeated materialization must therefore consume the
+             * store-owned tensor, not publish a new pointer as an informal
+             * shadow of the same immutable model value.
+             */
+            binding.tensor_owner = entry.binding.tensor_owner;
+            binding.tensor = entry.binding.tensor;
+            binding.prepared = entry.ref;
+            if (!binding.tensor)
+            {
+                throw std::runtime_error(
+                    "PreparedWeightStore exact binding has no authoritative source tensor for " +
+                    binding.identity.canonical_name + " on " + device.to_string());
+            }
+            binding.tensor->publishPreparedDeviceState();
             return true;
+        }
 
         for (const auto &[id, entry] : entries_)
         {
@@ -315,6 +353,122 @@ namespace llaminar2
         return false;
     }
 
+    bool PreparedWeightStore::adoptPreparedEmbeddingForBinding(
+        WeightBinding &binding,
+        DeviceId device)
+    {
+        if (!binding.tensor)
+            return false;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto exact = embedding_entries_.find(
+            keyFor(binding.binding_id, device));
+        if (exact != embedding_entries_.end())
+        {
+            const EmbeddingEntry &entry = exact->second;
+            const bool same_canonical_name =
+                !entry.binding.identity.canonical_name.empty() &&
+                entry.binding.identity.canonical_name ==
+                    binding.identity.canonical_name;
+            if (!same_canonical_name ||
+                !compatiblePreparedAdoptionBinding(entry.binding, binding) ||
+                !entry.activeHandle())
+            {
+                throw std::runtime_error(
+                    "PreparedWeightStore stable embedding binding identity collision for " +
+                    binding.identity.canonical_name + " on " +
+                    device.to_string());
+            }
+
+            binding.tensor_owner = entry.binding.tensor_owner;
+            binding.tensor = entry.binding.tensor;
+            binding.prepared = entry.ref;
+            binding.tensor->publishPreparedDeviceState();
+            return true;
+        }
+
+        for (const auto &[id, entry] : embedding_entries_)
+        {
+            (void)id;
+            const PreparedEmbeddingHandle *active_handle = entry.activeHandle();
+            if (entry.ref.device != device || !active_handle)
+                continue;
+
+            const bool same_tensor = entry.binding.tensor == binding.tensor;
+            const bool same_canonical_name =
+                !entry.binding.identity.canonical_name.empty() &&
+                entry.binding.identity.canonical_name ==
+                    binding.identity.canonical_name;
+            if ((!same_tensor && !same_canonical_name) ||
+                !compatiblePreparedAdoptionBinding(entry.binding, binding))
+            {
+                continue;
+            }
+
+            validateBindingForStore(
+                binding,
+                model_id_,
+                PreparedWeightKind::PreparedEmbedding);
+
+            /*
+             * Prepared embedding handles are tensor-affine. Preserve the
+             * first model-lifetime tensor as the sole authority when a later
+             * graph materialization assigns the same frozen weight a new
+             * binding id.
+             */
+            binding.tensor_owner = entry.binding.tensor_owner;
+            binding.tensor = entry.binding.tensor;
+            WeightBinding stored = binding;
+            auto ref = makeRef(
+                binding.binding_id,
+                PreparedWeightKind::PreparedEmbedding,
+                device);
+            stored.prepared = ref;
+
+            auto owned = entry.owned_handle;
+            if (!owned)
+            {
+                owned = std::make_shared<PreparedEmbeddingHandle>();
+                owned->tensor = active_handle->tensor;
+                owned->device_id = active_handle->device_id;
+                owned->weights = active_handle->weights;
+            }
+            embedding_entries_[keyFor(ref)] = EmbeddingEntry{
+                std::move(stored),
+                ref,
+                std::move(owned),
+                nullptr,
+            };
+            binding.prepared = ref;
+            binding.tensor->publishPreparedDeviceState();
+            return true;
+        }
+
+        return false;
+    }
+
+    bool PreparedWeightStore::adoptPreparedForBinding(
+        WeightBinding &binding,
+        DeviceId device)
+    {
+        if (!binding.prepared.has_value())
+            return false;
+
+        switch (binding.prepared->kind)
+        {
+        case PreparedWeightKind::CpuPackedGemm:
+        case PreparedWeightKind::CudaInt8PackedGemm:
+        case PreparedWeightKind::RocmInt8PackedGemm:
+            return adoptPreparedGemmForBinding(binding, device);
+        case PreparedWeightKind::PreparedEmbedding:
+            return adoptPreparedEmbeddingForBinding(binding, device);
+        case PreparedWeightKind::None:
+        case PreparedWeightKind::MoeExpertSlab:
+            return false;
+        }
+        return false;
+    }
+
     ITensorGemm *PreparedWeightStore::gemmKernel(const PreparedWeightRef &ref) const
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -338,14 +492,42 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(mutex_);
         const auto key = keyFor(binding_id, device);
         auto it = entries_.find(key);
+        auto emb_it = embedding_entries_.find(key);
+        if (it != entries_.end() && emb_it != embedding_entries_.end())
+            return std::nullopt;
         if (it != entries_.end())
             return it->second.ref;
-
-        auto emb_it = embedding_entries_.find(key);
         if (emb_it != embedding_entries_.end())
             return emb_it->second.ref;
 
         return std::nullopt;
+    }
+
+    std::optional<PreparedWeightRef> PreparedWeightStore::preparedRefForBinding(
+        uint64_t binding_id,
+        DeviceId device,
+        PreparedWeightKind expected_kind) const
+    {
+        if (binding_id == 0 || expected_kind == PreparedWeightKind::None)
+            return std::nullopt;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto key = keyFor(binding_id, device);
+        if (expected_kind == PreparedWeightKind::PreparedEmbedding)
+        {
+            const auto embedding = embedding_entries_.find(key);
+            if (embedding == embedding_entries_.end() ||
+                embedding->second.ref.kind != expected_kind)
+            {
+                return std::nullopt;
+            }
+            return embedding->second.ref;
+        }
+
+        const auto gemm = entries_.find(key);
+        if (gemm == entries_.end() || gemm->second.ref.kind != expected_kind)
+            return std::nullopt;
+        return gemm->second.ref;
     }
 
     ITensorFusedGateUpGemm *PreparedWeightStore::fusedGateUpKernel(
@@ -504,7 +686,8 @@ namespace llaminar2
         auto it = entries_.find(keyFor(ref));
         if (it != entries_.end())
         {
-            return samePreparedRef(it->second.ref, ref);
+            if (samePreparedRef(it->second.ref, ref))
+                return true;
         }
 
         auto emb_it = embedding_entries_.find(keyFor(ref));
@@ -530,6 +713,34 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return entries_.size();
+    }
+
+    size_t PreparedWeightStore::sizeForDevice(DeviceId device) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t count = 0;
+
+        // GEMM and embedding registries use the exact backend+ordinal in their
+        // stable key, so aliases cannot accidentally credit a sibling device.
+        for (const auto &[key, _] : entries_)
+        {
+            if (key.device == device)
+                ++count;
+        }
+        for (const auto &[key, _] : embedding_entries_)
+        {
+            if (key.device == device)
+                ++count;
+        }
+
+        // Expert slabs have their own stable ids but retain the same exact
+        // device identity in the public reference.
+        for (const auto &[_, slab] : expert_slabs_)
+        {
+            if (slab && slab->ref.device == device)
+                ++count;
+        }
+        return count;
     }
 
     void PreparedWeightStore::resetDynamicState()

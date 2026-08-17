@@ -103,6 +103,53 @@ TEST_F(ComputeGraphExecutionTest, LinearChain)
     EXPECT_LT(pos_b, pos_c);
 }
 
+TEST_F(ComputeGraphExecutionTest, ExecutionStageViewTracksOrderAndInvalidatesOnMutation)
+{
+    ComputeGraph graph;
+    auto stage_a = std::make_unique<MockComputeStage>(
+        ComputeStageType::RMS_NORM,
+        "A");
+    auto stage_b = std::make_unique<MockComputeStage>(
+        ComputeStageType::GEMM,
+        "B");
+    MockComputeStage *stage_a_ptr = stage_a.get();
+    MockComputeStage *stage_b_ptr = stage_b.get();
+    graph.addNode("A", std::move(stage_a));
+    graph.addNode("B", std::move(stage_b));
+    graph.addDependency("B", "A");
+
+    const auto &initial_stages = graph.getExecutionStages();
+    ASSERT_EQ(initial_stages.size(), 2);
+    EXPECT_EQ(initial_stages[0], stage_a_ptr);
+    EXPECT_EQ(initial_stages[1], stage_b_ptr);
+    EXPECT_EQ(&initial_stages, &graph.getExecutionStages())
+        << "An unchanged graph should reuse one direct-pointer view.";
+
+    auto replacement_b = std::make_unique<MockComputeStage>(
+        ComputeStageType::GEMM,
+        "B replacement");
+    MockComputeStage *replacement_b_ptr = replacement_b.get();
+    graph.addNode("B", std::move(replacement_b));
+
+    const auto &replaced_stages = graph.getExecutionStages();
+    ASSERT_EQ(replaced_stages.size(), 2);
+    EXPECT_EQ(replaced_stages[0], stage_a_ptr);
+    EXPECT_EQ(replaced_stages[1], replacement_b_ptr);
+
+    auto stage_c = std::make_unique<MockComputeStage>(
+        ComputeStageType::ADD_RESIDUAL,
+        "C");
+    MockComputeStage *stage_c_ptr = stage_c.get();
+    graph.addNode("C", std::move(stage_c));
+    graph.addDependency("C", "B");
+
+    const auto &extended_stages = graph.getExecutionStages();
+    ASSERT_EQ(extended_stages.size(), 3);
+    EXPECT_EQ(extended_stages[0], stage_a_ptr);
+    EXPECT_EQ(extended_stages[1], replacement_b_ptr);
+    EXPECT_EQ(extended_stages[2], stage_c_ptr);
+}
+
 TEST_F(ComputeGraphExecutionTest, DiamondDAG)
 {
     // Diamond pattern:

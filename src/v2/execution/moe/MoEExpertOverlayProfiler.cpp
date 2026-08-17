@@ -1,6 +1,11 @@
 /**
  * @file MoEExpertOverlayProfiler.cpp
- * @brief Lightweight Phase 9A profiling aggregation for MoE expert overlays.
+ * @brief Diagnostic-only aggregation for production MoE expert-overlay evidence.
+ *
+ * This file deliberately observes work after the production graph has selected
+ * routes. It never owns routing, collective ordering, or tensor residency; its
+ * sole job is to expose exact participant-level execution in the campaign CSV
+ * schema and PerfStats stream.
  */
 
 #include "MoEExpertOverlayProfiler.h"
@@ -41,10 +46,19 @@ namespace llaminar2
             return instance;
         }
 
+        /**
+         * @brief Decide whether two observations can be safely accumulated.
+         *
+         * Participant identity is part of this key because two NUMA CPU
+         * endpoints can share a device descriptor while owning different
+         * expert ranges.
+         */
         bool sameKey(const MoEExpertOverlayProfileRow &lhs, const MoEExpertOverlayProfileRow &rhs)
         {
             return lhs.phase == rhs.phase && lhs.layer == rhs.layer &&
-                   lhs.tier_index == rhs.tier_index && lhs.domain == rhs.domain;
+                   lhs.tier_index == rhs.tier_index &&
+                   lhs.participant_id == rhs.participant_id &&
+                   lhs.domain == rhs.domain;
         }
 
         void mergeTextField(std::string &target, const std::string &value)
@@ -60,6 +74,7 @@ namespace llaminar2
                 target += "+" + value;
         }
 
+        /** @brief Add counters and timings from one observation into its aggregate row. */
         void mergeRow(MoEExpertOverlayProfileRow &target, const MoEExpertOverlayProfileRow &row)
         {
             mergeTextField(target.domain_kind, row.domain_kind);
@@ -67,6 +82,7 @@ namespace llaminar2
             target.assigned_experts = std::max(target.assigned_experts, row.assigned_experts);
             target.resident_experts = std::max(target.resident_experts, row.resident_experts);
             target.routed_entries += row.routed_entries;
+            target.active_routes += row.active_routes;
             target.selected_rows += row.selected_rows;
             target.transfer_bytes += row.transfer_bytes;
             target.outbound_bytes += row.outbound_bytes;
@@ -150,6 +166,7 @@ namespace llaminar2
             PerfStatsCollector::Tags tags{
                 {"layer", std::to_string(row.layer)},
                 {"tier", std::to_string(row.tier_index)},
+                {"participant", std::to_string(row.participant_id)},
                 {"domain", row.domain},
                 {"domain_kind", row.domain_kind},
                 {"backend", row.backend},
@@ -207,6 +224,7 @@ namespace llaminar2
             addUnifiedCounterIfNonZero(row, tags, "assigned_experts", row.assigned_experts);
             addUnifiedCounterIfNonZero(row, tags, "resident_experts", row.resident_experts);
             addUnifiedCounterIfNonZero(row, tags, "routed_entries", static_cast<double>(row.routed_entries));
+            addUnifiedCounterIfNonZero(row, tags, "active_routes", static_cast<double>(row.active_routes));
             addUnifiedCounterIfNonZero(row, tags, "selected_rows", static_cast<double>(row.selected_rows));
             addUnifiedCounterIfNonZero(row, tags, "transfer_bytes", static_cast<double>(row.transfer_bytes));
             addUnifiedCounterIfNonZero(row, tags, "outbound_bytes", static_cast<double>(row.outbound_bytes));
@@ -288,8 +306,8 @@ namespace llaminar2
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
         table << fort::header
-              << "Phase" << "Layer" << "Tier" << "Domain" << "Kind" << "Backend"
-              << "Assigned" << "Resident" << "Routed" << "Rows" << "Bytes"
+              << "Phase" << "Layer" << "Tier" << "Participant" << "Domain" << "Kind" << "Backend"
+              << "Assigned" << "Resident" << "Routed" << "Active routes" << "Rows" << "Bytes"
               << "Compute ms" << "Local reduce ms" << "Final reduce ms"
               << "Participants" << "Transport" << "Accumulation"
               << "In rows" << "CPU rows" << "GPU rows" << "Dense saved"
@@ -301,12 +319,14 @@ namespace llaminar2
             table << row.phase
                   << row.layer
                   << row.tier_index
+                  << row.participant_id
                   << row.domain
                   << row.domain_kind
                   << row.backend
                   << row.assigned_experts
                   << row.resident_experts
                   << row.routed_entries
+                  << row.active_routes
                   << row.selected_rows
                   << row.transfer_bytes
                   << formatDouble(row.compute_ms)
@@ -336,8 +356,8 @@ namespace llaminar2
     {
         const auto snapshot = rows();
         std::ostringstream out;
-        out << "phase,layer,tier_index,domain,domain_kind,backend,assigned_experts,resident_experts,"
-            << "routed_entries,selected_rows,transfer_bytes,outbound_bytes,return_bytes,"
+        out << "phase,layer,tier_index,participant_id,domain,domain_kind,backend,assigned_experts,resident_experts,"
+            << "routed_entries,active_routes,selected_rows,transfer_bytes,outbound_bytes,return_bytes,"
             << "compute_ms,domain_reduce_ms,cross_domain_reduce_ms,participant_count,"
             << "executed_experts,transport_mode,final_reduce_mode,accumulation_path,"
             << "inbound_rows,compact_dispatch_bytes,compact_return_bytes,dense_bytes_avoided,"
@@ -348,12 +368,14 @@ namespace llaminar2
             out << csvEscape(row.phase) << ','
                 << row.layer << ','
                 << row.tier_index << ','
+                << row.participant_id << ','
                 << csvEscape(row.domain) << ','
                 << csvEscape(row.domain_kind) << ','
                 << csvEscape(row.backend) << ','
                 << row.assigned_experts << ','
                 << row.resident_experts << ','
                 << row.routed_entries << ','
+                << row.active_routes << ','
                 << row.selected_rows << ','
                 << row.transfer_bytes << ','
                 << row.outbound_bytes << ','
@@ -462,9 +484,21 @@ namespace llaminar2
             if (tier.tier_index >= 0 && static_cast<size_t>(tier.tier_index) < routed_tiers.size())
             {
                 const auto &routed_tier = routed_tiers[static_cast<size_t>(tier.tier_index)];
-                row.resident_experts = routed_tier.max_experts_per_layer > 0
-                                           ? routed_tier.max_experts_per_layer
-                                           : row.assigned_experts;
+                if (!routed_tier.resolved_live_experts_per_layer.empty() &&
+                    layer >= 0 && static_cast<size_t>(layer) <
+                                      routed_tier.resolved_live_experts_per_layer.size())
+                {
+                    row.resident_experts =
+                        routed_tier.resolved_live_experts_per_layer[
+                            static_cast<size_t>(layer)];
+                }
+                else
+                {
+                    row.resident_experts =
+                        routed_tier.max_experts_per_layer > 0
+                            ? routed_tier.max_experts_per_layer
+                            : row.assigned_experts;
+                }
                 row.transport_mode = routed_tier.fallback ? "fallback" : toString(tier.transfer_mode);
             }
             else
@@ -518,12 +552,20 @@ namespace llaminar2
         recordRow(std::move(row));
     }
 
+    /**
+     * @brief Store one local-expert observation without changing execution ownership.
+     *
+     * Zero-work calls are intentional: they preserve proof that a participant
+     * was scheduled even when its mask admitted no routes.
+     */
     void MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
         int layer,
         int tier_index,
+        int participant_id,
         const std::string &device_key,
         bool is_cpu,
-        size_t input_rows,
+        size_t inbound_rows,
+        size_t active_routes,
         size_t output_rows,
         std::vector<int> unique_expert_ids,
         double compute_ms)
@@ -535,16 +577,19 @@ namespace llaminar2
         row.phase = "gn_local_expert";
         row.layer = layer;
         row.tier_index = tier_index;
+        row.participant_id = participant_id;
         row.domain = device_key.empty() ? "unknown" : device_key;
         row.domain_kind = is_cpu ? "CPU" : "GPU";
-        row.selected_rows = input_rows;
-        row.inbound_rows = output_rows;
+        row.selected_rows = output_rows;
+        row.inbound_rows = inbound_rows;
+        row.routed_entries = active_routes;
+        row.active_routes = active_routes;
         row.assigned_experts = static_cast<int>(unique_expert_ids.size());
         row.resident_experts = row.assigned_experts;
         row.compute_ms = compute_ms;
         row.transport_mode = "local";
-        row.cpu_fallback_rows = is_cpu ? input_rows : 0;
-        row.gpu_cached_rows = is_cpu ? 0 : input_rows;
+        row.cpu_fallback_rows = is_cpu ? output_rows : 0;
+        row.gpu_cached_rows = is_cpu ? 0 : output_rows;
         row.executed_experts = joinInts(std::move(unique_expert_ids));
         row.accumulation_path = is_cpu ? "CPU" : "GPU";
         recordRow(std::move(row));

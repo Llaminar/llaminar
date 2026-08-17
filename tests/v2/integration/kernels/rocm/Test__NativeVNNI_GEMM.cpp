@@ -47,7 +47,9 @@
 #include <vector>
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "backends/rocm/HIPGraphCapture.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 #include "../../../utils/TestTensorFactory.h"
@@ -579,27 +581,20 @@ namespace
             << "Packed IQ3_S native-VNNI GDN padded prefill warmup failed";
         ASSERT_TRUE(waitForROCmTestBoundary(stream_));
 
-        ASSERT_EQ(hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal), hipSuccess);
+        HIPGraphCapture capture(stream_, 0);
+        ScopedBackendGraphCapture capture_transaction(
+            capture,
+            "NativeVNNIGEMMTest.IQ3S_GDNPaddedPrefillFusedProjectionGraphCaptures");
+        ASSERT_TRUE(capture_transaction.begin());
         const bool launch_ok = qkv_kernel.multiply_fused_tensor(
             input.get(), projections, M, K);
-        hipGraph_t graph = nullptr;
-        const hipError_t end_capture_status = hipStreamEndCapture(stream_, &graph);
+        capture_transaction.finish();
 
         ASSERT_TRUE(launch_ok)
             << "Packed IQ3_S native-VNNI GDN padded prefill launch failed during graph capture";
-        ASSERT_EQ(end_capture_status, hipSuccess)
-            << hipGetErrorString(end_capture_status);
-        ASSERT_NE(graph, nullptr);
-
-        hipGraphExec_t exec = nullptr;
-        ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
-        ASSERT_EQ(hipGraphLaunch(exec, stream_), hipSuccess);
+        ASSERT_TRUE(capture.instantiate());
+        ASSERT_TRUE(capture.launch());
         ASSERT_TRUE(waitForROCmTestBoundary(stream_));
-
-        if (exec)
-            (void)hipGraphExecDestroy(exec);
-        if (graph)
-            (void)hipGraphDestroy(graph);
         qkv_kernel.unbindWorkspace();
         z_kernel.unbindWorkspace();
 #endif

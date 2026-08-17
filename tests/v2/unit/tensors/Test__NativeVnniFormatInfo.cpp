@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <functional>
 #include <memory>
 #include <string>
@@ -65,7 +66,56 @@ namespace
          [] { return TestTensorFactory::createQ8_0Random({2, 256}); }},
         {"Q8_1", 20, 32, false, false, false,
          [] { return TestTensorFactory::createQ8_1Random({2, 256}); }},
+        {"Q8_K", 21, 32, false, true, false,
+         [] { return TestTensorFactory::createQ8_KRandom({2, 256}); }},
     };
+}
+
+TEST(Test__NativeVnniFormatInfo, SourceIdentitiesAreExhaustiveUniqueAndCanonical)
+{
+    ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), 21u);
+    ASSERT_EQ(native_vnni_formats::kAllSourceFormats.size(), kExpectations.size());
+
+    for (size_t i = 0; i < native_vnni_formats::kAllSourceFormats.size(); ++i)
+    {
+        const NativeVnniSourceFormat &entry =
+            native_vnni_formats::kAllSourceFormats[i];
+        ASSERT_NE(entry.metadata, nullptr) << entry.quant_type;
+        EXPECT_EQ(
+            native_vnni_formats::forQuantType(entry.quant_type),
+            entry.metadata)
+            << entry.quant_type;
+        EXPECT_EQ(
+            native_vnni_formats::forSourceIdentity(
+                entry.metadata->codebook_id,
+                entry.metadata->is_superblock),
+            entry.metadata)
+            << entry.quant_type;
+
+        const uint8_t expected_device_codebook =
+            entry.metadata->codebook_id == 20 ||
+                    entry.metadata->codebook_id == 21
+                ? static_cast<uint8_t>(19)
+                : entry.metadata->codebook_id;
+        EXPECT_EQ(
+            canonicalDeviceVnniCodebookId(entry.metadata->codebook_id),
+            expected_device_codebook)
+            << entry.quant_type;
+
+        for (size_t j = i + 1;
+             j < native_vnni_formats::kAllSourceFormats.size();
+             ++j)
+        {
+            const NativeVnniSourceFormat &other =
+                native_vnni_formats::kAllSourceFormats[j];
+            ASSERT_NE(other.metadata, nullptr) << other.quant_type;
+            EXPECT_FALSE(
+                entry.metadata->codebook_id == other.metadata->codebook_id &&
+                entry.metadata->is_superblock == other.metadata->is_superblock)
+                << entry.quant_type << " and " << other.quant_type
+                << " have an ambiguous migration identity";
+        }
+    }
 }
 
 TEST(Test__NativeVnniFormatInfo, TensorMetadataMatchesPerfSweepCodebookIds)
@@ -123,5 +173,54 @@ TEST(Test__NativeVnniFormatInfo, PackedRegionSizingMatchesCanonicalMetadata)
             expected.has_emins
                 ? blocks * sizeof(uint32_t)
                 : 0);
+    }
+}
+
+TEST(Test__NativeVnniFormatInfo, MigrationStableAndReusableFormatsCoverEveryCodebook)
+{
+    for (const auto &expected : kExpectations)
+    {
+        SCOPED_TRACE(expected.name);
+        const NativeVnniFormatInfo *source =
+            native_vnni_formats::forQuantType(expected.name);
+        ASSERT_NE(source, nullptr);
+
+        const auto migrated = migrationStableDeviceVnniFormat(*source);
+        const int expected_migrated_payload =
+            source->codebook_id == 8
+                ? 24
+                : (source->codebook_id == 0 ||
+                           source->codebook_id == 4 ||
+                           source->codebook_id == 5
+                       ? 16
+                       : 32);
+        const uint8_t expected_migrated_codebook =
+            expected_migrated_payload < 32
+                ? canonicalDeviceVnniCodebookId(source->codebook_id)
+                : (source->is_asymmetric
+                       ? kNativeVnniExpandedInt8MinCodebook
+                       : static_cast<uint8_t>(19));
+        EXPECT_EQ(
+            migrated.payload_bytes_per_block,
+            expected_migrated_payload);
+        EXPECT_EQ(migrated.codebook_id, expected_migrated_codebook);
+        EXPECT_EQ(migrated.is_asymmetric, source->is_asymmetric);
+        EXPECT_FALSE(migrated.has_emins);
+        EXPECT_TRUE(deviceVnniExecutionCompatibleWithSource(
+            *source, migrated.codebook_id));
+
+        const auto allocation =
+            reusableDeviceVnniAllocationFormat(*source);
+        EXPECT_EQ(
+            allocation.payload_bytes_per_block,
+            std::max(source->payload_bytes, expected_migrated_payload));
+        EXPECT_EQ(allocation.has_mins, source->is_asymmetric);
+        EXPECT_EQ(allocation.has_emins, source->has_emins);
+        EXPECT_GE(
+            allocation.payload_bytes_per_block,
+            source->payload_bytes);
+        EXPECT_GE(
+            allocation.payload_bytes_per_block,
+            migrated.payload_bytes_per_block);
     }
 }

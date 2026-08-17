@@ -502,12 +502,14 @@ namespace llaminar2
     };
 
     /**
-     * @brief Cached full forward graph for decode mode
+     * @brief Cached full forward topology for exact-shape forward execution.
      *
-     * During decode (seq_len=1), the graph structure is identical between
-     * steps — only token_ids, position_ids, and position_offset change.
-     * Instead of rebuilding hundreds of stage objects every forward() call,
-     * we cache the graph and its stages after the first decode step.
+     * Decode and exact CPU prefill both have stable topology for a matching
+     * signature; only request-owned token, position, and runtime state changes.
+     * Instead of rebuilding hundreds of stage objects and their persistent
+     * kernel scratch every forward call, this object owns the graph after first
+     * materialization. GPU prefill additionally attaches its native captured
+     * executable through @ref prefill_graph_cache.
      *
      * Stable buffers (token_ids, position_ids) are owned here so that
      * cached stages' pointers remain valid across calls.
@@ -550,6 +552,15 @@ namespace llaminar2
         // kernels consume real token counts instead of padded rows.
         std::vector<IComputeStage *> prefill_replay_param_stages;
         bool prefill_replay_param_stages_cached = false;
+
+        /**
+         * Sparse MoE manual boundaries that consume root-authoritative wire
+         * transaction identity. These pointers are cached separately from
+         * ordinary dynamic parameters because capture/replay lifecycle must
+         * never be allowed to alter distributed key ordering.
+         */
+        std::vector<IComputeStage *> moe_overlay_collective_runtime_stages;
+        bool moe_overlay_collective_runtime_stages_cached = false;
 
         // Tracks whether setGPUStream has been applied to all stages.
         // Decode graph replay reapplies the capture stream before dynamic
@@ -615,8 +626,8 @@ namespace llaminar2
         /// Latest diagnostic metadata for bucketed/chunked prefill graph execution.
         PrefillGraphExecutionObservation last_prefill_graph_observation;
 
-        /// Monotonic engine-level LRU tick for bucketed prefill forward-cache eviction.
-        uint64_t bucketed_prefill_last_access_tick = 0;
+        /// Monotonic engine-level LRU tick for all reusable prefill topology entries.
+        uint64_t prefill_last_access_tick = 0;
 
         /// Explicit stream for prefill warmup/capture/replay.
         CachedGraphStream prefill_capture_stream;
@@ -644,7 +655,7 @@ namespace llaminar2
         void *outputProducerStream(bool is_decode,
                                    bool used_graph_replay) const noexcept
         {
-            if (is_decode && used_graph_replay)
+            if (used_graph_replay)
                 return segment_cache.capture_stream;
             if (!is_decode && prefill_capture_stream.stream)
                 return prefill_capture_stream.stream;
@@ -847,7 +858,7 @@ namespace llaminar2
                 prefill_graph_cache->invalidateAll();
             last_prefill_graph_observation = {};
             prefill_capture_stream.reset();
-            bucketed_prefill_last_access_tick = 0;
+            prefill_last_access_tick = 0;
             graph.reset();
             snapshot_manifest.clear();
             snapshot_configuration_epoch = 0;
@@ -860,6 +871,8 @@ namespace llaminar2
             dynamic_param_stages_cached = false;
             prefill_replay_param_stages.clear();
             prefill_replay_param_stages_cached = false;
+            moe_overlay_collective_runtime_stages.clear();
+            moe_overlay_collective_runtime_stages_cached = false;
             gpu_stream_applied = false;
             applied_stream = nullptr;
             gpu_stream = nullptr;

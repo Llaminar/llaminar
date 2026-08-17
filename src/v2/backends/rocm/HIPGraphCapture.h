@@ -39,6 +39,8 @@ namespace llaminar2
         bool instantiate() override;
         bool launch() override;
         [[nodiscard]] bool launchOnStream(void *stream) const override;
+        bool buildOrderedTimelineTransaction(
+            std::span<const GPUOrderedTimelineStep> ordered_steps) override;
         [[nodiscard]] void *executionStream() const noexcept override
         {
             return static_cast<void *>(stream_);
@@ -57,6 +59,8 @@ namespace llaminar2
         hipGraph_t graph() const { return graph_; }
         /// @return The underlying HIP graph executable (may be nullptr)
         hipGraphExec_t executable() const { return exec_; }
+        /// @return Immutable ROCm ordinal owning this graph.
+        int deviceOrdinal() const noexcept { return device_ordinal_; }
 
     private:
         /** @brief Select the immutable HIP owner before a runtime operation. */

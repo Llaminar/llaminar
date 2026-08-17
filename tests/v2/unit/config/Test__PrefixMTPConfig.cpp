@@ -8,6 +8,7 @@
 
 #include "config/OrchestrationConfigParser.h"
 #include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "models/GraphTypes.h"
 #include "utils/DebugEnv.h"
@@ -571,42 +572,42 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
 }
 
 /**
- * @brief Every shape-dependent GPU forward family requires eager publication.
+ * @brief Every shape-dependent forward family requires eager publication.
  *
  * The serial stochastic oracle intentionally disables MTP while preserving the
- * production phase-split dense policy. This matrix locks in that replicated or
- * mirrored decode topology and Dynamic MoE maintenance are independently
- * sufficient to require eager graph family planning; otherwise prefill can
- * capture a smaller workspace before compact decode or the maintenance graph
- * publishes its additional requirements.
+ * production phase-split dense policy. This matrix locks in replicated or
+ * mirrored decode topology and ExpertOverlay graph families; durable MoE
+ * maintenance itself runs through the background RCU authority and does not
+ * install a second graph-side Dynamic family.
  */
-TEST(Test__PrefixMTPConfig, ShapeDependentGPUForwardPoliciesRequireEagerFamilyManifest)
+TEST(Test__PrefixMTPConfig, ShapeDependentForwardPoliciesRequireEagerFamilyManifest)
 {
     GraphConfig config;
     config.dense_tp_enabled = true;
 
-    EXPECT_FALSE(config.requiresEagerGPUWorkspaceFamilyManifest());
+    EXPECT_FALSE(config.requiresEagerWorkspaceFamilyManifest());
 
     config.mtp.enabled = true;
-    EXPECT_TRUE(config.requiresEagerGPUWorkspaceFamilyManifest());
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest())
+        << "CPU stages and captured GPU graphs both retain bound workspace addresses";
 
     config.mtp.enabled = false;
     config.dense_tp_decode_replicated = true;
-    EXPECT_TRUE(config.requiresEagerGPUWorkspaceFamilyManifest());
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest());
 
     config.dense_tp_decode_replicated = false;
     config.dense_tp_decode_mirrored_embedding = true;
-    EXPECT_TRUE(config.requiresEagerGPUWorkspaceFamilyManifest());
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest());
 
     config.dense_tp_enabled = false;
-    EXPECT_FALSE(config.requiresEagerGPUWorkspaceFamilyManifest())
+    EXPECT_FALSE(config.requiresEagerWorkspaceFamilyManifest())
         << "A replicated single-device graph has no phase-split TP topology";
 
-    config.moe.rebalance_mode = MoERebalanceMode::DYNAMIC;
-    EXPECT_TRUE(config.requiresEagerGPUWorkspaceFamilyManifest())
-        << "Dynamic MoE adds maintenance and decode route-apply participants";
-
-    config.moe.rebalance_mode = MoERebalanceMode::OBSERVE;
-    EXPECT_FALSE(config.requiresEagerGPUWorkspaceFamilyManifest())
-        << "Observe mode does not add a maintenance or route-apply graph";
+    config.moe.routed_expert_plan =
+        std::make_shared<MoERoutedExpertPlacementPlan>();
+    config.moe.routed_expert_plan->enabled = true;
+    config.moe.routed_expert_plan->topology =
+        RoutedExpertPlacementTopology::TieredOverlay;
+    EXPECT_TRUE(config.requiresEagerWorkspaceFamilyManifest())
+        << "Tiered overlay startup must resolve every participant's initial prepared bank";
 }

@@ -518,12 +518,16 @@ namespace llaminar2
             return nullptr;
         }
 
-        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override
+        void packVnniBlock(
+            const VnniPackContext &ctx,
+            int source_n,
+            int destination_n,
+            int b) const override
         {
             auto *unpackable = dynamic_cast<const IINT8Unpackable *>(inner());
             if (unpackable)
             {
-                unpackable->packVnniBlock(ctx, n, b);
+                unpackable->packVnniBlock(ctx, source_n, destination_n, b);
             }
         }
 

@@ -10,6 +10,8 @@
  */
 
 #include "ROCmNativeVNNIGemmShard.h"
+#include "../../../tensors/NativeVnniFormatInfo.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <array>
 #include <cstddef>
@@ -68,10 +70,19 @@ constexpr ROCmNativeVNNIGemmShardFn shardForCodebook(uint8_t codebook_id)
         return rocmGemm_native_vnni_fp32_shard_6;
     case 17:
     case 19:
+    case llaminar2::kNativeVnniExpandedInt8MinCodebook:
         return rocmGemm_native_vnni_fp32_shard_7;
     default:
         return nullptr;
     }
+}
+
+/** @brief Preserve legacy policy semantics for a self-describing decoder. */
+constexpr uint8_t defaultArithmeticPolicyCodebook(uint8_t codebook_id)
+{
+    return codebook_id == llaminar2::kNativeVnniExpandedInt8MinCodebook
+               ? static_cast<uint8_t>(19)
+               : codebook_id;
 }
 
 constexpr std::array<ROCmNativeVNNIGridInitShardFn, 8> kGridInitializers = {
@@ -174,6 +185,78 @@ extern "C" bool rocmNativeVNNIPrefill_getLastLaunchResources(
            attributes.maxThreadsPerBlock >= selection.block_threads;
 }
 
+/**
+ * @brief Dispatch prefill with separate physical and arithmetic identities.
+ *
+ * The physical codebook selects a shard and decoder. The arithmetic policy
+ * codebook is forwarded unchanged so that every cooperative row reproduces
+ * the source format's serial-M1 split tree after cross-tier normalization.
+ */
+extern "C" bool rocmGemm_native_vnni_fp32_with_policy(
+    const int8_t *d_A_int8,
+    const uint8_t *d_payload,
+    const void *d_block_scales,
+    const void *d_block_mins,
+    const void *d_block_emins,
+    float *d_output,
+    const float *d_scales_A,
+    const float *d_scales_A_blockwise,
+    int M,
+    int N,
+    int K,
+    uint8_t codebook_id,
+    uint8_t arithmetic_policy_codebook_id,
+    int device_id,
+    void *stream)
+{
+    const ROCmNativeVNNIGemmShardFn shard = shardForCodebook(codebook_id);
+    if (!shard)
+    {
+        std::fprintf(
+            stderr,
+            "[rocmGemm_native_vnni_fp32] unsupported codebook_id=%u\n",
+            static_cast<unsigned>(codebook_id));
+        return false;
+    }
+
+    const bool launched = shard(
+        d_A_int8,
+        d_payload,
+        d_block_scales,
+        d_block_mins,
+        d_block_emins,
+        d_output,
+        d_scales_A,
+        d_scales_A_blockwise,
+        M,
+        N,
+        K,
+        codebook_id,
+        arithmetic_policy_codebook_id,
+        device_id,
+        stream);
+
+    if (launched && llaminar2::PerfStatsCollector::isEnabled())
+    {
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "rocm_native_vnni_prefill_launch",
+            1.0,
+            "gemm",
+            "rocm:" + std::to_string(device_id),
+            llaminar2::PerfStatsCollector::Tags{
+                {"codebook", std::to_string(static_cast<int>(codebook_id))},
+                {"arithmetic_policy_codebook",
+                 std::to_string(
+                     static_cast<int>(arithmetic_policy_codebook_id))},
+                {"m", std::to_string(M)},
+                {"n", std::to_string(N)},
+                {"k", std::to_string(K)}});
+    }
+    return launched;
+}
+
+/** @brief Dispatch self-describing prefill through the explicit policy ABI. */
 extern "C" bool rocmGemm_native_vnni_fp32(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
@@ -190,17 +273,7 @@ extern "C" bool rocmGemm_native_vnni_fp32(
     int device_id,
     void *stream)
 {
-    const ROCmNativeVNNIGemmShardFn shard = shardForCodebook(codebook_id);
-    if (!shard)
-    {
-        std::fprintf(
-            stderr,
-            "[rocmGemm_native_vnni_fp32] unsupported codebook_id=%u\n",
-            static_cast<unsigned>(codebook_id));
-        return false;
-    }
-
-    return shard(
+    return rocmGemm_native_vnni_fp32_with_policy(
         d_A_int8,
         d_payload,
         d_block_scales,
@@ -213,6 +286,7 @@ extern "C" bool rocmGemm_native_vnni_fp32(
         N,
         K,
         codebook_id,
+        defaultArithmeticPolicyCodebook(codebook_id),
         device_id,
         stream);
 }

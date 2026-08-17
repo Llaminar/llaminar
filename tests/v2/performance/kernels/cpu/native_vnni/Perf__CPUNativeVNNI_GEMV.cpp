@@ -273,6 +273,37 @@ namespace
         int world_size_ = 1;
     };
 
+    /**
+     * @brief Prove a promotion-grade CPU timing process has no MPI co-run peer.
+     *
+     * Independent socket-local workloads can alter package power, cache, and
+     * memory-pressure state enough to reverse the ordering of decode schedule
+     * candidates. Because production dispatch has no discriminator for an
+     * unrelated peer's current shape or candidate, such timings cannot train or
+     * certify a total policy. Paired M=1 and grouped-verifier evidence therefore
+     * runs in a one-rank MPI world; violating that contract is fatal before any
+     * timing row can be published.
+     *
+     * @return The authenticated MPI world size, always one.
+     * @throws std::runtime_error if MPI is unavailable or a co-run rank exists.
+     */
+    int requireProcessIsolatedCPUPairedTiming()
+    {
+        int initialized = 0;
+        if (MPI_Initialized(&initialized) != MPI_SUCCESS || !initialized)
+            throw std::runtime_error(
+                "CPU paired timing requires an initialized MPI runtime");
+        int world_size = 0;
+        if (MPI_Comm_size(MPI_COMM_WORLD, &world_size) != MPI_SUCCESS)
+            throw std::runtime_error(
+                "MPI_Comm_size failed while authenticating CPU paired timing");
+        if (world_size != 1)
+            throw std::runtime_error(
+                "CPU paired timing requires process isolation: MPI world size " +
+                std::to_string(world_size) + " is not one");
+        return world_size;
+    }
+
     // =========================================================================
     // System roofline — measured via STREAM-like calibration
     // =========================================================================
@@ -502,7 +533,7 @@ namespace
      * Production inference and CTest normally enter through the launcher/MPI
      * wrapper, which sets socket-aware OpenMP placement.  Directly launching
      * this perf binary on a large dual-socket host leaves libgomp free to use
-     * every hardware thread, turning the tiny M=2..4 verifier probe into a
+     * every hardware thread, turning the compact verifier-row probe into a
      * scheduler and cross-socket migration benchmark.  Explicit user settings
      * remain authoritative; this helper only supplies a sane local default for
      * the verifier-row microbench when no threading policy was provided.
@@ -534,38 +565,6 @@ namespace
                 max_threads,
                 kStandaloneThreadCap);
         }
-    }
-
-    /**
-     * @brief Capture the exact persistent OpenMP team used by one CPU launch.
-     *
-     * Linux performance events attached to the process leader cannot be reset
-     * atomically across already-inherited worker events. The profiler instead
-     * opens one event group against every concrete worker TID after warmup has
-     * established libgomp's team. Indexing by OpenMP thread number keeps the
-     * main thread at element zero, which lets `LinuxPerfControl` exclude its
-     * own enable/disable syscalls from the measured main-thread interval.
-     *
-     * @return Worker TIDs ordered by stable OpenMP thread number.
-     */
-    std::vector<pid_t> captureOpenMPProfilerThreadIds()
-    {
-        std::vector<pid_t> thread_ids(
-            static_cast<size_t>(omp_get_max_threads()),
-            static_cast<pid_t>(-1));
-#pragma omp parallel shared(thread_ids)
-        {
-            const int thread_number = omp_get_thread_num();
-            thread_ids[static_cast<size_t>(thread_number)] =
-                static_cast<pid_t>(::syscall(SYS_gettid));
-        }
-        if (std::find(thread_ids.begin(), thread_ids.end(), -1) !=
-            thread_ids.end())
-        {
-            throw std::runtime_error(
-                "OpenMP profiler failed to capture every worker TID");
-        }
-        return thread_ids;
     }
 
     /**
@@ -783,31 +782,6 @@ namespace
 
         std::vector<CPUProfilerBatchRequest> requests_;
     };
-
-    /**
-     * @brief Profile one exact CPU request using reusable per-worker events.
-     */
-    template <typename Launch>
-    void profileExactCPURequest(
-        native_vnni_dispatch::LinuxPerfControl &control,
-        const std::string &request_id,
-        const std::string &output_path,
-        Launch &&launch)
-    {
-        control.rebind(request_id, output_path);
-        if (!control.prepared())
-            control.prepare(captureOpenMPProfilerThreadIds());
-        const auto parallel_perf_control = [](auto &&action)
-        {
-#pragma omp parallel
-            {
-                action(static_cast<size_t>(omp_get_thread_num()));
-            }
-        };
-        control.begin(parallel_perf_control);
-        launch();
-        control.end(parallel_perf_control);
-    }
 
     /**
      * @brief Read a comma-separated environment variable as lowercase tokens.
@@ -1242,8 +1216,15 @@ namespace
         std::string effective_policy;
         std::string build_isa;
         std::string isa;
+        std::string execution_route;
+        std::string task_grid;
         int k_tiles = 0;
+        int policy_n = 0;
+        int ambient_n_block_chunks = 0;
         int n_block_chunks = 0;
+        int physical_row_tile = 0;
+        int64_t producer_tasks = 0;
+        int64_t reduction_tasks = 0;
         int threads = 0;
         uint64_t count = 0;
     };
@@ -1284,12 +1265,68 @@ namespace
             result.effective_policy = tag("effective_policy");
             result.build_isa = tag("build_isa");
             result.isa = tag("isa");
+            result.execution_route = tag("route");
+            result.task_grid = tag("task_grid");
             result.k_tiles = std::stoi(tag("k_tiles"));
+            result.policy_n = std::stoi(tag("policy_n"));
+            result.ambient_n_block_chunks =
+                std::stoi(tag("ambient_n_block_chunks"));
             result.n_block_chunks = std::stoi(tag("n_block_chunks"));
+            result.physical_row_tile =
+                std::stoi(tag("physical_row_tile"));
+            result.producer_tasks = std::stoll(tag("producer_tasks"));
+            result.reduction_tasks = std::stoll(tag("reduction_tasks"));
             result.threads = std::stoi(tag("threads"));
             result.count += record.count;
         }
         return result;
+    }
+
+    /**
+     * @brief Validate one direct grouped launch against its resolved task grid.
+     *
+     * Candidate labels alone are not sufficient evidence: two nominal labels
+     * can otherwise describe the same normalized N grid, or a stale launcher
+     * can publish the right label while using a different row/K decomposition.
+     * Keep the complete comparison in one helper shared by canonical timing and
+     * isolated profiler launches so neither evidence path can weaken the other.
+     *
+     * @param route PerfStats identity emitted by the production entry point.
+     * @param expected Resolver-owned physical schedule for this exact shape.
+     * @param requested_policy Explicit policy name supplied by the harness.
+     * @param build_isa Maximum ISA compiled into the measured binary.
+     * @param runtime_isa Effective ISA used by the launch.
+     * @param k_tiles Frozen serial-M1 K partition count.
+     * @param policy_n Logical N used by generated dispatch.
+     * @param threads OpenMP team width used by the launch.
+     * @return True only when every launch-identity field agrees.
+     */
+    bool matchesCPUVerifierRouteIdentity(
+        const CPUVerifierRouteEvidence &route,
+        const VerifierRowsScheduleResolution &expected,
+        std::string_view requested_policy,
+        std::string_view build_isa,
+        std::string_view runtime_isa,
+        int k_tiles,
+        int policy_n,
+        int threads)
+    {
+        return route.found &&
+               route.requested_policy == requested_policy &&
+               route.effective_policy ==
+                   verifierRowsPolicyName(expected.effective) &&
+               route.build_isa == build_isa && route.isa == runtime_isa &&
+               route.execution_route ==
+                   verifierRowsExecutionRouteName(expected.route) &&
+               route.task_grid == verifierRowsTaskGridName(expected.task_grid) &&
+               route.k_tiles == k_tiles && route.policy_n == policy_n &&
+               route.ambient_n_block_chunks ==
+                   expected.ambient_n_block_chunks &&
+               route.n_block_chunks == expected.n_block_chunks &&
+               route.physical_row_tile == expected.physical_row_tile &&
+               route.producer_tasks == expected.producer_tasks &&
+               route.reduction_tasks == expected.reduction_tasks &&
+               route.threads == threads;
     }
 
     /** Route identity observed from the real production M=1 entry point. */
@@ -1775,16 +1812,17 @@ namespace
     }
 
     /**
-     * @brief Create the exact eager prepared-weight layout needed by one
-     *        isolated CPU profiler launch without regenerating source weights.
+     * @brief Create the exact eager prepared-weight layout needed by one CPU
+     *        NativeVNNI dispatch-evidence cell.
      *
-     * Canonical trainer observations construct a real quantized tensor, run
-     * the production packer, prove byte equality, and measure latency. The
-     * profiler transaction augments that immutable observation with hardware
-     * counters for exactly one already-identified prepared kernel candidate.
-     * Recreating a multi-gigabyte source tensor and decoding it into the same
-     * eager layout before every isolated counter launch adds no profiler
-     * signal; it only makes fixture setup dominate corpus collection.
+     * Dispatch fitting measures the prepared GEMV/GEMM kernel, not source
+     * tensor generation or model-load packing. Recreating a multi-gigabyte
+     * random tensor for every `(format, shape, ISA)` cell previously left all
+     * but one OpenMP worker idle and made fixture setup dominate collection.
+     * The exhaustive real-source all-format tests independently prove packing
+     * and serial-row byte equivalence. Canonical timing, paired confirmation,
+     * and isolated profiling can therefore construct the already-prepared
+     * layout directly while still entering the production kernel launcher.
      *
      * This helper obtains intrinsic codebook metadata from a tiny real tensor,
      * then constructs the same aligned interleaved dimensions and metadata
@@ -1795,9 +1833,10 @@ namespace
      * dependent control flow, so the instruction stream and memory geometry
      * are identical to a normally packed invocation.
      *
-     * @warning This is profiler-fixture construction only. Correctness,
-     *          canonical timing, dispatch installation, and production
-     *          inference must always use the real source-format packer.
+     * @warning This fixture is evidence-harness infrastructure only. It may
+     *          certify prepared-kernel arithmetic and economy after the real
+     *          source packer passes its dedicated all-format gate; production
+     *          inference must always prepare actual model weights.
      *
      * @param format Source tensor format whose intrinsic metadata is required.
      * @param N Output-row count of the exact profiled geometry.
@@ -1805,7 +1844,7 @@ namespace
      * @return Fully owned eager prepared weights accepted by the production
      *         CPU NativeVNNI GEMV/GEMM entry points.
      */
-    CPUNativeVNNIPackedWeights createProfilerPackedWeightsForFormat(
+    CPUNativeVNNIPackedWeights createDispatchEvidencePackedWeightsForFormat(
         const FormatSpec &format,
         int N,
         int K)
@@ -1840,11 +1879,30 @@ namespace
         packed.codebook_id = metadata->codebook_id;
         packed.is_asymmetric = metadata->is_asymmetric;
         packed.is_superblock = metadata->is_superblock;
-        packed.is_nibble_lut = is_nibble_lut_format(metadata->codebook_id);
-        packed.data_stride = packed.is_nibble_lut ? 1024 : 2048;
-        packed.interleaved_block_stride =
-            packed.data_stride + 256 +
-            (packed.is_asymmetric ? 128 : 0);
+        packed.encoding = is_nibble_lut_format(metadata->codebook_id)
+                              ? CPUNativeVNNIEncoding::NibbleLUT
+                          : metadata->codebook_id == 8
+                              ? CPUNativeVNNIEncoding::Q6KNativeDualScale
+                              : CPUNativeVNNIEncoding::ExpandedInt8;
+        if (packed.usesNibbleLUT())
+        {
+            packed.data_stride = 1024;
+            packed.interleaved_block_stride =
+                packed.data_stride + 256 +
+                (packed.is_asymmetric ? 128 : 0);
+        }
+        else if (packed.usesQ6KNativeDualScale())
+        {
+            packed.data_stride = 1536;
+            packed.interleaved_block_stride = 1792;
+        }
+        else
+        {
+            packed.data_stride = 2048;
+            packed.interleaved_block_stride =
+                packed.data_stride + 256 +
+                (packed.is_asymmetric ? 128 : 0);
+        }
 
         const size_t n_chunks =
             static_cast<size_t>(packed.N_padded / 64);
@@ -1874,9 +1932,10 @@ namespace
             }
 
             // Overwrite inline metadata with finite values at exactly the
-            // offsets consumed by the production kernels. Compensation is a
-            // diagnostic value here: canonical numerical evidence comes from
-            // the real packed tensor, outside isolated profiling.
+            // offsets consumed by the production kernels. The fixture's
+            // frozen-serial launch is the arithmetic oracle for this timing
+            // cell; source-to-prepared conversion is proved independently by
+            // the real-tensor all-format suite.
 #pragma omp for schedule(static)
             for (int64_t block_index = 0;
                  block_index < static_cast<int64_t>(
@@ -1887,17 +1946,24 @@ namespace
                 uint8_t *const block =
                     bytes + static_cast<size_t>(block_index) *
                                 packed.interleaved_block_stride;
-                auto *const compensation = reinterpret_cast<int16_t *>(
-                    block + packed.data_stride);
-                auto *const scales = reinterpret_cast<uint16_t *>(
-                    block + packed.data_stride + 128);
-                auto *const minima = packed.is_asymmetric
-                    ? reinterpret_cast<uint16_t *>(
-                          block + packed.data_stride + 256)
+                auto *const compensation = packed.usesInlineCompensation()
+                    ? reinterpret_cast<int16_t *>(
+                          block + packed.data_stride)
                     : nullptr;
+                auto *const scales = reinterpret_cast<uint16_t *>(
+                    block + packed.data_stride +
+                    (packed.usesInlineCompensation() ? 128 : 0));
+                auto *const minima = packed.usesQ6KNativeDualScale()
+                    ? reinterpret_cast<uint16_t *>(
+                          block + packed.data_stride + 128)
+                    : packed.is_asymmetric
+                        ? reinterpret_cast<uint16_t *>(
+                              block + packed.data_stride + 256)
+                        : nullptr;
                 for (int column = 0; column < 64; ++column)
                 {
-                    compensation[column] = 0;
+                    if (compensation)
+                        compensation[column] = 0;
                     scales[column] = one_fp16;
                     if (minima)
                         minima[column] = min_fp16;
@@ -1927,6 +1993,69 @@ namespace
         return getEnvInt(
                    "LLAMINAR_CPU_NVNNI_PROFILER_REAL_PACKED_WEIGHTS")
                    .value_or(0) == 0;
+    }
+
+    /**
+     * @brief Own one prepared-weight fixture and its production kernel wrapper.
+     *
+     * `source_weights` is populated only by the explicit profiler A/B mode
+     * that compares a real-packed fixture with the canonical direct prepared
+     * fixture. Keeping it in the owner makes the source lifetime unambiguous
+     * even though the kernel eagerly owns its packed representation.
+     */
+    struct DispatchEvidenceWeightFixture
+    {
+        std::unique_ptr<TensorBase> source_weights;
+        std::unique_ptr<CPUNativeVNNIGemmKernel> kernel;
+    };
+
+    /**
+     * @brief Build one prepared fixture for timing or paired certification.
+     *
+     * The canonical path constructs the exact prepared layout directly and
+     * first-touches it with the complete OpenMP team. `use_real_source_packer`
+     * exists only for a focused profiler A/B diagnostic; corpus collection
+     * never selects it.
+     *
+     * @param format Source-format identity and codebook metadata.
+     * @param N Output width of the measured projection.
+     * @param K Reduction width of the measured projection.
+     * @param use_real_source_packer Whether the profiler A/B explicitly asks
+     *        to include real source generation and production packing.
+     * @return Owner for the prepared weights and production kernel wrapper.
+     */
+    DispatchEvidenceWeightFixture createDispatchEvidenceWeightFixture(
+        const FormatSpec &format,
+        int N,
+        int K,
+        bool use_real_source_packer = false)
+    {
+        DispatchEvidenceWeightFixture fixture;
+        if (use_real_source_packer)
+        {
+            fixture.source_weights = createWeightsForFormat(
+                format.name,
+                static_cast<size_t>(N),
+                static_cast<size_t>(K));
+            if (!fixture.source_weights)
+                throw std::runtime_error(
+                    "Cannot create CPU dispatch-evidence weights for " +
+                    format.name);
+            fixture.kernel = std::make_unique<CPUNativeVNNIGemmKernel>(
+                fixture.source_weights.get());
+        }
+        else
+        {
+            fixture.kernel = std::make_unique<CPUNativeVNNIGemmKernel>(
+                createDispatchEvidencePackedWeightsForFormat(format, N, K));
+        }
+        if (!fixture.kernel || !fixture.kernel->isValid())
+        {
+            throw std::runtime_error(
+                "Cannot prepare CPU dispatch-evidence kernel for " +
+                format.name);
+        }
+        return fixture;
     }
 
     // =========================================================================
@@ -2093,22 +2222,24 @@ namespace
         for (auto &v : A)
             v = dist(rng);
 
+        CPUNativeVNNIGemmKernel packed_kernel(weights.get());
+        if (!packed_kernel.isValid())
+            return r;
+        const auto &packed = packed_kernel.packedWeights();
+
         // --- Tile config ---
-        int payload = 32; // Q8_0 payload bytes per block
-        int threads = omp_get_max_threads();
-        auto tile = computeTileConfig(shape.N, shape.K, 1, payload, threads);
+        const int threads = omp_get_max_threads();
+        const auto tile = computeTileConfig(
+            shape.N, shape.K, 1, packed.preparedFootprint(), threads);
         r.nbc = tile.n_block_chunks;
         r.k_tiles = tile.k_tiles;
         r.tile_cat = categoryName(tile.category);
 
         // --- Weight data sizes ---
         int N_chunks = (shape.N + 63) / 64;
-        // Packed VNNI: interleaved blocks + scales + comps
-        // INT8 pre-decoded: stride=2048 per chunk per K-block
-        r.packed_bytes = (double)N_chunks * bpr * (2048 + 256 + 256); // interleaved + scales + comp
+        r.packed_bytes = static_cast<double>(N_chunks) * bpr *
+                         packed.interleaved_block_stride;
         // --- Packed VNNI GEMV (quantize FP32→Q8_1 + INT8 packed VNNI) ---
-        CPUNativeVNNIGemmKernel packed_kernel(weights.get());
-        if (packed_kernel.isValid())
         {
             std::vector<float> C_packed(shape.N, 0.0f);
             r.packed_us = benchPackedVNNI(
@@ -2351,19 +2482,19 @@ namespace
     }
 
     /**
-     * @test Prove profiler-only prepared fixtures reproduce every production
-     *       source format's eager memory geometry.
+     * @test Prove dispatch-evidence fixtures reproduce every production source
+     *       format's eager memory geometry.
      *
      * Isolated hardware-counter launches may skip expensive source generation
      * only if the resulting production kernel observes the same codebook,
      * dimensions, strides, metadata offsets, alignment, and total byte extent.
      * This all-format regression compares a small real pack against the
-     * synthetic profiler fixture and also verifies that every metadata lane is
+     * direct prepared fixture and also verifies that every metadata lane is
      * initialized to a finite value.
      */
     TEST_F(
         CPUNativeVNNIGemvTest,
-        ProfilerPreparedWeights_MatchProductionLayout_AllFormats)
+        DispatchEvidencePreparedWeights_MatchProductionLayout_AllFormats)
     {
         constexpr int N = 65;
         constexpr int K = 256;
@@ -2380,47 +2511,52 @@ namespace
             const CPUNativeVNNIPackedWeights &production =
                 production_kernel.packedWeights();
 
-            CPUNativeVNNIPackedWeights profiler =
-                createProfilerPackedWeightsForFormat(format, N, K);
-            EXPECT_EQ(profiler.N, production.N);
-            EXPECT_EQ(profiler.K, production.K);
-            EXPECT_EQ(profiler.N_padded, production.N_padded);
-            EXPECT_EQ(profiler.blocks_per_row, production.blocks_per_row);
-            EXPECT_EQ(profiler.payload_bytes, production.payload_bytes);
-            EXPECT_EQ(profiler.codebook_id, production.codebook_id);
-            EXPECT_EQ(profiler.is_asymmetric, production.is_asymmetric);
-            EXPECT_EQ(profiler.is_superblock, production.is_superblock);
-            EXPECT_EQ(profiler.is_nibble_lut, production.is_nibble_lut);
-            EXPECT_EQ(profiler.data_stride, production.data_stride);
+            CPUNativeVNNIPackedWeights evidence =
+                createDispatchEvidencePackedWeightsForFormat(format, N, K);
+            EXPECT_EQ(evidence.N, production.N);
+            EXPECT_EQ(evidence.K, production.K);
+            EXPECT_EQ(evidence.N_padded, production.N_padded);
+            EXPECT_EQ(evidence.blocks_per_row, production.blocks_per_row);
+            EXPECT_EQ(evidence.payload_bytes, production.payload_bytes);
+            EXPECT_EQ(evidence.codebook_id, production.codebook_id);
+            EXPECT_EQ(evidence.is_asymmetric, production.is_asymmetric);
+            EXPECT_EQ(evidence.is_superblock, production.is_superblock);
+            EXPECT_EQ(evidence.encoding, production.encoding);
+            EXPECT_EQ(evidence.data_stride, production.data_stride);
             EXPECT_EQ(
-                profiler.interleaved_block_stride,
+                evidence.interleaved_block_stride,
                 production.interleaved_block_stride);
             EXPECT_EQ(
-                profiler.native_interleaved.size(),
+                evidence.native_interleaved.size(),
                 production.native_interleaved.size());
-            EXPECT_TRUE(profiler.hasInterleavedData());
+            EXPECT_TRUE(evidence.hasInterleavedData());
             EXPECT_EQ(
                 reinterpret_cast<uintptr_t>(
-                    profiler.native_interleaved.data()) % 64,
+                    evidence.native_interleaved.data()) % 64,
                 0u);
 
-            const int n_chunks = profiler.N_padded / 64;
+            const int n_chunks = evidence.N_padded / 64;
             for (int chunk = 0; chunk < n_chunks; ++chunk)
             {
                 for (int block = 0;
-                     block < profiler.blocks_per_row;
+                     block < evidence.blocks_per_row;
                      ++block)
                 {
                     const int16_t *compensation =
-                        profiler.chunkComp(chunk, block);
+                        evidence.usesInlineCompensation()
+                            ? evidence.chunkComp(chunk, block)
+                            : nullptr;
                     const uint16_t *scales =
-                        profiler.chunkScales(chunk, block);
-                    const uint16_t *minima = profiler.is_asymmetric
-                        ? profiler.chunkMins(chunk, block)
+                        evidence.chunkScales(chunk, block);
+                    const uint16_t *minima =
+                        (evidence.is_asymmetric ||
+                         evidence.usesQ6KNativeDualScale())
+                        ? evidence.chunkMins(chunk, block)
                         : nullptr;
                     for (int column = 0; column < 64; ++column)
                     {
-                        EXPECT_EQ(compensation[column], 0);
+                        if (compensation)
+                            EXPECT_EQ(compensation[column], 0);
                         EXPECT_EQ(scales[column], expected_scale);
                         if (minima)
                             EXPECT_EQ(minima[column], expected_minimum);
@@ -2428,8 +2564,8 @@ namespace
                 }
             }
 
-            CPUNativeVNNIGemmKernel profiler_kernel(std::move(profiler));
-            EXPECT_TRUE(profiler_kernel.isValid());
+            CPUNativeVNNIGemmKernel evidence_kernel(std::move(evidence));
+            EXPECT_TRUE(evidence_kernel.isValid());
         }
     }
 
@@ -2598,7 +2734,8 @@ namespace
     TEST_F(CPUNativeVNNIGemvTest, TileConfig_AllShapes)
     {
         int threads = omp_get_max_threads();
-        int payload = 32; // Q8_0
+        const NativeVNNIPreparedFootprint footprint =
+            preparedFootprintForFormat(/*Q8_0 codebook=*/19, false);
 
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
@@ -2628,7 +2765,8 @@ namespace
                 auto shapes = buildShapes(model, tp);
                 for (const auto &s : shapes)
                 {
-                    auto cfg = computeTileConfig(s.N, s.K, 1, payload, threads);
+                    auto cfg = computeTileConfig(
+                        s.N, s.K, 1, footprint, threads);
                     int N_chunks = (s.N + 63) / 64;
                     int n_tasks = (N_chunks + cfg.n_block_chunks - 1) / cfg.n_block_chunks;
                     int k_tasks = (cfg.k_tiles > 0) ? cfg.k_tiles : 1;
@@ -3171,21 +3309,24 @@ namespace
          *
          * The full Qwen3.6 verifier economy benchmark is still the acceptance
          * gate, but it is too expensive for microkernel iteration.  This test
-         * isolates the exact primitive we are tuning: pre-quantized M=2..4
-         * grouped verifier rows versus M individual decode GEMVs.  It keeps
-         * correctness strict with cosine, relative L2, and symmetric KL while
-         * exporting timing rows that can be fed into the same trainer/dashboard
-         * workflow used by the GPU dispatch sweeps.
+         * isolates the exact primitive we are tuning: pre-quantized grouped
+         * verifier rows versus M individual decode GEMVs across the canonical
+         * runtime-M inventory. It keeps
+         * correctness byte-identical to serial M=1 decode while retaining
+         * cosine, relative L2, and symmetric KL as diagnostic evidence. Timing
+         * rows are emitted only after byte identity is proven, so an
+         * approximate grouped implementation can never enter the dispatch
+         * trainer corpus as a candidate.
          *
          * Useful knobs:
          * - LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=Q4_K,Q6_K or "all"
-         * - LLAMINAR_CPU_NVNNI_VERIFIER_M=2,3,4
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_M=2,3,4,...,17,31
          * - LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen36_FFN_DownProjection
          * - LLAMINAR_CPU_NVNNI_VERIFIER_N=5120
          * - LLAMINAR_CPU_NVNNI_VERIFIER_K=5120
          * - LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=20
          * - LLAMINAR_CPU_NVNNI_VERIFIER_CSV=/tmp/cpu_verifier_rows.csv
-         * - LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS=1 for M=3/4 forced wide vs pairwise A/B
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS=1 for forced wide vs pairwise A/B
          * - LLAMINAR_CPU_NVNNI_VERIFIER_MIN_SPEEDUP=1.0 to require economy
          * - LLAMINAR_CPU_NVNNI_VERIFIER_THREADS=28 to override standalone thread cap
          */
@@ -3250,10 +3391,10 @@ namespace
         const int max_cases =
             std::max(1, getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_MAX_CASES").value_or(1000000));
         const ISAPath isa_path = parseISAPathForVerifierBench();
-        const std::array<int, 3> rows = {2, 3, 4};
+        const auto &rows = kGroupedVerifierRuntimeRows;
         const std::string csv_path =
             getEnvString("LLAMINAR_CPU_NVNNI_VERIFIER_CSV");
-        const bool run_m4_variants =
+        const bool run_policy_variants =
             getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS").value_or(0) != 0;
         const double min_required_speedup =
             getEnvDouble("LLAMINAR_CPU_NVNNI_VERIFIER_MIN_SPEEDUP")
@@ -3361,6 +3502,13 @@ namespace
                     const std::string label =
                         fmt.name + " " + shape.name + " M=" + std::to_string(M);
                     assertVerifierMetricsStrict(metrics, label);
+                    ASSERT_EQ(
+                        llaminar2::test::trainer::nativeByteMismatchCount(
+                            grouped, serial),
+                        0u)
+                        << label
+                        << " grouped verifier rows differ byte-for-byte from "
+                           "serial M=1 decode";
 
                     const TimingSummary grouped_timing =
                         timeMicrobench(warmup, iterations, run_grouped);
@@ -3391,7 +3539,7 @@ namespace
                             "cpu,verifier_rows,%s,%u,%d,%d,%d,%d,%s,%d,%d,%d,%s,%.3f,%.3f,%.6f,%.3f,%.3f,%.9f,%.9e,%.9e,%.9e,1\n",
                             fmt.name.c_str(),
                             static_cast<unsigned>(packed.codebook_id),
-                            packed.is_nibble_lut ? 1 : 0,
+                            packed.usesNibbleLUT() ? 1 : 0,
                             packed.payload_bytes,
                             packed.is_asymmetric ? 1 : 0,
                             packed.is_superblock ? 1 : 0,
@@ -3418,7 +3566,7 @@ namespace
                         "[CPUNativeVNNI][VERIFIER_ROWS] format=%s codebook=%u nibble=%d payload=%d asymmetric=%d superblock=%d shape=%s N=%d K=%d M=%d isa=%s grouped_us=%.3f serial_us=%.3f speedup=%.3f cosine=%.9f rel_l2=%.9e symmetric_kl=%.9e\n",
                         fmt.name.c_str(),
                         static_cast<unsigned>(packed.codebook_id),
-                        packed.is_nibble_lut ? 1 : 0,
+                        packed.usesNibbleLUT() ? 1 : 0,
                         packed.payload_bytes,
                         packed.is_asymmetric ? 1 : 0,
                         packed.is_superblock ? 1 : 0,
@@ -3444,7 +3592,7 @@ namespace
                     }
 
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                    if (run_m4_variants && M >= 3)
+                    if (run_policy_variants && M >= 3)
                     {
                         if (!verifierBenchUsesAVX512(isa_path))
                         {
@@ -3508,6 +3656,20 @@ namespace
                         assertVerifierMetricsStrict(
                             pairwise_metrics,
                             label + " forced pairwise verifier policy");
+                        ASSERT_EQ(
+                            llaminar2::test::trainer::nativeByteMismatchCount(
+                                wide_rows, serial),
+                            0u)
+                            << label
+                            << " forced wide verifier policy differs byte-for-byte "
+                               "from serial M=1 decode";
+                        ASSERT_EQ(
+                            llaminar2::test::trainer::nativeByteMismatchCount(
+                                pairwise_rows, serial),
+                            0u)
+                            << label
+                            << " forced pairwise verifier policy differs byte-for-byte "
+                               "from serial M=1 decode";
 
                         const TimingSummary wide_timing =
                             timeMicrobench(warmup, iterations, run_wide_policy);
@@ -3535,7 +3697,7 @@ namespace
                                     phase,
                                     fmt.name.c_str(),
                                     static_cast<unsigned>(packed.codebook_id),
-                                    packed.is_nibble_lut ? 1 : 0,
+                                    packed.usesNibbleLUT() ? 1 : 0,
                                     packed.payload_bytes,
                                     packed.is_asymmetric ? 1 : 0,
                                     packed.is_superblock ? 1 : 0,
@@ -3590,7 +3752,7 @@ namespace
                             wide_metrics.symmetric_kl);
                     }
 #else
-                    if (run_m4_variants && M >= 3)
+                    if (run_policy_variants && M >= 3)
                     {
                         FAIL()
                             << "LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS requires an AVX512-VNNI build";
@@ -3799,12 +3961,13 @@ namespace
         const char *observed_path = evidence.route.serial_kpart
                                         ? "serial-kpart"
                                         : "serial-full-k";
-        output << "native-vnni-paired-interleaved-v3,"
+        output << "native-vnni-cpu-paired-isolated-v4,"
                << request.request_id << ",cpu,decode_m1,"
                << request.source_format << ','
                << request.source_codebook << ','
                << request.execution_codebook << ','
                << request.architecture_class << ','
+               << "process-isolated-v1,1,"
                << request.shape << ",eager,1,"
                << request.n << ',' << request.k << ','
                << pair_index << ',' << configured_pair_count << ','
@@ -3856,6 +4019,8 @@ namespace
             << "CPU paired timing requires ambient perfstats/profiling to be disabled";
         ASSERT_TRUE(native_vnni_dispatch::profilerRequestId().empty())
             << "isolated Linux-perf profiling cannot run inside paired timing";
+        const int mpi_world_size = requireProcessIsolatedCPUPairedTiming();
+        ASSERT_EQ(mpi_world_size, 1);
 
         const int warmups = std::max(
             5, getEnvInt("LLAMINAR_CPU_NVNNI_DECODE_WARMUP").value_or(5));
@@ -3875,7 +4040,8 @@ namespace
         ASSERT_TRUE(output.is_open()) << output_path;
         output
             << "protocol_version,request_id,backend,phase,source_format,"
-               "source_codebook,execution_codebook,architecture_class,shape,"
+               "source_codebook,execution_codebook,architecture_class,"
+               "timing_scope,mpi_world_size,shape,"
                "execution_mode,m,n,k,pair_index,configured_pair_count,"
                "within_pair_order,cell_order_seed,pair_order_seed,candidate_role,"
                "candidate_id,timed_replays,latency_us,latency_us_hex,warmup_count,"
@@ -3939,20 +4105,41 @@ namespace
             ASSERT_NE(exact, nullptr) << request.request_id;
             ASSERT_NE(selected, exact) << request.request_id;
 
-            auto weights = createWeightsForFormat(
-                format_iterator->name,
-                static_cast<size_t>(request.n),
-                static_cast<size_t>(request.k));
-            ASSERT_NE(weights, nullptr) << request.request_id;
-            CPUNativeVNNIGemmKernel kernel(weights.get());
-            ASSERT_TRUE(kernel.isValid()) << request.request_id;
-            const auto &packed = kernel.packedWeights();
+            DispatchEvidenceWeightFixture fixture =
+                createDispatchEvidenceWeightFixture(
+                    *format_iterator, request.n, request.k);
+            ASSERT_NE(fixture.kernel, nullptr) << request.request_id;
+            const auto &packed = fixture.kernel->packedWeights();
             ASSERT_EQ(
                 static_cast<int>(packed.codebook_id), request.source_codebook)
                 << request.request_id;
             ASSERT_EQ(
                 static_cast<int>(packed.codebook_id), request.execution_codebook)
                 << request.request_id;
+
+            const NativeVNNITileConfig serial_geometry = computeTileConfig(
+                request.n,
+                request.k,
+                1,
+                packed.preparedFootprint(),
+                threads);
+            const DecodeScheduleGeometry schedule_geometry{
+                .n = request.n,
+                .k = request.k,
+                .k_tiles = serial_geometry.k_tiles,
+                .threads = threads,
+            };
+            for (const CPUDecodeScheduleCandidate *candidate : {selected, exact})
+            {
+                ASSERT_NE(candidate, nullptr);
+                const DecodeScheduleResolution resolution =
+                    resolveDecodeSchedulePolicy(
+                        candidate->policy, schedule_geometry);
+                ASSERT_TRUE(resolution.isExactPhysicalIdentity())
+                    << request.request_id << " requested non-physical candidate "
+                    << candidate->canonical_id << " effective="
+                    << decodeSchedulePolicyName(resolution.effective);
+            }
 
             std::mt19937 rng(static_cast<uint32_t>(
                 0xDEC0DEu + request.n + request.k +
@@ -4151,12 +4338,13 @@ namespace
         double latency_us,
         int warmup_count)
     {
-        output << "native-vnni-paired-interleaved-v3,"
+        output << "native-vnni-cpu-paired-isolated-v4,"
                << request.request_id << ",cpu,verifier_rows,"
                << request.source_format << ','
                << request.source_codebook << ','
                << request.execution_codebook << ','
                << request.architecture_class << ','
+               << "process-isolated-v1,1,"
                << request.shape << ",eager," << request.m << ','
                << request.n << ',' << request.k << ','
                << pair_index << ',' << configured_pair_count << ','
@@ -4208,6 +4396,8 @@ namespace
             << "CPU grouped paired timing requires profiling to be disabled";
         ASSERT_TRUE(native_vnni_dispatch::profilerRequestId().empty())
             << "isolated Linux-perf profiling cannot run inside paired timing";
+        const int mpi_world_size = requireProcessIsolatedCPUPairedTiming();
+        ASSERT_EQ(mpi_world_size, 1);
 
         const int warmups = std::max(
             5, getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_WARMUP").value_or(5));
@@ -4227,7 +4417,8 @@ namespace
         ASSERT_TRUE(output.is_open()) << output_path;
         output
             << "protocol_version,request_id,backend,phase,source_format,"
-               "source_codebook,execution_codebook,architecture_class,shape,"
+               "source_codebook,execution_codebook,architecture_class,"
+               "timing_scope,mpi_world_size,shape,"
                "execution_mode,m,n,k,pair_index,configured_pair_count,"
                "within_pair_order,cell_order_seed,pair_order_seed,candidate_role,"
                "candidate_id,timed_replays,latency_us,latency_us_hex,warmup_count,"
@@ -4286,14 +4477,11 @@ namespace
                 ASSERT_NE(selected, exact) << request.request_id;
             }
 
-            auto weights = createWeightsForFormat(
-                format_iterator->name,
-                static_cast<size_t>(request.n),
-                static_cast<size_t>(request.k));
-            ASSERT_NE(weights, nullptr) << request.request_id;
-            CPUNativeVNNIGemmKernel kernel(weights.get());
-            ASSERT_TRUE(kernel.isValid()) << request.request_id;
-            const auto &packed = kernel.packedWeights();
+            DispatchEvidenceWeightFixture fixture =
+                createDispatchEvidenceWeightFixture(
+                    *format_iterator, request.n, request.k);
+            ASSERT_NE(fixture.kernel, nullptr) << request.request_id;
+            const auto &packed = fixture.kernel->packedWeights();
             ASSERT_EQ(
                 static_cast<int>(packed.codebook_id), request.source_codebook)
                 << request.request_id;
@@ -4641,27 +4829,6 @@ namespace
             bool correctness_pass = false;
         };
 
-        /**
-         * @brief One format-local weight fixture prepared outside timing.
-         *
-         * The individual TestTensorFactory generators deliberately retain
-         * their historical format-specific seed and serial PRNG stream.  They
-         * are independent of one another, however, so preparing selected
-         * formats concurrently preserves every generated byte while avoiding
-         * a long single-core setup phase on large vocabulary projections.
-         * Isolated profiler runs instead construct one layout-identical
-         * prepared fixture at a time because their canonical timing transaction
-         * already performed source conversion and correctness. Packed-kernel
-         * construction and all measured launches remain sequential across
-         * formats so their OpenMP teams never contend or retain several large
-         * interleaved buffers concurrently.
-         */
-        struct PreparedDecodeWeights
-        {
-            const FormatSpec *format = nullptr;
-            std::unique_ptr<TensorBase> weights;
-        };
-
         std::vector<const FormatSpec *> selected_formats;
         selected_formats.reserve(MTP_SMALL_M_FORMATS.size());
         for (const auto &format : MTP_SMALL_M_FORMATS)
@@ -4685,50 +4852,46 @@ namespace
         ASSERT_FALSE(selected_formats.empty())
             << "No CPU M=1 decode formats selected";
 
-        std::vector<PreparedDecodeWeights> prepared_weights(
-            selected_formats.size());
-#pragma omp parallel for schedule(dynamic, 1)
-        for (int index = 0;
-             index < static_cast<int>(selected_formats.size());
-             ++index)
-        {
-            const FormatSpec *format =
-                selected_formats[static_cast<size_t>(index)];
-            PreparedDecodeWeights &prepared =
-                prepared_weights[static_cast<size_t>(index)];
-            prepared.format = format;
-            if (!profiling_requested)
-            {
-                prepared.weights = createWeightsForFormat(
-                    format->name,
-                    static_cast<size_t>(N),
-                    static_cast<size_t>(K));
-            }
-        }
-
         int executed_cases = 0;
         int emitted_rows = 0;
         int isolated_profile_launches = 0;
-        for (auto &prepared : prepared_weights)
+        for (const FormatSpec *format_pointer : selected_formats)
         {
-            ASSERT_NE(prepared.format, nullptr);
-            const FormatSpec &format = *prepared.format;
-            std::unique_ptr<CPUNativeVNNIGemmKernel> kernel;
-            if (profiling_requested && useSyntheticProfilerPreparedWeights())
-            {
-                kernel = std::make_unique<CPUNativeVNNIGemmKernel>(
-                    createProfilerPackedWeightsForFormat(format, N, K));
-            }
-            else
-            {
-                ASSERT_NE(prepared.weights, nullptr) << format.name;
-                kernel = std::make_unique<CPUNativeVNNIGemmKernel>(
-                    prepared.weights.get());
-            }
-            ASSERT_TRUE(kernel->isValid()) << format.name;
+            ASSERT_NE(format_pointer, nullptr);
+            const FormatSpec &format = *format_pointer;
+            const bool real_packed_profiler_diagnostic =
+                profiling_requested &&
+                !useSyntheticProfilerPreparedWeights();
+            DispatchEvidenceWeightFixture fixture =
+                createDispatchEvidenceWeightFixture(
+                    format,
+                    N,
+                    K,
+                    real_packed_profiler_diagnostic);
+            ASSERT_NE(fixture.kernel, nullptr) << format.name;
+            CPUNativeVNNIGemmKernel *const kernel = fixture.kernel.get();
             const auto &packed = kernel->packedWeights();
             const size_t weight_bytes =
                 packed.native_interleaved.size() + packed.payload.size();
+            const NativeVNNITileConfig serial_geometry = computeTileConfig(
+                N,
+                K,
+                1,
+                packed.preparedFootprint(),
+                omp_get_max_threads());
+            const DecodeScheduleGeometry schedule_geometry{
+                .n = N,
+                .k = K,
+                .k_tiles = serial_geometry.k_tiles,
+                .threads = omp_get_max_threads(),
+            };
+            const auto candidate_is_physical =
+                [&](const CPUDecodeScheduleCandidate &candidate)
+            {
+                return resolveDecodeSchedulePolicy(
+                           candidate.policy, schedule_geometry)
+                    .isExactPhysicalIdentity();
+            };
 
             std::mt19937 rng(static_cast<uint32_t>(
                 0xDEC0DEu + N + K + format.name.size()));
@@ -4774,6 +4937,8 @@ namespace
                     {
                         continue;
                     }
+                    const bool physical_candidate =
+                        candidate_is_physical(candidate);
                     CPUProfilerBatchRequest *batch_request = nullptr;
                     if (profiler_batch.enabled())
                     {
@@ -4788,6 +4953,12 @@ namespace
                         if (!batch_request)
                             continue;
                     }
+                    ASSERT_TRUE(physical_candidate)
+                        << "CPU profiler manifest requested a non-physical M=1 "
+                           "candidate: "
+                        << candidate.canonical_id << " N=" << N << " K=" << K;
+                    if (!physical_candidate)
+                        continue;
 
                     std::vector<float> output(static_cast<size_t>(N), 0.0f);
                     const auto run_candidate = [&]()
@@ -4808,7 +4979,7 @@ namespace
                         : single_perf_output_path;
 
                     PerfStatsCollector::reset();
-                    profileExactCPURequest(
+                    native_vnni_dispatch::profileExactOpenMPRegion(
                         *perf_control,
                         exact_request_id,
                         exact_output_path,
@@ -4859,6 +5030,8 @@ namespace
                 {
                     continue;
                 }
+                if (!candidate_is_physical(candidate))
+                    continue;
                 std::vector<float> output(static_cast<size_t>(N), 0.0f);
                 const auto run_candidate = [&]()
                 {
@@ -5197,7 +5370,7 @@ namespace
                     N,
                     K,
                     1,
-                    packed.payload_bytes,
+                    packed.preparedFootprint(),
                     certified_threads);
 
             std::mt19937 rng(static_cast<uint32_t>(
@@ -5358,7 +5531,7 @@ namespace
             ASSERT_TRUE(kernel.isValid());
             const auto &packed = kernel.packedWeights();
             const NativeVNNITileConfig serial_geometry = computeTileConfig(
-                N, K, 1, packed.payload_bytes, certified_threads);
+                N, K, 1, packed.preparedFootprint(), certified_threads);
             ASSERT_LE(serial_geometry.k_tiles, 1)
                 << "Focused full-K grouped geometry unexpectedly selected K-partition";
 
@@ -5449,25 +5622,27 @@ namespace
                         std::vector<float>(output_elements, 0.0f),
                     }};
                     std::array<FusedVerifierRowsDesc, 2> descriptors = {{
-                        {
-                            &packed,
-                            fused_outputs[0].data(),
-                            nullptr,
-                            N,
-                            N,
-                            nullptr,
-                            DecodeSchedulePolicy::Auto,
-                            candidate,
+                        FusedVerifierRowsDesc{
+                            .packed = &packed,
+                            .output = fused_outputs[0].data(),
+                            .bias = nullptr,
+                            .N = N,
+                            .ldc = N,
+                            .rows = 0,
+                            .input = nullptr,
+                            .decode_schedule = DecodeSchedulePolicy::Auto,
+                            .verifier_schedule = candidate,
                         },
-                        {
-                            &packed,
-                            fused_outputs[1].data(),
-                            nullptr,
-                            N,
-                            N,
-                            nullptr,
-                            DecodeSchedulePolicy::Auto,
-                            candidate,
+                        FusedVerifierRowsDesc{
+                            .packed = &packed,
+                            .output = fused_outputs[1].data(),
+                            .bias = nullptr,
+                            .N = N,
+                            .ldc = N,
+                            .rows = 0,
+                            .input = nullptr,
+                            .decode_schedule = DecodeSchedulePolicy::Auto,
+                            .verifier_schedule = candidate,
                         },
                     }};
                     const auto run_fused = [&]()
@@ -5601,7 +5776,7 @@ namespace
                        n,
                        k,
                        1,
-                       packed.payload_bytes,
+                       packed.preparedFootprint(),
                        certified_threads)
                 .k_tiles;
         };
@@ -5909,10 +6084,12 @@ namespace
                 "shape,execution_mode,m,n,k,candidate_id,build_isa,"
                 "runtime_isa_requested,runtime_isa_effective,threads,weight_bytes,"
                 "warmup_count,sample_count,min_us,median_us,p95_us,mad_us,cv,"
-                "serial_median_us,speedup,bit_mismatches,first_bit_mismatch,"
-                "repeat_byte_mismatches,max_abs,relative_l2,cosine,symmetric_kld,"
+                "bit_mismatches,first_bit_mismatch,repeat_byte_mismatches,"
+                "max_abs,relative_l2,cosine,symmetric_kld,"
                 "grouped_output_digest,serial_output_digest,timing_sample_digest,"
-                "route_counter_ok,observed_candidate_id,k_tiles,n_block_chunks,"
+                "route_counter_ok,observed_candidate_id,k_tiles,policy_n,"
+                "ambient_n_block_chunks,n_block_chunks,execution_route,task_grid,"
+                "physical_row_tile,producer_tasks,reduction_tasks,"
                 "numerical_correctness,correctness_pass,is_winner\n");
         }
 
@@ -5941,7 +6118,6 @@ namespace
             llaminar2::test::trainer::FP32Evidence comparison;
             CPUVerifierRouteEvidence route;
             size_t repeat_byte_mismatches = 0;
-            double speedup = 0.0;
             int timing_warmup_count = 0;
             bool route_ok = false;
             bool numerical_correctness = false;
@@ -5956,49 +6132,52 @@ namespace
             if (!shouldRunName(format_filters, format.name))
                 continue;
 
-            std::unique_ptr<TensorBase> weights;
-            std::unique_ptr<CPUNativeVNNIGemmKernel> kernel;
-            if (profiling_requested && useSyntheticProfilerPreparedWeights())
-            {
-                kernel = std::make_unique<CPUNativeVNNIGemmKernel>(
-                    createProfilerPackedWeightsForFormat(format, N, K));
-            }
-            else
-            {
-                weights = createWeightsForFormat(
-                    format.name,
-                    static_cast<size_t>(N),
-                    static_cast<size_t>(K));
-                ASSERT_NE(weights, nullptr) << format.name;
-                kernel = std::make_unique<CPUNativeVNNIGemmKernel>(
-                    weights.get());
-            }
-            ASSERT_TRUE(kernel->isValid()) << format.name;
+            const bool real_packed_profiler_diagnostic =
+                profiling_requested &&
+                !useSyntheticProfilerPreparedWeights();
+            DispatchEvidenceWeightFixture fixture =
+                createDispatchEvidenceWeightFixture(
+                    format,
+                    N,
+                    K,
+                    real_packed_profiler_diagnostic);
+            ASSERT_NE(fixture.kernel, nullptr) << format.name;
+            CPUNativeVNNIGemmKernel *const kernel = fixture.kernel.get();
             const auto &packed = kernel->packedWeights();
             const size_t weight_bytes =
                 packed.native_interleaved.size() + packed.payload.size();
+            const int policy_n =
+                cpuNativeVNNISerialEquivalentPolicyN(N);
             const NativeVNNITileConfig serial_geometry = computeTileConfig(
-                N,
+                policy_n,
                 K,
                 1,
-                packed.payload_bytes,
+                packed.preparedFootprint(),
                 omp_get_max_threads());
             const auto candidate_is_forceable =
                 [&](const Candidate &candidate, int runtime_m)
             {
-                if (!verifierRowsPolicySupportsRuntime(
+                try
+                {
+                    (void)resolveVerifierRowsSchedule(
                         candidate.policy,
-                        effective_runtime_isa == "AVX512",
-                        runtime_m,
-                        serial_geometry.k_tiles))
+                        candidate.policy,
+                        VerifierRowsScheduleGeometry{
+                            .rows = runtime_m,
+                            .physical_n = N,
+                            .policy_n = policy_n,
+                            .k_tiles = serial_geometry.k_tiles,
+                            .ambient_n_block_chunks =
+                                std::max(1, serial_geometry.n_block_chunks),
+                            .use_avx512 =
+                                effective_runtime_isa == "AVX512",
+                        });
+                    return true;
+                }
+                catch (const std::invalid_argument &)
                 {
                     return false;
                 }
-                return normalizeVerifierRowsPolicy(
-                           candidate.policy,
-                           (N + 63) / 64,
-                           effective_runtime_isa == "AVX512",
-                           runtime_m) == candidate.policy;
             };
 
             for (int M : verifier_rows)
@@ -6105,18 +6284,41 @@ namespace
                             : single_perf_output_path;
 
                         PerfStatsCollector::reset();
-                        profileExactCPURequest(
+                        native_vnni_dispatch::profileExactOpenMPRegion(
                             *perf_control,
                             exact_request_id,
                             exact_output_path,
                             run_candidate);
                         const CPUVerifierRouteEvidence route =
                             findCPUVerifierRoute(M, N, K, packed.codebook_id);
+                        const VerifierRowsScheduleResolution expected_schedule =
+                            resolveVerifierRowsSchedule(
+                                candidate.policy,
+                                candidate.policy,
+                                VerifierRowsScheduleGeometry{
+                                    .rows = M,
+                                    .physical_n = N,
+                                    .policy_n = policy_n,
+                                    .k_tiles = serial_geometry.k_tiles,
+                                    .ambient_n_block_chunks = std::max(
+                                        1,
+                                        serial_geometry.n_block_chunks),
+                                    .use_avx512 =
+                                        effective_runtime_isa == "AVX512",
+                                });
                         ASSERT_TRUE(route.found);
                         ASSERT_EQ(route.count, 1u);
-                        ASSERT_EQ(route.build_isa, build_isa);
-                        ASSERT_EQ(route.isa, effective_runtime_isa);
-                        ASSERT_EQ(route.effective_policy, candidate.route_name);
+                        ASSERT_TRUE(matchesCPUVerifierRouteIdentity(
+                            route,
+                            expected_schedule,
+                            candidate.route_name,
+                            build_isa,
+                            effective_runtime_isa,
+                            serial_geometry.k_tiles,
+                            policy_n,
+                            omp_get_max_threads()))
+                            << "isolated profiler launch did not publish its "
+                               "exact resolved task-grid identity";
 
                         ++isolated_profile_launches;
                         profiled_cell = true;
@@ -6154,8 +6356,6 @@ namespace
                 run_serial();
                 const std::string serial_digest =
                     llaminar2::test::trainer::nativeByteDigest(serial);
-                const StrongTimingMeasurement serial_timing =
-                    timeStrongTrainerCandidate(warmups, samples, run_serial);
 
                 /*
                  * A single-projection candidate can be byte exact while the
@@ -6172,8 +6372,20 @@ namespace
                     static_cast<size_t>(M) * static_cast<size_t>(N),
                     0.0f);
                 std::array<FusedVerifierRowsDesc, 2> fused_descriptors = {{
-                    {&packed, fused_projection0.data(), nullptr, N, N},
-                    {&packed, fused_projection1.data(), nullptr, N, N},
+                    FusedVerifierRowsDesc{
+                        .packed = &packed,
+                        .output = fused_projection0.data(),
+                        .bias = nullptr,
+                        .N = N,
+                        .ldc = N,
+                    },
+                    FusedVerifierRowsDesc{
+                        .packed = &packed,
+                        .output = fused_projection1.data(),
+                        .bias = nullptr,
+                        .N = N,
+                        .ldc = N,
+                    },
                 }};
                 const auto run_fused_projection_bundle = [&]()
                 {
@@ -6185,87 +6397,6 @@ namespace
                         K_blocks,
                         isa_path);
                 };
-
-                PerfStatsCollector::reset();
-                ASSERT_TRUE(run_fused_projection_bundle());
-                const std::vector<float> first_fused_projection0 =
-                    fused_projection0;
-                const std::vector<float> first_fused_projection1 =
-                    fused_projection1;
-                ASSERT_TRUE(run_fused_projection_bundle());
-                EXPECT_EQ(
-                    llaminar2::test::trainer::nativeByteMismatchCount(
-                        fused_projection0, serial),
-                    0u)
-                    << format.name << " M=" << M
-                    << " fused projection 0 differs from serial M=1 decode";
-                EXPECT_EQ(
-                    llaminar2::test::trainer::nativeByteMismatchCount(
-                        fused_projection1, serial),
-                    0u)
-                    << format.name << " M=" << M
-                    << " fused projection 1 differs from serial M=1 decode";
-                EXPECT_EQ(
-                    llaminar2::test::trainer::nativeByteMismatchCount(
-                        fused_projection0, first_fused_projection0),
-                    0u)
-                    << format.name << " M=" << M
-                    << " fused projection 0 changed across repeats";
-                EXPECT_EQ(
-                    llaminar2::test::trainer::nativeByteMismatchCount(
-                        fused_projection1, first_fused_projection1),
-                    0u)
-                    << format.name << " M=" << M
-                    << " fused projection 1 changed across repeats";
-
-                const VerifierRowsPolicy fused_auto_policy =
-                    normalizeVerifierRowsPolicy(
-                        selectVerifierRowsPolicy(packed, M, N, K),
-                        (N + 63) / 64,
-                        effective_runtime_isa == "AVX512",
-                        M);
-                const bool fused_auto_wide =
-                    fused_auto_policy == VerifierRowsPolicy::WideRows;
-                uint64_t fused_route_count = 0;
-                for (const auto &record : PerfStatsCollector::snapshot(
-                         {"kernel.cpu_native_vnni_fused_verifier_rows_projection_launch"}))
-                {
-                    if (record.name !=
-                        "cpu_native_vnni_fused_verifier_rows_projection_launch")
-                    {
-                        continue;
-                    }
-                    EXPECT_EQ(record.tags.at("m"), std::to_string(M));
-                    EXPECT_EQ(record.tags.at("n"), std::to_string(N));
-                    EXPECT_EQ(record.tags.at("k"), std::to_string(K));
-                    EXPECT_EQ(
-                        record.tags.at("codebook"),
-                        std::to_string(packed.codebook_id));
-                    EXPECT_EQ(record.tags.at("isa"), effective_runtime_isa);
-                    const int observed_k_tiles =
-                        std::stoi(record.tags.at("k_tiles"));
-                    const bool grouped_k_parallel = observed_k_tiles > 1;
-                    EXPECT_EQ(
-                        record.tags.at("route"),
-                        grouped_k_parallel
-                            ? "grouped_k_parallel_row_tiles"
-                        : fused_auto_wide
-                            ? "grouped_full_k_wide_rows"
-                            : "grouped_full_k_pair_grid");
-                    EXPECT_EQ(
-                        record.tags.at("effective_verifier_policy"),
-                        verifierRowsPolicyName(fused_auto_policy));
-                    EXPECT_EQ(
-                        record.tags.at("physical_row_tile"),
-                        fused_auto_wide ? "4" : "2");
-                    fused_route_count += record.count;
-                }
-                EXPECT_EQ(
-                    fused_route_count,
-                    2u * fused_descriptors.size())
-                    << format.name << " M=" << M
-                    << " did not publish one fused grouped route per projection "
-                       "and repeat";
 
                 std::vector<CandidateRow> rows;
                 rows.reserve(CANDIDATES.size());
@@ -6375,34 +6506,20 @@ namespace
                         << candidate.route_name
                         << " fused projection 1 changed across repeats";
 
-                    const VerifierRowsPolicy expected_fused_policy =
-                        candidate.policy;
-                    const bool expected_fused_wide_rows =
-                        expected_fused_policy == VerifierRowsPolicy::WideRows &&
-                        effective_runtime_isa == "AVX512" && M >= 3;
-                    const char *expected_fused_route =
-                        serial_geometry.k_tiles > 1
-                            ? "grouped_k_parallel_row_tiles"
-                        : expected_fused_policy ==
-                                  VerifierRowsPolicy::FullKRowChunkGrid
-                            ? "grouped_full_k_row_chunk_grid"
-                        : verifierRowsPolicyUsesFullKNMajor(
-                                  expected_fused_policy)
-                            ? "grouped_full_k_two_row_n_major"
-                        : expected_fused_wide_rows
-                            ? "grouped_full_k_wide_rows"
-                            : "grouped_full_k_pair_grid";
-                    const int expected_physical_row_tile =
-                        expected_fused_policy ==
-                                VerifierRowsPolicy::FullKRowChunkGrid
-                            ? 1
-                        : expected_fused_wide_rows
-                            ? 4
-                            : 2;
-                    const int expected_fused_n_block_chunks =
-                        verifierRowsPolicyNBlockChunks(
-                            expected_fused_policy,
-                            serial_geometry.n_block_chunks);
+                    const VerifierRowsScheduleResolution expected_schedule =
+                        resolveVerifierRowsSchedule(
+                            candidate.policy,
+                            candidate.policy,
+                            VerifierRowsScheduleGeometry{
+                                .rows = M,
+                                .physical_n = N,
+                                .policy_n = policy_n,
+                                .k_tiles = serial_geometry.k_tiles,
+                                .ambient_n_block_chunks = std::max(
+                                    1, serial_geometry.n_block_chunks),
+                                .use_avx512 =
+                                    effective_runtime_isa == "AVX512",
+                            });
                     uint64_t candidate_fused_route_count = 0;
                     for (const auto &record : PerfStatsCollector::snapshot(
                              {"kernel.cpu_native_vnni_fused_verifier_rows_projection_launch"}))
@@ -6424,17 +6541,39 @@ namespace
                             candidate.route_name);
                         ASSERT_EQ(
                             record.tags.at("effective_verifier_policy"),
-                            verifierRowsPolicyName(expected_fused_policy));
-                        ASSERT_EQ(record.tags.at("route"), expected_fused_route);
+                            verifierRowsPolicyName(expected_schedule.effective));
+                        ASSERT_EQ(
+                            record.tags.at("route"),
+                            verifierRowsExecutionRouteName(
+                                expected_schedule.route));
+                        ASSERT_EQ(
+                            record.tags.at("task_grid"),
+                            verifierRowsTaskGridName(
+                                expected_schedule.task_grid));
                         ASSERT_EQ(
                             record.tags.at("physical_row_tile"),
-                            std::to_string(expected_physical_row_tile));
+                            std::to_string(
+                                expected_schedule.physical_row_tile));
                         ASSERT_EQ(
                             std::stoi(record.tags.at("k_tiles")),
                             serial_geometry.k_tiles);
                         ASSERT_EQ(
+                            std::stoi(record.tags.at("policy_n")),
+                            policy_n);
+                        ASSERT_EQ(
+                            std::stoi(
+                                record.tags.at(
+                                    "ambient_n_block_chunks")),
+                            expected_schedule.ambient_n_block_chunks);
+                        ASSERT_EQ(
                             std::stoi(record.tags.at("n_block_chunks")),
-                            expected_fused_n_block_chunks);
+                            expected_schedule.n_block_chunks);
+                        ASSERT_EQ(
+                            std::stoll(record.tags.at("producer_tasks")),
+                            expected_schedule.producer_tasks);
+                        ASSERT_EQ(
+                            std::stoll(record.tags.at("reduction_tasks")),
+                            expected_schedule.reduction_tasks);
                         candidate_fused_route_count += record.count;
                     }
                     ASSERT_EQ(
@@ -6455,10 +6594,15 @@ namespace
                             serial,
                             static_cast<size_t>(M) * static_cast<size_t>(N));
                     const bool route_ok =
-                        route.found && route.count > 0 &&
-                        route.build_isa == build_isa &&
-                        route.isa == effective_runtime_isa &&
-                        route.effective_policy == candidate.route_name;
+                        route.count > 0 && matchesCPUVerifierRouteIdentity(
+                            route,
+                            expected_schedule,
+                            candidate.route_name,
+                            build_isa,
+                            effective_runtime_isa,
+                            serial_geometry.k_tiles,
+                            policy_n,
+                            omp_get_max_threads());
                     ASSERT_TRUE(route_ok)
                         << format.name << " M=" << M << " candidate="
                         << candidate.route_name
@@ -6486,22 +6630,17 @@ namespace
                         << format.name << " M=" << M << " candidate="
                         << candidate.route_name
                         << " changed native output bytes across repeats";
-                    const double speedup =
-                        timing.evidence.median > 0.0
-                            ? serial_timing.evidence.median /
-                                  timing.evidence.median
-                            : 0.0;
                     rows.push_back(CandidateRow{
-                        candidate,
-                        timing,
-                        comparison,
-                        route,
-                        repeat_byte_mismatches,
-                        speedup,
-                        candidate_warmups,
-                        route_ok,
-                        numerical_correctness,
-                        correctness_pass});
+                        .candidate = candidate,
+                        .timing = timing,
+                        .comparison = comparison,
+                        .route = route,
+                        .repeat_byte_mismatches = repeat_byte_mismatches,
+                        .timing_warmup_count = candidate_warmups,
+                        .route_ok = route_ok,
+                        .numerical_correctness = numerical_correctness,
+                        .correctness_pass = correctness_pass,
+                    });
                 }
 
                 int best_index = -1;
@@ -6529,8 +6668,9 @@ namespace
                         std::fprintf(
                             csv,
                             "cpu,verifier_rows,%s,%u,%u,%s,eager,%d,%d,%d,%s,%s,%s,%s,%d,%zu,"
-                            "%d,%d,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%zu,%zu,"
-                            "%.9g,%.9g,%.9g,%.9g,%s,%s,%s,%d,%s,%d,%d,%d,%d,%d\n",
+                            "%d,%d,%.9f,%.9f,%.9f,%.9f,%.9f,%zu,%zu,%zu,"
+                            "%.9g,%.9g,%.9g,%.9g,%s,%s,%s,%d,%s,%d,%d,%d,%d,"
+                            "%s,%s,%d,%lld,%lld,%d,%d,%d\n",
                             format.name.c_str(),
                             static_cast<unsigned>(packed.codebook_id),
                             static_cast<unsigned>(packed.codebook_id),
@@ -6551,8 +6691,6 @@ namespace
                             row.timing.evidence.p95,
                             row.timing.evidence.mad,
                             row.timing.evidence.cv,
-                            serial_timing.evidence.median,
-                            row.speedup,
                             row.comparison.mismatch_count,
                             row.comparison.first_mismatch_index,
                             row.repeat_byte_mismatches,
@@ -6566,7 +6704,16 @@ namespace
                             row.route_ok ? 1 : 0,
                             row.route.effective_policy.c_str(),
                             row.route.k_tiles,
+                            row.route.policy_n,
+                            row.route.ambient_n_block_chunks,
                             row.route.n_block_chunks,
+                            row.route.execution_route.c_str(),
+                            row.route.task_grid.c_str(),
+                            row.route.physical_row_tile,
+                            static_cast<long long>(
+                                row.route.producer_tasks),
+                            static_cast<long long>(
+                                row.route.reduction_tasks),
                             row.numerical_correctness ? 1 : 0,
                             row.correctness_pass ? 1 : 0,
                             static_cast<int>(index) == best_index ? 1 : 0);
@@ -6610,7 +6757,7 @@ namespace
                     rows[static_cast<size_t>(best_index)];
                 std::fprintf(
                     stderr,
-                    "[CPUNativeVNNI][VERIFIER][STRONG] format=%s codebook=%u shape=%s M=%d candidate=%s build_isa=%s requested_runtime_isa=%s effective_runtime_isa=%s median_us=%.3f speedup=%.3f bit_mismatches=%zu repeat_byte_mismatches=%zu\n",
+                    "[CPUNativeVNNI][VERIFIER][STRONG] format=%s codebook=%u shape=%s M=%d candidate=%s build_isa=%s requested_runtime_isa=%s effective_runtime_isa=%s median_us=%.3f bit_mismatches=%zu repeat_byte_mismatches=%zu route=%s task_grid=%s producer_tasks=%lld reduction_tasks=%lld\n",
                     format.name.c_str(),
                     static_cast<unsigned>(packed.codebook_id),
                     shape_name.c_str(),
@@ -6620,9 +6767,12 @@ namespace
                     requested_runtime_isa.c_str(),
                     best.route.isa.c_str(),
                     best.timing.evidence.median,
-                    best.speedup,
                     best.comparison.mismatch_count,
-                    best.repeat_byte_mismatches);
+                    best.repeat_byte_mismatches,
+                    best.route.execution_route.c_str(),
+                    best.route.task_grid.c_str(),
+                    static_cast<long long>(best.route.producer_tasks),
+                    static_cast<long long>(best.route.reduction_tasks));
                 ++executed_cases;
             }
 
@@ -6780,7 +6930,9 @@ namespace
                     shape.N,
                     shape.K,
                     1,
-                    format.payload_bytes,
+                    preparedFootprintForFormat(
+                        static_cast<uint8_t>(raw_codebook),
+                        format.is_asymmetric),
                     threads);
                 const bool serial_kpart = serial.k_tiles > 1;
                 std::fprintf(
@@ -7202,7 +7354,7 @@ namespace
             if (profiling_requested && useSyntheticProfilerPreparedWeights())
             {
                 kernel = std::make_unique<CPUNativeVNNIGemmKernel>(
-                    createProfilerPackedWeightsForFormat(format, N, K));
+                    createDispatchEvidencePackedWeightsForFormat(format, N, K));
             }
             else
             {
@@ -7276,7 +7428,7 @@ namespace
                     N,
                     K,
                     1,
-                    packed.payload_bytes,
+                    packed.preparedFootprint(),
                     omp_get_max_threads());
                 const bool serial_m1_uses_kpart = serial_route.k_tiles > 1;
                 const auto with_candidate_route =
@@ -7394,7 +7546,7 @@ namespace
                         with_candidate_route(candidate, [&]()
                         {
                             PerfStatsCollector::reset();
-                            profileExactCPURequest(
+                            native_vnni_dispatch::profileExactOpenMPRegion(
                                 *perf_control,
                                 exact_request_id,
                                 exact_output_path,

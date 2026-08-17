@@ -673,14 +673,13 @@ namespace
             return true;
         }
 
-        bool publishLogitsAtBoundary(
-            TensorBase *logits,
-            IDeviceContext *ctx,
-            void *producer_stream) override
+        bool publishForwardResultAtBoundary(
+            const ForwardOutput &output,
+            IDeviceContext *ctx) override
         {
             ++sync_logits_calls;
-            if (!ctx || !ctx->isGPU() || !producer_stream ||
-                !logits || logits != output_tensor_)
+            if (!ctx || !ctx->isGPU() || !output.execution.stream ||
+                !output.logits || output.logits != output_tensor_)
                 return false;
 
             /*
@@ -689,7 +688,10 @@ namespace
              * than replay-completion fences, so republish the graph-declared
              * tensor after executable launch without forcing host visibility.
              */
-            TransferEngine::publishDeviceWrite(logits, ctx->deviceId(), producer_stream);
+            TransferEngine::publishDeviceWrite(
+                output.logits,
+                ctx->deviceId(),
+                output.execution.stream);
             return true;
         }
 

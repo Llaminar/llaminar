@@ -33,9 +33,9 @@
 #include "../../collective/ILocalPPContext.h"
 #include "../../loaders/ModelContext.h"
 #include "../../interfaces/IMPIContext.h"
+#include "../../utils/Assertions.h"
 #include "../../utils/MPIContext.h"
 #include "../../utils/Tokenizer.h"
-#include "../moe/ExpertWeightTransfer.h"
 #include <memory>
 #include <mutex>
 #include <atomic>
@@ -47,14 +47,39 @@
 namespace llaminar2
 {
 
-    class MoERebalanceController;
+    class MoEOverlayResidencyAuthority;
+    class MoEOverlayParticipantResidencyRegistry;
+    class MoEOverlayPhysicalResidencyFabric;
+    class MoEOverlayParticipantPreparedWaveFactory;
+    class MoEOverlayTierMigrationTransport;
+    class MoEOverlayMPIRemoteProjectionTransport;
+    class MoEOverlayMPIResidencyConsensus;
+    class MoEOverlayDistributedResidencyTransport;
+    class MoEOverlayMPIHistogramPublisher;
+    class MoEOverlayResidencyMaintenanceService;
+    class MoEOverlayInferenceInterferenceProbe;
+    class MoEOverlayInferenceTransactionCoordinator;
+    class MoEOverlayInferenceTransactionFollower;
     class IModelContext;
-    struct ExpertReplicaSet;
     struct MoEExpertOverlayExecutionPlan;
+    struct MoEOverlayResidencySnapshot;
 
+    /**
+     * @brief Freeze a model-aware ExpertOverlay plan for one runtime graph family.
+     *
+     * The MTP policy is part of placement identity because a routed NextN
+     * sidecar owns an additional prepared expert bank that does not exist in a
+     * non-MTP graph family.
+     *
+     * @param model_ctx Loaded model and tensor inventory authority.
+     * @param plan Declarative requested placement plan.
+     * @param mtp Exact effective MTP policy selected by orchestration.
+     * @return Immutable runtime-active placement plan, or null for no request.
+     */
     std::shared_ptr<MoERoutedExpertPlacementPlan> freezeMoEExpertOverlayPlanForModel(
         IModelContext &model_ctx,
-        const std::shared_ptr<MoERoutedExpertPlacementPlan> &plan);
+        const std::shared_ptr<MoERoutedExpertPlacementPlan> &plan,
+        const MTPRuntimeConfig &mtp);
 
     /**
      * @brief Concrete implementation of IOrchestrationRunner
@@ -97,6 +122,38 @@ namespace llaminar2
         OrchestrationRunner(
             OrchestrationConfig config,
             std::unique_ptr<IExecutionPlanBuilder> plan_builder);
+
+        /**
+         * @brief Construct with an immutable, preloaded real-weight context
+         *
+         * Runs the ordinary production initialization sequence, including plan
+         * construction, graph lowering, capture, and runtime controllers, while
+         * reusing one already authenticated ModelContext.  Initialization
+         * rejects a context whose path, distribution, or layer ownership does
+         * not match the newly built execution plan; it never falls back to
+         * loading a different context.
+         *
+         * @param config Orchestration configuration
+         * @param plan_builder Plan builder for creating execution plans
+         * @param reuse_contract Immutable model authority and the production
+         *        plan that certified its prepared weights
+         */
+        OrchestrationRunner(
+            OrchestrationConfig config,
+            std::unique_ptr<IExecutionPlanBuilder> plan_builder,
+            std::shared_ptr<ModelContext> model_ctx);
+
+        /**
+         * @brief Construct with plan-certified prepared weights from a prior runner.
+         *
+         * @param config Orchestration configuration.
+         * @param plan_builder Builder for the new production plan.
+         * @param reuse_contract Context and weight-affecting plan certificate.
+         */
+        OrchestrationRunner(
+            OrchestrationConfig config,
+            std::unique_ptr<IExecutionPlanBuilder> plan_builder,
+            ModelContextReuseContract reuse_contract);
 
         /**
          * @brief Construct with pre-built execution plan
@@ -174,7 +231,6 @@ namespace llaminar2
             const SamplingParams &sampling) override;
         void setDecodeStepTokenBudget(int max_tokens) override;
         bool maybeApplyMoERebalance() override;
-        bool usesDeviceSideMoERebalanceController() const override;
         uint64_t moeRuntimeMovementEpoch() const override;
 
         // =====================================================================
@@ -205,6 +261,20 @@ namespace llaminar2
         void setStopTokens(const std::vector<int32_t> &stop_tokens) override;
         std::shared_ptr<ITokenizer> tokenizer() const override;
         const std::string &architecture() const override;
+        const IModelContext *modelContextForDiagnostics() const override;
+
+        /**
+         * @brief Return the immutable live ExpertOverlay map for diagnostics.
+         *
+         * This read-only view exists so production parity can attribute router
+         * checkpoints to the exact published epoch. It exposes no mutation or
+         * publication operation and returns null when ExpertOverlay is absent.
+         */
+        [[nodiscard]] std::shared_ptr<const MoEOverlayResidencySnapshot>
+        expertOverlayResidencySnapshotForDiagnostics() const;
+
+        std::optional<ModelContextReuseContract>
+        modelContextReuseContract() const override;
         // =====================================================================
         // IOrchestrationRunner: Snapshot API
         // =====================================================================
@@ -222,49 +292,6 @@ namespace llaminar2
 
         const GraphExecutorStats *executorStats() const override;
         void resetExecutorStats() override;
-
-        /// Get MoE rebalance controller from the underlying DGO (if any)
-        MoERebalanceController *moeRebalanceController() const;
-        std::vector<MoERebalanceController *> moeRebalanceControllers() const;
-        MoERebalanceController *moeRebalanceControllerForDomain(
-            const std::string &domain_id) const;
-
-        /// Apply rebalanced expert masks to DGO's cached MoEExpertComputeStages
-        void applyMoEExpertMasks(
-            const std::vector<std::vector<bool>> &masks,
-            const ReceivedWeightsMap &received = {},
-            const std::string &domain_id = {});
-
-        /// Apply MoE masks to every local device runner when the underlying
-        /// runner is a RankOrchestrator. Returns true if handled.
-        bool applyMoEExpertMasksForAllLocalDevices(
-            const MoERebalanceController &controller,
-            const ExpertReplicaSet *replica_arrivals = nullptr,
-            const std::vector<int> *previous_ownership_placement = nullptr);
-
-        /// Apply precomputed MoE masks to every local device runner when the
-        /// underlying runner is a RankOrchestrator. Returns true if handled.
-        bool applyMoEExpertMasksForAllLocalDevices(
-            const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
-            const std::string &domain_id = {});
-
-        /// Set expert replica info for per-token dynamic dispatch
-        void setExpertReplicaSet(const ExpertReplicaSet &replicas, int participant_id);
-
-        /// Apply one dynamic MoE rebalance cycle, including bounded hot replicas.
-        bool applyMoERebalanceWithReplicas(bool log_histogram_summary = false);
-
-        /// Transfer packed weights for migrating experts via MPI.
-        ReceivedWeightsMap transferExpertWeights(
-            const std::vector<ExpertMigration> &manifest, int num_layers);
-
-        /// Transfer pre-packed weights for replicated experts via MPI (non-destructive).
-        ReceivedWeightsMap transferReplicaWeights(
-            const ExpertReplicaSet &replicas, int num_layers);
-
-        /// Release raw expert weight data after initial VNNI packing.
-        /// @return Total bytes freed/released
-        size_t releaseRawExpertWeights();
 
         // =====================================================================
         // IOrchestrationRunner: GPU-side Sampling
@@ -300,7 +327,6 @@ namespace llaminar2
             PREFILL = 3,             ///< Prefill (followed by token count + tokens)
             DECODE_STEP = 4,         ///< Run one decode step (followed by int32 token budget)
             SKIP_LOGITS_DECODE = 5,  ///< Set skip-logits-gather for decode
-            APPLY_MOE_REBALANCE = 6, ///< Apply dynamic MoE rebalance/hot replicas
             FORCE_DECODE_TOKEN = 7,  ///< Commit a forced token (followed by token id)
             SET_STOP_TOKENS = 8,     ///< Install request stop policy (followed by count + token IDs)
             SHUTDOWN = 99            ///< Exit the worker loop
@@ -319,6 +345,10 @@ namespace llaminar2
          * @brief Signal workers to exit their loops.
          */
         void shutdownMPIWorkers() override;
+        int coordinatedRootRank() const override
+        {
+            return mpi_coordinated_root_rank_;
+        }
         void setMoEExpertOverlayMPIContext(std::shared_ptr<IMPIContext> mpi_ctx) override
         {
             moe_expert_overlay_mpi_ctx_ = std::move(mpi_ctx);
@@ -327,17 +357,32 @@ namespace llaminar2
         /**
          * @brief Enable MPI coordinated mode.
          *
-         * When enabled, rank 0 broadcasts commands before inference operations
-         * so worker ranks can participate in lockstep. Must be enabled on rank 0
-         * before workers enter runMPIWorkerLoop().
+         * When enabled, the inventory-resolved coordinated root broadcasts
+         * commands before inference operations so worker ranks participate in
+         * lockstep. The root enables this before workers enter their loops.
          *
          * Only server/interactive modes use this. Modes where all ranks run
          * the same code path (SingleShotChat, Completion) do NOT enable this.
          */
-        void setMPICoordinatedMode(bool enabled) override { mpi_coordinated_mode_ = enabled; }
+        void setMPICoordinatedMode(bool enabled) override
+        {
+            /**
+             * A worker loop can only be started once for an orchestration
+             * runner.  Re-enabling coordinated mode after rank zero has sent
+             * SHUTDOWN would make a later command wait for workers that have
+             * already deliberately left the communicator protocol.
+             */
+            if (enabled && mpi_workers_shutdown_)
+            {
+                LLAMINAR_UNREACHABLE(
+                    "Cannot re-enable MPI coordinated mode after worker shutdown; "
+                    "construct a new OrchestrationRunner for the next serving session");
+            }
+            mpi_coordinated_mode_ = enabled;
+        }
 
         /**
-         * @brief Broadcast an MPI command from rank 0 to all ranks.
+         * @brief Broadcast an MPI command from the coordinated root to all ranks.
          *
          * Only broadcasts when mpi_coordinated_mode_ is enabled.
          * Called internally before operations that require all ranks.
@@ -377,6 +422,65 @@ namespace llaminar2
         bool freezeMoEExpertOverlayPlanForLoadedModel();
 
         /**
+         * @brief Create the one process-local RCU authority for a tiered overlay.
+         *
+         * This runs after model-aware placement is frozen and before any root or
+         * participant graph is built. Dynamic policies also create the shared
+         * double-buffered histogram from the exact owner-map geometry.
+         */
+        bool initializeMoEExpertOverlayResidencyAuthority();
+
+        /**
+         * @brief Return whether the frozen authority is a homogeneous GPU tier.
+         *
+         * The authority execution enum deliberately also covers homogeneous
+         * CPU tiers, where host and participant memory are the same domain.
+         * This narrower predicate selects the captured CUDA/ROCm executor and
+         * prevents the host maintenance service from becoming a second writer.
+         */
+        bool usesHomogeneousGpuDeviceResidentMoEOverlayAuthority() const;
+
+        /**
+         * @brief Materialize the topology-selected authority executor.
+         *
+         * Called only after graph construction has registered every live
+         * initial prepared-engine bank. Homogeneous GPU tiers retain their
+         * captured device transaction; CPU, heterogeneous, and multi-tier
+         * plans install the process-local physical fabric and background host
+         * scheduler. Exactly one branch may publish durable epochs.
+         */
+        bool initializeMoEExpertOverlayResidencyMaintenance();
+
+        /**
+         * @brief Seal continuation-rank native graphs before ticket admission.
+         *
+         * Only the distributed ExpertOverlay continuation rank performs this
+         * operation. It passes the already-frozen common prefill schedule to
+         * the runner, so native graph residency and memory preflight consume
+         * the same physical-row accounting authority.
+         */
+        bool materializeMoEOverlayContinuationServingGraphFamily();
+
+        /**
+         * @brief Bind the fixed-slot heterogeneous inference control plane.
+         *
+         * The continuation rank creates one direct publisher per remote expert
+         * rank and installs a shared coordinator into its symmetric LocalTP
+         * graphs. Each remote rank binds its already-retained expert graph to a
+         * follower. No ticket contains token, KV, sampler, or model state.
+         */
+        bool initializeMoEOverlayInferenceTransactions();
+
+        /**
+         * @brief Stop background proposals and destroy migration ownership safely.
+         *
+         * The maintenance worker drains exact transfer events while the graph,
+         * prepared engines, and devices are still alive. Destruction then
+         * proceeds transport, factory, fabric, registry, and authority.
+         */
+        void shutdownMoEExpertOverlayResidencyMaintenance() noexcept;
+
+        /**
          * @brief Validate TP/PP configuration against loaded model
          *
          * Checks that the requested parallelism configuration is compatible
@@ -408,6 +512,21 @@ namespace llaminar2
          * @return true if model fits, false with error if not
          */
         bool validateMemoryPlan();
+
+        /**
+         * @brief Freeze the one bounded prefill schedule used by every overlay rank.
+         *
+         * After each rank has independently admitted its local graph arena,
+         * the continuation root publishes the configured bucket ladder and the
+         * overlay communicator reduces the capacity to the smallest safe
+         * value.  This runs only during initialization; request execution
+         * consumes the resulting typed RuntimeConfig contract without a
+         * control-plane collective or a capacity guess.
+         *
+         * @return True when no distributed overlay is active or a complete
+         *         executable schedule contract has been installed.
+         */
+        bool establishMoEOverlayPrefillScheduleContract();
 
         /**
          * @brief Build compute graphs
@@ -602,28 +721,22 @@ namespace llaminar2
             int capture_draft_depth,
             GenerationBatchResult result);
         /**
-         * @brief Publish device MoE maintenance before launching a future MTP consumer.
+         * @brief Record that one resident generation step owned its MoE boundaries.
          *
-         * Accepted-state publication and the next speculative sidecar use
-         * independent GPU streams. Dynamic residency maintenance may flip the
-         * active placement bank between those operations, so a sidecar must
-         * never be submitted until the complete decode boundary has published
-         * its maintenance completion event. This helper is the sole ordering gate
-         * for resident sidecar prelaunches: it enqueues maintenance once for the
-         * current decode step and records that the ordinary outer-loop boundary
-         * must acknowledge, rather than replay, the same transaction.
+         * Dynamic homogeneous GPU parents contain the first external
+         * maintenance publication and every internal transaction tail. This
+         * method publishes that ownership as PerfStats evidence and arms one
+         * outer-loop acknowledgement; it never launches maintenance itself.
          *
-         * Non-device-controller lanes are unchanged because they do not have a
-         * concurrent placement-bank publisher.  A failure is fatal to the
-         * current decode step; launching the consumer against ambiguous expert
-         * ownership is never an allowed fallback.
-         *
-         * @param consumer Human-readable consumer name used in diagnostics.
-         * @return true when no device maintenance is required or its event has
-         *         been published before the future consumer launch.
+         * @param transaction_count Number of device-ledger transactions whose
+         *        graph family contained the typed maintenance boundary.
+         * @param execution_policy Exact CUDA/HIP parent execution policy.
+         * @return true when no device authority is active or ownership was
+         *         recorded; false on an overlapping lifecycle publication.
          */
-        bool publishDeviceMoEMaintenanceBeforeMTPConsumer(
-            const char *consumer);
+        bool noteEmbeddedDeviceMoEOverlayMaintenance(
+            uint64_t transaction_count,
+            DeviceGenerationExecutionPolicy execution_policy);
         /**
          * @brief Resolve the scalar sidecar base position for MTP planning.
          *
@@ -719,17 +832,57 @@ namespace llaminar2
             int token_count,
             const std::string &failure_message,
             int stable_segment_tokens = 0);
-        void recordMoERebalanceRawExpertRelease(
-            const std::string &domain_id,
-            const std::string &device);
-        bool publishPendingMoERebalanceUpdate();
-        bool publishPendingMoERebalanceBeforeForward(const char *reason);
-        void drainPendingMoERebalanceBeforeCacheClear();
-        void clearUnderlyingRunnerCacheAfterMoEPublish(const char *reason);
+        /**
+         * @brief Publish the current request generation to graph-native MoE runners.
+         *
+         * The generation is an overlay-world protocol value rather than a
+         * graph-cache or local device epoch. Every rank invokes this at the
+         * same initialization/reset boundary before it can enter a sparse
+         * dispatch collective.
+         *
+         * @param reason Stable lifecycle label retained in PerfStats evidence.
+         * @return False when a distributed overlay runner rejects the value.
+         */
+        bool publishMoEOverlayCollectiveRequestGeneration(const char *reason);
+        /**
+         * @brief Advance and publish a fresh distributed sparse-collective generation.
+         *
+         * Request reset returns logical token positions to zero. Advancing this
+         * separate authority prevents a preserved graph cache from accepting a
+         * stale sparse packet key from the previous request.
+         */
+        bool advanceMoEOverlayCollectiveRequestGeneration(const char *reason);
+        /**
+         * @brief Reset request-owned runner state after the overlay epoch is quiescent.
+         *
+         * Expert movement is owned by the ExpertOverlay maintenance service;
+         * this lifecycle helper therefore cannot publish masks, replicas, or
+         * any other durable placement data.
+         */
+        void resetUnderlyingRunnerRequestState(const char *reason);
 
         // =====================================================================
         // Error Handling
         // =====================================================================
+
+        /**
+         * @brief Terminate a coordinated MPI worker after an inference command fails.
+         *
+         * A worker may fail before another rank enters the next sparse MoE or
+         * tensor-parallel collective. Returning to the command broadcast loop
+         * in that state strands the other rank inside that unmatched collective.
+         * A real MPI communicator is therefore aborted as one job. Test
+         * contexts deliberately expose `MPI_COMM_NULL`; they receive an
+         * exception instead so unit tests can prove that the worker never
+         * consumes a later command after failure.
+         *
+         * @param command Name of the coordinated command that failed.
+         * @param reason Command-local failure diagnostic.
+         * @note This method never returns.
+         */
+        [[noreturn]] void terminateFailedMPIWorkerCommand(
+            const char *command,
+            const std::string &reason);
 
         /**
          * @brief Set error message and return false
@@ -750,12 +903,64 @@ namespace llaminar2
         std::unique_ptr<IExecutionPlanBuilder> plan_builder_;
         std::shared_ptr<IMPIContext> mpi_ctx_;
         std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx_;
+        /** Shared route evidence retained by authority and every child graph. */
+        std::shared_ptr<DecodeExpertHistogram>
+            moe_expert_overlay_decode_histogram_;
+        /** The only live owner-map publication authority in this process. */
+        std::shared_ptr<MoEOverlayResidencyAuthority>
+            moe_expert_overlay_residency_authority_;
+        /** Epoch-indexed prepared banks for participants hosted by this rank. */
+        std::shared_ptr<MoEOverlayParticipantResidencyRegistry>
+            moe_expert_overlay_participant_residency_;
+        /** Preallocated process-local CPU/GPU destination slots and lanes. */
+        std::shared_ptr<MoEOverlayPhysicalResidencyFabric>
+            moe_expert_overlay_physical_residency_fabric_;
+        /** Private non-blocking MPI data plane for cross-rank projections. */
+        std::shared_ptr<MoEOverlayMPIRemoteProjectionTransport>
+            moe_expert_overlay_remote_projection_transport_;
+        /** Joins physical arrivals into immutable participant candidate banks. */
+        std::unique_ptr<MoEOverlayParticipantPreparedWaveFactory>
+            moe_expert_overlay_wave_factory_;
+        /** Process-local composite event-polled migration transport. */
+        std::shared_ptr<MoEOverlayTierMigrationTransport>
+            moe_expert_overlay_migration_transport_;
+        /** Private all-rank reservation/stage/commit vote authority. */
+        std::shared_ptr<MoEOverlayMPIResidencyConsensus>
+            moe_expert_overlay_residency_consensus_;
+        /** Distributed two-phase wrapper around process-local movement. */
+        std::shared_ptr<MoEOverlayDistributedResidencyTransport>
+            moe_expert_overlay_distributed_migration_transport_;
+        /** Coordinator-to-peer immutable histogram publication lane. */
+        std::shared_ptr<MoEOverlayMPIHistogramPublisher>
+            moe_expert_overlay_histogram_publisher_;
+        /** Sole host background scheduler for durable overlay movement. */
+        std::unique_ptr<MoEOverlayResidencyMaintenanceService>
+            moe_expert_overlay_maintenance_service_;
+        /** Lock-free live inference interval boundary used only when armed. */
+        std::shared_ptr<MoEOverlayInferenceInterferenceProbe>
+            moe_expert_overlay_interference_probe_;
         std::shared_ptr<ModelContext> model_ctx_;
+        /**
+         * @brief Plan that certified a caller-retained PreparedWeightStore.
+         *
+         * Present only for the explicit reuse constructor.  Initialization
+         * compares its weight-affecting topology with the newly resolved plan
+         * before memory admission can credit existing device residency.
+         */
+        std::optional<RankExecutionPlan> retained_prepared_weight_plan_;
+        /** True only after the current plan passed the retained-plan comparison. */
+        bool retained_prepared_weight_plan_validated_{false};
         std::unique_ptr<ILocalTPContext> local_tp_ctx_;
         std::unique_ptr<ILocalPPContext> local_pp_ctx_;
 
         // Execution infrastructure
         std::unique_ptr<IInferenceRunner> runner_;
+        /** Rank-wide source authority; null on remote and non-overlay ranks. */
+        std::shared_ptr<MoEOverlayInferenceTransactionCoordinator>
+            moe_overlay_inference_transaction_coordinator_;
+        /** Remote retained-graph scheduler; null on the continuation rank. */
+        std::unique_ptr<MoEOverlayInferenceTransactionFollower>
+            moe_overlay_inference_transaction_follower_;
         /**
          * @brief Whether shutdown may resolve a physical backend for runner_.
          *
@@ -776,19 +981,6 @@ namespace llaminar2
          * lifetime without leaking local-TP topology details to parity tests.
          */
         mutable std::unordered_map<std::string, std::vector<float>> snapshot_combined_cache_;
-
-        struct PendingMoERebalanceUpdate
-        {
-            RankOrchestrator *rank = nullptr;
-            RankOrchestrator::PreparedMoEExpertMaskUpdate prepared;
-            ExpertReplicaSet replica_set;
-            int participant_id = 0;
-            bool publish_replica_set = false;
-            bool release_raw_after_publish = false;
-            std::string domain_id;
-            std::string device;
-        };
-        std::optional<PendingMoERebalanceUpdate> pending_moe_rebalance_prepare_;
 
         // Status
         std::atomic<bool> initialized_{false};
@@ -984,16 +1176,6 @@ namespace llaminar2
         std::optional<SamplingParams>
             prelaunched_mtp_first_sidecar_params_;
         /**
-         * @brief Whether this decode step already published device MoE maintenance.
-         *
-         * The flag bridges the inner MTP transaction, which must order a
-         * prelaunched sidecar immediately, and the outer generation loop, which
-         * historically owned the decode-boundary callback.  It does not replace
-         * a GPU event or carry data-plane state; it only prevents the host
-         * scheduler from submitting the same maintenance graph twice.
-         */
-        bool device_moe_maintenance_published_in_decode_step_ = false;
-        /**
          * @brief Scheduler-owned logical position for the current decode transaction.
          *
          * This control-plane scalar is initialized from the request token count
@@ -1129,6 +1311,14 @@ namespace llaminar2
          */
         bool device_generation_terminal_ledger_authoritative_{false};
         /**
+         * @brief One-shot proof that the completed resident step owned maintenance.
+         *
+         * `maybeApplyMoERebalance()` consumes this acknowledgement instead of
+         * submitting a redundant no-op graph after a native parent has already
+         * crossed every committed transaction boundary.
+         */
+        bool device_generation_embedded_moe_maintenance_pending_ack_{false};
+        /**
          * @brief Per-request state initialized by prefillBatch().
          *
          * Phase 8 request batching must never reuse the scalar last-token or
@@ -1168,7 +1358,24 @@ namespace llaminar2
         std::vector<BatchedDecodeRequestState> batched_request_states_;
         bool batched_decode_active_{false};
         int decode_step_token_budget_{0};                               // Optional per-step cap used by generate(); 0 means unlimited
-        bool mpi_coordinated_mode_{false};                              // When true, rank 0 broadcasts commands for worker loop
+        bool mpi_coordinated_mode_{false};
+        /**
+         * @brief Sole authority for the coordinated command protocol.
+         *
+         * This is zero for ordinary rank orchestration and the resolved
+         * continuation root for heterogeneous ExpertOverlay. It is frozen
+         * during plan construction and never changes during inference.
+         */
+        int mpi_coordinated_root_rank_{0};
+        /**
+         * @brief Whether rank zero has permanently closed the coordinated
+         *        worker-command protocol for this runner.
+         *
+         * A second SHUTDOWN is not harmless: worker ranks have already left
+         * their receive loop, so a second broadcast would deadlock rank zero.
+         * This flag makes that terminal lifecycle transition idempotent.
+         */
+        bool mpi_workers_shutdown_{false};
         std::shared_ptr<ITokenizer> tokenizer_;
         MTPStats mtp_stats_;
         std::unique_ptr<MTPDepthController> mtp_depth_controller_;
@@ -1177,7 +1384,20 @@ namespace llaminar2
         bool mtp_bypassed_{false};
         bool mtp_bypass_recorded_for_request_{false};
         std::string mtp_bypass_reason_;
+        /**
+         * @brief Last completed request epoch, owned by the continuation rank.
+         *
+         * Non-authority ranks retain the exact value published by the
+         * continuation rank solely so their next lifecycle broadcast can
+         * validate and report it. They never independently advance this
+         * counter; sparse wire identity has one authority even when root and
+         * expert graph caches have different lifetimes.
+         */
         uint64_t request_epoch_{0};
+        /** Exact generation most recently installed into every sparse graph. */
+        uint64_t moe_overlay_collective_generation_id_{0};
+        /** Monotonic outer-command identity owned only by the continuation rank. */
+        uint64_t moe_overlay_inference_command_sequence_{0};
     };
 
 } // namespace llaminar2

@@ -36,6 +36,7 @@
 #include "../../../backends/DeviceId.h"
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 
 // NOTE: DO NOT include HIP headers here!
@@ -172,6 +173,23 @@ namespace llaminar2
                 float alpha = 1.0f, float beta = 0.0f);
 
             /**
+             * @brief Submit FP32 GEMM on one exact non-null HIP stream.
+             *
+             * The cached hipBLAS kernel is shared by every floating projection
+             * on a device. This entry point binds the shared handle and submits
+             * the operation while holding its short host-side dispatch lock, so
+             * another stream cannot retarget the handle between those actions.
+             * The lock is released immediately after enqueue and does not wait
+             * for device execution.
+             */
+            bool executeOnStream(
+                ExplicitGPUStream stream,
+                const float *d_A, const float *d_B, float *d_C,
+                int M, int N, int K,
+                bool transA = false, bool transB = false,
+                float alpha = 1.0f, float beta = 0.0f);
+
+            /**
              * @brief Batched FP32 GEMM with row-major Llaminar layout.
              *
              * All batch entries share dimensions and transpose flags, but may use
@@ -179,6 +197,17 @@ namespace llaminar2
              * device memory and valid for the active stream.
              */
             bool execute_batched(
+                const float *const *d_A_array,
+                const float *const *d_B_array,
+                float *const *d_C_array,
+                int M, int N, int K,
+                int batch_count,
+                bool transA = false, bool transB = false,
+                float alpha = 1.0f, float beta = 0.0f);
+
+            /** @brief Submit batched FP32 GEMM on one exact HIP stream. */
+            bool executeBatchedOnStream(
+                ExplicitGPUStream stream,
                 const float *const *d_A_array,
                 const float *const *d_B_array,
                 float *const *d_C_array,
@@ -214,12 +243,29 @@ namespace llaminar2
                 bool transA = false, bool transB = false,
                 float alpha = 1.0f, float beta = 0.0f);
 
+            /** @brief Submit fused-bias FP32 GEMM on one exact HIP stream. */
+            bool executeWithBiasOnStream(
+                ExplicitGPUStream stream,
+                const float *d_A, const float *d_B, float *d_C,
+                const float *d_bias,
+                int M, int N, int K,
+                bool transA = false, bool transB = false,
+                float alpha = 1.0f, float beta = 0.0f);
+
             /**
              * @brief FP16 GEMM: C = alpha * A @ B + beta * C
              *
              * Uses hipblasHgemm for native FP16 computation.
              */
             bool execute_fp16(
+                const void *d_A, const void *d_B, void *d_C,
+                int M, int N, int K,
+                bool transA = false, bool transB = false,
+                float alpha = 1.0f, float beta = 0.0f);
+
+            /** @brief Submit native FP16 GEMM on one exact HIP stream. */
+            bool executeFP16OnStream(
+                ExplicitGPUStream stream,
                 const void *d_A, const void *d_B, void *d_C,
                 int M, int N, int K,
                 bool transA = false, bool transB = false,
@@ -245,7 +291,12 @@ namespace llaminar2
             bool ownsHandle() const { return owns_handle_; }
 
             /**
-             * @brief Bind a validated stream to this kernel and its hipBLAS handle.
+             * @brief Retain the exact validated stream for legacy entry points.
+             *
+             * The handle is rebound only inside the dispatch critical section
+             * immediately before enqueue.  Merely binding a wrapper therefore
+             * cannot retarget another wrapper that shares this low-level
+             * kernel.
              *
              * @param stream Non-null HIP stream validated by the public kernel
              *        interface.
@@ -266,6 +317,13 @@ namespace llaminar2
             Precision precision_ = Precision::FP32;
             bool owns_handle_ = true;    ///< false when using context's hipBLAS handle
             bool owns_lt_handle_ = true; ///< false when using context's hipBLASLt handle
+            /**
+             * Serializes only handle mutation plus asynchronous submission.
+             * Device execution is not waited here. Context-owned shared handles
+             * additionally rely on their single worker-thread submission
+             * contract; independently submitted cached wrappers share this lock.
+             */
+            mutable std::mutex dispatch_mutex_;
         };
 
         /**

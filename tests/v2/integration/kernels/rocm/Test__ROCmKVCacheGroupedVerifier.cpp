@@ -544,13 +544,8 @@ LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(FP16_From_FP16, 3)
 LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(FP16_From_BF16, 4)
 LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(FP16_From_Q8_1, 5)
 LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(Q8_1_From_FP32, 6)
-LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(Q8_1_From_FP16, 7)
-LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(Q8_1_From_BF16, 8)
-LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(Q8_1_From_Q8_1, 9)
-LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ4V_From_FP32, 10)
-LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ4V_From_TQ8_TQ4, 11)
-LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ8V_From_FP32, 12)
-LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(TQ8K_TQ8V_From_TQ8, 13)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(AQ8K_TQ4V_From_FP32, 7)
+LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST(AQ8K_TQ8V_From_FP32, 8)
 
 #undef LLAMINAR_ROCM_KV_RUNTIME_FORMAT_TEST
 
@@ -627,12 +622,12 @@ TEST(Test__ROCmKVCacheGroupedVerifier,
 }
 
 /**
- * @brief Stress both TurboQuant policies through captured MTP publication.
+ * @brief Stress all asymmetric compressed policies through captured MTP publication.
  *
- * TQ8-K/TQ4-V and TQ8-K/TQ8-V share canonical sequence metadata but own
- * different grouped quantization and logical-block paths. This test subjects
- * both real cache implementations to graph reuse, wraparound, prefix restore,
- * and explicit producer/consumer event handoffs.
+ * AQ8-K with Q8_1, TQ4, and TQ8 values shares canonical sequence metadata but
+ * owns distinct value-codec paths. This test subjects every real compressed
+ * cache implementation to graph reuse, wraparound, prefix restore, and
+ * explicit producer/consumer event handoffs.
  */
 TEST(Test__ROCmKVCacheGroupedVerifier,
      AdversarialTurboQuantMultiStreamGraphReuseMatchesSerialState)
@@ -651,9 +646,10 @@ TEST(Test__ROCmKVCacheGroupedVerifier,
     ROCmKVLifecycleRuntime runtime;
 
     for (const auto &[precision, label] :
-         std::array<std::pair<ActivationPrecision, const char *>, 2>{{
-             {ActivationPrecision::TQ4, "TQ8-K/TQ4-V"},
-             {ActivationPrecision::TQ8, "TQ8-K/TQ8-V"},
+         std::array<std::pair<ActivationPrecision, const char *>, 3>{{
+             {ActivationPrecision::Q8_1, "AQ8-K/Q8_1-V"},
+             {ActivationPrecision::TQ4, "AQ8-K/TQ4-V"},
+             {ActivationPrecision::TQ8, "AQ8-K/TQ8-V"},
          }})
     {
         SCOPED_TRACE(label);

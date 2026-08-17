@@ -21,6 +21,7 @@
 #include <numeric>
 #include <chrono>
 #include <cmath>
+#include <algorithm>
 
 namespace llaminar2::test
 {
@@ -463,6 +464,145 @@ namespace llaminar2::test
         // In CI with oversubscription, we won't hit real UPI bandwidth
         // Just verify it's positive and operations succeed
         EXPECT_GT(bandwidth_gbps, 0.0) << "Measured bandwidth should be positive";
+    }
+
+    /**
+     * @test Compare the timeout-aware UPI request-progress loop with blocking MPI
+     *       at the exact Qwen3.6-35B prefill reduction geometry.
+     *
+     * Qwen3.6-35B publishes 434 rows of 2,048 FP32 hidden values at each
+     * tensor-parallel reduction.  A historical timeout hardening change replaced
+     * blocking MPI progress with `MPI_Test()` followed by a one-millisecond sleep.
+     * Open MPI may require many `MPI_Test()` calls to advance a segmented large
+     * reduction, so that sleep multiplied protocol progress into roughly 85 ms
+     * per collective.  A generic "bandwidth is positive" assertion did not catch
+     * the resulting order-of-magnitude prefill regression.
+     *
+     * This test measures a blocking `MPI_Allreduce` control and the production
+     * `UPICollectiveBackend` path back-to-back with the same communicator, payload,
+     * process placement, and warmed buffers.  The production path retains its
+     * timeout and fatal failure semantics, but its progress machinery must remain
+     * close to the MPI transport floor.  A relative gate is used so overloaded CI
+     * hosts do not need to meet this workstation's absolute UPI bandwidth.
+     */
+    TEST_F(Test__UPIBackendMPI, PrefillPayloadProgressTracksBlockingMPI)
+    {
+        constexpr size_t kPrefillRows = 434;
+        constexpr size_t kHiddenDimension = 2048;
+        constexpr size_t kElementCount = kPrefillRows * kHiddenDimension;
+        constexpr int kWarmupIterations = 3;
+        constexpr int kMeasuredIterations = 10;
+
+        std::vector<float> buffer(kElementCount, static_cast<float>(world_rank_ + 1));
+
+        const auto reset_buffer = [&]()
+        {
+            std::fill(
+                buffer.begin(),
+                buffer.end(),
+                static_cast<float>(world_rank_ + 1));
+        };
+
+        const auto measure_blocking_mpi = [&]() -> double
+        {
+            for (int iteration = 0; iteration < kWarmupIterations; ++iteration)
+            {
+                reset_buffer();
+                EXPECT_EQ(
+                    MPI_Allreduce(
+                        MPI_IN_PLACE,
+                        buffer.data(),
+                        static_cast<int>(kElementCount),
+                        MPI_FLOAT,
+                        MPI_SUM,
+                        MPI_COMM_WORLD),
+                    MPI_SUCCESS);
+            }
+
+            EXPECT_EQ(MPI_Barrier(MPI_COMM_WORLD), MPI_SUCCESS);
+            const auto start = std::chrono::steady_clock::now();
+            for (int iteration = 0; iteration < kMeasuredIterations; ++iteration)
+            {
+                reset_buffer();
+                EXPECT_EQ(
+                    MPI_Allreduce(
+                        MPI_IN_PLACE,
+                        buffer.data(),
+                        static_cast<int>(kElementCount),
+                        MPI_FLOAT,
+                        MPI_SUM,
+                        MPI_COMM_WORLD),
+                    MPI_SUCCESS);
+            }
+            const auto stop = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::micro>(stop - start).count() /
+                   static_cast<double>(kMeasuredIterations);
+        };
+
+        const auto measure_production_upi = [&]() -> double
+        {
+            for (int iteration = 0; iteration < kWarmupIterations; ++iteration)
+            {
+                reset_buffer();
+                EXPECT_TRUE(backend_->allreduce(
+                    buffer.data(),
+                    kElementCount,
+                    CollectiveDataType::FLOAT32,
+                    CollectiveOp::ALLREDUCE_SUM));
+            }
+
+            EXPECT_EQ(MPI_Barrier(MPI_COMM_WORLD), MPI_SUCCESS);
+            const auto start = std::chrono::steady_clock::now();
+            for (int iteration = 0; iteration < kMeasuredIterations; ++iteration)
+            {
+                reset_buffer();
+                EXPECT_TRUE(backend_->allreduce(
+                    buffer.data(),
+                    kElementCount,
+                    CollectiveDataType::FLOAT32,
+                    CollectiveOp::ALLREDUCE_SUM));
+            }
+            const auto stop = std::chrono::steady_clock::now();
+            return std::chrono::duration<double, std::micro>(stop - start).count() /
+                   static_cast<double>(kMeasuredIterations);
+        };
+
+        const double blocking_local_us = measure_blocking_mpi();
+        const double production_local_us = measure_production_upi();
+        double blocking_max_us = 0.0;
+        double production_max_us = 0.0;
+        ASSERT_EQ(
+            MPI_Allreduce(
+                &blocking_local_us,
+                &blocking_max_us,
+                1,
+                MPI_DOUBLE,
+                MPI_MAX,
+                MPI_COMM_WORLD),
+            MPI_SUCCESS);
+        ASSERT_EQ(
+            MPI_Allreduce(
+                &production_local_us,
+                &production_max_us,
+                1,
+                MPI_DOUBLE,
+                MPI_MAX,
+                MPI_COMM_WORLD),
+            MPI_SUCCESS);
+
+        if (world_rank_ == 0)
+        {
+            LOG_INFO("Qwen3.6-35B prefill allreduce control="
+                     << blocking_max_us << " us, production UPI="
+                     << production_max_us << " us, ratio="
+                     << production_max_us / blocking_max_us);
+        }
+
+        const double allowed_production_us =
+            std::max(blocking_max_us * 3.0, blocking_max_us + 250.0);
+        EXPECT_LE(production_max_us, allowed_production_us)
+            << "Timeout-aware UPI progress is materially slower than blocking MPI "
+            << "for the production 434x2048 FP32 prefill payload";
     }
 
     // =============================================================================

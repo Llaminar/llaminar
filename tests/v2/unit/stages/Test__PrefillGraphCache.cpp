@@ -407,6 +407,96 @@ TEST(Test__PrefillGraphCache, ResidentCapacityFiltersLargerBucketsAndRemainsTota
         << "short-context runners still need one total graph boundary";
 }
 
+TEST(Test__PrefillGraphCache,
+     ExpertOverlayDefaultSegmentFitsCompleteBucketFamilyAndRuntimeReserve)
+{
+    const auto retained_buckets = prefillGraphBucketsAtOrBelowCapacity(
+        defaultPrefillGraphBuckets(),
+        kDefaultExpertOverlayPrefillSegmentRows);
+
+    EXPECT_EQ(kDefaultExpertOverlayPrefillSegmentRows, 600)
+        << "The production bucket inventory currently resolves the measured "
+           "single-segment 595-token regime to its 600-row capture";
+    ASSERT_FALSE(retained_buckets.empty());
+    EXPECT_EQ(retained_buckets.back(),
+              kDefaultExpertOverlayPrefillSegmentRows);
+    EXPECT_LE(
+        retained_buckets.size() +
+            kExpertOverlayPrefillGraphIdentityReserve,
+        kDefaultPrefillGraphMaxCachedEntries)
+        << "Serving setup must not evict its own lower buckets when live "
+           "request and prefix-runtime identities are installed";
+}
+
+TEST(Test__PrefillGraphCache, ResidentCandidatesAreDescendingConfiguredShapes)
+{
+    EXPECT_EQ(
+        residentPrefillGraphRowCandidates(
+            {512, 128, -1, 256, 128, 1024}, 600),
+        (std::vector<int>{512, 256, 128}));
+    EXPECT_EQ(
+        residentPrefillGraphRowCandidates({64, 128}, 32),
+        (std::vector<int>{32}));
+    EXPECT_TRUE(
+        residentPrefillGraphRowCandidates({64, 128}, 0).empty());
+}
+
+TEST(Test__PrefillGraphCache, SegmentedCandidatesDoNotAdmitFullContextGraphs)
+{
+    const std::vector<int> buckets{256, 512, 1024, 2048, 4096};
+    EXPECT_EQ(
+        segmentedPrefillGraphRowCandidates(buckets, 4096, 256),
+        (std::vector<int>{256}));
+    EXPECT_EQ(
+        segmentedPrefillGraphRowCandidates(buckets, 4096, 448),
+        (std::vector<int>{256}));
+    EXPECT_EQ(
+        segmentedPrefillGraphRowCandidates(buckets, 128, 256),
+        (std::vector<int>{128}));
+    EXPECT_TRUE(
+        segmentedPrefillGraphRowCandidates(buckets, 4096, 0).empty());
+}
+
+TEST(Test__PrefillGraphCache, RawPromptFloorCannotExceedResidentCapacity)
+{
+    EXPECT_EQ(
+        effectivePrefillGraphMinimumPaddedBucketSeqLen(256, 128),
+        128);
+    EXPECT_EQ(
+        effectivePrefillGraphMinimumPaddedBucketSeqLen(64, 128),
+        64);
+    EXPECT_EQ(
+        effectivePrefillGraphMinimumPaddedBucketSeqLen(0, 128),
+        1);
+    EXPECT_EQ(
+        effectivePrefillGraphMinimumPaddedBucketSeqLen(256, 0),
+        256);
+}
+
+TEST(Test__PrefillGraphCache,
+     RawPromptInventoryIsSharedByCaptureAndAuthenticatedSidebands)
+{
+    const auto buckets = rawPrefillGraphBucketsForResidentCapacity(
+        {64, 128, 256, 512},
+        /*resident_graph_rows=*/256,
+        /*configured_floor=*/64);
+    EXPECT_EQ(buckets, (std::vector<int>{64, 128, 256}));
+
+    const auto ten_rows = selectPrefillGraphBucket(10, buckets);
+    ASSERT_TRUE(ten_rows);
+    EXPECT_EQ(ten_rows.bucket_seq_len, 64)
+        << "a transaction ticket must authenticate the same physical bucket "
+           "that ForwardExecutionEngine captures";
+
+    const auto short_context = rawPrefillGraphBucketsForResidentCapacity(
+        {64, 128},
+        /*resident_graph_rows=*/32,
+        /*configured_floor=*/64);
+    EXPECT_EQ(short_context, (std::vector<int>{32}))
+        << "the shared resolver retains the capacity-complete short-context "
+           "boundary";
+}
+
 TEST(Test__PrefillGraphCache, BucketPadding_CopiesRealTokensAndPadsTail)
 {
     const int tokens[] = {10, 11, 12};
@@ -853,6 +943,7 @@ TEST(Test__PrefillGraphCache, Preflight_AllowsPaddedBucketGraphStableMoERebalanc
         /*bucket_seq_len=*/768,
         PrefillGraphPreflightMode::Default,
         /*collectives_graph_capturable=*/false,
+        /*heterogeneous_segmentation_admitted=*/false,
         /*moe_rebalancing_graph_stable=*/true);
     EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }

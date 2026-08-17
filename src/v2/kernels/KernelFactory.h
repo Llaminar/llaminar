@@ -90,6 +90,7 @@ namespace llaminar2
     enum class KVCacheLayoutMode : uint8_t;
     class ITensor;
     class TensorBase;
+    class IPackedWeights;
     class ITensorGemm;
     class ITensorRoPE;
     class ITensorSwiGLU;
@@ -1390,6 +1391,36 @@ namespace llaminar
                  */
                 static std::shared_ptr<llaminar2::ITensorGemm> createExpertGemmFromTransferBlob(
                     const std::vector<uint8_t> &blob);
+
+                /**
+                 * @brief Create a GEMM engine from arbitrary contiguous wire storage.
+                 *
+                 * This overload lets dynamic migration receive directly into
+                 * uninitialized aligned storage without copying into a temporary
+                 * `std::vector` solely to satisfy the construction API.
+                 *
+                 * @param data First byte of one complete packed-weight wire record.
+                 * @param size Number of readable bytes beginning at `data`.
+                 * @return Caller-owned prepared GEMM engine, or `nullptr` on failure.
+                 */
+                static std::shared_ptr<llaminar2::ITensorGemm> createExpertGemmFromTransferBlob(
+                    const uint8_t *data,
+                    size_t size);
+
+                /**
+                 * @brief Consume final CPU packed storage into a prepared GEMM engine.
+                 *
+                 * Direct CPU expert movement receives MPI sections into the
+                 * allocations owned by `packed_weights`; this factory moves those
+                 * allocations into the kernel without a serialization round trip.
+                 *
+                 * @param packed_weights Complete eager CPU NativeVNNI weights.
+                 * @return Shared prepared engine, or `nullptr` for an incompatible
+                 *         or incomplete packed representation.
+                 */
+                static std::shared_ptr<llaminar2::ITensorGemm>
+                createExpertGemmFromPackedWeights(
+                    std::unique_ptr<llaminar2::IPackedWeights> packed_weights);
 
                 /**
                  * @brief Number of active GEMM engine registry entries

@@ -2282,7 +2282,7 @@ namespace
             {
                 // Uneven Q-head assignments are a separate placement policy;
                 // this tournament exercises the equal tensor splits requested
-                // by the production LocalTP/NodeLocalTP graph contracts.
+                // by the production LocalTP/NodeTP graph contracts.
                 if (geometry.n_heads % tp_degree != 0)
                     continue;
 

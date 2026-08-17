@@ -9,7 +9,8 @@ the development corpus.
 
 This module implements a two-stage, post-freeze transaction:
 
-* derive several fresh geometry candidates for every immutable generic leaf;
+* derive several fresh geometry candidates for every immutable generic leaf
+  in deterministic affinity-visible physical-core workers;
 * ask the production C++ tile planner whether each geometry uses serial full-K
   or ordered K-part arithmetic on each ISA regime;
 * select one matching physical route per leaf without reading timing data;
@@ -28,13 +29,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+import os
 import re
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .candidate_registry import cpu_native_vnni_decode_registry
+from .candidate_registry import (
+    cpu_native_vnni_decode_registry,
+    resolve_cpu_native_vnni_decode_n_block_chunks,
+)
 from .certification import CertificationReport
 from .corpus import GenericDomain, ObservationCorpus
 from .cpu_prefill_route_manifest import (
@@ -56,6 +63,7 @@ from .cpu_sealed_paired import (
 from .segmented_policy import (
     CandidatePointCost,
     GenericDispatchRule,
+    _physical_core_worker_count,
 )
 from .shape_manifest import NativeVNNIShapeManifest
 
@@ -68,6 +76,29 @@ CPU_DECODE_SEALED_GEOMETRY_PREFIX = "CPUDecodeAutoSeal_"
 SERIAL_FULL_K_BUNDLE = "single-native-vnni-decode:serial-full-k:fp32-output:v1"
 SERIAL_KPART_BUNDLE = "single-native-vnni-decode:serial-kpart:fp32-output:v1"
 DEFAULT_GEOMETRY_CANDIDATES_PER_RULE = 12
+
+
+# Frozen-rule reserve searches are independent but each may inspect tens of
+# thousands of lattice points. The parent materializes these immutable inputs
+# once, then Linux ``fork`` workers inherit their pages without repeatedly
+# serializing the development corpus through multiprocessing pipes.
+_PARALLEL_PROBE_RULES: tuple[GenericDispatchRule, ...] = ()
+_PARALLEL_PROBE_DIMENSIONS_BY_GROUP: Mapping[str, tuple[int, int]] = {}
+_PARALLEL_PROBE_FORBIDDEN: frozenset[tuple[int, int]] = frozenset()
+_PARALLEL_PROBE_MAXIMUM_WEIGHT_ELEMENTS = 0
+_PARALLEL_PROBE_DEVELOPMENT_ROWS_BY_GROUP: Mapping[str, tuple[object, ...]] = {}
+_PARALLEL_PROBE_SUPPLEMENTAL_COSTS_BY_GROUP: Mapping[
+    str, tuple[CandidatePointCost, ...]
+] = {}
+_PARALLEL_PLAN_RULES: tuple[GenericDispatchRule, ...] = ()
+_PARALLEL_PLAN_ROUTES_BY_DOMAIN: Mapping[
+    tuple[int, str, int, str], tuple[CPUPrefillSerialRoute, ...]
+] = {}
+_PARALLEL_PLAN_FORCEABLE_BY_GEOMETRY: Mapping[
+    tuple[int, int, int, int], tuple[str, ...]
+] = {}
+
+
 def _sha256_json(value: object) -> str:
     """Return a stable digest for one JSON-compatible transaction object."""
 
@@ -97,6 +128,95 @@ def cpu_decode_sealed_reserve_commitment(
             "development-and-burned-anchor-launch-k-tiles-v2"
         ),
     })
+
+
+def _fresh_cpu_decode_probe_geometries_at(
+    rule_index: int,
+) -> tuple[tuple[int, int], ...]:
+    """Build one rule's reserve from process-inherited immutable indexes."""
+
+    rule = _PARALLEL_PROBE_RULES[rule_index]
+    launch_k_tiles_by_group: dict[str, int] = {}
+    for shape_group_id in rule.development_shape_groups:
+        for row in _PARALLEL_PROBE_DEVELOPMENT_ROWS_BY_GROUP.get(
+            shape_group_id, ()
+        ):
+            if (
+                getattr(
+                    row,
+                    "architecture_class",
+                    rule.domain.architecture_class,
+                ) != rule.domain.architecture_class
+                or getattr(
+                    row,
+                    "runtime_codebook_id",
+                    rule.domain.runtime_codebook_id,
+                ) != rule.domain.runtime_codebook_id
+                or getattr(
+                    row,
+                    "bundle_signature",
+                    rule.domain.bundle_signature,
+                ) != rule.domain.bundle_signature
+                or getattr(
+                    row, "operation_kind", rule.domain.operation_kind
+                ) != rule.domain.operation_kind
+                or getattr(
+                    row, "execution_mode", rule.domain.execution_mode
+                ) != rule.domain.execution_mode
+                or getattr(row, "m", rule.domain.m) != rule.domain.m
+            ):
+                continue
+            launch_k_tiles = int(getattr(row, "launch_k_tiles", 0))
+            previous = launch_k_tiles_by_group.setdefault(
+                row.shape_group_id, launch_k_tiles
+            )
+            if previous != launch_k_tiles:
+                raise ValueError(
+                    "CPU decode shape group changed frozen K-tile geometry"
+                )
+
+    # A burned seal becomes legitimate development evidence for the next
+    # policy generation. Its fresh shape may consequently become the only
+    # anchor owned by a later leaf. Preserve the exact K-tile telemetry carried
+    # by that evidence just as broad-sweep observations do; treating it as
+    # absent silently rewrites ordered K-part into full-K arithmetic.
+    for shape_group_id in rule.development_shape_groups:
+        for cost in _PARALLEL_PROBE_SUPPLEMENTAL_COSTS_BY_GROUP.get(
+            shape_group_id, ()
+        ):
+            runtime = cost.runtime_key
+            if (
+                runtime.architecture_class != rule.domain.architecture_class
+                or runtime.runtime_codebook_id
+                != rule.domain.runtime_codebook_id
+                or runtime.bundle_signature != rule.domain.bundle_signature
+                or runtime.operation_kind != rule.domain.operation_kind
+                or runtime.execution_mode != rule.domain.execution_mode
+                or runtime.m != rule.domain.m
+            ):
+                continue
+            launch_k_tiles = int(runtime.launch_k_tiles)
+            previous = launch_k_tiles_by_group.setdefault(
+                cost.shape_group_id, launch_k_tiles
+            )
+            if previous != launch_k_tiles:
+                raise ValueError(
+                    "CPU decode supplemental shape group changed frozen "
+                    "K-tile geometry"
+                )
+
+    return fresh_geometry_candidates_for_rule(
+        rule,
+        _PARALLEL_PROBE_DIMENSIONS_BY_GROUP,
+        _PARALLEL_PROBE_FORBIDDEN,
+        _PARALLEL_PROBE_MAXIMUM_WEIGHT_ELEMENTS,
+        DEFAULT_GEOMETRY_CANDIDATES_PER_RULE,
+        launch_k_tiles_by_group=launch_k_tiles_by_group,
+        n_quanta=(1, 32),
+        k_quantum=32,
+        stratify_by_work=True,
+        minimum_count=1,
+    )
 
 
 def _rule_regime(rule: GenericDispatchRule) -> tuple[str, int]:
@@ -256,13 +376,15 @@ def build_cpu_decode_sealed_route_probe(
     ):
         raise ValueError("CPU decode sealing requires a frozen generic policy")
     dimensions_by_group: dict[str, tuple[int, int]] = {}
-    development_rows_by_group: dict[str, list[object]] = defaultdict(list)
+    mutable_development_rows_by_group: dict[str, list[object]] = defaultdict(
+        list
+    )
     for row in development:
         dimensions = (row.aggregate_n, row.k)
         previous = dimensions_by_group.setdefault(row.shape_group_id, dimensions)
         if previous != dimensions:
             raise ValueError("CPU decode shape group changed dimensions")
-        development_rows_by_group[row.shape_group_id].append(row)
+        mutable_development_rows_by_group[row.shape_group_id].append(row)
     for shape_group_id, dimensions in (
         supplemental_dimensions_by_group or {}
     ).items():
@@ -275,94 +397,82 @@ def build_cpu_decode_sealed_route_probe(
         *dimensions_by_group.values(),
         *((shape.n, shape.k) for shape in manifest.shapes),
     })
-    selected = set()
     supplemental_costs = tuple(
         cost
         for domain_costs in (supplemental_development_costs or {}).values()
         for cost in domain_costs
     )
-    supplemental_costs_by_group: dict[
+    mutable_supplemental_costs_by_group: dict[
         str, list[CandidatePointCost]
     ] = defaultdict(list)
     for cost in supplemental_costs:
-        supplemental_costs_by_group[cost.shape_group_id].append(cost)
-    for rule in rules:
-        launch_k_tiles_by_group: dict[str, int] = {}
-        for shape_group_id in rule.development_shape_groups:
-            for row in development_rows_by_group.get(shape_group_id, ()):
-                if (
-                    getattr(
-                        row,
-                        "architecture_class",
-                        rule.domain.architecture_class,
-                    ) != rule.domain.architecture_class
-                    or getattr(
-                        row,
-                        "runtime_codebook_id",
-                        rule.domain.runtime_codebook_id,
-                    ) != rule.domain.runtime_codebook_id
-                    or getattr(
-                        row,
-                        "bundle_signature",
-                        rule.domain.bundle_signature,
-                    ) != rule.domain.bundle_signature
-                    or getattr(
-                        row, "operation_kind", rule.domain.operation_kind
-                    ) != rule.domain.operation_kind
-                    or getattr(
-                        row, "execution_mode", rule.domain.execution_mode
-                    ) != rule.domain.execution_mode
-                    or getattr(row, "m", rule.domain.m) != rule.domain.m
-                ):
-                    continue
-                launch_k_tiles = int(getattr(row, "launch_k_tiles", 0))
-                previous = launch_k_tiles_by_group.setdefault(
-                    row.shape_group_id, launch_k_tiles
-                )
-                if previous != launch_k_tiles:
-                    raise ValueError(
-                        "CPU decode shape group changed frozen K-tile geometry"
-                    )
-        # A burned seal becomes legitimate development evidence for the next
-        # policy generation. Its fresh shape may consequently become the only
-        # anchor owned by a later leaf. Preserve the exact K-tile telemetry
-        # carried by that evidence just as we do for broad-sweep observations;
-        # treating it as absent silently rewrites an ordered K-part launch into
-        # full-K and can make every nearby geometry miss the frozen leaf.
-        for shape_group_id in rule.development_shape_groups:
-            for cost in supplemental_costs_by_group.get(shape_group_id, ()):
-                runtime = cost.runtime_key
-                if (
-                    runtime.architecture_class != rule.domain.architecture_class
-                    or runtime.runtime_codebook_id !=
-                        rule.domain.runtime_codebook_id
-                    or runtime.bundle_signature != rule.domain.bundle_signature
-                    or runtime.operation_kind != rule.domain.operation_kind
-                    or runtime.execution_mode != rule.domain.execution_mode
-                    or runtime.m != rule.domain.m
-                ):
-                    continue
-                launch_k_tiles = int(runtime.launch_k_tiles)
-                previous = launch_k_tiles_by_group.setdefault(
-                    cost.shape_group_id, launch_k_tiles
-                )
-                if previous != launch_k_tiles:
-                    raise ValueError(
-                        "CPU decode supplemental shape group changed frozen "
-                        "K-tile geometry"
-                    )
-        selected.update(fresh_geometry_candidates_for_rule(
-            rule,
-            dimensions_by_group,
-            forbidden,
-            manifest.maximum_cpu_measurement_weight_elements,
-            DEFAULT_GEOMETRY_CANDIDATES_PER_RULE,
-            launch_k_tiles_by_group=launch_k_tiles_by_group,
-            n_quanta=(1, 32),
-            k_quantum=32,
-            stratify_by_work=True,
-            minimum_count=1,
-        ))
+        mutable_supplemental_costs_by_group[cost.shape_group_id].append(cost)
+
+    development_rows_by_group = {
+        group: tuple(rows)
+        for group, rows in mutable_development_rows_by_group.items()
+    }
+    supplemental_costs_by_group = {
+        group: tuple(costs)
+        for group, costs in mutable_supplemental_costs_by_group.items()
+    }
+    requested_workers = int(os.environ.get(
+        "LLAMINAR_NATIVE_VNNI_POLICY_WORKERS",
+        str(_physical_core_worker_count()),
+    ))
+    if requested_workers < 1:
+        raise ValueError("CPU decode reserve worker count must be positive")
+    worker_count = min(
+        requested_workers,
+        _physical_core_worker_count(),
+        len(rules),
+    )
+
+    global _PARALLEL_PROBE_RULES
+    global _PARALLEL_PROBE_DIMENSIONS_BY_GROUP
+    global _PARALLEL_PROBE_FORBIDDEN
+    global _PARALLEL_PROBE_MAXIMUM_WEIGHT_ELEMENTS
+    global _PARALLEL_PROBE_DEVELOPMENT_ROWS_BY_GROUP
+    global _PARALLEL_PROBE_SUPPLEMENTAL_COSTS_BY_GROUP
+    _PARALLEL_PROBE_RULES = rules
+    _PARALLEL_PROBE_DIMENSIONS_BY_GROUP = dimensions_by_group
+    _PARALLEL_PROBE_FORBIDDEN = forbidden
+    _PARALLEL_PROBE_MAXIMUM_WEIGHT_ELEMENTS = (
+        manifest.maximum_cpu_measurement_weight_elements
+    )
+    _PARALLEL_PROBE_DEVELOPMENT_ROWS_BY_GROUP = development_rows_by_group
+    _PARALLEL_PROBE_SUPPLEMENTAL_COSTS_BY_GROUP = supplemental_costs_by_group
+    try:
+        # A tiny unit fixture is faster in-process. Production policies own
+        # hundreds of independent leaves and therefore use every available
+        # physical core without scheduling duplicate SMT workers.
+        if worker_count > 1 and len(rules) >= 8:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                candidates_by_rule = tuple(executor.map(
+                    _fresh_cpu_decode_probe_geometries_at,
+                    range(len(rules)),
+                ))
+        else:
+            candidates_by_rule = tuple(
+                _fresh_cpu_decode_probe_geometries_at(rule_index)
+                for rule_index in range(len(rules))
+            )
+    finally:
+        _PARALLEL_PROBE_RULES = ()
+        _PARALLEL_PROBE_DIMENSIONS_BY_GROUP = {}
+        _PARALLEL_PROBE_FORBIDDEN = frozenset()
+        _PARALLEL_PROBE_MAXIMUM_WEIGHT_ELEMENTS = 0
+        _PARALLEL_PROBE_DEVELOPMENT_ROWS_BY_GROUP = {}
+        _PARALLEL_PROBE_SUPPLEMENTAL_COSTS_BY_GROUP = {}
+
+    selected = {
+        dimensions
+        for candidates in candidates_by_rule
+        for dimensions in candidates
+    }
     shapes = tuple(
         CPUDecodeSealedProbeShape(_fresh_shape_name(n, k), n, k)
         for n, k in sorted(selected, key=lambda item: (item[0] * item[1], item))
@@ -440,37 +550,92 @@ def _request_id(fields: Mapping[str, object], plan_seed: str) -> str:
     }).removeprefix("sha256:")[:24]
 
 
-def _forceable_candidates(n: int) -> tuple[str, ...]:
-    """Return distinct physical N-chunk schedules at this geometry."""
+def _forceable_candidates(
+    n: int,
+    k: int,
+    k_tiles: int,
+    threads: int,
+) -> tuple[str, ...]:
+    """Return distinct economical schedules at one complete CPU geometry."""
 
-    n_chunks = (n + 63) // 64
     result = []
     for candidate in cpu_native_vnni_decode_registry().entries:
         chunks = int(candidate.config_json["n_block_chunks"])
-        # The production kernel collapses a requested width that covers the
-        # complete N inventory to the smallest power-of-two bucket that still
-        # covers that inventory.  For example, thirteen chunks make nbc16 a
-        # real route even though 16 > 13; nbc8 remains real because it creates
-        # two tasks.  Keep this predicate byte-for-byte equivalent to
-        # normalizeDecodeSchedulePolicy() in CPUNativeVNNIGemv.h so a frozen
-        # production winner cannot become impossible to seal in Python.
-        if n_chunks <= 1:
-            normalized_chunks = 1
-        elif chunks < n_chunks:
-            normalized_chunks = chunks
-        elif n_chunks <= 2:
-            normalized_chunks = 2
-        elif n_chunks <= 4:
-            normalized_chunks = 4
-        elif n_chunks <= 8:
-            normalized_chunks = 8
-        else:
-            normalized_chunks = 16
-        if chunks == normalized_chunks:
+        effective = resolve_cpu_native_vnni_decode_n_block_chunks(
+            chunks,
+            n=n,
+            k=k,
+            k_tiles=k_tiles,
+            threads=threads,
+        )
+        if chunks == effective:
             result.append(candidate.candidate_id)
     if not result:
-        raise ValueError(f"N={n} has no forceable CPU decode schedule")
+        raise ValueError(
+            f"N={n} K={k} k_tiles={k_tiles} threads={threads} has no "
+            "forceable CPU decode schedule"
+        )
     return tuple(result)
+
+
+def _cpu_decode_sealed_witness_at(
+    rule_index: int,
+) -> CPUDecodeSealedRuleWitness:
+    """Select one fresh route for a rule from process-inherited indexes."""
+
+    rule = _PARALLEL_PLAN_RULES[rule_index]
+    regime, threads = _rule_regime(rule)
+    domain_key = (
+        rule.domain.runtime_codebook_id,
+        regime,
+        threads,
+        rule.domain.bundle_signature,
+    )
+    eligible = []
+    for route in _PARALLEL_PLAN_ROUTES_BY_DOMAIN.get(domain_key, ()):
+        forceable = _PARALLEL_PLAN_FORCEABLE_BY_GEOMETRY[
+            (route.n, route.k, route.k_tiles, route.threads)
+        ]
+        if (
+            len(forceable) >= 2
+            and rule.candidate_id in forceable
+            and rule.matches(route.n, route.k, route.k_tiles)
+        ):
+            eligible.append(route)
+    if not eligible:
+        raise ValueError(
+            "CPU decode route probe cannot exercise frozen rule "
+            f"index={rule_index} codebook={rule.domain.runtime_codebook_id}"
+        )
+    selected_route = min(
+        eligible,
+        key=lambda route: (
+            route.n * route.k,
+            route.n,
+            route.k,
+            route.shape_name,
+        ),
+    )
+    forceable = _PARALLEL_PLAN_FORCEABLE_BY_GEOMETRY[
+        (
+            selected_route.n,
+            selected_route.k,
+            selected_route.k_tiles,
+            selected_route.threads,
+        )
+    ]
+    return CPUDecodeSealedRuleWitness(
+        rule_index=rule_index,
+        shape=selected_route.shape_name,
+        n=selected_route.n,
+        k=selected_route.k,
+        k_tiles=selected_route.k_tiles,
+        architecture_class=rule.domain.architecture_class,
+        runtime_codebook=rule.domain.runtime_codebook_id,
+        bundle_signature=rule.domain.bundle_signature,
+        selected_candidate_id=rule.candidate_id,
+        forceable_candidate_ids=forceable,
+    )
 
 
 def build_cpu_decode_sealed_plan(
@@ -484,9 +649,20 @@ def build_cpu_decode_sealed_plan(
 ) -> CPUDecodeSealedPlan:
     """Select one fresh route per frozen leaf and enumerate all challengers."""
 
+    # Authenticate every immutable plan input exactly once.  In production the
+    # development corpus contains hundreds of thousands of observations, so
+    # recomputing its canonical digest at each use would turn plan assembly into
+    # repeated whole-corpus preprocessing.  The local values below are also the
+    # sole identities used to seed and publish the plan, making it impossible
+    # for validation and publication to accidentally hash different snapshots.
+    development_corpus_digest = development.digest()
+    route_probe_digest = probe.digest
+    candidate_registry_digest = cpu_native_vnni_decode_registry().digest()
+    format_registry_digest_value = registry_digest()
+
     if probe.frozen_generic_policy_digest != frozen_generic_policy_digest:
         raise ValueError("CPU decode route probe belongs to another frozen policy")
-    if probe.development_corpus_digest != development.digest():
+    if probe.development_corpus_digest != development_corpus_digest:
         raise ValueError("CPU decode development corpus changed after route probe")
     if probe.sealed_build_id != sealed_build_id:
         raise ValueError("CPU decode route probe belongs to another sealed build")
@@ -499,54 +675,79 @@ def build_cpu_decode_sealed_plan(
     )
     if not route_candidates:
         raise ValueError("CPU decode route manifests omit generated probe shapes")
+    route_manifest_digest = routes.digest()
 
-    witnesses = []
-    for rule_index, rule in enumerate(rules):
-        regime, threads = _rule_regime(rule)
-        eligible = tuple(
-            route
-            for route in route_candidates
-            if route.execution_codebook == rule.domain.runtime_codebook_id
-            and route.isa_regime == regime
-            and route.threads == threads
-            and _decode_bundle(route) == rule.domain.bundle_signature
-            and rule.matches(route.n, route.k, route.k_tiles)
-            and rule.candidate_id in _forceable_candidates(route.n)
-            and len(_forceable_candidates(route.n)) >= 2
-        )
-        if not eligible:
-            raise ValueError(
-                "CPU decode route probe cannot exercise frozen rule "
-                f"index={rule_index} codebook={rule.domain.runtime_codebook_id}"
+    mutable_routes_by_domain: dict[
+        tuple[int, str, int, str], list[CPUPrefillSerialRoute]
+    ] = defaultdict(list)
+    forceable_by_geometry: dict[
+        tuple[int, int, int, int], tuple[str, ...]
+    ] = {}
+    for route in route_candidates:
+        mutable_routes_by_domain[
+            (
+                route.execution_codebook,
+                route.isa_regime,
+                route.threads,
+                _decode_bundle(route),
             )
-        selected_route = min(
-            eligible,
-            key=lambda route: (route.n * route.k, route.n, route.k, route.shape_name),
-        )
-        forceable = _forceable_candidates(selected_route.n)
-        witnesses.append(CPUDecodeSealedRuleWitness(
-            rule_index=rule_index,
-            shape=selected_route.shape_name,
-            n=selected_route.n,
-            k=selected_route.k,
-            k_tiles=selected_route.k_tiles,
-            architecture_class=rule.domain.architecture_class,
-            runtime_codebook=rule.domain.runtime_codebook_id,
-            bundle_signature=rule.domain.bundle_signature,
-            selected_candidate_id=rule.candidate_id,
-            forceable_candidate_ids=forceable,
-        ))
+        ].append(route)
+        geometry = (route.n, route.k, route.k_tiles, route.threads)
+        if geometry not in forceable_by_geometry:
+            forceable_by_geometry[geometry] = _forceable_candidates(*geometry)
+    routes_by_domain = {
+        domain: tuple(routes_for_domain)
+        for domain, routes_for_domain in mutable_routes_by_domain.items()
+    }
+
+    requested_workers = int(os.environ.get(
+        "LLAMINAR_NATIVE_VNNI_POLICY_WORKERS",
+        str(_physical_core_worker_count()),
+    ))
+    if requested_workers < 1:
+        raise ValueError("CPU decode seal planner worker count must be positive")
+    worker_count = min(
+        requested_workers,
+        _physical_core_worker_count(),
+        len(rules),
+    )
+
+    global _PARALLEL_PLAN_RULES
+    global _PARALLEL_PLAN_ROUTES_BY_DOMAIN
+    global _PARALLEL_PLAN_FORCEABLE_BY_GEOMETRY
+    _PARALLEL_PLAN_RULES = rules
+    _PARALLEL_PLAN_ROUTES_BY_DOMAIN = routes_by_domain
+    _PARALLEL_PLAN_FORCEABLE_BY_GEOMETRY = forceable_by_geometry
+    try:
+        if worker_count > 1 and len(rules) >= 8:
+            with ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            ) as executor:
+                witnesses = tuple(executor.map(
+                    _cpu_decode_sealed_witness_at,
+                    range(len(rules)),
+                ))
+        else:
+            witnesses = tuple(
+                _cpu_decode_sealed_witness_at(rule_index)
+                for rule_index in range(len(rules))
+            )
+    finally:
+        _PARALLEL_PLAN_RULES = ()
+        _PARALLEL_PLAN_ROUTES_BY_DOMAIN = {}
+        _PARALLEL_PLAN_FORCEABLE_BY_GEOMETRY = {}
 
     seed_payload = {
         "schema_version": CPU_DECODE_SEALED_PLAN_SCHEMA,
         "frozen_generic_policy_digest": frozen_generic_policy_digest,
-        "development_corpus_digest": development.digest(),
+        "development_corpus_digest": development_corpus_digest,
         "sealed_build_id": sealed_build_id,
         "reserve_commitment": probe.reserve_commitment,
-        "route_probe_digest": probe.digest,
-        "route_manifest_digest": routes.digest(),
-        "candidate_registry_digest": cpu_native_vnni_decode_registry().digest(),
-        "format_registry_digest": registry_digest(),
+        "route_probe_digest": route_probe_digest,
+        "route_manifest_digest": route_manifest_digest,
+        "candidate_registry_digest": candidate_registry_digest,
+        "format_registry_digest": format_registry_digest_value,
         "rule_witnesses": [asdict(item) for item in witnesses],
     }
     plan_digest = _sha256_json(seed_payload)
@@ -594,13 +795,13 @@ def build_cpu_decode_sealed_plan(
     return CPUDecodeSealedPlan(
         schema_version=CPU_DECODE_SEALED_PLAN_SCHEMA,
         frozen_generic_policy_digest=frozen_generic_policy_digest,
-        development_corpus_digest=development.digest(),
+        development_corpus_digest=development_corpus_digest,
         sealed_build_id=sealed_build_id,
         reserve_commitment=probe.reserve_commitment,
-        route_probe_digest=probe.digest,
-        route_manifest_digest=routes.digest(),
-        candidate_registry_digest=cpu_native_vnni_decode_registry().digest(),
-        format_registry_digest=registry_digest(),
+        route_probe_digest=route_probe_digest,
+        route_manifest_digest=route_manifest_digest,
+        candidate_registry_digest=candidate_registry_digest,
+        format_registry_digest=format_registry_digest_value,
         plan_digest=plan_digest,
         rule_witnesses=tuple(witnesses),
         requests=tuple(sorted(requests)),
@@ -866,7 +1067,10 @@ def validate_cpu_decode_sealed_plan(
             raise ValueError(f"CPU decode sealed witness changed rule {index}")
         if (witness.n, witness.k) in development_dimensions | static_dimensions:
             raise ValueError("CPU decode sealed witness geometry was visible to fitting")
-        if tuple(witness.forceable_candidate_ids) != _forceable_candidates(witness.n):
+        _, threads = _rule_regime(rule)
+        if tuple(witness.forceable_candidate_ids) != _forceable_candidates(
+            witness.n, witness.k, witness.k_tiles, threads
+        ):
             raise ValueError("CPU decode sealed forceable candidate set changed")
         expected = {
             (source_format, challenger)

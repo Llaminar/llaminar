@@ -18,6 +18,7 @@
 #include "CPURingKVCache.h"
 #include "../HybridKVCacheConfig.h"
 #include "../IHybridKVCache.h"
+#include "../../config/GDNHeadAssignment.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../utils/OpenMPUtils.h"
 
@@ -763,21 +764,19 @@ namespace llaminar2
 
             int n_k_heads = n_k_heads_full;
             int n_v_heads = n_v_heads_full;
-            const bool gdn_modular_repeat = (n_v_heads_full > n_k_heads_full);
 
             if (config.local_n_heads > 0 && config.n_heads > 0 &&
                 config.local_n_heads < config.n_heads)
             {
-                n_v_heads = n_v_heads_full * config.local_n_heads / config.n_heads;
-                if (n_v_heads <= 0)
-                    n_v_heads = 1;
-
-                if (!gdn_modular_repeat)
-                {
-                    n_k_heads = n_k_heads_full * config.local_n_heads / config.n_heads;
-                    if (n_k_heads <= 0)
-                        n_k_heads = 1;
-                }
+                const GDNHeadAssignment assignment =
+                    GDNHeadAssignment::fromPartition(
+                        n_k_heads_full,
+                        n_v_heads_full,
+                        config.local_head_start,
+                        config.local_n_heads,
+                        config.n_heads);
+                n_k_heads = assignment.localKeyHeads();
+                n_v_heads = assignment.localValueHeads();
             }
 
             const int d_v = config.gdn_state_size;

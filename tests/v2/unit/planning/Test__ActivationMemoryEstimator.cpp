@@ -1,8 +1,14 @@
+/**
+ * @file Test__ActivationMemoryEstimator.cpp
+ * @brief Verifies generic and production model graph-arena byte accounting.
+ */
+
 #include <gtest/gtest.h>
 #include "planning/ActivationMemoryEstimator.h"
 #include "backends/DeviceId.h"
 
 #include <algorithm>
+#include <string>
 
 using namespace llaminar2;
 
@@ -102,4 +108,69 @@ TEST(Test__ActivationMemoryEstimator, OneRowPrefill_StillOwnsEveryRegisteredBuff
         DeviceId::cuda(0));
 
     EXPECT_EQ(actual, expected);
+}
+
+TEST(Test__ActivationMemoryEstimator,
+     Qwen35MoE122BLocalTP_MatchesDeclarativeArenaByteForByte)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen35moe";
+    profile.n_layers = 49;
+    profile.mtp_layer_count = 1;
+    profile.d_model = 3072;
+    profile.d_ff = 1024;
+    profile.n_heads = 32;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 256;
+    profile.vocab_size = 248320;
+    profile.max_seq_len = 4096;
+    profile.expert_count = 256;
+    profile.expert_used_count = 8;
+    profile.expert_feed_forward_length = 1024;
+
+    const auto add_projection = [&](
+        std::string name,
+        size_t output_columns,
+        size_t input_columns)
+    {
+        TensorSizeInfo tensor;
+        tensor.name = std::move(name);
+        tensor.K = input_columns;
+        tensor.elements = output_columns * input_columns;
+        tensor.layer_index = 0;
+        profile.tensors.push_back(std::move(tensor));
+    };
+    add_projection("blk.0.attn_q.weight", 16384, 3072);
+    add_projection("blk.0.attn_gate.weight", 8192, 3072);
+    add_projection("blk.0.attn_qkv.weight", 16384, 3072);
+    add_projection("blk.0.ssm_out.weight", 3072, 8192);
+    add_projection("blk.0.ssm_alpha.weight", 64, 3072);
+    add_projection("blk.0.ssm_beta.weight", 64, 3072);
+
+    const size_t actual = ActivationMemoryEstimator::estimate(
+        profile,
+        ActivationGraphMemoryGeometry{
+            .batch_size = 1,
+            .resident_graph_rows = 4096,
+            .local_d_ff = 512,
+            .local_n_heads = 16,
+            .local_n_kv_heads = 1,
+            .first_layer = 0,
+            .last_layer = 47,
+            .total_shards = 2,
+            .mtp_target_query_rows = 2,
+            .mtp_terminal_logits_layout =
+                MTPTerminalLogitsLayout::FullVocabularyPerParticipant,
+        },
+        DeviceId::cuda(0));
+
+    /*
+     * This constant is the independent sum of all 49 layer/model BufferSpecs
+     * resolved by Qwen35MoESchema for the real 122B local-TP geometry.  It is
+     * also the byte sum printed by BufferArena's address map in the production
+     * model probe. In particular it includes the 503,316,480-byte canonical
+     * route tensor that exposed the original capacity-admission defect.
+     */
+    constexpr size_t kExpectedDeclarativeArenaBytes = 2253085700ULL;
+    EXPECT_EQ(actual, kExpectedDeclarativeArenaBytes);
 }

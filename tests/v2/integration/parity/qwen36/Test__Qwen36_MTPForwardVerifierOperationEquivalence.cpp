@@ -202,9 +202,9 @@ namespace
             test_case.required_cuda_devices = 0;
             test_case.required_rocm_devices = 0;
             test_case.metadata_envs = {
-                "LLAMINAR_QWEN36_MOE_CPU_MTP_DIAGNOSTIC_METADATA"};
+                "LLAMINAR_QWEN36_MOE_MTP_DIAGNOSTIC_METADATA"};
             test_case.default_metadata_path =
-                "pytorch_qwen36_moe_cpu_mtp_diagnostic_snapshots/metadata.txt";
+                "pytorch_qwen36_moe_mtp_diagnostic_snapshots/metadata.txt";
             break;
         case VerifierBackend::CUDA:
             test_case.name += " CUDA";
@@ -212,9 +212,9 @@ namespace
             test_case.required_cuda_devices = 1;
             test_case.required_rocm_devices = 0;
             test_case.metadata_envs = {
-                "LLAMINAR_QWEN36_MOE_CUDA_MTP_DIAGNOSTIC_METADATA"};
+                "LLAMINAR_QWEN36_MOE_MTP_DIAGNOSTIC_METADATA"};
             test_case.default_metadata_path =
-                "pytorch_qwen36_moe_cuda_mtp_diagnostic_snapshots/metadata.txt";
+                "pytorch_qwen36_moe_mtp_diagnostic_snapshots/metadata.txt";
             break;
         case VerifierBackend::ROCm:
             test_case.name += " ROCm";
@@ -222,9 +222,9 @@ namespace
             test_case.required_cuda_devices = 0;
             test_case.required_rocm_devices = 1;
             test_case.metadata_envs = {
-                "LLAMINAR_QWEN36_MOE_ROCM_MTP_DIAGNOSTIC_METADATA"};
+                "LLAMINAR_QWEN36_MOE_MTP_DIAGNOSTIC_METADATA"};
             test_case.default_metadata_path =
-                "pytorch_qwen36_moe_rocm_mtp_diagnostic_snapshots/metadata.txt";
+                "pytorch_qwen36_moe_mtp_diagnostic_snapshots/metadata.txt";
             break;
         }
 

@@ -387,6 +387,58 @@ namespace llaminar2
             return ok;
         }
 
+        /**
+         * @brief Execute merged-QKV recurrence through the bound HIP workspace.
+         *
+         * Device deinterleave and recurrence are enqueued on the exact stage
+         * stream and remain one graph-captured producer/consumer sequence. The
+         * implementation performs no host materialization or synchronization.
+         */
+        bool chunkForwardMergedQKV(
+            const float *merged_qkv, int qkv_stride,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_k_heads, int n_heads, int d_k, int d_v,
+            int global_v_head_offset, int chunk_size,
+            bool use_qk_l2norm) override
+        {
+            const int compact_stride =
+                2 * n_k_heads * d_k + n_heads * d_v;
+            if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
+                n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+                qkv_stride != compact_stride)
+            {
+                return false;
+            }
+
+            float *q = nullptr;
+            float *k = nullptr;
+            float *v = nullptr;
+            if (!deinterleave_qkv_device(
+                    merged_qkv, q, k, v,
+                    seq_len, n_k_heads, n_heads,
+                    d_k, d_v, global_v_head_offset))
+            {
+                return false;
+            }
+
+            if (seq_len == 1)
+            {
+                return recurrent_step(
+                    q, k, v,
+                    alpha, beta_raw, A_log, dt_bias,
+                    output, state,
+                    n_heads, d_k, d_v, use_qk_l2norm);
+            }
+            return chunk_forward(
+                q, k, v,
+                alpha, beta_raw, A_log, dt_bias,
+                output, state,
+                seq_len, n_heads, d_k, d_v,
+                chunk_size, use_qk_l2norm);
+        }
+
         bool chunkForwardWithEffectiveSeqLen(
             const float *Q, const float *K, const float *V,
             const float *alpha, const float *beta_raw,

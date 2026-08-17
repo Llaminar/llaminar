@@ -11,7 +11,9 @@
 #include "../qwen35/Qwen35Graph.h"
 #include "../../execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "../../execution/moe/DeviceMoERebalanceController.h"
+#include "../../execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "../../execution/moe/MoERuntimeTable.h"
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -24,6 +26,10 @@ namespace llaminar2
     class DeviceMoERebalanceTransferState;
     class ILocalTPContext;
     class IMoERuntimeTable;
+    class MoELocalExpertSerialBufferArena;
+    class MoEExpertOwnerMap;
+    class MoEOverlayCollectiveWorkspace;
+    class MoEOverlayMPIRankBatchTransport;
     struct PrefixFingerprintMaterial;
 
     /**
@@ -70,17 +76,28 @@ namespace llaminar2
         ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
             DeviceId device) override;
 
-        ComputeGraph buildMTPGraph(
-            int depth_idx,
-            const MTPDepthWeights &weights,
-            const MTPForwardInput &input,
-            MTPForwardOutput &output);
+        /** @copydoc IGraphBuilder::deviceMoEOverlayEpochExecutionBinding */
+        DeviceMoEOverlayEpochExecutionBinding
+        deviceMoEOverlayEpochExecutionBinding(DeviceId device) override;
 
-        ComputeGraph buildMTPGraph(
-            int depth_idx,
-            const MTPDepthWeightBindings &bindings,
-            const MTPForwardInput &input,
-            MTPForwardOutput &output) override;
+        /**
+         * @brief Declare Qwen3.5/3.6 MoE sidecar state ownership.
+         *
+         * MoE sidecars use MTP-prefixed activations, a depth-scoped router
+         * runtime table with request histogram publication disabled, and the
+         * shifted MTP KV cache. They therefore preserve main-model state. The
+         * target verifier remains authoritative for accepted shifted rows so
+         * routed expert state and shifted KV share one commit boundary.
+         */
+        [[nodiscard]] MTPSidecarStateContract
+        mtpSidecarStateContract() const noexcept override
+        {
+            return {
+                .main_state = MTPSidecarMainStatePolicy::Preserved,
+                .shifted_row = MTPShiftedRowPublicationPolicy::
+                    TargetVerifierAuthoritative,
+            };
+        }
 
         /// Override resolver config to register MoE buffer IDs and formulas
         GraphResolverConfig getResolverConfig(int seq_len) const override;
@@ -235,18 +252,6 @@ namespace llaminar2
             const int32_t *sequence_lengths_device) override;
 
     private:
-        struct ScopedMTPGraphContext
-        {
-            ScopedMTPGraphContext(
-                Qwen35MoEGraph &graph,
-                int depth_idx);
-            ~ScopedMTPGraphContext();
-
-            Qwen35MoEGraph &graph;
-            bool previous_active = false;
-            int previous_depth_idx = -1;
-        };
-
         /**
          * @brief Role of a graph-side rebalance binding.
          *
@@ -338,7 +343,73 @@ namespace llaminar2
             const MoERuntimeTableIdentity &identity,
             int prefill_token_capacity = 0,
             int num_layers_override = -1,
-            bool register_decode_histogram = true);
+            bool register_decode_histogram = true,
+            bool bind_overlay_epoch = false);
+
+        /**
+         * @brief Return immutable row-packed tensors for one ordered overlay participant.
+         *
+         * Transformer layers, prefill buckets, grouped verification, and MTP
+         * sidecars may use one arena only because their execution is ordered by
+         * the orchestrator's serial graph-family policy.  The participant id is
+         * part of the key: two CPU sockets or two GPU owners may execute in
+         * parallel and must never alias compact host/device packets.
+         *
+         * @param device Exact local owner of the expert GEMM work.
+         * @param participant Stable overlay participant identity.
+         * @param required_row_capacity Compact input rows required by this graph.
+         * @return Model-lifetime immutable-address tensor owner.
+         * @throws std::logic_error when a later graph asks for capacity outside
+         *         the immutable graph-family plan.
+         */
+        std::shared_ptr<MoELocalExpertSerialBufferArena>
+        localExpertSerialBufferArenaForParticipant(
+            DeviceId device,
+            int participant,
+            size_t required_row_capacity);
+        /**
+         * @brief Return one serial-family host packet arena for a participant.
+         *
+         * A rank batch must retain every participant packet concurrently, but
+         * transformer layers and graph roles are orchestrator-serialized. One
+         * arena per participant therefore gives each endpoint independent
+         * storage while avoiding capacity-wide allocation per layer.
+         *
+         * @param graph_device Continuation graph device used to resolve the
+         *        immutable maximum activation-row admission.
+         * @param participant Stable global overlay participant id.
+         * @return Model-lifetime fixed-capacity host packet workspace.
+         */
+        std::shared_ptr<MoEOverlayCollectiveWorkspace>
+        overlayProtocolWorkspaceForParticipant(
+            DeviceId graph_device,
+            int participant);
+        /**
+         * @brief Return the shared direct MPI transport for one remote rank group.
+         *
+         * The group is immutable and sorted. All layers and serial graph roles
+         * reuse its fixed wire buffers; the transport's stage-sequence ledger
+         * and in-flight guard reject stale or concurrent reuse.
+         *
+         * @param graph_device Continuation device defining row admission.
+         * @param tier_index Integer-priority tier ordinal.
+         * @param domain_ordinal Stable routed-domain ordinal.
+         * @param source_world_rank Continuation authority rank.
+         * @param target_world_rank Remote endpoint-owner rank.
+         * @param participant_ids Complete rank-local participant group.
+         * @param owner_map Frozen owner map shared with transaction admission.
+         * @param source_participant_id Planner-selected continuation participant.
+         */
+        std::shared_ptr<IMoEOverlayRankBatchTransport>
+        overlayRankBatchTransportForGroup(
+            DeviceId graph_device,
+            int tier_index,
+            int domain_ordinal,
+            int source_world_rank,
+            int target_world_rank,
+            std::vector<int> participant_ids,
+            const MoEExpertOwnerMap &owner_map,
+            int source_participant_id);
         /**
          * @brief Return the device-local decode maintenance binding for async
          * graph-side rebalance.
@@ -361,6 +432,22 @@ namespace llaminar2
     private:
         std::unordered_map<std::string, std::unique_ptr<MoERuntimeTable>> moe_runtime_tables_;
         /**
+         * @brief One request-epoch RCU arena per serial GPU graph family.
+         *
+         * Durable main decode, grouped verification, ordinary prefill, every
+         * MTP depth, and current-batch LLEP bind their runtime layers to the
+         * same request ticket address. The LLEP child first reads the pinned
+         * main bank, then may publish a private transient override bank after
+         * transfer apply; request reset clears that override. The orchestrator
+         * acquires and releases the durable reader around the complete
+         * transaction, so maintenance may prepare and publish the peer bank
+         * without splitting a speculative chain.
+         */
+        std::unordered_map<
+            std::string,
+            std::shared_ptr<DeviceMoEOverlayEpochArena>>
+            moe_overlay_epoch_arenas_;
+        /**
          * @brief Per-device transient route scratch shared by serial graph roles.
          *
          * Main prefill, grouped verifier, and every MTP sidecar retain separate
@@ -372,6 +459,28 @@ namespace llaminar2
             std::string,
             std::shared_ptr<DeviceMoESerialRouteScratchArena>>
             moe_serial_route_scratch_arenas_;
+        /**
+         * @brief One compact sparse-route arena per local device/participant serial family.
+         *
+         * This is separate from route-planner scratch: it owns host-visible
+         * compact hidden/input/output tensors used at heterogeneous manual
+         * boundaries.  The owner key excludes layer and graph role only after
+         * serial-family ordering has made that reuse safe.
+         */
+        std::unordered_map<
+            std::string,
+            std::shared_ptr<MoELocalExpertSerialBufferArena>>
+            moe_serial_local_expert_buffer_arenas_;
+        /** One fixed host packet family per logical sparse endpoint. */
+        std::unordered_map<
+            std::string,
+            std::shared_ptr<MoEOverlayCollectiveWorkspace>>
+            moe_serial_overlay_protocol_workspaces_;
+        /** One fixed direct-MPI wire family per tier/domain/rank participant group. */
+        std::unordered_map<
+            std::string,
+            std::shared_ptr<IMoEOverlayRankBatchTransport>>
+            moe_overlay_rank_batch_transports_;
         std::unordered_map<std::string, std::shared_ptr<DeviceMoETransferSlotDirectory>> moe_transfer_slot_directories_;
         std::unordered_map<std::string, std::shared_ptr<DeviceMoERebalanceTransferState>> moe_rebalance_transfer_states_;
         std::unordered_map<std::string, GraphSideRebalanceBinding> moe_graph_rebalance_bindings_;
@@ -397,8 +506,6 @@ namespace llaminar2
         std::unordered_map<std::string, std::unique_ptr<FP32Tensor>>
             mirrored_layer_checkpoints_;
 
-        bool mtp_graph_context_active_ = false;
-        int mtp_graph_depth_idx_ = -1;
     };
 
 } // namespace llaminar2

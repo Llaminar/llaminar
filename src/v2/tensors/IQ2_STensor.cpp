@@ -440,13 +440,13 @@ namespace llaminar2
         simd::unpack_iq2_s_superblock_to_int8(super_block, output, scales, mins);
     }
 
-    void IQ2_STensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    void IQ2_STensor::packVnniBlock(const VnniPackContext &ctx, int source_n, int destination_n, int b) const
     {
-        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const size_t linear = vnniLinearIdx(ctx, destination_n, b);
         const int sb_per_row = vnniSuperBlocksPerRow(ctx.K);
         const int sb_idx = b / 8;
         const int sub_idx = b % 8;
-        const auto *blk = &typed_data()[static_cast<size_t>(n) * sb_per_row + sb_idx];
+        const auto *blk = &typed_data()[static_cast<size_t>(source_n) * sb_per_row + sb_idx];
 
         uint8_t payload_buf[9];
         std::memcpy(payload_buf, blk->qs + sub_idx * 4, 4);

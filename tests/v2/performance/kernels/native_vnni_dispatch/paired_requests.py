@@ -45,6 +45,7 @@ from .paired_confirmation import (
     PairedCellKey,
     PairedTimingComparison,
     paired_timing_comparisons,
+    promotion_eligible_comparisons,
     read_paired_confirmation_csv,
 )
 from .profiler_model import load_profiler_feature_catalog
@@ -279,6 +280,8 @@ def paired_comparison_digest(
                 item.exact_effective_candidate_id,
                 item.selected_to_exact_median_ratio,
                 item.pair_count,
+                item.timing_scope,
+                item.mpi_world_size,
             ),
         ):
             rows.append({
@@ -291,6 +294,8 @@ def paired_comparison_digest(
                     edge.selected_to_exact_median_ratio.hex()
                 ),
                 "pair_count": edge.pair_count,
+                "timing_scope": edge.timing_scope,
+                "mpi_world_size": edge.mpi_world_size,
             })
     encoded = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
@@ -946,6 +951,13 @@ def build_paired_request_plan(
                     "selected launch is not forceable across every source alias"
                 )
             runtime_edges = runtime_comparisons.get(cell.runtime_key, ())
+            # Historical CPU v3 rows did not identify their co-running socket
+            # workload. They may seed a development fit, but only isolated v4
+            # edges can close a tournament, confirm a miss, or suppress a fresh
+            # request. GPU evidence remains promotion eligible unchanged.
+            authoritative_runtime_edges = promotion_eligible_comparisons(
+                runtime_edges
+            )
             competitor = _source_alias_regret_witness(
                 aliases,
                 selected,
@@ -956,7 +968,7 @@ def build_paired_request_plan(
                 continue
 
             complete_star = _complete_directional_star_latencies(
-                runtime_edges,
+                authoritative_runtime_edges,
                 shared_candidates,
             )
             if complete_star is not None:
@@ -996,7 +1008,7 @@ def build_paired_request_plan(
                 continue
 
             direct_regret = _direct_paired_regret(
-                runtime_edges, selected, competitor
+                authoritative_runtime_edges, selected, competitor
             )
             issue_fields = {
                 "source_format": source_format,
@@ -1030,7 +1042,9 @@ def build_paired_request_plan(
             for exact in shared_candidates:
                 if exact == selected:
                     continue
-                if _directed_paired_ratio(runtime_edges, selected, exact) is not None:
+                if _directed_paired_ratio(
+                    authoritative_runtime_edges, selected, exact
+                ) is not None:
                     continue
                 edge = (
                     key.execution_codebook,

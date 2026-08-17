@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <optional>
 
+#include "tensors/NativeVnniFormatInfo.h"
+
 namespace llaminar2 {
 
 /// Format identifiers for GPU repack kernel dispatch.
@@ -41,6 +43,56 @@ enum class RepackFormat : uint8_t {
     RAW_FP  = 255, ///< Floating-point passthrough (no repack, direct H2D copy)
 };
 
+/**
+ * @brief Return the compact payload bytes emitted for one 32-value block.
+ * @param format Source GGUF repack format.
+ * @return Positive payload width for quantized formats, otherwise zero.
+ *
+ * Persistent ExpertOverlay allocations may be wider than this live payload,
+ * but the repack kernel must still write a tightly packed execution matrix
+ * within each independently recyclable expert group.
+ */
+[[nodiscard]] inline constexpr int repackPayloadBytesPerBlock(
+    RepackFormat format) noexcept
+{
+    switch (format)
+    {
+    case RepackFormat::Q4_0:
+    case RepackFormat::IQ4_NL:
+    case RepackFormat::Q4_1:
+    case RepackFormat::Q4_K:
+    case RepackFormat::IQ4_XS:
+        return 16;
+    case RepackFormat::Q5_0:
+    case RepackFormat::Q5_1:
+    case RepackFormat::Q5_K:
+        return 20;
+    case RepackFormat::Q6_K:
+        return 24;
+    case RepackFormat::Q3_K:
+    case RepackFormat::IQ3_XXS:
+        return 12;
+    case RepackFormat::Q2_K:
+    case RepackFormat::IQ2_XXS:
+        return 8;
+    case RepackFormat::IQ3_S:
+        return 13;
+    case RepackFormat::IQ2_S:
+    case RepackFormat::IQ2_XS:
+        return 9;
+    case RepackFormat::IQ1_S:
+    case RepackFormat::IQ1_M:
+        return 6;
+    case RepackFormat::Q8_0:
+    case RepackFormat::Q8_1:
+    case RepackFormat::Q8_K:
+        return 32;
+    case RepackFormat::RAW_FP:
+        return 0;
+    }
+    return 0;
+}
+
 /// Function pointer types for backend-agnostic repack kernel dispatch.
 /// DeviceLoadPipeline stores these and calls through them without knowing
 /// whether the underlying implementation is CUDA or ROCm.
@@ -56,6 +108,7 @@ struct RepackKernels {
                                   int output_N,
                                   int output_row_offset,
                                   int packed_group_rows,
+                                  int allocation_payload_bytes_per_block,
                                   void* stream);
 
     VnniRepackFn vnniRepack = nullptr;
@@ -97,22 +150,6 @@ inline std::optional<RepackFormat> codebookIdToRepackFormat(uint8_t codebook_id,
         default: return std::nullopt;
         }
     }
-}
-
-/**
- * @brief Return the codebook consumed by device GEMM/MoE kernels after repack.
- *
- * Q8_0, Q8_1, and Q8_K have different source block layouts, but preparation
- * normalizes all three into the same 32-byte signed-INT8 payload with one FP16
- * scale per execution block.  Reusing codebook 19 keeps dense and grouped MoE
- * dispatch on the tuned economical raw-INT8 kernels while the RepackFormat
- * continues to identify the original source layout correctly.
- */
-inline uint8_t canonicalDeviceVnniCodebookId(uint8_t source_codebook_id)
-{
-    return source_codebook_id == 20 || source_codebook_id == 21
-               ? static_cast<uint8_t>(19)
-               : source_codebook_id;
 }
 
 } // namespace llaminar2

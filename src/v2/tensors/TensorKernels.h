@@ -17,22 +17,71 @@
 #include "../kernels/GDNDeviceStateBinding.h"
 #include "../kernels/attention/AttentionExecutionPolicy.h"
 #include "../kernels/common/DeviceNativeVNNIMatrixDesc.h"
+#include "NativeVnniFormatInfo.h"
+#include "TensorType.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
 namespace llaminar2
 {
+    namespace cpu::native_vnni
+    {
+        struct CPUNativeVNNIPackedWeights;
+    }
+
     // Forward declarations
     class ITensor; // Device-agnostic tensor interface
     class TensorBase;
     struct PreparedEmbeddingHandle;
     struct Q8_1Block;
     class IDeviceContext; // For kernel execute() interface
+
+    /**
+     * @brief Immutable contiguous FP16/BF16/FP32 weight view exported by GEMM.
+     *
+     * ExpertOverlay uses this descriptor to move the exact live mathematical
+     * weights without manufacturing a tensor mirror. The engine lifetime owns
+     * `data`; callers must retain the exporting engine until all asynchronous
+     * reads complete.
+     */
+    struct ContiguousFloatingPointWeightDescriptor
+    {
+        const void *data = nullptr;
+        TensorType type = TensorType::FP32;
+        int n = 0;
+        int k = 0;
+        std::size_t bytes = 0;
+
+        /** @return Whether pointer, precision, geometry, and byte size agree. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            std::size_t element_bytes = 0;
+            switch (type)
+            {
+            case TensorType::FP16:
+            case TensorType::BF16:
+                element_bytes = sizeof(std::uint16_t);
+                break;
+            case TensorType::FP32:
+                element_bytes = sizeof(float);
+                break;
+            default:
+                return false;
+            }
+            if (!data || n <= 0 || k <= 0)
+                return false;
+            const auto elements = static_cast<std::size_t>(n) *
+                                  static_cast<std::size_t>(k);
+            return elements <= SIZE_MAX / element_bytes &&
+                   bytes == elements * element_bytes;
+        }
+    };
 
     // =============================================================================
     // Fused Operation Configuration
@@ -563,7 +612,7 @@ namespace llaminar2
         /**
          * @brief Grouped verifier-row SwiGLU + down projection.
          *
-         * The MTP verifier publishes accepted rows from a compact M=2..4 graph,
+         * The MTP verifier publishes accepted rows from a runtime-M grouped graph,
          * but the published row must be numerically equivalent to serial decode.
          * Implementations that override this method must compute all verifier
          * rows through a grouped/concurrent path while preserving the M=1 decode
@@ -573,7 +622,8 @@ namespace llaminar2
          * @param gate Gate projection rows [m, k].
          * @param up Up projection rows [m, k].
          * @param output Down projection output [m, n].
-         * @param m Verifier row count. Production MTP uses 2..4.
+         * @param m Verifier row count. Every supported value greater than one
+         *        must use the grouped implementation; callers may not replay rows.
          * @param n Output width.
          * @param k Intermediate width.
          */
@@ -598,13 +648,37 @@ namespace llaminar2
         }
 
         /**
-         * @brief Check if this kernel supports optimized fused multi-projection
+         * @brief Check if this kernel implements fused multi-projection
          *
-         * @return true if multiply_fused_tensor() has optimized implementation beyond sequential GEMMs
+         * Returning true is a production contract: multiply_fused_tensor() must
+         * execute the complete bundle without reconstructing it as a sequence of
+         * polymorphic multiply_tensor() calls.
+         *
+         * @return true only when the first-class fused implementation exists.
          */
         virtual bool supports_fused_projection() const
         {
-            return false; // Default: no optimized fusion, uses sequential fallback
+            return false;
+        }
+
+        /**
+         * @brief Provision persistent backend resources for fused projection capture.
+         *
+         * Fused projection implementations may use auxiliary streams, events,
+         * descriptor tables, or other model-lifetime launch resources. Graph
+         * capture cannot create those resources lazily from multiply_fused_tensor(),
+         * so the owning compute stage calls this method from its typed
+         * prepareGraphLaunch() lifecycle before beginCapture(). Implementations
+         * must not execute model arithmetic or synchronize the device here.
+         *
+         * @param projection_count Maximum projection fan-out represented by the
+         *        upcoming fused launch.
+         * @return true when the fused launch is capture-ready.
+         */
+        virtual bool prepareFusedProjectionGraphCapture(
+            size_t projection_count)
+        {
+            return projection_count > 0;
         }
 
         /**
@@ -638,6 +712,87 @@ namespace llaminar2
         {
             out = {};
             return false;
+        }
+
+        /**
+         * @brief Export unambiguous source provenance for prepared VNNI weights.
+         *
+         * The device descriptor carries the canonical execution codebook. This
+         * second identity preserves distinctions such as Q4_1 versus Q4_K and
+         * Q8_0 versus normalized Q8_1/Q8_K for cross-tier migration.
+         * Unsupported or provenance-free engines return false and clear @p out.
+         */
+        virtual bool exportNativeVNNISourceIdentity(
+            NativeVnniSourceIdentity &out) const
+        {
+            out = {};
+            return false;
+        }
+
+        /**
+         * @brief Borrow immutable CPU NativeVNNI execution bytes for migration.
+         *
+         * CPU prepared kernels override this to expose their single authoritative
+         * packed representation. The returned object remains owned by the engine
+         * and is valid only while the caller retains that engine's shared lifetime.
+         * GPU and non-NativeVNNI engines return null.
+         */
+        virtual const cpu::native_vnni::CPUNativeVNNIPackedWeights *
+        exportCPUNativeVNNIPackedWeights() const
+        {
+            return nullptr;
+        }
+
+        /**
+         * @brief Borrow the mutable final CPU NativeVNNI byte range for a
+         * retired ExpertOverlay physical slot.
+         *
+         * This is an infrastructure-only mutation boundary. The caller must
+         * own the slot through the ExpertOverlay residency fabric and may
+         * write the returned range only after the old residency epoch's ticket
+         * barrier has drained. Ordinary kernels, stages, and coherence callers
+         * must use @ref exportCPUNativeVNNIPackedWeights instead.
+         *
+         * @return Engine-owned final execution bytes, or an empty span when
+         *         the prepared engine cannot participate in slot recycling.
+         */
+        virtual std::span<std::uint8_t>
+        exportRetiredCPUNativeVNNIStorage() noexcept
+        {
+            return {};
+        }
+
+        /**
+         * @brief Borrow an immutable contiguous floating-point weight matrix.
+         *
+         * CPU and GPU floating GEMM engines override this with their exact live
+         * FP16, BF16, or FP32 execution allocation. Quantized engines return
+         * false and clear @p out. Retaining the engine pins the returned bytes.
+         *
+         * @param out Receives pointer, precision, geometry, and exact byte size.
+         * @return True only when the engine executes from contiguous float data.
+         */
+        virtual bool exportContiguousFloatingPointWeights(
+            ContiguousFloatingPointWeightDescriptor &out) const
+        {
+            out = {};
+            return false;
+        }
+
+        /**
+         * @brief Borrow mutable bytes from a retired CPU floating-point slot.
+         *
+         * This is the floating analogue of
+         * @ref exportRetiredCPUNativeVNNIStorage. Only the ExpertOverlay
+         * physical residency fabric may write the range, after the old epoch's
+         * inference-ticket barrier has drained.
+         *
+         * @return Engine-owned row-major bytes, or an empty span otherwise.
+         */
+        virtual std::span<std::uint8_t>
+        exportRetiredCPUFloatingPointStorage() noexcept
+        {
+            return {};
         }
 
         // =====================================================================
@@ -677,8 +832,8 @@ namespace llaminar2
          * - Output tensors: allocated on device, then published through TransferEngine after write
          * - Weight tensors: managed by the kernel (already packed/uploaded)
          *
-         * **For CPU execution**: Falls back to host pointers transparently
-         * **For GPU execution**: Uses device pointers, no manual sync needed by caller
+         * **For CPU execution**: Uses the backend's grouped/fused host implementation.
+         * **For GPU execution**: Uses device pointers, no manual sync needed by caller.
          *
          * @param input Input tensor [m, k] (FP32)
          * @param projections Vector of tensor projection descriptors
@@ -687,7 +842,8 @@ namespace llaminar2
          * @param mpi_ctx MPI context for distributed execution
          * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
          *
-         * @return true on success, false on error
+         * @return true on success. False means the required production contract
+         *         is unavailable or failed and must be treated as fatal by the stage.
          */
         virtual bool multiply_fused_tensor(
             const TensorBase *input,
@@ -696,40 +852,19 @@ namespace llaminar2
             const IMPIContext *mpi_ctx = nullptr,
             DeviceWorkspaceManager *workspace = nullptr)
         {
-            // Default implementation: call multiply_tensor() for each projection
-            for (const auto &proj : projections)
-            {
-                if (!proj.kernel || !proj.output)
-                {
-                    return false; // Invalid projection
-                }
-
-                // Use tensor-aware multiply - kernel handles device placement
-                // Note: Must pass transpose_B explicitly before alpha/beta to match signature:
-                //   multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, bias, mpi_ctx, device_idx, workspace)
-                bool success = proj.kernel->multiply_tensor(
-                    input, proj.output,
-                    m, proj.n, k,
-                    true,      // transpose_B (weights are [K,N] stored as [N,K] transposed)
-                    1.0f,      // alpha
-                    0.0f,      // beta
-                    proj.bias, // bias tensor (may be nullptr)
-                    mpi_ctx,
-                    -1, // device_idx (use default)
-                    workspace);
-
-                if (!success)
-                {
-                    return false;
-                }
-            }
-            return true;
+            (void)input;
+            (void)projections;
+            (void)m;
+            (void)k;
+            (void)mpi_ctx;
+            (void)workspace;
+            return false;
         }
 
         /**
          * @brief Grouped verifier-row projection with serial decode row math.
          *
-         * MTP verifier graphs often evaluate M=2..4 candidate rows together.
+         * MTP verifier graphs evaluate a runtime number of candidate rows together.
          * A normal GEMM kernel may legally change accumulation order across
          * rows, K tiles, or projection groups, but verifier rows that publish
          * recurrent/KV state need the same per-row numerical contract as M=1
@@ -2382,6 +2517,19 @@ namespace llaminar2
     {
     public:
         /**
+         * @brief Provision persistent resources for the two-projection capture.
+         *
+         * Adapters backed by ITensorGemm kernels forward this to both child
+         * kernels. CPU implementations may retain the default validation-only
+         * behavior because they do not own GPU graph resources.
+         */
+        virtual bool prepareFusedProjectionGraphCapture(
+            size_t projection_count)
+        {
+            return projection_count == 2;
+        }
+
+        /**
          * @brief Execute fused Gate/Up GEMM with tensor inputs/outputs
          *
          * @param input Input activations tensor [m, k]
@@ -4032,15 +4180,19 @@ namespace llaminar2
         }
 
         /**
-         * @brief Deinterleave merged QKV buffer on device (GPU-only)
+         * @brief Transform merged QKV rows in caller-owned device workspace.
          *
          * Splits a merged [seq_len, q_dim + k_dim + v_dim] device buffer into
          * separate contiguous Q, K, V device arrays. Handles Qwen GDN modular
          * Q/K tiling:
          *   k_head_for_v_head_j = (j + global_v_head_offset) % n_k_heads
          *
-         * GPU implementations allocate persistent grow-only scratch internally.
-         * CPU implementations return false (deinterleave done on host by stage).
+         * This operation is invoked only for GPU paths that require separate
+         * contiguous matrices for a downstream recurrence variant. Scratch is
+         * bound by the graph workspace before capture; implementations must
+         * never allocate private storage from this method. A false result is a
+         * fatal execution error, not permission for a host or allocation-based
+         * alternate path.
          *
          * @param d_merged_qkv  Device pointer to merged QKV buffer
          * @param d_q           [out] Device pointer to deinterleaved Q [seq_len, n_v_heads * d_k]
@@ -4052,7 +4204,7 @@ namespace llaminar2
          * @param d_k           Key/query head dimension
          * @param d_v           Value head dimension
          * @param global_v_head_offset  TP modular repeat offset
-         * @return true if device deinterleave succeeded, false for CPU fallback
+         * @return true after the device transform completes successfully.
          */
         virtual bool deinterleave_qkv_device(
             const float *d_merged_qkv,
@@ -4076,9 +4228,9 @@ namespace llaminar2
         /**
          * @brief Bind caller-owned scratch for merged-QKV deinterleaving.
          *
-         * GPU implementations use this workspace instead of keeping a private
-         * grow-only deinterleave buffer per GDN layer. Passing nullptr unbinds
-         * the shared buffer and restores the implementation's fallback behavior.
+         * GPU implementations use this workspace instead of keeping private
+         * deinterleave storage per GDN layer. Passing nullptr explicitly
+         * unbinds the buffer; any later operation that requires it must fail.
          *
          * @param scratch Device pointer to the deinterleave scratch buffer.
          * @param scratch_size Number of float elements available in scratch.
@@ -4121,11 +4273,63 @@ namespace llaminar2
             int chunk_size, bool use_qk_l2norm) = 0;
 
         /**
+         * @brief Execute ordinary decode or prefill directly from merged QKV rows.
+         *
+         * The source layout is one row per token:
+         *
+         *   [Q(n_k_heads*d_k) | K(n_k_heads*d_k) | V(n_heads*d_v)]
+         *
+         * For local value head @p h, Q and K are selected from
+         * `(h + global_v_head_offset) mod n_k_heads`; V remains indexed by the
+         * local head. Implementations own any backend-specific layout handling.
+         * CPU kernels consume the row strides directly, while GPU kernels may
+         * launch their graph-captured device transform before recurrence. The
+         * caller must never materialize a host-side Q/K/V copy as an alternate
+         * path.
+         *
+         * This operation is mandatory for every backend. It covers ordinary
+         * live-state execution; verifier snapshots, request-batched state banks,
+         * and graph-replay effective-length scalars retain their explicit APIs.
+         *
+         * @param merged_qkv First merged source row.
+         * @param qkv_stride Source-row stride in FP32 elements.
+         * @param alpha Per-row/per-local-head gate projection.
+         * @param beta_raw Per-row/per-local-head raw beta projection.
+         * @param A_log Per-local-head learned gate scale.
+         * @param dt_bias Per-local-head learned time-step bias.
+         * @param output Contiguous `[seq_len, n_heads*d_v]` output.
+         * @param state Live recurrence state, updated in place on CPU. GPU
+         *        implementations resolve their bound persistent state owner.
+         * @param seq_len Number of real rows to advance.
+         * @param n_k_heads Number of Q/K heads encoded in each source row.
+         * @param n_heads Number of participant-local V/output heads.
+         * @param d_k Q/K width and recurrence-state row count.
+         * @param d_v V/output width.
+         * @param global_v_head_offset Global first V-head index for modular Q/K
+         *        selection under tensor parallelism.
+         * @param chunk_size Backend scheduling hint; arithmetic remains fixed.
+         * @param use_qk_l2norm Whether to normalize Q/K before recurrence.
+         * @return true after exact recurrence completion; false is a fatal
+         *         execution error, never a request to use another path.
+         */
+        virtual bool chunkForwardMergedQKV(
+            const float *merged_qkv, int qkv_stride,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_k_heads, int n_heads, int d_k, int d_v,
+            int global_v_head_offset, int chunk_size,
+            bool use_qk_l2norm) = 0;
+
+        /**
          * @brief Chunk prefill with recurrence-state snapshots after each row.
          *
          * Snapshot rows are laid out as:
          *   state_snapshots[row * snapshot_stride_floats + state_index]
          * where state_index spans [n_heads, d_k, d_v].
+         * CPU implementations publish the terminal snapshot back to @p state.
+         * A backend may materialize snapshots directly during recurrence, but it
+         * must preserve serial-row arithmetic and may not replay rows afterward.
          */
         virtual bool chunkForwardWithStateSnapshots(
             const float *Q, const float *K, const float *V,
@@ -4165,20 +4369,18 @@ namespace llaminar2
          *
          *   [Q(n_k_heads*d_k) | K(n_k_heads*d_k) | V(n_heads*d_v)]
          *
-         * The generic stage path can deinterleave that tensor into separate
-         * contiguous Q/K/V matrices before calling chunkForwardWithStateSnapshots(),
-         * but all-position MTP verifier chunks are tiny (M=2..4), so the copy can
-         * dominate CPU replay time.  Implementations that can read this merged
-         * layout directly should override this method and publish the same
-         * post-row snapshots as serial recurrent_step().
+         * All-position MTP verifier chunks are latency-sensitive, so backends
+         * serving a merged verifier graph consume this layout directly and
+         * publish the same post-row snapshots as serial recurrent_step(). The
+         * supplied live @p state remains unchanged until the accepted snapshot
+         * is explicitly published by the transaction owner.
          *
          * The Q/K head for local V-head h is:
          *
          *   qk_head = (h + global_v_head_offset) mod n_k_heads
          *
-         * Returning false means the implementation has no direct merged-QKV
-         * verifier path; callers may use their explicit deinterleave path when
-         * that behavior is intended.
+         * Returning false is a fatal contract violation for a graph that chose
+         * this layout; callers must not reconstruct rows through another path.
          */
         virtual bool chunkForwardMergedQKVWithStateSnapshots(
             const float *merged_qkv, int qkv_stride,

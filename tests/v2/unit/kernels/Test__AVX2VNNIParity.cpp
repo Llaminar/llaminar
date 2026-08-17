@@ -39,6 +39,30 @@ using namespace llaminar2::cpu::native_vnni::isa;
 using namespace llaminar2;
 using llaminar2::test::TestTensorFactory;
 
+/**
+ * @brief Prove native scale conversion preserves every binary16 bit contract.
+ *
+ * Finite values exercise the F16C hot path. Infinity and NaN encodings
+ * exercise the portable special-value path, including signaling-NaN payloads.
+ * Comparing the resulting FP32 bytes rather than floating-point equality also
+ * covers signed zero and every NaN payload.
+ */
+TEST(NativeVNNIFP16Scale, ExhaustiveBinary16ExpansionMatchesPortableBytes)
+{
+    for (uint32_t raw = 0; raw <= 0xffffu; ++raw)
+    {
+        const uint16_t fp16 = static_cast<uint16_t>(raw);
+        const float expected = llaminar2::fp16_to_fp32(fp16);
+        const float actual = nativeVNNIFP16ScaleToFP32(fp16);
+        uint32_t expected_bits = 0;
+        uint32_t actual_bits = 0;
+        std::memcpy(&expected_bits, &expected, sizeof(expected_bits));
+        std::memcpy(&actual_bits, &actual, sizeof(actual_bits));
+        ASSERT_EQ(actual_bits, expected_bits)
+            << "binary16 encoding 0x" << std::hex << raw;
+    }
+}
+
 // ============================================================================
 // Helper functions (free functions for macro accessibility)
 // ============================================================================
@@ -240,21 +264,269 @@ protected:
  */
 TEST(CPUNativeVNNIDecodePolicy, NormalizesGeometryDependentAliases)
 {
+    const auto resolve = [](DecodeSchedulePolicy policy, int n)
+    {
+        return resolveDecodeSchedulePolicy(
+                   policy,
+                   DecodeScheduleGeometry{
+                       .n = n,
+                       .k = 32,
+                       .k_tiles = 0,
+                       .threads = 28,
+                   })
+            .effective;
+    };
     EXPECT_EQ(
-        normalizeDecodeSchedulePolicy(DecodeSchedulePolicy::Nbc16, 1),
+        resolve(DecodeSchedulePolicy::Nbc16, 64),
         DecodeSchedulePolicy::Nbc1);
     EXPECT_EQ(
-        normalizeDecodeSchedulePolicy(DecodeSchedulePolicy::Nbc8, 3),
+        resolve(DecodeSchedulePolicy::Nbc8, 160),
         DecodeSchedulePolicy::Nbc4);
     EXPECT_EQ(
-        normalizeDecodeSchedulePolicy(DecodeSchedulePolicy::Nbc16, 7),
+        resolve(DecodeSchedulePolicy::Nbc16, 448),
         DecodeSchedulePolicy::Nbc8);
     EXPECT_EQ(
-        normalizeDecodeSchedulePolicy(DecodeSchedulePolicy::Nbc2, 7),
+        resolve(DecodeSchedulePolicy::Nbc2, 448),
         DecodeSchedulePolicy::Nbc2);
     EXPECT_EQ(
-        normalizeDecodeSchedulePolicy(DecodeSchedulePolicy::Nbc16, 32),
+        resolve(DecodeSchedulePolicy::Nbc16, 2048),
         DecodeSchedulePolicy::Nbc16);
+}
+
+/**
+ * @test Keep coarse M=1 schedules from suppressing useful core parallelism.
+ *
+ * The Qwen development geometry below reproduced a five-minute NBC8/NBC16
+ * timing cell because those policies exposed only 22 and 11 full-K producer
+ * tasks to a 28-core socket. NBC4 exposes 44 tasks and completes the same
+ * byte-exact work economically. Small matrices retain the coarse policies,
+ * and a two-tile frozen K partition also makes NBC8 sufficiently parallel.
+ */
+TEST(CPUNativeVNNIDecodePolicy, ResolvesLargeUnderfilledSchedulesToFullTeamGrid)
+{
+    constexpr int N = 11264;
+    constexpr int K = 38912;
+    constexpr int threads = 28;
+
+    const DecodeScheduleGeometry full_k{
+        .n = N,
+        .k = K,
+        .k_tiles = 0,
+        .threads = threads,
+    };
+    for (const DecodeSchedulePolicy policy : {
+             DecodeSchedulePolicy::Nbc1,
+             DecodeSchedulePolicy::Nbc2,
+             DecodeSchedulePolicy::Nbc4})
+    {
+        const DecodeScheduleResolution resolution =
+            resolveDecodeSchedulePolicy(policy, full_k);
+        EXPECT_TRUE(resolution.isExactPhysicalIdentity());
+        EXPECT_EQ(resolution.effective, policy);
+        EXPECT_GE(resolution.producer_tasks, resolution.target_tasks);
+    }
+
+    for (const DecodeSchedulePolicy policy : {
+             DecodeSchedulePolicy::Nbc8,
+             DecodeSchedulePolicy::Nbc16})
+    {
+        const DecodeScheduleResolution resolution =
+            resolveDecodeSchedulePolicy(policy, full_k);
+        EXPECT_FALSE(resolution.isExactPhysicalIdentity());
+        EXPECT_EQ(resolution.effective, DecodeSchedulePolicy::Nbc4);
+        EXPECT_EQ(resolution.n_block_chunks, 4);
+        EXPECT_EQ(resolution.producer_tasks, 44);
+        EXPECT_EQ(resolution.target_tasks, threads);
+    }
+
+    const DecodeScheduleResolution small_work = resolveDecodeSchedulePolicy(
+        DecodeSchedulePolicy::Nbc16,
+        DecodeScheduleGeometry{
+            .n = N,
+            .k = 2048,
+            .k_tiles = 0,
+            .threads = threads,
+        });
+    EXPECT_TRUE(small_work.isExactPhysicalIdentity());
+    EXPECT_EQ(small_work.effective, DecodeSchedulePolicy::Nbc16);
+
+    const DecodeScheduleResolution k_parallel = resolveDecodeSchedulePolicy(
+        DecodeSchedulePolicy::Nbc8,
+        DecodeScheduleGeometry{
+            .n = N,
+            .k = K,
+            .k_tiles = 2,
+            .threads = threads,
+        });
+    EXPECT_TRUE(k_parallel.isExactPhysicalIdentity());
+    EXPECT_EQ(k_parallel.producer_tasks, 44);
+}
+
+/**
+ * @test Resolve every grouped verifier task topology from one typed authority.
+ *
+ * The fused bundle scheduler, direct launcher, PerfStats contract, and corpus
+ * adapter must agree on more than a policy label. This device-free regression
+ * fixes the exact physical row tile, N-block width, producer task count, and
+ * reduction task count for each distinct grid. It also proves that zero and
+ * one both mean full-K while only values greater than one mean independent K
+ * partials.
+ */
+TEST(CPUNativeVNNIVerifierSchedule, ResolvesPhysicalTaskGridIdentity)
+{
+    EXPECT_FALSE(nativeVNNIUsesKPartitions(0));
+    EXPECT_FALSE(nativeVNNIUsesKPartitions(1));
+    EXPECT_TRUE(nativeVNNIUsesKPartitions(2));
+
+    const auto resolve_full_k = [](VerifierRowsPolicy policy)
+    {
+        return resolveVerifierRowsSchedule(
+            policy,
+            policy,
+            VerifierRowsScheduleGeometry{
+                .rows = 5,
+                .physical_n = 320,
+                .policy_n = 320,
+                .k_tiles = 0,
+                .ambient_n_block_chunks = 4,
+                .use_avx512 = true,
+            });
+    };
+
+    const VerifierRowsScheduleResolution row_chunk = resolve_full_k(
+        VerifierRowsPolicy::FullKRowChunkGrid);
+    EXPECT_EQ(
+        row_chunk.route,
+        VerifierRowsExecutionRoute::GroupedFullKRowChunkGrid);
+    EXPECT_EQ(row_chunk.task_grid, VerifierRowsTaskGrid::RowNChunk);
+    EXPECT_EQ(row_chunk.physical_row_tile, 1);
+    EXPECT_EQ(row_chunk.n_block_chunks, 1);
+    EXPECT_EQ(row_chunk.producer_tasks, 25);
+    EXPECT_EQ(row_chunk.reduction_tasks, 0);
+
+    const VerifierRowsScheduleResolution n_major = resolve_full_k(
+        VerifierRowsPolicy::FullKTwoRowNbc2);
+    EXPECT_EQ(
+        n_major.route,
+        VerifierRowsExecutionRoute::GroupedFullKTwoRowNMajor);
+    EXPECT_EQ(n_major.task_grid, VerifierRowsTaskGrid::NBlockAllRows);
+    EXPECT_EQ(n_major.physical_row_tile, 2);
+    EXPECT_EQ(n_major.n_block_chunks, 2);
+    EXPECT_EQ(n_major.n_blocks, 3);
+    EXPECT_EQ(n_major.producer_tasks, 3);
+
+    const VerifierRowsScheduleResolution pair_grid = resolve_full_k(
+        VerifierRowsPolicy::FullKTwoRowPairGridNbc4);
+    EXPECT_EQ(
+        pair_grid.route,
+        VerifierRowsExecutionRoute::GroupedFullKPairGrid);
+    EXPECT_EQ(pair_grid.task_grid, VerifierRowsTaskGrid::RowTileNBlock);
+    EXPECT_EQ(pair_grid.physical_row_tile, 2);
+    EXPECT_EQ(pair_grid.n_block_chunks, 4);
+    EXPECT_EQ(pair_grid.n_blocks, 2);
+    EXPECT_EQ(pair_grid.producer_tasks, 6);
+
+    const VerifierRowsScheduleResolution wide = resolve_full_k(
+        VerifierRowsPolicy::WideRows);
+    EXPECT_EQ(
+        wide.route,
+        VerifierRowsExecutionRoute::GroupedFullKWideRows);
+    EXPECT_EQ(wide.physical_row_tile, 4);
+    EXPECT_EQ(wide.n_block_chunks, 4);
+    EXPECT_EQ(wide.producer_tasks, 4);
+
+    const auto resolve_kpart = [](VerifierRowsPolicy policy)
+    {
+        return resolveVerifierRowsSchedule(
+            policy,
+            policy,
+            VerifierRowsScheduleGeometry{
+                .rows = 5,
+                .physical_n = 320,
+                .policy_n = 320,
+                .k_tiles = 3,
+                .ambient_n_block_chunks = 8,
+                .use_avx512 = true,
+            });
+    };
+    const VerifierRowsScheduleResolution pairwise_kpart = resolve_kpart(
+        VerifierRowsPolicy::Pairwise);
+    EXPECT_EQ(
+        pairwise_kpart.route,
+        VerifierRowsExecutionRoute::GroupedKParallelRowTiles);
+    EXPECT_EQ(
+        pairwise_kpart.task_grid,
+        VerifierRowsTaskGrid::RowTileNChunkKTile);
+    EXPECT_EQ(pairwise_kpart.physical_row_tile, 2);
+    EXPECT_EQ(pairwise_kpart.n_block_chunks, 1);
+    EXPECT_EQ(pairwise_kpart.producer_tasks, 45);
+    EXPECT_EQ(pairwise_kpart.reduction_tasks, 25);
+
+    const VerifierRowsScheduleResolution wide_kpart = resolve_kpart(
+        VerifierRowsPolicy::WideRows);
+    EXPECT_EQ(wide_kpart.physical_row_tile, 4);
+    EXPECT_EQ(wide_kpart.n_block_chunks, 1);
+    EXPECT_EQ(wide_kpart.producer_tasks, 30);
+    EXPECT_EQ(wide_kpart.reduction_tasks, 25);
+
+    EXPECT_THROW(
+        resolve_kpart(VerifierRowsPolicy::FullKTwoRowNbc1),
+        std::invalid_argument);
+}
+
+/**
+ * @test Reject aliases and invalid full-K overrides before kernel execution.
+ *
+ * A forced candidate is evidence for one physical launch. Explicitly naming a
+ * wider grid that collapses on small N must therefore fail, while generated
+ * `Auto` dispatch may publish the canonical route. The trainer-only override
+ * is legal only for full-K Pairwise/WideRows pair grids.
+ */
+TEST(CPUNativeVNNIVerifierSchedule, RejectsNonPhysicalExplicitIdentity)
+{
+    const VerifierRowsScheduleGeometry small_n{
+        .rows = 4,
+        .physical_n = 64,
+        .policy_n = 64,
+        .k_tiles = 0,
+        .ambient_n_block_chunks = 4,
+        .use_avx512 = true,
+    };
+    EXPECT_THROW(
+        resolveVerifierRowsSchedule(
+            VerifierRowsPolicy::FullKTwoRowPairGridNbc8,
+            VerifierRowsPolicy::FullKTwoRowPairGridNbc8,
+            small_n),
+        std::invalid_argument);
+
+    const VerifierRowsScheduleResolution generated =
+        resolveVerifierRowsSchedule(
+            VerifierRowsPolicy::Auto,
+            VerifierRowsPolicy::FullKTwoRowPairGridNbc8,
+            small_n);
+    EXPECT_EQ(
+        generated.effective,
+        VerifierRowsPolicy::FullKTwoRowPairGridNbc1);
+    EXPECT_EQ(generated.n_block_chunks, 1);
+
+    VerifierRowsScheduleGeometry override_geometry = small_n;
+    override_geometry.physical_n = 320;
+    override_geometry.policy_n = 320;
+    override_geometry.full_k_n_block_chunks_override = 2;
+    const VerifierRowsScheduleResolution overridden =
+        resolveVerifierRowsSchedule(
+            VerifierRowsPolicy::Pairwise,
+            VerifierRowsPolicy::Pairwise,
+            override_geometry);
+    EXPECT_EQ(overridden.n_block_chunks, 2);
+    EXPECT_EQ(overridden.producer_tasks, 6);
+
+    EXPECT_THROW(
+        resolveVerifierRowsSchedule(
+            VerifierRowsPolicy::FullKTwoRowPairGridNbc2,
+            VerifierRowsPolicy::FullKTwoRowPairGridNbc2,
+            override_geometry),
+        std::invalid_argument);
 }
 
 /**
@@ -332,12 +604,18 @@ TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
                                 << " N=" << n << " K=" << k
                                 << " serial_kpart=" << serial_kpart;
 
+                            const DecodeScheduleGeometry geometry{
+                                .n = n,
+                                .k = k,
+                                .k_tiles = serial_kpart ? 2 : 0,
+                                .threads = threads,
+                            };
                             const DecodeSchedulePolicy physical =
-                                resolveGeneratedDecodeSchedulePolicy(nominal, n);
-                            EXPECT_EQ(
-                                normalizeDecodeSchedulePolicy(
-                                    physical, (n + 63) / 64),
-                                physical)
+                                resolveGeneratedDecodeSchedulePolicy(
+                                    nominal, geometry);
+                            EXPECT_TRUE(
+                                resolveDecodeSchedulePolicy(physical, geometry)
+                                    .isExactPhysicalIdentity())
                                 << "threads=" << threads
                                 << " codebook=" << static_cast<int>(codebook)
                                 << " N=" << n << " K=" << k
@@ -349,19 +627,21 @@ TEST(CPUNativeVNNIDecodePolicy, GeneratedRulesResolvePhysicalAllCodebooks)
         }
     }
 
-    CPUNativeVNNIDecodePolicy iq4_xs_nominal{};
-    ASSERT_TRUE(generated::selectCPUNativeVNNIDecodeGeneratedPolicy(
-        runtime_regimes.front().first,
-        runtime_regimes.front().second,
-        28,
-        4,
-        160,
-        224,
-        false,
-        1,
-        iq4_xs_nominal));
+    /*
+     * Keep the original three-chunk regression independent of the currently
+     * installed fit.  A future corpus may legitimately select NBC1 or NBC2 for
+     * this exact geometry; the architectural invariant is that a nominal NBC8
+     * candidate is resolved to its one physical NBC4 launch before execution.
+     */
     EXPECT_EQ(
-        resolveGeneratedDecodeSchedulePolicy(iq4_xs_nominal, 160),
+        resolveGeneratedDecodeSchedulePolicy(
+            CPUNativeVNNIDecodePolicy::Nbc8,
+            DecodeScheduleGeometry{
+                .n = 160,
+                .k = 224,
+                .k_tiles = 0,
+                .threads = 28,
+            }),
         DecodeSchedulePolicy::Nbc4);
 }
 
@@ -784,6 +1064,51 @@ TEST_F(AVX2VNNIParity, DpbusdIntrinsic_ZeroAccumulator)
     }
 }
 
+/**
+ * @test Exhaust every scalar input value at the AVX2 emulation boundary.
+ *
+ * A direct unsigned-byte by signed-byte `maddubs` implementation saturates for
+ * combinations such as 255 x 127. The production emulation separates even and
+ * odd byte products before INT32 accumulation, so all 65,536 scalar value pairs
+ * must still reproduce the exact four-product dot in every vector lane.
+ */
+TEST_F(AVX2VNNIParity, DpbusdIntrinsic_ExhaustiveUnsignedSignedByteDomain)
+{
+    alignas(32) std::array<uint8_t, 32> activations{};
+    alignas(32) std::array<int8_t, 32> weights{};
+    alignas(32) std::array<int32_t, 8> actual{};
+
+    for (int activation = 0; activation <= 255; ++activation)
+    {
+        activations.fill(static_cast<uint8_t>(activation));
+        for (int weight = -128; weight <= 127; ++weight)
+        {
+            weights.fill(static_cast<int8_t>(weight));
+            const __m256i result = avx2_dpbusd_epi32(
+                _mm256_setzero_si256(),
+                _mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(activations.data())),
+                _mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(weights.data())));
+            _mm256_store_si256(
+                reinterpret_cast<__m256i *>(actual.data()), result);
+
+            const int32_t expected = 4 * activation * weight;
+            for (size_t lane = 0; lane < actual.size(); ++lane)
+            {
+                if (actual[lane] != expected)
+                {
+                    FAIL() << "activation=" << activation
+                           << " weight=" << weight
+                           << " lane=" << lane
+                           << " expected=" << expected
+                           << " actual=" << actual[lane];
+                }
+            }
+        }
+    }
+}
+
 TEST_F(AVX2VNNIParity, DpbusdIntrinsic_WithAccumulator)
 {
     // Test with non-zero accumulator
@@ -897,26 +1222,28 @@ TEST_F(AVX2VNNIParity, DpbusdIntrinsic_MultipleAccumulations)
         alignas(64) float result_256[64] = {};                                             \
                                                                                            \
         /* AVX512 chunk */                                                                 \
-        __m512i lut512 = packed.is_nibble_lut                                              \
+        __m512i lut512 = packed.usesNibbleLUT()                                              \
                              ? build_decode_lut(packed.codebook_id)                        \
                              : _mm512_setzero_si512();                                     \
-        if (packed.is_nibble_lut)                                                          \
+        if (packed.usesNibbleLUT())                                                          \
             gemv_native_vnni_avx512_chunk_native(packed, A_q8.data(), result_512,          \
                                                  0, 0, packed.blocks_per_row, lut512);     \
         else                                                                               \
-            gemv_native_vnni_avx512_chunk_int8(packed, A_q8.data(), result_512,            \
-                                               0, 0, packed.blocks_per_row);               \
+            gemv_native_vnni_avx512_chunk_non_nibble(                                    \
+                packed, A_q8.data(), result_512,                                          \
+                0, 0, packed.blocks_per_row);                                             \
                                                                                            \
         /* AVX2 chunk */                                                                   \
-        __m256i lut256 = packed.is_nibble_lut                                              \
+        __m256i lut256 = packed.usesNibbleLUT()                                              \
                              ? build_decode_lut_avx2_for_codebook(packed.codebook_id)      \
                              : _mm256_setzero_si256();                                     \
-        if (packed.is_nibble_lut)                                                          \
+        if (packed.usesNibbleLUT())                                                          \
             gemv_avx2_chunk_native(packed, A_q8.data(), result_256,                        \
                                    0, 0, packed.blocks_per_row, lut256);                   \
         else                                                                               \
-            gemv_avx2_chunk_int8(packed, A_q8.data(), result_256,                          \
-                                 0, 0, packed.blocks_per_row);                             \
+            gemv_avx2_chunk_non_nibble(                                                   \
+                packed, A_q8.data(), result_256,                                          \
+                0, 0, packed.blocks_per_row);                                             \
                                                                                            \
         assertExactEqual(result_512, result_256, 64,                                       \
                          #FORMAT " chunk GEMV " #N "x" #K);                                \
@@ -1134,7 +1461,138 @@ FULL_GEMM_PARITY_TEST(IQ1_S, createIQ1_SRandom, 8, 512, 512, 121)
 
 #undef FULL_GEMM_PARITY_TEST
 
-TEST_F(AVX2VNNIParity, RuntimeISADispatch_ScalarAVX2AVX512_VerifierRows)
+/**
+ * @test Prove Q6_K remains native, dual-scale, and byte exact for every MTP M.
+ *
+ * This regression deliberately verifies both the physical prepared-weight
+ * representation and the arithmetic contract. A Q6_K tensor must not silently
+ * regress to the old one-byte-per-weight expansion: each 64-column by 32-K
+ * block contains 1,536 bytes of native low/high-bit payload followed by two
+ * independent 128-byte FP16 scale arrays. No duplicate scalar payload or INT8
+ * expansion is retained.
+ *
+ * Every grouped runtime size is then evaluated through both explicit ISA
+ * dispatches. Each grouped output must match independently executed serial
+ * M=1 rows byte for byte, and AVX2 must match AVX-512 byte for byte. This
+ * catches changes to reduction order, accidental FMA contraction, row-tail
+ * decomposition bugs, and ISA-specific interpretation of the two Q6 scales.
+ */
+TEST_F(AVX2VNNIParity, Q6KNativeDualScaleEncodingIsByteExactForAllRuntimeRows)
+{
+    constexpr int N = 256;
+    constexpr int K = 512;
+    constexpr int native_data_stride = 1536;
+    constexpr int native_block_stride = 1792;
+    constexpr std::array<int, 17> runtime_rows = {
+        2, 3, 4, 5, 6, 7, 8, 9,
+        10, 11, 12, 13, 14, 15, 16, 17, 31};
+    constexpr int maximum_rows = runtime_rows.back();
+
+    ScopedOpenMPControls openmp_controls;
+    omp_set_num_threads(4);
+
+    auto weights = TestTensorFactory::createQ6_KRandom({N, K}, 0x5136u);
+    const auto packed = packWeights(weights.get());
+
+    ASSERT_TRUE(packed.usesQ6KNativeDualScale());
+    EXPECT_FALSE(packed.usesNibbleLUT());
+    EXPECT_FALSE(packed.usesExpandedInt8());
+    EXPECT_FALSE(packed.usesInlineCompensation());
+    EXPECT_EQ(packed.data_stride, native_data_stride);
+    EXPECT_EQ(packed.interleaved_block_stride, native_block_stride);
+    EXPECT_TRUE(packed.payload.empty());
+    EXPECT_TRUE(packed.int8_flat.empty());
+    EXPECT_EQ(
+        packed.native_interleaved.size(),
+        static_cast<size_t>(packed.N_padded / 64) *
+            static_cast<size_t>(packed.blocks_per_row) * native_block_stride);
+
+    std::vector<Q8_1Block> activations(
+        static_cast<size_t>(maximum_rows) * packed.blocks_per_row);
+    for (int row = 0; row < maximum_rows; ++row)
+    {
+        const auto row_blocks = createRandomQ8_1(K, 0x7000u + row);
+        std::copy(
+            row_blocks.begin(),
+            row_blocks.end(),
+            activations.begin() +
+                static_cast<size_t>(row) * packed.blocks_per_row);
+    }
+
+    std::vector<float> serial_avx512(
+        static_cast<size_t>(maximum_rows) * N, 0.0f);
+    std::vector<float> serial_avx2(
+        static_cast<size_t>(maximum_rows) * N, 0.0f);
+    for (int row = 0; row < maximum_rows; ++row)
+    {
+        const Q8_1Block *const row_activations =
+            activations.data() +
+            static_cast<size_t>(row) * packed.blocks_per_row;
+        gemv_native_vnni_preq(
+            packed,
+            row_activations,
+            serial_avx512.data() + static_cast<size_t>(row) * N,
+            ISAPath::AVX512,
+            DecodeSchedulePolicy::FrozenSerialOracle);
+        gemv_native_vnni_preq(
+            packed,
+            row_activations,
+            serial_avx2.data() + static_cast<size_t>(row) * N,
+            ISAPath::AVX2,
+            DecodeSchedulePolicy::FrozenSerialOracle);
+    }
+
+    ASSERT_EQ(
+        std::memcmp(
+            serial_avx512.data(),
+            serial_avx2.data(),
+            serial_avx512.size() * sizeof(float)),
+        0)
+        << "native Q6_K serial M=1 bytes differ between AVX-512 and AVX2";
+
+    for (const int M : runtime_rows)
+    {
+        SCOPED_TRACE(std::string("M=") + std::to_string(M));
+        const size_t output_elements = static_cast<size_t>(M) * N;
+        const size_t output_bytes = output_elements * sizeof(float);
+        std::vector<float> grouped_avx512(output_elements, 0.0f);
+        std::vector<float> grouped_avx2(output_elements, 0.0f);
+
+        gemm_native_vnni_preq_decode_equivalent_rows(
+            packed,
+            activations.data(),
+            grouped_avx512.data(),
+            M,
+            N,
+            ISAPath::AVX512,
+            VerifierRowsPolicy::Auto);
+        gemm_native_vnni_preq_decode_equivalent_rows(
+            packed,
+            activations.data(),
+            grouped_avx2.data(),
+            M,
+            N,
+            ISAPath::AVX2,
+            VerifierRowsPolicy::Auto);
+
+        ASSERT_EQ(
+            std::memcmp(
+                grouped_avx512.data(), serial_avx512.data(), output_bytes),
+            0)
+            << "AVX-512 grouped Q6_K differs from serial M=1 rows";
+        ASSERT_EQ(
+            std::memcmp(grouped_avx2.data(), serial_avx2.data(), output_bytes),
+            0)
+            << "AVX2 grouped Q6_K differs from serial M=1 rows";
+        ASSERT_EQ(
+            std::memcmp(
+                grouped_avx512.data(), grouped_avx2.data(), output_bytes),
+            0)
+            << "grouped Q6_K bytes differ between AVX-512 and AVX2";
+    }
+}
+
+TEST_F(AVX2VNNIParity, RuntimeISADispatch_AVX2AVX512_ScalarM1OracleOnly)
 {
     struct Case
     {
@@ -1175,29 +1633,31 @@ TEST_F(AVX2VNNIParity, RuntimeISADispatch_ScalarAVX2AVX512_VerifierRows)
         gemv_native_vnni_preq(
             packed, A_q8_all.data(), gemv_256.data(), ISAPath::AVX2,
             DecodeSchedulePolicy::FrozenSerialOracle);
-        gemv_native_vnni_preq(
-            packed, A_q8_all.data(), gemv_scalar.data(), ISAPath::SCALAR,
-            DecodeSchedulePolicy::FrozenSerialOracle);
 
         assertExactEqual(gemv_512.data(), gemv_256.data(), N,
                          test_case.name + " M=1 AVX512 vs AVX2");
+        gemv_native_vnni_preq(
+            packed, A_q8_all.data(), gemv_scalar.data(), ISAPath::SCALAR,
+            DecodeSchedulePolicy::FrozenSerialOracle);
         assertStrictMetricClose(gemv_512.data(), gemv_scalar.data(), N,
-                                test_case.name + " M=1 AVX512 vs scalar");
+                                test_case.name + " M=1 AVX512 vs scalar oracle");
 
         std::vector<float> rows_512(static_cast<size_t>(M) * N, 0.0f);
         std::vector<float> rows_256(static_cast<size_t>(M) * N, 0.0f);
-        std::vector<float> rows_scalar(static_cast<size_t>(M) * N, 0.0f);
         gemm_native_vnni_preq_decode_equivalent_rows(
             packed, A_q8_all.data(), rows_512.data(), M, N, ISAPath::AVX512);
         gemm_native_vnni_preq_decode_equivalent_rows(
             packed, A_q8_all.data(), rows_256.data(), M, N, ISAPath::AVX2);
-        gemm_native_vnni_preq_decode_equivalent_rows(
-            packed, A_q8_all.data(), rows_scalar.data(), M, N, ISAPath::SCALAR);
 
         assertExactEqual(rows_512.data(), rows_256.data(), M * N,
                          test_case.name + " verifier rows AVX512 vs AVX2");
-        assertStrictMetricClose(rows_512.data(), rows_scalar.data(), M * N,
-                                test_case.name + " verifier rows AVX512 vs scalar");
+        EXPECT_THROW(
+            gemm_native_vnni_preq_decode_equivalent_rows(
+                packed, A_q8_all.data(), rows_256.data(), M, N,
+                ISAPath::SCALAR),
+            std::runtime_error)
+            << test_case.name
+            << " grouped production dispatch must reject the scalar diagnostic path";
     }
 }
 

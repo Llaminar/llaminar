@@ -386,7 +386,11 @@ namespace
 
                 for (size_t n = 0; n < N_sz; ++n)
                     for (int b = 0; b < blocks_per_row; ++b)
-                        weights->packVnniBlock(ctx, static_cast<int>(n), b);
+                        weights->packVnniBlock(
+                            ctx,
+                            static_cast<int>(n),
+                            static_cast<int>(n),
+                            b);
             }
 
             // Calculate native VNNI weight bytes

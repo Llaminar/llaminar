@@ -36,11 +36,33 @@ namespace llaminar2
 {
     class ITokenizer;          // Forward declaration
     class IMPIContext;         // Forward declaration
+    class IModelContext;       // Forward declaration
+    class ModelContext;        // Forward declaration
     struct GraphExecutorStats; // Forward declaration
 }
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Model authority plus the production plan that prepared its weights.
+     *
+     * Packed weights may outlive one runner, but their validity is narrower than
+     * the underlying GGUF metadata: device ordinal, layer ownership, sharding,
+     * and whether trailing MTP weights were required all affect the prepared
+     * set.  Carrying the certifying plan with the shared context prevents a new
+     * runner from treating an arbitrary preloaded ModelContext as complete
+     * device residency.  The consumer still builds its own current plan and
+     * validates the weight-affecting fields before using this contract.
+     *
+     * Mutable graph, arena, stream, controller, and request state are never part
+     * of this object.
+     */
+    struct ModelContextReuseContract
+    {
+        std::shared_ptr<ModelContext> context;
+        RankExecutionPlan prepared_weight_plan;
+    };
 
     /**
      * @brief Result of a generation step or full generation
@@ -309,16 +331,6 @@ namespace llaminar2
         virtual bool maybeApplyMoERebalance() { return true; }
 
         /**
-         * @brief True when MoE rebalance publish/apply is owned by captured device graph stages.
-         *
-         * Callers still invoke maybeApplyMoERebalance() at every committed
-         * decode boundary.  This flag selects its implementation: device-side
-         * mode schedules the captured maintenance graph, while legacy
-         * non-device modes publish host-prepared work.
-         */
-        virtual bool usesDeviceSideMoERebalanceController() const { return false; }
-
-        /**
          * @brief Observable MoE expert movement epoch for parity/diagnostics.
          *
          * Unlike placement epochs used for graph and prefix-cache keys, this
@@ -454,6 +466,38 @@ namespace llaminar2
          * the runner has not yet been initialized or does not know its arch.
          */
         virtual const std::string &architecture() const = 0;
+
+        /**
+         * @brief Read-only model authority for diagnostics and parity tooling.
+         *
+         * The returned context remains owned by the runner and is valid only
+         * for the runner's initialized lifetime.  The const boundary prevents
+         * diagnostic callers from loading weights or mutating the runner's
+         * sole model authority.  Lightweight mocks may return nullptr.
+         */
+        virtual const IModelContext *modelContextForDiagnostics() const
+        {
+            return nullptr;
+        }
+
+        /**
+         * @brief Retain the exact model authority for a later compatible runner.
+         *
+         * This is a setup/teardown boundary, never a hot-path accessor.  The
+         * returned context owns its WeightManager and additive
+         * PreparedWeightStore, while graphs, arenas, streams, controllers, and
+         * request state remain owned by this runner.  Callers may retain and
+         * pass the pointer back to the factory's preloaded-context overload but
+         * must not mutate its weight-placement or loader policy.  Implementations
+         * that span multiple independent model authorities return nullptr.
+         *
+         * @return Shared rank-local model authority, or nullptr when unsupported.
+         */
+        virtual std::optional<ModelContextReuseContract>
+        modelContextReuseContract() const
+        {
+            return std::nullopt;
+        }
 
         // =====================================================================
         // Snapshot Capture (for parity testing)
@@ -655,11 +699,23 @@ namespace llaminar2
         virtual void setMoEExpertOverlayMPIContext(std::shared_ptr<IMPIContext> /*mpi_ctx*/) {}
 
         /**
+         * @brief Return the MPI rank that owns coordinated request execution.
+         *
+         * Ordinary TP/PP runners retain rank zero. A rank-agnostic heterogeneous
+         * ExpertOverlay returns its inventory-resolved continuation root so the
+         * process owning dense model state, tokenizer output, logits, sampling,
+         * prefix state, and terminal results is also the command authority.
+         *
+         * @return Valid rank in the runner's coordinated MPI communicator.
+         */
+        virtual int coordinatedRootRank() const { return 0; }
+
+        /**
          * @brief Enable MPI coordinated mode.
          *
-         * When enabled, rank 0 broadcasts commands so non-root ranks
-         * (in their worker loops) can participate in inference collectives.
-         * Must be called on rank 0 before workers enter runMPIWorkerLoop().
+         * When enabled, coordinatedRootRank() broadcasts commands so every
+         * other rank can participate in inference collectives from its worker
+         * loop. The root must enable this before workers enter that loop.
          *
          * Modes where all ranks run the same code (SingleShotChat, Completion)
          * must NOT enable this — they already coordinate inline.

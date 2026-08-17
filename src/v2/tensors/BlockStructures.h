@@ -601,13 +601,14 @@ namespace llaminar2
      *   - 1 high bit packed in high_bits (selects upper/lower 8-centroid half)
      *
      * Two FP32 scalars are stored per head block:
-     *   - norm:          original vector norm for non-unit inputs
-     *   - residual_norm: set to -1.0f as sentinel for scalar-full mode
+     *   - norm: original vector norm, retained for diagnostics and zero tests
+     *   - reconstruction_norm: least-squares radial coefficient for the exact
+     *     finite-D centroid vector selected by the encoder
      *
      * Template parameter D = number of elements (head_dim).
      *
      * Memory layout:
-     *   [float norm][float residual_norm][uint8_t mse_indices[D*3/8]][uint8_t high_bits[D/8]]
+     *   [float norm][float reconstruction_norm][uint8_t mse_indices[D*3/8]][uint8_t high_bits[D/8]]
      *
      * Memory per block:
      *   D=64:  4 + 4 + 24 + 8  = 40 bytes
@@ -618,8 +619,12 @@ namespace llaminar2
     {
         static_assert(D > 0 && D % 8 == 0, "TQ4Block dimension must be positive and divisible by 8");
 
-        float norm;
-        float residual_norm;
+        float norm; ///< Original vector L2 norm; zero identifies an all-zero block.
+        /**
+         * Least-squares-adjusted radius for the selected centroid vector.
+         * Decode reconstructs `centroid * reconstruction_norm / sqrt(D)`.
+         */
+        float reconstruction_norm;
         uint8_t mse_indices[D * 3 / 8]; ///< Low 3 bits of each 4-bit centroid index
         uint8_t high_bits[D / 8];       ///< High bit (bit 3) of each 4-bit centroid index
 
@@ -656,10 +661,10 @@ namespace llaminar2
      *
      * Quantization path:
      *   FP32 → normalize → rotate (Haar-random Π) → scale (×√D) →
-     *   nearest Lloyd-Max centroid → uint8_t index + norm + residual_norm
+     *   nearest Lloyd-Max centroid → uint8_t index + norm + reconstruction norm
      *
      * Memory layout:
-     *   [float norm][float residual_norm][uint8_t indices[D]]
+     *   [float norm][float reconstruction_norm][uint8_t indices[D]]
      *
      * Memory per block:
      *   D=64:  4 + 4 + 64  = 72 bytes   (vs TQ4: 40 bytes, 1.8× larger)
@@ -672,9 +677,13 @@ namespace llaminar2
     {
         static_assert(D > 0 && D % 8 == 0, "TQ8Block dimension must be positive and divisible by 8");
 
-        float norm;          ///< Original vector L2 norm
-        float residual_norm; ///< Set to -1.0f as sentinel for scalar-full mode
-        uint8_t indices[D];  ///< 8-bit Lloyd-Max centroid indices (0-255)
+        float norm; ///< Original vector L2 norm; zero identifies an all-zero block.
+        /**
+         * Least-squares-adjusted norm for the selected finite-D centroid vector.
+         * Decode reconstructs `centroid * reconstruction_norm / sqrt(D)`.
+         */
+        float reconstruction_norm;
+        uint8_t indices[D]; ///< 8-bit Lloyd-Max centroid indices (0-255)
 
         static constexpr int BLOCK_DIM = D;
         static constexpr int BITS = 8;
@@ -690,6 +699,64 @@ namespace llaminar2
     static_assert(sizeof(TQ8Block_64) == 72, "TQ8Block_64 must be 72 bytes");
     static_assert(sizeof(TQ8Block_128) == 136, "TQ8Block_128 must be 136 bytes");
     static_assert(sizeof(TQ8Block_256) == 264, "TQ8Block_256 must be 264 bytes");
+
+    // ========================================================================
+    // Attention-key Q8 block -- quadratic companding
+    // ========================================================================
+
+    /**
+     * @brief Eight-bit attention-key block with quadratic companding.
+     *
+     * Attention keys frequently contain a few large coordinates alongside many
+     * much smaller coordinates that still affect the QK score. A linear int8
+     * scale spends almost all of its codes on the outlier range and can erase
+     * those smaller coordinates. This block stores the signed square root of
+     * each normalized coordinate instead. Real Qwen key-projection sweeps show
+     * that quadratic companding minimizes QK-score error once the request-local
+     * anchor removes token-common bias. Dequantization is the inexpensive
+     * signed polynomial `quadratic_scale * q * abs(q)`; the square root is paid
+     * only when a key is appended to the cache.
+     *
+     * One block represents one complete attention head. Keeping a single scale
+     * per head makes the physical format independent of tensor row padding and
+     * lets captured CPU, CUDA, and ROCm cache implementations share identical
+     * serialized bytes.
+     *
+     * @tparam D Number of coordinates in one attention head.
+     */
+    template <int D>
+    struct AttentionKeyQ8Block
+    {
+        static_assert(D > 0 && D % 8 == 0,
+                      "AttentionKeyQ8Block dimension must be positive and divisible by 8");
+
+        float quadratic_scale; ///< `max(abs(x)) / 127^2`, or zero for an all-zero head.
+        int8_t codes[D];   ///< Signed companded codes in the closed range [-127, 127].
+
+        static constexpr int BLOCK_DIM = D;                         ///< Logical values per block.
+        static constexpr int BITS = 8;                              ///< Payload bits per coordinate.
+        static constexpr int MAX_CODE = 127;                        ///< Largest code magnitude.
+        static constexpr int MAX_CODE_SQUARED = 127 * 127;          ///< Polynomial divisor.
+        static constexpr float INVERSE_MAX_CODE_SQUARED =           ///< Pre-rounded shared scale multiplier.
+            1.0f / static_cast<float>(MAX_CODE_SQUARED);
+        static constexpr size_t TOTAL_BYTES = sizeof(float) + D;    ///< Serialized block bytes.
+    };
+
+    /// Attention-key Q8 block for a 64-coordinate head.
+    using AttentionKeyQ8Block_64 = AttentionKeyQ8Block<64>;
+    /// Attention-key Q8 block for a 128-coordinate head.
+    using AttentionKeyQ8Block_128 = AttentionKeyQ8Block<128>;
+    /// Attention-key Q8 block for a 256-coordinate head.
+    using AttentionKeyQ8Block_256 = AttentionKeyQ8Block<256>;
+
+    static_assert(sizeof(AttentionKeyQ8Block_64) == 68,
+                  "AttentionKeyQ8Block_64 must be 68 bytes");
+    static_assert(sizeof(AttentionKeyQ8Block_128) == 132,
+                  "AttentionKeyQ8Block_128 must be 132 bytes");
+    static_assert(sizeof(AttentionKeyQ8Block_256) == 260,
+                  "AttentionKeyQ8Block_256 must be 260 bytes");
+    static_assert(std::is_trivially_copyable_v<AttentionKeyQ8Block_64>,
+                  "AttentionKeyQ8 blocks must remain blob-transferable");
 
     // ========================================================================
     // TQ2 Bit-packing Helpers (used by TQ4 3-bit index packing)

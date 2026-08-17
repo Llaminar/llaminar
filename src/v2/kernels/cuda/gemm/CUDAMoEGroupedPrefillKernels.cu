@@ -111,7 +111,8 @@ namespace
         (uint32_t{1} << 15) |
         (uint32_t{1} << 16) |
         (uint32_t{1} << 17) |
-        (uint32_t{1} << 19);
+        (uint32_t{1} << 19) |
+        (uint32_t{1} << llaminar2::kNativeVnniExpandedInt8MinCodebook);
 
     /** Abort the captured graph when device-owned grouping metadata is invalid. */
     __device__ __forceinline__ void failFastInvalidGroupedImmaState()
@@ -1932,6 +1933,7 @@ namespace
         LAUNCH_CODEBOOK(16);
         LAUNCH_CODEBOOK(17);
         LAUNCH_CODEBOOK(19);
+        LAUNCH_CODEBOOK(llaminar2::kNativeVnniExpandedInt8MinCodebook);
 
 #undef LAUNCH_CODEBOOK
         return launched;
@@ -1992,6 +1994,8 @@ namespace
         LAUNCH_GATE_UP_CODEBOOK(16);
         LAUNCH_GATE_UP_CODEBOOK(17);
         LAUNCH_GATE_UP_CODEBOOK(19);
+        LAUNCH_GATE_UP_CODEBOOK(
+            llaminar2::kNativeVnniExpandedInt8MinCodebook);
 
 #undef LAUNCH_GATE_UP_CODEBOOK
         return launched;
@@ -2052,6 +2056,8 @@ namespace
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(16);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(17);
         LAUNCH_PAIRED_GATE_UP_CODEBOOK(19);
+        LAUNCH_PAIRED_GATE_UP_CODEBOOK(
+            llaminar2::kNativeVnniExpandedInt8MinCodebook);
 
 #undef LAUNCH_PAIRED_GATE_UP_CODEBOOK
         return launched;
@@ -2409,6 +2415,7 @@ namespace
             QUERY_CODEBOOK(16);
             QUERY_CODEBOOK(17);
             QUERY_CODEBOOK(19);
+            QUERY_CODEBOOK(llaminar2::kNativeVnniExpandedInt8MinCodebook);
         default:
             return false;
         }
@@ -2458,6 +2465,8 @@ namespace
             QUERY_GATE_UP_CODEBOOK(16);
             QUERY_GATE_UP_CODEBOOK(17);
             QUERY_GATE_UP_CODEBOOK(19);
+            QUERY_GATE_UP_CODEBOOK(
+                llaminar2::kNativeVnniExpandedInt8MinCodebook);
         default:
             return false;
         }

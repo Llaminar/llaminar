@@ -64,9 +64,13 @@ namespace llaminar2
          * - Input activations (A) must be on GPU
          * - Output (C) must be on GPU
          *
-         * **Thread Safety**:
-         * - Single kernel instance should be used from one thread
-         * - hipBLAS handle is per-kernel (not shared)
+         * **Thread Safety and stream ownership**:
+         * - Wrappers for the same weight shape may share one cached low-level
+         *   hipBLAS handle.
+         * - Every launch supplies its exact non-null operation stream.  The
+         *   low-level kernel serializes only handle rebinding plus enqueue, so
+         *   work already submitted on different streams remains concurrent.
+         * - Clearing one wrapper's binding cannot retarget another wrapper.
          */
         class ROCmFloatingPointGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
@@ -255,6 +259,10 @@ namespace llaminar2
             // =========================================================================
 
             KernelSnapshotInfo getKernelSnapshotInfo() const override;
+
+            /** @brief Export the exact live row-major GPU floating weights. */
+            bool exportContiguousFloatingPointWeights(
+                ContiguousFloatingPointWeightDescriptor &out) const override;
 
             // =========================================================================
             // Accessors

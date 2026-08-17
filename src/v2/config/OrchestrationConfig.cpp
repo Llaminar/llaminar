@@ -32,8 +32,8 @@ namespace llaminar2
         {
         case TPScope::AUTO:
             return "auto";
-        case TPScope::LOCAL:
-            return "local";
+        case TPScope::RANK_LOCAL:
+            return "rank_local";
         case TPScope::NODE_LOCAL:
             return "node_local";
         case TPScope::GLOBAL:
@@ -131,8 +131,8 @@ namespace llaminar2
         std::string lower = toLower(str);
         if (lower == "auto")
             return TPScope::AUTO;
-        if (lower == "local")
-            return TPScope::LOCAL;
+        if (lower == "rank_local" || lower == "rank-local")
+            return TPScope::RANK_LOCAL;
         if (lower == "node_local" || lower == "nodelocal")
             return TPScope::NODE_LOCAL;
         if (lower == "global")
@@ -190,8 +190,8 @@ namespace llaminar2
         {
             switch (scope)
             {
-            case TPScope::LOCAL:
-                return ExecutionDomainScope::LOCAL;
+            case TPScope::RANK_LOCAL:
+                return ExecutionDomainScope::RANK_LOCAL;
             case TPScope::NODE_LOCAL:
                 return ExecutionDomainScope::NODE_LOCAL;
             case TPScope::GLOBAL:
@@ -207,8 +207,8 @@ namespace llaminar2
         {
             switch (scope)
             {
-            case ExecutionDomainScope::LOCAL:
-                return TPScope::LOCAL;
+            case ExecutionDomainScope::RANK_LOCAL:
+                return TPScope::RANK_LOCAL;
             case ExecutionDomainScope::NODE_LOCAL:
                 return TPScope::NODE_LOCAL;
             case ExecutionDomainScope::GLOBAL:
@@ -256,6 +256,92 @@ namespace llaminar2
                        rhs.routed_decode_assignment_policy &&
                    lhs.routed_prefill_assignment_policy ==
                        rhs.routed_prefill_assignment_policy;
+        }
+
+        bool participantSelectorAcceptsResolvedAddress(
+            const GlobalDeviceAddress &selector,
+            const GlobalDeviceAddress &resolved)
+        {
+            const bool wildcard_host = selector.hostname.empty() ||
+                                       selector.hostname == "localhost";
+            return selector.device_type == resolved.device_type &&
+                   selector.device_ordinal == resolved.device_ordinal &&
+                   (wildcard_host || selector.hostname == resolved.hostname) &&
+                   (!selector.hasValidNuma() ||
+                    selector.numa_node == resolved.numa_node);
+        }
+
+        bool sameDomainIntentAfterHardwareBinding(
+            const ExecutionDomainDefinition &requested,
+            const ExecutionDomainDefinition &resolved)
+        {
+            if (requested.name != resolved.name ||
+                requested.participants.size() != resolved.participants.size() ||
+                !sameWeights(requested.weights, resolved.weights) ||
+                requested.backend != resolved.backend ||
+                requested.routed_compute_policy != resolved.routed_compute_policy ||
+                requested.routed_phase_policy != resolved.routed_phase_policy ||
+                requested.routed_decode_assignment_policy !=
+                    resolved.routed_decode_assignment_policy ||
+                requested.routed_prefill_assignment_policy !=
+                    resolved.routed_prefill_assignment_policy)
+            {
+                return false;
+            }
+
+            auto normalizedScope = [](const ExecutionDomainDefinition &domain)
+            {
+                if (domain.scope == ExecutionDomainScope::SINGLE &&
+                    domain.participants.size() == 1)
+                {
+                    return ExecutionDomainScope::AUTO;
+                }
+                return domain.scope;
+            };
+            if (requested.scope != ExecutionDomainScope::AUTO &&
+                normalizedScope(requested) != normalizedScope(resolved))
+                return false;
+
+            for (size_t index = 0; index < requested.participants.size(); ++index)
+            {
+                if (!participantSelectorAcceptsResolvedAddress(
+                        requested.participants[index],
+                        resolved.participants[index]))
+                {
+                    return false;
+                }
+            }
+
+            if (requested.owner_rank.has_value() &&
+                requested.owner_rank != resolved.owner_rank)
+            {
+                return false;
+            }
+            if (!requested.ranks.empty() && requested.ranks != resolved.ranks)
+                return false;
+            return true;
+        }
+
+        bool hasCompleteHardwareResolvedOwnership(
+            const RoutedExpertDomain &domain)
+        {
+            if (domain.owner_rank < 0)
+                return false;
+
+            /*
+             * A LocalTP domain is wholly owned by one MPI rank. Its devices do
+             * not form a cross-rank participant list, so repeating the owner
+             * once per device would violate the typed LOCAL-domain contract.
+             */
+            if (domain.scope == ExecutionDomainScope::RANK_LOCAL)
+                return domain.world_ranks.empty();
+
+            /*
+             * SINGLE, NODE_LOCAL, and GLOBAL domains retain the binder's
+             * participant-order rank map. NODE_LOCAL uses it to construct the
+             * CPU collective; SINGLE uses its sole entry for remote ownership.
+             */
+            return domain.world_ranks.size() == domain.participants.size();
         }
 
         void addUniqueName(std::vector<std::string> &names, const std::string &name)
@@ -610,6 +696,151 @@ namespace llaminar2
         return errors;
     }
 
+    std::vector<std::string> installResolvedMoEExpertOverlayPlan(
+        OrchestrationConfig &config,
+        std::shared_ptr<MoERoutedExpertPlacementPlan> resolved_plan,
+        MoEExpertOverlayPlanInstallOrigin origin)
+    {
+        std::vector<std::string> errors;
+        if (!resolved_plan || !resolved_plan->usesExpertOverlayAuthority())
+        {
+            errors.push_back(
+                "Hardware-resolved MoE overlay installation requires an enabled tiered plan");
+            return errors;
+        }
+
+        if (origin ==
+            MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP)
+        {
+            const bool has_simple_tp_authority =
+                !config.tp_devices.empty() || config.tp_degree > 1;
+            if (!has_simple_tp_authority)
+            {
+                errors.push_back(
+                    "Implicit ExpertOverlay installation requires an active simple TP selector to replace");
+            }
+            if (!config.domain_definitions.empty() ||
+                !config.pp_stage_definitions.empty())
+            {
+                errors.push_back(
+                    "Implicit ExpertOverlay installation cannot replace simple TP while user-declared named domains remain active");
+            }
+            if (resolved_plan->topology !=
+                    RoutedExpertPlacementTopology::SingleDomain ||
+                resolved_plan->domains.size() != 1u ||
+                resolved_plan->routed_tiers.size() != 1u ||
+                resolved_plan->routed_tiers.front().priority != 0)
+            {
+                errors.push_back(
+                    "Implicit ExpertOverlay installation requires one priority-zero single-domain plan");
+            }
+            if (!errors.empty())
+                return errors;
+        }
+        if (!config.moe_routed_expert_plan ||
+            !config.moe_routed_expert_plan->usesExpertOverlayAuthority())
+        {
+            errors.push_back(
+                "Cannot install a hardware-resolved MoE overlay without a requested tiered plan");
+            return errors;
+        }
+
+        std::unordered_map<std::string, const RoutedExpertDomain *> resolved_by_name;
+        for (const auto &domain : resolved_plan->domains)
+        {
+            if (!resolved_by_name.emplace(domain.name, &domain).second)
+            {
+                errors.push_back(
+                    "Hardware-resolved MoE overlay contains duplicate domain '" +
+                    domain.name + "'");
+            }
+            if (!hasCompleteHardwareResolvedOwnership(domain))
+            {
+                errors.push_back(
+                    "Hardware-resolved MoE overlay domain '" + domain.name +
+                    "' does not have complete participant rank ownership");
+            }
+        }
+
+        for (const auto &requested : config.moe_routed_expert_plan->domains)
+        {
+            auto found = resolved_by_name.find(requested.name);
+            if (found == resolved_by_name.end())
+            {
+                errors.push_back(
+                    "Hardware binding removed requested MoE overlay domain '" +
+                    requested.name + "'");
+                continue;
+            }
+            if (!sameDomainIntentAfterHardwareBinding(
+                    requested.toExecutionDomainDefinition(),
+                    found->second->toExecutionDomainDefinition()))
+            {
+                errors.push_back(
+                    "Hardware binding changed non-location intent for MoE overlay domain '" +
+                    requested.name + "'");
+            }
+        }
+
+        std::vector<DomainDefinition> installed_domains =
+            config.domain_definitions;
+        for (const auto &resolved : resolved_plan->domains)
+        {
+            const auto resolved_definition =
+                resolved.toExecutionDomainDefinition();
+            auto existing = std::find_if(
+                installed_domains.begin(),
+                installed_domains.end(),
+                [&](const auto &candidate)
+                {
+                    return candidate.name == resolved.name;
+                });
+            if (existing == installed_domains.end())
+            {
+                installed_domains.push_back(
+                    DomainDefinition::fromExecutionDomainDefinition(
+                        resolved_definition));
+                continue;
+            }
+
+            if (!sameDomainIntentAfterHardwareBinding(
+                    existing->toExecutionDomainDefinition(),
+                    resolved_definition))
+            {
+                errors.push_back(
+                    "Resolved MoE overlay domain '" + resolved.name +
+                    "' conflicts with the canonical --define-domain hardware pool");
+                continue;
+            }
+            *existing = DomainDefinition::fromExecutionDomainDefinition(
+                resolved_definition);
+        }
+
+        if (!errors.empty())
+            return errors;
+
+        config.moe_routed_expert_plan = std::move(resolved_plan);
+        config.domain_definitions = std::move(installed_domains);
+
+        if (origin ==
+            MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP)
+        {
+            /*
+             * The installed named domain now contains the exact resolved
+             * participants, weights, scope, and collective backend. Retiring
+             * every simple-TP selector makes it the sole topology authority;
+             * subsequent planners cannot accidentally choose the preliminary
+             * representation or diagnose the internal translation as a user
+             * conflict.
+             */
+            config.tp_devices.clear();
+            config.tp_weights.clear();
+            config.tp_degree = 1;
+            config.tp_scope = TPScope::AUTO;
+        }
+        return errors;
+    }
+
     std::vector<std::string> validateMoERoutedExpertPlacementConfig(
         const OrchestrationConfig &config)
     {
@@ -696,27 +927,6 @@ namespace llaminar2
                                  " does not match continuation root rank " +
                                  std::to_string(continuation_owner) +
                                  "; current routed-placement root execution requires base and continuation placement on the same root rank");
-            }
-        }
-
-        for (const auto &tier : plan.routed_tiers)
-        {
-            if (tier.domain == plan.continuation_domain)
-                continue;
-
-            const auto *domain = domainByName(tier.domain);
-            if (!domain)
-                continue;
-
-            const bool remote_single_device =
-                domain->scope == ExecutionDomainScope::SINGLE &&
-                domain->owner_rank >= 0 &&
-                continuation_owner >= 0 &&
-                domain->owner_rank != continuation_owner;
-            if (remote_single_device)
-            {
-                errors.push_back("MoE routed-expert placement auxiliary domain '" + domain->name +
-                                 "' has no Phase 6 worker implementation for remote single-device replicated routed compute");
             }
         }
 
@@ -883,9 +1093,23 @@ namespace llaminar2
         {
             errors.push_back("MoE rebalance window growth factor must be > 0");
         }
+        if (moe_rebalance.migration_payoff_horizon_tokens == 0)
+        {
+            errors.push_back(
+                "MoE migration payoff horizon tokens must be > 0");
+        }
+        if (moe_rebalance.migration_max_cycles_per_wave == 0)
+        {
+            errors.push_back(
+                "MoE migration max cycles per wave must be > 0");
+        }
         if (moe_routed_prefill.assignment_window_tokens < 0)
         {
             errors.push_back("MoE routed-prefill assignment window tokens must be >= 0");
+        }
+        if (moe_routed_prefill.overlay_segment_rows <= 0)
+        {
+            errors.push_back("MoE overlay prefill segment rows must be > 0");
         }
         if (moe_routed_prefill.llep_alpha_numerator == 0)
         {
@@ -1104,6 +1328,8 @@ namespace llaminar2
         oss << "  moe:\n";
         oss << "    routed_expert_compute_policy: "
             << routedExpertComputePolicyToString(routed_expert_compute_policy) << "\n";
+        oss << "    routed_expert_owner_order: "
+            << routedExpertOwnerOrderToString(routed_expert_owner_order) << "\n";
         oss << "    residency_maintenance: "
             << moeRebalanceRuntimeModeToString(moe_rebalance.mode) << "\n";
         oss << "    hot_expert_cache: " << moe_hot_expert_cache.toString() << "\n";
@@ -1113,8 +1339,14 @@ namespace llaminar2
             << moe_rebalance.max_window_size << "\n";
         oss << "    residency_maintenance_window_growth: "
             << moe_rebalance.window_growth_factor << "\n";
+        oss << "    migration_payoff_horizon_tokens: "
+            << moe_rebalance.migration_payoff_horizon_tokens << "\n";
+        oss << "    migration_max_cycles_per_wave: "
+            << moe_rebalance.migration_max_cycles_per_wave << "\n";
         oss << "    routed_prefill_assignment_window_tokens: "
             << moe_routed_prefill.assignment_window_tokens << "\n";
+        oss << "    overlay_prefill_segment_rows: "
+            << moe_routed_prefill.overlay_segment_rows << "\n";
         oss << "    routed_prefill_least_loaded_min_routed_rows: "
             << moe_routed_prefill.least_loaded_min_routed_rows << "\n";
         oss << "    routed_prefill_llep_alpha: "
@@ -1147,8 +1379,10 @@ namespace llaminar2
             << moe_rebalance.device_min_load_spread_improvement_divisor << "\n";
         oss << "    device_min_wave_spread_improvement_per_payload_slot: "
             << moe_rebalance.device_min_wave_spread_improvement_per_payload_slot << "\n";
-        oss << "    device_min_foreign_rows_per_transfer: "
-            << moe_rebalance.device_min_foreign_rows_per_transfer << "\n";
+        oss << "    device_min_foreign_rows_per_critical_path_payload_slot: "
+            << moe_rebalance
+                   .device_min_foreign_rows_per_critical_path_payload_slot
+            << "\n";
         oss << "    device_min_router_spread_improvement_per_payload_slot: "
             << moe_rebalance.device_min_router_spread_improvement_per_payload_slot << "\n";
         oss << "    device_max_post_wave_load_spread_permille: "

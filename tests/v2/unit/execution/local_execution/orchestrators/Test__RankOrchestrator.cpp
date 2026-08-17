@@ -75,6 +75,26 @@ struct ChainedMTPRendezvous
     std::condition_variable cv;
 };
 
+/**
+ * @brief Shared observation of the rank-hosted MoE ticket protocol.
+ *
+ * Participant mocks run on the persistent LocalTP worker pool.  Atomics let
+ * the test prove that every observation finished before any participant was
+ * permitted to submit its captured maintenance or acknowledgement graph.
+ */
+struct DeviceMoETicketProtocolProbe
+{
+    explicit DeviceMoETicketProtocolProbe(uint32_t expected_participants_)
+        : expected_participants(expected_participants_)
+    {
+    }
+
+    uint32_t expected_participants = 0;
+    std::atomic<uint32_t> observations{0};
+    std::atomic<uint32_t> submissions{0};
+    std::atomic<bool> submission_preceded_full_observation{false};
+};
+
 std::string readSourceFileForRankOrchestratorTest(const std::string &path)
 {
     std::ifstream input(path);
@@ -241,7 +261,7 @@ public:
         return supports_device_resident_mtp_spec_state_publication_;
     }
 
-    bool usesMirroredLocalTPMTPHeadForVerifier() const override
+    bool usesMirroredMTPHeadForVerifier() const override
     {
         return uses_mirrored_localtp_mtp_head_for_verifier_;
     }
@@ -1849,6 +1869,76 @@ public:
         return out_handle->valid();
     }
 
+    DeviceMoERebalanceMaintenanceExecutionPolicy
+    deviceMoERebalanceMaintenanceExecutionPolicy()
+        const noexcept override
+    {
+        return device_moe_ticket_policy_;
+    }
+
+    DeviceMoERebalanceHostedObservationSchedule
+    deviceMoERebalanceHostedObservationSchedule()
+        const noexcept override
+    {
+        return device_moe_observation_schedule_;
+    }
+
+    bool submitHostScheduledDeviceMoERebalanceKnownNonDueBoundary()
+        override
+    {
+        device_moe_known_non_due_boundary_calls_.fetch_add(
+            1u,
+            std::memory_order_relaxed);
+        return device_moe_known_non_due_boundary_ok_;
+    }
+
+    bool observeDeviceMoERebalanceDispatchTicket(
+        DeviceMoERebalanceDispatchTicket *out_ticket) override
+    {
+        device_moe_ticket_observation_calls_.fetch_add(
+            1u,
+            std::memory_order_relaxed);
+        if (!out_ticket || !device_moe_ticket_observation_ok_)
+            return false;
+
+        *out_ticket = device_moe_dispatch_ticket_;
+        if (device_moe_ticket_protocol_probe_)
+        {
+            device_moe_ticket_protocol_probe_->observations.fetch_add(
+                1u,
+                std::memory_order_release);
+        }
+        return true;
+    }
+
+    bool submitHostScheduledDeviceMoERebalanceMaintenance(
+        const DeviceMoERebalanceDispatchTicket &ticket) override
+    {
+        device_moe_ticket_submission_calls_.fetch_add(
+            1u,
+            std::memory_order_relaxed);
+        last_submitted_device_moe_ticket_ = ticket;
+        if (device_moe_ticket_protocol_probe_)
+        {
+            /* Rank orchestration must complete and validate phase one for the
+             * whole LocalTP domain before phase two can launch a collective. */
+            if (device_moe_ticket_protocol_probe_->observations.load(
+                    std::memory_order_acquire) !=
+                device_moe_ticket_protocol_probe_->expected_participants)
+            {
+                device_moe_ticket_protocol_probe_
+                    ->submission_preceded_full_observation.store(
+                        true,
+                        std::memory_order_release);
+            }
+            device_moe_ticket_protocol_probe_->submissions.fetch_add(
+                1u,
+                std::memory_order_release);
+        }
+        return device_moe_ticket_submission_ok_ &&
+               ticket.hasSameDispatchDecision(device_moe_dispatch_ticket_);
+    }
+
     void clear_cache() override
     {
         clear_cache_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -2137,6 +2227,46 @@ public:
     void set_all_position_logits_ok(bool ok) { set_all_position_logits_ok_ = ok; }
     void set_mtp_unsupported_reason(std::string reason) { mtp_unsupported_reason_ = std::move(reason); }
     void set_primary_device_id(DeviceId device_id) { device_id_ = device_id; }
+    void set_device_moe_ticket_policy(
+        DeviceMoERebalanceMaintenanceExecutionPolicy policy)
+    {
+        device_moe_ticket_policy_ = policy;
+    }
+    void set_device_moe_dispatch_ticket(
+        DeviceMoERebalanceDispatchTicket ticket)
+    {
+        device_moe_dispatch_ticket_ = ticket;
+    }
+    void set_device_moe_observation_schedule(
+        DeviceMoERebalanceHostedObservationSchedule schedule)
+    {
+        device_moe_observation_schedule_ = schedule;
+    }
+    void set_device_moe_ticket_protocol_probe(
+        std::shared_ptr<DeviceMoETicketProtocolProbe> probe)
+    {
+        device_moe_ticket_protocol_probe_ = std::move(probe);
+    }
+    size_t device_moe_ticket_observation_call_count() const
+    {
+        return device_moe_ticket_observation_calls_.load(
+            std::memory_order_relaxed);
+    }
+    size_t device_moe_ticket_submission_call_count() const
+    {
+        return device_moe_ticket_submission_calls_.load(
+            std::memory_order_relaxed);
+    }
+    size_t device_moe_known_non_due_boundary_call_count() const
+    {
+        return device_moe_known_non_due_boundary_calls_.load(
+            std::memory_order_relaxed);
+    }
+    const DeviceMoERebalanceDispatchTicket &
+    last_submitted_device_moe_ticket() const
+    {
+        return last_submitted_device_moe_ticket_;
+    }
     void set_prefix_probe_position_override(int position)
     {
         prefix_probe_position_override_ = position;
@@ -2573,6 +2703,20 @@ private:
     std::shared_ptr<ChainedMTPRendezvous> chained_mtp_rendezvous_;
     PrefixLookupResult prefix_lookup_result_;
     DeviceId device_id_ = DeviceId::cpu();
+    DeviceMoERebalanceMaintenanceExecutionPolicy device_moe_ticket_policy_ =
+        DeviceMoERebalanceMaintenanceExecutionPolicy::Inactive;
+    DeviceMoERebalanceHostedObservationSchedule
+        device_moe_observation_schedule_{1u, 1u, 1u};
+    DeviceMoERebalanceDispatchTicket device_moe_dispatch_ticket_{};
+    DeviceMoERebalanceDispatchTicket last_submitted_device_moe_ticket_{};
+    std::shared_ptr<DeviceMoETicketProtocolProbe>
+        device_moe_ticket_protocol_probe_;
+    std::atomic<size_t> device_moe_ticket_observation_calls_{0};
+    std::atomic<size_t> device_moe_ticket_submission_calls_{0};
+    std::atomic<size_t> device_moe_known_non_due_boundary_calls_{0};
+    bool device_moe_ticket_observation_ok_ = true;
+    bool device_moe_ticket_submission_ok_ = true;
+    bool device_moe_known_non_due_boundary_ok_ = true;
     std::optional<int> prefix_probe_position_override_;
     bool prefix_populate_ok_ = true;
     bool prefix_harvest_ok_ = true;
@@ -3330,7 +3474,8 @@ static std::unique_ptr<MoERebalanceController> makeDomainController(
     cfg.top_k = 1;
     cfg.window_size = 4;
     cfg.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
-    cfg.initial_expert_to_socket = {0, 1};
+    cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+        1, 2, {0, 1});
     return std::make_unique<MoERebalanceController>(std::move(cfg));
 }
 
@@ -3358,6 +3503,241 @@ static RankOrchestrator::Config makeRankConfigForRunnerCount(int count)
     config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
     config.prefix_cache.block_size = 2;
     return config;
+}
+
+static DeviceMoERebalanceDispatchTicket makeDeviceMoEDispatchTicket(
+    uint32_t participant_id,
+    uint32_t participant_count,
+    uint32_t committed_rounds,
+    bool maintenance_due)
+{
+    DeviceMoERebalanceDispatchTicket ticket;
+    ticket.magic = DeviceMoERebalanceDispatchTicket::kMagic;
+    ticket.abi_version = DeviceMoERebalanceDispatchTicket::kABIVersion;
+    ticket.session_epoch_low = 7u;
+    ticket.workspace_generation_low = 13u;
+    ticket.participant_id = participant_id;
+    ticket.participant_count = participant_count;
+    ticket.healthy = 1u;
+    ticket.controller_version = moe_rebalance_abi::kVersion;
+    ticket.decode_rounds_committed = committed_rounds;
+    ticket.decode_rounds_until_maintenance = maintenance_due ? 0u : 3u;
+    ticket.maintenance_due = maintenance_due ? 1u : 0u;
+    ticket.decode_boundary_advanced = 1u;
+    return ticket;
+}
+
+TEST_F(
+    Test__RankOrchestrator,
+    HostScheduledDeviceMoEMaintenanceObservesEveryParticipantBeforeSubmission)
+{
+    for (const bool maintenance_due : {false, true})
+    {
+        SCOPED_TRACE(
+            maintenance_due ? "due maintenance graph"
+                            : "non-due acknowledgement graph");
+        auto probe = std::make_shared<DeviceMoETicketProtocolProbe>(2u);
+        std::vector<std::unique_ptr<IInferenceRunner>> runners;
+        std::array<MockDeviceGraphOrchestrator *, 2> runner_ptrs{};
+        for (uint32_t participant = 0; participant < 2u; ++participant)
+        {
+            auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
+            runner_ptrs[participant] = runner.get();
+            runner->set_primary_device_id(
+                DeviceId::rocm(static_cast<int>(participant)));
+            runner->set_device_moe_ticket_policy(
+                DeviceMoERebalanceMaintenanceExecutionPolicy::
+                    HostScheduledCapturedMaintenance);
+            runner->set_device_moe_dispatch_ticket(
+                makeDeviceMoEDispatchTicket(
+                    participant,
+                    2u,
+                    maintenance_due ? 64u : 1u,
+                    maintenance_due));
+            runner->set_device_moe_ticket_protocol_probe(probe);
+            runners.push_back(std::move(runner));
+        }
+
+        auto orchestrator = RankOrchestrator::createForTest(
+            llaminar2::test::MockModelContext::createMinimal(),
+            std::move(runners),
+            makeTPContextForRunnerCount(2),
+            makeRankConfigForRunnerCount(2));
+
+        ASSERT_EQ(
+            orchestrator->deviceMoERebalanceMaintenanceExecutionPolicy(),
+            DeviceMoERebalanceMaintenanceExecutionPolicy::
+                HostScheduledCapturedMaintenance);
+        ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
+        EXPECT_EQ(probe->observations.load(std::memory_order_acquire), 2u);
+        EXPECT_EQ(probe->submissions.load(std::memory_order_acquire), 2u);
+        EXPECT_FALSE(
+            probe->submission_preceded_full_observation.load(
+                std::memory_order_acquire));
+        for (uint32_t participant = 0; participant < 2u; ++participant)
+        {
+            ASSERT_NE(runner_ptrs[participant], nullptr);
+            EXPECT_EQ(
+                runner_ptrs[participant]
+                    ->device_moe_ticket_observation_call_count(),
+                1u);
+            EXPECT_EQ(
+                runner_ptrs[participant]
+                    ->device_moe_ticket_submission_call_count(),
+                1u);
+            EXPECT_EQ(
+                runner_ptrs[participant]
+                    ->last_submitted_device_moe_ticket()
+                    .participant_id,
+                participant);
+            EXPECT_EQ(
+                runner_ptrs[participant]
+                    ->last_submitted_device_moe_ticket()
+                    .maintenance_due,
+                maintenance_due ? 1u : 0u);
+        }
+    }
+}
+
+TEST_F(
+    Test__RankOrchestrator,
+    HostScheduledDeviceMoEMaintenanceRejectsDivergentTicketsBeforeSubmission)
+{
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    for (uint32_t participant = 0; participant < 2u; ++participant)
+    {
+        auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
+        runner->set_primary_device_id(
+            DeviceId::rocm(static_cast<int>(participant)));
+        runner->set_device_moe_ticket_policy(
+            DeviceMoERebalanceMaintenanceExecutionPolicy::
+                HostScheduledCapturedMaintenance);
+        runner->set_device_moe_dispatch_ticket(
+            makeDeviceMoEDispatchTicket(
+                participant,
+                2u,
+                participant == 0u ? 64u : 65u,
+                true));
+        runners.push_back(std::move(runner));
+    }
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_DEATH(
+        {
+            DeviceMoERebalanceDispatchTicket ticket;
+            (void)orchestrator->observeDeviceMoERebalanceDispatchTicket(
+                &ticket);
+        },
+        "divergent maintenance decisions");
+}
+
+TEST_F(
+    Test__RankOrchestrator,
+    HostScheduledDeviceMoECadenceElidesTicketsUntilMaintenanceCanBeDue)
+{
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    std::array<MockDeviceGraphOrchestrator *, 2> runner_ptrs{};
+    for (uint32_t participant = 0; participant < 2u; ++participant)
+    {
+        auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
+        runner_ptrs[participant] = runner.get();
+        runner->set_primary_device_id(
+            DeviceId::rocm(static_cast<int>(participant)));
+        runner->set_device_moe_ticket_policy(
+            DeviceMoERebalanceMaintenanceExecutionPolicy::
+                HostScheduledCapturedMaintenance);
+        runner->set_device_moe_observation_schedule({64u, 64u, 1u});
+        runner->set_device_moe_dispatch_ticket(
+            makeDeviceMoEDispatchTicket(
+                participant,
+                2u,
+                64u,
+                true));
+        runners.push_back(std::move(runner));
+    }
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    for (uint32_t boundary = 1u; boundary < 64u; ++boundary)
+        ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
+    for (const auto *runner : runner_ptrs)
+    {
+        ASSERT_NE(runner, nullptr);
+        EXPECT_EQ(
+            runner->device_moe_known_non_due_boundary_call_count(),
+            63u);
+        EXPECT_EQ(runner->device_moe_ticket_observation_call_count(), 0u);
+        EXPECT_EQ(runner->device_moe_ticket_submission_call_count(), 0u);
+    }
+
+    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
+    for (const auto *runner : runner_ptrs)
+    {
+        EXPECT_EQ(
+            runner->device_moe_known_non_due_boundary_call_count(),
+            63u);
+        EXPECT_EQ(runner->device_moe_ticket_observation_call_count(), 1u);
+        EXPECT_EQ(runner->device_moe_ticket_submission_call_count(), 1u);
+    }
+}
+
+TEST_F(
+    Test__RankOrchestrator,
+    HostScheduledDeviceMoEMTPCadenceUsesMaximumCommitBoundAndTicketRemaining)
+{
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    std::array<MockDeviceGraphOrchestrator *, 2> runner_ptrs{};
+    for (uint32_t participant = 0; participant < 2u; ++participant)
+    {
+        auto runner = std::make_unique<MockDeviceGraphOrchestrator>();
+        runner_ptrs[participant] = runner.get();
+        runner->set_primary_device_id(
+            DeviceId::rocm(static_cast<int>(participant)));
+        runner->set_device_moe_ticket_policy(
+            DeviceMoERebalanceMaintenanceExecutionPolicy::
+                HostScheduledCapturedMaintenance);
+        /* Two depth-3 MTP transactions can commit at most eight rounds. */
+        runner->set_device_moe_observation_schedule({8u, 8u, 4u});
+        runner->set_device_moe_dispatch_ticket(
+            makeDeviceMoEDispatchTicket(
+                participant,
+                2u,
+                5u,
+                false));
+        runners.push_back(std::move(runner));
+    }
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
+    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
+    for (const auto *runner : runner_ptrs)
+    {
+        ASSERT_NE(runner, nullptr);
+        EXPECT_EQ(
+            runner->device_moe_known_non_due_boundary_call_count(),
+            1u);
+        EXPECT_EQ(runner->device_moe_ticket_observation_call_count(), 1u);
+    }
+
+    /* The authenticated non-due ticket reports only three rounds remaining,
+     * so ceil(3 / 4) requires another observation on the very next boundary. */
+    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
+    for (const auto *runner : runner_ptrs)
+        EXPECT_EQ(runner->device_moe_ticket_observation_call_count(), 2u);
 }
 
 static MTPSpecStepPlan makeMTPSpecPublicationPlan(
@@ -3749,6 +4129,60 @@ TEST_F(Test__RankOrchestrator, ForwardTPWorkerJoinWaitsForSlowForward)
            "not a wall-clock worker-join timeout for arbitrary host-side work.";
 }
 
+/**
+ * @brief A TP rank nested in a non-terminal PP stage never gathers logits.
+ *
+ * Both child graphs expose mock local-logits storage so an untyped TP forward
+ * would gather it. The nested PP stage contract owns hidden activations only;
+ * therefore a successful forward must leave every local-logits consumer
+ * untouched and reject direct host logits observation. This is the focused
+ * regression for heterogeneous HybridPP+TP stage zero attempting D2H logits
+ * observation after its production graph had correctly omitted LM_HEAD.
+ */
+TEST_F(Test__RankOrchestrator, NestedNonHeadTPStageDoesNotGatherOrExposeLogits)
+{
+    MockDeviceGraphOrchestrator::Config child_config;
+    child_config.vocab_size = 4;
+
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>(child_config);
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_mock_logits_local(/*local_vocab=*/2, {1.0f, 2.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>(child_config);
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_mock_logits_local(/*local_vocab=*/2, {3.0f, 4.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto config = makeRankConfigForRunnerCount(2);
+    FactoryPPStageConfig stage;
+    stage.first_layer = 0;
+    stage.last_layer = 1;
+    stage.has_embedding = true;
+    stage.has_lm_head = false;
+    config.nested_pp_stage_config = stage;
+
+    auto model_ctx = llaminar2::test::MockModelContextBuilder()
+                         .usePreset(llaminar2::test::ModelPreset::MINIMAL)
+                         .setVocabSize(4)
+                         .build();
+    auto orchestrator = RankOrchestrator::createForTest(
+        std::move(model_ctx),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        config);
+
+    const int32_t token = 17;
+    ASSERT_TRUE(orchestrator->forward(&token, 1));
+    EXPECT_EQ(runner0_ptr->get_logits_local_info_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->get_logits_local_info_call_count(), 0u);
+    EXPECT_EQ(runner0_ptr->consume_logits_local_info_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->consume_logits_local_info_call_count(), 0u);
+    EXPECT_THROW(static_cast<void>(orchestrator->logits()), std::logic_error);
+}
+
 TEST_F(Test__RankOrchestrator, ClearCacheClearsAllDevices)
 {
     // Simulate RankOrchestrator::clear_cache
@@ -4082,7 +4516,7 @@ TEST_F(Test__RankOrchestrator, GpuDynamicMoERebalanceRefreshesStableGraphTables)
     const auto epoch_fn_pos =
         dgo_source.find("uint64_t DeviceGraphOrchestrator::moePlacementEpoch() const");
     const auto gpu_stable_guard_pos =
-        dgo_source.find("usesGraphStableGpuMoERebalance()", epoch_fn_pos);
+        dgo_source.find("usesGraphStableMoEOverlayResidency()", epoch_fn_pos);
     const auto gpu_stable_return_pos =
         dgo_source.find("return 0;", gpu_stable_guard_pos);
     const auto mask_epoch_pos =
@@ -4096,20 +4530,27 @@ TEST_F(Test__RankOrchestrator, GpuDynamicMoERebalanceRefreshesStableGraphTables)
         << "GPU dynamic MoE must bypass placement epochs before graph-cache signature materialization";
 
     const auto stable_predicate_pos =
-        dgo_source.find("bool DeviceGraphOrchestrator::usesGraphStableGpuMoERebalance() const");
+        dgo_source.find("bool DeviceGraphOrchestrator::usesGraphStableMoEOverlayResidency() const");
     ASSERT_NE(stable_predicate_pos, std::string::npos);
     const auto stable_predicate_end =
         dgo_source.find("uint64_t DeviceGraphOrchestrator::moePlacementEpoch() const", stable_predicate_pos);
     ASSERT_NE(stable_predicate_end, std::string::npos);
     const std::string stable_predicate_body =
         dgo_source.substr(stable_predicate_pos, stable_predicate_end - stable_predicate_pos);
-    EXPECT_NE(stable_predicate_body.find("ExecutionDomainScope::LOCAL"), std::string::npos);
-    EXPECT_NE(stable_predicate_body.find("domain.usesParticipantAssignedPrefill()"), std::string::npos)
-        << "Graph-stable dynamic MoE must follow the routed domain's typed "
-           "participant-assigned prefill policy rather than a retired enum name.";
-    EXPECT_NE(stable_predicate_body.find("domain.participants.size() < 2"), std::string::npos);
-    EXPECT_NE(stable_predicate_body.find("participant.isGPU()"), std::string::npos);
-    EXPECT_NE(stable_predicate_body.find("participant.device_type != participant_type"), std::string::npos);
+    EXPECT_NE(
+        stable_predicate_body.find(
+            "usesExpertOverlayDurableResidencyAuthority()"),
+        std::string::npos);
+    EXPECT_NE(
+        stable_predicate_body.find(
+            "MoEOverlayAuthorityExecutionKind::Unresolved"),
+        std::string::npos)
+        << "Graph stability must follow the topology-frozen ExpertOverlay "
+           "authority contract, not reconstruct device topology in the runner.";
+    EXPECT_EQ(stable_predicate_body.find("resolveCap("), std::string::npos);
+    EXPECT_EQ(
+        stable_predicate_body.find("debugEnv()"),
+        std::string::npos);
 
     const auto prepare_direct_pos =
         dgo_source.find("DeviceGraphOrchestrator::prepareExpertWeightsDirectForMasksFrom");
@@ -4251,7 +4692,7 @@ TEST_F(Test__RankOrchestrator, GpuDynamicMoERebalanceRefreshesStableGraphTables)
         << "Replica publication must bind an explicit stream before refreshing GPU placement tables";
 }
 
-TEST_F(Test__RankOrchestrator, LocalTPMoERebalanceDoesNotUseHostWorkerForGpuTransferStaging)
+TEST_F(Test__RankOrchestrator, TopLevelRunnerCannotPublishLegacyMoEPlacement)
 {
     const std::string runner_source =
         readSourceFileForRankOrchestratorTest(
@@ -4260,30 +4701,29 @@ TEST_F(Test__RankOrchestrator, LocalTPMoERebalanceDoesNotUseHostWorkerForGpuTran
 
     ASSERT_EQ(runner_source.find("std::async("), std::string::npos)
         << "GPU transfer staging must not call CUDA/HIP from a separate host worker while graphs/collectives replay";
-    ASSERT_NE(runner_source.find("pending_moe_rebalance_prepare_"), std::string::npos)
-        << "LocalTP GPU transfer staging should use a first-class delayed publish state, not a host worker";
-    ASSERT_NE(runner_source.find("publishPendingMoERebalanceUpdate"), std::string::npos)
-        << "delayed LocalTP MoE publishes need an explicit runner-owned drain point";
+    for (const char *retired_writer : {
+             "pending_moe_rebalance_prepare_",
+             "publishPendingMoERebalanceUpdate",
+             "applyMoERebalanceWithReplicas",
+             "applyMoEExpertMasksForAllLocalDevices",
+             "setExpertReplicaSet(",
+         })
+    {
+        EXPECT_EQ(runner_source.find(retired_writer), std::string::npos)
+            << retired_writer
+            << " would reintroduce a durable writer beside ExpertOverlay";
+    }
+    EXPECT_NE(
+        runner_source.find("moe_expert_overlay_maintenance_service_"),
+        std::string::npos);
 }
 
-TEST_F(Test__RankOrchestrator, ClearCacheDrainsPendingMoERebalanceBeforeDroppingTransfers)
+TEST_F(Test__RankOrchestrator, RequestResetCannotPublishOrDiscardExpertPlacement)
 {
     const std::string runner_source =
         readSourceFileForRankOrchestratorTest(
             "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
     ASSERT_FALSE(runner_source.empty());
-
-    auto count_occurrences = [](const std::string &haystack, const std::string &needle)
-    {
-        size_t count = 0;
-        size_t pos = 0;
-        while ((pos = haystack.find(needle, pos)) != std::string::npos)
-        {
-            ++count;
-            pos += needle.size();
-        }
-        return count;
-    };
 
     const auto clear_pos = runner_source.find("void OrchestrationRunner::clearCache()");
     ASSERT_NE(clear_pos, std::string::npos);
@@ -4292,51 +4732,43 @@ TEST_F(Test__RankOrchestrator, ClearCacheDrainsPendingMoERebalanceBeforeDropping
     const std::string clear_body = runner_source.substr(clear_pos, clear_end - clear_pos);
 
     const auto request_reset_pos =
-        clear_body.find("clearUnderlyingRunnerCacheAfterMoEPublish(\"request-clear-cache\")");
+        clear_body.find("resetUnderlyingRunnerRequestState(\"request-clear-cache\")");
     ASSERT_NE(request_reset_pos, std::string::npos)
-        << "request/session cache reset must publish prepared MoE rebalances before resetting runtime state";
-    EXPECT_EQ(clear_body.find("pending_moe_rebalance_prepare_.reset()"), std::string::npos)
-        << "clearCache() must never silently erase a prepared MoE publish";
+        << "request/session reset must use the typed request-state helper";
     EXPECT_EQ(clear_body.find("runner_->clear_cache()"), std::string::npos)
-        << "clearCache() must go through the MoE-publish-aware reset helper";
+        << "request reset must use the explicit reset contract";
 
-    const auto drain_fn = runner_source.find("void OrchestrationRunner::drainPendingMoERebalanceBeforeCacheClear()");
-    ASSERT_NE(drain_fn, std::string::npos);
-    const auto helper_fn =
-        runner_source.find("void OrchestrationRunner::clearUnderlyingRunnerCacheAfterMoEPublish", drain_fn);
+    const auto helper_fn = runner_source.find(
+        "void OrchestrationRunner::resetUnderlyingRunnerRequestState");
     ASSERT_NE(helper_fn, std::string::npos);
-    const std::string drain_body = runner_source.substr(drain_fn, helper_fn - drain_fn);
-    EXPECT_NE(drain_body.find("publishPendingMoERebalanceUpdate()"), std::string::npos);
-    EXPECT_NE(drain_body.find("throw std::runtime_error"), std::string::npos)
-        << "failed cache-boundary drains must fail fast instead of falling through";
-
-    const auto apply_fn = runner_source.find("bool OrchestrationRunner::applyMoERebalanceWithReplicas", helper_fn);
-    ASSERT_NE(apply_fn, std::string::npos);
-    const std::string helper_body = runner_source.substr(helper_fn, apply_fn - helper_fn);
-    const auto helper_drain_pos = helper_body.find("drainPendingMoERebalanceBeforeCacheClear()");
-    const auto clear_transfers_pos = helper_body.find("clearPendingGpuDirectExpertTransfersForAllDevices()");
+    const auto helper_end = runner_source.find(
+        "bool OrchestrationRunner::publishMoEOverlayCollectiveRequestGeneration",
+        helper_fn);
+    ASSERT_NE(helper_end, std::string::npos);
+    const std::string helper_body =
+        runner_source.substr(helper_fn, helper_end - helper_fn);
     const auto runner_reset_pos = helper_body.find("runner_->resetInferenceState(");
-    ASSERT_NE(helper_drain_pos, std::string::npos);
-    ASSERT_NE(clear_transfers_pos, std::string::npos);
     ASSERT_NE(runner_reset_pos, std::string::npos);
-    EXPECT_LT(helper_drain_pos, clear_transfers_pos)
-        << "shared cache reset must not discard staged GPU-direct transfers before the pending publish drains";
-    EXPECT_LT(helper_drain_pos, runner_reset_pos)
-        << "shared cache reset must not reset graph/cache state before the pending MoE publish applies masks";
-
-    EXPECT_EQ(count_occurrences(runner_source, "runner_->clear_cache()"), 0u)
-        << "OrchestrationRunner cache resets must not use the old clear_cache() junk drawer; "
-           "they must funnel through clearUnderlyingRunnerCacheAfterMoEPublish() and resetInferenceState().";
+    for (const char *forbidden_mutation : {
+             "publishPendingMoERebalance",
+             "applyMoEExpertMasks",
+             "clearPendingGpuDirectExpertTransfers",
+             "setExpertReplicaSet",
+         })
+    {
+        EXPECT_EQ(helper_body.find(forbidden_mutation), std::string::npos)
+            << forbidden_mutation;
+    }
     for (const char *reason : {
              "shutdown",
              "prefix-cache-initial-reset",
              "request-clear-cache",
          })
     {
-        EXPECT_NE(runner_source.find(std::string("clearUnderlyingRunnerCacheAfterMoEPublish(\"") +
+        EXPECT_NE(runner_source.find(std::string("resetUnderlyingRunnerRequestState(\"") +
                                      reason + "\")"),
                   std::string::npos)
-            << "Missing MoE-publish-aware cache reset reason " << reason;
+            << "Missing typed request reset reason " << reason;
     }
 }
 
@@ -4384,7 +4816,7 @@ TEST_F(Test__RankOrchestrator, ShutdownSynchronizesAllRankDevicesBeforeRelease)
         << "rank-level synchronization must drain child runner device streams, not only collectives";
 }
 
-TEST_F(Test__RankOrchestrator, DeviceSideMoERebalanceSkipsHostRuntimeHistogramBridge)
+TEST_F(Test__RankOrchestrator, DeviceResidentExpertOverlaySkipsHostRuntimeHistogramBridge)
 {
     const std::string source =
         readSourceFileForRankOrchestratorTest(
@@ -4394,18 +4826,21 @@ TEST_F(Test__RankOrchestrator, DeviceSideMoERebalanceSkipsHostRuntimeHistogramBr
     const auto wire_pos = source.find("void RankOrchestrator::wireLocalTPMoERuntimeHistogramSyncs()");
     ASSERT_NE(wire_pos, std::string::npos);
     const auto device_side_gate_pos =
-        source.find("usesDeviceSideMoERebalanceController()", wire_pos);
+        source.find("moeOverlayAuthorityExecution()", wire_pos);
     const auto register_pos =
         source.find("active_histogram->registerRuntimeHistogramSync", wire_pos);
     ASSERT_NE(device_side_gate_pos, std::string::npos)
-        << "Device-side graph rebalance gathers histograms on-device and must not wire host sync callbacks.";
+        << "Device-resident ExpertOverlay gathers histograms on-device and must not wire host sync callbacks.";
     ASSERT_NE(register_pos, std::string::npos);
     EXPECT_LT(device_side_gate_pos, register_pos)
         << "The host runtime histogram bridge must be bypassed before callback registration in device-side mode.";
-    EXPECT_NE(source.find("device-side graph rebalance owns histogram allgather"), std::string::npos);
+    EXPECT_NE(
+        source.find(
+            "device-resident ExpertOverlay authority owns histogram allgather"),
+        std::string::npos);
 }
 
-TEST_F(Test__RankOrchestrator, LocalTPMoERebalancePublishesPendingUpdateBeforeNewProposal)
+TEST_F(Test__RankOrchestrator, ProductionDecodeBoundaryCannotEnterLegacyLocalTPPublisher)
 {
     const std::string runner_source =
         readSourceFileForRankOrchestratorTest(
@@ -4413,74 +4848,48 @@ TEST_F(Test__RankOrchestrator, LocalTPMoERebalancePublishesPendingUpdateBeforeNe
     ASSERT_FALSE(runner_source.empty());
 
     const auto maybe_pos = runner_source.find("bool OrchestrationRunner::maybeApplyMoERebalance()");
-    const auto publish_pos = runner_source.find("publishPendingMoERebalanceUpdate()", maybe_pos);
-    const auto controller_pos = runner_source.find("auto *controller = moeRebalanceController()", maybe_pos);
-    const auto device_side_gate_pos = runner_source.find("usesDeviceSideMoERebalanceController()", maybe_pos);
-    const auto decision_pos = runner_source.find("controller->rebalanceDecision()", maybe_pos);
-    const auto delayed_prepare_pos = runner_source.find("local_tp_delayed_publish");
-    const auto mpi_guard_pos = runner_source.find("local_tp_runner && !mpi_coordinated_world", delayed_prepare_pos);
-    const auto prepare_pos = runner_source.find("prepareMoEExpertMaskTransfersForAllDevices", delayed_prepare_pos);
-    const auto pre_forward_helper_pos =
-        runner_source.find("bool OrchestrationRunner::publishPendingMoERebalanceBeforeForward");
-    const auto helper_publish_pos =
-        runner_source.find("publishPendingMoERebalanceUpdate()", pre_forward_helper_pos);
-
     ASSERT_NE(maybe_pos, std::string::npos);
-    ASSERT_NE(publish_pos, std::string::npos)
-        << "a pending host async rebalance must be published after one compute interval";
-    ASSERT_NE(controller_pos, std::string::npos);
-    ASSERT_NE(device_side_gate_pos, std::string::npos)
-        << "device-side graph rebalance must bypass host delayed-publish maintenance";
-    ASSERT_NE(decision_pos, std::string::npos);
-    ASSERT_NE(delayed_prepare_pos, std::string::npos);
-    ASSERT_NE(mpi_guard_pos, std::string::npos)
-        << "delayed publish is currently safe only for single-process LocalTP domains";
-    ASSERT_NE(prepare_pos, std::string::npos)
-        << "LocalTP delayed publish must prepare transfer slots without publishing masks immediately";
-    ASSERT_NE(pre_forward_helper_pos, std::string::npos);
-    ASSERT_NE(helper_publish_pos, std::string::npos)
-        << "A prepared LocalTP publish must be drained before the next collective-bearing forward.";
-    EXPECT_LT(device_side_gate_pos, publish_pos)
-        << "device-side graph rebalance must not drain a host-prepared publish first";
-    EXPECT_LT(publish_pos, decision_pos);
+    const auto maybe_end = runner_source.find(
+        "// =========================================================================",
+        maybe_pos);
+    ASSERT_NE(maybe_end, std::string::npos);
+    const std::string maybe_body =
+        runner_source.substr(maybe_pos, maybe_end - maybe_pos);
+    EXPECT_NE(maybe_body.find("moe_expert_overlay_maintenance_service_"),
+              std::string::npos);
+    EXPECT_NE(maybe_body.find("notifyMaintenanceProgress()"),
+              std::string::npos);
+    for (const char *retired_entry : {
+             "publishPendingMoERebalanceUpdate()",
+             "moeRebalanceController()",
+             "usesDeviceSideMoERebalanceController()",
+             "controller->rebalanceDecision()",
+             "applyMoERebalanceWithReplicas()",
+         })
+    {
+        EXPECT_EQ(maybe_body.find(retired_entry), std::string::npos)
+            << retired_entry;
+    }
 
     const auto decode_pos = runner_source.find("GenerationResult OrchestrationRunner::decodeStep()");
-    const auto decode_helper_pos =
-        runner_source.find("publishPendingMoERebalanceBeforeForward(\"decode_step\")", decode_pos);
     const auto decode_forward_pos = runner_source.find("runner_->forward(&last_token_, 1)", decode_pos);
     ASSERT_NE(decode_pos, std::string::npos);
-    ASSERT_NE(decode_helper_pos, std::string::npos);
     ASSERT_NE(decode_forward_pos, std::string::npos);
-    EXPECT_LT(decode_helper_pos, decode_forward_pos)
-        << "Pending LocalTP rebalance publishes must be applied symmetrically before decode launches TP collectives.";
+    EXPECT_EQ(
+        runner_source.find(
+            "publishPendingMoERebalanceBeforeForward(\"decode_step\")",
+            decode_pos),
+        std::string::npos);
 
     const auto force_pos = runner_source.find("GenerationResult OrchestrationRunner::forceDecodeToken");
-    const auto force_helper_pos =
-        runner_source.find("publishPendingMoERebalanceBeforeForward(\"force_decode_token\")", force_pos);
     const auto force_forward_pos = runner_source.find("runner_->forward(&last_token_, 1)", force_pos);
     ASSERT_NE(force_pos, std::string::npos);
-    ASSERT_NE(force_helper_pos, std::string::npos);
     ASSERT_NE(force_forward_pos, std::string::npos);
-    EXPECT_LT(force_helper_pos, force_forward_pos)
-        << "Forced-token decode also advances TP collectives and must drain prepared publishes first.";
-}
-
-TEST_F(Test__RankOrchestrator, HotReplicaStrategyDoesNotFallbackToOwnershipSwaps)
-{
-    const std::string runner_source =
-        readSourceFileForRankOrchestratorTest(
-            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
-    ASSERT_FALSE(runner_source.empty());
-
-    const auto strategy_pos = runner_source.find("const bool hot_replica_strategy = max_replicas > 0");
-    const auto stable_log_pos = runner_source.find("No beneficial hot expert replicas; keeping base expert ownership stable");
-    const auto ownership_guard_pos = runner_source.find("if (!controller->hasReplicas() && !hot_replica_strategy)");
-    ASSERT_NE(strategy_pos, std::string::npos)
-        << "hot-expert cache mode must be represented as an explicit rebalance strategy";
-    ASSERT_NE(stable_log_pos, std::string::npos)
-        << "empty low-benefit replica proposals should keep base ownership stable";
-    ASSERT_NE(ownership_guard_pos, std::string::npos)
-        << "ownership swaps should run only when hot-replica strategy is disabled";
+    EXPECT_EQ(
+        runner_source.find(
+            "publishPendingMoERebalanceBeforeForward(\"force_decode_token\")",
+            force_pos),
+        std::string::npos);
 }
 
 TEST_F(Test__RankOrchestrator, PreparedMoEExpertMaskUpdateSnapshotsMasksForDelayedPublish)
@@ -4587,15 +4996,24 @@ TEST_F(Test__RankOrchestrator, ReplicaArrivalTransferMasksCopyOnlyToNonOwners)
         DeviceId(DeviceType::CPU, 0),
         DeviceId(DeviceType::CPU, 1),
         DeviceId(DeviceType::CPU, 2)};
-    cfg.initial_expert_to_socket = {0, 1, 0, 2};
+    cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+        2, 3, {0, 1, 0, 2});
     MoERebalanceController controller(std::move(cfg));
 
     ExpertReplicaSet arrivals;
     arrivals.domain_id = "gpu";
-    arrivals.is_replicated = {false, true, true, false};
-    arrivals.owner_socket = {0, 1, 0, 2};
-    arrivals.num_replicated = 2;
-    arrivals.num_sockets = 3;
+    arrivals.base_ownership = controller.currentOwnership();
+    arrivals.replica_participants_by_layer.assign(
+        2,
+        std::vector<std::vector<bool>>(4, std::vector<bool>(3, false)));
+    for (int layer = 0; layer < 2; ++layer)
+    {
+        arrivals.setReplicaOnParticipant(layer, 1, 0);
+        arrivals.setReplicaOnParticipant(layer, 1, 2);
+        arrivals.setReplicaOnParticipant(layer, 2, 1);
+        arrivals.setReplicaOnParticipant(layer, 2, 2);
+    }
+    arrivals.rebuildAggregateReplicaFlags();
 
     auto masks = rank_orchestrator_detail::buildReplicaArrivalTransferMasks(controller, arrivals);
     ASSERT_EQ(masks.size(), 3u);
@@ -4640,14 +5058,13 @@ TEST_F(Test__RankOrchestrator, ReplicaArrivalTransferMasksUseLayerParticipantRes
         DeviceId(DeviceType::CPU, 0),
         DeviceId(DeviceType::CPU, 1),
         DeviceId(DeviceType::CPU, 2)};
-    cfg.initial_expert_to_socket = {0, 1, 2, 0};
+    cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+        3, 3, {0, 1, 2, 0});
     MoERebalanceController controller(std::move(cfg));
 
     ExpertReplicaSet arrivals;
     arrivals.domain_id = "gpu";
-    arrivals.owner_socket = {0, 1, 2, 0};
-    arrivals.num_sockets = 3;
-    arrivals.is_replicated.assign(4, false);
+    arrivals.base_ownership = controller.currentOwnership();
     arrivals.replica_participants_by_layer.assign(
         3,
         std::vector<std::vector<bool>>(4, std::vector<bool>(3, false)));
@@ -4691,15 +5108,17 @@ TEST_F(Test__RankOrchestrator, EmptyReplicaArrivalTransferMasksSuppressCopies)
     cfg.top_k = 1;
     cfg.window_size = 4;
     cfg.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
-    cfg.initial_expert_to_socket = {0, 1};
+    cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+        2, 2, {0, 1});
     MoERebalanceController controller(std::move(cfg));
 
     ExpertReplicaSet arrivals;
     arrivals.domain_id = "gpu";
-    arrivals.is_replicated = {false, false};
-    arrivals.owner_socket = {0, 1};
-    arrivals.num_replicated = 0;
-    arrivals.num_sockets = 2;
+    arrivals.base_ownership = controller.currentOwnership();
+    arrivals.replica_participants_by_layer.assign(
+        2,
+        std::vector<std::vector<bool>>(2, std::vector<bool>(2, false)));
+    arrivals.rebuildAggregateReplicaFlags();
 
     const auto full_mask0 = controller.computeExpertMasksForParticipant(0);
     ASSERT_EQ(full_mask0.size(), 2u);
@@ -4736,13 +5155,19 @@ TEST_F(Test__RankOrchestrator, OwnershipArrivalTransferMasksCopyOnlyNewOwners)
         DeviceId(DeviceType::CPU, 0),
         DeviceId(DeviceType::CPU, 1),
         DeviceId(DeviceType::CPU, 2)};
-    cfg.initial_expert_to_socket = {1, 1, 0, 2};
+    cfg.initial_ownership = MoELayeredExpertOwnership(
+        3,
+        {
+            {0, 1, 2, 0},
+            {1, 1, 0, 2},
+        });
     MoERebalanceController controller(std::move(cfg));
 
-    const std::vector<int> previous_placement = {0, 1, 2, 0};
+    const auto previous_ownership = MoELayeredExpertOwnership::uniform(
+        2, 3, {0, 1, 2, 0});
     auto masks = rank_orchestrator_detail::buildOwnershipArrivalTransferMasks(
         controller,
-        previous_placement);
+        previous_ownership);
 
     ASSERT_EQ(masks.size(), 3u);
     for (const auto &participant_masks : masks)
@@ -4752,7 +5177,16 @@ TEST_F(Test__RankOrchestrator, OwnershipArrivalTransferMasksCopyOnlyNewOwners)
             ASSERT_EQ(layer_mask.size(), 4u);
     }
 
-    for (int layer = 0; layer < 2; ++layer)
+    for (int participant = 0; participant < 3; ++participant)
+    {
+        for (int expert = 0; expert < 4; ++expert)
+        {
+            EXPECT_FALSE(masks[participant][0][expert])
+                << "unchanged layer zero must not receive expert " << expert;
+        }
+    }
+
+    const int layer = 1;
     {
         EXPECT_TRUE(masks[1][layer][0])
             << "expert 0 moved from participant 0 to participant 1";
@@ -4796,14 +5230,16 @@ TEST_F(Test__RankOrchestrator, OwnershipArrivalSnapshotKeepsTransferMaskSeparate
     cfg.top_k = 1;
     cfg.window_size = 4;
     cfg.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
-    cfg.initial_expert_to_socket = {0, 0, 1, 1};
+    cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+        1, 2, {0, 0, 1, 1});
     MoERebalanceController controller(std::move(cfg));
 
-    const std::vector<int> previous_placement = {0, 1, 1, 0};
+    const auto previous_ownership = MoELayeredExpertOwnership::uniform(
+        1, 2, {0, 1, 1, 0});
     auto snapshot = orchestrator->snapshotMoEExpertMasksForAllDevices(
         controller,
         nullptr,
-        &previous_placement);
+        &previous_ownership);
 
     ASSERT_EQ(snapshot.masks_by_participant.size(), 2u);
     ASSERT_EQ(snapshot.masks_by_participant[0].size(), 1u);
@@ -6229,7 +6665,7 @@ TEST_F(Test__RankOrchestrator,
 
     ASSERT_TRUE(orchestrator->supportsGreedyAllPositionBatchOutcomeOnDevice());
     ASSERT_TRUE(orchestrator->supportsDeviceResidentMTPSpecStatePublication());
-    ASSERT_TRUE(orchestrator->usesMirroredLocalTPMTPHeadForVerifier());
+    ASSERT_TRUE(orchestrator->usesMirroredMTPHeadForVerifier());
 
     const std::array<int32_t, 2> draft_tokens = {10, 4};
     DeviceSpeculativeOutcomeHandle handle;
@@ -6575,7 +7011,7 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredStochasticOutcomePublishesEveryPar
         << "Mirrored LocalTP stochastic support requires every child to expose "
            "full-vocab resident stochastic verification.";
     ASSERT_TRUE(orchestrator->supportsDeviceResidentMTPSpecStatePublication());
-    ASSERT_TRUE(orchestrator->usesMirroredLocalTPMTPHeadForVerifier());
+    ASSERT_TRUE(orchestrator->usesMirroredMTPHeadForVerifier());
     ASSERT_TRUE(orchestrator->supportsMTPSidecarLogitsStreamHandoff());
     ASSERT_TRUE(orchestrator->supportsMTPDeviceDraftTokenInput());
 
@@ -6801,7 +7237,7 @@ TEST_F(Test__RankOrchestrator, LocalTPMirroredDeferredStochasticDraftSamplesEver
         makeRankConfigForRunnerCount(2));
 
     ASSERT_TRUE(orchestrator->supportsDeviceStochasticMTPVerification());
-    ASSERT_TRUE(orchestrator->usesMirroredLocalTPMTPHeadForVerifier());
+    ASSERT_TRUE(orchestrator->usesMirroredMTPHeadForVerifier());
     ASSERT_TRUE(orchestrator->supportsMTPDeviceDraftTokenInput());
 
     SamplingParams params;
@@ -8514,6 +8950,134 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ColumnParallel_ProportionalWeights)
     EXPECT_FLOAT_EQ(snapshot.combined_data[total_cols - 1], 2.0f); // Last col from dev1
 }
 
+TEST_F(Test__RankOrchestrator, TPSnapshot_PackedColumnParallel_ReassemblesSemanticGroups)
+{
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_QKV_PROJECTION";
+    snapshot.mode = SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+    snapshot.tp_degree = 2;
+    snapshot.column_groups = {
+        SnapshotColumnGroup{
+            .name = "Q",
+            .global_cols = 2,
+            .mode = SnapshotColumnGroupMode::PARTITIONED,
+            .participant_cols = {1, 1}},
+        SnapshotColumnGroup{
+            .name = "K",
+            .global_cols = 2,
+            .mode = SnapshotColumnGroupMode::PARTITIONED,
+            .participant_cols = {1, 1}},
+        SnapshotColumnGroup{
+            .name = "V",
+            .global_cols = 4,
+            .mode = SnapshotColumnGroupMode::PARTITIONED,
+            .participant_cols = {2, 2}},
+    };
+
+    DeviceSnapshotData device0;
+    device0.device_index = 0;
+    device0.rows = 2;
+    device0.cols = 4;
+    device0.data = {
+        10.0f, 20.0f, 30.0f, 31.0f,
+        110.0f, 120.0f, 130.0f, 131.0f};
+
+    DeviceSnapshotData device1;
+    device1.device_index = 1;
+    device1.rows = 2;
+    device1.cols = 4;
+    device1.data = {
+        11.0f, 21.0f, 32.0f, 33.0f,
+        111.0f, 121.0f, 132.0f, 133.0f};
+
+    // Deliberately publish in reverse vector order. The typed TP index, not
+    // incidental collection order, owns the production concatenation order.
+    snapshot.device_data = {device1, device0};
+
+    ASSERT_TRUE(snapshot.computeCombined());
+    EXPECT_EQ(snapshot.combined_rows, 2u);
+    EXPECT_EQ(snapshot.combined_cols, 8u);
+    EXPECT_EQ(
+        snapshot.combined_data,
+        (std::vector<float>{
+            10.0f, 11.0f, 20.0f, 21.0f, 30.0f, 31.0f, 32.0f, 33.0f,
+            110.0f, 111.0f, 120.0f, 121.0f, 130.0f, 131.0f, 132.0f, 133.0f}));
+}
+
+TEST_F(Test__RankOrchestrator, TPSnapshot_PackedColumnParallel_VerifiesReplicatedGroups)
+{
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_QKV_PROJECTION";
+    snapshot.mode = SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+    snapshot.tp_degree = 2;
+    snapshot.column_groups = {
+        SnapshotColumnGroup{
+            .name = "Q",
+            .global_cols = 2,
+            .mode = SnapshotColumnGroupMode::REPLICATED,
+            .participant_cols = {2, 2}},
+        SnapshotColumnGroup{
+            .name = "K",
+            .global_cols = 2,
+            .mode = SnapshotColumnGroupMode::REPLICATED,
+            .participant_cols = {2, 2}},
+        SnapshotColumnGroup{
+            .name = "V",
+            .global_cols = 4,
+            .mode = SnapshotColumnGroupMode::PARTITIONED,
+            .participant_cols = {2, 2}},
+    };
+
+    DeviceSnapshotData device0;
+    device0.device_index = 0;
+    device0.rows = 1;
+    device0.cols = 6;
+    device0.data = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    DeviceSnapshotData device1 = device0;
+    device1.device_index = 1;
+    device1.data = {1.0f, 2.0f, 3.0f, 4.0f, 7.0f, 8.0f};
+    snapshot.device_data = {device0, device1};
+
+    ASSERT_TRUE(snapshot.computeCombined());
+    EXPECT_EQ(
+        snapshot.combined_data,
+        (std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f,
+                            5.0f, 6.0f, 7.0f, 8.0f}));
+
+    snapshot.combined_valid = false;
+    snapshot.device_data[1].data[0] = 9.0f;
+    EXPECT_FALSE(snapshot.computeCombined())
+        << "A divergent replicated Q group must never be hidden by rank zero";
+}
+
+TEST_F(Test__RankOrchestrator, TPSnapshot_PackedColumnParallel_RejectsIncompleteLayout)
+{
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_GDN_CONV1D_OUTPUT";
+    snapshot.mode = SnapshotShardingMode::PACKED_COLUMN_PARALLEL;
+    snapshot.tp_degree = 2;
+    snapshot.column_groups = {
+        SnapshotColumnGroup{
+            .name = "Q",
+            .global_cols = 2,
+            .mode = SnapshotColumnGroupMode::PARTITIONED,
+            .participant_cols = {1, 1}},
+    };
+
+    DeviceSnapshotData device0;
+    device0.device_index = 0;
+    device0.rows = 1;
+    device0.cols = 2; // One undeclared local column must fail closed.
+    device0.data = {1.0f, 2.0f};
+    DeviceSnapshotData device1 = device0;
+    device1.device_index = 1;
+    snapshot.device_data = {device0, device1};
+
+    EXPECT_FALSE(snapshot.computeCombined());
+    EXPECT_FALSE(snapshot.combined_valid);
+    EXPECT_TRUE(snapshot.combined_data.empty());
+}
+
 TEST_F(Test__RankOrchestrator, TPSnapshot_RowParallel_SumsDevicePartials)
 {
     TPSnapshot snapshot;
@@ -8779,6 +9343,89 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_UnknownShardingRejectsMultiDeviceCombi
     EXPECT_EQ(snapshot.combined_cols, 0);
 }
 
+TEST_F(Test__RankOrchestrator, TPSnapshot_RootOnlyRequiresExactlyOnePublisher)
+{
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_MOE_CANONICAL_PUBLICATION_REDUCE_TO_ROOT";
+    snapshot.mode = SnapshotShardingMode::ROOT_ONLY;
+    snapshot.tp_degree = 2;
+
+    DeviceSnapshotData root;
+    root.device_index = 1;
+    root.rows = 1;
+    root.cols = 4;
+    root.data = {1.0f, 2.0f, 3.0f, 4.0f};
+    snapshot.device_data.push_back(root);
+
+    ASSERT_TRUE(snapshot.computeCombined());
+    EXPECT_EQ(snapshot.combined_data, root.data);
+
+    snapshot.combined_valid = false;
+    snapshot.device_data.push_back(root);
+    EXPECT_FALSE(snapshot.computeCombined())
+        << "A rooted collective must not expose two authoritative outputs";
+    EXPECT_TRUE(snapshot.combined_data.empty());
+    EXPECT_EQ(snapshot.combined_rows, 0u);
+    EXPECT_EQ(snapshot.combined_cols, 0u);
+}
+
+TEST_F(Test__RankOrchestrator, TPSnapshot_MTPQualifiersPreserveSchemaLayout)
+{
+    StageShardingConfig sharding = {
+        {"FFN_NORM", SnapshotShardingMode::REPLICATED},
+        {"MOE_EXPERT_OUTPUT", SnapshotShardingMode::ROW_PARALLEL},
+        {"MTP_TERMINAL_HIDDEN_ROW_SELECT", SnapshotShardingMode::REPLICATED},
+    };
+
+    EXPECT_TRUE(isMTPDepthQualifiedSnapshot("MTP0_FFN_NORM"));
+    EXPECT_TRUE(isMTPDepthQualifiedSnapshot(
+        "MTP_DECODE_SIDECAR_DEVICE_TARGET_TOKEN_LIVE_POSITION_MTP2_MOE_EXPERT_OUTPUT"));
+    EXPECT_FALSE(isMTPDepthQualifiedSnapshot(
+        "MTP_REQUEST_BATCH_CONDITION_LM_HEAD"));
+    EXPECT_EQ(
+        getStageShardingMode(
+            "MTP_DECODE_SIDECAR_DEVICE_TARGET_TOKEN_LIVE_POSITION_MTP0_FFN_NORM",
+            sharding),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        getStageShardingMode(
+            "MTP_DECODE_SIDECAR_CHAIN_DEVICE_TOKEN_LIVE_POSITION_MTP2_MOE_EXPERT_OUTPUT",
+            sharding),
+        SnapshotShardingMode::ROW_PARALLEL);
+    EXPECT_EQ(
+        getStageShardingMode(
+            "MTP_DECODE_SIDECAR_MTP_TERMINAL_HIDDEN_ROW_SELECT",
+            sharding),
+        SnapshotShardingMode::REPLICATED);
+}
+
+/**
+ * @brief Capture spelling must not change a layer checkpoint's TP contract.
+ */
+TEST_F(Test__RankOrchestrator, TPSnapshot_LayerPrefixGrammarIsCaseInsensitive)
+{
+    StageShardingConfig sharding = {
+        {"MOE_CANONICAL_PUBLICATION_BROADCAST",
+         SnapshotShardingMode::REPLICATED},
+    };
+
+    EXPECT_EQ(
+        extractStageType("layer17_MOE_CANONICAL_PUBLICATION_BROADCAST"),
+        "MOE_CANONICAL_PUBLICATION_BROADCAST");
+    EXPECT_EQ(
+        extractStageType("LAYER17_MOE_CANONICAL_PUBLICATION_BROADCAST"),
+        "MOE_CANONICAL_PUBLICATION_BROADCAST");
+    EXPECT_EQ(
+        getStageShardingMode(
+            "LAYER17_MOE_CANONICAL_PUBLICATION_BROADCAST", sharding),
+        SnapshotShardingMode::REPLICATED);
+
+    EXPECT_EQ(extractStageType("LAYER_MALFORMED"), "LAYER_MALFORMED")
+        << "Only the typed layer<digits>_ grammar may be stripped";
+    EXPECT_EQ(extractStageType("layered_ATTENTION_CONTEXT"),
+              "layered_ATTENTION_CONTEXT");
+}
+
 TEST_F(Test__RankOrchestrator, TPSnapshot_SchemaFamiliesResolveByLongestPrefix)
 {
     StageShardingConfig sharding = {
@@ -8801,6 +9448,31 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_SchemaFamiliesResolveByLongestPrefix)
             "layer3_ATTENTION_CONTEXT",
             sharding),
         SnapshotShardingMode::UNKNOWN);
+}
+
+/**
+ * @brief Materialized MTP publication graph identities retain replicated data.
+ */
+TEST_F(Test__RankOrchestrator, TPSnapshot_MTPPublicationFamiliesResolveByGeometry)
+{
+    StageShardingConfig sharding = {
+        {"MTP_TERMINAL_HIDDEN_CONTIGUOUS_ROWS_*",
+         SnapshotShardingMode::REPLICATED},
+        {"MTP_TERMINAL_HIDDEN_DEVICE_ACCEPTED_ROWS_*",
+         SnapshotShardingMode::REPLICATED},
+        {"MTP_TERMINAL_HIDDEN_REQUEST_ROWS_*",
+         SnapshotShardingMode::REPLICATED},
+    };
+
+    EXPECT_EQ(
+        getStageShardingMode("MTP_TERMINAL_HIDDEN_CONTIGUOUS_ROWS_3", sharding),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        getStageShardingMode("MTP_TERMINAL_HIDDEN_DEVICE_ACCEPTED_ROWS_2", sharding),
+        SnapshotShardingMode::REPLICATED);
+    EXPECT_EQ(
+        getStageShardingMode("MTP_TERMINAL_HIDDEN_REQUEST_ROWS_4", sharding),
+        SnapshotShardingMode::REPLICATED);
 }
 
 TEST_F(Test__RankOrchestrator, TPSnapshot_LegacyEmbeddingShardingDistinguishesPreAndPostAllreduce)

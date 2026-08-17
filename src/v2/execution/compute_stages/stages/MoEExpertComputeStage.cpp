@@ -1,6 +1,15 @@
 /**
  * @file MoEExpertComputeStage.cpp
- * @brief Implementation of unified MoE FFN, shared expert, and shared expert gate stages
+ * @brief Implements routed MoE, shared-expert, and shared-gate compute stages.
+ *
+ * The stages in this file preserve the model's routing arithmetic while
+ * selecting the backend-native execution contract.  In particular, CPU
+ * NativeVNNI expert projections consume the canonical Q8_1 representation of
+ * the hidden rows.  Ordinary CPU graphs receive that representation from the
+ * router stage, whereas graph-native heterogeneous ExpertOverlay participants
+ * receive FP32 rows through a sparse transport boundary and must explicitly
+ * publish the identical Q8_1 rows before either serial or grouped expert
+ * execution begins.
  */
 
 #include "MoEExpertComputeStage.h"
@@ -9,10 +18,14 @@
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../../../collective/ILocalTPContext.h"
+#include "../../../collective/IGlobalTPContext.h"
+#include "../../../execution/moe/CanonicalMoERouteRecord.h"
 #include "../../../execution/moe/DecodeExpertHistogram.h"
+#include "../../../execution/moe/DeviceMoEExpertDescriptorBuilder.h"
 #include "../../../execution/moe/ExpertWeightTransfer.h"
 #include "../../../execution/moe/ExpertWeightPayloadProvider.h"
 #include "../../../execution/moe/MoEExpertWeightService.h"
+#include "../../../execution/moe/MoEOverlayNodeLocalRouteExchange.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -24,6 +37,7 @@
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../kernels/cpu/moe/CPUMoEKernel.h"
+#include "../../../kernels/cpu/moe/CPUCanonicalRouteReducer.h"
 #include "../../../kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
 #include "../../../kernels/cpu/primitives/VectorPrimitives.h"
 #include "../../../kernels/cpu/primitives/SwiGLUPrimitives.h"
@@ -58,6 +72,7 @@
 #include <numeric>
 #include <sstream>
 #include <typeindex>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
@@ -652,6 +667,65 @@ namespace llaminar2
                 }
             }
 
+            /*
+             * Reconstruct the counterfactual StaticOwner load from the same
+             * immutable router output and placement bank.  The final
+             * participant row is already available above, but without this
+             * baseline an exactly balanced LLEP result says nothing about how
+             * much critical-path work it actually removed.  This remains
+             * inside the explicitly enabled diagnostic path; production graph
+             * execution never downloads or mirrors router assignments.
+             */
+            std::array<uint64_t, kDeviceMoEMaxParticipants>
+                standard_participant_load{};
+            uint64_t invalid_standard_rows = 0;
+            if (runtime.active_bank <= 1u)
+            {
+                const auto &bank = runtime.banks[runtime.active_bank];
+                for (int32_t expert : route_experts)
+                {
+                    if (expert < 0 ||
+                        static_cast<uint32_t>(expert) >= expert_count)
+                    {
+                        ++invalid_standard_rows;
+                        continue;
+                    }
+                    const int32_t owner =
+                        bank.experts[static_cast<size_t>(expert)]
+                            .owner_participant;
+                    if (owner < 0 ||
+                        static_cast<size_t>(owner) >=
+                            standard_participant_load.size())
+                    {
+                        ++invalid_standard_rows;
+                        continue;
+                    }
+                    ++standard_participant_load[static_cast<size_t>(owner)];
+                }
+            }
+            else
+            {
+                invalid_standard_rows = route_experts.size();
+            }
+            uint64_t standard_load_min = 0;
+            uint64_t standard_load_max = 0;
+            uint64_t standard_load_spread = 0;
+            uint64_t assigned_load_min = 0;
+            uint64_t assigned_load_max = 0;
+            uint64_t assigned_load_spread = 0;
+            least_loaded_ep::summarizeParticipantLoads(
+                standard_participant_load.data(),
+                runtime.participant_count,
+                &standard_load_min,
+                &standard_load_max,
+                &standard_load_spread);
+            least_loaded_ep::summarizeParticipantLoads(
+                participant_load.data(),
+                runtime.participant_count,
+                &assigned_load_min,
+                &assigned_load_max,
+                &assigned_load_spread);
+
             uint64_t expert_count_sum = 0;
             int32_t max_expert_count = 0;
             uint32_t nonzero_experts = 0;
@@ -708,6 +782,17 @@ namespace llaminar2
                      << " max_expert_count=" << max_expert_count
                      << " nonzero_experts=" << nonzero_experts
                      << " invalid_participants=" << invalid_participant_rows
+                     << " invalid_standard_rows=" << invalid_standard_rows
+                     << " standard_load_min=" << standard_load_min
+                     << " standard_load_max=" << standard_load_max
+                     << " standard_load_spread=" << standard_load_spread
+                     << " assigned_load_min=" << assigned_load_min
+                     << " assigned_load_max=" << assigned_load_max
+                     << " assigned_load_spread=" << assigned_load_spread
+                     << " standard_p0=" << standard_participant_load[0]
+                     << " standard_p1=" << standard_participant_load[1]
+                     << " standard_p2=" << standard_participant_load[2]
+                     << " standard_p3=" << standard_participant_load[3]
                      << " p0=" << participant_load[0]
                      << " p1=" << participant_load[1]
                      << " p2=" << participant_load[2]
@@ -1141,6 +1226,64 @@ namespace llaminar2
              */
             moe_runtime_table_initialized_ = runtimeTableHasActiveGroupedDecodeBank();
         }
+
+        /*
+         * A grouped CPU verifier graph has one immutable runtime-M bucket, so
+         * its maximum routed-row count is known at construction as M * top-k.
+         * Materialize that bounded scratch now, before request execution. The
+         * old first-use allocation lived inside every routed-expert layer and
+         * made the first verifier transaction pay dozens of allocator and
+         * first-touch events. It also made an otherwise steady-state CPU graph
+         * mutate its memory topology after admission.
+         *
+         * Ordinary prefill is deliberately excluded. Its much larger buckets
+         * need graph-level lifetime sharing rather than eagerly reserving one
+         * worst-case arena per model layer. M=1 uses the dedicated decode
+         * implementation and therefore does not need grouped-row scratch.
+         */
+        if (params_.device_id.is_cpu() &&
+            params_.force_decode_equivalent_verifier_prefill &&
+            params_.seq_len > 1 &&
+            params_.top_k > 0 && params_.top_k <= 16 &&
+            params_.d_model > 0 && params_.expert_intermediate > 0)
+        {
+            const size_t verifier_route_capacity =
+                static_cast<size_t>(params_.seq_len) *
+                static_cast<size_t>(params_.top_k);
+            if (verifier_route_capacity >
+                static_cast<size_t>(std::numeric_limits<int>::max()))
+            {
+                throw std::overflow_error(
+                    "CPU MoE verifier routed-row capacity exceeds int range");
+            }
+
+            scratch_gate_ = makeScratchFP32(
+                verifier_route_capacity,
+                static_cast<size_t>(params_.expert_intermediate),
+                params_.device_id);
+            scratch_up_ = makeScratchFP32(
+                verifier_route_capacity,
+                static_cast<size_t>(params_.expert_intermediate),
+                params_.device_id);
+            scratch_out_ = makeScratchFP32(
+                verifier_route_capacity,
+                static_cast<size_t>(params_.d_model),
+                params_.device_id);
+            scratch_capacity_ = static_cast<int>(verifier_route_capacity);
+
+            const size_t router_blocks_per_row =
+                (static_cast<size_t>(params_.d_model) +
+                 Q8_1Block::BLOCK_SIZE - 1u) /
+                Q8_1Block::BLOCK_SIZE;
+            const size_t swiglu_blocks_per_row =
+                (static_cast<size_t>(params_.expert_intermediate) +
+                 Q8_1Block::BLOCK_SIZE - 1u) /
+                Q8_1Block::BLOCK_SIZE;
+            cpu_grouped_router_q8_.resize(
+                verifier_route_capacity * router_blocks_per_row);
+            cpu_grouped_swiglu_q8_.resize(
+                verifier_route_capacity * swiglu_blocks_per_row);
+        }
     }
 
     bool MoEExpertComputeStage::usesGraphStableRuntimeDecodePlacement() const
@@ -1164,6 +1307,12 @@ namespace llaminar2
     {
         return usesGraphStableRuntimeDecodePlacement() ||
                usesGraphStableFixedTopologyPrefillPlacement();
+    }
+
+    bool MoEExpertComputeStage::expertMaskMatches(
+        const std::vector<bool> &candidate) const noexcept
+    {
+        return params_.expert_mask == candidate;
     }
 
     bool MoEExpertComputeStage::validatePreparedWeights(std::string *error) const
@@ -1265,10 +1414,18 @@ namespace llaminar2
         return refreshGraphStablePlacement(/*preserve_capture_ready=*/true);
     }
 
-    ExpertWeightBlobs MoEExpertComputeStage::detachAndSerializeExpert(int expert_id)
+    ExpertPackedWeights MoEExpertComputeStage::detachPreparedExpert(int expert_id)
     {
         auto ctx = buildWeightContext();
-        return MoEExpertWeightService::detachAndSerializeExpert(ctx, expert_id);
+        return MoEExpertWeightService::detachPreparedExpert(ctx, expert_id);
+    }
+
+    ExpertPackedWeights MoEExpertComputeStage::clonePreparedExpert(
+        int expert_id) const
+    {
+        auto ctx =
+            const_cast<MoEExpertComputeStage *>(this)->buildWeightContext();
+        return MoEExpertWeightService::clonePreparedExpert(ctx, expert_id);
     }
 
     ExpertWeightBlobs MoEExpertComputeStage::serializeExpert(int expert_id) const
@@ -1536,6 +1693,9 @@ namespace llaminar2
 
     size_t MoEExpertComputeStage::releaseRawExpertWeights()
     {
+        if (raw_weights_released_)
+            return 0;
+
         const auto active_expert = [&](size_t expert)
         {
             if (!params_.expert_mask.empty())
@@ -1608,10 +1768,16 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::registerAndPrepareNewExperts(
         const std::vector<bool> &new_mask,
-        const std::unordered_map<int, ExpertWeightBlobs> *received_weights)
+        const std::unordered_map<int, ExpertWeightBlobs> *received_weights,
+        const std::unordered_map<int, PreparedExpertEngines> *
+            received_prepared_experts)
     {
         auto ctx = buildWeightContext();
-        const bool ok = MoEExpertWeightService::registerAndPrepareNewExperts(ctx, new_mask, received_weights);
+        const bool ok = MoEExpertWeightService::registerAndPrepareNewExperts(
+            ctx,
+            new_mask,
+            received_weights,
+            received_prepared_experts);
         params_.gate_slab_ref = ctx.gate_slab_ref;
         params_.up_slab_ref = ctx.up_slab_ref;
         params_.down_slab_ref = ctx.down_slab_ref;
@@ -1659,6 +1825,9 @@ namespace llaminar2
 
     MoEWeightContext MoEExpertComputeStage::buildWeightContext()
     {
+        const CPUExpertNUMAPlacement cpu_placement =
+            CPUExpertNUMAPlacement::forDevice(params_.device_id);
+
         return MoEWeightContext{
             params_.device_id,
             params_.num_experts,
@@ -1688,7 +1857,8 @@ namespace llaminar2
             params_.up_slab_ref,
             params_.down_slab_ref,
             true,
-            &params_.gpu_direct_slot_pool};
+            &params_.gpu_direct_slot_pool,
+            cpu_placement};
     }
 
     IMoEKernel *MoEExpertComputeStage::ensureMoEKernel() const
@@ -2073,7 +2243,6 @@ namespace llaminar2
 
         if (usesPublishedFixedTopologyMaskGrouping())
         {
-            invalidateFixedTopologyMaskPublication();
             if (!publishFixedTopologyMaskBeforeCapture(kernel))
                 return false;
         }
@@ -2166,6 +2335,66 @@ namespace llaminar2
         const int intermediate = params_.expert_intermediate;
         const bool is_gpu = params_.device_id.is_gpu();
 
+        if (params_.canonical_route_contributions)
+        {
+            const auto required_arithmetic =
+                is_gpu
+                    ? MoECanonicalRouteArithmeticPolicy::
+                          PreweightedContributionThenOrderedAdd
+                    : MoECanonicalRouteArithmeticPolicy::
+                          UnweightedExpertRowThenOrderedFMA;
+            if (params_.canonical_route_arithmetic != required_arithmetic)
+            {
+                LOG_ERROR(
+                    "[MoEExpertComputeStage] Canonical route publication has "
+                    "an incompatible arithmetic contract"
+                    << " device=" << params_.device_id.to_string()
+                    << " configured="
+                    << moeCanonicalRouteArithmeticPolicyToString(
+                           params_.canonical_route_arithmetic)
+                    << " required="
+                    << moeCanonicalRouteArithmeticPolicyToString(
+                           required_arithmetic)
+                    << " layer=" << params_.layer_idx);
+                return false;
+            }
+            if (params_.canonical_route_layout ==
+                    MoECanonicalRoutePublicationLayout::Unspecified ||
+                (is_gpu &&
+                 params_.canonical_route_layout !=
+                     MoECanonicalRoutePublicationLayout::
+                         DenseOriginalRouteSlots))
+            {
+                LOG_ERROR(
+                    "[MoEExpertComputeStage] Canonical route publication has "
+                    "an incompatible physical layout"
+                    << " device=" << params_.device_id.to_string()
+                    << " layout="
+                    << moeCanonicalRoutePublicationLayoutToString(
+                           params_.canonical_route_layout)
+                    << " layer=" << params_.layer_idx);
+                return false;
+            }
+        }
+        else if (params_.canonical_route_arithmetic !=
+                     MoECanonicalRouteArithmeticPolicy::Unspecified ||
+                 params_.canonical_route_layout !=
+                     MoECanonicalRoutePublicationLayout::Unspecified)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Canonical route policy was set "
+                "without a canonical publication tensor"
+                << " device=" << params_.device_id.to_string()
+                << " arithmetic="
+                << moeCanonicalRouteArithmeticPolicyToString(
+                       params_.canonical_route_arithmetic)
+                << " layout="
+                << moeCanonicalRoutePublicationLayoutToString(
+                       params_.canonical_route_layout)
+                << " layer=" << params_.layer_idx);
+            return false;
+        }
+
         if (params_.prefix_runtime_device_rehydration)
         {
             /*
@@ -2188,11 +2417,10 @@ namespace llaminar2
             DeviceMoERebalanceApplyStatus *apply_status = nullptr;
             if (!params_.prefix_runtime_rehydration_transfer_state ||
                 !rehydration_kernel ||
-                !executeTransferBackedPrefillLLEPMovement(
+                !executePrefixRuntimeRehydrationPayloadMovement(
                     rehydration_kernel,
                     &transfer_status,
                     &apply_status,
-                    PrefillLLEPTransferPurpose::PrefixRuntimeRehydration,
                     params_.prefix_runtime_rehydration_transfer_state.get()) ||
                 !transfer_status ||
                 !apply_status)
@@ -2244,17 +2472,6 @@ namespace llaminar2
 
         // Get device-appropriate MoE kernel for gather/scatter
         IMoEKernel *kernel = ensureMoEKernel();
-
-        // Resolve the contiguous expert-ID range owned by this participant.
-        const int local_start = params_.local_expert_start;
-        const int local_count = (params_.local_expert_count < 0)
-                                    ? num_experts
-                                    : params_.local_expert_count;
-        const int local_end = local_start + local_count;
-
-        const bool has_prefill_mask = !params_.replica_set.prefill_mask.empty();
-        const std::vector<bool> &prefill_mask_ref = params_.replica_set.prefill_mask;
-        const bool has_replicas = params_.replica_set.num_replicated > 0;
 
         // =====================================================================
         // Phase 5: Fully-grouped MoE prefill pipeline (graph-capturable)
@@ -2321,10 +2538,6 @@ namespace llaminar2
             return true;
         }
 
-        // Zero the output buffer via tensor-aware kernel (works for both CPU and GPU).
-        const size_t output_bytes = static_cast<size_t>(seq_len) * d_model * sizeof(float);
-        kernel->zeroBuffer(params_.output, output_bytes);
-
         const bool forced_verifier_decode_replay =
             params_.seq_len == 1 && params_.force_grouped_verifier_prefill_for_decode;
         if (forced_verifier_decode_replay && isGraphCaptureActive())
@@ -2380,175 +2593,14 @@ namespace llaminar2
             return false;
         }
 
-        // =====================================================================
-        // CPU prefill path: D2H routing data + host-side grouping
-        // =====================================================================
-
-        // Read pre-computed routing results from MoERoutingStage.
-        // These are small (seq_len * top_k floats each), so D2H is acceptable.
-        const float *routing_idx_data = params_.routing_indices->data();
-        const float *routing_wt_data = params_.routing_weights->data();
-
-        // Step 3: Group tokens by expert for batched GEMM execution.
-        // With expert-ID apportionment, process only the local range while still
-        // build the full routing map so scratch sizing is correct.
-
-        std::vector<std::vector<std::pair<int, float>>> expert_token_lists(num_experts);
-
-        for (int t = 0; t < seq_len; ++t)
-        {
-            for (int k = 0; k < top_k; ++k)
-            {
-                int expert_id = static_cast<int>(routing_idx_data[t * top_k + k]);
-                float weight = routing_wt_data[t * top_k + k];
-                if (expert_id < 0 || expert_id >= num_experts)
-                {
-                    LOG_ERROR("[MoEExpertComputeStage] Invalid routed expert id " << expert_id
-                                                                                  << " at token " << t
-                                                                                  << " slot " << k
-                                                                                  << " for layer " << params_.layer_idx
-                                                                                  << " (num_experts=" << num_experts << ")");
-                    return false;
-                }
-                if (!std::isfinite(weight))
-                {
-                    LOG_ERROR("[MoEExpertComputeStage] Non-finite route weight at token " << t
-                                                                                          << " slot " << k
-                                                                                          << " for layer " << params_.layer_idx);
-                    return false;
-                }
-                if (weight == 0.0f)
-                    continue;
-                // With static ownership or a dynamic resident mask, accumulate only local expert rows.
-                bool is_local;
-                if (has_prefill_mask)
-                {
-                    // Pre-built mask: single lookup, no branches
-                    is_local = prefill_mask_ref[expert_id];
-                }
-                else if (!params_.expert_mask.empty())
-                {
-                    is_local = params_.expert_mask[expert_id];
-                    // Replicated experts: only owner socket processes during prefill
-                    if (is_local && has_replicas &&
-                        params_.replica_set.isReplicatedForLayer(params_.layer_idx, expert_id) &&
-                        params_.replica_set.owner_socket[expert_id] != params_.my_socket_id)
-                    {
-                        is_local = false;
-                    }
-                }
-                else
-                    is_local = (expert_id >= local_start && expert_id < local_end);
-                if (is_local)
-                    expert_token_lists[expert_id].emplace_back(t, weight);
-            }
-        }
-
-        // Ensure GEMM engine pointers are copied into the stage-local cache and
-        // validate every active expert before execution.
-        int max_batch = 0;
-        std::vector<int> active_local_experts;
-        for (int expert_id = 0; expert_id < num_experts; ++expert_id)
-        {
-            const auto &tl = expert_token_lists[expert_id];
-            if (!tl.empty())
-                active_local_experts.push_back(expert_id);
-            max_batch = std::max(max_batch, static_cast<int>(tl.size()));
-        }
-
-        if (!ensureGemmEnginesForExperts(active_local_experts))
-        {
-            LOG_ERROR("[MoEExpertComputeStage] Missing prepared GEMM engines for active prefill experts");
-            return false;
-        }
-
-        // Ensure scratch buffers have enough capacity for largest expert batch
-        if (max_batch > 0 && max_batch > scratch_capacity_)
-        {
-            scratch_batch_ = makeScratchFP32(max_batch, d_model, params_.device_id);
-            scratch_gate_ = makeScratchFP32(max_batch, intermediate, params_.device_id);
-            scratch_up_ = makeScratchFP32(max_batch, intermediate, params_.device_id);
-            scratch_out_ = makeScratchFP32(max_batch, d_model, params_.device_id);
-            scratch_capacity_ = max_batch;
-        }
-
-        // Step 4: Execute each active expert (reusing cached engines + scratch)
-        for (int expert_id = 0; expert_id < num_experts; ++expert_id)
-        {
-            const auto &token_list = expert_token_lists[expert_id];
-            if (token_list.empty())
-                continue;
-
-            const int num_tokens = static_cast<int>(token_list.size());
-
-            // Build token indices and weights arrays for kernel calls
-            std::vector<int> token_indices(num_tokens);
-            std::vector<float> token_weights(num_tokens);
-            for (int i = 0; i < num_tokens; ++i)
-            {
-                token_indices[i] = token_list[i].first;
-                token_weights[i] = token_list[i].second;
-            }
-
-            // Gather tokens into reusable scratch batch via tensor-aware kernel.
-            // CPU: kernel reads data()/mutable_data().
-            // GPU: kernel uploads indices to device staging, gathers on device.
-            kernel->gatherTokenBatchFromTensors(
-                params_.input, scratch_batch_.get(),
-                token_indices.data(), num_tokens, d_model);
-            if (is_gpu)
-                gpuExecution().publish(scratch_batch_.get());
-
-            // Use cached GEMM engines (device-agnostic via ITensorGemm)
-            ITensorGemm *gate_gemm = cached_gate_gemm_[expert_id];
-            ITensorGemm *up_gemm = cached_up_gemm_[expert_id];
-            ITensorGemm *down_gemm = cached_down_gemm_[expert_id];
-
-            // Gate+Up projections via fused multi-projection (quantizes input once)
-            std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-                {gate_gemm, scratch_gate_.get(), intermediate, nullptr, "gate"},
-                {up_gemm, scratch_up_.get(), intermediate, nullptr, "up"}};
-            if (!gate_gemm->multiply_fused_tensor(
-                    scratch_batch_.get(), projections,
-                    num_tokens, d_model,
-                    nullptr, getWorkspace()))
-            {
-                LOG_ERROR("[MoEExpertComputeStage] Gate/up projection failed for expert "
-                          << expert_id << " layer " << params_.layer_idx);
-                return false;
-            }
-            if (is_gpu)
-            {
-                for (const auto &projection : projections)
-                    gpuExecution().publish(projection.output);
-            }
-
-            // Mandatory fused SwiGLU/down grouped implementation.
-            if (!fusedSwigluDown(
-                    *this,
-                    scratch_gate_.get(), scratch_up_.get(), scratch_out_.get(),
-                    down_gemm, num_tokens, d_model, intermediate,
-                    getWorkspace()))
-            {
-                LOG_ERROR("[MoEExpertComputeStage] SwiGLU/down projection failed for expert "
-                          << expert_id << " layer " << params_.layer_idx);
-                return false;
-            }
-
-            // Scatter weighted results back via tensor-aware kernel.
-            kernel->scatterAddWeightedFromTensors(
-                params_.output, scratch_out_.get(),
-                token_indices.data(), token_weights.data(),
-                num_tokens, d_model);
-            if (is_gpu)
-                gpuExecution().publish(params_.output);
-        }
-
-        LOG_TRACE("[MoEExpertComputeStage] Processed " << seq_len << " tokens via GEMM kernels, "
-                                                       << top_k << " experts per token");
-        if (is_gpu && !params_.output_registered_in_arena)
-            gpuExecution().publish(params_.output);
-        return true;
+        /*
+         * CPU prefill is a first-class grouped, serial-row-equivalent route.
+         * It shares the same arithmetic implementation as MTP verification,
+         * while ordinary-prefill ownership remains static and explicit.
+         */
+        return executeCPUGroupedDecodeEquivalentRows(
+            ctx,
+            CPUGroupedRowsPurpose::OrdinaryPrefill);
     }
 
     // =========================================================================
@@ -2613,9 +2665,48 @@ namespace llaminar2
          */
         if (!is_gpu)
         {
-            kernel->zeroBuffer(
-                params_.output,
-                static_cast<size_t>(d_model) * sizeof(float));
+            TensorBase *const publication =
+                params_.canonical_route_contributions
+                    ? params_.canonical_route_contributions
+                    : params_.output;
+            const bool packed_canonical_records =
+                params_.canonical_route_contributions &&
+                params_.canonical_route_layout ==
+                    MoECanonicalRoutePublicationLayout::
+                        PackedIndexedRouteRows;
+            if (packed_canonical_records)
+            {
+                float *const records = publication->mutable_data();
+                const size_t capacity =
+                    canonical_moe_route_record::recordCapacity(
+                        publication->numel(),
+                        d_model);
+                if (!records || capacity < static_cast<size_t>(top_k) ||
+                    !canonical_moe_route_record::writeRecordCount(
+                        records,
+                        publication->numel(),
+                        0u))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] CPU decode packed route "
+                              "publication buffer is undersized"
+                              << " layer=" << params_.layer_idx
+                              << " elements=" << publication->numel()
+                              << " capacity=" << capacity
+                              << " required_records=" << top_k);
+                    return false;
+                }
+            }
+            else
+            {
+                const size_t publication_rows =
+                    params_.canonical_route_contributions
+                        ? static_cast<size_t>(top_k)
+                        : size_t{1};
+                kernel->zeroBuffer(
+                    publication,
+                    publication_rows * static_cast<size_t>(d_model) *
+                        sizeof(float));
+            }
         }
 
         // Expert-ID ownership range.
@@ -2904,6 +2995,16 @@ namespace llaminar2
                 return false;
             }
 
+            if (!isGraphCaptureActive())
+            {
+                /*
+                 * The eager launch has now exercised the same workspace-native
+                 * fused route used by capture. Record that its stable pointer
+                 * arrays and scratch bindings are warm; prepareGraphLaunch()
+                 * will still revalidate them against the exact capture stream.
+                 */
+                runtime_grouped_decode_launch_state_prepared_ = true;
+            }
             publishPublicationTarget();
             return true;
         }
@@ -2967,6 +3068,7 @@ namespace llaminar2
             int expert_id;
             float weight;
             int batch_idx;
+            int route_slot;
         };
         ActiveExpert active_experts[16]; // stack-allocated, max top_k
         int num_active = 0;
@@ -2987,6 +3089,19 @@ namespace llaminar2
         int routing_int_indices[16]; // stack-allocated, max top_k
         for (int k = 0; k < top_k; ++k)
         {
+            const float weight = routing_wt_data[k];
+            if (!std::isfinite(weight))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Non-finite decode route weight at slot "
+                          << k << " for layer " << params_.layer_idx);
+                return false;
+            }
+            if (weight == 0.0f)
+            {
+                routing_int_indices[k] = -1;
+                continue;
+            }
+
             routing_int_indices[k] = static_cast<int>(routing_idx_data[k]);
             if (routing_int_indices[k] < 0 || routing_int_indices[k] >= num_experts)
             {
@@ -2994,12 +3109,6 @@ namespace llaminar2
                                                                               << " at decode slot " << k
                                                                               << " for layer " << params_.layer_idx
                                                                               << " (num_experts=" << num_experts << ")");
-                return false;
-            }
-            if (!std::isfinite(routing_wt_data[k]))
-            {
-                LOG_ERROR("[MoEExpertComputeStage] Non-finite decode route weight at slot "
-                          << k << " for layer " << params_.layer_idx);
                 return false;
             }
         }
@@ -3020,6 +3129,11 @@ namespace llaminar2
             // No replicas — use simple mask/range check
             for (int k = 0; k < top_k; ++k)
             {
+                if (routing_wt_data[k] == 0.0f)
+                {
+                    compute_here[k] = false;
+                    continue;
+                }
                 const int expert_id = routing_int_indices[k];
                 if (!params_.expert_mask.empty())
                     compute_here[k] = params_.expert_mask[expert_id];
@@ -3071,7 +3185,11 @@ namespace llaminar2
             batch_projections_.push_back(
                 {up_gemm, scratch_up_batch_[num_active].get(), intermediate, nullptr, "up"});
 
-            active_experts[num_active] = {expert_id, routing_wt_data[k], num_active};
+            active_experts[num_active] = {
+                expert_id,
+                routing_wt_data[k],
+                num_active,
+                k};
             num_active++;
         }
 
@@ -3105,6 +3223,42 @@ namespace llaminar2
                     auto *native_gate = dynamic_cast<CPUNativeVNNIGemmKernel *>(
                         batch_projections_[0].kernel);
                     const float *input_rows = input_tensor->data();
+                    /*
+                     * A graph-native ExpertOverlay participant receives this
+                     * one compact row from sparse transport instead of from a
+                     * local router.  The NativeVNNI projection contract is
+                     * still exactly the router's Q8_1 quantization, so publish
+                     * it at the declared transport boundary before looking it
+                     * up.  This mirrors the grouped-row path below; omitting
+                     * it made a one-row cold-tier packet fail while multi-row
+                     * packets succeeded.
+                     */
+                    if (params_.cpu_router_q8_input_publication ==
+                        CPURouterQ8InputPublicationPolicy::PublishTransportedRows)
+                    {
+                        if (!cpu_moe_kernel || !input_rows ||
+                            !cpu_moe_kernel->publishTransportedRouterQ8Hidden(
+                                input_rows,
+                                /*rows=*/1,
+                                d_model))
+                        {
+                            LOG_ERROR(
+                                "[MoEExpertComputeStage] CPU ExpertOverlay transport "
+                                "failed to publish canonical serial router Q8_1 row for layer "
+                                << params_.layer_idx << " d_model=" << d_model);
+                            return false;
+                        }
+                        PerfStatsCollector::addCounter(
+                            "moe_overlay",
+                            "cpu_transport_router_q8_publications",
+                            1.0,
+                            "decode",
+                            params_.device_id.toString(),
+                            {{"layer", std::to_string(params_.layer_idx)},
+                             {"rows", "1"},
+                             {"d_model", std::to_string(d_model)},
+                             {"source", "compact_transport_serial_row"}});
+                    }
                     const Q8_1Block *published_router_q8 =
                         cpu_moe_kernel && input_rows
                             ? cpu_moe_kernel->publishedRouterQ8Hidden(
@@ -3120,7 +3274,7 @@ namespace llaminar2
                         return false;
                     }
                     projected =
-                        native_gate->multiply_fused_router_q8_hidden_decode_equivalent(
+                        native_gate->multiply_fused_router_q8_hidden_grouped_decode_equivalent(
                             published_router_q8,
                             batch_projections_,
                             /*m=*/1,
@@ -3285,9 +3439,109 @@ namespace llaminar2
         }
         else
         {
-            // CPU Phase 2: batch SwiGLU + fused down projections + vec_axpy
+            // CPU Phase 2: batch SwiGLU + fused down projections, followed by
+            // either the serial ordered fold or raw canonical-slot publication.
 
             float *output = params_.output->mutable_data();
+            float *canonical_routes =
+                params_.canonical_route_contributions
+                    ? params_.canonical_route_contributions->mutable_data()
+                    : nullptr;
+            if (!output ||
+                (params_.canonical_route_contributions && !canonical_routes))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] CPU decode could not access "
+                          "its publication tensor for layer "
+                          << params_.layer_idx);
+                return false;
+            }
+            const bool packed_canonical_records =
+                canonical_routes &&
+                params_.canonical_route_layout ==
+                    MoECanonicalRoutePublicationLayout::
+                        PackedIndexedRouteRows;
+
+            if (packed_canonical_records)
+            {
+                /*
+                 * Route identity is control metadata, not projection output.
+                 * Publish it once from the immutable active-route schedule before
+                 * any row arithmetic begins. This keeps the payload loop branch
+                 * light and makes a malformed slot/index fail before partially
+                 * publishing a transaction.
+                 */
+                for (int active_index = 0; active_index < num_active; ++active_index)
+                {
+                    const auto &info = active_experts[active_index];
+                    if (info.batch_idx < 0 || info.batch_idx >= num_active ||
+                        info.route_slot < 0 || info.route_slot >= top_k)
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage] CPU decode packed route "
+                                  "schedule contains an invalid record or route slot"
+                                  << " layer=" << params_.layer_idx
+                                  << " active_index=" << active_index
+                                  << " record=" << info.batch_idx
+                                  << " route_slot=" << info.route_slot
+                                  << " active_records=" << num_active
+                                  << " top_k=" << top_k);
+                        return false;
+                    }
+                    float *const route_record =
+                        canonical_moe_route_record::record(
+                            canonical_routes,
+                            static_cast<size_t>(info.batch_idx),
+                            d_model);
+                    if (!canonical_moe_route_record::writeFlatRouteSlot(
+                            route_record,
+                            d_model,
+                            static_cast<size_t>(info.route_slot)))
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage] CPU decode route slot "
+                                  "cannot be represented by packed publication"
+                                  << " layer=" << params_.layer_idx
+                                  << " route_slot=" << info.route_slot);
+                        return false;
+                    }
+                }
+            }
+
+            auto publish_route = [&](const ActiveExpert &info,
+                                     const float *route_output)
+            {
+                if (canonical_routes)
+                {
+                    /*
+                     * Keep the expert row unweighted. The post-collective CPU
+                     * reducer applies this route's original weight with
+                     * vec_axpy in increasing slot order, exactly reproducing
+                     * serial decode's FMA tree after ownership movement.
+                     */
+                    float *destination = nullptr;
+                    if (packed_canonical_records)
+                    {
+                        destination = canonical_moe_route_record::record(
+                            canonical_routes,
+                            static_cast<size_t>(info.batch_idx),
+                            d_model);
+                    }
+                    else
+                    {
+                        destination =
+                            canonical_routes +
+                            static_cast<size_t>(info.route_slot) *
+                                static_cast<size_t>(d_model);
+                    }
+                    std::copy_n(route_output, d_model, destination);
+                }
+                else
+                {
+                    primitives::vec_axpy(
+                        output,
+                        route_output,
+                        info.weight,
+                        d_model);
+                }
+            };
 
             // Ensure per-expert output buffers for fused approach
             if (static_cast<int>(scratch_down_batch_.size()) < num_active)
@@ -3345,12 +3599,12 @@ namespace llaminar2
 
             if (fused_ok)
             {
-                // Phase 2c: Weighted accumulate all outputs
+                // Phase 2c: Publish every completed route through the selected
+                // graph arithmetic contract.
                 for (int i = 0; i < num_active; ++i)
                 {
                     const auto &info = active_experts[i];
-                    primitives::vec_axpy(output, scratch_down_batch_[i]->data(),
-                                         info.weight, d_model);
+                    publish_route(info, scratch_down_batch_[i]->data());
                 }
             }
             else
@@ -3375,8 +3629,21 @@ namespace llaminar2
                         return false;
                     }
 
-                    primitives::vec_axpy(output, scratch_out_ptr, info.weight, d_model);
+                    publish_route(info, scratch_out_ptr);
                 }
+            }
+
+            if (packed_canonical_records &&
+                !canonical_moe_route_record::writeRecordCount(
+                    canonical_routes,
+                    params_.canonical_route_contributions->numel(),
+                    static_cast<size_t>(num_active)))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] CPU decode could not publish "
+                          "its packed route record count"
+                          << " layer=" << params_.layer_idx
+                          << " count=" << num_active);
+                return false;
             }
 
         } // end CPU Phase 2 else block
@@ -3387,7 +3654,9 @@ namespace llaminar2
         return true;
     }
 
-    bool MoEExpertComputeStage::executeCPUGroupedDecodeEquivalentVerifierPrefill(IDeviceContext *ctx)
+    bool MoEExpertComputeStage::executeCPUGroupedDecodeEquivalentRows(
+        IDeviceContext *ctx,
+        CPUGroupedRowsPurpose purpose)
     {
         (void)ctx;
         const int seq_len = params_.seq_len;
@@ -3398,14 +3667,14 @@ namespace llaminar2
 
         if (params_.device_id.is_gpu())
         {
-            LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier executor called for GPU device "
+            LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row executor called for GPU device "
                       << params_.device_id.to_string());
             return false;
         }
         if (!params_.input || !params_.output ||
             !params_.routing_indices || !params_.routing_weights)
         {
-            LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier executor missing tensors");
+            LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row executor missing tensors");
             return false;
         }
 
@@ -3413,7 +3682,19 @@ namespace llaminar2
         const float *routing_wt_data = params_.routing_weights->data();
         if (!routing_idx_data || !routing_wt_data)
         {
-            LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier executor could not access routing tensors");
+            LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row executor could not access routing tensors");
+            return false;
+        }
+
+        if (seq_len < 1 || d_model <= 0 || intermediate <= 0 ||
+            num_experts <= 0 || top_k <= 0 || top_k > num_experts || top_k > 16)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row executor received invalid geometry: "
+                      << "M=" << seq_len
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate
+                      << " experts=" << num_experts
+                      << " top_k=" << top_k);
             return false;
         }
 
@@ -3421,27 +3702,74 @@ namespace llaminar2
         if (!kernel)
             return false;
 
-        struct VerifierRouteSlot
-        {
-            int row = 0;
-            int route = 0;
-            int expert_id = 0;
-            float weight = 0.0f;
-        };
+        const bool record_cpu_moe_phase_timings =
+            PerfStatsCollector::isDomainEnabled("cpu_moe_grouped_rows");
+        const auto route_schedule_start = record_cpu_moe_phase_timings
+                                              ? PerfStatsCollector::Clock::now()
+                                              : PerfStatsCollector::Clock::time_point{};
 
-        std::vector<VerifierRouteSlot> local_slots;
-        local_slots.reserve(static_cast<size_t>(seq_len) * static_cast<size_t>(top_k));
-        std::vector<int> original_slot_to_local(
-            static_cast<size_t>(seq_len) * static_cast<size_t>(top_k),
-            -1);
-        std::vector<std::vector<int>> expert_local_slots(static_cast<size_t>(num_experts));
-        std::vector<uint8_t> expert_needed(static_cast<size_t>(num_experts), 0u);
+        const size_t route_slot_capacity =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+        cpu_grouped_route_slots_.clear();
+        cpu_grouped_route_slots_.reserve(route_slot_capacity);
+        cpu_grouped_original_to_local_.assign(route_slot_capacity, -1);
+        cpu_grouped_expert_counts_.assign(static_cast<size_t>(num_experts), 0);
 
         const int local_start = params_.local_expert_start;
         const int local_count = (params_.local_expert_count < 0)
                                     ? num_experts
                                     : params_.local_expert_count;
         const int local_end = local_start + local_count;
+
+        const bool verifier_rows =
+            purpose == CPUGroupedRowsPurpose::MTPVerifier;
+        const bool has_replicas = params_.replica_set.num_replicated > 0;
+        const bool has_prefill_mask =
+            !params_.replica_set.prefill_mask.empty();
+        if (!params_.expert_mask.empty() &&
+            params_.expert_mask.size() != static_cast<size_t>(num_experts))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row expert mask size "
+                      << params_.expert_mask.size()
+                      << " does not match num_experts=" << num_experts
+                      << " layer=" << params_.layer_idx);
+            return false;
+        }
+        if (has_prefill_mask &&
+            params_.replica_set.prefill_mask.size() !=
+                static_cast<size_t>(num_experts))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row prefill mask size "
+                      << params_.replica_set.prefill_mask.size()
+                      << " does not match num_experts=" << num_experts
+                      << " layer=" << params_.layer_idx);
+            return false;
+        }
+        if (has_replicas &&
+            (!params_.replica_set.hasLayerReplicaPlacement() ||
+             params_.replica_set.base_ownership.expertCount() != num_experts ||
+             params_.layer_idx < 0 ||
+             params_.layer_idx >= params_.replica_set.base_ownership.layerCount()))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row layered replica ownership does not match num_experts="
+                      << num_experts
+                      << " layer=" << params_.layer_idx);
+            return false;
+        }
+        /*
+         * Preserve full pre-ownership routing evidence for static apportionment
+         * diagnosis.  The vector is stage-owned and grow-only, so enabling
+         * PerfStats does not recreate one heap object per expert invocation.
+         */
+        const bool record_route_distribution =
+            !verifier_rows &&
+            PerfStatsCollector::isDomainEnabled("moe_static_apportionment") &&
+            params_.my_socket_id == 0;
+        if (record_route_distribution)
+        {
+            cpu_grouped_routed_rows_by_expert_.assign(
+                static_cast<size_t>(num_experts), 0u);
+        }
 
         for (int row = 0; row < seq_len; ++row)
         {
@@ -3455,28 +3783,40 @@ namespace llaminar2
                 const size_t flat_slot =
                     static_cast<size_t>(row) * static_cast<size_t>(top_k) +
                     static_cast<size_t>(route);
+                const float weight = row_weights[route];
+                if (!std::isfinite(weight))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row non-finite route weight"
+                              << " row=" << row
+                              << " route=" << route
+                              << " layer=" << params_.layer_idx);
+                    return false;
+                }
+                if (weight == 0.0f)
+                {
+                    routing_int_indices[route] = -1;
+                    continue;
+                }
+
                 const int expert_id = static_cast<int>(routing_idx_data[flat_slot]);
                 routing_int_indices[route] = expert_id;
                 if (expert_id < 0 || expert_id >= num_experts)
                 {
-                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier invalid expert id "
+                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row invalid expert id "
                               << expert_id << " row=" << row
                               << " route=" << route
                               << " layer=" << params_.layer_idx
                               << " num_experts=" << num_experts);
                     return false;
                 }
-                if (!std::isfinite(row_weights[route]))
+                if (record_route_distribution)
                 {
-                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier non-finite route weight"
-                              << " row=" << row
-                              << " route=" << route
-                              << " layer=" << params_.layer_idx);
-                    return false;
+                    ++cpu_grouped_routed_rows_by_expert_[
+                        static_cast<size_t>(expert_id)];
                 }
             }
 
-            if (params_.replica_set.num_replicated > 0)
+            if (verifier_rows && has_replicas)
             {
                 params_.replica_set.assignForToken(
                     routing_int_indices,
@@ -3489,21 +3829,40 @@ namespace llaminar2
             }
             else
             {
-                if (!params_.expert_mask.empty() &&
-                    params_.expert_mask.size() != static_cast<size_t>(num_experts))
-                {
-                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier expert mask size "
-                              << params_.expert_mask.size()
-                              << " does not match num_experts=" << num_experts
-                              << " layer=" << params_.layer_idx);
-                    return false;
-                }
                 for (int route = 0; route < top_k; ++route)
                 {
+                    if (row_weights[route] == 0.0f)
+                    {
+                        compute_here[route] = false;
+                        continue;
+                    }
                     const int expert_id = routing_int_indices[route];
-                    compute_here[route] = params_.expert_mask.empty()
-                                              ? (expert_id >= local_start && expert_id < local_end)
-                                              : params_.expert_mask[static_cast<size_t>(expert_id)];
+                    if (!verifier_rows && has_prefill_mask)
+                    {
+                        compute_here[route] =
+                            params_.replica_set.prefill_mask[
+                                static_cast<size_t>(expert_id)];
+                    }
+                    else if (!params_.expert_mask.empty())
+                    {
+                        bool computes_locally =
+                            params_.expert_mask[static_cast<size_t>(expert_id)];
+                        if (!verifier_rows && computes_locally && has_replicas &&
+                            params_.replica_set.isReplicatedForLayer(
+                                params_.layer_idx, expert_id) &&
+                            params_.replica_set.ownerParticipant(
+                                params_.layer_idx, expert_id) !=
+                                params_.my_socket_id)
+                        {
+                            computes_locally = false;
+                        }
+                        compute_here[route] = computes_locally;
+                    }
+                    else
+                    {
+                        compute_here[route] =
+                            expert_id >= local_start && expert_id < local_end;
+                    }
                 }
             }
 
@@ -3513,40 +3872,186 @@ namespace llaminar2
                     continue;
 
                 const int expert_id = routing_int_indices[route];
-                const int local_slot = static_cast<int>(local_slots.size());
+                const int local_slot =
+                    static_cast<int>(cpu_grouped_route_slots_.size());
                 const size_t flat_slot =
                     static_cast<size_t>(row) * static_cast<size_t>(top_k) +
                     static_cast<size_t>(route);
-                original_slot_to_local[flat_slot] = local_slot;
-                expert_local_slots[static_cast<size_t>(expert_id)].push_back(local_slot);
-                expert_needed[static_cast<size_t>(expert_id)] = 1u;
-                local_slots.push_back({row, route, expert_id, row_weights[route]});
+                cpu_grouped_original_to_local_[flat_slot] = local_slot;
+                ++cpu_grouped_expert_counts_[static_cast<size_t>(expert_id)];
+                cpu_grouped_route_slots_.push_back(
+                    {row, route, expert_id, row_weights[route]});
             }
         }
 
-        std::vector<int> active_experts;
-        active_experts.reserve(static_cast<size_t>(num_experts));
+        if (record_route_distribution)
+        {
+            for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+            {
+                const uint32_t routed_rows =
+                    cpu_grouped_routed_rows_by_expert_[
+                        static_cast<size_t>(expert_id)];
+                if (routed_rows == 0)
+                    continue;
+                PerfStatsCollector::addCounter(
+                    "moe_static_apportionment",
+                    "routed_rows",
+                    static_cast<double>(routed_rows),
+                    "prefill",
+                    params_.device_id.toString(),
+                    {{"layer", std::to_string(params_.layer_idx)},
+                     {"expert", std::to_string(expert_id)},
+                     {"tokens", std::to_string(seq_len)},
+                     {"top_k", std::to_string(top_k)}});
+            }
+        }
+
+        /*
+         * Convert original-order route slots into one flat CSR schedule.  The
+         * second pass is stable: slots for each expert appear in the same
+         * row/top-k order in which routing produced them.
+         */
+        cpu_grouped_expert_offsets_.resize(
+            static_cast<size_t>(num_experts) + 1u);
+        cpu_grouped_expert_offsets_[0] = 0;
+        cpu_grouped_active_experts_.clear();
+        cpu_grouped_active_experts_.reserve(static_cast<size_t>(num_experts));
+        int max_batch = 0;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
-            if (expert_needed[static_cast<size_t>(expert_id)] != 0u)
-                active_experts.push_back(expert_id);
+            const int count =
+                cpu_grouped_expert_counts_[static_cast<size_t>(expert_id)];
+            cpu_grouped_expert_offsets_[static_cast<size_t>(expert_id) + 1u] =
+                cpu_grouped_expert_offsets_[static_cast<size_t>(expert_id)] +
+                count;
+            if (count > 0)
+                cpu_grouped_active_experts_.push_back(expert_id);
+            max_batch = std::max(max_batch, count);
         }
-        if (!ensureGemmEnginesForExperts(active_experts))
+        cpu_grouped_expert_write_offsets_ = cpu_grouped_expert_offsets_;
+        cpu_grouped_expert_local_slots_.resize(cpu_grouped_route_slots_.size());
+        cpu_grouped_local_to_expert_position_.resize(
+            cpu_grouped_route_slots_.size());
+        for (size_t local_slot = 0;
+             local_slot < cpu_grouped_route_slots_.size();
+             ++local_slot)
         {
-            LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier missing prepared GEMM engines");
+            const int expert_id =
+                cpu_grouped_route_slots_[local_slot].expert_id;
+            const int destination =
+                cpu_grouped_expert_write_offsets_[
+                    static_cast<size_t>(expert_id)]++;
+            cpu_grouped_expert_local_slots_[static_cast<size_t>(destination)] =
+                static_cast<int>(local_slot);
+            cpu_grouped_local_to_expert_position_[local_slot] = destination;
+        }
+
+        if (!ensureGemmEnginesForExperts(cpu_grouped_active_experts_))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row execution is missing prepared GEMM engines");
             return false;
         }
 
         const size_t output_bytes =
             static_cast<size_t>(seq_len) * static_cast<size_t>(d_model) * sizeof(float);
-        kernel->zeroBuffer(params_.output, output_bytes);
-        if (local_slots.empty())
+        TensorBase *const publication =
+            params_.canonical_route_contributions
+                ? params_.canonical_route_contributions
+                : params_.output;
+        const bool packed_canonical_records =
+            params_.canonical_route_contributions &&
+            params_.canonical_route_layout ==
+                MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows;
+        const size_t publication_bytes =
+            params_.canonical_route_contributions
+                ? output_bytes * static_cast<size_t>(top_k)
+                : output_bytes;
+        if (packed_canonical_records)
+        {
+            float *const packed_records = publication->mutable_data();
+            const size_t packed_capacity =
+                canonical_moe_route_record::recordCapacity(
+                    publication->numel(),
+                    d_model);
+            if (!packed_records || packed_capacity < route_slot_capacity ||
+                !canonical_moe_route_record::writeRecordCount(
+                    packed_records,
+                    publication->numel(),
+                    cpu_grouped_route_slots_.size()))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] CPU grouped packed route "
+                          "publication buffer is undersized"
+                          << " layer=" << params_.layer_idx
+                          << " elements=" << publication->numel()
+                          << " capacity=" << packed_capacity
+                          << " required_records=" << route_slot_capacity
+                          << " active_records="
+                          << cpu_grouped_route_slots_.size());
+                return false;
+            }
+
+            /*
+             * The route schedule is complete and immutable at this point. Encode
+             * every original slot before entering the OpenMP payload-copy loop so
+             * worker threads cannot throw through an OpenMP region or expose a
+             * half-described packed transaction.
+             */
+            for (size_t local_slot = 0;
+                 local_slot < cpu_grouped_route_slots_.size();
+                 ++local_slot)
+            {
+                const auto &slot = cpu_grouped_route_slots_[local_slot];
+                if (slot.row < 0 || slot.row >= seq_len ||
+                    slot.route < 0 || slot.route >= top_k)
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped packed route "
+                              "schedule contains an invalid row or route"
+                              << " layer=" << params_.layer_idx
+                              << " local_slot=" << local_slot
+                              << " row=" << slot.row
+                              << " route=" << slot.route
+                              << " seq_len=" << seq_len
+                              << " top_k=" << top_k);
+                    return false;
+                }
+                const size_t flat_slot =
+                    static_cast<size_t>(slot.row) *
+                        static_cast<size_t>(top_k) +
+                    static_cast<size_t>(slot.route);
+                float *const route_record =
+                    canonical_moe_route_record::record(
+                        packed_records,
+                        local_slot,
+                        d_model);
+                if (flat_slot >= route_slot_capacity ||
+                    !canonical_moe_route_record::writeFlatRouteSlot(
+                        route_record,
+                        d_model,
+                        flat_slot))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped route slot "
+                              "cannot be represented by packed publication"
+                              << " layer=" << params_.layer_idx
+                              << " local_slot=" << local_slot
+                              << " flat_slot=" << flat_slot
+                              << " route_slots=" << route_slot_capacity);
+                    return false;
+                }
+            }
+        }
+        else
+        {
+            kernel->zeroBuffer(publication, publication_bytes);
+        }
+        if (cpu_grouped_route_slots_.empty())
         {
             PerfStatsCollector::addCounter(
-                "mtp",
-                "moe_routed_grouped_decode_equivalent_verifier_prefill_rows",
+                verifier_rows ? "mtp" : "prefill",
+                verifier_rows
+                    ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
+                    : "moe_routed_grouped_decode_equivalent_prefill_rows",
                 static_cast<double>(seq_len),
-                "verifier",
+                verifier_rows ? "verifier" : "prefill",
                 params_.device_id.toString(),
                 {{"stage", "routed_expert"},
                  {"route", "cpu_expert_slot_grouped"},
@@ -3556,17 +4061,17 @@ namespace llaminar2
         }
 
         /*
-         * NativeVNNI gate/up projections all consume the same Q8_1 activation
-         * contract.  Require the immediately preceding CPU router publication
-         * once for the complete verifier batch, then gather blocks from it for
-         * each expert chunk.  Floating-point expert bundles retain their own
-         * grouped implementation; mixing the two contracts within one routed
-         * layer is rejected because it would make publication semantics depend
-         * on which expert happened to win top-k.
+         * NativeVNNI gate/up/down projections share one activation contract.
+         * Require the immediately preceding CPU router publication once for
+         * the complete runtime batch, then gather canonical blocks for each
+         * expert. Floating-point bundles retain their own grouped exact
+         * implementation. Mixing either contract within an expert or across a
+         * layer is fatal because route-dependent arithmetic would otherwise be
+         * possible.
          */
-        bool any_native_gateup = false;
-        bool all_native_gateup = true;
-        for (int expert_id : active_experts)
+        bool any_native_bundle = false;
+        bool all_native_bundles = true;
+        for (int expert_id : cpu_grouped_active_experts_)
         {
             const bool native_gate =
                 dynamic_cast<CPUNativeVNNIGemmKernel *>(
@@ -3574,20 +4079,25 @@ namespace llaminar2
             const bool native_up =
                 dynamic_cast<CPUNativeVNNIGemmKernel *>(
                     cached_up_gemm_[static_cast<size_t>(expert_id)]) != nullptr;
-            if (native_gate != native_up)
+            const bool native_down =
+                dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                    cached_down_gemm_[static_cast<size_t>(expert_id)]) != nullptr;
+            const bool any_native = native_gate || native_up || native_down;
+            const bool all_native = native_gate && native_up && native_down;
+            if (any_native != all_native)
             {
-                LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier found mixed "
-                          "gate/up kernel contracts for expert "
+                LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row execution found mixed "
+                          "gate/up/down kernel contracts for expert "
                           << expert_id << " layer=" << params_.layer_idx);
                 return false;
             }
-            any_native_gateup = any_native_gateup || native_gate;
-            all_native_gateup = all_native_gateup && native_gate;
+            any_native_bundle = any_native_bundle || all_native;
+            all_native_bundles = all_native_bundles && all_native;
         }
-        if (any_native_gateup != all_native_gateup)
+        if (any_native_bundle != all_native_bundles)
         {
-            LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier cannot mix "
-                      "NativeVNNI and floating expert gate/up contracts in layer "
+            LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row execution cannot mix "
+                      "NativeVNNI and floating expert bundles in layer "
                       << params_.layer_idx);
             return false;
         }
@@ -3595,15 +4105,41 @@ namespace llaminar2
         const Q8_1Block *published_router_q8 = nullptr;
         const int router_q8_blocks_per_row =
             (d_model + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-        if (all_native_gateup)
+        if (all_native_bundles)
         {
             auto *cpu_moe_kernel = dynamic_cast<CPUMoEKernel *>(kernel);
             const float *input_rows = params_.input->data();
             if (!cpu_moe_kernel || !input_rows)
             {
-                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped verifier "
+                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped-row execution "
                           "requires the production CPUMoEKernel router");
                 return false;
+            }
+            if (params_.cpu_router_q8_input_publication ==
+                CPURouterQ8InputPublicationPolicy::PublishTransportedRows)
+            {
+                if (!cpu_moe_kernel->publishTransportedRouterQ8Hidden(
+                        input_rows,
+                        seq_len,
+                        d_model))
+                {
+                    LOG_ERROR(
+                        "[MoEExpertComputeStage] CPU ExpertOverlay transport "
+                        "failed to publish canonical router Q8_1 rows for layer "
+                        << params_.layer_idx << " seq_len=" << seq_len
+                        << " d_model=" << d_model);
+                    return false;
+                }
+                PerfStatsCollector::addCounter(
+                    "moe_overlay",
+                    "cpu_transport_router_q8_publications",
+                    1.0,
+                    verifier_rows ? "verifier" : "prefill",
+                    params_.device_id.toString(),
+                    {{"layer", std::to_string(params_.layer_idx)},
+                     {"rows", std::to_string(seq_len)},
+                     {"d_model", std::to_string(d_model)},
+                     {"source", "fixed_capacity_ticket"}});
             }
             published_router_q8 = cpu_moe_kernel->publishedRouterQ8Hidden(
                 input_rows,
@@ -3611,7 +4147,7 @@ namespace llaminar2
                 d_model);
             if (!published_router_q8)
             {
-                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped verifier "
+                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped-row execution "
                           "is missing the matching router Q8_1 publication for layer "
                           << params_.layer_idx << " seq_len=" << seq_len
                           << " d_model=" << d_model);
@@ -3619,9 +4155,46 @@ namespace llaminar2
             }
         }
 
-        std::vector<float> route_slot_outputs(
-            local_slots.size() * static_cast<size_t>(d_model),
-            0.0f);
+        const int local_route_rows =
+            static_cast<int>(cpu_grouped_route_slots_.size());
+        auto record_cpu_moe_phase =
+            [&](const char *name,
+                PerfStatsCollector::Clock::time_point start)
+        {
+            if (!record_cpu_moe_phase_timings)
+                return;
+            const auto finish = PerfStatsCollector::Clock::now();
+            const auto duration_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    finish - start).count();
+            PerfStatsCollector::recordTimingNs(
+                "cpu_moe_grouped_rows",
+                name,
+                static_cast<uint64_t>(duration_ns),
+                verifier_rows ? "verifier" : "prefill",
+                params_.device_id.toString(),
+                {{"layer", std::to_string(params_.layer_idx)},
+                 {"seq_len", std::to_string(seq_len)},
+                 {"local_route_rows", std::to_string(local_route_rows)},
+                 {"active_experts",
+                  std::to_string(cpu_grouped_active_experts_.size())},
+                 {"purpose", verifier_rows ? "verifier" : "prefill"}});
+        };
+        record_cpu_moe_phase(
+            "route_schedule_and_bundle_validation",
+            route_schedule_start);
+
+        const auto workspace_prepare_start = record_cpu_moe_phase_timings
+                                                 ? PerfStatsCollector::Clock::now()
+                                                 : PerfStatsCollector::Clock::time_point{};
+        const int scratch_rows =
+            all_native_bundles ? local_route_rows : max_batch;
+        if (!all_native_bundles)
+        {
+            cpu_grouped_route_outputs_.resize(
+                static_cast<size_t>(local_route_rows) *
+                static_cast<size_t>(d_model));
+        }
 
         auto scratch_has_shape = [](const std::shared_ptr<FP32Tensor> &tensor,
                                     int min_rows,
@@ -3635,86 +4208,274 @@ namespace llaminar2
                    shape[1] == static_cast<size_t>(cols);
         };
 
-        auto ensure_cpu_scratch = [&](int rows) -> bool
+        if (!all_native_bundles &&
+            !scratch_has_shape(scratch_batch_, max_batch, d_model))
         {
-            if (!all_native_gateup && !scratch_has_shape(scratch_batch_, rows, d_model))
-                scratch_batch_ = makeScratchFP32(rows, d_model, params_.device_id);
-            if (!scratch_has_shape(scratch_gate_, rows, intermediate))
-                scratch_gate_ = makeScratchFP32(rows, intermediate, params_.device_id);
-            if (!scratch_has_shape(scratch_up_, rows, intermediate))
-                scratch_up_ = makeScratchFP32(rows, intermediate, params_.device_id);
-            if (!scratch_has_shape(scratch_out_, rows, d_model))
-                scratch_out_ = makeScratchFP32(rows, d_model, params_.device_id);
-            scratch_capacity_ = std::max(scratch_capacity_, rows);
-            return (all_native_gateup || scratch_batch_) &&
-                   scratch_gate_ && scratch_up_ && scratch_out_;
-        };
-
-        std::vector<Q8_1Block> gathered_router_q8;
-        if (all_native_gateup)
+            scratch_batch_ = makeScratchFP32(
+                max_batch, d_model, params_.device_id);
+        }
+        if (!scratch_has_shape(scratch_gate_, scratch_rows, intermediate))
         {
-            gathered_router_q8.resize(
-                static_cast<size_t>(4) *
-                static_cast<size_t>(router_q8_blocks_per_row));
+            scratch_gate_ = makeScratchFP32(
+                scratch_rows, intermediate, params_.device_id);
+        }
+        if (!scratch_has_shape(scratch_up_, scratch_rows, intermediate))
+        {
+            scratch_up_ = makeScratchFP32(
+                scratch_rows, intermediate, params_.device_id);
+        }
+        if (!scratch_has_shape(scratch_out_, scratch_rows, d_model))
+        {
+            scratch_out_ = makeScratchFP32(
+                scratch_rows, d_model, params_.device_id);
+        }
+        scratch_capacity_ = std::max(scratch_capacity_, scratch_rows);
+        if ((!all_native_bundles && !scratch_batch_) ||
+            !scratch_gate_ || !scratch_up_ || !scratch_out_)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row scratch allocation failed");
+            return false;
         }
 
-        for (int expert_id : active_experts)
+        if (all_native_bundles)
         {
-            const auto &slots_for_expert =
-                expert_local_slots[static_cast<size_t>(expert_id)];
-            ITensorGemm *gate_gemm = cached_gate_gemm_[static_cast<size_t>(expert_id)];
-            ITensorGemm *up_gemm = cached_up_gemm_[static_cast<size_t>(expert_id)];
-            ITensorGemm *down_gemm = cached_down_gemm_[static_cast<size_t>(expert_id)];
-            if (!gate_gemm || !up_gemm || !down_gemm)
-            {
-                LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier found null GEMM for expert "
-                          << expert_id << " layer=" << params_.layer_idx);
-                return false;
-            }
+            cpu_grouped_router_q8_.resize(
+                static_cast<size_t>(local_route_rows) *
+                static_cast<size_t>(router_q8_blocks_per_row));
+            const int swiglu_q8_blocks_per_row =
+                (intermediate + Q8_1Block::BLOCK_SIZE - 1) /
+                Q8_1Block::BLOCK_SIZE;
+            cpu_grouped_swiglu_q8_.resize(
+                static_cast<size_t>(local_route_rows) *
+                static_cast<size_t>(swiglu_q8_blocks_per_row));
+        }
+        else
+        {
+            cpu_grouped_token_indices_.resize(static_cast<size_t>(max_batch));
+        }
+        batch_projections_.clear();
+        batch_projections_.reserve(2u);
+        record_cpu_moe_phase(
+            "workspace_prepare_and_output_zero",
+            workspace_prepare_start);
 
-            for (size_t chunk_begin = 0; chunk_begin < slots_for_expert.size(); chunk_begin += 4u)
+        if (all_native_bundles)
+        {
+            /*
+             * Gather every locally owned route into one expert-major Q8_1
+             * matrix. The router is the sole hidden-state quantizer; this copy
+             * changes only row order and therefore cannot perturb arithmetic.
+             */
+            const auto router_q8_gather_start =
+                record_cpu_moe_phase_timings
+                    ? PerfStatsCollector::Clock::now()
+                    : PerfStatsCollector::Clock::time_point{};
+            auto gather_router_rows = [&]()
             {
-                const int chunk_rows = static_cast<int>(
-                    std::min<size_t>(4u, slots_for_expert.size() - chunk_begin));
-                if (!ensure_cpu_scratch(chunk_rows))
-                    return false;
-
-                std::array<int, 4> token_indices = {};
-                for (int i = 0; i < chunk_rows; ++i)
+#pragma omp for schedule(static)
+                for (int expert_position = 0;
+                     expert_position < local_route_rows;
+                     ++expert_position)
                 {
                     const int local_slot =
-                        slots_for_expert[chunk_begin + static_cast<size_t>(i)];
-                    token_indices[static_cast<size_t>(i)] =
-                        local_slots[static_cast<size_t>(local_slot)].row;
+                    cpu_grouped_expert_local_slots_[
+                            static_cast<size_t>(expert_position)];
+                    const int token_row =
+                        cpu_grouped_route_slots_[
+                            static_cast<size_t>(local_slot)].row;
+                    const Q8_1Block *source_row =
+                        published_router_q8 +
+                        static_cast<size_t>(token_row) *
+                            static_cast<size_t>(router_q8_blocks_per_row);
+                    Q8_1Block *destination_row =
+                        cpu_grouped_router_q8_.data() +
+                        static_cast<size_t>(expert_position) *
+                            static_cast<size_t>(router_q8_blocks_per_row);
+                    std::copy_n(
+                        source_row,
+                        router_q8_blocks_per_row,
+                        destination_row);
+                }
+            };
+            OMP_WORKSHARE_REGION(gather_router_rows);
+            record_cpu_moe_phase(
+                "router_q8_expert_major_gather",
+                router_q8_gather_start);
+
+            using BatchedProjection =
+                CPUNativeVNNIGemmKernel::BatchedPrequantizedProjectionDesc;
+            std::array<
+                BatchedProjection,
+                CPUNativeVNNIGemmKernel::kMaxBatchedPrequantizedProjections>
+                gate_up_projection_descriptors = {};
+            std::array<
+                BatchedProjection,
+                CPUNativeVNNIGemmKernel::kMaxBatchedPrequantizedProjections>
+                down_projection_descriptors = {};
+            int gate_up_projection_count = 0;
+            int down_projection_count = 0;
+            float *gate_rows = scratch_gate_->mutable_data();
+            float *up_rows = scratch_up_->mutable_data();
+            float *down_rows = scratch_out_->mutable_data();
+            if (!gate_rows || !up_rows || !down_rows)
+                return false;
+
+            const int swiglu_q8_blocks_per_row =
+                (intermediate + Q8_1Block::BLOCK_SIZE - 1) /
+                Q8_1Block::BLOCK_SIZE;
+            for (int expert_id : cpu_grouped_active_experts_)
+            {
+                const int expert_begin =
+                    cpu_grouped_expert_offsets_[static_cast<size_t>(expert_id)];
+                const int expert_end =
+                    cpu_grouped_expert_offsets_[
+                        static_cast<size_t>(expert_id) + 1u];
+                const int expert_rows = expert_end - expert_begin;
+                auto *native_gate =
+                    dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                        cached_gate_gemm_[static_cast<size_t>(expert_id)]);
+                auto *native_up =
+                    dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                        cached_up_gemm_[static_cast<size_t>(expert_id)]);
+                auto *native_down =
+                    dynamic_cast<CPUNativeVNNIGemmKernel *>(
+                        cached_down_gemm_[static_cast<size_t>(expert_id)]);
+                if (!native_gate || !native_up || !native_down ||
+                    gate_up_projection_count + 2 >
+                        CPUNativeVNNIGemmKernel::
+                            kMaxBatchedPrequantizedProjections ||
+                    down_projection_count >=
+                        CPUNativeVNNIGemmKernel::
+                            kMaxBatchedPrequantizedProjections)
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI batched "
+                              "FFN descriptor capacity exceeded in layer "
+                              << params_.layer_idx);
+                    return false;
                 }
 
-                if (all_native_gateup)
+                const Q8_1Block *expert_input =
+                    cpu_grouped_router_q8_.data() +
+                    static_cast<size_t>(expert_begin) *
+                        static_cast<size_t>(router_q8_blocks_per_row);
+                gate_up_projection_descriptors[
+                    static_cast<size_t>(gate_up_projection_count++)] = {
+                    .kernel = native_gate,
+                    .input_q8 = expert_input,
+                    .output = gate_rows +
+                        static_cast<size_t>(expert_begin) *
+                            static_cast<size_t>(intermediate),
+                    .bias = nullptr,
+                    .rows = expert_rows,
+                    .n = intermediate,
+                    .ldc = intermediate,
+                };
+                gate_up_projection_descriptors[
+                    static_cast<size_t>(gate_up_projection_count++)] = {
+                    .kernel = native_up,
+                    .input_q8 = expert_input,
+                    .output = up_rows +
+                        static_cast<size_t>(expert_begin) *
+                            static_cast<size_t>(intermediate),
+                    .bias = nullptr,
+                    .rows = expert_rows,
+                    .n = intermediate,
+                    .ldc = intermediate,
+                };
+                down_projection_descriptors[
+                    static_cast<size_t>(down_projection_count++)] = {
+                    .kernel = native_down,
+                    .input_q8 = cpu_grouped_swiglu_q8_.data() +
+                        static_cast<size_t>(expert_begin) *
+                            static_cast<size_t>(swiglu_q8_blocks_per_row),
+                    .output = down_rows +
+                        static_cast<size_t>(expert_begin) *
+                            static_cast<size_t>(d_model),
+                    .bias = nullptr,
+                    .rows = expert_rows,
+                    .n = d_model,
+                    .ldc = d_model,
+                };
+            }
+
+            const auto grouped_ffn_start = record_cpu_moe_phase_timings
+                                               ? PerfStatsCollector::Clock::now()
+                                               : PerfStatsCollector::Clock::time_point{};
+            if (!CPUNativeVNNIGemmKernel::
+                    execute_moe_grouped_ffn_transaction_preq_decode_equivalent(
+                        gate_up_projection_descriptors.data(),
+                        gate_up_projection_count,
+                        d_model,
+                        gate_rows,
+                        up_rows,
+                        cpu_grouped_swiglu_q8_.data(),
+                        local_route_rows,
+                        intermediate,
+                        swiglu_q8_blocks_per_row,
+                        down_projection_descriptors.data(),
+                        down_projection_count))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI layer-batched "
+                          "grouped FFN transaction failed in layer "
+                          << params_.layer_idx);
+                return false;
+            }
+            record_cpu_moe_phase(
+                "native_vnni_grouped_ffn_transaction",
+                grouped_ffn_start);
+
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_moe_native_vnni_layer_batched_expert_calls",
+                1.0,
+                verifier_rows ? "verifier" : "prefill",
+                "cpu",
+                {{"layer", std::to_string(params_.layer_idx)},
+                 {"active_experts",
+                  std::to_string(cpu_grouped_active_experts_.size())},
+                 {"local_route_rows", std::to_string(local_route_rows)},
+                 {"team_lifetime", "complete_moe_ffn"}});
+        }
+        else
+        {
+            for (int expert_id : cpu_grouped_active_experts_)
+            {
+                const int expert_begin =
+                    cpu_grouped_expert_offsets_[static_cast<size_t>(expert_id)];
+                const int expert_end =
+                    cpu_grouped_expert_offsets_[
+                        static_cast<size_t>(expert_id) + 1u];
+                const int expert_rows = expert_end - expert_begin;
+                ITensorGemm *gate_gemm =
+                    cached_gate_gemm_[static_cast<size_t>(expert_id)];
+                ITensorGemm *up_gemm =
+                    cached_up_gemm_[static_cast<size_t>(expert_id)];
+                ITensorGemm *down_gemm =
+                    cached_down_gemm_[static_cast<size_t>(expert_id)];
+                if (!gate_gemm || !up_gemm || !down_gemm)
                 {
-                    for (int i = 0; i < chunk_rows; ++i)
-                    {
-                        const Q8_1Block *source_row =
-                            published_router_q8 +
-                            static_cast<size_t>(token_indices[static_cast<size_t>(i)]) *
-                                static_cast<size_t>(router_q8_blocks_per_row);
-                        Q8_1Block *destination_row =
-                            gathered_router_q8.data() +
-                            static_cast<size_t>(i) *
-                                static_cast<size_t>(router_q8_blocks_per_row);
-                        std::copy_n(
-                            source_row,
-                            router_q8_blocks_per_row,
-                            destination_row);
-                    }
+                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row execution "
+                              "found null GEMM for expert "
+                              << expert_id << " layer=" << params_.layer_idx);
+                    return false;
                 }
-                else
+
+                for (int expert_row = 0; expert_row < expert_rows; ++expert_row)
                 {
-                    kernel->gatherTokenBatchFromTensors(
-                        params_.input,
-                        scratch_batch_.get(),
-                        token_indices.data(),
-                        chunk_rows,
-                        d_model);
+                    const int local_slot =
+                        cpu_grouped_expert_local_slots_[
+                            static_cast<size_t>(expert_begin + expert_row)];
+                    cpu_grouped_token_indices_[
+                        static_cast<size_t>(expert_row)] =
+                        cpu_grouped_route_slots_[
+                            static_cast<size_t>(local_slot)].row;
                 }
+                kernel->gatherTokenBatchFromTensors(
+                    params_.input,
+                    scratch_batch_.get(),
+                    cpu_grouped_token_indices_.data(),
+                    expert_rows,
+                    d_model);
 
                 batch_projections_.clear();
                 batch_projections_.push_back(
@@ -3722,89 +4483,77 @@ namespace llaminar2
                 batch_projections_.push_back(
                     {up_gemm, scratch_up_.get(), intermediate, nullptr, "up"});
 
-                bool projected = false;
-                if (all_native_gateup)
-                {
-                    auto *native_gate =
-                        dynamic_cast<CPUNativeVNNIGemmKernel *>(gate_gemm);
-                    projected = native_gate &&
-                                native_gate->multiply_fused_router_q8_hidden_decode_equivalent(
-                                    gathered_router_q8.data(),
-                                    batch_projections_,
-                                    chunk_rows,
-                                    d_model);
-                }
-                else if (chunk_rows > 1)
-                {
-                    projected = gate_gemm->multiply_fused_verifier_rows_decode_equivalent(
-                        scratch_batch_.get(),
-                        batch_projections_,
-                        chunk_rows,
-                        d_model,
-                        nullptr,
-                        getWorkspace());
-                }
-                else
-                {
-                    projected = gate_gemm->multiply_fused_tensor(
-                        scratch_batch_.get(),
-                        batch_projections_,
-                        chunk_rows,
-                        d_model,
-                        nullptr,
-                        getWorkspace());
-                }
+                const bool projected = verifier_rows && expert_rows > 1
+                    ? gate_gemm->multiply_fused_verifier_rows_decode_equivalent(
+                          scratch_batch_.get(),
+                          batch_projections_,
+                          expert_rows,
+                          d_model,
+                          nullptr,
+                          getWorkspace())
+                    : gate_gemm->multiply_fused_tensor(
+                          scratch_batch_.get(),
+                          batch_projections_,
+                          expert_rows,
+                          d_model,
+                          nullptr,
+                          getWorkspace());
                 if (!projected)
                 {
-                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier gate/up projection failed"
+                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row gate/up projection failed"
                               << " expert=" << expert_id
-                              << " rows=" << chunk_rows
+                              << " rows=" << expert_rows
                               << " layer=" << params_.layer_idx);
                     return false;
                 }
 
-                const bool down_ok =
-                    chunk_rows > 1
-                        ? down_gemm->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                const bool down_ok = verifier_rows && expert_rows > 1
+                    ? down_gemm->
+                          multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
                               scratch_gate_.get(),
                               scratch_up_.get(),
                               scratch_out_.get(),
-                              chunk_rows,
+                              expert_rows,
                               d_model,
                               intermediate,
                               1.0f,
                               0.0f,
                               getWorkspace())
-                        : fusedSwigluDown(
-                              *this,
-                              scratch_gate_.get(),
-                              scratch_up_.get(),
-                              scratch_out_.get(),
-                              down_gemm,
-                              chunk_rows,
-                              d_model,
-                              intermediate,
-                              getWorkspace());
+                    : fusedSwigluDown(
+                          *this,
+                          scratch_gate_.get(),
+                          scratch_up_.get(),
+                          scratch_out_.get(),
+                          down_gemm,
+                          expert_rows,
+                          d_model,
+                          intermediate,
+                          getWorkspace());
                 if (!down_ok)
                 {
-                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped verifier SwiGLU/down projection failed"
+                    LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row SwiGLU/down projection failed"
                               << " expert=" << expert_id
-                              << " rows=" << chunk_rows
+                              << " rows=" << expert_rows
                               << " layer=" << params_.layer_idx);
                     return false;
                 }
 
-                const float *down_rows = scratch_out_->data();
-                if (!down_rows)
+                const float *expert_down_rows = scratch_out_->data();
+                if (!expert_down_rows)
                     return false;
-                for (int i = 0; i < chunk_rows; ++i)
+                for (int expert_row = 0;
+                     expert_row < expert_rows;
+                     ++expert_row)
                 {
                     const int local_slot =
-                        slots_for_expert[chunk_begin + static_cast<size_t>(i)];
+                        cpu_grouped_expert_local_slots_[
+                            static_cast<size_t>(expert_begin + expert_row)];
                     std::copy_n(
-                        down_rows + static_cast<size_t>(i) * static_cast<size_t>(d_model),
+                        expert_down_rows +
+                            static_cast<size_t>(expert_row) *
+                                static_cast<size_t>(d_model),
                         d_model,
-                        route_slot_outputs.data() +
+                        cpu_grouped_route_outputs_.data() +
                             static_cast<size_t>(local_slot) *
                                 static_cast<size_t>(d_model));
                 }
@@ -3812,55 +4561,128 @@ namespace llaminar2
         }
 
         float *output = params_.output->mutable_data();
-        if (!output)
+        float *canonical_routes =
+            params_.canonical_route_contributions
+                ? params_.canonical_route_contributions->mutable_data()
+                : nullptr;
+        if (!output ||
+            (params_.canonical_route_contributions && !canonical_routes))
             return false;
-        for (int row = 0; row < seq_len; ++row)
+        const float *native_down_rows =
+            all_native_bundles ? scratch_out_->data() : nullptr;
+        if (all_native_bundles && !native_down_rows)
+            return false;
+
+        /*
+         * Rows are independent. A complete local owner folds routes directly
+         * with the exact serial top-k FMA order. A distributed CPU owner instead
+         * publishes the raw expert result into its original route slot; the
+         * collective preserves that slot identity and the canonical reducer
+         * performs the same serial FMA loop after all owners are visible.
+         */
+        const auto accumulate_start = record_cpu_moe_phase_timings
+                                          ? PerfStatsCollector::Clock::now()
+                                          : PerfStatsCollector::Clock::time_point{};
+        auto accumulate_rows = [&]()
         {
-            float *row_output =
-                output + static_cast<size_t>(row) * static_cast<size_t>(d_model);
-            for (int route = 0; route < top_k; ++route)
+#pragma omp for schedule(static)
+            for (int row = 0; row < seq_len; ++row)
             {
-                const size_t flat_slot =
-                    static_cast<size_t>(row) * static_cast<size_t>(top_k) +
-                    static_cast<size_t>(route);
-                const int local_slot = original_slot_to_local[flat_slot];
-                if (local_slot < 0)
-                    continue;
-                const auto &slot = local_slots[static_cast<size_t>(local_slot)];
-                primitives::vec_axpy(
-                    row_output,
-                    route_slot_outputs.data() +
-                        static_cast<size_t>(local_slot) *
-                            static_cast<size_t>(d_model),
-                    slot.weight,
-                    d_model);
+                float *row_output =
+                    output + static_cast<size_t>(row) *
+                        static_cast<size_t>(d_model);
+                for (int route = 0; route < top_k; ++route)
+                {
+                    const size_t flat_slot =
+                        static_cast<size_t>(row) *
+                            static_cast<size_t>(top_k) +
+                        static_cast<size_t>(route);
+                    const int local_slot =
+                        cpu_grouped_original_to_local_[flat_slot];
+                    if (local_slot < 0)
+                        continue;
+                    const auto &slot =
+                        cpu_grouped_route_slots_[
+                            static_cast<size_t>(local_slot)];
+                    const int output_position = all_native_bundles
+                        ? cpu_grouped_local_to_expert_position_[
+                              static_cast<size_t>(local_slot)]
+                        : local_slot;
+                    const float *route_output = all_native_bundles
+                        ? native_down_rows +
+                              static_cast<size_t>(output_position) *
+                                  static_cast<size_t>(d_model)
+                        : cpu_grouped_route_outputs_.data() +
+                              static_cast<size_t>(output_position) *
+                                  static_cast<size_t>(d_model);
+                    if (canonical_routes)
+                    {
+                        float *destination = nullptr;
+                        if (packed_canonical_records)
+                        {
+                            destination = canonical_moe_route_record::record(
+                                canonical_routes,
+                                static_cast<size_t>(local_slot),
+                                d_model);
+                        }
+                        else
+                        {
+                            destination =
+                                canonical_routes +
+                                flat_slot * static_cast<size_t>(d_model);
+                        }
+                        std::copy_n(
+                            route_output,
+                            d_model,
+                            destination);
+                    }
+                    else
+                    {
+                        primitives::vec_axpy(
+                            row_output,
+                            route_output,
+                            slot.weight,
+                            d_model);
+                    }
+                }
             }
-        }
+        };
+        OMP_WORKSHARE_REGION(accumulate_rows);
+        record_cpu_moe_phase(
+            canonical_routes
+                ? "canonical_route_slot_publication"
+                : "ordered_topk_accumulation",
+            accumulate_start);
 
         PerfStatsCollector::addCounter(
-            "mtp",
-            "moe_routed_grouped_decode_equivalent_verifier_prefill_rows",
+            verifier_rows ? "mtp" : "prefill",
+            verifier_rows
+                ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
+                : "moe_routed_grouped_decode_equivalent_prefill_rows",
             static_cast<double>(seq_len),
-            "verifier",
+            verifier_rows ? "verifier" : "prefill",
             params_.device_id.toString(),
             {{"stage", "routed_expert"},
              {"route", "cpu_expert_slot_grouped"},
-             {"local_route_slots", std::to_string(local_slots.size())},
-             {"active_experts", std::to_string(active_experts.size())},
+             {"local_route_slots", std::to_string(cpu_grouped_route_slots_.size())},
+             {"active_experts", std::to_string(cpu_grouped_active_experts_.size())},
              {"seq_len", std::to_string(seq_len)},
              {"top_k", std::to_string(top_k)}});
-        if (all_native_gateup)
+        if (all_native_bundles)
         {
             PerfStatsCollector::addCounter(
                 "kernel",
-                "cpu_moe_grouped_verifier_router_q8_reuse_calls",
+                verifier_rows
+                    ? "cpu_moe_grouped_verifier_router_q8_reuse_calls"
+                    : "cpu_moe_prefill_router_q8_reuse_calls",
                 1.0,
                 "moe",
                 "cpu",
                 {{"seq_len", std::to_string(seq_len)},
                  {"top_k", std::to_string(top_k)},
-                 {"active_experts", std::to_string(active_experts.size())},
-                 {"route", "cpu_expert_slot_grouped"}});
+                 {"active_experts", std::to_string(cpu_grouped_active_experts_.size())},
+                 {"route", "cpu_expert_slot_grouped"},
+                 {"purpose", verifier_rows ? "verifier" : "prefill"}});
         }
         return true;
     }
@@ -3960,7 +4782,11 @@ namespace llaminar2
         }
 
         if (!is_gpu)
-            return executeCPUGroupedDecodeEquivalentVerifierPrefill(ctx);
+        {
+            return executeCPUGroupedDecodeEquivalentRows(
+                ctx,
+                CPUGroupedRowsPurpose::MTPVerifier);
+        }
 
         IMoEKernel *kernel = ensureMoEKernel();
         if (!kernel)
@@ -4027,15 +4853,9 @@ namespace llaminar2
             cached_up_gemm_.resize(num_experts, nullptr);
             cached_down_gemm_.resize(num_experts, nullptr);
 
-            const int local_start = params_.local_expert_start;
-            const int local_count = (params_.local_expert_count < 0)
-                                        ? num_experts
-                                        : params_.local_expert_count;
-            const int local_end = local_start + local_count;
-
-            for (int e = local_start; e < local_end; ++e)
+            for (int e = 0; e < num_experts; ++e)
             {
-                if (!params_.expert_mask.empty() && !params_.expert_mask[e])
+                if (!expertComputesLocally(e))
                     continue;
                 cached_gate_gemm_[e] = params_.prepared_store->expertGemmKernel(*params_.gate_slab_ref, e);
                 cached_up_gemm_[e] = params_.prepared_store->expertGemmKernel(*params_.up_slab_ref, e);
@@ -4217,48 +5037,92 @@ namespace llaminar2
             return false;
         }
 
-        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(static_cast<size_t>(params_.num_experts));
-        std::vector<DeviceNativeVNNIMatrixDesc> up_descs(static_cast<size_t>(params_.num_experts));
+        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(
+            static_cast<size_t>(params_.num_experts));
+        std::vector<DeviceNativeVNNIMatrixDesc> up_descs(
+            static_cast<size_t>(params_.num_experts));
+        std::vector<DeviceMoEFloatingMatrixDesc> floating_gate_descs(
+            static_cast<size_t>(params_.num_experts));
+        std::vector<DeviceMoEFloatingMatrixDesc> floating_up_descs(
+            static_cast<size_t>(params_.num_experts));
+        std::optional<DeviceMoEWeightFormat> table_format;
         int valid_descs = 0;
         for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
         {
             if (cached_gate_gemm_.size() <= static_cast<size_t>(expert_id) ||
                 cached_up_gemm_.size() <= static_cast<size_t>(expert_id) ||
+                cached_down_gemm_.size() <= static_cast<size_t>(expert_id) ||
                 !cached_gate_gemm_[static_cast<size_t>(expert_id)] ||
-                !cached_up_gemm_[static_cast<size_t>(expert_id)])
+                !cached_up_gemm_[static_cast<size_t>(expert_id)] ||
+                !cached_down_gemm_[static_cast<size_t>(expert_id)])
             {
                 continue;
             }
 
-            DeviceNativeVNNIMatrixDesc gate_desc;
-            DeviceNativeVNNIMatrixDesc up_desc;
-            if (!cached_gate_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(gate_desc) ||
-                !cached_up_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(up_desc) ||
-                gate_desc.n != intermediate || gate_desc.k != d_model ||
-                up_desc.n != intermediate || up_desc.k != d_model)
+            DeviceMoEExpertDescriptor exported;
+            if (!exportDeviceMoEExpertWeightDescriptors(
+                    cached_gate_gemm_[static_cast<size_t>(expert_id)],
+                    cached_up_gemm_[static_cast<size_t>(expert_id)],
+                    cached_down_gemm_[static_cast<size_t>(expert_id)],
+                    d_model,
+                    intermediate,
+                    exported))
             {
                 LOG_DEBUG("[MoEExpertComputeStage] Unable to export grouped gate/up descriptor for expert "
                           << expert_id << " layer " << params_.layer_idx);
                 return false;
             }
+            if (table_format && *table_format != exported.weight_format)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Mixed routed-expert weight formats in layer "
+                          << params_.layer_idx << " expert=" << expert_id);
+                return false;
+            }
+            table_format = exported.weight_format;
 
-            gate_descs[static_cast<size_t>(expert_id)] = gate_desc;
-            up_descs[static_cast<size_t>(expert_id)] = up_desc;
+            if (exported.weight_format == DeviceMoEWeightFormat::NativeVNNI)
+            {
+                gate_descs[static_cast<size_t>(expert_id)] = exported.gate;
+                up_descs[static_cast<size_t>(expert_id)] = exported.up;
+            }
+            else
+            {
+                floating_gate_descs[static_cast<size_t>(expert_id)] =
+                    exported.floating_gate;
+                floating_up_descs[static_cast<size_t>(expert_id)] =
+                    exported.floating_up;
+            }
             ++valid_descs;
         }
 
-        if (valid_descs == 0)
+        if (valid_descs == 0 || !table_format)
             return false;
 
         int table_id = grouped_gateup_desc_table_id_;
         if (table_id >= 0 &&
             grouped_gateup_desc_table_num_experts_ == params_.num_experts &&
             grouped_gateup_desc_table_d_model_ == d_model &&
-            grouped_gateup_desc_table_intermediate_ == intermediate)
+            grouped_gateup_desc_table_intermediate_ == intermediate &&
+            grouped_gateup_desc_table_weight_format_ == *table_format)
         {
-            if (!kernel->updateGroupedExpertGateUpDescriptorTables(
-                    table_id, gate_descs.data(), up_descs.data(),
-                    params_.num_experts, d_model, intermediate))
+            const bool updated =
+                *table_format == DeviceMoEWeightFormat::NativeVNNI
+                    ? kernel->updateGroupedExpertGateUpDescriptorTables(
+                          table_id,
+                          gate_descs.data(),
+                          up_descs.data(),
+                          params_.num_experts,
+                          d_model,
+                          intermediate)
+                    : kernel->updateGroupedExpertFloatingGateUpDescriptorTables(
+                          table_id,
+                          floating_gate_descs.data(),
+                          floating_up_descs.data(),
+                          *table_format,
+                          params_.num_experts,
+                          d_model,
+                          intermediate);
+            if (!updated)
             {
                 return false;
             }
@@ -4266,8 +5130,20 @@ namespace llaminar2
             return true;
         }
 
-        table_id = kernel->uploadGroupedExpertGateUpDescriptorTables(
-            gate_descs.data(), up_descs.data(), params_.num_experts, d_model, intermediate);
+        table_id = *table_format == DeviceMoEWeightFormat::NativeVNNI
+                       ? kernel->uploadGroupedExpertGateUpDescriptorTables(
+                             gate_descs.data(),
+                             up_descs.data(),
+                             params_.num_experts,
+                             d_model,
+                             intermediate)
+                       : kernel->uploadGroupedExpertFloatingGateUpDescriptorTables(
+                             floating_gate_descs.data(),
+                             floating_up_descs.data(),
+                             *table_format,
+                             params_.num_experts,
+                             d_model,
+                             intermediate);
         if (table_id < 0)
             return false;
 
@@ -4275,6 +5151,7 @@ namespace llaminar2
         grouped_gateup_desc_table_num_experts_ = params_.num_experts;
         grouped_gateup_desc_table_d_model_ = d_model;
         grouped_gateup_desc_table_intermediate_ = intermediate;
+        grouped_gateup_desc_table_weight_format_ = *table_format;
         grouped_gateup_desc_table_dirty_ = false;
         runtime_grouped_decode_launch_state_prepared_ = false;
         return true;
@@ -4302,41 +5179,83 @@ namespace llaminar2
             return false;
         }
 
-        std::vector<DeviceNativeVNNIMatrixDesc> down_descs(static_cast<size_t>(params_.num_experts));
+        std::vector<DeviceNativeVNNIMatrixDesc> down_descs(
+            static_cast<size_t>(params_.num_experts));
+        std::vector<DeviceMoEFloatingMatrixDesc> floating_down_descs(
+            static_cast<size_t>(params_.num_experts));
+        std::optional<DeviceMoEWeightFormat> table_format;
         int valid_descs = 0;
         for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
         {
-            if (cached_down_gemm_.size() <= static_cast<size_t>(expert_id) ||
+            if (cached_gate_gemm_.size() <= static_cast<size_t>(expert_id) ||
+                cached_up_gemm_.size() <= static_cast<size_t>(expert_id) ||
+                cached_down_gemm_.size() <= static_cast<size_t>(expert_id) ||
+                !cached_gate_gemm_[static_cast<size_t>(expert_id)] ||
+                !cached_up_gemm_[static_cast<size_t>(expert_id)] ||
                 !cached_down_gemm_[static_cast<size_t>(expert_id)])
             {
                 continue;
             }
 
-            DeviceNativeVNNIMatrixDesc desc;
-            if (!cached_down_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc) ||
-                desc.n != d_model || desc.k != intermediate)
+            DeviceMoEExpertDescriptor exported;
+            if (!exportDeviceMoEExpertWeightDescriptors(
+                    cached_gate_gemm_[static_cast<size_t>(expert_id)],
+                    cached_up_gemm_[static_cast<size_t>(expert_id)],
+                    cached_down_gemm_[static_cast<size_t>(expert_id)],
+                    d_model,
+                    intermediate,
+                    exported))
             {
                 LOG_DEBUG("[MoEExpertComputeStage] Unable to export grouped down descriptor for expert "
                           << expert_id << " layer " << params_.layer_idx);
                 return false;
             }
+            if (table_format && *table_format != exported.weight_format)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Mixed routed-expert weight formats in layer "
+                          << params_.layer_idx << " expert=" << expert_id);
+                return false;
+            }
+            table_format = exported.weight_format;
 
-            down_descs[static_cast<size_t>(expert_id)] = desc;
+            if (exported.weight_format == DeviceMoEWeightFormat::NativeVNNI)
+            {
+                down_descs[static_cast<size_t>(expert_id)] = exported.down;
+            }
+            else
+            {
+                floating_down_descs[static_cast<size_t>(expert_id)] =
+                    exported.floating_down;
+            }
             ++valid_descs;
         }
 
-        if (valid_descs == 0)
+        if (valid_descs == 0 || !table_format)
             return false;
 
         int table_id = grouped_down_desc_table_id_;
         if (table_id >= 0 &&
             grouped_down_desc_table_num_experts_ == params_.num_experts &&
             grouped_down_desc_table_d_model_ == d_model &&
-            grouped_down_desc_table_intermediate_ == intermediate)
+            grouped_down_desc_table_intermediate_ == intermediate &&
+            grouped_down_desc_table_weight_format_ == *table_format)
         {
-            if (!kernel->updateGroupedExpertDownDescriptorTable(
-                    table_id, down_descs.data(),
-                    params_.num_experts, d_model, intermediate))
+            const bool updated =
+                *table_format == DeviceMoEWeightFormat::NativeVNNI
+                    ? kernel->updateGroupedExpertDownDescriptorTable(
+                          table_id,
+                          down_descs.data(),
+                          params_.num_experts,
+                          d_model,
+                          intermediate)
+                    : kernel->updateGroupedExpertFloatingDownDescriptorTable(
+                          table_id,
+                          floating_down_descs.data(),
+                          *table_format,
+                          params_.num_experts,
+                          d_model,
+                          intermediate);
+            if (!updated)
             {
                 return false;
             }
@@ -4344,8 +5263,18 @@ namespace llaminar2
             return true;
         }
 
-        table_id = kernel->uploadGroupedExpertDownDescriptorTable(
-            down_descs.data(), params_.num_experts, d_model, intermediate);
+        table_id = *table_format == DeviceMoEWeightFormat::NativeVNNI
+                       ? kernel->uploadGroupedExpertDownDescriptorTable(
+                             down_descs.data(),
+                             params_.num_experts,
+                             d_model,
+                             intermediate)
+                       : kernel->uploadGroupedExpertFloatingDownDescriptorTable(
+                             floating_down_descs.data(),
+                             *table_format,
+                             params_.num_experts,
+                             d_model,
+                             intermediate);
         if (table_id < 0)
             return false;
 
@@ -4353,6 +5282,7 @@ namespace llaminar2
         grouped_down_desc_table_num_experts_ = params_.num_experts;
         grouped_down_desc_table_d_model_ = d_model;
         grouped_down_desc_table_intermediate_ = intermediate;
+        grouped_down_desc_table_weight_format_ = *table_format;
         grouped_down_desc_table_dirty_ = false;
         runtime_grouped_decode_launch_state_prepared_ = false;
         return true;
@@ -4508,8 +5438,10 @@ namespace llaminar2
                 return false;
             }
             if (has_replicas &&
-                (params_.replica_set.is_replicated.size() != static_cast<size_t>(params_.num_experts) ||
-                 params_.replica_set.owner_socket.size() != static_cast<size_t>(params_.num_experts)))
+                (!params_.replica_set.hasLayerReplicaPlacement() ||
+                 params_.replica_set.base_ownership.expertCount() != params_.num_experts ||
+                 params_.layer_idx < 0 ||
+                 params_.layer_idx >= params_.replica_set.base_ownership.layerCount()))
             {
                 LOG_ERROR("[MoEExpertComputeStage] Cannot initialize MoE runtime decode bank for layer "
                           << params_.layer_idx << ": replica metadata does not match num_experts="
@@ -4567,7 +5499,8 @@ namespace llaminar2
                     has_replicas && params_.replica_set.isReplicatedForLayer(params_.layer_idx, expert_id);
                 int owner_participant = params_.my_socket_id;
                 if (has_replicas)
-                    owner_participant = params_.replica_set.owner_socket[static_cast<size_t>(expert_id)];
+                    owner_participant = params_.replica_set.ownerParticipant(
+                        params_.layer_idx, expert_id);
 
                 uint32_t resident_mask = 0u;
                 if (owner_participant >= 0 && owner_participant < participant_count)
@@ -4598,13 +5531,18 @@ namespace llaminar2
                 if (!expertComputesLocally(expert_id))
                     continue;
 
-                if (!cached_gate_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.gate) ||
-                    !cached_up_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.up) ||
-                    !cached_down_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.down))
+                if (!exportDeviceMoEExpertWeightDescriptors(
+                        cached_gate_gemm_[static_cast<size_t>(expert_id)],
+                        cached_up_gemm_[static_cast<size_t>(expert_id)],
+                        cached_down_gemm_[static_cast<size_t>(expert_id)],
+                        params_.d_model,
+                        params_.expert_intermediate,
+                        desc))
                 {
                     LOG_DEBUG("[MoEExpertComputeStage] Cannot initialize MoE runtime decode bank for layer "
                               << params_.layer_idx << " expert " << expert_id
-                              << ": prepared GEMM engines did not export native-VNNI descriptors");
+                              << ": prepared GEMM engines did not export a uniform "
+                                 "NativeVNNI/FP16/BF16/FP32 descriptor family");
                     return false;
                 }
 
@@ -4652,12 +5590,7 @@ namespace llaminar2
         int participant_count = params_.participant_count;
         const bool has_replicas = params_.replica_set.num_replicated > 0;
         if (participant_count <= 0 && has_replicas)
-            participant_count = params_.replica_set.num_sockets;
-        if (participant_count <= 0 && has_replicas)
-        {
-            for (int owner : params_.replica_set.owner_socket)
-                participant_count = std::max(participant_count, owner + 1);
-        }
+            participant_count = params_.replica_set.participantCount();
         if (participant_count <= 0)
             participant_count = std::max(1, params_.my_socket_id + 1);
         return participant_count;
@@ -4778,8 +5711,10 @@ namespace llaminar2
                 return false;
             }
             if (has_replicas &&
-                (params_.replica_set.is_replicated.size() != static_cast<size_t>(params_.num_experts) ||
-                 params_.replica_set.owner_socket.size() != static_cast<size_t>(params_.num_experts)))
+                (!params_.replica_set.hasLayerReplicaPlacement() ||
+                 params_.replica_set.base_ownership.expertCount() != params_.num_experts ||
+                 params_.layer_idx < 0 ||
+                 params_.layer_idx >= params_.replica_set.base_ownership.layerCount()))
             {
                 return false;
             }
@@ -4819,8 +5754,14 @@ namespace llaminar2
                 if (owner_participant >= 0 && owner_participant < participant_count)
                     effective_resident_mask |=
                         1u << static_cast<uint32_t>(owner_participant);
+                const bool external_to_domain =
+                    owner_participant == -1 &&
+                    effective_resident_mask == 0u &&
+                    bank->local_compute_mask[
+                        static_cast<size_t>(expert_id)] == 0u;
                 if ((raw_resident_mask & ~valid_mask) != 0u ||
-                    effective_resident_mask == 0u ||
+                    (effective_resident_mask == 0u &&
+                     !external_to_domain) ||
                     expert.logical_expert_id != expert_id ||
                     owner_participant < -1 ||
                     owner_participant >= participant_count)
@@ -4834,7 +5775,8 @@ namespace llaminar2
             {
                 owner_participant = params_.my_socket_id;
                 if (has_replicas)
-                    owner_participant = params_.replica_set.owner_socket[static_cast<size_t>(expert_id)];
+                    owner_participant = params_.replica_set.ownerParticipant(
+                        params_.layer_idx, expert_id);
                 replicated =
                     has_replicas &&
                     params_.replica_set.isReplicatedForLayer(params_.layer_idx, expert_id);
@@ -4853,7 +5795,13 @@ namespace llaminar2
             uint32_t expected_resident_mask = 0u;
             if (owner_participant >= 0 && owner_participant < participant_count)
                 expected_resident_mask |= (1u << static_cast<uint32_t>(owner_participant));
-            if (!mutable_runtime_descriptors && replicated)
+            // A graph-initialized runtime bank is the sole placement authority
+            // when it carries explicit owner metadata.  In that mode the stage
+            // may intentionally have no static ReplicaSet at all, so consulting
+            // it here would both violate ownership and index an absent geometry.
+            // Static banks still reconstruct the expected mask from ReplicaSet
+            // and compare it below.
+            if (!runtime_owner_metadata && replicated)
             {
                 for (int participant = 0; participant < participant_count; ++participant)
                 {
@@ -4902,9 +5850,7 @@ namespace llaminar2
                 continue;
 
             if (expert.local_slot < 0 ||
-                !expert.gate.valid() ||
-                !expert.up.valid() ||
-                !expert.down.valid() ||
+                !expert.weightsReady() ||
                 !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::Valid) ||
                 !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::Resident) ||
                 !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::LocalCompute))
@@ -5185,10 +6131,10 @@ namespace llaminar2
     }
 
     bool MoEExpertComputeStage::
-        requestsTransferBackedCurrentBatchPrefillLLEP() const noexcept
+        usesGraphPhasedCurrentBatchPrefillLLEP() const noexcept
     {
         return params_.prefill_llep_assignment_mode ==
-               PrefillLLEPAssignmentMode::TransferBackedCurrentBatch;
+               PrefillLLEPAssignmentMode::GraphPhasedCurrentBatch;
     }
 
     bool MoEExpertComputeStage::hasValidCompactLLEPTransferBinding() const
@@ -5223,18 +6169,11 @@ namespace llaminar2
                params_.prefill_llep_rebalance_config.participant_count;
     }
 
-    bool MoEExpertComputeStage::hasTransferBackedPrefillLLEP() const
-    {
-        return requestsTransferBackedCurrentBatchPrefillLLEP() &&
-               params_.seq_len > 1 &&
-               hasValidCompactLLEPTransferBinding();
-    }
-
-    bool MoEExpertComputeStage::executeTransferBackedPrefillLLEPMovement(
+    bool MoEExpertComputeStage::
+        executePrefixRuntimeRehydrationPayloadMovement(
         IMoEKernel *kernel,
         DeviceMoERebalanceStatus **transfer_status_out,
         DeviceMoERebalanceApplyStatus **apply_status_out,
-        PrefillLLEPTransferPurpose purpose,
         DeviceMoERebalanceTransferState *transfer_state_override) const
     {
         if (!kernel)
@@ -5269,18 +6208,15 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * These transaction shapes share transport storage, but they do not
-         * share evidence ownership. Rehydration publishes an already-restored
-         * prefix state and must preserve its histogram window. Current-batch
-         * movement consumes that window and starts the next one. Keep the
-         * distinction in this typed policy derivation so every kernel in the
-         * transaction observes one coherent immutable config value.
-         */
+        /* Prefix rehydration publishes placement and histogram evidence that
+         * was already restored from the portable snapshot. This transport must
+         * preserve that evidence so the first maintenance decision after a
+         * cache hit matches uninterrupted execution. Current-batch movement is
+         * owned by MoEGPUCurrentBatchLLEPStage and never enters this method. */
         const DeviceMoERebalanceConfig config =
             prefillLLEPTransferConfig(
                 params_.prefill_llep_rebalance_config,
-                purpose);
+                PrefillLLEPTransferPurpose::PrefixRuntimeRehydration);
         if (tracePrefillLLEPStatusEnabled())
         {
             LOG_INFO("[MoEExpertComputeStage] prefill LLEP transfer config"
@@ -5334,6 +6270,11 @@ namespace llaminar2
             bound_workspace_->getBuffer(prefillLLEPWorkspaceBufferName(
                 MoEDeviceRebalanceStage::WS_GATHERED_COMMAND_HEADER,
                 workspace_name)));
+        auto *transfer_slot_claim_index =
+            static_cast<DeviceMoETransferSlotClaimIndex *>(
+                bound_workspace_->getBuffer(prefillLLEPWorkspaceBufferName(
+                    MoEDeviceRebalanceStage::WS_TRANSFER_SLOT_CLAIM_INDEX,
+                    workspace_name)));
         auto *status = static_cast<DeviceMoERebalanceStatus *>(
             bound_workspace_->getBuffer(prefillLLEPLayerPublicationBufferName(
                 MoEDeviceRebalanceStage::WS_STATUS,
@@ -5359,6 +6300,7 @@ namespace llaminar2
 
         if (!plan_entries || !plan_count || !command_header ||
             !gathered_plan_entries || !gathered_command_headers ||
+            !transfer_slot_claim_index ||
             !status || !apply_status || !local_source_descriptors ||
             !local_payload || !gathered_payload)
         {
@@ -5368,6 +6310,8 @@ namespace llaminar2
                       << " command_header=" << static_cast<void *>(command_header)
                       << " gathered_plan_entries=" << static_cast<void *>(gathered_plan_entries)
                       << " gathered_command_headers=" << static_cast<void *>(gathered_command_headers)
+                      << " transfer_slot_claim_index="
+                      << static_cast<void *>(transfer_slot_claim_index)
                       << " status=" << static_cast<void *>(status)
                       << " apply_status=" << static_cast<void *>(apply_status)
                       << " local_source_descriptors=" << static_cast<void *>(local_source_descriptors)
@@ -5427,8 +6371,8 @@ namespace llaminar2
                 static_cast<uint32_t>(params_.layer_idx),
                 1))
         {
-                LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill command materialization failed");
-                return false;
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed prefix-runtime rehydration command materialization failed");
+            return false;
         }
         IBackend *backend = getBackendFor(params_.device_id);
         if (!tracePrefillLLEPStatus(
@@ -5454,6 +6398,10 @@ namespace llaminar2
             return false;
         }
 
+        /* Prefix rehydration restores participant-owned request lists, so it
+         * gathers those lists before destination projection. Ordinary
+         * current-batch LLEP derives mirrored commands locally and uses no
+         * metadata collective. */
         static_assert((sizeof(DeviceMoERebalancePlanEntry) % sizeof(int32_t)) == 0);
         static_assert((sizeof(DeviceMoERebalanceCommandBufferHeader) % sizeof(int32_t)) == 0);
         const size_t plan_int32_words =
@@ -5469,10 +6417,10 @@ namespace llaminar2
                 static_cast<int>(config.participant_id),
                 transfer_stream,
                 workspace_name.empty()
-                    ? std::string("moe_prefill_llep_transfer_plan")
+                    ? std::string("moe_prefix_runtime_rehydration_transfer_plan")
                     : workspace_name + "_plan"))
         {
-            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill plan allgather failed");
+            LOG_ERROR("[MoEExpertComputeStage] Prefix-runtime rehydration plan allgather failed");
             return false;
         }
         if (!params_.prefill_llep_tp_ctx->allgatherRawOnStream(
@@ -5483,10 +6431,10 @@ namespace llaminar2
                 static_cast<int>(config.participant_id),
                 transfer_stream,
                 workspace_name.empty()
-                    ? std::string("moe_prefill_llep_transfer_header")
+                    ? std::string("moe_prefix_runtime_rehydration_transfer_header")
                     : workspace_name + "_header"))
         {
-            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill command-header allgather failed");
+            LOG_ERROR("[MoEExpertComputeStage] Prefix-runtime rehydration command-header allgather failed");
             return false;
         }
         if (!kernel->projectPrefillLeastLoadedDomainCommands(
@@ -5503,6 +6451,7 @@ namespace llaminar2
                 runtime_layers,
                 params_.prefill_llep_transfer_slots,
                 params_.prefill_llep_transfer_slot_count,
+                transfer_slot_claim_index,
                 1))
         {
             LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill domain command projection failed");
@@ -5852,22 +6801,33 @@ namespace llaminar2
                     RoutedExpertAssignmentPolicy::LeastLoadedResident;
             if (requires_participant_assignment)
             {
-                /*
-                 * LLEP planning consumes global route counts before it can
-                 * assign participants. This first publication is deliberately
-                 * route-only; the final assignment boundary below publishes
-                 * the complete grouped execution plan exactly once.
-                 */
-                groups_prepared = kernel->groupPrefillRoutes(
-                    moe_runtime_layer_,
-                    params_.routing_indices,
-                    params_.routing_weights,
-                    seq_len,
-                    seq_len,
-                    num_experts,
-                    top_k,
-                    filter_runtime_grouping_to_local_experts,
-                    /*retain_routes_for_deferred_commit=*/false);
+                if (usesGraphPhasedCurrentBatchPrefillLLEP())
+                {
+                    /* The explicit PlanAndPack and UnpackApplyAndAssign graph
+                     * nodes already published the route-only ledger and final
+                     * participant ids. Re-grouping here would overwrite that
+                     * publication and make the payload collective's result
+                     * causally irrelevant. This stage owns only the final
+                     * descriptor-table publication below. */
+                    groups_prepared = true;
+                }
+                else
+                {
+                    /* Resident-only LLEP consumes global route counts before it
+                     * can assign participants. This first publication is
+                     * deliberately route-only; the final assignment boundary
+                     * below publishes the complete grouped execution plan. */
+                    groups_prepared = kernel->groupPrefillRoutes(
+                        moe_runtime_layer_,
+                        params_.routing_indices,
+                        params_.routing_weights,
+                        seq_len,
+                        seq_len,
+                        num_experts,
+                        top_k,
+                        filter_runtime_grouping_to_local_experts,
+                        /*retain_routes_for_deferred_commit=*/false);
+                }
             }
             else
             {
@@ -5950,147 +6910,15 @@ namespace llaminar2
                 !fully_replicated_local_rows &&
                 params_.routed_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedResident)
             {
-                const auto &runtime_state =
-                    params_.moe_runtime_table->hostLayerState(params_.layer_idx);
-                if (requestsTransferBackedCurrentBatchPrefillLLEP())
+                if (usesGraphPhasedCurrentBatchPrefillLLEP())
                 {
-                    if (!hasTransferBackedPrefillLLEP())
-                    {
-                        throw std::logic_error(
-                            "TransferBackedCurrentBatch LLEP assignment requires "
-                            "a valid compact graph-owned transport binding");
-                    }
-
-                    least_loaded_ep::LeastLoadedExpertAssignmentConfig llep_config;
-                    llep_config.expert_count =
-                        static_cast<uint32_t>(num_experts);
-                    llep_config.participant_count =
-                        runtime_state.participant_count > 0u
-                            ? runtime_state.participant_count
-                            : static_cast<uint32_t>(
-                                  std::max(1, params_.participant_count));
-                    /*
-                     * Long-prefill LLEP uses the same policy knobs as captured
-                     * decode maintenance. The transfer directory is the
-                     * physical working set, so both new arrivals and the full
-                     * non-owner assignment are bounded by its real capacity.
-                     */
-                    llep_config.alpha_numerator =
-                        std::max<uint32_t>(
-                            1u,
-                            params_.prefill_llep_rebalance_config
-                                .llep_alpha_numerator);
-                    llep_config.alpha_denominator =
-                        std::max<uint32_t>(
-                            1u,
-                            params_.prefill_llep_rebalance_config
-                                .llep_alpha_denominator);
-                    llep_config.lambda_numerator =
-                        std::max<uint32_t>(
-                            1u,
-                            params_.prefill_llep_rebalance_config
-                                .llep_lambda_numerator);
-                    llep_config.lambda_denominator =
-                        std::max<uint32_t>(
-                            1u,
-                            params_.prefill_llep_rebalance_config
-                                .llep_lambda_denominator);
-                    llep_config.enable_balanced_skip =
-                        params_.prefill_llep_rebalance_config
-                            .llep_enable_balanced_skip != 0u;
-                    /*
-                     * The graph builder has already resolved typed runtime
-                     * configuration against any explicit environment
-                     * overrides. Re-reading DebugEnv here used process-global
-                     * defaults instead of the policy captured by this graph.
-                     * In particular, a test or request that deliberately set a
-                     * zero economy floor still inherited the production
-                     * relative and per-payload floors, causing the device
-                     * planner to select standard EP without any visible
-                     * configuration error. The stage must consume one immutable
-                     * graph-owned policy object from construction through
-                     * capture and replay.
-                     */
-                    llep_config.min_spread_improvement =
-                        params_.prefill_llep_rebalance_config
-                            .min_load_spread_improvement;
-                    llep_config.min_spread_improvement_divisor =
-                        params_.prefill_llep_rebalance_config
-                            .min_load_spread_improvement_divisor;
-                    llep_config.min_spread_improvement_per_transfer =
-                        params_.prefill_llep_rebalance_config
-                            .min_wave_spread_improvement_per_payload_slot;
-                    llep_config.min_foreign_rows_per_transfer =
-                        params_.prefill_llep_rebalance_config
-                            .min_foreign_rows_per_transfer;
-                    const uint32_t physical_transfer_slot_capacity =
-                        std::min<uint32_t>(
-                            params_.prefill_llep_payload_slot_capacity,
-                            params_.prefill_llep_transfer_slot_count);
-                    llep_config.max_weight_transfers =
-                        physical_transfer_slot_capacity;
-                    llep_config.max_non_owner_experts_per_participant =
-                        physical_transfer_slot_capacity;
-
-                    groups_prepared =
-                        kernel->planPrefillRoutesLeastLoadedCurrentBatch(
-                            compute_launch,
-                            moe_runtime_layer_,
-                            seq_len,
-                            seq_len,
-                            num_experts,
-                            top_k,
-                            llep_config);
-                    if (!groups_prepared)
-                    {
-                        LOG_ERROR(
-                            "[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
-                            "planPrefillRoutesLeastLoadedCurrentBatch failed");
-                        return false;
-                    }
-                    if (!trace_runtime_assignment("after_llep_plan"))
-                        return false;
-
-                    DeviceMoERebalanceStatus *transfer_status = nullptr;
-                    DeviceMoERebalanceApplyStatus *apply_status = nullptr;
-                    if (!executeTransferBackedPrefillLLEPMovement(
-                            kernel,
-                            &transfer_status,
-                            &apply_status,
-                            PrefillLLEPTransferPurpose::CurrentBatchMovement))
-                    {
-                        LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
-                                  "transfer-backed LLEP movement failed");
-                        return false;
-                    }
-                    if (!transfer_status || !apply_status)
-                    {
-                        LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
-                                  "transfer-backed LLEP movement did not publish transfer/apply status buffers");
-                        return false;
-                    }
-                    /*
-                     * This checkpoint observes the exact device-owned handoff
-                     * between transfer publication and route assignment.  It
-                     * remains completely absent from production execution
-                     * unless LLAMINAR_MOE_PREFILL_ASSIGNMENT_TRACE is enabled.
-                     * In particular, it gives diagnostics a coherent view of
-                     * the newly active placement bank without adding a host
-                     * mirror, stream synchronization, or D2H read to the hot
-                     * path.
-                     */
+                    /* The preceding explicit apply stage is the only owner of
+                     * movement and route assignment. Retain the diagnostic
+                     * boundary here, then publish this expert stage's prepared
+                     * descriptor table over those already-final assignments. */
                     if (!trace_runtime_assignment("after_llep_transfer_apply"))
                         return false;
-                    groups_prepared =
-                        kernel->assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
-                            compute_launch,
-                            moe_runtime_layer_,
-                            seq_len,
-                            seq_len,
-                            num_experts,
-                            top_k,
-                            transfer_status,
-                            apply_status);
+                    groups_prepared = true;
                 }
                 else
                 {
@@ -6287,6 +7115,99 @@ namespace llaminar2
                moe_runtime_table_initialized_ &&
                runtimeTableHasActiveGroupedDecodeBank();
 #endif
+    }
+
+    bool MoEExpertComputeStage::supportsExplicitRoutingDecodeGraphCapturePreflight() const
+    {
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
+        return false;
+#else
+        if (params_.force_grouped_verifier_prefill_for_decode ||
+            params_.seq_len != 1 ||
+            !params_.require_device_routing_tensor_decode ||
+            !supportsDeviceRoutingTensorDecodeExecutionBackend(params_.device_id) ||
+            params_.d_model <= 0 ||
+            params_.expert_intermediate <= 0 ||
+            params_.num_experts <= 0 ||
+            params_.top_k <= 0 ||
+            params_.top_k > 16 ||
+            params_.top_k > params_.num_experts ||
+            !params_.input ||
+            !params_.output ||
+            !params_.routing_indices ||
+            !params_.routing_weights ||
+            params_.replica_set.num_replicated != 0 ||
+            (!params_.expert_mask.empty() &&
+             params_.expert_mask.size() !=
+                 static_cast<size_t>(params_.num_experts)))
+        {
+            return false;
+        }
+
+        return hasPreparedExpertGemmEnginesForExperts(
+            fixedTopologyPrefillExpertIds());
+#endif
+    }
+
+    bool MoEExpertComputeStage::isExplicitRoutingDecodeGraphCapturable() const
+    {
+        if (!supportsExplicitRoutingDecodeGraphCapturePreflight() ||
+            !moe_kernel_ ||
+            !runtime_grouped_decode_launch_state_prepared_)
+        {
+            return false;
+        }
+
+        if (usesPublishedFixedTopologyMaskGrouping() &&
+            fixed_topology_mask_publication_state_ !=
+                FixedTopologyMaskPublicationState::Published)
+        {
+            return false;
+        }
+
+        return grouped_gateup_desc_table_id_ >= 0 &&
+               grouped_down_desc_table_id_ >= 0 &&
+               !grouped_gateup_desc_table_dirty_ &&
+               !grouped_down_desc_table_dirty_;
+    }
+
+    bool MoEExpertComputeStage::prepareExplicitRoutingDecodeLaunchState(
+        IMoEKernel *kernel)
+    {
+        if (!kernel ||
+            !supportsExplicitRoutingDecodeGraphCapturePreflight() ||
+            isGraphCaptureActive())
+        {
+            return false;
+        }
+
+        const std::vector<int> local_expert_ids =
+            fixedTopologyPrefillExpertIds();
+        if (local_expert_ids.empty() ||
+            !ensureGemmEnginesForExperts(local_expert_ids) ||
+            !ensureGroupedGateUpDescriptorTable(
+                kernel, params_.d_model, params_.expert_intermediate) ||
+            !ensureGroupedDownDescriptorTable(
+                kernel, params_.d_model, params_.expert_intermediate) ||
+            !publishFixedTopologyMaskBeforeCapture(kernel) ||
+            !kernel->prepareGroupedRuntimeDecodeLaunchState(
+                grouped_gateup_desc_table_id_,
+                grouped_down_desc_table_id_,
+                params_.top_k,
+                params_.d_model,
+                params_.expert_intermediate,
+                MoEDecodeDescriptorSource::StaticDescriptorTable))
+        {
+            runtime_grouped_decode_launch_state_prepared_ = false;
+            LOG_ERROR("[MoEExpertComputeStage] Failed to prepare fused "
+                      "explicit-routing grouped-decode launch state"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.to_string());
+            return false;
+        }
+
+        runtime_grouped_decode_launch_state_prepared_ = true;
+        return true;
     }
 
     bool MoEExpertComputeStage::supportsFixedTopologyPrefillGraphCapturePreflight() const
@@ -6582,22 +7503,25 @@ namespace llaminar2
         if (!hasAllPreparedExpertGemmEngines())
             return false;
 
+        std::optional<DeviceMoEWeightFormat> layer_format;
         for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
         {
-            DeviceNativeVNNIMatrixDesc gate;
-            DeviceNativeVNNIMatrixDesc up;
-            DeviceNativeVNNIMatrixDesc down;
-            if (!params_.prepared_gate_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(gate) ||
-                !params_.prepared_up_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(up) ||
-                !params_.prepared_down_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(down) ||
-                gate.n != params_.expert_intermediate || gate.k != params_.d_model ||
-                up.n != params_.expert_intermediate || up.k != params_.d_model ||
-                down.n != params_.d_model || down.k != params_.expert_intermediate)
+            DeviceMoEExpertDescriptor desc;
+            if (!exportDeviceMoEExpertWeightDescriptors(
+                    params_.prepared_gate_gemm[static_cast<size_t>(expert_id)],
+                    params_.prepared_up_gemm[static_cast<size_t>(expert_id)],
+                    params_.prepared_down_gemm[static_cast<size_t>(expert_id)],
+                    params_.d_model,
+                    params_.expert_intermediate,
+                    desc))
             {
                 return false;
             }
+            if (layer_format && *layer_format != desc.weight_format)
+                return false;
+            layer_format = desc.weight_format;
         }
-        return true;
+        return layer_format.has_value();
     }
 
     const DeviceMoEPlacementBank *MoEExpertComputeStage::activeRuntimePlacementBank() const
@@ -6659,7 +7583,16 @@ namespace llaminar2
             params.moe_owned_kernels,
             params.moe_packed_gate_lifetime,
             params.moe_packed_up_lifetime,
-            params.moe_packed_down_lifetime};
+            params.moe_packed_down_lifetime,
+            nullptr,
+            nullptr,
+            nullptr,
+            {},
+            {},
+            {},
+            true,
+            nullptr,
+            CPUExpertNUMAPlacement::forDevice(params.device_id)};
         return MoEExpertWeightService::extractExpertViews(ctx);
     }
 
@@ -6692,7 +7625,10 @@ namespace llaminar2
             params.expert_registry,
             params.gate_slab_ref,
             params.up_slab_ref,
-            params.down_slab_ref};
+            params.down_slab_ref,
+            true,
+            nullptr,
+            CPUExpertNUMAPlacement::forDevice(params.device_id)};
         bool ok = MoEExpertWeightService::prepareGemmEngines(ctx);
         // Phase C: Copy slab refs back to params for rebalance reuse
         params.gate_slab_ref = ctx.gate_slab_ref;
@@ -6738,8 +7674,7 @@ namespace llaminar2
          * compute would permit segmented or unordered execution before the
          * invariant is diagnosed.
          */
-        return requestsTransferBackedCurrentBatchPrefillLLEP() ||
-               params_.prefix_runtime_device_rehydration;
+        return params_.prefix_runtime_device_rehydration;
     }
 
     bool MoEExpertComputeStage::isGraphCapturable() const
@@ -6754,6 +7689,11 @@ namespace llaminar2
         // are built and execution is pure kernel launches reading routing info
         // from the device-resident MoE runtime table.
         if (isDeviceRoutedDecodeGraphCapturable())
+            return true;
+
+        // Heterogeneous followers consume their explicit participant-local
+        // routing tensors directly and intentionally have no runtime table.
+        if (isExplicitRoutingDecodeGraphCapturable())
             return true;
 
         // Fixed-topology grouped prefill path
@@ -6784,6 +7724,10 @@ namespace llaminar2
             supportsFixedTopologyPrefillGraphCapturePreflight();
         const bool runtime_decode_ready =
             isDeviceRoutedDecodeGraphCapturable();
+        const bool explicit_decode_preflight =
+            supportsExplicitRoutingDecodeGraphCapturePreflight();
+        const bool explicit_decode_ready =
+            isExplicitRoutingDecodeGraphCapturable();
         const std::vector<int> fixed_experts =
             fixedTopologyPrefillExpertIds();
         const bool fixed_engines_ready =
@@ -6798,10 +7742,12 @@ namespace llaminar2
             << " route="
             << (runtime_row_grouping_requested
                     ? "runtime_table_grouped_rows"
-                    : (params_.seq_len == 1 &&
-                               !params_.force_grouped_verifier_prefill_for_decode
-                           ? "runtime_table_decode"
-                           : "fixed_topology_prefill"))
+                    : (explicit_decode_preflight
+                           ? "explicit_routing_decode"
+                           : (params_.seq_len == 1 &&
+                                      !params_.force_grouped_verifier_prefill_for_decode
+                                  ? "runtime_table_decode"
+                                  : "fixed_topology_prefill")))
             << " backend_grouped="
             << perfBool(supportsGroupedPrefillGraphCaptureBackend(params_.device_id))
             << " kernel=" << perfBool(moe_kernel_ != nullptr)
@@ -6820,6 +7766,9 @@ namespace llaminar2
             << " runtime_decode_warmed="
             << perfBool(runtime_grouped_decode_launch_state_prepared_)
             << " runtime_decode_ready=" << perfBool(runtime_decode_ready)
+            << " explicit_decode_preflight="
+            << perfBool(explicit_decode_preflight)
+            << " explicit_decode_ready=" << perfBool(explicit_decode_ready)
             << " gateup_desc=" << grouped_gateup_desc_table_id_
             << " down_desc=" << grouped_down_desc_table_id_;
         return out.str();
@@ -6830,8 +7779,7 @@ namespace llaminar2
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
-        bool decode_supported = false;
-        decode_supported =
+        const bool runtime_decode_supported =
             !params_.force_grouped_verifier_prefill_for_decode &&
             supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
             params_.seq_len == 1 &&
@@ -6846,7 +7794,9 @@ namespace llaminar2
             params_.moe_runtime_table &&
             params_.layer_idx >= 0;
 
-        return decode_supported || supportsFixedTopologyPrefillGraphCapturePreflight();
+        return runtime_decode_supported ||
+               supportsExplicitRoutingDecodeGraphCapturePreflight() ||
+               supportsFixedTopologyPrefillGraphCapturePreflight();
 #endif
     }
 
@@ -6911,28 +7861,27 @@ namespace llaminar2
                 }
                 runtime_grouped_decode_launch_state_prepared_ = true;
             }
+            else if (supportsExplicitRoutingDecodeGraphCapturePreflight())
+            {
+                IMoEKernel *kernel = ensureMoEKernel();
+                if (!prepareExplicitRoutingDecodeLaunchState(kernel))
+                    return false;
+            }
         }
 
-        const bool prepare_current_batch =
-            requestsTransferBackedCurrentBatchPrefillLLEP();
         const bool prepare_prefix_rehydration =
             params_.prefix_runtime_device_rehydration;
-        if (!prepare_current_batch && !prepare_prefix_rehydration)
+        if (!prepare_prefix_rehydration)
+        {
+            if (sparse_overlay_invocation_bound_)
+                sparse_overlay_launch_metadata_dirty_ = false;
             return true;
+        }
         if (!hasValidCompactLLEPTransferBinding())
         {
             throw std::logic_error(
                 "MoE graph launch requested compact LLEP transport without a "
                 "valid graph-owned LocalTP binding");
-        }
-        if (prepare_current_batch &&
-            !params_.prefill_llep_transfer_state->isMaterializedFor(
-                params_.device_id,
-                params_.prefill_llep_workspace_name))
-        {
-            throw std::runtime_error(
-                "Transfer-backed current-batch LLEP graph preparation could "
-                "not validate its persistent transfer resources");
         }
         if (prepare_prefix_rehydration &&
             (!params_.prefix_runtime_rehydration_transfer_state ||
@@ -6954,11 +7903,12 @@ namespace llaminar2
             params_.device_id.to_string(),
             {{"stage", "moe_expert_grouped_prefill"},
              {"layer", std::to_string(params_.layer_idx)},
-             {"current_batch",
-              prepare_current_batch ? "transfer_backed" : "resident_only"},
+             {"current_batch", "explicit_graph_phases"},
              {"prefix_rehydration",
               prepare_prefix_rehydration ? "enabled" : "disabled"},
              {"workspace", params_.prefill_llep_workspace_name}});
+        if (sparse_overlay_invocation_bound_)
+            sparse_overlay_launch_metadata_dirty_ = false;
         return true;
     }
 
@@ -7184,7 +8134,6 @@ namespace llaminar2
                 /*projection_count=*/2u);
         }
         const bool needs_llep_transport_workspace =
-            requestsTransferBackedCurrentBatchPrefillLLEP() ||
             params_.prefix_runtime_device_rehydration;
         if (needs_llep_transport_workspace &&
             !hasValidCompactLLEPTransferBinding())
@@ -7242,6 +8191,14 @@ namespace llaminar2
             combined.buffers.push_back({
                 prefillLLEPWorkspaceBufferName(MoEDeviceRebalanceStage::WS_GATHERED_COMMAND_HEADER, workspace_name),
                 participant_count * sizeof(DeviceMoERebalanceCommandBufferHeader),
+                256,
+                true});
+            combined.buffers.push_back({
+                prefillLLEPWorkspaceBufferName(
+                    MoEDeviceRebalanceStage::WS_TRANSFER_SLOT_CLAIM_INDEX,
+                    workspace_name),
+                deviceMoETransferSlotClaimIndexBytes(
+                    params_.prefill_llep_transfer_slot_count),
                 256,
                 true});
             combined.buffers.push_back({
@@ -7332,27 +8289,15 @@ namespace llaminar2
         }
 
         bound_workspace_ = workspace;
-        const bool bind_current_batch =
-            requestsTransferBackedCurrentBatchPrefillLLEP();
         const bool bind_prefix_rehydration =
             params_.prefix_runtime_device_rehydration;
-        if (workspace && (bind_current_batch || bind_prefix_rehydration))
+        if (workspace && bind_prefix_rehydration)
         {
             if (!hasValidCompactLLEPTransferBinding())
             {
                 throw std::logic_error(
                     "MoE LLEP workspace binding requires a complete compact "
                     "transfer topology");
-            }
-            if (bind_current_batch &&
-                !params_.prefill_llep_transfer_state->
-                     materializePersistentResources(
-                         params_.device_id,
-                         params_.prefill_llep_workspace_name))
-            {
-                throw std::runtime_error(
-                    "MoE LLEP workspace binding could not materialize its "
-                    "persistent current-batch transfer resources");
             }
             if (bind_prefix_rehydration &&
                 (!params_.prefix_runtime_rehydration_transfer_state ||
@@ -7373,8 +8318,7 @@ namespace llaminar2
                 params_.device_id.to_string(),
                 {{"stage", "moe_expert_grouped_prefill"},
                  {"layer", std::to_string(params_.layer_idx)},
-                 {"current_batch",
-                  bind_current_batch ? "transfer_backed" : "resident_only"},
+                 {"current_batch", "explicit_graph_phases"},
                  {"prefix_rehydration",
                   bind_prefix_rehydration ? "enabled" : "disabled"},
                  {"workspace", params_.prefill_llep_workspace_name}});
@@ -7430,6 +8374,172 @@ namespace llaminar2
         bound_workspace_ = nullptr;
         runtime_grouped_decode_launch_state_prepared_ = false;
         invalidateFixedTopologyMaskPublication();
+        sparse_overlay_launch_metadata_dirty_ =
+            sparse_overlay_invocation_bound_;
+    }
+
+    bool MoEExpertComputeStage::bindSparseOverlayInvocation(
+        const SparseOverlayInvocation &invocation)
+    {
+        const size_t expert_count =
+            static_cast<size_t>(std::max(params_.num_experts, 0));
+        const bool valid_binding_identity =
+            invocation.binding_kind ==
+                    SparseOverlayBindingKind::SetupPriming
+                ? invocation.engine_binding_generation == 0 &&
+                      !sparse_overlay_invocation_bound_
+                : invocation.binding_kind ==
+                          SparseOverlayBindingKind::ResidencyPublication &&
+                      invocation.engine_binding_generation != 0;
+        const auto tensorHolds = [](const TensorBase *tensor,
+                                    size_t required_elements)
+        {
+            return tensor && tensor->native_type() == TensorType::FP32 &&
+                   tensor->numel() >= required_elements;
+        };
+
+        if (isGraphCaptureActive() || !params_.device_id.is_valid() ||
+            params_.top_k <= 0 || params_.top_k > 16 ||
+            params_.top_k > params_.num_experts ||
+            params_.num_experts <= 0 ||
+            params_.d_model <= 0 || invocation.live_rows <= 0 ||
+            !valid_binding_identity ||
+            !invocation.expert_mask ||
+            params_.expert_mask.size() != expert_count ||
+            invocation.expert_mask->size() != expert_count ||
+            invocation.gate_engines.size() != expert_count ||
+            invocation.up_engines.size() != expert_count ||
+            invocation.down_engines.size() != expert_count)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Invalid sparse-overlay invocation geometry or lifecycle");
+            return false;
+        }
+
+        const size_t rows = static_cast<size_t>(invocation.live_rows);
+        if (rows > std::numeric_limits<size_t>::max() /
+                       static_cast<size_t>(params_.d_model) ||
+            rows > std::numeric_limits<size_t>::max() /
+                       static_cast<size_t>(params_.top_k))
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Sparse-overlay invocation element count overflows size_t");
+            return false;
+        }
+        const size_t hidden_elements = rows * static_cast<size_t>(params_.d_model);
+        const size_t routing_elements =
+            rows * static_cast<size_t>(params_.top_k);
+        if (!tensorHolds(invocation.input, hidden_elements) ||
+            !tensorHolds(invocation.routing_indices, routing_elements) ||
+            !tensorHolds(invocation.routing_weights, routing_elements) ||
+            !tensorHolds(invocation.output, hidden_elements))
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Sparse-overlay invocation tensors do not hold the live FP32 prefix");
+            return false;
+        }
+
+        const bool first_binding = !sparse_overlay_invocation_bound_;
+        if (!first_binding &&
+            (params_.input != invocation.input ||
+             params_.routing_indices != invocation.routing_indices ||
+             params_.routing_weights != invocation.routing_weights ||
+             params_.output != invocation.output ||
+             params_.seq_len != invocation.live_rows))
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Sparse-overlay replay attempted to change a captured tensor-family identity");
+            return false;
+        }
+
+        const bool binding_generation_changed =
+            first_binding ||
+            sparse_overlay_engine_binding_generation_ !=
+                invocation.engine_binding_generation;
+        bool mask_changed = false;
+        bool engines_changed = false;
+        if (binding_generation_changed)
+        {
+            mask_changed =
+                !std::equal(
+                    invocation.expert_mask->begin(),
+                    invocation.expert_mask->end(),
+                    params_.expert_mask.begin(),
+                    params_.expert_mask.end());
+            for (size_t expert = 0; expert < expert_count; ++expert)
+            {
+                const bool active = (*invocation.expert_mask)[expert];
+                if (active &&
+                    (!invocation.gate_engines[expert] ||
+                     !invocation.up_engines[expert] ||
+                     !invocation.down_engines[expert]))
+                {
+                    LOG_ERROR(
+                        "[MoEExpertComputeStage] Sparse-overlay invocation has an active expert without complete prepared engines");
+                    return false;
+                }
+                engines_changed = engines_changed ||
+                                  params_.prepared_gate_gemm[expert] !=
+                                      invocation.gate_engines[expert] ||
+                                  params_.prepared_up_gemm[expert] !=
+                                      invocation.up_engines[expert] ||
+                                  params_.prepared_down_gemm[expert] !=
+                                      invocation.down_engines[expert];
+            }
+        }
+
+        params_.input = invocation.input;
+        params_.routing_indices = invocation.routing_indices;
+        params_.routing_weights = invocation.routing_weights;
+        params_.output = invocation.output;
+        params_.seq_len = invocation.live_rows;
+        if (binding_generation_changed)
+        {
+            std::copy(
+                invocation.expert_mask->begin(),
+                invocation.expert_mask->end(),
+                params_.expert_mask.begin());
+            std::copy(
+                invocation.gate_engines.begin(),
+                invocation.gate_engines.end(),
+                params_.prepared_gate_gemm.begin());
+            std::copy(
+                invocation.up_engines.begin(),
+                invocation.up_engines.end(),
+                params_.prepared_up_gemm.begin());
+            std::copy(
+                invocation.down_engines.begin(),
+                invocation.down_engines.end(),
+                params_.prepared_down_gemm.begin());
+        }
+
+        /*
+         * Weight descriptor tables contain engine-owned device pointers. A
+         * residency epoch that changes only the live route count can reuse the
+         * tables; an actual engine replacement must rebuild them before the
+         * next launch. The vectors were construction-sized above, so these
+         * copies do not allocate in the inference path.
+         */
+        const bool caches_uninitialized =
+            cached_gate_gemm_.size() != expert_count ||
+            cached_up_gemm_.size() != expert_count ||
+            cached_down_gemm_.size() != expert_count;
+        sparse_overlay_invocation_bound_ = true;
+        sparse_overlay_engine_binding_generation_ =
+            invocation.engine_binding_generation;
+        if (first_binding || engines_changed || mask_changed ||
+            caches_uninitialized)
+        {
+            cached_gate_gemm_ = params_.prepared_gate_gemm;
+            cached_up_gemm_ = params_.prepared_up_gemm;
+            cached_down_gemm_ = params_.prepared_down_gemm;
+            grouped_gateup_desc_table_dirty_ = true;
+            grouped_down_desc_table_dirty_ = true;
+            runtime_grouped_decode_launch_state_prepared_ = false;
+            invalidateFixedTopologyMaskPublication();
+            sparse_overlay_launch_metadata_dirty_ = true;
+        }
+        return true;
     }
 
     bool MoEExpertComputeStage::hasWorkspace() const
@@ -7638,7 +8748,16 @@ namespace llaminar2
         IMoEKernel *kernel, int d_model, int intermediate) const
     {
         if (!kernel || !cached_gate_gemm_ || !cached_up_gemm_ || d_model <= 0 || intermediate <= 0)
+        {
+            LOG_ERROR("[SharedExpertFFNStage] Cannot publish the shared gate/up "
+                      "descriptor table: kernel="
+                      << perfBool(kernel != nullptr)
+                      << " gate_gemm=" << perfBool(cached_gate_gemm_ != nullptr)
+                      << " up_gemm=" << perfBool(cached_up_gemm_ != nullptr)
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate);
             return false;
+        }
 
         if (shared_grouped_gateup_desc_table_id_ >= 0 &&
             shared_grouped_gateup_desc_table_d_model_ == d_model &&
@@ -7647,20 +8766,63 @@ namespace llaminar2
             return true;
         }
 
-        DeviceNativeVNNIMatrixDesc gate_desc;
-        DeviceNativeVNNIMatrixDesc up_desc;
-        if (!cached_gate_gemm_->exportNativeVNNIMatrixDesc(gate_desc) ||
-            !cached_up_gemm_->exportNativeVNNIMatrixDesc(up_desc) ||
-            gate_desc.n != intermediate || gate_desc.k != d_model ||
-            up_desc.n != intermediate || up_desc.k != d_model)
+        /*
+         * A shared expert is simply an always-selected one-entry expert table.
+         * Export the complete projection triple through the same typed boundary
+         * as routed experts so floating model weights do not get mistaken for
+         * failed NativeVNNI preparation.  Validating down here as part of the
+         * triple also prevents gate/up and down tables from recording different
+         * precision families in one captured launch.
+         */
+        DeviceMoEExpertDescriptor exported;
+        if (!exportDeviceMoEExpertWeightDescriptors(
+                cached_gate_gemm_,
+                cached_up_gemm_,
+                cached_down_gemm_,
+                d_model,
+                intermediate,
+                exported))
         {
+            LOG_ERROR("[SharedExpertFFNStage] Prepared shared gate/up/down "
+                      "weights do not export one supported descriptor family"
+                      << " device=" << params_.device_id.to_string()
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate
+                      << " gate_type="
+                      << (params_.gate_w ? params_.gate_w->dtype_name() : "null")
+                      << " up_type="
+                      << (params_.up_w ? params_.up_w->dtype_name() : "null")
+                      << " down_type="
+                      << (params_.down_w ? params_.down_w->dtype_name() : "null"));
             return false;
         }
 
-        const int table_id = kernel->uploadGroupedExpertGateUpDescriptorTables(
-            &gate_desc, &up_desc, 1, d_model, intermediate);
+        const int table_id =
+            exported.weight_format == DeviceMoEWeightFormat::NativeVNNI
+                ? kernel->uploadGroupedExpertGateUpDescriptorTables(
+                      &exported.gate,
+                      &exported.up,
+                      1,
+                      d_model,
+                      intermediate)
+                : kernel->uploadGroupedExpertFloatingGateUpDescriptorTables(
+                      &exported.floating_gate,
+                      &exported.floating_up,
+                      exported.weight_format,
+                      1,
+                      d_model,
+                      intermediate);
         if (table_id < 0)
+        {
+            LOG_ERROR("[SharedExpertFFNStage] Backend rejected the typed shared "
+                      "gate/up descriptor table"
+                      << " device=" << params_.device_id.to_string()
+                      << " weight_format="
+                      << static_cast<std::uint32_t>(exported.weight_format)
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate);
             return false;
+        }
 
         shared_grouped_gateup_desc_table_id_ = table_id;
         shared_grouped_gateup_desc_table_d_model_ = d_model;
@@ -7672,7 +8834,15 @@ namespace llaminar2
         IMoEKernel *kernel, int d_model, int intermediate) const
     {
         if (!kernel || !cached_down_gemm_ || d_model <= 0 || intermediate <= 0)
+        {
+            LOG_ERROR("[SharedExpertFFNStage] Cannot publish the shared down "
+                      "descriptor table: kernel="
+                      << perfBool(kernel != nullptr)
+                      << " down_gemm=" << perfBool(cached_down_gemm_ != nullptr)
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate);
             return false;
+        }
 
         if (shared_grouped_down_desc_table_id_ >= 0 &&
             shared_grouped_down_desc_table_d_model_ == d_model &&
@@ -7681,17 +8851,54 @@ namespace llaminar2
             return true;
         }
 
-        DeviceNativeVNNIMatrixDesc down_desc;
-        if (!cached_down_gemm_->exportNativeVNNIMatrixDesc(down_desc) ||
-            down_desc.n != d_model || down_desc.k != intermediate)
+        /* Keep the down-table format coupled to the validated gate/up triple. */
+        DeviceMoEExpertDescriptor exported;
+        if (!exportDeviceMoEExpertWeightDescriptors(
+                cached_gate_gemm_,
+                cached_up_gemm_,
+                cached_down_gemm_,
+                d_model,
+                intermediate,
+                exported))
         {
+            LOG_ERROR("[SharedExpertFFNStage] Prepared shared gate/up/down "
+                      "weights do not export one supported descriptor family"
+                      << " device=" << params_.device_id.to_string()
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate
+                      << " gate_type="
+                      << (params_.gate_w ? params_.gate_w->dtype_name() : "null")
+                      << " up_type="
+                      << (params_.up_w ? params_.up_w->dtype_name() : "null")
+                      << " down_type="
+                      << (params_.down_w ? params_.down_w->dtype_name() : "null"));
             return false;
         }
 
-        const int table_id = kernel->uploadGroupedExpertDownDescriptorTable(
-            &down_desc, 1, d_model, intermediate);
+        const int table_id =
+            exported.weight_format == DeviceMoEWeightFormat::NativeVNNI
+                ? kernel->uploadGroupedExpertDownDescriptorTable(
+                      &exported.down,
+                      1,
+                      d_model,
+                      intermediate)
+                : kernel->uploadGroupedExpertFloatingDownDescriptorTable(
+                      &exported.floating_down,
+                      exported.weight_format,
+                      1,
+                      d_model,
+                      intermediate);
         if (table_id < 0)
+        {
+            LOG_ERROR("[SharedExpertFFNStage] Backend rejected the typed shared "
+                      "down descriptor table"
+                      << " device=" << params_.device_id.to_string()
+                      << " weight_format="
+                      << static_cast<std::uint32_t>(exported.weight_format)
+                      << " d_model=" << d_model
+                      << " intermediate=" << intermediate);
             return false;
+        }
 
         shared_grouped_down_desc_table_id_ = table_id;
         shared_grouped_down_desc_table_d_model_ = d_model;
@@ -8200,7 +9407,13 @@ namespace llaminar2
 
         IMoEKernel *kernel = ensureMoEKernel();
         if (!kernel)
+        {
+            LOG_ERROR("[SharedExpertFFNStage] Backend MoE kernel is unavailable "
+                      "after exact-stream binding"
+                      << " device=" << params_.device_id.to_string()
+                      << " seq_len=" << params_.seq_len);
             return false;
+        }
 
         if (shouldUseGroupedVerifierPrefillRoute())
         {
@@ -8225,6 +9438,11 @@ namespace llaminar2
             !ensureSharedGroupedDownDescriptorTable(
                 kernel, params_.d_model, params_.intermediate))
         {
+            LOG_ERROR("[SharedExpertFFNStage] Failed to prepare typed shared "
+                      "expert descriptor tables before grouped-decode capture"
+                      << " device=" << params_.device_id.to_string()
+                      << " d_model=" << params_.d_model
+                      << " intermediate=" << params_.intermediate);
             return false;
         }
 
@@ -8619,6 +9837,11 @@ namespace llaminar2
         if (stream)
             setGPUStream(stream);
 
+        /* A rooted-reduction observer exists only to keep participant graphs
+         * structurally symmetric. It owns no tensor and launches no kernel. */
+        if (!ownsGateArithmetic())
+            return true;
+
         if (params_.device_id.is_gpu())
         {
             TensorBase *gate_input = effectiveGateInput();
@@ -8634,7 +9857,7 @@ namespace llaminar2
         }
 
         if (params_.seq_len > 1 && params_.active_row_count_device &&
-            PerfStatsCollector::isEnabled())
+            PerfStatsCollector::isDomainEnabled("moe"))
         {
             PerfStatsCollector::addCounter(
                 "moe",
@@ -8686,6 +9909,9 @@ namespace llaminar2
             return false;
         }
 
+        if (!ownsGateArithmetic())
+            return true;
+
         if (!params_.input || !params_.gate_inp || !params_.shared_output)
         {
             LOG_ERROR("[SharedExpertGateStage] Null tensor parameter");
@@ -8716,7 +9942,8 @@ namespace llaminar2
             params_.device_id.is_gpu() && seq_len > 1
                 ? params_.active_row_count_device
                 : nullptr;
-        if (device_active_rows && PerfStatsCollector::isEnabled())
+        if (device_active_rows &&
+            PerfStatsCollector::isDomainEnabled("moe"))
         {
             PerfStatsCollector::addCounter(
                 "moe",
@@ -8802,6 +10029,8 @@ namespace llaminar2
 
     size_t SharedExpertGateStage::estimatedFlops() const
     {
+        if (!ownsGateArithmetic())
+            return 0u;
         // Dot product + sigmoid + elementwise multiply, plus one add in fused-combine mode.
         const size_t per_token = static_cast<size_t>(2 * params_.d_model + params_.d_model);
         const size_t fused_add = (params_.routed_residual && params_.combined_output)
@@ -8834,6 +10063,8 @@ namespace llaminar2
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
+        if (!ownsGateArithmetic())
+            return supportsGroupedPrefillGraphCaptureBackend(params_.device_id);
         // Single kernel call (sigmoid gating): pure kernel launch after explicit
         // launch-state preparation.
         // Capturable for both decode (seq_len==1) and prefill (seq_len>1) on supported GPU backends
@@ -8851,6 +10082,8 @@ namespace llaminar2
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
+        if (!ownsGateArithmetic())
+            return supportsGroupedPrefillGraphCaptureBackend(params_.device_id);
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                params_.seq_len > 0 &&
                params_.d_model > 0 &&
@@ -8864,6 +10097,12 @@ namespace llaminar2
 
     bool SharedExpertGateStage::supportsLazyPrefillGraphCapturePreflight() const
     {
+        if (!ownsGateArithmetic())
+        {
+            return supportsGroupedPrefillGraphCaptureBackend(
+                       params_.device_id) &&
+                   params_.seq_len > 1;
+        }
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                params_.seq_len > 1 &&
                params_.d_model > 0 &&
@@ -8876,6 +10115,8 @@ namespace llaminar2
 
     bool SharedExpertGateStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
+        if (!ownsGateArithmetic())
+            return supportsLazyPrefillGraphCapturePreflight();
         return supportsLazyPrefillGraphCapturePreflight() &&
                params_.active_row_count_device != nullptr;
     }
@@ -8916,6 +10157,8 @@ namespace llaminar2
     StageBufferRequirements SharedExpertGateStage::getBufferRequirements() const
     {
         StageBufferRequirements reqs;
+        if (!ownsGateArithmetic())
+            return reqs;
         if (params_.input)
             reqs.addInput("input", params_.input->shape(), toBufferTensorType(params_.input->native_type()));
         if (params_.shared_output)
@@ -8937,6 +10180,8 @@ namespace llaminar2
 
     StageBufferContract SharedExpertGateStage::bufferContract() const
     {
+        if (!ownsGateArithmetic())
+            return {};
         auto contract = StageBufferContract::build();
 
         contract.addInput(params_.input_buffer_id);
@@ -8961,6 +10206,16 @@ namespace llaminar2
     StageDumpInfo SharedExpertGateStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
+        if (!ownsGateArithmetic())
+        {
+            info.addScalarInt(
+                "execution_role",
+                static_cast<int>(params_.execution_role));
+            return info;
+        }
+        info.addScalarInt(
+            "execution_role",
+            static_cast<int>(params_.execution_role));
         if (params_.input)
             info.addInput("input", params_.input, params_.seq_len, params_.d_model);
         if (params_.gate_inp)
@@ -8989,6 +10244,15 @@ namespace llaminar2
         : IComputeStage(params.device_id),
           params_(std::move(params))
     {
+        if (params_.canonical_route_layout ==
+                MoECanonicalRoutePublicationLayout::PackedIndexedRouteRows &&
+            params_.seq_len > 0 && params_.top_k > 0)
+        {
+            packed_record_for_route_slot_.resize(
+                static_cast<size_t>(params_.seq_len) *
+                    static_cast<size_t>(params_.top_k),
+                -1);
+        }
     }
 
     namespace
@@ -9004,20 +10268,81 @@ namespace llaminar2
         bool ownsCanonicalRouteReduction(
             MoECanonicalRouteReductionRole role) noexcept
         {
-            return role == MoECanonicalRouteReductionRole::RootOwner;
+            return role == MoECanonicalRouteReductionRole::RootOwner ||
+                   role ==
+                       MoECanonicalRouteReductionRole::AllreduceParticipant;
+        }
+
+        /**
+         * @brief Upload immutable root-side mapped-lane descriptors once.
+         *
+         * INT32Tensor is only the aligned RAII storage owner. The bytes retain
+         * their strongly typed ABI at construction and launch, and preparation
+         * happens before native capture on the stage's exact stream.
+         */
+        bool uploadNodeLocalRoutePeerBindings(
+            const std::vector<MoENodeLocalRoutePeerDeviceBinding> &bindings,
+            const StageGPUExecution &execution,
+            std::unique_ptr<TensorBase> *storage)
+        {
+            static_assert(std::is_trivially_copyable_v<
+                          MoENodeLocalRoutePeerDeviceBinding>);
+            static_assert(
+                sizeof(MoENodeLocalRoutePeerDeviceBinding) %
+                    sizeof(std::int32_t) ==
+                0u);
+            if (!storage || bindings.empty())
+                return false;
+            try
+            {
+                const std::size_t bytes =
+                    bindings.size() *
+                    sizeof(MoENodeLocalRoutePeerDeviceBinding);
+                const std::size_t words =
+                    bytes / sizeof(std::int32_t);
+                auto prepared = std::make_unique<INT32Tensor>(
+                    std::vector<std::size_t>{words});
+                std::memcpy(
+                    prepared->raw_mutable_data(), bindings.data(), bytes);
+                execution.prepareInput(prepared.get());
+                execution.requirePreparedInput(prepared.get());
+                if (!prepared->gpu_data_ptr())
+                    throw std::runtime_error(
+                        "peer descriptor upload has no device address");
+                *storage = std::move(prepared);
+                return true;
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR(
+                    "[MoECanonicalRouteReduceStage] Failed to prepare "
+                    "node-local peer bindings: "
+                    << error.what());
+                return false;
+            }
         }
     } // namespace
 
     bool MoECanonicalRouteReduceStage::execute(IDeviceContext *ctx)
     {
+        const bool uses_node_local_exchange =
+            params_.node_local_route_exchange != nullptr;
         if (!ctx ||
             !params_.canonical_route_contributions ||
             !params_.output ||
             params_.seq_len <= 0 ||
             params_.top_k <= 0 ||
             params_.d_model <= 0 ||
+            params_.canonical_route_arithmetic ==
+                MoECanonicalRouteArithmeticPolicy::Unspecified ||
+            params_.canonical_route_layout ==
+                MoECanonicalRoutePublicationLayout::Unspecified ||
             params_.reduction_role ==
-                MoECanonicalRouteReductionRole::Unspecified)
+                MoECanonicalRouteReductionRole::Unspecified ||
+            (uses_node_local_exchange &&
+             (!params_.route_participant_ids ||
+              params_.route_participant_id < 0 ||
+              !params_.node_local_route_exchange->materialized())))
         {
             LOG_ERROR("[MoECanonicalRouteReduceStage] Invalid execution contract"
                       << " ctx=" << (ctx != nullptr)
@@ -9027,8 +10352,20 @@ namespace llaminar2
                       << " seq_len=" << params_.seq_len
                       << " top_k=" << params_.top_k
                       << " d_model=" << params_.d_model
+                      << " arithmetic="
+                      << moeCanonicalRouteArithmeticPolicyToString(
+                             params_.canonical_route_arithmetic)
+                      << " layout="
+                      << moeCanonicalRoutePublicationLayoutToString(
+                             params_.canonical_route_layout)
                       << " reduction_role="
-                      << static_cast<int>(params_.reduction_role));
+                      << static_cast<int>(params_.reduction_role)
+                      << " node_local_exchange="
+                      << uses_node_local_exchange
+                      << " route_participant_ids="
+                      << (params_.route_participant_ids != nullptr)
+                      << " route_participant_id="
+                      << params_.route_participant_id);
             return false;
         }
 
@@ -9038,8 +10375,252 @@ namespace llaminar2
          * remains symmetric, but non-root participants must not read those
          * slots or launch redundant arithmetic before the compact broadcast.
          */
-        if (!ownsCanonicalRouteReduction(params_.reduction_role))
+        if (!uses_node_local_exchange &&
+            !ownsCanonicalRouteReduction(params_.reduction_role))
             return true;
+
+        if (params_.device_id.is_cpu())
+        {
+            const bool dense_allreduce_slots =
+                params_.canonical_route_layout ==
+                    MoECanonicalRoutePublicationLayout::
+                        DenseOriginalRouteSlots;
+            const bool packed_rooted_rows =
+                params_.canonical_route_layout ==
+                    MoECanonicalRoutePublicationLayout::
+                        PackedIndexedRouteRows;
+            if ((!dense_allreduce_slots && !packed_rooted_rows) ||
+                (dense_allreduce_slots &&
+                 params_.reduction_role !=
+                     MoECanonicalRouteReductionRole::
+                         AllreduceParticipant) ||
+                (packed_rooted_rows &&
+                 params_.reduction_role !=
+                     MoECanonicalRouteReductionRole::RootOwner) ||
+                params_.canonical_route_arithmetic !=
+                    MoECanonicalRouteArithmeticPolicy::
+                        UnweightedExpertRowThenOrderedFMA ||
+                !params_.routing_weights)
+            {
+                LOG_ERROR(
+                    "[MoECanonicalRouteReduceStage] CPU canonical reduction "
+                    "received incompatible ownership, arithmetic, or layout"
+                    << " role=" << static_cast<int>(params_.reduction_role)
+                    << " arithmetic="
+                    << moeCanonicalRouteArithmeticPolicyToString(
+                           params_.canonical_route_arithmetic)
+                    << " layout="
+                    << moeCanonicalRoutePublicationLayoutToString(
+                           params_.canonical_route_layout)
+                    << " routing_weights="
+                    << (params_.routing_weights != nullptr));
+                return false;
+            }
+
+            const float *route_rows =
+                params_.canonical_route_contributions->data();
+            const float *route_weights = params_.routing_weights->data();
+            float *output = params_.output->mutable_data();
+            if (!route_rows || !route_weights || !output)
+            {
+                LOG_ERROR(
+                    "[MoECanonicalRouteReduceStage] CPU canonical reduction "
+                    "could not access host tensors");
+                return false;
+            }
+
+            const size_t route_slot_count =
+                static_cast<size_t>(params_.seq_len) *
+                static_cast<size_t>(params_.top_k);
+            const bool publication_timing_enabled =
+                PerfStatsCollector::isDomainEnabled(
+                    "moe_canonical_publication");
+            const auto publication_start = publication_timing_enabled
+                                               ? PerfStatsCollector::Clock::now()
+                                               : PerfStatsCollector::Clock::time_point{};
+            size_t gathered_record_count = 0u;
+            if (packed_rooted_rows)
+            {
+                const size_t record_capacity =
+                    canonical_moe_route_record::recordCapacity(
+                        params_.canonical_route_contributions->numel(),
+                        params_.d_model);
+                gathered_record_count =
+                    canonical_moe_route_record::readRecordCount(
+                        route_rows,
+                        params_.canonical_route_contributions->numel());
+                if (record_capacity < route_slot_count ||
+                    gathered_record_count > route_slot_count ||
+                    packed_record_for_route_slot_.size() != route_slot_count)
+                {
+                    LOG_ERROR(
+                        "[MoECanonicalRouteReduceStage] Packed CPU route "
+                        "publication has invalid capacity/count"
+                        << " capacity=" << record_capacity
+                        << " gathered=" << gathered_record_count
+                        << " route_slots=" << route_slot_count
+                        << " lookup="
+                        << packed_record_for_route_slot_.size());
+                    return false;
+                }
+
+                std::fill(
+                    packed_record_for_route_slot_.begin(),
+                    packed_record_for_route_slot_.end(),
+                    -1);
+                size_t expected_records = 0u;
+                for (size_t record_index = 0;
+                     record_index < gathered_record_count;
+                     ++record_index)
+                {
+                    const float *const route_record =
+                        canonical_moe_route_record::record(
+                            route_rows,
+                            record_index,
+                            params_.d_model);
+                    const size_t flat_slot = static_cast<size_t>(
+                        canonical_moe_route_record::readFlatRouteSlot(
+                            route_record,
+                            params_.d_model));
+                    if (flat_slot >= route_slot_count ||
+                        route_weights[flat_slot] == 0.0f ||
+                        packed_record_for_route_slot_[flat_slot] >= 0)
+                    {
+                        LOG_ERROR(
+                            "[MoECanonicalRouteReduceStage] Packed CPU route "
+                            "record has an invalid, inert, or duplicate slot"
+                            << " record=" << record_index
+                            << " slot=" << flat_slot
+                            << " route_slots=" << route_slot_count
+                            << " weight="
+                            << (flat_slot < route_slot_count
+                                    ? route_weights[flat_slot]
+                                    : 0.0f));
+                        return false;
+                    }
+                    packed_record_for_route_slot_[flat_slot] =
+                        static_cast<int32_t>(record_index);
+                }
+                for (size_t flat_slot = 0;
+                     flat_slot < route_slot_count;
+                     ++flat_slot)
+                {
+                    if (route_weights[flat_slot] == 0.0f)
+                        continue;
+                    ++expected_records;
+                    if (packed_record_for_route_slot_[flat_slot] < 0)
+                    {
+                        LOG_ERROR(
+                            "[MoECanonicalRouteReduceStage] Packed CPU route "
+                            "publication is missing a live original slot"
+                            << " slot=" << flat_slot
+                            << " weight=" << route_weights[flat_slot]);
+                        return false;
+                    }
+                }
+                if (expected_records != gathered_record_count)
+                {
+                    LOG_ERROR(
+                        "[MoECanonicalRouteReduceStage] Packed CPU route "
+                        "record total does not match live router slots"
+                        << " expected=" << expected_records
+                        << " gathered=" << gathered_record_count);
+                    return false;
+                }
+            }
+
+            cpu::moe::CanonicalRouteFoldPlan fold_plan;
+            if (!cpu::moe::reduceCanonicalRouteRowsOrderedFMA(
+                    {
+                        .route_rows = route_rows,
+                        .route_weights = route_weights,
+                        .record_for_route_slot = packed_rooted_rows
+                                                     ? packed_record_for_route_slot_.data()
+                                                     : nullptr,
+                        .output = output,
+                        .rows = params_.seq_len,
+                        .top_k = params_.top_k,
+                        .columns = params_.d_model,
+                    },
+                    &fold_plan))
+            {
+                LOG_ERROR(
+                    "[MoECanonicalRouteReduceStage] CPU canonical ordered "
+                    "route fold rejected a validated publication"
+                    << " rows=" << params_.seq_len
+                    << " top_k=" << params_.top_k
+                    << " d_model=" << params_.d_model
+                    << " packed=" << packed_rooted_rows);
+                return false;
+            }
+
+            if (publication_timing_enabled)
+            {
+                const PerfStatsCollector::Tags publication_tags{
+                    {"top_k", std::to_string(params_.top_k)},
+                    {"d_model", std::to_string(params_.d_model)},
+                    {"layout",
+                     moeCanonicalRoutePublicationLayoutToString(
+                         params_.canonical_route_layout)},
+                    {"gathered_records",
+                     std::to_string(gathered_record_count)},
+                    {"executor",
+                     cpu::moe::canonicalRouteFoldExecutorName(
+                         fold_plan.executor)},
+                    {"column_tile",
+                     std::to_string(fold_plan.column_tile)},
+                    {"parallel_tasks",
+                     std::to_string(fold_plan.parallel_tasks)},
+                    {"team_threads",
+                     std::to_string(fold_plan.team_threads)}};
+                PerfStatsCollector::addCounter(
+                    "moe_canonical_publication",
+                    packed_rooted_rows
+                        ? "cpu_packed_route_root_ordered_fma_rows"
+                        : "cpu_unweighted_route_slot_ordered_fma_rows",
+                    static_cast<double>(params_.seq_len),
+                    params_.seq_len == 1 ? "decode" : "prefill",
+                    params_.device_id.to_string(),
+                    publication_tags);
+                const auto publication_finish =
+                    PerfStatsCollector::Clock::now();
+                const auto publication_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        publication_finish - publication_start)
+                        .count();
+                PerfStatsCollector::recordTimingNs(
+                    "moe_canonical_publication",
+                    packed_rooted_rows
+                        ? "cpu_packed_route_root_ordered_fma"
+                        : "cpu_dense_route_root_ordered_fma",
+                    publication_ns > 0
+                        ? static_cast<uint64_t>(publication_ns)
+                        : 0u,
+                    params_.seq_len == 1 ? "decode" : "prefill",
+                    params_.device_id.to_string(),
+                    publication_tags);
+            }
+            return true;
+        }
+
+        if (params_.canonical_route_arithmetic !=
+                MoECanonicalRouteArithmeticPolicy::
+                    PreweightedContributionThenOrderedAdd ||
+            params_.canonical_route_layout !=
+                MoECanonicalRoutePublicationLayout::
+                    DenseOriginalRouteSlots)
+        {
+            LOG_ERROR(
+                "[MoECanonicalRouteReduceStage] GPU canonical reduction "
+                "requires dense preweighted route contributions"
+                << " arithmetic="
+                << moeCanonicalRouteArithmeticPolicyToString(
+                       params_.canonical_route_arithmetic)
+                << " layout="
+                << moeCanonicalRoutePublicationLayoutToString(
+                       params_.canonical_route_layout));
+            return false;
+        }
 
         if (!moe_kernel_)
         {
@@ -9047,8 +10628,122 @@ namespace llaminar2
             moe_kernel_ = owned_moe_kernel_.get();
         }
         IMoEKernel *kernel = bindStageStream(moe_kernel_);
-        if (!kernel ||
-            !kernel->reduceCanonicalRouteContributions(
+        if (!kernel)
+        {
+            LOG_ERROR(
+                "[MoECanonicalRouteReduceStage] Device kernel is unavailable"
+                << " device=" << params_.device_id.toString());
+            return false;
+        }
+
+        if (uses_node_local_exchange)
+        {
+            const StageGPUExecution execution = gpuExecution();
+            execution.requirePreparedInput(
+                params_.canonical_route_contributions);
+            const auto *const route_contributions =
+                static_cast<const float *>(
+                    params_.canonical_route_contributions->gpu_data_ptr());
+            const std::uint64_t live_route_slots =
+                static_cast<std::uint64_t>(params_.seq_len) *
+                static_cast<std::uint64_t>(params_.top_k);
+            if (!route_contributions || live_route_slots == 0u ||
+                live_route_slots >
+                    std::numeric_limits<std::uint32_t>::max())
+            {
+                LOG_ERROR(
+                    "[MoECanonicalRouteReduceStage] Sparse node-local route "
+                    "publication has invalid device input or geometry");
+                return false;
+            }
+            const MoEKernelLaunchContext launch{
+                .stream = execution.nativeStream(),
+            };
+            if (params_.reduction_role ==
+                MoECanonicalRouteReductionRole::RootOwner)
+            {
+                execution.requirePreparedOutput(params_.output);
+                if (!node_local_peer_bindings_storage_ ||
+                    !node_local_validation_storage_ ||
+                    node_local_peer_count_ == 0u)
+                {
+                    LOG_ERROR(
+                        "[MoECanonicalRouteReduceStage] Root sparse route "
+                        "consumer has no prepared peer descriptors/status");
+                    return false;
+                }
+                MoENodeLocalRouteConsumeLaunch consumption{
+                    .peers = static_cast<
+                        const MoENodeLocalRoutePeerDeviceBinding *>(
+                        node_local_peer_bindings_storage_->gpu_data_ptr()),
+                    .peer_count = node_local_peer_count_,
+                    .root_canonical_route_contributions =
+                        route_contributions,
+                    .route_participant_ids =
+                        params_.route_participant_ids,
+                    .dense_output = static_cast<float *>(
+                        params_.output->gpu_data_ptr()),
+                    .validation_status = static_cast<std::int32_t *>(
+                        node_local_validation_storage_->gpu_data_ptr()),
+                    .root_participant = params_.route_participant_id,
+                    .physical_rows =
+                        static_cast<std::uint32_t>(params_.seq_len),
+                    .top_k = static_cast<std::uint32_t>(params_.top_k),
+                    .d_model = static_cast<std::uint32_t>(params_.d_model),
+                };
+                if (!kernel->acquireNodeLocalCanonicalRoutes(
+                        launch, consumption))
+                {
+                    LOG_ERROR(
+                        "[MoECanonicalRouteReduceStage] Root sparse route "
+                        "epoch acquisition failed");
+                    return false;
+                }
+                /*
+                 * The acquire kernel above is the device-owned producer edge.
+                 * Pull only owner-selected mapped rows into stable root VRAM;
+                 * a fixed full-lane DMA would transfer mostly stale rows for a
+                 * sparse high-cardinality expert topology.
+                 */
+                if (!kernel->stageNodeLocalCanonicalRoutes(
+                        launch, consumption))
+                {
+                    LOG_ERROR(
+                        "[MoECanonicalRouteReduceStage] Root sparse route "
+                        "owner-selected payload staging failed");
+                    return false;
+                }
+                if (!kernel->foldNodeLocalCanonicalRoutes(
+                        launch, consumption))
+                {
+                    LOG_ERROR(
+                        "[MoECanonicalRouteReduceStage] Root sparse route "
+                        "validation/fold failed");
+                    return false;
+                }
+                execution.publish(params_.output);
+                return true;
+            }
+
+            MoENodeLocalRoutePublishLaunch publication{
+                .lane = node_local_producer_binding_,
+                .canonical_route_contributions = route_contributions,
+                .route_participant_ids = params_.route_participant_ids,
+                .live_route_slots =
+                    static_cast<std::uint32_t>(live_route_slots),
+            };
+            if (!kernel->publishNodeLocalCanonicalRoutes(
+                    launch, publication))
+            {
+                LOG_ERROR(
+                    "[MoECanonicalRouteReduceStage] Peer sparse node-local "
+                    "route publication failed");
+                return false;
+            }
+            return true;
+        }
+
+        if (!kernel->reduceCanonicalRouteContributions(
                 params_.canonical_route_contributions,
                 params_.output,
                 params_.seq_len,
@@ -9082,6 +10777,8 @@ namespace llaminar2
     {
         switch (backend)
         {
+        case ComputeBackendType::CPU:
+            return true;
 #if defined(HAVE_CUDA)
         case ComputeBackendType::GPU_CUDA:
             return true;
@@ -9099,6 +10796,8 @@ namespace llaminar2
     {
         if (!supportsGraphCaptureAfterLaunchPreparation())
             return false;
+        if (params_.node_local_route_exchange)
+            return moe_kernel_ != nullptr;
         return !ownsCanonicalRouteReduction(params_.reduction_role) ||
                moe_kernel_ != nullptr;
     }
@@ -9115,7 +10814,10 @@ namespace llaminar2
             return false;
         }
         setGPUStream(stream);
-        if (!ownsCanonicalRouteReduction(params_.reduction_role))
+        const bool uses_node_local_exchange =
+            params_.node_local_route_exchange != nullptr;
+        if (!uses_node_local_exchange &&
+            !ownsCanonicalRouteReduction(params_.reduction_role))
             return true;
 
         if (!moe_kernel_)
@@ -9124,7 +10826,96 @@ namespace llaminar2
                 KernelFactory::createMoEKernel(params_.device_id);
             moe_kernel_ = owned_moe_kernel_.get();
         }
-        return bindStageStream(moe_kernel_) != nullptr;
+        if (!bindStageStream(moe_kernel_))
+            return false;
+
+        if (!uses_node_local_exchange)
+            return true;
+        if (!params_.route_participant_ids ||
+            params_.route_participant_id < 0 ||
+            !params_.node_local_route_exchange->materialized())
+        {
+            LOG_ERROR(
+                "[MoECanonicalRouteReduceStage] Sparse route launch "
+                "preparation requires a materialized fabric and stable "
+                "device-owned route assignment");
+            return false;
+        }
+        const bool is_root =
+            params_.reduction_role ==
+            MoECanonicalRouteReductionRole::RootOwner;
+        if (is_root !=
+                (params_.route_participant_id ==
+                 params_.node_local_route_exchange->rootParticipant()) ||
+            is_root !=
+                (params_.device_id ==
+                 params_.node_local_route_exchange->rootDevice()))
+        {
+            LOG_ERROR(
+                "[MoECanonicalRouteReduceStage] Sparse route role disagrees "
+                "with fabric root identity");
+            return false;
+        }
+
+        const StageGPUExecution execution = gpuExecution();
+        if (is_root)
+        {
+            const auto bindings =
+                params_.node_local_route_exchange->rootPeerBindings(
+                    params_.device_id);
+            if (bindings.empty())
+            {
+                return false;
+            }
+            node_local_peer_count_ =
+                static_cast<std::uint32_t>(bindings.size());
+            if (!node_local_peer_bindings_storage_)
+            {
+                if (!uploadNodeLocalRoutePeerBindings(
+                        bindings,
+                        execution,
+                        &node_local_peer_bindings_storage_))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                execution.requirePreparedInput(
+                    node_local_peer_bindings_storage_.get());
+            }
+            if (!node_local_validation_storage_)
+            {
+                auto validation = std::make_unique<INT32Tensor>(
+                    std::vector<std::size_t>{1u});
+                execution.prepareOutput(validation.get());
+                execution.requirePreparedOutput(validation.get());
+                if (!validation->gpu_data_ptr())
+                    return false;
+                node_local_validation_storage_ = std::move(validation);
+            }
+            else
+            {
+                execution.requirePreparedOutput(
+                    node_local_validation_storage_.get());
+            }
+        }
+        else
+        {
+            node_local_producer_binding_ =
+                params_.node_local_route_exchange->producerBinding(
+                    params_.device_id);
+            if (!node_local_producer_binding_.valid() ||
+                node_local_producer_binding_.producer_participant !=
+                    params_.route_participant_id)
+            {
+                LOG_ERROR(
+                    "[MoECanonicalRouteReduceStage] Producer mapped alias "
+                    "does not match graph participant identity");
+                return false;
+            }
+        }
+        return true;
     }
 
     bool MoECanonicalRouteReduceStage::supportsGraphCaptureAfterLaunchPreparation() const
@@ -9135,6 +10926,9 @@ namespace llaminar2
                params_.seq_len > 0 &&
                params_.top_k > 0 &&
                params_.d_model > 0 &&
+               (!params_.node_local_route_exchange ||
+                (params_.route_participant_ids &&
+                 params_.route_participant_id >= 0)) &&
                params_.reduction_role !=
                    MoECanonicalRouteReductionRole::Unspecified;
     }
@@ -9165,7 +10959,10 @@ namespace llaminar2
     MoECanonicalRouteReduceStage::getBufferRequirements() const
     {
         StageBufferRequirements reqs;
-        if (!ownsCanonicalRouteReduction(params_.reduction_role))
+        const bool participates =
+            params_.node_local_route_exchange ||
+            ownsCanonicalRouteReduction(params_.reduction_role);
+        if (!participates)
             return reqs;
         if (params_.canonical_route_contributions)
         {
@@ -9175,7 +10972,19 @@ namespace llaminar2
                 toBufferTensorType(
                     params_.canonical_route_contributions->native_type()));
         }
-        if (params_.output)
+        if (params_.canonical_route_arithmetic ==
+                MoECanonicalRouteArithmeticPolicy::
+                    UnweightedExpertRowThenOrderedFMA &&
+            params_.routing_weights)
+        {
+            reqs.addInput(
+                "routing_weights",
+                params_.routing_weights->shape(),
+                toBufferTensorType(
+                    params_.routing_weights->native_type()));
+        }
+        if (ownsCanonicalRouteReduction(params_.reduction_role) &&
+            params_.output)
         {
             reqs.addOutput(
                 "output",
@@ -9187,11 +10996,22 @@ namespace llaminar2
 
     StageBufferContract MoECanonicalRouteReduceStage::bufferContract() const
     {
-        if (!ownsCanonicalRouteReduction(params_.reduction_role))
+        const bool participates =
+            params_.node_local_route_exchange ||
+            ownsCanonicalRouteReduction(params_.reduction_role);
+        if (!participates)
             return {};
-        return StageBufferContract::build()
-            .addInput(params_.canonical_route_contributions_buffer_id)
-            .addOutput(params_.output_buffer_id);
+        auto contract = StageBufferContract::build();
+        contract.addInput(params_.canonical_route_contributions_buffer_id);
+        if (params_.canonical_route_arithmetic ==
+            MoECanonicalRouteArithmeticPolicy::
+                UnweightedExpertRowThenOrderedFMA)
+        {
+            contract.addInput(params_.routing_weights_buffer_id);
+        }
+        if (ownsCanonicalRouteReduction(params_.reduction_role))
+            contract.addOutput(params_.output_buffer_id);
+        return contract;
     }
 
     StageDumpInfo MoECanonicalRouteReduceStage::buildDumpInfoImpl() const
@@ -9199,13 +11019,26 @@ namespace llaminar2
         StageDumpInfo info;
         const bool owns_reduction =
             ownsCanonicalRouteReduction(params_.reduction_role);
-        if (owns_reduction && params_.canonical_route_contributions)
+        const bool participates =
+            owns_reduction || params_.node_local_route_exchange;
+        if (participates && params_.canonical_route_contributions)
         {
             info.addInput(
                 "canonical_route_contributions",
                 params_.canonical_route_contributions,
                 static_cast<size_t>(params_.seq_len * params_.top_k),
                 static_cast<size_t>(params_.d_model));
+        }
+        if (owns_reduction && params_.routing_weights &&
+            params_.canonical_route_arithmetic ==
+                MoECanonicalRouteArithmeticPolicy::
+                    UnweightedExpertRowThenOrderedFMA)
+        {
+            info.addInput(
+                "routing_weights",
+                params_.routing_weights,
+                params_.seq_len,
+                params_.top_k);
         }
         if (owns_reduction && params_.output)
         {
@@ -9222,6 +11055,339 @@ namespace llaminar2
             "reduction_role",
             static_cast<int>(params_.reduction_role));
         info.addScalarBool("owns_reduction", owns_reduction);
+        return info;
+    }
+
+    // =========================================================================
+    // MoECanonicalRouteGatherStage
+    // =========================================================================
+
+    MoECanonicalRouteGatherStage::MoECanonicalRouteGatherStage(Params params)
+        : IComputeStage(params.device_id),
+          params_(std::move(params))
+    {
+    }
+
+    bool MoECanonicalRouteGatherStage::execute(IDeviceContext *ctx)
+    {
+        auto *const global_tp =
+            dynamic_cast<IGlobalTPContext *>(params_.tp_ctx);
+        if (!ctx || !params_.device_id.is_cpu() || !global_tp ||
+            !params_.packed_route_records || params_.seq_len <= 0 ||
+            params_.top_k <= 0 || params_.d_model <= 0 ||
+            params_.root_participant < 0 ||
+            params_.root_participant >= global_tp->degree() ||
+            global_tp->degree() <= 1)
+        {
+            LOG_ERROR("[MoECanonicalRouteGatherStage] Invalid rooted packed "
+                      "gather contract"
+                      << " ctx=" << (ctx != nullptr)
+                      << " device=" << params_.device_id.to_string()
+                      << " global_tp=" << (global_tp != nullptr)
+                      << " records="
+                      << (params_.packed_route_records != nullptr)
+                      << " seq_len=" << params_.seq_len
+                      << " top_k=" << params_.top_k
+                      << " d_model=" << params_.d_model
+                      << " root=" << params_.root_participant);
+            return false;
+        }
+
+        float *const records = params_.packed_route_records->mutable_data();
+        const size_t route_slot_count =
+            static_cast<size_t>(params_.seq_len) *
+            static_cast<size_t>(params_.top_k);
+        const size_t record_capacity =
+            canonical_moe_route_record::recordCapacity(
+                params_.packed_route_records->numel(),
+                params_.d_model);
+        const size_t local_record_count =
+            canonical_moe_route_record::readRecordCount(
+                records,
+                params_.packed_route_records->numel());
+        if (!records || record_capacity < route_slot_count ||
+            local_record_count > route_slot_count)
+        {
+            LOG_ERROR("[MoECanonicalRouteGatherStage] Packed publication "
+                      "capacity/count is invalid"
+                      << " stage="
+                      << (params_.stage_name.empty()
+                              ? "(unnamed)"
+                              : params_.stage_name)
+                      << " capacity=" << record_capacity
+                      << " local_records=" << local_record_count
+                      << " route_slots=" << route_slot_count);
+            return false;
+        }
+
+        const bool gather_timing_enabled =
+            PerfStatsCollector::isDomainEnabled(
+                "moe_canonical_publication");
+        const auto gather_start = gather_timing_enabled
+                                      ? PerfStatsCollector::Clock::now()
+                                      : PerfStatsCollector::Clock::time_point{};
+        size_t gathered_record_count = 0u;
+        if (!global_tp->gatherVariableFloatRecordsToRoot(
+                records,
+                local_record_count,
+                records,
+                route_slot_count,
+                canonical_moe_route_record::recordWidth(params_.d_model),
+                params_.root_participant,
+                gathered_record_count,
+                params_.stage_name))
+        {
+            LOG_ERROR("[MoECanonicalRouteGatherStage] Native packed rooted "
+                      "gather failed"
+                      << " stage="
+                      << (params_.stage_name.empty()
+                              ? "(unnamed)"
+                              : params_.stage_name)
+                      << " participant=" << global_tp->myIndex()
+                      << " root=" << params_.root_participant);
+            return false;
+        }
+        if (global_tp->myIndex() == params_.root_participant &&
+            (gathered_record_count > route_slot_count ||
+             !canonical_moe_route_record::writeRecordCount(
+                 records,
+                 params_.packed_route_records->numel(),
+                 gathered_record_count)))
+        {
+            LOG_ERROR("[MoECanonicalRouteGatherStage] Root could not publish "
+                      "the gathered packed-record count"
+                      << " gathered=" << gathered_record_count
+                      << " route_slots=" << route_slot_count);
+            return false;
+        }
+
+        const size_t local_elements =
+            local_record_count *
+            canonical_moe_route_record::recordWidth(params_.d_model);
+        const PerfStatsCollector::Tags tags{
+            {"stage",
+             params_.stage_name.empty() ? "unnamed" : params_.stage_name},
+            {"root", std::to_string(params_.root_participant)},
+            {"participant", std::to_string(global_tp->myIndex())},
+            {"degree", std::to_string(global_tp->degree())},
+            {"local_records", std::to_string(local_record_count)},
+            {"record_width",
+             std::to_string(
+                 canonical_moe_route_record::recordWidth(params_.d_model))}};
+        if (gather_timing_enabled)
+        {
+            const auto gather_finish = PerfStatsCollector::Clock::now();
+            const auto gather_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    gather_finish - gather_start)
+                    .count();
+            PerfStatsCollector::recordTimingNs(
+                "moe_canonical_publication",
+                "cpu_packed_route_gather",
+                gather_ns > 0 ? static_cast<uint64_t>(gather_ns) : 0u,
+                params_.seq_len == 1 ? "decode" : "prefill",
+                params_.device_id.to_string(),
+                tags);
+        }
+        PerfStatsCollector::addCounter(
+            "moe_canonical_publication",
+            "cpu_packed_route_gather_calls",
+            1.0,
+            params_.seq_len == 1 ? "decode" : "prefill",
+            params_.device_id.to_string(),
+            tags);
+        PerfStatsCollector::addCounter(
+            "moe_canonical_publication",
+            "cpu_packed_route_gather_local_bytes",
+            static_cast<double>(local_elements * sizeof(float)),
+            params_.seq_len == 1 ? "decode" : "prefill",
+            params_.device_id.to_string(),
+            tags);
+        return true;
+    }
+
+    bool MoECanonicalRouteGatherStage::supportsBackend(
+        ComputeBackendType backend) const
+    {
+        return backend == ComputeBackendType::CPU;
+    }
+
+    StageBufferRequirements
+    MoECanonicalRouteGatherStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+        if (params_.packed_route_records)
+        {
+            reqs.addInout(
+                "packed_route_records",
+                params_.packed_route_records->shape(),
+                toBufferTensorType(
+                    params_.packed_route_records->native_type()));
+        }
+        return reqs;
+    }
+
+    StageBufferContract MoECanonicalRouteGatherStage::bufferContract() const
+    {
+        if (!params_.packed_route_records)
+            return {};
+        return StageBufferContract::build().addPreallocatedInOut(
+            params_.packed_route_records_buffer_id);
+    }
+
+    StageDumpInfo MoECanonicalRouteGatherStage::buildDumpInfoImpl() const
+    {
+        StageDumpInfo info;
+        if (params_.packed_route_records)
+        {
+            info.addInput(
+                "packed_route_records",
+                params_.packed_route_records,
+                params_.packed_route_records->rows(),
+                params_.packed_route_records->cols());
+        }
+        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("top_k", params_.top_k);
+        info.addScalarInt("d_model", params_.d_model);
+        info.addScalarInt("root_participant", params_.root_participant);
+        return info;
+    }
+
+    // =========================================================================
+    // MoECanonicalOutputBroadcastStage
+    // =========================================================================
+
+    MoECanonicalOutputBroadcastStage::
+        MoECanonicalOutputBroadcastStage(Params params)
+        : IComputeStage(params.device_id),
+          params_(std::move(params))
+    {
+    }
+
+    bool MoECanonicalOutputBroadcastStage::execute(IDeviceContext *ctx)
+    {
+        auto *const global_tp =
+            dynamic_cast<IGlobalTPContext *>(params_.tp_ctx);
+        if (!ctx || !params_.device_id.is_cpu() || !global_tp ||
+            !params_.output || params_.seq_len <= 0 ||
+            params_.d_model <= 0 || params_.root_participant < 0 ||
+            params_.root_participant >= global_tp->degree() ||
+            global_tp->degree() <= 1)
+        {
+            LOG_ERROR("[MoECanonicalOutputBroadcastStage] Invalid compact "
+                      "broadcast contract"
+                      << " ctx=" << (ctx != nullptr)
+                      << " device=" << params_.device_id.to_string()
+                      << " global_tp=" << (global_tp != nullptr)
+                      << " output=" << (params_.output != nullptr)
+                      << " seq_len=" << params_.seq_len
+                      << " d_model=" << params_.d_model
+                      << " root=" << params_.root_participant);
+            return false;
+        }
+        const size_t element_count =
+            static_cast<size_t>(params_.seq_len) *
+            static_cast<size_t>(params_.d_model);
+        const bool broadcast_timing_enabled =
+            PerfStatsCollector::isDomainEnabled(
+                "moe_canonical_publication");
+        const auto broadcast_start = broadcast_timing_enabled
+                                         ? PerfStatsCollector::Clock::now()
+                                         : PerfStatsCollector::Clock::time_point{};
+        if (!global_tp->broadcastFloatElements(
+                params_.output,
+                element_count,
+                params_.root_participant,
+                params_.stage_name))
+        {
+            LOG_ERROR("[MoECanonicalOutputBroadcastStage] Compact rooted "
+                      "broadcast failed"
+                      << " stage="
+                      << (params_.stage_name.empty()
+                              ? "(unnamed)"
+                              : params_.stage_name)
+                      << " participant=" << global_tp->myIndex()
+                      << " root=" << params_.root_participant);
+            return false;
+        }
+        const PerfStatsCollector::Tags broadcast_tags{
+            {"stage",
+             params_.stage_name.empty() ? "unnamed" : params_.stage_name},
+            {"root", std::to_string(params_.root_participant)},
+            {"participant", std::to_string(global_tp->myIndex())},
+            {"degree", std::to_string(global_tp->degree())},
+            {"bytes", std::to_string(element_count * sizeof(float))}};
+        if (broadcast_timing_enabled)
+        {
+            const auto broadcast_finish = PerfStatsCollector::Clock::now();
+            const auto broadcast_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    broadcast_finish - broadcast_start)
+                    .count();
+            PerfStatsCollector::recordTimingNs(
+                "moe_canonical_publication",
+                "cpu_compact_output_broadcast",
+                broadcast_ns > 0
+                    ? static_cast<uint64_t>(broadcast_ns)
+                    : 0u,
+                params_.seq_len == 1 ? "decode" : "prefill",
+                params_.device_id.to_string(),
+                broadcast_tags);
+        }
+        PerfStatsCollector::addCounter(
+            "moe_canonical_publication",
+            "cpu_compact_output_broadcast_calls",
+            1.0,
+            params_.seq_len == 1 ? "decode" : "prefill",
+            params_.device_id.to_string(),
+            broadcast_tags);
+        return true;
+    }
+
+    bool MoECanonicalOutputBroadcastStage::supportsBackend(
+        ComputeBackendType backend) const
+    {
+        return backend == ComputeBackendType::CPU;
+    }
+
+    StageBufferRequirements
+    MoECanonicalOutputBroadcastStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+        if (params_.output)
+        {
+            reqs.addInout(
+                "output",
+                params_.output->shape(),
+                toBufferTensorType(params_.output->native_type()));
+        }
+        return reqs;
+    }
+
+    StageBufferContract
+    MoECanonicalOutputBroadcastStage::bufferContract() const
+    {
+        if (!params_.output)
+            return {};
+        return StageBufferContract::build().addPreallocatedInOut(
+            params_.output_buffer_id);
+    }
+
+    StageDumpInfo
+    MoECanonicalOutputBroadcastStage::buildDumpInfoImpl() const
+    {
+        StageDumpInfo info;
+        if (params_.output)
+        {
+            info.addOutput(
+                "output",
+                params_.output,
+                params_.seq_len,
+                params_.d_model);
+        }
+        info.addScalarInt("seq_len", params_.seq_len);
+        info.addScalarInt("d_model", params_.d_model);
+        info.addScalarInt("root_participant", params_.root_participant);
         return info;
     }
 

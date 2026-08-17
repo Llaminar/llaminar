@@ -223,6 +223,7 @@ namespace llaminar2
         int bucket_seq_len,
         PrefillGraphPreflightMode mode,
         bool collectives_graph_capturable,
+        bool heterogeneous_segmentation_admitted,
         bool moe_rebalancing_graph_stable,
         std::string *reject_stage_name,
         std::string *reject_stage_type) const
@@ -253,7 +254,9 @@ namespace llaminar2
         if (moe_rebalancing_active && padded_bucket && !moe_rebalancing_graph_stable)
             return PrefillGraphRejectReason::ActiveMoERebalancing;
 
-        if (collective_nodes && !collective_nodes->empty() && !collectives_graph_capturable)
+        if (collective_nodes && !collective_nodes->empty() &&
+            !collectives_graph_capturable &&
+            !heterogeneous_segmentation_admitted)
             return PrefillGraphRejectReason::CollectiveNodesPresent;
 
         if (padded_bucket && containsPaddedBucketUnsafeGDNStage(graph))
@@ -283,6 +286,16 @@ namespace llaminar2
                     : node->stage->isGraphCapturable();
             if (!stage_ok)
             {
+                const bool declared_heterogeneous_boundary =
+                    heterogeneous_segmentation_admitted &&
+                    (node->stage->isCollectiveStage() ||
+                     node->stage->isManualGraphBoundary()) &&
+                    (!padded_bucket ||
+                     node->stage
+                         ->supportsPaddedPrefillGraphCapturePreflight());
+                if (declared_heterogeneous_boundary)
+                    continue;
+
                 if (reject_stage_name)
                     *reject_stage_name = name;
                 if (reject_stage_type)

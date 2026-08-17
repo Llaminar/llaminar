@@ -29,9 +29,10 @@ namespace
         auto test_case = rocmSingleDeviceCase();
         test_case.name = "Qwen3.6 MoE ROCm SingleDevice benchmark-prompt MTP diagnostic";
         test_case.prompt = qwen36MoEBenchmarkPrompt();
-        test_case.metadata_envs = {"LLAMINAR_QWEN36_MOE_ROCM_MTP_DIAGNOSTIC_METADATA"};
+        test_case.metadata_envs = {
+            "LLAMINAR_QWEN36_MOE_MTP_DIAGNOSTIC_METADATA"};
         test_case.default_metadata_path =
-            "pytorch_qwen36_moe_rocm_mtp_diagnostic_snapshots/metadata.txt";
+            "pytorch_qwen36_moe_mtp_diagnostic_snapshots/metadata.txt";
         test_case.decode_steps = 4;
         test_case.max_seq_len = 768;
         return test_case;

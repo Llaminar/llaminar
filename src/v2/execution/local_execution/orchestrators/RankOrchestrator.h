@@ -68,6 +68,7 @@
 // Forward declaration for fromPlan() factory method
 namespace llaminar2
 {
+    class MoEOverlayNodeLocalRouteExchange;
     struct RankExecutionPlan;
 }
 
@@ -84,6 +85,9 @@ namespace llaminar2
     class DeviceSampler;
     class IMPIContext;
     class PreparedWeightStore;
+    class DecodeExpertHistogram;
+    class MoEOverlayResidencyAuthority;
+    class MoEOverlayParticipantResidencyRegistry;
     struct GraphExecutorStats;
     struct MoERoutedExpertPlacementPlan;
     struct PlacementPlan;
@@ -97,9 +101,16 @@ namespace llaminar2
             const MoERebalanceController &controller,
             const ExpertReplicaSet &arrivals);
 
+        /**
+         * @brief Mark only exact layer/expert payloads whose owner changed.
+         *
+         * The previous plan is deliberately layered. A flat expert-owner row
+         * would expand one layer's ownership change across every routed layer
+         * and transfer unrelated prepared weights.
+         */
         std::vector<std::vector<std::vector<bool>>> buildOwnershipArrivalTransferMasks(
             const MoERebalanceController &controller,
-            const std::vector<int> &previous_placement);
+            const MoELayeredExpertOwnership &previous_ownership);
     }
 
     /**
@@ -253,6 +264,10 @@ namespace llaminar2
             /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
             RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
+            /// Static whole-expert owner ordering for apportioned execution.
+            RoutedExpertOwnerOrder routed_expert_owner_order =
+                RoutedExpertOwnerOrder::Ordinal;
+
             /// Bounded remote-expert cache for dynamic routed-row assignment.
             MoEHotExpertCacheConfig moe_hot_expert_cache;
 
@@ -282,8 +297,28 @@ namespace llaminar2
             /// Optional same-layer MoE expert overlay plan propagated to child graph runners.
             std::shared_ptr<MoERoutedExpertPlacementPlan> moe_routed_expert_plan;
 
+            /// One process-local residency authority shared by every child graph.
+            std::shared_ptr<MoEOverlayResidencyAuthority>
+                moe_expert_overlay_residency_authority;
+
+            /** Process-local immutable prepared banks keyed by residency epoch. */
+            std::shared_ptr<MoEOverlayParticipantResidencyRegistry>
+                moe_expert_overlay_participant_residency;
+
+            /// Lifetime owner for the authority's allocation-free route histogram.
+            std::shared_ptr<DecodeExpertHistogram>
+                moe_expert_overlay_decode_histogram;
+
             /// Optional MPI context used by MoE overlay domain-worker commands.
             std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
+
+            /**
+             * One process-local sparse route fabric shared by continuation
+             * device graphs. RankOrchestrator creates it from declared
+             * topology before child graph construction.
+             */
+            std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
+                moe_node_local_route_exchange;
 
             // =================================================================
             // Helper Methods
@@ -451,6 +486,24 @@ namespace llaminar2
          */
         bool forward(const int *tokens, int seq_len) override;
         bool forwardPrefill(const int *tokens, int seq_len) override;
+        /** @copydoc IInferenceRunner::materializeServingGraphFamilyWithoutLaunch */
+        bool materializeServingGraphFamilyWithoutLaunch(
+            const ServingGraphFamilyMaterializationPlan &plan) override;
+        /** @brief Forward the root-published sparse MoE generation to every child graph. */
+        bool setMoEOverlayCollectiveRequestGeneration(
+            uint64_t generation_id) override;
+        /**
+         * @brief Bind one shared ticket coordinator to every LocalTP child.
+         *
+         * Participant indices follow the immutable child-runner order used by
+         * the worker pool. Pipeline-shaped rank graphs are rejected because a
+         * single symmetric sparse transaction cannot describe sequential PP
+         * stages.
+         */
+        bool setMoEOverlayInferenceTransactionCoordinator(
+            std::shared_ptr<MoEOverlayInferenceTransactionCoordinator>
+                coordinator,
+            int continuation_participant_index) override;
         bool forwardGroupedMTPVerifierWithHostTokenIds(
             const std::vector<std::vector<int>> &token_batches) override;
         /**
@@ -767,7 +820,7 @@ namespace llaminar2
         bool supportsMTPDeviceDraftTokenInput() const override;
         bool supportsMTPSidecarPreservesMainState() const override;
         bool supportsMTPShiftedRowReuseFromSidecar() const override;
-        bool usesMirroredLocalTPMTPHeadForVerifier() const override;
+        bool usesMirroredMTPHeadForVerifier() const override;
         bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
         bool applyPenaltiesOnDevice(
             const std::vector<LogitPenalty> &penalties,
@@ -1129,6 +1182,46 @@ namespace llaminar2
         void resetInferenceState(const InferenceStateResetRequest &request) override;
         void clear_cache() override;
         bool maybeApplyDecodeBoundaryMaintenance() override;
+
+        /**
+         * @brief Resolve one scheduling policy across the LocalTP domain.
+         * @return The shared child policy, or `Unsupported` on disagreement.
+         */
+        DeviceMoERebalanceMaintenanceExecutionPolicy
+        deviceMoERebalanceMaintenanceExecutionPolicy()
+            const noexcept override;
+
+        /** @brief Resolve one immutable hosted cadence across all participants. */
+        DeviceMoERebalanceHostedObservationSchedule
+        deviceMoERebalanceHostedObservationSchedule()
+            const noexcept override;
+
+        /**
+         * @brief Validate a graph-embedded known-non-due boundary on every participant.
+         *
+         * No participant launch is legal here: ordinary HIP decode already
+         * owns cadence in its complete graph and MTP owns its accepted-state
+         * transaction. The rank checks each participant's immutable topology
+         * without a worker-pool rendezvous, event, or D2H.
+         */
+        bool submitHostScheduledDeviceMoERebalanceKnownNonDueBoundary()
+            override;
+
+        /**
+         * @brief Observe and compare every participant ticket before launch.
+         * @param out_ticket Non-null destination for the authoritative decision.
+         * @return true only when all participants published the same decision.
+         */
+        bool observeDeviceMoERebalanceDispatchTicket(
+            DeviceMoERebalanceDispatchTicket *out_ticket) override;
+
+        /**
+         * @brief Concurrently submit a previously retained rank decision.
+         * @param ticket Authoritative ticket returned by the observation phase.
+         * @return true only when every participant accepted its local ticket.
+         */
+        bool submitHostScheduledDeviceMoERebalanceMaintenance(
+            const DeviceMoERebalanceDispatchTicket &ticket) override;
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
 
         /**
@@ -1357,7 +1450,9 @@ namespace llaminar2
         std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
         MoERebalanceController *moeRebalanceControllerForDomain(
             const std::string &domain_id) const override;
-        bool usesDeviceSideMoERebalanceController() const override;
+        MoEOverlayAuthorityExecutionKind
+        moeOverlayAuthorityExecution() const override;
+        bool deviceResidentMoEOverlayMaintenanceReady() const override;
 
         struct MoEExpertMaskSnapshot
         {
@@ -1401,7 +1496,7 @@ namespace llaminar2
         MoEExpertMaskSnapshot snapshotMoEExpertMasksForAllDevices(
             const MoERebalanceController &controller,
             const ExpertReplicaSet *replica_arrivals = nullptr,
-            const std::vector<int> *previous_ownership_placement = nullptr) const;
+            const MoELayeredExpertOwnership *previous_ownership = nullptr) const;
 
         /**
          * Prepare local expert arrivals for a future mask publication.
@@ -1423,7 +1518,7 @@ namespace llaminar2
         bool applyMoEExpertMasksForAllDevices(
             const MoERebalanceController &controller,
             const ExpertReplicaSet *replica_arrivals = nullptr,
-            const std::vector<int> *previous_ownership_placement = nullptr);
+            const MoELayeredExpertOwnership *previous_ownership = nullptr);
         bool applyMoEExpertMasksForAllDevices(
             const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
             const std::string &domain_id = {},
@@ -1452,6 +1547,19 @@ namespace llaminar2
          * @brief Initialize device runners from configuration
          */
         void initializeDeviceRunners();
+
+        /**
+         * @brief Whether this rank owns the main forward logits boundary.
+         *
+         * Ordinary TP ranks own an LM head. A TP rank nested inside a PP stage
+         * instead follows the stage's typed graph contract: non-terminal stages
+         * publish hidden activations and must never allocate, gather, or expose a
+         * host logits aggregate. This predicate is the single authority used by
+         * construction, forward completion, and the public logits accessor.
+         *
+         * @return true when the active rank topology includes the LM head.
+         */
+        bool ownsMainForwardLogits() const noexcept;
 
         /**
          * @brief Initialize device runners for PP mode
@@ -1670,6 +1778,23 @@ namespace llaminar2
         /** Per-participant authenticated tickets retained between observe/submit. */
         std::vector<sampling_math::DeviceGenerationDispatchTicket>
             rank_hosted_device_generation_tickets_;
+        /**
+         * Allocation-free participant tickets for ordinary HIP MoE cadence.
+         *
+         * The device controller ABI supports at most eight participants. A
+         * fixed array keeps the per-token hosted scheduler from allocating and
+         * retains each participant's lifecycle identity between observe/submit.
+         */
+        std::array<DeviceMoERebalanceDispatchTicket, 8>
+            rank_hosted_device_moe_rebalance_tickets_{};
+        size_t rank_hosted_device_moe_rebalance_ticket_count_ = 0;
+        /** Immutable hosted cadence retained for the current request. */
+        DeviceMoERebalanceHostedObservationSchedule
+            rank_hosted_device_moe_rebalance_observation_schedule_{};
+        /** Conservative decode-boundary countdown, never live device state. */
+        uint32_t
+            rank_hosted_device_moe_boundaries_until_observation_ = 0;
+        bool rank_hosted_device_moe_observation_schedule_initialized_ = false;
         int admitted_device_generation_max_new_tokens_ = 0;
 
         /// Per-child prefix hits captured during the last rank-level lookup.

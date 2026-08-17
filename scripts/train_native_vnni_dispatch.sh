@@ -200,6 +200,8 @@ fi
 # refresh implementation that incorrectly returned before producing every
 # required production artifact.
 cpu_batch_limit=0
+stop_after_cpu_decode=0
+resume_after_cpu_decode=0
 for ((argument_index = 0;
       argument_index < ${#refresh_arguments[@]};
       ++argument_index)); do
@@ -215,6 +217,12 @@ for ((argument_index = 0;
       ;;
     --cpu-batch-limit=*)
       cpu_batch_limit="${argument#*=}"
+      ;;
+    --stop-after-cpu-decode)
+      stop_after_cpu_decode=1
+      ;;
+    --resume-after-cpu-decode)
+      resume_after_cpu_decode=1
       ;;
   esac
 done
@@ -501,7 +509,13 @@ if (( ! dry_run )); then
       --quiet
   collection_status=$?
   set -e
-  if (( collection_status == 1 && cpu_batch_limit > 0 )); then
+  # A decode-only CPU invocation deliberately leaves the grouped half of the
+  # corpus absent. Retain that authenticated M=1 checkpoint under the same
+  # canonical workspace identity that --resume-after-cpu-decode will reopen.
+  # Treating this as a generic incomplete-corpus error used to strand the paid
+  # decode evidence and made the documented two-command transaction unusable.
+  if (( collection_status == 1 &&
+        (cpu_batch_limit > 0 || stop_after_cpu_decode > 0) )); then
     printf 'NativeVNNI collection checkpoint retained: %s\n' "${staging_dir}"
     exit 0
   fi

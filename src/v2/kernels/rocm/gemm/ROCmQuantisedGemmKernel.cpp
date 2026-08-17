@@ -78,6 +78,7 @@
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "backends/DeviceId.h"       // DeviceId
 #include "tensors/Tensors.h"         // Q8_1Tensor, FP32Tensor, etc.
+#include "tensors/TensorSlice.h"     // TensorSlice - unwrap TP-sharded biases
 #include "tensors/BlockStructures.h" // Q8_1Block
 #include "tensors/FP16Utils.h"
 #include "tensors/IQQuantTables.h" // iq3s_grid, iq2xs_grid, ksigns_iq2xs etc.
@@ -85,6 +86,7 @@
 #include "tensors/KernelSnapshotInfo.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/SlabGemmConfig.h"
 #include "utils/Logger.h"
@@ -310,6 +312,21 @@ namespace llaminar2
                 uint8_t codebook_id,
                 int device_id, void *stream);
 
+            /** Execute physical NativeVNNI bytes with source math policy. */
+            bool rocmGemm_native_vnni_fp32_with_policy(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const void *d_block_scales,
+                const void *d_block_mins,
+                const void *d_block_emins,
+                float *d_output,
+                const float *d_scales_A,
+                const float *d_scales_A_blockwise,
+                int M, int N, int K,
+                uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
+                int device_id, void *stream);
+
             // Native-VNNI GEMV: lossless decode with FP16 per-block scales.
             // Supports all ≤6-bit quantized formats via codebook_id:
             //   Q-quants: Q4_0, Q4_1, Q5_0, Q5_1
@@ -330,6 +347,22 @@ namespace llaminar2
                 float *d_partial_fp32, // [KB_MAX × N] partial buffer (nullable when KB=1)
                 int N, int K,
                 uint8_t codebook_id,
+                int device_id, void *stream,
+                const float *d_scale_A_blockwise = nullptr);
+
+            /** Execute serial GEMV with distinct decoder and math policy. */
+            bool rocmGemv_native_vnni_fp32_with_policy(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const void *d_block_scales,
+                const void *d_block_mins,
+                const void *d_block_emins,
+                float *d_C_fp32,
+                const float *d_scale_A,
+                float *d_partial_fp32,
+                int N, int K,
+                uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
                 int device_id, void *stream,
                 const float *d_scale_A_blockwise = nullptr);
 
@@ -358,6 +391,22 @@ namespace llaminar2
                 float *d_partial_fp32,            // [KB_MAX × M × N]
                 int M, int N, int K,
                 uint8_t codebook_id,
+                int device_id, void *stream);
+
+            /** Execute verifier GEMV with distinct decoder and math policy. */
+            bool rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const void *d_block_scales,
+                const void *d_block_mins,
+                const void *d_block_emins,
+                float *d_C_fp32,
+                const float *d_scale_A_blockwise,
+                const int32_t *d_sum_A_blockwise,
+                float *d_partial_fp32,
+                int M, int N, int K,
+                uint8_t codebook_id,
+                uint8_t arithmetic_policy_codebook_id,
                 int device_id, void *stream);
 
             bool rocmGemv_native_vnni_small_m_batched_fp32(
@@ -743,6 +792,8 @@ namespace llaminar2
             void *d_weights_native_emins = nullptr;   // [blocks_per_row × N] uint32_t* (Q2_K only, packed {lo,hi} FP16 emins)
             uint8_t native_vnni_codebook_id = 0;
             uint32_t native_vnni_blocks_per_row = 0;
+            NativeVnniSourceIdentity native_source_identity;
+            NativeVnniReusableDeviceAllocationFormat native_allocation_format;
             bool has_native_vnni = false;
             void *startup_h2d_pinned_scales = nullptr;
             void *startup_h2d_pinned_vnni = nullptr;
@@ -822,6 +873,31 @@ namespace llaminar2
 
         namespace
         {
+            /**
+             * @brief Resolve the serial arithmetic authority for prepared bytes.
+             *
+             * Device execution may normalize source formats (notably a CPU
+             * promotion into codebook 23), but launch geometry must remain
+             * owned by the original source codebook. Constructors establish
+             * provenance once; reaching inference without it is a fatal
+             * lifecycle violation rather than permission to guess.
+             */
+            inline uint8_t requireNativeVNNIArithmeticPolicyCodebook(
+                uint8_t execution_codebook_id,
+                const NativeVnniSourceIdentity &source_identity)
+            {
+                if (!source_identity.present)
+                {
+                    throw std::logic_error(
+                        "[ROCmQuantisedGemmKernel] NativeVNNI execution lost "
+                        "source arithmetic identity for codebook " +
+                        std::to_string(
+                            static_cast<int>(execution_codebook_id)));
+                }
+                return canonicalDeviceVnniCodebookId(
+                    source_identity.codebook_id);
+            }
+
             inline bool validatePointerDeviceOrLog(
                 const void *ptr,
                 int expected_device,
@@ -1092,6 +1168,12 @@ namespace llaminar2
             auto it = pools.find(device_id);
             if (it == pools.end())
             {
+                if (isGraphCaptureActive())
+                {
+                    throw std::runtime_error(
+                        "[ConcurrentGemm] Capture began before the ROCm projection "
+                        "stream/event pool was initialized");
+                }
                 auto pool = std::make_unique<ConcurrentPrefillPool>();
                 // Initialize with MAX_STREAMS so the pool can serve any
                 // caller's concurrency request without re-initialization.
@@ -1112,6 +1194,28 @@ namespace llaminar2
             auto &pools = sharedPrefillPools();
             // Pool destructor releases only stream/event infrastructure.
             pools.clear();
+        }
+
+        bool ROCmQuantisedGemmKernel::prepareFusedProjectionGraphCapture(
+            size_t projection_count)
+        {
+            if (projection_count == 0)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel] Fused projection capture "
+                          "preparation requires positive fan-out");
+                return false;
+            }
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel] Fused projection resources "
+                          "must be prepared before graph capture begins");
+                return false;
+            }
+
+            auto &pool = getSharedPrefillPool(
+                rocm_device_id_,
+                static_cast<int>(projection_count));
+            return pool.initialized && pool.count > 0;
         }
 
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(const TensorBase *weights, int rocm_device_id)
@@ -1148,6 +1252,20 @@ namespace llaminar2
             impl_->owns_weight_memory = true;        // Legacy constructor owns weight memory
             impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
 
+            const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
+            const NativeVnniFormatInfo *format =
+                unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            if (!format)
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Quantized tensor has no NativeVNNI source identity");
+            }
+            impl_->native_source_identity = {
+                .codebook_id = format->codebook_id,
+                .is_superblock = format->is_superblock,
+                .present = true,
+            };
+
             LOG_TRACE("[ROCmQuantisedGemmKernel] Created (legacy) for " << N_ << "x" << K_
                                                                         << " quantized weights (type=" << static_cast<int>(wt)
                                                                         << ") on ROCm device " << rocm_device_id_);
@@ -1174,6 +1292,12 @@ namespace llaminar2
 
             impl_->owns_weight_memory = false;       // Pre-packed path doesn't own weight memory
             impl_->rocm_device_id = rocm_device_id_; // Store device ID for cleanup
+            impl_->native_source_identity = packed->native_source_identity;
+            if (!impl_->native_source_identity.present)
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Pre-packed weights lost NativeVNNI source identity");
+            }
 
             LOG_TRACE("[ROCmQuantisedGemmKernel] Created (pre-packed) for " << N_ << "x" << K_
                                                                             << " INT8 weights on ROCm device " << rocm_device_id_);
@@ -1184,7 +1308,9 @@ namespace llaminar2
             uint8_t *d_native_vnni, void *d_native_scales,
             void *d_native_mins, void *d_native_emins,
             uint8_t codebook_id, uint32_t blocks_per_row,
-            std::shared_ptr<void> lifetime_owner)
+            std::shared_ptr<void> lifetime_owner,
+            NativeVnniSourceIdentity source_identity,
+            NativeVnniReusableDeviceAllocationFormat allocation_format)
             : weights_(nullptr),
               packed_(nullptr),
               lifetime_owner_(std::move(lifetime_owner)),
@@ -1202,6 +1328,46 @@ namespace llaminar2
             impl_->d_weights_native_emins = d_native_emins;
             impl_->native_vnni_codebook_id = codebook_id;
             impl_->native_vnni_blocks_per_row = blocks_per_row;
+            const NativeVnniFormatInfo *source_format =
+                source_identity.present
+                    ? native_vnni_formats::forSourceIdentity(
+                          source_identity.codebook_id,
+                          source_identity.is_superblock)
+                    : nullptr;
+            if (!source_format ||
+                !deviceVnniExecutionCompatibleWithSource(*source_format, codebook_id) ||
+                (codebook_id == kNativeVnniExpandedInt8MinCodebook && !d_native_mins))
+            {
+                throw std::invalid_argument(
+                    "[ROCmQuantisedGemmKernel] Direct device weights require an exact, "
+                    "execution-compatible NativeVNNI source identity");
+            }
+            impl_->native_source_identity = source_identity;
+            if (allocation_format.payload_bytes_per_block != 0)
+            {
+                const auto execution_format =
+                    codebook_id == canonicalDeviceVnniCodebookId(
+                                       source_format->codebook_id)
+                        ? NativeVnniMigrationStableDeviceFormat{
+                              .codebook_id = codebook_id,
+                              .payload_bytes_per_block = static_cast<uint8_t>(
+                                  source_format->payload_bytes),
+                              .is_asymmetric = source_format->is_asymmetric,
+                              .has_emins = source_format->has_emins,
+                          }
+                        : migrationStableDeviceVnniFormat(*source_format);
+                if (allocation_format.payload_bytes_per_block <
+                        execution_format.payload_bytes_per_block ||
+                    (execution_format.is_asymmetric &&
+                     !allocation_format.has_mins) ||
+                    (execution_format.has_emins &&
+                     !allocation_format.has_emins))
+                {
+                    throw std::invalid_argument(
+                        "[ROCmQuantisedGemmKernel] Reusable allocation cannot represent its live execution format");
+                }
+            }
+            impl_->native_allocation_format = allocation_format;
             impl_->has_native_vnni = true;
             impl_->owns_weight_memory = false;
             impl_->rocm_device_id = rocm_device_id;
@@ -1338,7 +1504,31 @@ namespace llaminar2
             out.k = static_cast<int>(K_);
             out.blocks_per_row = impl_->native_vnni_blocks_per_row;
             out.codebook_id = impl_->native_vnni_codebook_id;
+            out.allocation_payload_bytes_per_block =
+                impl_->native_allocation_format.payload_bytes_per_block;
+            out.allocation_has_mins = static_cast<uint8_t>(
+                impl_->native_allocation_format.has_mins);
+            out.allocation_has_emins = static_cast<uint8_t>(
+                impl_->native_allocation_format.has_emins);
+            out.source_codebook_id = impl_->native_source_identity.codebook_id;
+            out.source_is_superblock = static_cast<uint8_t>(
+                impl_->native_source_identity.is_superblock);
+            out.source_identity_present = static_cast<uint8_t>(
+                impl_->native_source_identity.present);
             return out.valid();
+        }
+
+        bool ROCmQuantisedGemmKernel::exportNativeVNNISourceIdentity(
+            NativeVnniSourceIdentity &out) const
+        {
+            if (!impl_ || !impl_->native_source_identity.present)
+            {
+                out = {};
+                return false;
+            }
+            out = impl_->native_source_identity;
+            return native_vnni_formats::forSourceIdentity(
+                       out.codebook_id, out.is_superblock) != nullptr;
         }
 
         /**
@@ -1557,7 +1747,7 @@ namespace llaminar2
                 }
 
                 float *d_native_output = (beta != 0.0f) ? impl_->d_C_fp32 : d_output;
-                native_ok = rocmGemm_native_vnni_fp32(
+                native_ok = rocmGemm_native_vnni_fp32_with_policy(
                     d_A_int8,
                     impl_->d_weights_native_vnni,
                     impl_->d_weights_native_scales,
@@ -1568,6 +1758,9 @@ namespace llaminar2
                     d_scales_A_blockwise,
                     m, n, k,
                     impl_->native_vnni_codebook_id,
+                    requireNativeVNNIArithmeticPolicyCodebook(
+                        impl_->native_vnni_codebook_id,
+                        impl_->native_source_identity),
                     rocm_device_id_, effective_stream);
 
                 if (profiling_enabled)
@@ -2492,7 +2685,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums(
+                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
                             impl_->d_A_int8,
                             impl_->d_weights_native_vnni,
                             impl_->d_weights_native_scales,
@@ -2504,6 +2697,9 @@ namespace llaminar2
                             impl_->d_scatter_partial,
                             m, n, k,
                             impl_->native_vnni_codebook_id,
+                            requireNativeVNNIArithmeticPolicyCodebook(
+                                impl_->native_vnni_codebook_id,
+                                impl_->native_source_identity),
                             rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI small-M verifier GEMV failed");
@@ -2583,7 +2779,7 @@ namespace llaminar2
 
                     if (impl_->has_native_vnni)
                     {
-                        if (!rocmGemv_native_vnni_fp32(
+                        if (!rocmGemv_native_vnni_fp32_with_policy(
                                 impl_->d_A_int8,
                                 impl_->d_weights_native_vnni,
                                 impl_->d_weights_native_scales,
@@ -2594,6 +2790,9 @@ namespace llaminar2
                                 impl_->d_scatter_partial,
                                 n, k,
                                 impl_->native_vnni_codebook_id,
+                                requireNativeVNNIArithmeticPolicyCodebook(
+                                    impl_->native_vnni_codebook_id,
+                                    impl_->native_source_identity),
                                 rocm_device_id_, gpu_stream_,
                                 impl_->d_scales_A_blockwise))
                         {
@@ -2787,7 +2986,7 @@ namespace llaminar2
                             return false;
                         }
 
-                        if (!rocmGemv_native_vnni_fp32(
+                        if (!rocmGemv_native_vnni_fp32_with_policy(
                                 impl_->d_A_int8,
                                 impl_->d_weights_native_vnni,
                                 impl_->d_weights_native_scales,
@@ -2798,6 +2997,9 @@ namespace llaminar2
                                 impl_->d_scatter_partial,
                                 n, k,
                                 impl_->native_vnni_codebook_id,
+                                requireNativeVNNIArithmeticPolicyCodebook(
+                                    impl_->native_vnni_codebook_id,
+                                    impl_->native_source_identity),
                                 rocm_device_id_, gpu_stream_,
                                 impl_->d_scales_A_blockwise))
                         {
@@ -3065,7 +3267,7 @@ namespace llaminar2
                 {
                     const uint8_t cb_id = impl_->native_vnni_codebook_id;
                     {
-                        if (rocmGemm_native_vnni_fp32(
+                        if (rocmGemm_native_vnni_fp32_with_policy(
                                 d_A_int8,
                                 impl_->d_weights_native_vnni,
                                 impl_->d_weights_native_scales,
@@ -3076,6 +3278,9 @@ namespace llaminar2
                                 impl_->d_scales_A_blockwise,
                                 m, n, k,
                                 cb_id,
+                                requireNativeVNNIArithmeticPolicyCodebook(
+                                    cb_id,
+                                    impl_->native_source_identity),
                                 rocm_device_id_, gpu_stream_))
                         {
                             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] "
@@ -3191,6 +3396,7 @@ namespace llaminar2
         {
             auto execution_stream =
                 static_cast<hipStream_t>(requireGPUStream());
+            const DeviceId target_device = DeviceId::rocm(rocm_device_id_);
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(
                 ROCmKernelType::GEMM, execution_stream);
 
@@ -3404,6 +3610,65 @@ namespace llaminar2
                 return true;
             };
 
+            /**
+             * Join every optional bias producer to the transaction root before
+             * the projection streams fork from quant_ready.  TP biases are
+             * TensorSlice wrappers around their presliced FP32 storage; treating
+             * the wrapper itself as FP32 silently drops the learned bias.  The
+             * root-stream join also makes an asynchronous startup publication an
+             * explicit dependency in eager execution and native graph capture.
+             */
+            const auto join_projection_biases_to_root =
+                [&](const char *callsite)
+            {
+                for (size_t pi = 0; pi < projections.size(); ++pi)
+                {
+                    const auto &projection = projections[pi];
+                    if (!projection.bias)
+                        continue;
+
+                    const TensorBase *bias_tensor = projection.bias;
+                    if (auto *slice =
+                            dynamic_cast<const TensorSlice *>(projection.bias))
+                    {
+                        bias_tensor = slice->inner();
+                    }
+
+                    auto *fp32_bias = dynamic_cast<FP32Tensor *>(
+                        const_cast<TensorBase *>(bias_tensor));
+                    if (!fp32_bias)
+                    {
+                        throw std::runtime_error(
+                            std::string("[") + callsite + "] Projection " +
+                            std::to_string(pi) + " bias is not FP32Tensor");
+                    }
+
+                    const auto current_device = fp32_bias->current_device();
+                    if (current_device.has_value() &&
+                        current_device->is_gpu() &&
+                        current_device.value() != target_device)
+                    {
+                        throw std::runtime_error(
+                            std::string("[") + callsite + "] Projection " +
+                            std::to_string(pi) + " bias is resident on " +
+                            current_device->to_string() + " instead of " +
+                            target_device.toString());
+                    }
+
+                    TransferEngine::requireDeviceInput(
+                        fp32_bias,
+                        target_device,
+                        execution_stream);
+                    if (!fp32_bias->gpu_data_ptr())
+                    {
+                        throw std::runtime_error(
+                            std::string("[") + callsite + "] Projection " +
+                            std::to_string(pi) +
+                            " bias has no device storage after root-stream join");
+                    }
+                }
+            };
+
             // =========================================================================
             // CONCURRENT PREFILL PATH: Multi-stream dispatch for M>1 projections
             //
@@ -3468,6 +3733,8 @@ namespace llaminar2
                     const int num_proj = static_cast<int>(projections.size());
                     auto &pool = getSharedPrefillPool(rocm_device_id_, num_proj);
 
+                    join_projection_biases_to_root("ConcurrentPrefill");
+
                     // Record event after quantization completes on main stream
                     (void)hipEventRecord(pool.quant_ready,
                                    static_cast<hipStream_t>(gpu_stream_));
@@ -3522,10 +3789,29 @@ namespace llaminar2
                         const float *d_bias = nullptr;
                         if (proj.bias)
                         {
-                            auto *bias_fp32 = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(proj.bias));
-                            if (bias_fp32)
+                            const TensorBase *bias_tensor = proj.bias;
+                            if (auto *slice =
+                                    dynamic_cast<const TensorSlice *>(proj.bias))
                             {
-                                d_bias = static_cast<const float *>(bias_fp32->gpu_data_ptr());
+                                bias_tensor = slice->inner();
+                            }
+                            auto *bias_fp32 = dynamic_cast<FP32Tensor *>(
+                                const_cast<TensorBase *>(bias_tensor));
+                            if (!bias_fp32)
+                            {
+                                throw std::runtime_error(
+                                    "[ConcurrentPrefill] Projection " +
+                                    std::to_string(pi) +
+                                    " bias is not FP32Tensor");
+                            }
+                            d_bias = static_cast<const float *>(
+                                bias_fp32->gpu_data_ptr());
+                            if (!d_bias)
+                            {
+                                throw std::runtime_error(
+                                    "[ConcurrentPrefill] Projection " +
+                                    std::to_string(pi) +
+                                    " bias lost its prejoined device storage");
                             }
                         }
 
@@ -3580,6 +3866,24 @@ namespace llaminar2
                         (void)hipStreamWaitEvent(
                             static_cast<hipStream_t>(gpu_stream_),
                             pool.completion[si], 0);
+                    }
+
+                    /* Prove the persistent side-stream prefill branch ran. */
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "rocm_fused_projection_stream_pool_calls",
+                            1.0,
+                            "gemm",
+                            "rocm:" + std::to_string(rocm_device_id_),
+                            PerfStatsCollector::Tags{
+                                {"mode", "prefill"},
+                                {"m", std::to_string(m)},
+                                {"k", std::to_string(k)},
+                                {"projections", std::to_string(num_proj)},
+                                {"streams", std::to_string(
+                                     std::min(num_proj, pool.count))}});
                     }
 
                     LOG_TRACE("[ConcurrentPrefill] All " << num_proj
@@ -3656,6 +3960,7 @@ namespace llaminar2
                 {
                     const int num_proj = static_cast<int>(projections.size());
                     auto &pool = getSharedPrefillPool(rocm_device_id_, num_proj);
+                    join_projection_biases_to_root("ConcurrentDecode");
                     const std::string batched_partial_name =
                         scatterPartialBatchedBufferName();
                     const size_t batched_partial_bytes =
@@ -3698,10 +4003,29 @@ namespace llaminar2
                         const float *d_bias = nullptr;
                         if (proj.bias)
                         {
-                            auto *bias_fp32 = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(proj.bias));
-                            if (bias_fp32)
+                            const TensorBase *bias_tensor = proj.bias;
+                            if (auto *slice =
+                                    dynamic_cast<const TensorSlice *>(proj.bias))
                             {
-                                d_bias = static_cast<const float *>(bias_fp32->gpu_data_ptr());
+                                bias_tensor = slice->inner();
+                            }
+                            auto *bias_fp32 = dynamic_cast<FP32Tensor *>(
+                                const_cast<TensorBase *>(bias_tensor));
+                            if (!bias_fp32)
+                            {
+                                throw std::runtime_error(
+                                    "[ConcurrentDecode] Projection " +
+                                    std::to_string(pi) +
+                                    " bias is not FP32Tensor");
+                            }
+                            d_bias = static_cast<const float *>(
+                                bias_fp32->gpu_data_ptr());
+                            if (!d_bias)
+                            {
+                                throw std::runtime_error(
+                                    "[ConcurrentDecode] Projection " +
+                                    std::to_string(pi) +
+                                    " bias lost its prejoined device storage");
                             }
                         }
 
@@ -3742,7 +4066,7 @@ namespace llaminar2
                                     static_cast<size_t>(stream_idx) *
                                         scatter_slot_bytes);
 
-                            proj_ok = rocmGemv_native_vnni_fp32(
+                            proj_ok = rocmGemv_native_vnni_fp32_with_policy(
                                 impl_->d_A_int8,
                                 rocm_kernel->impl_->d_weights_native_vnni,
                                 rocm_kernel->impl_->d_weights_native_scales,
@@ -3753,6 +4077,9 @@ namespace llaminar2
                                 stream_partial,
                                 n, k,
                                 rocm_kernel->impl_->native_vnni_codebook_id,
+                                requireNativeVNNIArithmeticPolicyCodebook(
+                                    rocm_kernel->impl_->native_vnni_codebook_id,
+                                    rocm_kernel->impl_->native_source_identity),
                                 rocm_device_id_, pool.streams[stream_idx],
                                 fused_uses_blockwise_shared_quant ? impl_->d_scales_A_blockwise : nullptr);
                         }
@@ -3805,6 +4132,24 @@ namespace llaminar2
                         (void)hipStreamWaitEvent(
                             static_cast<hipStream_t>(gpu_stream_),
                             pool.completion[si], 0);
+                    }
+
+                    /* Prove the persistent side-stream decode branch ran. */
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "rocm_fused_projection_stream_pool_calls",
+                            1.0,
+                            "gemm",
+                            "rocm:" + std::to_string(rocm_device_id_),
+                            PerfStatsCollector::Tags{
+                                {"mode", "decode"},
+                                {"m", std::to_string(m)},
+                                {"k", std::to_string(k)},
+                                {"projections", std::to_string(num_proj)},
+                                {"streams", std::to_string(
+                                     std::min(num_proj, pool.count))}});
                     }
 
                     LOG_TRACE("[ConcurrentDecode] All " << num_proj
@@ -4470,7 +4815,7 @@ namespace llaminar2
                                                                                                  << " NATIVE-VNNI GEMV M=1 N=" << n << " K=" << k
                                                                                                  << (d_bias ? " +bias" : ""));
 
-                        if (!rocmGemv_native_vnni_fp32(
+                        if (!rocmGemv_native_vnni_fp32_with_policy(
                                 impl_->d_A_int8,
                                 rocm_kernel->impl_->d_weights_native_vnni,
                                 rocm_kernel->impl_->d_weights_native_scales,
@@ -4481,6 +4826,9 @@ namespace llaminar2
                                 impl_->d_scatter_partial,
                                 n, k,
                                 rocm_kernel->impl_->native_vnni_codebook_id,
+                                requireNativeVNNIArithmeticPolicyCodebook(
+                                    rocm_kernel->impl_->native_vnni_codebook_id,
+                                    rocm_kernel->impl_->native_source_identity),
                                 rocm_device_id_, gpu_stream_,
                                 fused_uses_blockwise_shared_quant ? impl_->d_scales_A_blockwise : nullptr))
                         {
@@ -4618,7 +4966,7 @@ namespace llaminar2
                         break;
                     }
 
-                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums(
+                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
                             impl_->d_A_int8,
                             rocm_kernel->impl_->d_weights_native_vnni,
                             rocm_kernel->impl_->d_weights_native_scales,
@@ -4630,6 +4978,9 @@ namespace llaminar2
                             rocm_kernel->impl_->d_scatter_partial,
                             m, n, k,
                             rocm_kernel->impl_->native_vnni_codebook_id,
+                            requireNativeVNNIArithmeticPolicyCodebook(
+                                rocm_kernel->impl_->native_vnni_codebook_id,
+                                rocm_kernel->impl_->native_source_identity),
                             rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M verifier GEMV failed for projection "
@@ -5419,6 +5770,7 @@ namespace llaminar2
                     impl_->d_weights_native_emins = upload.d_native_vnni_emins;
                     impl_->native_vnni_codebook_id = packed_->native_vnni_codebook_id;
                     impl_->native_vnni_blocks_per_row = packed_->native_vnni_blocks_per_row;
+                    impl_->native_source_identity = packed_->native_source_identity;
                     impl_->has_native_vnni = (upload.d_native_vnni_payload != nullptr && upload.d_native_vnni_scales != nullptr);
                     impl_->startup_h2d_pinned_scales = upload.startup_h2d_pinned_scales;
                     impl_->startup_h2d_pinned_vnni = upload.startup_h2d_pinned_vnni;
@@ -5620,6 +5972,7 @@ namespace llaminar2
 
                 impl_->native_vnni_codebook_id = host_packed.native_vnni_codebook_id;
                 impl_->native_vnni_blocks_per_row = host_packed.native_vnni_blocks_per_row;
+                impl_->native_source_identity = host_packed.native_source_identity;
             }
 
             impl_->has_native_vnni = (impl_->d_weights_native_vnni != nullptr &&
@@ -5912,7 +6265,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums(
+                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums_policy(
                             impl_->d_A_int8,
                             impl_->d_weights_native_vnni,
                             impl_->d_weights_native_scales,
@@ -5924,6 +6277,9 @@ namespace llaminar2
                             impl_->d_scatter_partial,
                             m, n, k,
                             impl_->native_vnni_codebook_id,
+                            requireNativeVNNIArithmeticPolicyCodebook(
+                                impl_->native_vnni_codebook_id,
+                                impl_->native_source_identity),
                             rocm_device_id_, gpu_stream_))
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
@@ -5968,7 +6324,7 @@ namespace llaminar2
                 if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
                 {
                     const uint8_t cb_id = impl_->native_vnni_codebook_id;
-                    if (rocmGemm_native_vnni_fp32(
+                    if (rocmGemm_native_vnni_fp32_with_policy(
                             impl_->d_A_int8,
                             impl_->d_weights_native_vnni,
                             impl_->d_weights_native_scales,
@@ -5979,6 +6335,9 @@ namespace llaminar2
                             impl_->d_scales_A_blockwise,
                             m, n, k,
                             cb_id,
+                            requireNativeVNNIArithmeticPolicyCodebook(
+                                cb_id,
+                                impl_->native_source_identity),
                             rocm_device_id_, gpu_stream_))
                     {
                         publishROCmTensorWrite(*output, rocm_device_id_, gpu_stream_);
@@ -6111,7 +6470,7 @@ namespace llaminar2
                         }
 
                         float *d_native_output = (beta != 0.0f) ? impl_->d_C_fp32 : d_C;
-                        if (!rocmGemv_native_vnni_fp32(
+                        if (!rocmGemv_native_vnni_fp32_with_policy(
                                 impl_->d_A_int8,
                                 impl_->d_weights_native_vnni,
                                 impl_->d_weights_native_scales,
@@ -6122,6 +6481,9 @@ namespace llaminar2
                                 impl_->d_scatter_partial,
                                 n, k,
                                 impl_->native_vnni_codebook_id,
+                                requireNativeVNNIArithmeticPolicyCodebook(
+                                    impl_->native_vnni_codebook_id,
+                                    impl_->native_source_identity),
                                 rocm_device_id_, gpu_stream_,
                                 impl_->d_scales_A_blockwise))
                         {
@@ -6271,7 +6633,7 @@ namespace llaminar2
             if (m > 1 && impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
             {
                 const uint8_t cb_id = impl_->native_vnni_codebook_id;
-                if (rocmGemm_native_vnni_fp32(
+                if (rocmGemm_native_vnni_fp32_with_policy(
                         impl_->d_A_int8,
                         impl_->d_weights_native_vnni,
                         impl_->d_weights_native_scales,
@@ -6282,6 +6644,9 @@ namespace llaminar2
                         impl_->d_scales_A_blockwise,
                         m, n, k,
                         cb_id,
+                        requireNativeVNNIArithmeticPolicyCodebook(
+                            cb_id,
+                            impl_->native_source_identity),
                         rocm_device_id_, gpu_stream_))
                 {
                     LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "

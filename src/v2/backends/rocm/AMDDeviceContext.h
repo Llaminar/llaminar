@@ -94,11 +94,8 @@ namespace llaminar2
         // IWorkerGPUContext Interface - Work Submission (thread-safe)
         // =========================================================================
 
-        /**
-         * @brief Submit work and wait for completion (blocking)
-         * @param work Function to execute on worker thread
-         */
-        void submitAndWait(std::function<void()> work) override;
+        /** @copydoc IWorkerGPUContext::ownsCurrentThread() */
+        bool ownsCurrentThread() const noexcept override;
 
         /**
          * @brief Submit work without waiting (non-blocking)
@@ -248,6 +245,8 @@ namespace llaminar2
         // =========================================================================
 
         std::thread worker_thread_;
+        /// Immutable identity published before the context reports initialized.
+        std::thread::id worker_thread_id_{};
         std::atomic<bool> running_{false};
         std::atomic<bool> shutdown_requested_{false};
 

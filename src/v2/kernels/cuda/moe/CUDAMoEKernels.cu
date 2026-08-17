@@ -10,10 +10,12 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda/std/__cccl/assert.h>
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
+#include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "kernels/cuda/moe/CUDAMoERouterPrefillPolicy.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -21,6 +23,7 @@
 #include "execution/moe/DeviceMoERebalanceABI.h"
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/LeastLoadedExpertAssignment.h"
+#include "execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
 #include "utils/DebugEnv.h"
 
@@ -37,6 +40,10 @@ namespace
 {
     using DeviceMoELLEPLayerPlanScratchView =
         llaminar2::DeviceMoELLEPLayerPlanScratch;
+    using DeviceMoETransferSlotClaimIndexView =
+        llaminar2::DeviceMoETransferSlotClaimIndex;
+    using DeviceMoETransferSlotClaimIndexEntryView =
+        llaminar2::DeviceMoETransferSlotClaimIndexEntry;
 
     constexpr int kThreads = 256;
     constexpr unsigned int kCudaGridYDimensionLimit = 65535u;
@@ -212,18 +219,36 @@ namespace
         uint8_t allocation_payload_bytes_per_block = 0;
         uint8_t allocation_has_mins = 0;
         uint8_t allocation_has_emins = 0;
+        uint8_t source_codebook_id = 0;
+        uint8_t source_is_superblock = 0;
+        uint8_t source_identity_present = 0;
+        uint8_t reserved = 0;
+        uint32_t reserved_tail = 0;
     };
+
+    static_assert(
+        sizeof(DeviceNativeVNNIMatrixDesc) == 56,
+        "CUDA MoE descriptor must match the shared device ABI");
 
     struct DeviceMoEExpertDescriptorView
     {
         DeviceNativeVNNIMatrixDesc gate;
         DeviceNativeVNNIMatrixDesc up;
         DeviceNativeVNNIMatrixDesc down;
+        llaminar2::DeviceMoEFloatingMatrixDesc floating_gate;
+        llaminar2::DeviceMoEFloatingMatrixDesc floating_up;
+        llaminar2::DeviceMoEFloatingMatrixDesc floating_down;
         int32_t logical_expert_id;
         int32_t owner_participant;
         int32_t local_slot;
         uint32_t flags;
+        llaminar2::DeviceMoEWeightFormat weight_format;
+        uint32_t reserved;
     };
+
+    static_assert(
+        sizeof(DeviceMoEExpertDescriptorView) == 240,
+        "CUDA expert descriptor view must match the shared runtime ABI");
 
     struct DeviceMoEPlacementBankView
     {
@@ -231,11 +256,19 @@ namespace
         uint8_t local_compute_mask[kDeviceMoEMaxExperts];
         uint8_t replica_role[kDeviceMoEMaxExperts];
         uint32_t resident_participant_mask[kDeviceMoEMaxExperts];
+        int32_t overlay_route_participant[kDeviceMoEMaxExperts];
         uint32_t epoch;
         uint32_t expert_count;
         uint32_t multi_resident_expert_count;
         uint32_t transient_placement_observed;
     };
+
+    static_assert(
+        sizeof(DeviceMoEPlacementBankView) ==
+        llaminar2::moe_runtime_abi::kPlacementBankBytes);
+    static_assert(
+        offsetof(DeviceMoEPlacementBankView, overlay_route_participant) ==
+        llaminar2::moe_runtime_abi::kOverlayRouteParticipantOffset);
 
     struct DeviceMoELayerRuntimeView
     {
@@ -248,6 +281,10 @@ namespace
         float topk_weights[kMaxTopK];
         uint64_t decode_histogram[kDeviceMoEMaxExperts];
         uint64_t decode_local_histogram[kDeviceMoEMaxExperts];
+        uint64_t prefill_histogram[kDeviceMoEMaxExperts];
+        uint64_t prefill_local_histogram[kDeviceMoEMaxExperts];
+        uint64_t grouped_verifier_histogram[kDeviceMoEMaxExperts];
+        uint64_t grouped_verifier_local_histogram[kDeviceMoEMaxExperts];
         uint64_t router_hot_cache_eligible_dispatches;
         uint64_t router_hot_cache_used_dispatches;
         uint64_t router_hot_cache_improved_dispatches;
@@ -280,6 +317,12 @@ namespace
         uint32_t participant_count;
         uint32_t current_batch_llep_movement_observed;
         uint32_t current_batch_llep_non_owner_assignment_observed;
+        uint32_t current_batch_llep_transient_bank_active;
+        llaminar2::moe_runtime_abi::DeviceMoERuntimeHistogramBank
+            *runtime_histogram_banks;
+        const uint32_t *runtime_histogram_active_bank;
+        const llaminar2::DeviceMoEOverlayEpochTicket *overlay_epoch_ticket;
+        const DeviceMoEPlacementBankView *overlay_placement_banks;
     };
 
     static_assert(
@@ -301,6 +344,199 @@ namespace
                  current_batch_llep_non_owner_assignment_observed) ==
         llaminar2::moe_runtime_abi::
             kCurrentBatchLLEPNonOwnerAssignmentObservedOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView,
+                 current_batch_llep_transient_bank_active) ==
+        llaminar2::moe_runtime_abi::
+            kCurrentBatchLLEPTransientBankActiveOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView, runtime_histogram_banks) ==
+        llaminar2::moe_runtime_abi::kRuntimeHistogramBanksOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView, runtime_histogram_active_bank) ==
+        llaminar2::moe_runtime_abi::kRuntimeHistogramActiveBankOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView, overlay_epoch_ticket) ==
+        llaminar2::moe_runtime_abi::kOverlayEpochTicketOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntimeView, overlay_placement_banks) ==
+        llaminar2::moe_runtime_abi::kOverlayPlacementBanksOffset);
+
+    /** Sentinel returned when an inference reader cannot prove its bank. */
+    constexpr uint32_t kInvalidRuntimeExecutionBank = 0xffffffffu;
+
+    /** @return Canonical durable placement banks for this runtime role. */
+    __device__ __forceinline__ const DeviceMoEPlacementBankView *
+    runtime_durable_placement_banks(const DeviceMoELayerRuntimeView *runtime)
+    {
+        return runtime && runtime->overlay_placement_banks
+                   ? runtime->overlay_placement_banks
+                   : (runtime ? runtime->banks : nullptr);
+    }
+
+    /** @return Placement banks visible to this exact captured child graph. */
+    __device__ __forceinline__ const DeviceMoEPlacementBankView *
+    runtime_placement_banks(const DeviceMoELayerRuntimeView *runtime)
+    {
+        if (!runtime)
+            return nullptr;
+        return runtime->current_batch_llep_transient_bank_active != 0u
+                   ? runtime->banks
+                   : runtime_durable_placement_banks(runtime);
+    }
+
+    /**
+     * @brief Resolve the placement bank held by this request's epoch ticket.
+     *
+     * Non-overlay runtime tables explicitly leave the ticket null and retain
+     * the legacy active-bank selector.  An overlay table must present a valid,
+     * positive-generation ticket whose epoch still names the selected bank;
+     * inference never substitutes the newer maintenance bank on failure.
+     */
+    __device__ __forceinline__ uint32_t runtime_execution_bank(
+        const DeviceMoELayerRuntimeView *runtime)
+    {
+        if (!runtime)
+            return kInvalidRuntimeExecutionBank;
+        if (!runtime->overlay_epoch_ticket)
+        {
+            return runtime->active_bank <= 1u
+                       ? runtime->active_bank
+                       : kInvalidRuntimeExecutionBank;
+        }
+
+        const uint64_t epoch = runtime->overlay_epoch_ticket->epoch;
+        const uint64_t selector = runtime->overlay_epoch_ticket->selector;
+        const uint32_t bank = static_cast<uint32_t>(selector & 1u);
+        const uint64_t generation = selector >> 1u;
+        const DeviceMoEPlacementBankView *placement_banks =
+            runtime_durable_placement_banks(runtime);
+        if (epoch == 0u || generation == 0u || bank > 1u ||
+            !placement_banks ||
+            static_cast<uint64_t>(placement_banks[bank].epoch) != epoch)
+        {
+            return kInvalidRuntimeExecutionBank;
+        }
+        if (runtime->current_batch_llep_transient_bank_active != 0u)
+        {
+            const uint32_t transient_bank = runtime->active_bank;
+            if (!runtime->overlay_placement_banks || transient_bank > 1u ||
+                static_cast<uint64_t>(runtime->banks[transient_bank].epoch) !=
+                    epoch)
+            {
+                return kInvalidRuntimeExecutionBank;
+            }
+            return transient_bank;
+        }
+        return bank;
+    }
+
+    /**
+     * @brief Return the epoch that identifies a transfer transaction.
+     *
+     * Request-local LLEP children retain their canonical parent's durable
+     * ticket while publishing private placement banks. Transfer slots must
+     * therefore use the pinned ticket epoch, not the child's mutable
+     * @c active_epoch metadata. Non-overlay tables retain their ordinary
+     * participant-local placement epoch.
+     */
+    __device__ __forceinline__ uint32_t runtime_command_epoch(
+        const DeviceMoELayerRuntimeView *runtime)
+    {
+        if (!runtime)
+            return 0u;
+        return runtime->overlay_epoch_ticket
+                   ? static_cast<uint32_t>(
+                         runtime->overlay_epoch_ticket->epoch)
+                   : runtime->active_epoch;
+    }
+
+    /**
+     * @brief Resolve one phase's writable selected-route counter array.
+     *
+     * External banks are model-lifetime state used by asynchronous overlay
+     * maintenance. The embedded arrays remain the authority for CPU mirrors
+     * and the graph-native same-domain rebalancer. A partially bound external
+     * bank is a fatal ABI violation rather than permission to lose evidence.
+     */
+    __device__ __forceinline__ uint64_t *runtime_selected_histogram(
+        DeviceMoELayerRuntimeView &runtime,
+        uint32_t source)
+    {
+        if (runtime.runtime_histogram_banks ||
+            runtime.runtime_histogram_active_bank)
+        {
+            if (!runtime.runtime_histogram_banks ||
+                !runtime.runtime_histogram_active_bank ||
+                source >= llaminar2::moe_runtime_abi::kHistogramSourceCount)
+            {
+                asm("trap;");
+            }
+            const uint32_t bank = *runtime.runtime_histogram_active_bank;
+            if (bank > 1u)
+                asm("trap;");
+            return runtime.runtime_histogram_banks[bank].selected[source];
+        }
+        switch (source)
+        {
+        case 0u:
+            return runtime.decode_histogram;
+        case 1u:
+            return runtime.prefill_histogram;
+        case 2u:
+            return runtime.grouped_verifier_histogram;
+        default:
+            asm("trap;");
+            return nullptr;
+        }
+    }
+
+    /** @brief Resolve one phase's writable locally-executed counter array. */
+    __device__ __forceinline__ uint64_t *runtime_local_histogram(
+        DeviceMoELayerRuntimeView &runtime,
+        uint32_t source)
+    {
+        if (runtime.runtime_histogram_banks ||
+            runtime.runtime_histogram_active_bank)
+        {
+            if (!runtime.runtime_histogram_banks ||
+                !runtime.runtime_histogram_active_bank ||
+                source >= llaminar2::moe_runtime_abi::kHistogramSourceCount)
+            {
+                asm("trap;");
+            }
+            const uint32_t bank = *runtime.runtime_histogram_active_bank;
+            if (bank > 1u)
+                asm("trap;");
+            return runtime.runtime_histogram_banks[bank].local[source];
+        }
+        switch (source)
+        {
+        case 0u:
+            return runtime.decode_local_histogram;
+        case 1u:
+            return runtime.prefill_local_histogram;
+        case 2u:
+            return runtime.grouped_verifier_local_histogram;
+        default:
+            asm("trap;");
+            return nullptr;
+        }
+    }
+
+    /** @brief Clear one expert's exact production-phase demand counters. */
+    __device__ __forceinline__ void reset_runtime_histogram_expert(
+        DeviceMoELayerRuntimeView &runtime,
+        uint32_t expert)
+    {
+        for (uint32_t source = 0u;
+             source < llaminar2::moe_runtime_abi::kHistogramSourceCount;
+             ++source)
+        {
+            runtime_selected_histogram(runtime, source)[expert] = 0ULL;
+            runtime_local_histogram(runtime, source)[expert] = 0ULL;
+        }
+    }
 
     /**
      * @brief Publish request-final LLEP evidence without reading live state on the host.
@@ -392,7 +628,7 @@ namespace
         uint32_t min_load_spread_improvement;
         uint32_t min_load_spread_improvement_divisor;
         uint32_t min_wave_spread_improvement_per_payload_slot;
-        uint32_t min_foreign_rows_per_transfer;
+        uint32_t min_foreign_rows_per_critical_path_payload_slot;
         uint32_t min_router_spread_improvement_per_payload_slot;
         uint32_t max_post_wave_load_spread_per_mille;
         uint32_t llep_alpha_numerator;
@@ -708,6 +944,7 @@ namespace
         uint32_t maintenance_due;
         uint32_t decode_boundary_advanced;
         DeviceMoERebalanceWaveProgressView waves[2];
+        llaminar2::DeviceMoERebalanceDispatchTicket dispatch_ticket;
     };
 
     struct DeviceMoEExpertDirectoryEntryView
@@ -1459,7 +1696,7 @@ namespace
         int top_k)
     {
         return runtime &&
-               runtime->active_bank <= 1u &&
+               runtime_execution_bank(runtime) <= 1u &&
                runtime->active_epoch != 0u &&
                runtime->expert_count == static_cast<uint32_t>(num_experts) &&
                runtime->top_k == static_cast<uint32_t>(top_k);
@@ -2099,6 +2336,379 @@ namespace
                 local_transfer_slot_count));
     }
 
+    /** Return the variable-length entry array stored directly after its header. */
+    __device__ __forceinline__ DeviceMoETransferSlotClaimIndexEntryView *
+    rebalance_transfer_slot_claim_index_entries(
+        DeviceMoETransferSlotClaimIndexView *index)
+    {
+        return reinterpret_cast<DeviceMoETransferSlotClaimIndexEntryView *>(
+            index + 1);
+    }
+
+    /** Return the read-only variable-length entry array after its header. */
+    __device__ __forceinline__ const DeviceMoETransferSlotClaimIndexEntryView *
+    rebalance_transfer_slot_claim_index_entries(
+        const DeviceMoETransferSlotClaimIndexView *index)
+    {
+        return reinterpret_cast<const DeviceMoETransferSlotClaimIndexEntryView *>(
+            index + 1);
+    }
+
+    /** Validate one runtime layer before it participates in storage liveness. */
+    __device__ __forceinline__ bool
+    rebalance_claim_index_runtime_layer_ok(
+        const DeviceMoELayerRuntimeView &runtime,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        return runtime.active_bank <= 1u &&
+               runtime.active_epoch != 0u &&
+               runtime.expert_count == config.num_experts &&
+               runtime.participant_id == config.participant_id &&
+               runtime.participant_count == config.participant_count;
+    }
+
+    /** Diagnose a valid-range claim against its physical directory entry. */
+    __device__ __forceinline__ uint32_t
+    rebalance_transfer_slot_directory_claim_error(
+        const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        uint32_t slot,
+        uint32_t layer,
+        uint32_t expert,
+        const DeviceMoEExpertDescriptorView &descriptor,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        if (!local_transfer_slots ||
+            local_transfer_slot_count !=
+                config.transfer_slot_directory_capacity ||
+            slot >= local_transfer_slot_count)
+        {
+            return llaminar2::moe_rebalance_policy::
+                TransferSlotClaimDirectoryIdentityMismatch;
+        }
+
+        const auto &directory_entry = local_transfer_slots[slot];
+        const bool physical_identity_valid =
+            directory_entry.participant == config.participant_id &&
+            directory_entry.slot_index == slot &&
+            directory_entry.descriptor.local_slot ==
+                descriptor.local_slot &&
+            directory_entry.generation != 0xffffffffu;
+        if (!physical_identity_valid)
+        {
+            return llaminar2::moe_rebalance_policy::
+                TransferSlotClaimDirectoryIdentityMismatch;
+        }
+
+        const bool occupant_matches =
+            directory_entry.layer == layer &&
+            directory_entry.expert == expert &&
+            directory_entry.descriptor.logical_expert_id ==
+                static_cast<int32_t>(expert) &&
+            directory_entry.descriptor.gate.payload ==
+                descriptor.gate.payload &&
+            directory_entry.descriptor.gate.scales ==
+                descriptor.gate.scales &&
+            directory_entry.descriptor.up.payload ==
+                descriptor.up.payload &&
+            directory_entry.descriptor.up.scales ==
+                descriptor.up.scales &&
+            directory_entry.descriptor.down.payload ==
+                descriptor.down.payload &&
+            directory_entry.descriptor.down.scales ==
+                descriptor.down.scales;
+        return occupant_matches
+                   ? 0u
+                   : llaminar2::moe_rebalance_policy::
+                         TransferSlotClaimOccupantMismatch;
+    }
+
+    /**
+     * @brief Build a fresh reverse claim index from live CUDA runtime state.
+     *
+     * One 256-lane block scans the complete layer/expert table once. Integer
+     * atomics publish order-independent counts and the two smallest flattened
+     * claim locations, so diagnostics are deterministic without serializing the
+     * healthy path. The next same-stream projection consumes `ready` only after
+     * this kernel has completed; no host mirror or synchronization participates.
+     */
+    __global__ void build_transfer_slot_claim_index_kernel(
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        DeviceMoERebalanceConfigView config,
+        DeviceMoETransferSlotClaimIndexView *index)
+    {
+        if (!index)
+            return;
+
+        const uint32_t lane = threadIdx.x;
+        auto *const entries =
+            rebalance_transfer_slot_claim_index_entries(index);
+        if (lane == 0u)
+        {
+            DeviceMoETransferSlotClaimIndexView empty{};
+            empty.magic = kDeviceMoERebalanceMagic;
+            empty.version = kDeviceMoERebalanceVersion;
+            empty.participant_id = config.participant_id;
+            empty.participant_count = config.participant_count;
+            empty.num_layers = config.num_layers;
+            empty.num_experts = config.num_experts;
+            empty.slot_count = local_transfer_slot_count;
+            empty.first_invalid_runtime_layer = kDeviceMoEInvalidSlot;
+            empty.first_invalid_claim_flat = kDeviceMoEInvalidSlot;
+            empty.first_duplicate_claim_flat = kDeviceMoEInvalidSlot;
+            empty.summary = rebalance_empty_transfer_slot_claim_summary();
+            *index = empty;
+        }
+        for (uint32_t slot = lane;
+             slot < local_transfer_slot_count;
+             slot += blockDim.x)
+        {
+            DeviceMoETransferSlotClaimIndexEntryView empty{};
+            empty.first_claim_flat = kDeviceMoEInvalidSlot;
+            empty.second_claim_flat = kDeviceMoEInvalidSlot;
+            entries[slot] = empty;
+        }
+        __syncthreads();
+
+        const bool geometry_ok =
+            runtime_layers &&
+            local_transfer_slots &&
+            rebalance_config_ok(config) &&
+            local_transfer_slot_count != 0u &&
+            local_transfer_slot_count ==
+                config.transfer_slot_directory_capacity;
+        if (!geometry_ok)
+        {
+            if (lane == 0u)
+            {
+                index->invalid_runtime_layers = 1u;
+                index->ready = 1u;
+            }
+            return;
+        }
+
+        for (uint32_t layer = lane;
+             layer < config.num_layers;
+             layer += blockDim.x)
+        {
+            const auto &runtime = runtime_layers[layer];
+            if (!rebalance_claim_index_runtime_layer_ok(runtime, config))
+            {
+                atomicAdd(&index->invalid_runtime_layers, 1u);
+                atomicMin(&index->first_invalid_runtime_layer, layer);
+                continue;
+            }
+            if (runtime.current_batch_llep_movement_observed != 0u)
+                atomicAdd(&index->summary.transient_placement_layers, 1u);
+            if (runtime.current_batch_llep_non_owner_assignment_observed != 0u)
+                atomicAdd(&index->summary.non_owner_assignment_layers, 1u);
+        }
+
+        const uint64_t descriptor_count =
+            static_cast<uint64_t>(config.num_layers) * config.num_experts;
+        const uint32_t local_bit =
+            runtime_participant_bit(static_cast<int>(config.participant_id));
+        for (uint64_t flat64 = lane;
+             flat64 < descriptor_count;
+             flat64 += blockDim.x)
+        {
+            const uint32_t flat = static_cast<uint32_t>(flat64);
+            const uint32_t layer = flat / config.num_experts;
+            const uint32_t expert = flat % config.num_experts;
+            const auto &runtime = runtime_layers[layer];
+            if (!rebalance_claim_index_runtime_layer_ok(runtime, config))
+                continue;
+
+            const auto &bank = runtime.banks[runtime.active_bank];
+            const auto &descriptor = bank.experts[expert];
+            const uint32_t resident_mask =
+                bank.resident_participant_mask[expert];
+            const auto claim =
+                llaminar2::moe_rebalance_policy::classifyTransferSlotClaim(
+                    descriptor.flags,
+                    resident_mask,
+                    local_bit,
+                    descriptor.owner_participant,
+                    config.participant_id,
+                    descriptor.local_slot,
+                    kDeviceMoEMaxTransferSlots,
+                    config.transfer_slot_directory_capacity,
+                    kDeviceMoEFlagValid,
+                    kDeviceMoEFlagResident,
+                    kDeviceMoEFlagTransferSlot);
+            if (!claim.claims_storage)
+                continue;
+
+            atomicAdd(&index->summary.active_claims, 1u);
+            const uint32_t slot =
+                descriptor.local_slot < 0
+                    ? kDeviceMoEInvalidSlot
+                    : static_cast<uint32_t>(descriptor.local_slot);
+            const uint32_t directory_error =
+                claim.valid()
+                    ? rebalance_transfer_slot_directory_claim_error(
+                          local_transfer_slots,
+                          local_transfer_slot_count,
+                          slot,
+                          layer,
+                          expert,
+                          descriptor,
+                          config)
+                    : claim.invalid_reasons;
+
+            /*
+             * Index every in-range physical claim before authenticating its
+             * logical directory occupant. A corrupt second descriptor must be
+             * visible as both an occupant mismatch and a duplicate storage
+             * claim; dropping it at the directory check would hide the very
+             * alias the reverse index is responsible for diagnosing.
+             */
+            if (claim.valid())
+            {
+                auto &entry = entries[slot];
+                atomicAdd(&entry.claim_count, 1u);
+                const uint32_t previous_first =
+                    atomicMin(&entry.first_claim_flat, flat);
+                if (previous_first != kDeviceMoEInvalidSlot &&
+                    previous_first != flat)
+                {
+                    atomicMin(
+                        &entry.second_claim_flat,
+                        previous_first > flat ? previous_first : flat);
+                }
+            }
+            if (!claim.valid() || directory_error != 0u)
+            {
+                atomicAdd(&index->summary.invalid_claims, 1u);
+                atomicMin(&index->first_invalid_claim_flat, flat);
+                continue;
+            }
+        }
+        __syncthreads();
+
+        for (uint32_t slot = lane;
+             slot < local_transfer_slot_count;
+             slot += blockDim.x)
+        {
+            const auto &entry = entries[slot];
+            if (entry.claim_count != 0u)
+            {
+                atomicAdd(&index->summary.unique_claims, 1u);
+                atomicMax(&index->summary.max_slot, slot);
+            }
+            if (entry.claim_count > 1u)
+            {
+                atomicAdd(
+                    &index->summary.duplicate_claims,
+                    entry.claim_count - 1u);
+                atomicMin(
+                    &index->first_duplicate_claim_flat,
+                    entry.second_claim_flat);
+            }
+        }
+        __syncthreads();
+
+        if (lane == 0u)
+        {
+            if (index->summary.unique_claims != 0u)
+            {
+                const uint32_t flat =
+                    entries[index->summary.max_slot].first_claim_flat;
+                index->summary.max_slot_layer = flat / config.num_experts;
+                index->summary.max_slot_expert = flat % config.num_experts;
+            }
+            if (index->summary.duplicate_claims != 0u)
+            {
+                const uint32_t duplicate_flat =
+                    index->first_duplicate_claim_flat;
+                for (uint32_t slot = 0u;
+                     slot < local_transfer_slot_count;
+                     ++slot)
+                {
+                    if (entries[slot].second_claim_flat == duplicate_flat)
+                    {
+                        index->summary.first_duplicate_slot = slot;
+                        break;
+                    }
+                }
+                index->summary.first_duplicate_layer =
+                    duplicate_flat / config.num_experts;
+                index->summary.first_duplicate_expert =
+                    duplicate_flat % config.num_experts;
+            }
+            if (index->summary.invalid_claims != 0u)
+            {
+                const uint32_t flat = index->first_invalid_claim_flat;
+                const uint32_t layer = flat / config.num_experts;
+                const uint32_t expert = flat % config.num_experts;
+                const auto &runtime = runtime_layers[layer];
+                const auto &bank = runtime.banks[runtime.active_bank];
+                const auto &descriptor = bank.experts[expert];
+                const uint32_t resident_mask =
+                    bank.resident_participant_mask[expert];
+                const auto claim =
+                    llaminar2::moe_rebalance_policy::classifyTransferSlotClaim(
+                        descriptor.flags,
+                        resident_mask,
+                        local_bit,
+                        descriptor.owner_participant,
+                        config.participant_id,
+                        descriptor.local_slot,
+                        kDeviceMoEMaxTransferSlots,
+                        config.transfer_slot_directory_capacity,
+                        kDeviceMoEFlagValid,
+                        kDeviceMoEFlagResident,
+                        kDeviceMoEFlagTransferSlot);
+                const uint32_t slot =
+                    descriptor.local_slot < 0
+                        ? kDeviceMoEInvalidSlot
+                        : static_cast<uint32_t>(descriptor.local_slot);
+                index->summary.first_invalid_slot = slot;
+                index->summary.first_invalid_layer = layer;
+                index->summary.first_invalid_expert = expert;
+                index->summary.first_invalid_reasons =
+                    claim.valid()
+                        ? rebalance_transfer_slot_directory_claim_error(
+                              local_transfer_slots,
+                              local_transfer_slot_count,
+                              slot,
+                              layer,
+                              expert,
+                              descriptor,
+                              config)
+                        : claim.invalid_reasons;
+                index->summary.first_invalid_flags = descriptor.flags;
+                index->summary.first_invalid_resident_mask = resident_mask;
+                index->summary.first_invalid_owner =
+                    descriptor.owner_participant;
+            }
+            __threadfence();
+            index->ready = 1u;
+        }
+    }
+
+    /** Authenticate that an index was rebuilt for this exact projection shape. */
+    __device__ __forceinline__ bool rebalance_transfer_slot_claim_index_ok(
+        const DeviceMoETransferSlotClaimIndexView *index,
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t local_transfer_slot_count)
+    {
+        return index &&
+               index->magic == kDeviceMoERebalanceMagic &&
+               index->version == kDeviceMoERebalanceVersion &&
+               index->ready == 1u &&
+               index->participant_id == config.participant_id &&
+               index->participant_count == config.participant_count &&
+               index->num_layers == config.num_layers &&
+               index->num_experts == config.num_experts &&
+               index->slot_count == local_transfer_slot_count &&
+               index->invalid_runtime_layers == 0u &&
+               index->summary.invalid_claims == 0u &&
+               index->summary.duplicate_claims == 0u;
+    }
+
     __device__ __forceinline__ bool runtime_expert_replicated(
         const DeviceMoELayerRuntimeView *runtime,
         const DeviceMoEPlacementBankView &bank,
@@ -2251,7 +2861,10 @@ namespace
             return;
         }
 
-        const auto &bank = runtime->banks[runtime->active_bank];
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
+        if (execution_bank > 1u)
+            return;
+        const auto &bank = runtime_placement_banks(runtime)[execution_bank];
         const uint32_t participant_count = runtime->participant_count;
         const uint32_t participant_id = runtime->participant_id;
         const bool valid_participants =
@@ -2873,10 +3486,10 @@ namespace
                 config.min_load_spread_improvement;
             llep_config.min_spread_improvement_divisor =
                 config.min_load_spread_improvement_divisor;
-            llep_config.min_spread_improvement_per_transfer =
+            llep_config.min_spread_improvement_per_critical_path_slot =
                 config.min_wave_spread_improvement_per_payload_slot;
-            llep_config.min_foreign_rows_per_transfer =
-                config.min_foreign_rows_per_transfer;
+            llep_config.min_foreign_rows_per_critical_path_slot =
+                config.min_foreign_rows_per_critical_path_payload_slot;
             llep_config.enable_balanced_skip =
                 config.llep_enable_balanced_skip != 0u;
             llep_config.max_weight_transfers =
@@ -3067,6 +3680,70 @@ namespace
                 shared_abort = 1u;
             }
 
+            /*
+             * Physical residency is an invariant, not a scheduling hint.
+             * Audit it before cadence/window early-outs so corrupt transfer
+             * claims cannot hide behind WindowNotReady and current-batch
+             * movement evidence remains observable on a skipped window.
+             */
+            if (shared_abort == 0u && !rebalance_config_ok(config))
+            {
+                status->status_code = kDeviceMoERebalanceStatusInvalidConfig;
+                shared_abort = 1u;
+            }
+            if (shared_abort == 0u && !runtime_layers)
+            {
+                status->status_code = kDeviceMoERebalanceStatusInvalidRuntime;
+                shared_abort = 1u;
+            }
+            if (shared_abort == 0u && !gathered_histograms)
+            {
+                status->status_code = kDeviceMoERebalanceStatusMissingHistogram;
+                shared_abort = 1u;
+            }
+            if (shared_abort == 0u)
+            {
+                if constexpr (LeastLoadedAssignment)
+                {
+                    const bool preflight_valid =
+                        llep_layer_plans &&
+                        llep_layer_plans[0].magic == kDeviceMoERebalanceMagic &&
+                        llep_layer_plans[0].version == kDeviceMoERebalanceVersion &&
+                        llep_layer_plans[0].claim_summary_ready == 1u;
+                    if (!preflight_valid)
+                    {
+                        status->status_code =
+                            kDeviceMoERebalanceStatusInvalidRuntime;
+                        shared_abort = 1u;
+                    }
+                    else
+                    {
+                        rebalance_publish_transfer_slot_claim_summary_fields(
+                            status,
+                            llep_layer_plans[0].claim_summary);
+                    }
+                }
+                else
+                {
+                    rebalance_publish_transfer_slot_claim_summary(
+                        status,
+                        runtime_layers,
+                        config,
+                        local_transfer_slots,
+                        local_transfer_slot_count);
+                }
+            }
+            if (shared_abort == 0u &&
+                (status->prefill_duplicate_transfer_slot_claims != 0u ||
+                 status->prefill_invalid_transfer_slot_claims != 0u ||
+                 status->prefill_active_transfer_slot_experts >
+                     config.active_transfer_slot_capacity))
+            {
+                status->status_code =
+                    kDeviceMoERebalanceStatusInvalidRuntime;
+                shared_abort = 1u;
+            }
+
             if (shared_abort == 0u)
             {
                 const uint32_t boundary =
@@ -3139,21 +3816,6 @@ namespace
                 wave_state->payload_bucket_overflow = 0u;
             }
 
-            if (shared_abort == 0u && !rebalance_config_ok(config))
-            {
-                status->status_code = kDeviceMoERebalanceStatusInvalidConfig;
-                shared_abort = 1u;
-            }
-            if (shared_abort == 0u && !runtime_layers)
-            {
-                status->status_code = kDeviceMoERebalanceStatusInvalidRuntime;
-                shared_abort = 1u;
-            }
-            if (shared_abort == 0u && !gathered_histograms)
-            {
-                status->status_code = kDeviceMoERebalanceStatusMissingHistogram;
-                shared_abort = 1u;
-            }
             if (shared_abort == 0u)
             {
                 const unsigned long long observed_slots =
@@ -3171,48 +3833,6 @@ namespace
                     status->skipped_busy_wave = 0u;
                     shared_abort = 1u;
                 }
-            }
-            if (shared_abort == 0u)
-            {
-                if constexpr (LeastLoadedAssignment)
-                {
-                    const bool preflight_valid =
-                        llep_layer_plans &&
-                        llep_layer_plans[0].magic == kDeviceMoERebalanceMagic &&
-                        llep_layer_plans[0].version == kDeviceMoERebalanceVersion &&
-                        llep_layer_plans[0].claim_summary_ready == 1u;
-                    if (!preflight_valid)
-                    {
-                        status->status_code =
-                            kDeviceMoERebalanceStatusInvalidRuntime;
-                        shared_abort = 1u;
-                    }
-                    else
-                    {
-                        rebalance_publish_transfer_slot_claim_summary_fields(
-                            status,
-                            llep_layer_plans[0].claim_summary);
-                    }
-                }
-                else
-                {
-                    rebalance_publish_transfer_slot_claim_summary(
-                        status,
-                        runtime_layers,
-                        config,
-                        local_transfer_slots,
-                        local_transfer_slot_count);
-                }
-            }
-            if (shared_abort == 0u &&
-                (status->prefill_duplicate_transfer_slot_claims != 0u ||
-                 status->prefill_invalid_transfer_slot_claims != 0u ||
-                 status->prefill_active_transfer_slot_experts >
-                     config.active_transfer_slot_capacity))
-            {
-                status->status_code =
-                    kDeviceMoERebalanceStatusInvalidRuntime;
-                shared_abort = 1u;
             }
         }
         __syncthreads();
@@ -3525,6 +4145,10 @@ namespace
             for (uint32_t expert = lane; expert < config.num_experts; expert += blockDim.x)
             {
                 next.experts[expert] = active.experts[expert];
+                /* Intra-domain replica policy cannot rewrite the overlay-wide
+                 * sparse-packet authority. Preserve it with the bank clone. */
+                next.overlay_route_participant[expert] =
+                    active.overlay_route_participant[expert];
                 DeviceMoEExpertDescriptorView &desc = next.experts[expert];
                 uint32_t resident_mask =
                     active.resident_participant_mask[expert] & valid_mask;
@@ -4889,8 +5513,7 @@ namespace
             {
                 for (uint32_t expert = lane; expert < config.num_experts; expert += blockDim.x)
                 {
-                    runtime.decode_histogram[expert] = 0ULL;
-                    runtime.decode_local_histogram[expert] = 0ULL;
+                    reset_runtime_histogram_expert(runtime, expert);
                 }
                 if (leader)
                 {
@@ -5151,6 +5774,12 @@ namespace
                 post_load_spread_ceiling_rejected;
             if (wave_rejected)
             {
+                /* `accepts` is a committed-command counter. Payload commands
+                 * pruned by this terminal economy gate never became an
+                 * executable wave and must be reported as rejections. */
+                dynamic_ownership_swap_rejections +=
+                    dynamic_ownership_swap_accepts;
+                dynamic_ownership_swap_accepts = 0u;
                 uint32_t resident_command_count = 0u;
                 command_count =
                     llaminar2::moe_rebalance_policy::prunePayloadArrivalsPreservingResidentAssignments(
@@ -5605,6 +6234,91 @@ namespace
             return;
         }
 
+        /*
+         * Build the wave-wide participant baseline before selecting any
+         * layer-local swap. A layer can call participant 0 "overloaded" while
+         * earlier or later layers already make participant 1 the aggregate
+         * bottleneck. Planning directly into this shared working vector makes
+         * every accepted command improve the actual multi-layer device load;
+         * the final economy gate is then a verifier, not a place where an
+         * entire payload wave is discarded after doing speculative work.
+         */
+        if (leader)
+        {
+            for (uint32_t window_index = 0;
+                 window_index < layer_wave_count;
+                 ++window_index)
+            {
+                const uint32_t layer =
+                    (layer_window_start +
+                     ((start_offset + window_index) % layer_window_count)) %
+                    config.num_layers;
+                const DeviceMoELayerRuntimeView &runtime = runtime_layers[layer];
+                if (runtime.active_bank > 1u ||
+                    runtime.expert_count != config.num_experts ||
+                    runtime.top_k != config.top_k ||
+                    runtime.participant_id != config.participant_id ||
+                    runtime.participant_count != config.participant_count)
+                {
+                    ++invalid_layers;
+                    continue;
+                }
+
+                for (uint32_t participant = 0;
+                     participant < config.participant_count;
+                     ++participant)
+                {
+                    shared_owner_policy_load[participant] = 0ULL;
+                }
+                const DeviceMoEPlacementBankView &active =
+                    runtime.banks[runtime.active_bank];
+                for (uint32_t expert = 0;
+                     expert < config.num_experts;
+                     ++expert)
+                {
+                    const int32_t owner =
+                        active.experts[expert].owner_participant;
+                    if (owner >= 0 &&
+                        owner < static_cast<int32_t>(config.participant_count))
+                    {
+                        shared_owner_policy_load[static_cast<uint32_t>(owner)] +=
+                            rebalance_global_count(
+                                gathered_histograms,
+                                config,
+                                window_index,
+                                expert);
+                    }
+                }
+
+                uint64_t layer_total = 0ULL;
+                uint64_t layer_min = 0ULL;
+                uint64_t layer_max = 0ULL;
+                llaminar2::moe_rebalance_policy::finalizeLoadSpread(
+                    shared_owner_policy_load,
+                    config.participant_count,
+                    layer_total,
+                    layer_min,
+                    layer_max);
+                for (uint32_t participant = 0;
+                     participant < config.participant_count;
+                     ++participant)
+                {
+                    shared_pre_policy_load[participant] +=
+                        shared_owner_policy_load[participant];
+                }
+                pre_wave_load_total += layer_total;
+                pre_wave_load_spread += layer_max - layer_min;
+            }
+            for (uint32_t participant = 0;
+                 participant < config.participant_count;
+                 ++participant)
+            {
+                shared_post_policy_load[participant] =
+                    shared_pre_policy_load[participant];
+            }
+        }
+        __syncthreads();
+
         for (uint32_t window_index = 0; window_index < layer_wave_count; ++window_index)
         {
             const uint32_t layer =
@@ -5621,8 +6335,6 @@ namespace
                      runtime.participant_count != config.participant_count)
                         ? 1u
                         : 0u;
-                if (shared_layer_invalid != 0u)
-                    ++invalid_layers;
             }
             __syncthreads();
             if (shared_layer_invalid != 0u)
@@ -5658,20 +6370,6 @@ namespace
                     if (shared_expert_owners[expert] >= 0)
                         shared_owner_policy_load[static_cast<uint32_t>(shared_expert_owners[expert])] += count;
                 }
-
-                uint64_t layer_pre_total = 0ULL;
-                uint64_t layer_pre_min = 0ULL;
-                uint64_t layer_pre_max = 0ULL;
-                llaminar2::moe_rebalance_policy::finalizeLoadSpread(
-                    shared_owner_policy_load,
-                    config.participant_count,
-                    layer_pre_total,
-                    layer_pre_min,
-                    layer_pre_max);
-                for (uint32_t participant = 0; participant < config.participant_count; ++participant)
-                    shared_pre_policy_load[participant] += shared_owner_policy_load[participant];
-                pre_wave_load_total += layer_pre_total;
-                pre_wave_load_spread += layer_pre_max - layer_pre_min;
 
                 const uint32_t max_swaps = config.dynamic_max_swaps_per_layer;
                 const uint32_t max_entries =
@@ -5753,6 +6451,25 @@ namespace
                         break;
                     }
 
+                    const auto aggregate_delta =
+                        llaminar2::moe_rebalance_policy::
+                            evaluateDynamicOwnershipSwapAgainstAggregateLoad(
+                                shared_post_policy_load,
+                                config.participant_count,
+                                swap_choice);
+                    if (!aggregate_delta.improves)
+                    {
+                        /*
+                         * Do not append a locally attractive command that
+                         * sends work toward the wave-wide bottleneck. Leaving
+                         * both planner vectors untouched lets a later layer
+                         * propose the opposite, globally useful direction.
+                         */
+                        ++skipped_no_improvement;
+                        ++dynamic_ownership_swap_rejections;
+                        break;
+                    }
+
                     DeviceMoERebalancePlanEntryView heavy_entry{};
                     heavy_entry.op = kDeviceMoERebalancePlanOwnershipTransfer;
                     heavy_entry.layer = layer;
@@ -5798,6 +6515,17 @@ namespace
                     ++shared_source_payload_slot_counts[light_source];
                     ++shared_destination_transfer_slot_counts[heavy_destination];
                     ++shared_destination_transfer_slot_counts[light_destination];
+                    /*
+                     * Commit the proposal that was authenticated immediately
+                     * above.  Re-evaluating it after publishing the commands
+                     * would create an impossible-to-rollback failure edge.
+                     */
+                    const uint64_t aggregate_shift =
+                        swap_choice.heavy_count - swap_choice.light_count;
+                    shared_post_policy_load[swap_choice.overloaded_participant] -=
+                        aggregate_shift;
+                    shared_post_policy_load[swap_choice.underloaded_participant] +=
+                        aggregate_shift;
                     llaminar2::moe_rebalance_policy::applyDynamicOwnershipSwap(
                         shared_owner_policy_load,
                         shared_expert_owners,
@@ -5821,8 +6549,6 @@ namespace
                     layer_post_total,
                     layer_post_min,
                     layer_post_max);
-                for (uint32_t participant = 0; participant < config.participant_count; ++participant)
-                    shared_post_policy_load[participant] += shared_owner_policy_load[participant];
                 post_wave_load_total += layer_post_total;
                 post_wave_load_spread += layer_post_max - layer_post_min;
 
@@ -5949,6 +6675,9 @@ namespace
                 wave_cost_floor_rejected || post_load_spread_ceiling_rejected;
             if (wave_rejected)
             {
+                dynamic_ownership_swap_rejections +=
+                    dynamic_ownership_swap_accepts;
+                dynamic_ownership_swap_accepts = 0u;
                 command_count = 0u;
                 if (plan_count)
                     *plan_count = 0u;
@@ -6173,7 +6902,15 @@ namespace
                 value =
                     llaminar2::moe_rebalance_policy::packCollectedState(
                         static_cast<unsigned long long>(
-                            runtime.decode_local_histogram[expert]),
+                            runtime_local_histogram(
+                                const_cast<DeviceMoELayerRuntimeView &>(runtime),
+                                0u)[expert] +
+                            runtime_local_histogram(
+                                const_cast<DeviceMoELayerRuntimeView &>(runtime),
+                                1u)[expert] +
+                            runtime_local_histogram(
+                                const_cast<DeviceMoELayerRuntimeView &>(runtime),
+                                2u)[expert]),
                         active_transfer_slots,
                         physically_resident,
                         transfer_backed);
@@ -6196,16 +6933,26 @@ namespace
     __device__ __forceinline__ bool rebalance_expert_desc_ready(
         const DeviceMoEExpertDescriptorView &desc)
     {
+        const bool native_ready =
+            desc.weight_format == llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+            rebalance_matrix_desc_ready(desc.gate) &&
+            rebalance_matrix_desc_ready(desc.up) &&
+            rebalance_matrix_desc_ready(desc.down);
+        const bool floating_ready =
+            llaminar2::deviceMoEWeightFormatIsFloating(desc.weight_format) &&
+            desc.floating_gate.valid() &&
+            desc.floating_up.valid() &&
+            desc.floating_down.valid();
         return desc.logical_expert_id >= 0 &&
-               rebalance_matrix_desc_ready(desc.gate) &&
-               rebalance_matrix_desc_ready(desc.up) &&
-               rebalance_matrix_desc_ready(desc.down);
+               (native_ready || floating_ready);
     }
 
     __device__ __forceinline__ bool rebalance_transfer_desc_ready(
         const DeviceMoEExpertDescriptorView &desc)
     {
-        return rebalance_matrix_desc_ready(desc.gate) &&
+        return desc.weight_format ==
+                   llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+               rebalance_matrix_desc_ready(desc.gate) &&
                rebalance_matrix_desc_ready(desc.up) &&
                rebalance_matrix_desc_ready(desc.down);
     }
@@ -6271,6 +7018,10 @@ namespace
         case 19:
         case 20:
             payload_bytes = 32u;
+            return true;
+        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
+            payload_bytes = 32u;
+            is_asymmetric = 1u;
             return true;
         default:
             return false;
@@ -6364,6 +7115,9 @@ namespace
         dst.k = src.k;
         dst.blocks_per_row = src.blocks_per_row;
         dst.codebook_id = src.codebook_id;
+        dst.source_codebook_id = src.source_codebook_id;
+        dst.source_is_superblock = src.source_is_superblock;
+        dst.source_identity_present = src.source_identity_present;
     }
 
     __device__ __forceinline__ bool rebalance_matrix_copy_ready(
@@ -7234,9 +7988,12 @@ namespace
         const DeviceMoEExpertDirectoryEntryView &entry,
         uint32_t slot_index,
         const DeviceMoELayerRuntimeView *runtime_layers,
-        const DeviceMoERebalanceConfigView &config)
+        const DeviceMoERebalanceConfigView &config,
+        const DeviceMoETransferSlotClaimIndexView *claim_index)
     {
         if (!runtime_layers ||
+            !claim_index ||
+            slot_index >= claim_index->slot_count ||
             entry.layer >= config.num_layers ||
             entry.expert >= config.num_experts ||
             (entry.flags & (kDeviceMoEDirectoryFlagResident |
@@ -7247,8 +8004,20 @@ namespace
             return false;
         }
 
+        const auto *const claims =
+            rebalance_transfer_slot_claim_index_entries(claim_index);
+        const uint32_t expected_flat =
+            entry.layer * config.num_experts + entry.expert;
+        if (claims[slot_index].claim_count != 1u ||
+            claims[slot_index].first_claim_flat != expected_flat)
+        {
+            return false;
+        }
+
         const auto &runtime = runtime_layers[entry.layer];
-        if (runtime.active_bank > 1u ||
+        const uint32_t execution_bank =
+            runtime_execution_bank(&runtime);
+        if (execution_bank > 1u ||
             runtime.expert_count != config.num_experts ||
             runtime.participant_id != config.participant_id ||
             runtime.participant_count != config.participant_count)
@@ -7256,62 +8025,16 @@ namespace
             return false;
         }
 
-        const auto &active = runtime.banks[runtime.active_bank];
+        const auto &active =
+            runtime_placement_banks(&runtime)[execution_bank];
         const auto &descriptor = active.experts[entry.expert];
         const uint32_t local_bit =
             runtime_participant_bit(static_cast<int>(config.participant_id));
-        (void)slot_index;
         return descriptor.logical_expert_id == static_cast<int32_t>(entry.expert) &&
                descriptor.local_slot == entry.descriptor.local_slot &&
                descriptor.owner_participant == entry.descriptor.owner_participant &&
                (descriptor.flags & kDeviceMoEFlagTransferSlot) != 0u &&
                (active.resident_participant_mask[entry.expert] & local_bit) != 0u;
-    }
-
-    /**
-     * @brief Detect any active descriptor that references a physical slot.
-     *
-     * This complete scan is the safety net for directory/runtime disagreement:
-     * an entry marked empty or stale is not reusable while any layer still
-     * publishes its stable pointer.  Rebalance projection is infrequent
-     * maintenance work, so correctness is preferable to trusting a partial
-     * logical lookup at this ownership boundary.
-     */
-    __device__ __forceinline__ bool rebalance_any_active_runtime_claims_slot(
-        const DeviceMoEExpertDirectoryEntryView &entry,
-        uint32_t slot_index,
-        const DeviceMoELayerRuntimeView *runtime_layers,
-        const DeviceMoERebalanceConfigView &config)
-    {
-        if (!runtime_layers)
-            return true;
-        (void)slot_index;
-
-        const uint32_t local_bit =
-            runtime_participant_bit(static_cast<int>(config.participant_id));
-        for (uint32_t layer = 0u; layer < config.num_layers; ++layer)
-        {
-            const auto &runtime = runtime_layers[layer];
-            if (runtime.active_bank > 1u ||
-                runtime.expert_count != config.num_experts ||
-                runtime.participant_id != config.participant_id ||
-                runtime.participant_count != config.participant_count)
-            {
-                return true;
-            }
-            const auto &active = runtime.banks[runtime.active_bank];
-            for (uint32_t expert = 0u; expert < config.num_experts; ++expert)
-            {
-                const auto &descriptor = active.experts[expert];
-                if (descriptor.local_slot == entry.descriptor.local_slot &&
-                    (descriptor.flags & kDeviceMoEFlagTransferSlot) != 0u &&
-                    (active.resident_participant_mask[expert] & local_bit) != 0u)
-                {
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     /**
@@ -7335,52 +8058,22 @@ namespace
         const DeviceMoEExpertDirectoryEntryView &entry,
         uint32_t slot_index,
         const DeviceMoELayerRuntimeView *runtime_layers,
-        const DeviceMoERebalanceConfigView &config)
+        const DeviceMoERebalanceConfigView &config,
+        const DeviceMoETransferSlotClaimIndexView *claim_index)
     {
         if (!runtime_layers ||
             !rebalance_transfer_slot_has_active_runtime_claim(
                 entry,
                 slot_index,
                 runtime_layers,
-                config))
+                config,
+                claim_index))
         {
             return false;
         }
 
         const uint32_t local_bit =
             runtime_participant_bit(static_cast<int>(config.participant_id));
-        uint32_t matching_claims = 0u;
-        for (uint32_t layer = 0u; layer < config.num_layers; ++layer)
-        {
-            const auto &runtime = runtime_layers[layer];
-            if (runtime.active_bank > 1u ||
-                runtime.expert_count != config.num_experts ||
-                runtime.participant_id != config.participant_id ||
-                runtime.participant_count != config.participant_count)
-            {
-                return false;
-            }
-            const auto &active = runtime.banks[runtime.active_bank];
-            for (uint32_t expert = 0u;
-                 expert < config.num_experts;
-                 ++expert)
-            {
-                const auto &descriptor = active.experts[expert];
-                if (descriptor.local_slot != entry.descriptor.local_slot ||
-                    (descriptor.flags & kDeviceMoEFlagTransferSlot) == 0u ||
-                    (active.resident_participant_mask[expert] & local_bit) == 0u)
-                {
-                    continue;
-                }
-
-                ++matching_claims;
-                if (layer != entry.layer || expert != entry.expert)
-                    return false;
-            }
-        }
-        if (matching_claims != 1u)
-            return false;
-
         const auto &runtime = runtime_layers[entry.layer];
         const auto &active = runtime.banks[runtime.active_bank];
         const auto occupancy =
@@ -7416,13 +8109,14 @@ namespace
         const DeviceMoEExpertDirectoryEntryView &entry,
         uint32_t slot_index,
         const DeviceMoELayerRuntimeView *runtime_layers,
-        const DeviceMoERebalanceConfigView &config)
+        const DeviceMoERebalanceConfigView &config,
+        const DeviceMoETransferSlotClaimIndexView *claim_index)
     {
-        if (rebalance_any_active_runtime_claims_slot(
-                entry,
-                slot_index,
-                runtime_layers,
-                config))
+        if (!runtime_layers ||
+            !claim_index ||
+            slot_index >= claim_index->slot_count ||
+            rebalance_transfer_slot_claim_index_entries(
+                claim_index)[slot_index].claim_count != 0u)
         {
             return false;
         }
@@ -7533,7 +8227,8 @@ namespace
         const DeviceMoERebalancePlanEntryView *selected_plans,
         uint32_t selected_plan_count,
         const DeviceMoERebalancePlanEntryView *wave_plan_entries,
-        uint32_t wave_plan_count)
+        uint32_t wave_plan_count,
+        const DeviceMoETransferSlotClaimIndexView *claim_index)
     {
         if (!runtime_layers ||
             !local_transfer_slots ||
@@ -7567,7 +8262,8 @@ namespace
                     entry,
                     slot,
                     runtime_layers,
-                    config))
+                    config,
+                    claim_index))
             {
                 selected_slot = slot;
                 break;
@@ -7594,7 +8290,8 @@ namespace
                     entry,
                     slot,
                     runtime_layers,
-                    config))
+                    config,
+                    claim_index))
             {
                 selected_slot = slot;
             }
@@ -7627,7 +8324,8 @@ namespace
                     entry,
                     slot,
                     runtime_layers,
-                    config) &&
+                    config,
+                    claim_index) &&
                 rebalance_transfer_slot_occupant_departs_in_wave(
                     entry,
                     wave_plan_entries,
@@ -7659,7 +8357,8 @@ namespace
                     entry,
                     slot,
                     runtime_layers,
-                    config))
+                    config,
+                    claim_index))
             {
                 selected_slot = slot;
             }
@@ -7698,7 +8397,8 @@ namespace
         uint32_t local_transfer_slot_count,
         const DeviceMoERebalanceConfigView &config,
         const DeviceMoERebalancePlanEntryView *selected_plans,
-        uint32_t selected_plan_count)
+        uint32_t selected_plan_count,
+        const DeviceMoETransferSlotClaimIndexView *claim_index)
     {
         if (rebalance_lease_local_transfer_slot(
                 plan,
@@ -7709,7 +8409,8 @@ namespace
                 selected_plans,
                 selected_plan_count,
                 /*wave_plan_entries=*/nullptr,
-                /*wave_plan_count=*/0u))
+                /*wave_plan_count=*/0u,
+                claim_index))
         {
             return true;
         }
@@ -7780,7 +8481,8 @@ namespace
                     prior,
                     slot_index,
                     runtime_layers,
-                    config);
+                    config,
+                    claim_index);
             if (!has_active_runtime_claim)
             {
                 selected_slot = slot_index;
@@ -7870,7 +8572,8 @@ namespace
         DeviceMoERebalanceWaveStateView *local_wave_states,
         DeviceMoELayerRuntimeView *runtime_layers,
         const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
-        uint32_t local_transfer_slot_count)
+        uint32_t local_transfer_slot_count,
+        const DeviceMoETransferSlotClaimIndexView *claim_index)
     {
         if (!gathered_plan_entries ||
             !gathered_command_headers ||
@@ -7878,6 +8581,7 @@ namespace
             !local_command_headers ||
             !runtime_layers ||
             !local_transfer_slots ||
+            !claim_index ||
             !rebalance_config_ok(config) ||
             plan_capacity == 0u ||
             local_transfer_slot_count == 0u)
@@ -7970,6 +8674,38 @@ namespace
          */
         if (threadIdx.x == 0)
         {
+            if (!rebalance_transfer_slot_claim_index_ok(
+                    claim_index,
+                    config,
+                    local_transfer_slot_count))
+            {
+                for (uint32_t buffer_index = 0u;
+                     buffer_index < metadata_buffer_count;
+                     ++buffer_index)
+                {
+                    local_command_headers[buffer_index].command_count = 0u;
+                }
+                if (status)
+                {
+                    status->status_code =
+                        kDeviceMoERebalanceStatusInvalidRuntime;
+                    status->invalid_runtime_layers +=
+                        claim_index->invalid_runtime_layers != 0u
+                            ? claim_index->invalid_runtime_layers
+                            : 1u;
+                    status->plan_overflow = 1u;
+                    rebalance_publish_transfer_slot_claim_summary_fields(
+                        status,
+                        claim_index->summary);
+                }
+                return;
+            }
+            if (status)
+            {
+                rebalance_publish_transfer_slot_claim_summary_fields(
+                    status,
+                    claim_index->summary);
+            }
             uint32_t total_command_count = 0u;
             uint32_t last_projected_epoch = 0u;
             uint32_t requested_by_source[kDeviceMoEMaxParticipants] = {};
@@ -8083,7 +8819,8 @@ namespace
                                          static_cast<unsigned long long>(metadata_buffer_count) +
                                      static_cast<unsigned long long>(buffer_index)) *
                                     static_cast<unsigned long long>(plan_capacity)],
-                                command_count))
+                                command_count,
+                                claim_index))
                         {
                             /*
                              * Preserve the domain command so source payload
@@ -8248,7 +8985,8 @@ namespace
         uint32_t command_buffer_count,
         DeviceMoELayerRuntimeView *runtime_layers,
         const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
-        uint32_t local_transfer_slot_count)
+        uint32_t local_transfer_slot_count,
+        const DeviceMoETransferSlotClaimIndexView *claim_index)
     {
         if (!gathered_plan_entries ||
             !gathered_command_headers ||
@@ -8258,6 +8996,7 @@ namespace
             !status ||
             !runtime_layers ||
             !local_transfer_slots ||
+            !claim_index ||
             !rebalance_config_ok(config) ||
             plan_capacity == 0u ||
             payload_slot_capacity == 0u ||
@@ -8295,6 +9034,28 @@ namespace
 
         if (threadIdx.x != 0u)
             return;
+
+        if (!rebalance_transfer_slot_claim_index_ok(
+                claim_index,
+                config,
+                local_transfer_slot_count))
+        {
+            DeviceMoERebalanceStatusView invalid_status{};
+            invalid_status.magic = kDeviceMoERebalanceMagic;
+            invalid_status.version = kDeviceMoERebalanceVersion;
+            invalid_status.status_code =
+                kDeviceMoERebalanceStatusInvalidRuntime;
+            invalid_status.invalid_runtime_layers =
+                claim_index->invalid_runtime_layers != 0u
+                    ? claim_index->invalid_runtime_layers
+                    : 1u;
+            invalid_status.plan_overflow = 1u;
+            rebalance_publish_transfer_slot_claim_summary_fields(
+                &invalid_status,
+                claim_index->summary);
+            *status = invalid_status;
+            return;
+        }
 
         const DeviceMoERebalanceStatusView prior_status = *status;
         DeviceMoERebalanceStatusView projected_status{};
@@ -8344,6 +9105,9 @@ namespace
             prior_status.prefill_first_duplicate_layer;
         projected_status.prefill_first_duplicate_expert =
             prior_status.prefill_first_duplicate_expert;
+        rebalance_publish_transfer_slot_claim_summary_fields(
+            &projected_status,
+            claim_index->summary);
 
         uint32_t total_command_count = 0u;
         uint32_t last_epoch = 0u;
@@ -8448,7 +9212,8 @@ namespace
                             local_transfer_slot_count,
                             config,
                             projected_wave_entries,
-                            output_count))
+                            output_count,
+                            claim_index))
                     {
                         projected_status.plan_overflow = 1u;
                         projected_status.payload_bucket_overflow = 1u;
@@ -8490,11 +9255,9 @@ namespace
                 payload_slot_capacity);
         projected_status.last_epoch =
             prior_status.last_epoch != 0u ? prior_status.last_epoch : last_epoch;
-        projected_status.planned_arrivals = prior_status.planned_arrivals;
+        projected_status.planned_arrivals = total_command_count;
         projected_status.windows_applied =
-            prior_status.windows_applied != 0u
-                ? prior_status.windows_applied
-                : (prior_status.planned_arrivals != 0u ? 1u : 0u);
+            total_command_count != 0u ? 1u : 0u;
         projected_status.payload_bucket_requested_slots = requested_payload_slots;
         projected_status.payload_bucket_slots = payload_bucket_slots;
         projected_status.payload_bucket_index =
@@ -8516,6 +9279,212 @@ namespace
         projected_status.llep_weight_transfer_count =
             prior_status.llep_weight_transfer_count;
         *status = projected_status;
+    }
+
+    /**
+     * @brief Expand one deterministic current-batch plan into all participant slices.
+     *
+     * Every homogeneous LocalTP participant owns the same transfer list because
+     * routing rows, planner arithmetic, and the logical residency masks are
+     * mirrored. Building the participant-major request envelope locally avoids
+     * two fixed-latency metadata collectives per MoE layer. Physical destination
+     * slots are deliberately left unresolved for the following projection
+     * kernel, which remains participant-local.
+     */
+    __global__ void materialize_prefill_llep_mirrored_domain_commands_kernel(
+        const DeviceMoELayerRuntimeView *__restrict__ runtime,
+        DeviceMoERebalancePlanEntryView *__restrict__ mirrored_plan_entries,
+        DeviceMoERebalanceCommandBufferHeaderView *__restrict__ mirrored_command_headers,
+        uint32_t plan_capacity,
+        DeviceMoERebalanceStatusView *__restrict__ status,
+        DeviceMoERebalanceConfigView config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx)
+    {
+        const uint32_t lane = threadIdx.x;
+        const unsigned long long total_entries =
+            static_cast<unsigned long long>(config.participant_count) *
+            static_cast<unsigned long long>(plan_capacity);
+        for (unsigned long long index = lane;
+             index < total_entries;
+             index += blockDim.x)
+        {
+            mirrored_plan_entries[index] = DeviceMoERebalancePlanEntryView{};
+        }
+        for (uint32_t participant = lane;
+             participant < config.participant_count;
+             participant += blockDim.x)
+        {
+            DeviceMoERebalanceCommandBufferHeaderView header{};
+            header.magic = kDeviceMoERebalanceMagic;
+            header.version = kDeviceMoERebalanceVersion;
+            header.phase = kDeviceMoERebalancePhasePlanAssignments;
+            header.command_capacity = plan_capacity;
+            header.participant_id = participant;
+            header.participant_count = config.participant_count;
+            mirrored_command_headers[participant] = header;
+        }
+        if (lane == 0u)
+        {
+            *status = DeviceMoERebalanceStatusView{};
+            status->magic = kDeviceMoERebalanceMagic;
+            status->version = kDeviceMoERebalanceVersion;
+            status->status_code = kDeviceMoERebalanceStatusOk;
+        }
+        __syncthreads();
+
+        if (lane != 0u)
+            return;
+
+        if (!runtime || !mirrored_plan_entries ||
+            !mirrored_command_headers || !status ||
+            !rebalance_config_ok(config) || plan_capacity == 0u ||
+            payload_slot_capacity == 0u ||
+            config.participant_count == 0u ||
+            config.participant_count >
+                static_cast<uint32_t>(kDeviceMoEMaxParticipants) ||
+            layer_idx >= config.num_layers ||
+            runtime_execution_bank(runtime) > 1u ||
+            runtime->participant_count != config.participant_count ||
+            !runtime->reserved_ptrs[2])
+        {
+            status->status_code = kDeviceMoERebalanceStatusInvalidRuntime;
+            status->invalid_runtime_layers = 1u;
+            return;
+        }
+
+        const uint32_t transfer_count =
+            runtime->reserved_u64[3] > 0xffffffffULL
+                ? 0xffffffffu
+                : static_cast<uint32_t>(runtime->reserved_u64[3]);
+        const uint32_t span_count =
+            runtime->reserved_u64[2] > 0xffffffffULL
+                ? 0xffffffffu
+                : static_cast<uint32_t>(runtime->reserved_u64[2]);
+        status->llep_assignment_span_count = span_count;
+        status->llep_weight_transfer_count = transfer_count;
+        if (transfer_count > static_cast<uint32_t>(kDeviceMoEMaxExperts))
+        {
+            status->plan_overflow = 1u;
+            status->payload_bucket_overflow = 1u;
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "mirrored current-batch LLEP transfer count exceeds the fixed expert ABI");
+            return;
+        }
+
+        const auto *transfers =
+            static_cast<const llaminar2::least_loaded_ep::LeastLoadedExpertWeightTransfer *>(
+                runtime->reserved_ptrs[2]);
+        const auto &active_bank =
+            runtime_placement_banks(runtime)[runtime_execution_bank(runtime)];
+        uint32_t command_counts[kDeviceMoEMaxParticipants] = {};
+        uint32_t source_payload_counts[kDeviceMoEMaxParticipants]
+                                      [kDeviceMoEMaxParticipants] = {};
+        uint32_t total_command_count = 0u;
+        uint32_t requested_payload_slots = 0u;
+        uint32_t overflow = 0u;
+        uint32_t source_mask = 0u;
+        uint32_t destination_mask = 0u;
+        uint64_t edge_mask = 0ULL;
+
+        for (uint32_t transfer_index = 0u;
+             transfer_index < transfer_count;
+             ++transfer_index)
+        {
+            const auto transfer = transfers[transfer_index];
+            uint32_t resident_mask = 0u;
+            if (transfer.expert < static_cast<uint32_t>(kDeviceMoEMaxExperts))
+            {
+                resident_mask =
+                    active_bank.resident_participant_mask[transfer.expert];
+            }
+            const uint32_t source_bit =
+                llaminar2::moe_rebalance_policy::participantBit(
+                    transfer.source_participant);
+            const bool valid =
+                transfer.expert < config.num_experts &&
+                transfer.source_participant < config.participant_count &&
+                transfer.destination_participant < config.participant_count &&
+                transfer.source_participant != transfer.destination_participant &&
+                (resident_mask & source_bit) != 0u;
+            if (!valid)
+            {
+                overflow = 1u;
+                ++status->invalid_runtime_layers;
+                continue;
+            }
+
+            const uint32_t destination = transfer.destination_participant;
+            const uint32_t source = transfer.source_participant;
+            const uint32_t output_index = command_counts[destination];
+            const uint32_t payload_slot =
+                source_payload_counts[destination][source];
+            if (output_index >= plan_capacity ||
+                payload_slot >= payload_slot_capacity)
+            {
+                overflow = 1u;
+                continue;
+            }
+            ++command_counts[destination];
+            ++source_payload_counts[destination][source];
+
+            DeviceMoERebalancePlanEntryView entry{};
+            entry.op = kDeviceMoERebalancePlanExpertPayloadArrival;
+            entry.flags = kDeviceMoERebalancePlanFlagCurrentBatchLLEP;
+            entry.layer = layer_idx;
+            entry.expert = transfer.expert;
+            entry.source_participant = source;
+            entry.destination_participant = destination;
+            entry.source_resident_mask = resident_mask;
+            entry.destination_slot = kDeviceMoEInvalidSlot;
+            entry.payload_slot = payload_slot;
+            mirrored_plan_entries[
+                static_cast<unsigned long long>(destination) *
+                    static_cast<unsigned long long>(plan_capacity) +
+                static_cast<unsigned long long>(output_index)] = entry;
+
+            ++total_command_count;
+            requested_payload_slots =
+                max(requested_payload_slots, payload_slot + 1u);
+            source_mask |=
+                llaminar2::moe_rebalance_policy::participantBit(source);
+            destination_mask |=
+                llaminar2::moe_rebalance_policy::participantBit(destination);
+            edge_mask |=
+                llaminar2::moe_rebalance_policy::directedParticipantEdgeBit(
+                    source,
+                    destination,
+                    static_cast<uint32_t>(kDeviceMoEMaxParticipants));
+        }
+
+        const uint32_t epoch = runtime_command_epoch(runtime);
+        for (uint32_t participant = 0u;
+             participant < config.participant_count;
+             ++participant)
+        {
+            mirrored_command_headers[participant].epoch = epoch;
+            mirrored_command_headers[participant].command_count =
+                command_counts[participant];
+        }
+        const uint32_t payload_bucket_slots =
+            llaminar2::moe_rebalance_policy::payloadBucketSlots(
+                requested_payload_slots,
+                payload_slot_capacity);
+        status->last_epoch = epoch;
+        status->planned_arrivals = total_command_count;
+        status->plan_overflow = overflow;
+        status->payload_bucket_requested_slots = requested_payload_slots;
+        status->payload_bucket_slots = payload_bucket_slots;
+        status->payload_bucket_index =
+            llaminar2::moe_rebalance_policy::payloadBucketIndex(
+                payload_bucket_slots);
+        status->payload_bucket_overflow =
+            overflow != 0u || requested_payload_slots > payload_bucket_slots
+                ? 1u
+                : 0u;
+        status->payload_source_participant_mask = source_mask;
+        status->payload_destination_participant_mask = destination_mask;
+        status->payload_edge_mask = edge_mask;
     }
 
     __global__ void materialize_prefill_llep_transfer_commands_kernel(
@@ -8573,7 +9542,7 @@ namespace
         {
             compact_command_count = 0u;
             overflow = 0u;
-            valid = 0u;
+            valid = 1u;
             transfer_count = 0u;
             span_count = 0u;
             fast_payload_source_participant_mask = 0u;
@@ -8600,7 +9569,7 @@ namespace
                     static_cast<uint32_t>(kDeviceMoEMaxExperts) &&
                 plan_capacity > 0u &&
                 layer_idx < config.num_layers &&
-                runtime->active_bank <= 1u &&
+                runtime_execution_bank(runtime) <= 1u &&
                 runtime->participant_count == config.participant_count &&
                 runtime->participant_count <= static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
                 runtime->reserved_ptrs[2])
@@ -8617,6 +9586,7 @@ namespace
             }
             else if (status)
             {
+                valid = 0u;
                 status->status_code = kDeviceMoERebalanceStatusInvalidRuntime;
                 status->invalid_runtime_layers = 1u;
             }
@@ -8629,7 +9599,9 @@ namespace
         const auto *transfers =
             static_cast<const llaminar2::least_loaded_ep::LeastLoadedExpertWeightTransfer *>(
                 runtime->reserved_ptrs[2]);
-        const auto &active_bank = runtime->banks[runtime->active_bank];
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
+        const auto &active_bank =
+            runtime_placement_banks(runtime)[execution_bank];
 
         if (transfer_count <= static_cast<uint32_t>(blockDim.x))
         {
@@ -8681,8 +9653,20 @@ namespace
                             static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
                         transfer_source != transfer_destination &&
                         (resident_mask & transfer_source_bit) != 0u;
-                    if (!transfer_valid ||
-                        compact_command_count >= plan_capacity)
+                    if (!transfer_valid)
+                    {
+                        overflow = 1u;
+                        continue;
+                    }
+                    /* Materialization is the pre-allgather request phase: a
+                     * participant publishes only arrivals it will receive.
+                     * Source-side packing is derived after the allgather by
+                     * domain projection, which merges these destination-local
+                     * requests without duplicating global transfers in every
+                     * participant buffer. */
+                    if (transfer_destination != config.participant_id)
+                        continue;
+                    if (compact_command_count >= plan_capacity)
                     {
                         overflow = 1u;
                         continue;
@@ -8757,7 +9741,7 @@ namespace
                         : plan_capacity;
                 *plan_count = command_count;
                 command_headers[0].command_count = command_count;
-                command_headers[0].epoch = runtime ? runtime->active_epoch : 0u;
+                command_headers[0].epoch = runtime_command_epoch(runtime);
 
                 uint32_t requested_payload_slots = 0u;
                 for (uint32_t participant = 0u;
@@ -8775,8 +9759,7 @@ namespace
 
                 status->last_epoch = command_headers[0].epoch;
                 status->planned_arrivals = command_count;
-                status->plan_overflow =
-                    overflow != 0u || transfer_count > command_count ? 1u : 0u;
+                status->plan_overflow = overflow != 0u ? 1u : 0u;
                 status->payload_bucket_requested_slots = requested_payload_slots;
                 status->payload_bucket_slots = payload_bucket_slots;
                 status->payload_bucket_index =
@@ -8809,7 +9792,7 @@ namespace
              */
             *plan_count = 0u;
             command_headers[0].command_count = 0u;
-            command_headers[0].epoch = runtime ? runtime->active_epoch : 0u;
+            command_headers[0].epoch = runtime_command_epoch(runtime);
             status->last_epoch = command_headers[0].epoch;
             status->planned_arrivals = 0u;
             status->plan_overflow = 1u;
@@ -9694,6 +10677,7 @@ namespace
                 continue;
 
             bool layer_reused = false;
+            bool current_batch_llep_reuse = false;
             for (uint32_t plan_index = 0u;
                  plan_index < plan_count;
                  ++plan_index)
@@ -9714,6 +10698,9 @@ namespace
                         command_epoch))
                 {
                     layer_reused = true;
+                    current_batch_llep_reuse =
+                        (plan.flags &
+                         kDeviceMoERebalancePlanFlagCurrentBatchLLEP) != 0u;
                     break;
                 }
             }
@@ -9721,7 +10708,14 @@ namespace
                 continue;
 
             auto &runtime = runtime_layers[prior_layer];
+            const uint32_t execution_bank =
+                runtime_execution_bank(&runtime);
+            const bool current_batch_child =
+                current_batch_llep_reuse &&
+                runtime.overlay_placement_banks &&
+                runtime.overlay_epoch_ticket;
             if (runtime.active_bank > 1u ||
+                execution_bank > 1u ||
                 runtime.expert_count != config.num_experts ||
                 runtime.participant_id != config.participant_id ||
                 runtime.participant_count != config.participant_count)
@@ -9729,11 +10723,19 @@ namespace
                 FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
                     "cross-layer CUDA slot retirement found invalid runtime metadata");
             }
+            if (current_batch_llep_reuse && !current_batch_child)
+            {
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "cross-layer CUDA LLEP slot retirement lost its ExpertOverlay child authority");
+            }
 
-            const auto &active = runtime.banks[runtime.active_bank];
-            const uint32_t inactive_bank = 1u - runtime.active_bank;
+            const auto &active =
+                runtime_placement_banks(&runtime)[execution_bank];
+            const uint32_t inactive_bank = 1u - execution_bank;
             auto &next = runtime.banks[inactive_bank];
-            next.epoch = runtime.active_epoch + 1u;
+            next.epoch = current_batch_child
+                             ? runtime_command_epoch(&runtime)
+                             : runtime.active_epoch + 1u;
             next.expert_count = config.num_experts;
             next.transient_placement_observed =
                 active.transient_placement_observed;
@@ -9744,6 +10746,8 @@ namespace
                  ++expert)
             {
                 next.experts[expert] = active.experts[expert];
+                next.overlay_route_participant[expert] =
+                    active.overlay_route_participant[expert];
                 next.local_compute_mask[expert] =
                     active.local_compute_mask[expert];
                 next.replica_role[expert] =
@@ -9786,6 +10790,10 @@ namespace
             __threadfence();
             runtime.active_bank = inactive_bank;
             runtime.active_epoch = next.epoch;
+            if (current_batch_child)
+            {
+                runtime.current_batch_llep_transient_bank_active = 1u;
+            }
             ++changed_layers;
         }
         return changed_layers;
@@ -9804,12 +10812,15 @@ namespace
         int target_layer,
         DeviceMoERebalanceGraphControllerStateView *controller_state,
         bool require_ready_wave,
-        uint32_t command_buffer_count)
+        uint32_t command_buffer_count,
+        const llaminar2::DeviceMoEOverlayEpochStatus *
+            overlay_reservation_status)
     {
         if (blockIdx.x != 0 || !status)
             return;
 
         __shared__ uint8_t changed_layer[kDeviceMoEMaxExperts];
+        __shared__ uint8_t current_batch_child_layer[kDeviceMoEMaxExperts];
         __shared__ uint32_t reduce_scratch[kThreads];
         __shared__ uint32_t shared_valid;
         __shared__ uint32_t shared_count;
@@ -9820,12 +10831,17 @@ namespace
         __shared__ const DeviceMoERebalancePlanEntryView *shared_plan_entries;
         __shared__ const uint32_t *shared_plan_count;
         __shared__ DeviceMoERebalanceCommandBufferHeaderView *shared_command_header;
+        __shared__ uint32_t shared_overlay_enabled;
+        __shared__ uint32_t shared_overlay_published_bank;
+        __shared__ uint32_t shared_overlay_candidate_bank;
+        __shared__ uint64_t shared_overlay_candidate_epoch;
 
         for (uint32_t layer = threadIdx.x;
              layer < static_cast<uint32_t>(kDeviceMoEMaxExperts);
              layer += blockDim.x)
         {
             changed_layer[layer] = 0u;
+            current_batch_child_layer[layer] = 0u;
         }
         reduce_scratch[threadIdx.x] = 0u;
         __syncthreads();
@@ -9845,6 +10861,56 @@ namespace
             shared_plan_entries = plan_entries;
             shared_plan_count = plan_count;
             shared_command_header = command_header;
+            shared_overlay_enabled = 0u;
+            shared_overlay_published_bank = 0u;
+            shared_overlay_candidate_bank = 0u;
+            shared_overlay_candidate_epoch = 0u;
+
+            if (overlay_reservation_status)
+            {
+                const uint32_t reserve_code =
+                    overlay_reservation_status->code;
+                const uint32_t reserve_operation =
+                    overlay_reservation_status->operation;
+                const uint32_t candidate_bank =
+                    overlay_reservation_status->bank;
+                const uint64_t candidate_epoch =
+                    overlay_reservation_status->epoch;
+                const uint64_t selector =
+                    overlay_reservation_status->selector;
+                const uint32_t published_bank =
+                    static_cast<uint32_t>(selector & 1u);
+                const uint64_t generation = selector >> 1u;
+                if (reserve_code != static_cast<uint32_t>(
+                                        llaminar2::DeviceMoEOverlayEpochStatusCode::Success))
+                {
+                    /* Busy retirement and no-capacity conditions are expected
+                     * maintenance poll misses. Leave placement untouched. */
+                    if (require_ready_wave)
+                        status->status_code = 0u;
+                    setup_ok = false;
+                }
+                else if (reserve_operation != static_cast<uint32_t>(
+                                                   llaminar2::DeviceMoEOverlayEpochOperation::ReserveCandidate) ||
+                         target_layer >= 0 || candidate_bank > 1u ||
+                         published_bank > 1u || candidate_bank == published_bank ||
+                         candidate_epoch <= 1u ||
+                         candidate_epoch > 0xffffffffull ||
+                         generation == 0u)
+                {
+                    if (require_ready_wave)
+                        status->status_code =
+                            kDeviceMoERebalanceApplyStatusInvalidRuntime;
+                    setup_ok = false;
+                }
+                else
+                {
+                    shared_overlay_enabled = 1u;
+                    shared_overlay_published_bank = published_bank;
+                    shared_overlay_candidate_bank = candidate_bank;
+                    shared_overlay_candidate_epoch = candidate_epoch;
+                }
+            }
 
             if (require_ready_wave)
             {
@@ -9988,19 +11054,46 @@ namespace
                     plan.destination_participant == config.participant_id;
                 const uint32_t destination_bit =
                     runtime_participant_bit(static_cast<int>(plan.destination_participant));
+                const bool current_batch_plan =
+                    (plan.flags &
+                     kDeviceMoERebalancePlanFlagCurrentBatchLLEP) != 0u;
 
                 auto &runtime = runtime_layers[plan.layer];
+                const uint32_t execution_bank =
+                    runtime_execution_bank(&runtime);
+                /* Durable maintenance starts only after the inference reader
+                 * has released its epoch ticket. In that transaction the
+                 * successful reservation status, not a deliberately invalid
+                 * request ticket, authorizes reads from published_bank. A
+                 * request-local apply has no such reservation and must still
+                 * prove its exact ticket-selected execution bank. */
                 if (runtime.active_bank > 1u ||
+                    (shared_overlay_enabled == 0u && execution_bank > 1u) ||
+                    (shared_overlay_enabled != 0u &&
+                     runtime.active_bank != shared_overlay_published_bank) ||
                     runtime.expert_count != config.num_experts ||
                     runtime.top_k != config.top_k ||
                     runtime.participant_id != config.participant_id ||
-                    runtime.participant_count != config.participant_count)
+                    runtime.participant_count != config.participant_count ||
+                    (current_batch_plan &&
+                     (!runtime.overlay_placement_banks ||
+                      !runtime.overlay_epoch_ticket ||
+                      !shared_command_header ||
+                      shared_command_header->epoch !=
+                          runtime_command_epoch(&runtime))))
                 {
                     ++status->invalid_plan_entries;
                     continue;
                 }
 
-                const auto &active = runtime.banks[runtime.active_bank];
+                const uint32_t source_bank =
+                    shared_overlay_enabled != 0u
+                        ? shared_overlay_published_bank
+                        : execution_bank;
+                const auto &active =
+                    shared_overlay_enabled != 0u
+                        ? runtime.banks[source_bank]
+                        : runtime_placement_banks(&runtime)[source_bank];
                 uint32_t resident_mask =
                     (active.resident_participant_mask[plan.expert] |
                      plan.source_resident_mask |
@@ -10042,6 +11135,10 @@ namespace
                 }
 
                 changed_layer[plan.layer] = 1u;
+                if (current_batch_plan)
+                {
+                    current_batch_child_layer[plan.layer] = 1u;
+                }
                 if (destination_local &&
                     rebalance_plan_requires_payload(plan.op) &&
                     plan.destination_previous_layer < config.num_layers &&
@@ -10050,6 +11147,23 @@ namespace
                      plan.destination_previous_expert != plan.expert))
                 {
                     changed_layer[plan.destination_previous_layer] = 1u;
+                    auto &previous_runtime =
+                        runtime_layers[plan.destination_previous_layer];
+                    if (current_batch_plan &&
+                        (!previous_runtime.overlay_placement_banks ||
+                         !previous_runtime.overlay_epoch_ticket ||
+                         !shared_command_header ||
+                         shared_command_header->epoch !=
+                             runtime_command_epoch(&previous_runtime)))
+                    {
+                        ++status->invalid_plan_entries;
+                        continue;
+                    }
+                    if (current_batch_plan)
+                    {
+                        current_batch_child_layer[
+                            plan.destination_previous_layer] = 1u;
+                    }
                 }
             }
 
@@ -10106,12 +11220,26 @@ namespace
                 continue;
 
             auto &runtime = runtime_layers[layer];
-            const uint32_t inactive_bank = 1u - runtime.active_bank;
-            const auto &active = runtime.banks[runtime.active_bank];
+            const uint32_t source_bank =
+                shared_overlay_enabled != 0u
+                    ? shared_overlay_published_bank
+                    : runtime_execution_bank(&runtime);
+            const uint32_t inactive_bank =
+                shared_overlay_enabled != 0u
+                    ? shared_overlay_candidate_bank
+                    : 1u - source_bank;
+            const auto &active =
+                runtime_placement_banks(&runtime)[source_bank];
             auto &next = runtime.banks[inactive_bank];
             if (threadIdx.x == 0)
             {
-                next.epoch = runtime.active_epoch + 1u;
+                next.epoch =
+                    shared_overlay_enabled != 0u
+                        ? static_cast<uint32_t>(shared_overlay_candidate_epoch)
+                        : (current_batch_child_layer[layer] != 0u
+                               ? static_cast<uint32_t>(
+                                     runtime.overlay_epoch_ticket->epoch)
+                               : runtime.active_epoch + 1u);
                 next.expert_count = config.num_experts;
                 next.multi_resident_expert_count =
                     active.multi_resident_expert_count;
@@ -10121,6 +11249,8 @@ namespace
             for (uint32_t expert = threadIdx.x; expert < config.num_experts; expert += blockDim.x)
             {
                 next.experts[expert] = active.experts[expert];
+                next.overlay_route_participant[expert] =
+                    active.overlay_route_participant[expert];
                 auto &base_desc = next.experts[expert];
                 uint32_t resident_mask =
                     active.resident_participant_mask[expert] & shared_valid_mask;
@@ -10215,7 +11345,12 @@ namespace
                     continue;
                 }
 
-                const auto &active = runtime.banks[runtime.active_bank];
+                const uint32_t source_bank =
+                    shared_overlay_enabled != 0u
+                        ? shared_overlay_published_bank
+                        : runtime_execution_bank(&runtime);
+                const auto &active =
+                    runtime_placement_banks(&runtime)[source_bank];
                 auto desc = active.experts[plan.expert];
                 uint32_t resident_mask =
                     (active.resident_participant_mask[plan.expert] |
@@ -10253,7 +11388,10 @@ namespace
                     continue;
                 }
 
-                const uint32_t inactive_bank = 1u - runtime.active_bank;
+                const uint32_t inactive_bank =
+                    shared_overlay_enabled != 0u
+                        ? shared_overlay_candidate_bank
+                        : 1u - source_bank;
                 auto &next = runtime.banks[inactive_bank];
                 if (ownership_transfer)
                 {
@@ -10319,7 +11457,14 @@ namespace
                 continue;
 
             auto &runtime = runtime_layers[layer];
-            const uint32_t inactive_bank = 1u - runtime.active_bank;
+            const uint32_t source_bank =
+                shared_overlay_enabled != 0u
+                    ? shared_overlay_published_bank
+                    : runtime_execution_bank(&runtime);
+            const uint32_t inactive_bank =
+                shared_overlay_enabled != 0u
+                    ? shared_overlay_candidate_bank
+                    : 1u - source_bank;
             auto &next = runtime.banks[inactive_bank];
             uint32_t local_multi_resident = 0u;
             for (uint32_t expert = threadIdx.x; expert < config.num_experts; expert += blockDim.x)
@@ -10329,8 +11474,7 @@ namespace
                     ++local_multi_resident;
                 if ((config.flags & kDeviceMoERebalanceFlagResetHistograms) != 0u)
                 {
-                    runtime.decode_histogram[expert] = 0ULL;
-                    runtime.decode_local_histogram[expert] = 0ULL;
+                    reset_runtime_histogram_expert(runtime, expert);
                 }
             }
             reduce_scratch[threadIdx.x] = local_multi_resident;
@@ -10350,8 +11494,22 @@ namespace
             __syncthreads();
             if (threadIdx.x == 0)
             {
-                runtime.active_bank = inactive_bank;
-                runtime.active_epoch = next.epoch;
+                /* A durable overlay apply only prepares the reserved peer.
+                 * The request-visible selector and the controller's active
+                 * metadata remain on the published bank until the all-layer
+                 * finalizer has cloned every untouched layer. */
+                if (shared_overlay_enabled == 0u)
+                {
+                    runtime.active_bank = inactive_bank;
+                    runtime.active_epoch = next.epoch;
+                    if (current_batch_child_layer[layer] != 0u)
+                    {
+                        /* Publish the request-local override only after its
+                         * complete bank is globally visible. The exact parent
+                         * ticket remains the epoch proof used by readers. */
+                        runtime.current_batch_llep_transient_bank_active = 1u;
+                    }
+                }
                 ++status->changed_layers;
                 status->post_apply_multi_resident_experts += reduce_scratch[0];
             }
@@ -10384,6 +11542,363 @@ namespace
                 }
             }
             __threadfence();
+        }
+    }
+
+    /** @return Atomic acquire-style load of one overlay 64-bit word. */
+    __device__ __forceinline__ uint64_t overlay_atomic_load64(
+        const uint64_t *value)
+    {
+        return static_cast<uint64_t>(atomicAdd(
+            reinterpret_cast<unsigned long long *>(
+                const_cast<uint64_t *>(value)),
+            0ull));
+    }
+
+    /** @return Atomic acquire-style load of one overlay 32-bit word. */
+    __device__ __forceinline__ uint32_t overlay_atomic_load32(
+        const uint32_t *value)
+    {
+        return atomicAdd(
+            reinterpret_cast<unsigned int *>(
+                const_cast<uint32_t *>(value)),
+            0u);
+    }
+
+    /** @brief Atomic release store for one overlay 64-bit word. */
+    __device__ __forceinline__ void overlay_atomic_store64(
+        uint64_t *destination,
+        uint64_t value)
+    {
+        atomicExch(
+            reinterpret_cast<unsigned long long *>(destination),
+            static_cast<unsigned long long>(value));
+    }
+
+    /** @brief Atomic release store for one overlay 32-bit word. */
+    __device__ __forceinline__ void overlay_atomic_store32(
+        uint32_t *destination,
+        uint32_t value)
+    {
+        atomicExch(reinterpret_cast<unsigned int *>(destination), value);
+    }
+
+    /**
+     * @brief Publish one complete semantic result after all provenance fields.
+     */
+    __device__ __forceinline__ void finish_overlay_publication_status(
+        llaminar2::DeviceMoEOverlayEpochStatus *status,
+        llaminar2::DeviceMoEOverlayEpochOperation operation,
+        llaminar2::DeviceMoEOverlayEpochStatusCode code,
+        uint64_t epoch,
+        uint64_t selector,
+        uint32_t bank,
+        llaminar2::DeviceMoEOverlayEpochBankState state)
+    {
+        status->epoch = epoch;
+        status->selector = selector;
+        status->operation = static_cast<uint32_t>(operation);
+        status->bank = bank;
+        status->observed_state = static_cast<uint32_t>(state);
+        __threadfence();
+        overlay_atomic_store32(&status->code, static_cast<uint32_t>(code));
+    }
+
+    /**
+     * @brief Complete one all-layer RCU publication after rebalance apply.
+     *
+     * Exactly one block owns the complete family. Each layer is normalized
+     * before the publication selector changes: changed layers already occupy
+     * the reserved peer bank, while untouched layers are cloned from the old
+     * published bank. Main and every MTP sidecar then observe the same immutable
+     * bank through their shared ticket and canonical placement pointer.
+     */
+    __global__ void finalize_overlay_rebalance_publication_kernel(
+        DeviceMoELayerRuntimeView *runtime_layers,
+        uint32_t layer_count,
+        uint32_t expert_count,
+        llaminar2::DeviceMoEOverlayEpochControl *control,
+        uint64_t *candidate_epoch_ptr,
+        llaminar2::DeviceMoEOverlayEpochStatus *status,
+        const DeviceMoERebalanceApplyStatusView *apply_status)
+    {
+        if (blockIdx.x != 0u || !runtime_layers || !control ||
+            !candidate_epoch_ptr || !status || !apply_status)
+        {
+            return;
+        }
+
+        __shared__ uint32_t valid;
+        __shared__ uint32_t published_bank;
+        __shared__ uint32_t candidate_bank;
+        __shared__ uint64_t candidate_epoch;
+        __shared__ uint64_t old_selector;
+
+        if (threadIdx.x == 0u)
+        {
+            /* Capture the reserve result before this same record becomes the
+             * final publication result. A failed/busy reserve is deliberately
+             * left intact for an ordered diagnostic consumer. */
+            const uint32_t reserve_code = status->code;
+            const uint32_t reserve_operation = status->operation;
+            candidate_bank = status->bank;
+            candidate_epoch = status->epoch;
+            old_selector = status->selector;
+            published_bank = static_cast<uint32_t>(old_selector & 1u);
+            valid =
+                reserve_code == static_cast<uint32_t>(
+                                    llaminar2::DeviceMoEOverlayEpochStatusCode::Success) &&
+                        reserve_operation == static_cast<uint32_t>(
+                                                 llaminar2::DeviceMoEOverlayEpochOperation::ReserveCandidate)
+                    ? 1u
+                    : 0u;
+
+            if (valid != 0u)
+            {
+                const bool apply_record_valid =
+                    apply_status->magic == kDeviceMoERebalanceMagic &&
+                    apply_status->version == kDeviceMoERebalanceVersion &&
+                    apply_status->status_code == kDeviceMoERebalanceStatusOk;
+                const bool topology_valid =
+                    layer_count > 0u &&
+                    layer_count <= static_cast<uint32_t>(kDeviceMoEMaxExperts) &&
+                    expert_count > 0u &&
+                    expert_count <= static_cast<uint32_t>(kDeviceMoEMaxExperts) &&
+                    candidate_bank <= 1u && published_bank <= 1u &&
+                    candidate_bank != published_bank &&
+                    (old_selector >> 1u) != 0u && candidate_epoch > 1u &&
+                    candidate_epoch < 0xffffffffull &&
+                    *candidate_epoch_ptr == candidate_epoch &&
+                    overlay_atomic_load64(&control->bank_epochs[candidate_bank]) ==
+                        candidate_epoch &&
+                    overlay_atomic_load32(&control->bank_states[candidate_bank]) ==
+                        static_cast<uint32_t>(
+                            llaminar2::DeviceMoEOverlayEpochBankState::Candidate) &&
+                    overlay_atomic_load32(&control->bank_states[published_bank]) ==
+                        static_cast<uint32_t>(
+                            llaminar2::DeviceMoEOverlayEpochBankState::Published) &&
+                    overlay_atomic_load64(&control->published_selector) ==
+                        old_selector;
+
+                if (!apply_record_valid || !topology_valid)
+                {
+                    /* The published bank remains authoritative. Abandon a
+                     * structurally valid reservation, but never index a bank
+                     * supplied by a corrupt status record. */
+                    uint32_t prior = static_cast<uint32_t>(
+                        llaminar2::DeviceMoEOverlayEpochBankState::Empty);
+                    if (candidate_bank <= 1u)
+                    {
+                        prior = atomicCAS(
+                            reinterpret_cast<unsigned int *>(
+                                &control->bank_states[candidate_bank]),
+                            static_cast<uint32_t>(
+                                llaminar2::DeviceMoEOverlayEpochBankState::Candidate),
+                            static_cast<uint32_t>(
+                                llaminar2::DeviceMoEOverlayEpochBankState::Empty));
+                        if (prior == static_cast<uint32_t>(
+                                         llaminar2::DeviceMoEOverlayEpochBankState::Candidate))
+                        {
+                            overlay_atomic_store64(
+                                &control->bank_epochs[candidate_bank], 0u);
+                        }
+                    }
+                    finish_overlay_publication_status(
+                        status,
+                        llaminar2::DeviceMoEOverlayEpochOperation::AbortCandidate,
+                        llaminar2::DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                        candidate_epoch,
+                        old_selector,
+                        candidate_bank,
+                        static_cast<llaminar2::DeviceMoEOverlayEpochBankState>(prior));
+                    valid = 0u;
+                }
+
+                if (valid != 0u && apply_status->changed_layers == 0u)
+                {
+                    const uint32_t prior = atomicCAS(
+                        reinterpret_cast<unsigned int *>(
+                            &control->bank_states[candidate_bank]),
+                        static_cast<uint32_t>(
+                            llaminar2::DeviceMoEOverlayEpochBankState::Candidate),
+                        static_cast<uint32_t>(
+                            llaminar2::DeviceMoEOverlayEpochBankState::Empty));
+                    if (prior == static_cast<uint32_t>(
+                                     llaminar2::DeviceMoEOverlayEpochBankState::Candidate))
+                    {
+                        overlay_atomic_store64(
+                            &control->bank_epochs[candidate_bank], 0u);
+                        finish_overlay_publication_status(
+                            status,
+                            llaminar2::DeviceMoEOverlayEpochOperation::AbortCandidate,
+                            llaminar2::DeviceMoEOverlayEpochStatusCode::Success,
+                            candidate_epoch,
+                            old_selector,
+                            candidate_bank,
+                            llaminar2::DeviceMoEOverlayEpochBankState::Empty);
+                    }
+                    else
+                    {
+                        finish_overlay_publication_status(
+                            status,
+                            llaminar2::DeviceMoEOverlayEpochOperation::AbortCandidate,
+                            llaminar2::DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                            candidate_epoch,
+                            old_selector,
+                            candidate_bank,
+                            static_cast<llaminar2::DeviceMoEOverlayEpochBankState>(prior));
+                    }
+                    valid = 0u;
+                }
+
+                /* The controller metadata remains on the published source.
+                 * Candidate epoch equality is the durable changed-layer mark;
+                 * monotonic epochs make it impossible to confuse stale data. */
+                for (uint32_t layer = 0u;
+                     valid != 0u && layer < layer_count;
+                     ++layer)
+                {
+                    const auto &runtime = runtime_layers[layer];
+                    if (runtime.expert_count != expert_count ||
+                        runtime.active_bank != published_bank ||
+                        runtime.active_epoch !=
+                            static_cast<uint32_t>(candidate_epoch - 1u) ||
+                        runtime.banks[published_bank].epoch !=
+                            static_cast<uint32_t>(candidate_epoch - 1u))
+                    {
+                        const uint32_t prior = atomicCAS(
+                            reinterpret_cast<unsigned int *>(
+                                &control->bank_states[candidate_bank]),
+                            static_cast<uint32_t>(
+                                llaminar2::DeviceMoEOverlayEpochBankState::Candidate),
+                            static_cast<uint32_t>(
+                                llaminar2::DeviceMoEOverlayEpochBankState::Empty));
+                        if (prior == static_cast<uint32_t>(
+                                         llaminar2::DeviceMoEOverlayEpochBankState::Candidate))
+                        {
+                            overlay_atomic_store64(
+                                &control->bank_epochs[candidate_bank], 0u);
+                        }
+                        finish_overlay_publication_status(
+                            status,
+                            llaminar2::DeviceMoEOverlayEpochOperation::AbortCandidate,
+                            llaminar2::DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                            candidate_epoch,
+                            old_selector,
+                            candidate_bank,
+                            static_cast<llaminar2::DeviceMoEOverlayEpochBankState>(prior));
+                        valid = 0u;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (valid == 0u)
+            return;
+
+        for (uint32_t layer = 0u; layer < layer_count; ++layer)
+        {
+            auto &runtime = runtime_layers[layer];
+            auto &candidate = runtime.banks[candidate_bank];
+            const auto &published = runtime.banks[published_bank];
+            const bool clone_untouched =
+                candidate.epoch != static_cast<uint32_t>(candidate_epoch);
+
+            if (clone_untouched)
+            {
+                for (uint32_t expert = threadIdx.x;
+                     expert < expert_count;
+                     expert += blockDim.x)
+                {
+                    candidate.experts[expert] = published.experts[expert];
+                    candidate.local_compute_mask[expert] =
+                        published.local_compute_mask[expert];
+                    candidate.replica_role[expert] =
+                        published.replica_role[expert];
+                    candidate.resident_participant_mask[expert] =
+                        published.resident_participant_mask[expert];
+                    candidate.overlay_route_participant[expert] =
+                        published.overlay_route_participant[expert];
+                }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0u)
+            {
+                if (clone_untouched)
+                {
+                    candidate.expert_count = published.expert_count;
+                    candidate.multi_resident_expert_count =
+                        published.multi_resident_expert_count;
+                    candidate.transient_placement_observed =
+                        published.transient_placement_observed;
+                }
+                candidate.epoch = static_cast<uint32_t>(candidate_epoch);
+            }
+            __syncthreads();
+        }
+
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0u)
+        {
+            /* Active-bank fields are maintenance metadata only for ticketed
+             * inference, but keeping them aligned makes the next controller
+             * wave and diagnostics consume the newly published source. */
+            for (uint32_t layer = 0u; layer < layer_count; ++layer)
+            {
+                runtime_layers[layer].active_bank = candidate_bank;
+                runtime_layers[layer].active_epoch =
+                    static_cast<uint32_t>(candidate_epoch);
+            }
+            __threadfence();
+
+            const uint32_t candidate_prior = atomicCAS(
+                reinterpret_cast<unsigned int *>(
+                    &control->bank_states[candidate_bank]),
+                static_cast<uint32_t>(
+                    llaminar2::DeviceMoEOverlayEpochBankState::Candidate),
+                static_cast<uint32_t>(
+                    llaminar2::DeviceMoEOverlayEpochBankState::Ready));
+            if (candidate_prior != static_cast<uint32_t>(
+                                       llaminar2::DeviceMoEOverlayEpochBankState::Candidate))
+            {
+                finish_overlay_publication_status(
+                    status,
+                    llaminar2::DeviceMoEOverlayEpochOperation::PublishCandidate,
+                    llaminar2::DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                    candidate_epoch,
+                    old_selector,
+                    candidate_bank,
+                    llaminar2::DeviceMoEOverlayEpochBankState::Ready);
+                return;
+            }
+
+            overlay_atomic_store32(
+                &control->bank_states[candidate_bank],
+                static_cast<uint32_t>(
+                    llaminar2::DeviceMoEOverlayEpochBankState::Published));
+            const uint64_t next_selector =
+                (((old_selector >> 1u) + 1u) << 1u) |
+                static_cast<uint64_t>(candidate_bank);
+            __threadfence();
+            overlay_atomic_store64(
+                &control->published_selector, next_selector);
+            /* Readers may still finish acquisition against the old selector;
+             * Retiring remains acquireable and its guard prevents reclamation. */
+            overlay_atomic_store32(
+                &control->bank_states[published_bank],
+                static_cast<uint32_t>(
+                    llaminar2::DeviceMoEOverlayEpochBankState::Retiring));
+            *candidate_epoch_ptr = candidate_epoch + 1u;
+            __threadfence();
+            finish_overlay_publication_status(
+                status,
+                llaminar2::DeviceMoEOverlayEpochOperation::PublishCandidate,
+                llaminar2::DeviceMoEOverlayEpochStatusCode::Success,
+                candidate_epoch,
+                next_selector,
+                candidate_bank,
+                llaminar2::DeviceMoEOverlayEpochBankState::Published);
         }
     }
 
@@ -10465,7 +11980,23 @@ namespace
             runtime_participant_bit(static_cast<int>(config.participant_id));
         const uint32_t valid_mask = runtime_valid_participant_mask(config.participant_count);
         auto &runtime = runtime_layers[layer];
+        const uint32_t execution_bank =
+            runtime_execution_bank(&runtime);
+        const bool current_batch_child =
+            runtime.overlay_placement_banks &&
+            runtime.overlay_epoch_ticket;
+        const bool incomplete_child_authority =
+            (runtime.overlay_placement_banks != nullptr) !=
+            (runtime.overlay_epoch_ticket != nullptr);
+        const bool durable_overlay_requires_atomic_apply =
+            runtime.overlay_epoch_ticket &&
+            !runtime.overlay_placement_banks;
         if (runtime.active_bank > 1u ||
+            execution_bank > 1u ||
+            incomplete_child_authority ||
+            durable_overlay_requires_atomic_apply ||
+            (current_batch_child &&
+             command_header->epoch != runtime_command_epoch(&runtime)) ||
             runtime.expert_count != config.num_experts ||
             runtime.top_k != config.top_k ||
             runtime.participant_id != config.participant_id ||
@@ -10485,7 +12016,8 @@ namespace
             return;
         }
 
-        const auto &active = runtime.banks[runtime.active_bank];
+        const auto &active =
+            runtime_placement_banks(&runtime)[execution_bank];
         uint32_t valid_plan_count = 0u;
         uint32_t ready_plan_count = 0u;
         bool blocked_on_arrival = false;
@@ -10498,7 +12030,11 @@ namespace
                 ++status->plan_entries_seen;
             if (plan.op == 0u || plan.layer != layer)
                 continue;
-            if (!rebalance_plan_applies_runtime(plan.op) ||
+            const bool current_batch_plan =
+                (plan.flags &
+                 kDeviceMoERebalancePlanFlagCurrentBatchLLEP) != 0u;
+            if (current_batch_plan != current_batch_child ||
+                !rebalance_plan_applies_runtime(plan.op) ||
                 plan.expert >= config.num_experts ||
                 plan.source_participant >= config.participant_count ||
                 plan.destination_participant >= config.participant_count ||
@@ -10628,9 +12164,11 @@ namespace
                 command_header->epoch,
                 layer);
 
-        const uint32_t inactive_bank = 1u - runtime.active_bank;
+        const uint32_t inactive_bank = 1u - execution_bank;
         auto &next = runtime.banks[inactive_bank];
-        next.epoch = runtime.active_epoch + 1u;
+        next.epoch = current_batch_child
+                         ? runtime_command_epoch(&runtime)
+                         : runtime.active_epoch + 1u;
         next.expert_count = config.num_experts;
         next.multi_resident_expert_count =
             active.multi_resident_expert_count;
@@ -10639,6 +12177,8 @@ namespace
         for (uint32_t expert = 0; expert < config.num_experts; ++expert)
         {
             next.experts[expert] = active.experts[expert];
+            next.overlay_route_participant[expert] =
+                active.overlay_route_participant[expert];
             auto &base_desc = next.experts[expert];
             uint32_t resident_mask =
                 active.resident_participant_mask[expert] & valid_mask;
@@ -10819,13 +12359,17 @@ namespace
                 ++multi_resident;
             if ((config.flags & kDeviceMoERebalanceFlagResetHistograms) != 0u)
             {
-                runtime.decode_histogram[expert] = 0ULL;
-                runtime.decode_local_histogram[expert] = 0ULL;
+                reset_runtime_histogram_expert(runtime, expert);
             }
         }
         next.multi_resident_expert_count = multi_resident;
+        __threadfence();
         runtime.active_bank = inactive_bank;
         runtime.active_epoch = next.epoch;
+        if (current_batch_child)
+        {
+            runtime.current_batch_llep_transient_bank_active = 1u;
+        }
         if (status)
         {
             status->status_code = 0u;
@@ -10875,6 +12419,7 @@ namespace
         case 16:
         case 17:
         case 19:
+        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -10894,6 +12439,7 @@ namespace
         case 14:
         case 16:
         case 17:
+        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
             return true;
         default:
             return false;
@@ -11690,11 +13236,33 @@ namespace
         float *__restrict__ expert_weights,
         int seq_len, int num_experts, int top_k,
         bool normalize_weights,
-        const int *__restrict__ effective_seq_len_ptr)
+        const int *__restrict__ effective_seq_len_ptr,
+        DeviceMoELayerRuntimeView *__restrict__ deferred_selected_route_ledger)
     {
         const int token = blockIdx.x;
         if (token >= seq_len)
             return;
+
+        const int total_slots = seq_len * top_k;
+        const bool ledger_is_complete =
+            deferred_selected_route_ledger == nullptr ||
+            (deferred_selected_route_ledger
+                 ->deferred_verifier_route_expert_ids != nullptr &&
+             deferred_selected_route_ledger
+                 ->deferred_verifier_route_participant_ids != nullptr &&
+             deferred_selected_route_ledger
+                     ->deferred_verifier_route_capacity >=
+                 static_cast<uint32_t>(total_slots));
+        if (!ledger_is_complete)
+        {
+            if (token == 0 && threadIdx.x == 0)
+            {
+                FAIL_FAST_INVALID_GROUPED_VERIFIER_COMMIT(
+                    "overlay verifier routing requires a complete per-layer "
+                    "deferred selected-route ledger");
+            }
+            return;
+        }
 
         int effective_seq_len = seq_len;
         if (effective_seq_len_ptr)
@@ -11711,6 +13279,13 @@ namespace
                     const size_t out = static_cast<size_t>(token) * top_k + k;
                     expert_indices[out] = -1.0f;
                     expert_weights[out] = 0.0f;
+                    if (deferred_selected_route_ledger)
+                    {
+                        deferred_selected_route_ledger
+                            ->deferred_verifier_route_expert_ids[out] = -1;
+                        deferred_selected_route_ledger
+                            ->deferred_verifier_route_participant_ids[out] = -1;
+                    }
                 }
             }
             for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
@@ -11806,6 +13381,19 @@ namespace
                     normalize_weights && selected_sum > 0.0f
                         ? selected_weights[k] / selected_sum
                         : selected_weights[k];
+                if (deferred_selected_route_ledger)
+                {
+                    /*
+                     * The continuation GPU knows selection but not which
+                     * heterogeneous participant will execute the ticket.
+                     * Retain only global demand; participant-local evidence is
+                     * deliberately absent rather than guessed.
+                     */
+                    deferred_selected_route_ledger
+                        ->deferred_verifier_route_expert_ids[out] = selected[k];
+                    deferred_selected_route_ledger
+                        ->deferred_verifier_route_participant_ids[out] = -1;
+                }
             }
         }
     }
@@ -11938,11 +13526,13 @@ namespace
                     const int expert = selected[k];
                     if (expert < 0 || expert >= kDeviceMoEMaxExperts)
                         continue;
-                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert]),
+                    atomicAdd(reinterpret_cast<unsigned long long *>(
+                                  &runtime_selected_histogram(*runtime, 0u)[expert]),
                               static_cast<unsigned long long>(1));
                     if (shape_ok && local_compute_flags[k])
                     {
-                        atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[expert]),
+                        atomicAdd(reinterpret_cast<unsigned long long *>(
+                                      &runtime_local_histogram(*runtime, 0u)[expert]),
                                   static_cast<unsigned long long>(1));
                     }
                 }
@@ -12005,11 +13595,13 @@ namespace
                 const int expert = expert_indices[k];
                 if (expert < 0 || expert >= kDeviceMoEMaxExperts)
                     continue;
-                atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert]),
+                atomicAdd(reinterpret_cast<unsigned long long *>(
+                              &runtime_selected_histogram(*runtime, 0u)[expert]),
                           static_cast<unsigned long long>(1));
                 if (shape_ok && local_compute_flags[k])
                 {
-                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[expert]),
+                    atomicAdd(reinterpret_cast<unsigned long long *>(
+                                  &runtime_local_histogram(*runtime, 0u)[expert]),
                               static_cast<unsigned long long>(1));
                 }
             }
@@ -12644,28 +14236,60 @@ namespace
         int num_experts,
         DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
         DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
-        DeviceNativeVNNIMatrixDesc *__restrict__ down_descs)
+        DeviceNativeVNNIMatrixDesc *__restrict__ down_descs,
+        llaminar2::DeviceMoEWeightFormat expected_format)
     {
         if (expert >= num_experts)
             return false;
 
         const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
+        const bool descriptor_ready =
+            expected_format == llaminar2::DeviceMoEWeightFormat::NativeVNNI
+                ? rebalance_matrix_desc_ready(desc.gate) &&
+                      rebalance_matrix_desc_ready(desc.up) &&
+                      rebalance_matrix_desc_ready(desc.down)
+                : llaminar2::deviceMoEWeightFormatIsFloating(expected_format) &&
+                      desc.floating_gate.valid() &&
+                      desc.floating_up.valid() &&
+                      desc.floating_down.valid();
         const bool local_ready =
             bank.local_compute_mask[expert] != 0u &&
             (bank.resident_participant_mask[expert] & local_bit) != 0u &&
             desc.local_slot >= 0 &&
-            rebalance_expert_desc_ready(desc);
-        if (local_ready)
+            desc.weight_format == expected_format && descriptor_ready;
+        if (expected_format ==
+            llaminar2::DeviceMoEWeightFormat::NativeVNNI)
         {
-            gate_descs[expert] = desc.gate;
-            up_descs[expert] = desc.up;
-            down_descs[expert] = desc.down;
+            gate_descs[expert] = local_ready
+                                     ? desc.gate
+                                     : DeviceNativeVNNIMatrixDesc{};
+            up_descs[expert] = local_ready
+                                   ? desc.up
+                                   : DeviceNativeVNNIMatrixDesc{};
+            down_descs[expert] = local_ready
+                                     ? desc.down
+                                     : DeviceNativeVNNIMatrixDesc{};
         }
         else
         {
-            gate_descs[expert] = DeviceNativeVNNIMatrixDesc{};
-            up_descs[expert] = DeviceNativeVNNIMatrixDesc{};
-            down_descs[expert] = DeviceNativeVNNIMatrixDesc{};
+            auto *floating_gate_descs =
+                reinterpret_cast<llaminar2::DeviceMoEFloatingMatrixDesc *>(
+                    gate_descs);
+            auto *floating_up_descs =
+                reinterpret_cast<llaminar2::DeviceMoEFloatingMatrixDesc *>(
+                    up_descs);
+            auto *floating_down_descs =
+                reinterpret_cast<llaminar2::DeviceMoEFloatingMatrixDesc *>(
+                    down_descs);
+            floating_gate_descs[expert] = local_ready
+                                              ? desc.floating_gate
+                                              : llaminar2::DeviceMoEFloatingMatrixDesc{};
+            floating_up_descs[expert] = local_ready
+                                            ? desc.floating_up
+                                            : llaminar2::DeviceMoEFloatingMatrixDesc{};
+            floating_down_descs[expert] = local_ready
+                                              ? desc.floating_down
+                                              : llaminar2::DeviceMoEFloatingMatrixDesc{};
         }
         return local_ready;
     }
@@ -12689,12 +14313,17 @@ namespace
         int num_experts,
         int *__restrict__ active_expert_ids,
         int max_active_experts,
+        llaminar2::DeviceMoEWeightFormat expected_format,
         RuntimePrefillPlanPublicationScratch &scratch)
     {
         const bool publish_active_experts = active_expert_ids != nullptr;
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
         if (!runtime || !gate_descs || !up_descs || !down_descs ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
-            runtime->active_bank > 1u ||
+            execution_bank > 1u ||
+            (expected_format !=
+                 llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+             !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)) ||
             (publish_active_experts &&
              (!runtime->expert_counts || max_active_experts <= 0 ||
               max_active_experts > num_experts)))
@@ -12708,7 +14337,8 @@ namespace
         }
 
         const int expert = static_cast<int>(threadIdx.x);
-        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+        const DeviceMoEPlacementBankView &bank =
+            runtime_placement_banks(runtime)[execution_bank];
         const uint32_t local_bit =
             runtime_participant_bit(static_cast<int>(runtime->participant_id));
         const bool local_ready = publish_runtime_expert_descriptors_lane(
@@ -12718,7 +14348,8 @@ namespace
             num_experts,
             gate_descs,
             up_descs,
-            down_descs);
+            down_descs,
+            expected_format);
 
         // Descriptor-only decode publication is complete at this point. This
         // branch is uniform and cannot strand a lane at a collective barrier.
@@ -12744,13 +14375,13 @@ namespace
                 const DeviceMoEExpertDescriptorView &desc =
                     bank.experts[invalid_expert];
                 printf("runtime_prefill_active_expert_not_ready "
-                       "participant=%u expert=%d count=%d active_bank=%u "
+                       "participant=%u expert=%d count=%d execution_bank=%u "
                        "local_mask=%u resident_mask=%u local_bit=%u "
                        "local_slot=%d logical=%d owner=%d\\n",
                        runtime->participant_id,
                        invalid_expert,
                        runtime->expert_counts[invalid_expert],
-                       runtime->active_bank,
+                       execution_bank,
                        bank.local_compute_mask[invalid_expert],
                        bank.resident_participant_mask[invalid_expert],
                        local_bit,
@@ -13034,16 +14665,18 @@ namespace
         int expert_id,
         int num_experts)
     {
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
         if (!runtime ||
             expert_id < 0 ||
             expert_id >= num_experts ||
             expert_id >= kDeviceMoEMaxExperts ||
-            runtime->active_bank > 1u)
+            execution_bank > 1u)
         {
             return false;
         }
 
-        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+        const DeviceMoEPlacementBankView &bank =
+            runtime_placement_banks(runtime)[execution_bank];
         const DeviceMoEExpertDescriptorView &desc = bank.experts[expert_id];
         const uint32_t local_bit =
             runtime_participant_bit(static_cast<int>(runtime->participant_id));
@@ -13227,7 +14860,8 @@ namespace
         DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         DeviceNativeVNNIMatrixDesc *__restrict__ down_descs,
         int *__restrict__ active_expert_ids,
-        int max_active_experts)
+        int max_active_experts,
+        llaminar2::DeviceMoEWeightFormat expected_format)
     {
         __shared__ int shared_route_experts[kDeviceMoERuntimeSmallGroupMaxSlots];
         __shared__ int shared_route_participants[kDeviceMoERuntimeSmallGroupMaxSlots];
@@ -13236,6 +14870,7 @@ namespace
         __shared__ RuntimeSmallGroupScanScratch scan_scratch;
 
         const int tid = static_cast<int>(threadIdx.x);
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
         const bool invalid_contract =
             !runtime || !original_to_grouped ||
             blockDim.x != kThreads ||
@@ -13244,7 +14879,7 @@ namespace
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
             top_k <= 0 || top_k > kMaxTopK ||
             (PublishRouterInputs && (!routing_indices || !routing_weights)) ||
-            runtime->active_bank > 1u ||
+            execution_bank > 1u ||
             runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots) ||
             !runtime->route_expert_ids || !runtime->route_weights ||
             !runtime->route_participant_ids || !runtime->expert_counts ||
@@ -13253,7 +14888,11 @@ namespace
             (PublishCompletePlan &&
              (!gate_descs || !up_descs || !down_descs ||
               !active_expert_ids || max_active_experts <= 0 ||
-              max_active_experts > num_experts)) ||
+              max_active_experts > num_experts ||
+              (expected_format !=
+                   llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+               !llaminar2::deviceMoEWeightFormatIsFloating(
+                   expected_format)))) ||
             (retain_routes_for_deferred_commit != 0 &&
              (!runtime->deferred_verifier_route_expert_ids ||
               !runtime->deferred_verifier_route_participant_ids ||
@@ -13344,6 +14983,39 @@ namespace
         }
         __syncthreads();
 
+        /*
+         * Only a complete ordinary-prefill plan is a serial-visible demand
+         * publication boundary.  Route-only grouping may be followed by LLEP
+         * participant assignment, while grouped verification must wait for
+         * the accepted-prefix commit.  Folding the counter update into this
+         * already-required small-plan kernel keeps that distinction exact
+         * without adding a graph node.
+         */
+        if constexpr (PublishCompletePlan)
+        {
+            if (retain_routes_for_deferred_commit == 0 &&
+                tid < current_slots)
+            {
+                const int expert_id = shared_route_experts[tid];
+                const int participant_id = shared_route_participants[tid];
+                if (expert_id >= 0 && expert_id < num_experts)
+                {
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long *>(
+                            &runtime_selected_histogram(*runtime, 1u)[expert_id]),
+                        1ULL);
+                    if (participant_id ==
+                        static_cast<int>(runtime->participant_id))
+                    {
+                        atomicAdd(
+                            reinterpret_cast<unsigned long long *>(
+                                &runtime_local_histogram(*runtime, 1u)[expert_id]),
+                            1ULL);
+                    }
+                }
+            }
+        }
+
         const int local_participant = static_cast<int>(runtime->participant_id);
         int count = 0;
         if (tid < num_experts)
@@ -13381,19 +15053,31 @@ namespace
             if constexpr (PublishCompletePlan)
             {
                 const DeviceMoEPlacementBankView &bank =
-                    runtime->banks[runtime->active_bank];
+                    runtime_placement_banks(runtime)[execution_bank];
                 const uint32_t local_bit =
                     runtime_participant_bit(local_participant);
-                const bool local_ready =
-                    publish_runtime_expert_descriptors_lane(
+                const bool is_active = count > 0;
+
+                /*
+                 * The compact plan makes only active experts reachable. Avoid
+                 * rewriting three 56-byte descriptors for every inactive
+                 * expert on each verifier step; active lanes still publish
+                 * exact bytes from the selected immutable placement bank.
+                 */
+                bool local_ready = true;
+                if (is_active)
+                {
+                    local_ready = publish_runtime_expert_descriptors_lane(
                         bank,
                         local_bit,
                         tid,
                         num_experts,
                         gate_descs,
                         up_descs,
-                        down_descs);
-                if (count > 0)
+                        down_descs,
+                        expected_format);
+                }
+                if (is_active)
                 {
                     if (active_rank < max_active_experts)
                         active_expert_ids[active_rank] = tid;
@@ -13431,19 +15115,19 @@ namespace
                     const int invalid_expert =
                         scan_scratch.first_invalid_expert;
                     const DeviceMoEPlacementBankView &bank =
-                        runtime->banks[runtime->active_bank];
+                        runtime_placement_banks(runtime)[execution_bank];
                     const DeviceMoEExpertDescriptorView &desc =
                         bank.experts[invalid_expert];
                     const uint32_t local_bit =
                         runtime_participant_bit(local_participant);
                     printf("runtime_prefill_active_expert_not_ready "
-                           "participant=%u expert=%d count=%d active_bank=%u "
+                           "participant=%u expert=%d count=%d execution_bank=%u "
                            "local_mask=%u resident_mask=%u local_bit=%u "
                            "local_slot=%d logical=%d owner=%d\\n",
                            runtime->participant_id,
                            invalid_expert,
                            runtime->expert_counts[invalid_expert],
-                           runtime->active_bank,
+                           execution_bank,
                            bank.local_compute_mask[invalid_expert],
                            bank.resident_participant_mask[invalid_expert],
                            local_bit,
@@ -13709,14 +15393,14 @@ namespace
 
         atomicAdd(
             reinterpret_cast<unsigned long long *>(
-                &runtime->decode_histogram[expert_id]),
+                &runtime_selected_histogram(*runtime, 2u)[expert_id]),
             1ULL);
         if (runtime->deferred_verifier_route_participant_ids[slot] ==
             static_cast<int>(runtime->participant_id))
         {
             atomicAdd(
                 reinterpret_cast<unsigned long long *>(
-                    &runtime->decode_local_histogram[expert_id]),
+                    &runtime_local_histogram(*runtime, 2u)[expert_id]),
                 1ULL);
         }
     }
@@ -13912,12 +15596,13 @@ namespace
             runtime->reserved_u64[3] = 0ULL;
         }
 
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
         const bool runtime_valid =
             runtime->route_expert_ids &&
             runtime->route_participant_ids &&
             absolute_position_ids &&
             active_row_count &&
-            runtime->active_bank <= 1u &&
+            execution_bank <= 1u &&
             runtime->participant_count > 0u &&
             runtime->participant_count <= kDeviceMoEMaxParticipants &&
             current_slots >= 0 &&
@@ -13950,7 +15635,7 @@ namespace
 
         const uint32_t participant_count = runtime->participant_count;
         const DeviceMoEPlacementBankView &bank =
-            runtime->banks[runtime->active_bank];
+            runtime_placement_banks(runtime)[execution_bank];
         const int row_slot_base = row * top_k;
         int participant_load[kDeviceMoEMaxParticipants] = {};
 
@@ -14155,8 +15840,8 @@ namespace
         uint32_t lambda_denominator,
         uint64_t min_spread_improvement,
         uint32_t min_spread_improvement_divisor,
-        uint64_t min_spread_improvement_per_transfer,
-        uint64_t min_foreign_rows_per_transfer,
+        uint64_t min_spread_improvement_per_critical_path_slot,
+        uint64_t min_foreign_rows_per_critical_path_slot,
         uint32_t max_weight_transfers,
         uint32_t max_non_owner_experts_per_participant,
         int enable_balanced_skip)
@@ -14171,6 +15856,7 @@ namespace
         if (!runtime)
             return;
 
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
         const int lane = threadIdx.x;
         if (lane == 0)
         {
@@ -14178,7 +15864,7 @@ namespace
             runtime->reserved_u64[3] = 0ULL;
         }
 
-        if (runtime->active_bank > 1u ||
+        if (execution_bank > 1u ||
             runtime->participant_count == 0u ||
             runtime->participant_count > kDeviceMoEMaxParticipants ||
             current_slots < 0 ||
@@ -14195,7 +15881,8 @@ namespace
         }
 
         const uint32_t participant_count = runtime->participant_count;
-        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+        const DeviceMoEPlacementBankView &bank =
+            runtime_placement_banks(runtime)[execution_bank];
 
         if (lane < kDeviceMoEMaxParticipants)
         {
@@ -14247,8 +15934,10 @@ namespace
         config.lambda_denominator = lambda_denominator;
         config.min_spread_improvement = min_spread_improvement;
         config.min_spread_improvement_divisor = min_spread_improvement_divisor;
-        config.min_spread_improvement_per_transfer = min_spread_improvement_per_transfer;
-        config.min_foreign_rows_per_transfer = min_foreign_rows_per_transfer;
+        config.min_spread_improvement_per_critical_path_slot =
+            min_spread_improvement_per_critical_path_slot;
+        config.min_foreign_rows_per_critical_path_slot =
+            min_foreign_rows_per_critical_path_slot;
         config.max_weight_transfers = max_weight_transfers;
         config.max_non_owner_experts_per_participant =
             max_non_owner_experts_per_participant;
@@ -14304,8 +15993,9 @@ namespace
         const DeviceMoELayerRuntimeView *__restrict__ runtime,
         int expert)
     {
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
         if (!runtime ||
-            runtime->active_bank > 1u ||
+            execution_bank > 1u ||
             runtime->participant_count == 0u ||
             runtime->participant_count > kDeviceMoEMaxParticipants ||
             expert < 0 ||
@@ -14313,7 +16003,8 @@ namespace
         {
             return -1;
         }
-        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+        const DeviceMoEPlacementBankView &bank =
+            runtime_placement_banks(runtime)[execution_bank];
         const int owner = bank.experts[expert].owner_participant;
         return (owner >= 0 && static_cast<uint32_t>(owner) < runtime->participant_count)
                    ? owner
@@ -14428,6 +16119,16 @@ namespace
         const int expert = blockIdx.x;
         if (!runtime || expert >= num_experts)
             return;
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
+        if (execution_bank > 1u)
+        {
+            if (expert == 0 && threadIdx.x == 0)
+            {
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "current-batch LLEP assignment has no valid execution epoch");
+            }
+            return;
+        }
         if (!runtime->route_expert_ids || !runtime->route_participant_ids ||
             !runtime->expert_counts || !runtime->expert_offsets ||
             !runtime->grouped_token_ids || !runtime->reserved_ptrs[1])
@@ -14465,9 +16166,9 @@ namespace
                     int32_t duplicate_slot = -1;
                     int32_t duplicate_first_expert = -1;
                     int32_t duplicate_second_expert = -1;
-                    if (runtime->active_bank <= 1u)
+                    if (execution_bank <= 1u)
                     {
-                        const auto &bank = runtime->banks[runtime->active_bank];
+                        const auto &bank = runtime_placement_banks(runtime)[execution_bank];
                         const uint32_t local_bit =
                             runtime_participant_bit(
                                 static_cast<int>(runtime->participant_id));
@@ -14611,7 +16312,8 @@ namespace
                 prefill_llep_default_owner_participant(runtime, expert);
             if (assigned_participant < 0)
                 return;
-            const DeviceMoEPlacementBankView &active_bank = runtime->banks[runtime->active_bank];
+            const DeviceMoEPlacementBankView &active_bank =
+                runtime_placement_banks(runtime)[execution_bank];
 
             for (int row = threadIdx.x; row < expert_count; row += blockDim.x)
             {
@@ -14645,7 +16347,8 @@ namespace
                     prefill_llep_default_owner_participant(runtime, expert);
                 if (assigned_participant < 0)
                     return;
-                const DeviceMoEPlacementBankView &active_bank = runtime->banks[runtime->active_bank];
+                const DeviceMoEPlacementBankView &active_bank =
+                    runtime_placement_banks(runtime)[execution_bank];
 
                 for (int row = threadIdx.x; row < expert_count; row += blockDim.x)
                 {
@@ -14693,7 +16396,8 @@ namespace
                 if (assigned_participant < 0)
                     continue;
             }
-            const DeviceMoEPlacementBankView &active_bank = runtime->banks[runtime->active_bank];
+            const DeviceMoEPlacementBankView &active_bank =
+                runtime_placement_banks(runtime)[execution_bank];
             if (!prefill_llep_assignment_ready(
                     runtime, active_bank, expert, row, assigned_participant))
             {
@@ -14722,13 +16426,16 @@ namespace
      * compact descriptor tables; grouped prefill uses the fused publication.
      */
     __global__ void materialize_runtime_prefill_descriptor_tables_kernel(
-        const DeviceMoELayerRuntimeView *__restrict__ runtime,
+        DeviceMoELayerRuntimeView *__restrict__ runtime,
         DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
         DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         DeviceNativeVNNIMatrixDesc *__restrict__ down_descs,
         int num_experts,
         int *__restrict__ active_expert_ids,
-        int max_active_experts)
+        int max_active_experts,
+        int current_slots,
+        int publish_prefill_histogram,
+        llaminar2::DeviceMoEWeightFormat expected_format)
     {
         __shared__ RuntimePrefillPlanPublicationScratch scratch;
         publish_runtime_prefill_plan_block(
@@ -14739,7 +16446,100 @@ namespace
             num_experts,
             active_expert_ids,
             max_active_experts,
+            expected_format,
             scratch);
+
+        /*
+         * Scalable grouping needs a separate descriptor-publication kernel
+         * already.  Count final assigned routes here so route-only grouping
+         * remains side-effect free and ordinary prefill adds no launch.
+         */
+        if (publish_prefill_histogram != 0)
+        {
+            for (int slot = threadIdx.x;
+                 slot < current_slots;
+                 slot += static_cast<int>(blockDim.x))
+            {
+                const int expert_id = runtime->route_expert_ids[slot];
+                const int participant_id =
+                    runtime->route_participant_ids[slot];
+                if (expert_id < 0 || expert_id >= num_experts)
+                    continue;
+                atomicAdd(
+                    reinterpret_cast<unsigned long long *>(
+                        &runtime_selected_histogram(*runtime, 1u)[expert_id]),
+                    1ULL);
+                if (participant_id ==
+                    static_cast<int>(runtime->participant_id))
+                {
+                    atomicAdd(
+                        reinterpret_cast<unsigned long long *>(
+                            &runtime_local_histogram(*runtime, 1u)[expert_id]),
+                        1ULL);
+                }
+            }
+        }
+    }
+
+    /**
+     * @brief Publish one uniform floating descriptor family from the active bank.
+     *
+     * The destination lives in the same graph-stable descriptor workspace used
+     * by NativeVNNI. Floating descriptors are smaller, so selecting this typed
+     * view changes neither arena capacity nor captured pointer identity. Every
+     * lane overwrites its expert entry, including explicit zeros for remote
+     * experts, before the following grouped projection consumes the table.
+     */
+    __global__ void materialize_runtime_floating_descriptor_tables_kernel(
+        const DeviceMoELayerRuntimeView *__restrict__ runtime,
+        llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ gate_descs,
+        llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ up_descs,
+        llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ down_descs,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat expected_format)
+    {
+        const int expert = static_cast<int>(threadIdx.x);
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
+        if (!runtime || !gate_descs || !up_descs || !down_descs ||
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+            execution_bank > 1u ||
+            !llaminar2::deviceMoEWeightFormatIsFloating(expected_format))
+        {
+            if (expert == 0)
+            {
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "floating runtime descriptor publication has an invalid contract");
+            }
+            return;
+        }
+        if (expert >= num_experts)
+            return;
+
+        const DeviceMoEPlacementBankView &bank =
+            runtime_placement_banks(runtime)[execution_bank];
+        const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
+        const uint32_t local_bit =
+            runtime_participant_bit(static_cast<int>(runtime->participant_id));
+        const bool local_ready =
+            bank.local_compute_mask[expert] != 0u &&
+            (bank.resident_participant_mask[expert] & local_bit) != 0u &&
+            desc.local_slot >= 0 &&
+            desc.weight_format == expected_format &&
+            desc.floating_gate.valid() &&
+            desc.floating_up.valid() &&
+            desc.floating_down.valid();
+        if (local_ready)
+        {
+            gate_descs[expert] = desc.floating_gate;
+            up_descs[expert] = desc.floating_up;
+            down_descs[expert] = desc.floating_down;
+        }
+        else
+        {
+            gate_descs[expert] = llaminar2::DeviceMoEFloatingMatrixDesc{};
+            up_descs[expert] = llaminar2::DeviceMoEFloatingMatrixDesc{};
+            down_descs[expert] = llaminar2::DeviceMoEFloatingMatrixDesc{};
+        }
     }
 
     __global__ void prefill_gather_expert_runtime_kernel(
@@ -16203,6 +18003,10 @@ namespace
             return native_vnni_dot_desc_range<17>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 19:
             return native_vnni_dot_desc_range<19>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case llaminar2::kNativeVnniExpandedInt8MinCodebook:
+            return native_vnni_dot_desc_range<
+                llaminar2::kNativeVnniExpandedInt8MinCodebook>(
+                desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         default:
             return 0.0f;
         }
@@ -16901,6 +18705,408 @@ namespace
             static_cast<size_t>(n)] = sum;
     }
 
+    /** @brief Load one contiguous expert weight using the published format tag. */
+    __device__ __forceinline__ float load_floating_moe_weight(
+        const void *__restrict__ data,
+        size_t index,
+        llaminar2::DeviceMoEWeightFormat format)
+    {
+        if (format == llaminar2::DeviceMoEWeightFormat::FP32)
+            return static_cast<const float *>(data)[index];
+        if (format == llaminar2::DeviceMoEWeightFormat::BF16)
+        {
+            return __bfloat162float(
+                static_cast<const __nv_bfloat16 *>(data)[index]);
+        }
+        return __half2float(static_cast<const __half *>(data)[index]);
+    }
+
+    /**
+     * @brief Fixed-tree gate/up decode for a device-selected floating expert.
+     *
+     * One block owns one `(route, output-column)` pair. All weight formats
+     * convert inside the same strided K loop and reduce through the same
+     * 256-thread tree, so M=1 decode and grouped verifier rows have an
+     * identical arithmetic schedule independent of BLAS heuristics.
+     */
+    __global__ __launch_bounds__(kThreads)
+    void grouped_floating_gate_up_decode_kernel(
+        const float *__restrict__ hidden,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ gate_descs,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ up_descs,
+        const int *__restrict__ expert_ids,
+        float *const *__restrict__ gate_outputs,
+        float *const *__restrict__ up_outputs,
+        int num_active,
+        int intermediate,
+        int d_model,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format)
+    {
+        __shared__ float gate_sums[kThreads];
+        __shared__ float up_sums[kThreads];
+        const int n = static_cast<int>(blockIdx.x);
+        const int route = logical_row_from_grid_yz();
+        if (route >= num_active || n >= intermediate)
+            return;
+
+        const int expert = expert_ids[route];
+        const bool valid = expert >= 0 && expert < num_experts &&
+                           gate_outputs[route] && up_outputs[route];
+        llaminar2::DeviceMoEFloatingMatrixDesc gate{};
+        llaminar2::DeviceMoEFloatingMatrixDesc up{};
+        if (valid)
+        {
+            gate = gate_descs[expert];
+            up = up_descs[expert];
+        }
+        const bool ready = valid && gate.data && up.data &&
+                           gate.n == intermediate && gate.k == d_model &&
+                           up.n == intermediate && up.k == d_model;
+
+        float gate_sum = 0.0f;
+        float up_sum = 0.0f;
+        if (ready)
+        {
+            const size_t weight_base =
+                static_cast<size_t>(n) * static_cast<size_t>(d_model);
+            for (int k = static_cast<int>(threadIdx.x);
+                 k < d_model;
+                 k += kThreads)
+            {
+                const float activation = hidden[k];
+                gate_sum = fmaf(
+                    activation,
+                    load_floating_moe_weight(
+                        gate.data, weight_base + static_cast<size_t>(k), format),
+                    gate_sum);
+                up_sum = fmaf(
+                    activation,
+                    load_floating_moe_weight(
+                        up.data, weight_base + static_cast<size_t>(k), format),
+                    up_sum);
+            }
+        }
+        gate_sums[threadIdx.x] = gate_sum;
+        up_sums[threadIdx.x] = up_sum;
+        __syncthreads();
+        for (int stride = kThreads / 2; stride > 0; stride >>= 1)
+        {
+            if (static_cast<int>(threadIdx.x) < stride)
+            {
+                gate_sums[threadIdx.x] = moe_accumulate_rn(
+                    gate_sums[threadIdx.x], gate_sums[threadIdx.x + stride]);
+                up_sums[threadIdx.x] = moe_accumulate_rn(
+                    up_sums[threadIdx.x], up_sums[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0 && valid)
+        {
+            gate_outputs[route][n] = ready ? gate_sums[0] : 0.0f;
+            up_outputs[route][n] = ready ? up_sums[0] : 0.0f;
+        }
+    }
+
+    /**
+     * @brief Fixed-tree floating SwiGLU/down decode with canonical route order.
+     *
+     * Direct output uses one block per output column and visits routes in
+     * router order. Canonical publication uses one block per route/column and
+     * writes the already-rounded weighted contribution. Both forms therefore
+     * share the same per-route dot tree and explicit weighting boundary.
+     */
+    __global__ __launch_bounds__(kThreads)
+    void grouped_floating_swiglu_down_decode_kernel(
+        const float *const *__restrict__ gate_rows,
+        const float *const *__restrict__ up_rows,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ down_descs,
+        const int *__restrict__ expert_ids,
+        const float *__restrict__ route_weights,
+        float *__restrict__ output,
+        float *__restrict__ canonical_routes,
+        int num_active,
+        int d_model,
+        int intermediate,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format)
+    {
+        __shared__ float sums[kThreads];
+        const int n = static_cast<int>(blockIdx.x);
+        const int publication_row = logical_row_from_grid_yz();
+        const bool canonical = canonical_routes != nullptr;
+        if (n >= d_model || (canonical && publication_row >= num_active))
+            return;
+
+        const int route_begin = canonical ? publication_row : 0;
+        const int route_end = canonical ? publication_row + 1 : num_active;
+        float output_sum = 0.0f;
+        for (int route = route_begin; route < route_end; ++route)
+        {
+            const int expert = expert_ids[route];
+            const bool valid = expert >= 0 && expert < num_experts &&
+                               gate_rows[route] && up_rows[route];
+            llaminar2::DeviceMoEFloatingMatrixDesc down{};
+            if (valid)
+                down = down_descs[expert];
+            const bool ready = valid && down.data &&
+                               down.n == d_model && down.k == intermediate;
+            float sum = 0.0f;
+            if (ready)
+            {
+                const size_t weight_base =
+                    static_cast<size_t>(n) * static_cast<size_t>(intermediate);
+                for (int k = static_cast<int>(threadIdx.x);
+                     k < intermediate;
+                     k += kThreads)
+                {
+                    const float gate = gate_rows[route][k];
+                    const float up = up_rows[route][k];
+                    const float swiglu =
+                        (gate / (1.0f + expf(-gate))) * up;
+                    sum = fmaf(
+                        swiglu,
+                        load_floating_moe_weight(
+                            down.data,
+                            weight_base + static_cast<size_t>(k),
+                            format),
+                        sum);
+                }
+            }
+            sums[threadIdx.x] = sum;
+            __syncthreads();
+            for (int stride = kThreads / 2; stride > 0; stride >>= 1)
+            {
+                if (static_cast<int>(threadIdx.x) < stride)
+                {
+                    sums[threadIdx.x] = moe_accumulate_rn(
+                        sums[threadIdx.x], sums[threadIdx.x + stride]);
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0)
+            {
+                output_sum = moe_accumulate_rn(
+                    output_sum,
+                    ready ? moe_weight_route_rn(route_weights[route], sums[0])
+                          : 0.0f);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0)
+        {
+            if (canonical)
+            {
+                canonical_routes[
+                    static_cast<size_t>(publication_row) *
+                        static_cast<size_t>(d_model) +
+                    static_cast<size_t>(n)] = output_sum;
+            }
+            else
+            {
+                output[n] = output_sum;
+            }
+        }
+    }
+
+    /** @brief Project all locally grouped prefill routes with floating weights. */
+    __global__ __launch_bounds__(kThreads)
+    void grouped_floating_gate_up_prefill_kernel(
+        const float *__restrict__ hidden,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ gate_descs,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ up_descs,
+        const int *__restrict__ original_to_grouped,
+        const int *__restrict__ original_expert_ids,
+        float *__restrict__ grouped_gate,
+        float *__restrict__ grouped_up,
+        int total_slots,
+        int top_k,
+        int intermediate,
+        int d_model,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format)
+    {
+        __shared__ float gate_sums[kThreads];
+        __shared__ float up_sums[kThreads];
+        const int n = static_cast<int>(blockIdx.x);
+        const int original_slot = logical_row_from_grid_yz();
+        if (original_slot >= total_slots || n >= intermediate)
+            return;
+        const int grouped_slot = original_to_grouped[original_slot];
+        const int expert = original_expert_ids
+                               ? original_expert_ids[original_slot]
+                               : 0;
+        if (grouped_slot < 0 || expert < 0 || expert >= num_experts)
+            return;
+
+        const auto gate = gate_descs[expert];
+        const auto up = up_descs[expert];
+        const bool ready = gate.data && up.data &&
+                           gate.n == intermediate && gate.k == d_model &&
+                           up.n == intermediate && up.k == d_model;
+        float gate_sum = 0.0f;
+        float up_sum = 0.0f;
+        if (ready)
+        {
+            const int token = original_slot / top_k;
+            const float *row = hidden +
+                static_cast<size_t>(token) * static_cast<size_t>(d_model);
+            const size_t weight_base =
+                static_cast<size_t>(n) * static_cast<size_t>(d_model);
+            for (int k = static_cast<int>(threadIdx.x);
+                 k < d_model;
+                 k += kThreads)
+            {
+                const float activation = row[k];
+                gate_sum = fmaf(
+                    activation,
+                    load_floating_moe_weight(
+                        gate.data, weight_base + static_cast<size_t>(k), format),
+                    gate_sum);
+                up_sum = fmaf(
+                    activation,
+                    load_floating_moe_weight(
+                        up.data, weight_base + static_cast<size_t>(k), format),
+                    up_sum);
+            }
+        }
+        gate_sums[threadIdx.x] = gate_sum;
+        up_sums[threadIdx.x] = up_sum;
+        __syncthreads();
+        for (int stride = kThreads / 2; stride > 0; stride >>= 1)
+        {
+            if (static_cast<int>(threadIdx.x) < stride)
+            {
+                gate_sums[threadIdx.x] = moe_accumulate_rn(
+                    gate_sums[threadIdx.x], gate_sums[threadIdx.x + stride]);
+                up_sums[threadIdx.x] = moe_accumulate_rn(
+                    up_sums[threadIdx.x], up_sums[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0)
+        {
+            const size_t index =
+                static_cast<size_t>(grouped_slot) *
+                    static_cast<size_t>(intermediate) +
+                static_cast<size_t>(n);
+            grouped_gate[index] = ready ? gate_sums[0] : 0.0f;
+            grouped_up[index] = ready ? up_sums[0] : 0.0f;
+        }
+    }
+
+    /** @brief Down-project grouped floating rows and publish canonical order. */
+    __global__ __launch_bounds__(kThreads)
+    void grouped_floating_swiglu_down_prefill_kernel(
+        const float *__restrict__ grouped_gate,
+        const float *__restrict__ grouped_up,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ down_descs,
+        const int *__restrict__ original_to_grouped,
+        const int *__restrict__ original_expert_ids,
+        const float *__restrict__ grouped_weights,
+        float *__restrict__ output,
+        float *__restrict__ canonical_routes,
+        int seq_len,
+        int total_slots,
+        int top_k,
+        int d_model,
+        int intermediate,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format)
+    {
+        __shared__ float sums[kThreads];
+        const int n = static_cast<int>(blockIdx.x);
+        const int publication_row = logical_row_from_grid_yz();
+        const bool canonical = canonical_routes != nullptr;
+        if (n >= d_model ||
+            (canonical ? publication_row >= total_slots
+                       : publication_row >= seq_len))
+        {
+            return;
+        }
+
+        const int route_begin = canonical
+                                    ? publication_row
+                                    : publication_row * top_k;
+        const int route_end = canonical
+                                  ? publication_row + 1
+                                  : route_begin + top_k;
+        float output_sum = 0.0f;
+        for (int original_slot = route_begin;
+             original_slot < route_end;
+             ++original_slot)
+        {
+            const int grouped_slot = original_to_grouped[original_slot];
+            const int expert = original_expert_ids
+                                   ? original_expert_ids[original_slot]
+                                   : 0;
+            const bool valid = grouped_slot >= 0 &&
+                               expert >= 0 && expert < num_experts;
+            llaminar2::DeviceMoEFloatingMatrixDesc down{};
+            if (valid)
+                down = down_descs[expert];
+            const bool ready = valid && down.data &&
+                               down.n == d_model && down.k == intermediate;
+            float sum = 0.0f;
+            if (ready)
+            {
+                const size_t row_base =
+                    static_cast<size_t>(grouped_slot) *
+                    static_cast<size_t>(intermediate);
+                const size_t weight_base =
+                    static_cast<size_t>(n) *
+                    static_cast<size_t>(intermediate);
+                for (int k = static_cast<int>(threadIdx.x);
+                     k < intermediate;
+                     k += kThreads)
+                {
+                    const float gate = grouped_gate[row_base + k];
+                    const float up = grouped_up[row_base + k];
+                    const float swiglu =
+                        (gate / (1.0f + expf(-gate))) * up;
+                    sum = fmaf(
+                        swiglu,
+                        load_floating_moe_weight(
+                            down.data,
+                            weight_base + static_cast<size_t>(k),
+                            format),
+                        sum);
+                }
+            }
+            sums[threadIdx.x] = sum;
+            __syncthreads();
+            for (int stride = kThreads / 2; stride > 0; stride >>= 1)
+            {
+                if (static_cast<int>(threadIdx.x) < stride)
+                {
+                    sums[threadIdx.x] = moe_accumulate_rn(
+                        sums[threadIdx.x], sums[threadIdx.x + stride]);
+                }
+                __syncthreads();
+            }
+            if (threadIdx.x == 0)
+            {
+                const float weighted = ready
+                    ? moe_weight_route_rn(
+                          grouped_weights[grouped_slot], sums[0])
+                    : 0.0f;
+                output_sum = moe_accumulate_rn(output_sum, weighted);
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0)
+        {
+            const size_t index =
+                static_cast<size_t>(publication_row) *
+                    static_cast<size_t>(d_model) +
+                static_cast<size_t>(n);
+            if (canonical)
+                canonical_routes[index] = output_sum;
+            else
+                output[index] = output_sum;
+        }
+    }
+
     /**
      * @brief Publish one shared partial into a rank-addressed canonical bank.
      *
@@ -17240,6 +19446,14 @@ namespace
             return;
         }
 
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
+        if (execution_bank > 1u)
+        {
+            gate_partials[partial_index] = 0.0f;
+            up_partials[partial_index] = 0.0f;
+            return;
+        }
+
         const int blocks_per_row = K / 32;
         const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
         const int b_start = k_part * blocks_per_part;
@@ -17253,7 +19467,8 @@ namespace
             return;
         }
 
-        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+        const DeviceMoEPlacementBankView &bank =
+            runtime_placement_banks(runtime)[execution_bank];
         const DeviceNativeVNNIMatrixDesc gate_desc = bank.experts[expert_id].gate;
         const DeviceNativeVNNIMatrixDesc up_desc = bank.experts[expert_id].up;
         gate_partials[partial_index] = native_vnni_dot_desc_range_dispatch<CodebookId>(
@@ -17309,8 +19524,15 @@ namespace
             return;
         }
 
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
+        if (execution_bank > 1u)
+        {
+            partials[partial_index] = 0.0f;
+            return;
+        }
+
         const DeviceMoEPlacementBankView &bank =
-            runtime->banks[runtime->active_bank];
+            runtime_placement_banks(runtime)[execution_bank];
         const DeviceNativeVNNIMatrixDesc desc = bank.experts[expert_id].down;
         const int8_t *route_A =
             A_int8 + static_cast<size_t>(route) * static_cast<size_t>(K);
@@ -17594,6 +19816,8 @@ extern "C"
                 QUERY_GROUPED_PREFILL_CODEBOOK(16);
                 QUERY_GROUPED_PREFILL_CODEBOOK(17);
                 QUERY_GROUPED_PREFILL_CODEBOOK(19);
+                QUERY_GROUPED_PREFILL_CODEBOOK(
+                    llaminar2::kNativeVnniExpandedInt8MinCodebook);
             case kMixedCodebookSentinel:
                 if (component == 1 || component == 2)
                 {
@@ -18023,14 +20247,17 @@ extern "C"
     bool cudaMoE_softmax_topk(float *logits, float *expert_indices, float *expert_weights,
                               int seq_len, int num_experts, int top_k, bool normalize_weights,
                               int device_idx, void *stream,
-                              const int *device_effective_seq_len)
+                              const int *device_effective_seq_len,
+                              void *deferred_selected_route_ledger)
     {
         if (num_experts > kMaxExperts || top_k > kMaxTopK)
             return false;
         cudaSetDevice(device_idx);
         softmax_topk_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             logits, expert_indices, expert_weights, seq_len, num_experts, top_k,
-            normalize_weights, device_effective_seq_len);
+            normalize_weights, device_effective_seq_len,
+            static_cast<DeviceMoELayerRuntimeView *>(
+                deferred_selected_route_ledger));
         return finishLaunch("cudaMoE_softmax_topk");
     }
 
@@ -18375,6 +20602,7 @@ extern "C"
         void *runtime_layers,
         const void *local_transfer_slots,
         uint32_t local_transfer_slot_count,
+        void *transfer_slot_claim_index,
         int device_idx,
         void *stream)
     {
@@ -18385,6 +20613,7 @@ extern "C"
             !config ||
             !runtime_layers ||
             !local_transfer_slots ||
+            !transfer_slot_claim_index ||
             !stream ||
             plan_capacity == 0u ||
             local_transfer_slot_count == 0u)
@@ -18393,6 +20622,16 @@ extern "C"
         }
         cudaSetDevice(device_idx);
         const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        build_transfer_slot_claim_index_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const DeviceMoELayerRuntimeView *>(runtime_layers),
+            static_cast<const DeviceMoEExpertDirectoryEntryView *>(
+                local_transfer_slots),
+            local_transfer_slot_count,
+            cfg,
+            static_cast<DeviceMoETransferSlotClaimIndexView *>(
+                transfer_slot_claim_index));
+        if (!finishLaunch("cudaMoE_build_transfer_slot_claim_index"))
+            return false;
         project_rebalance_domain_commands_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             static_cast<const DeviceMoERebalancePlanEntryView *>(gathered_plan_entries),
             static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(gathered_command_headers),
@@ -18407,7 +20646,9 @@ extern "C"
             static_cast<DeviceMoERebalanceWaveStateView *>(local_wave_states),
             static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
             static_cast<const DeviceMoEExpertDirectoryEntryView *>(local_transfer_slots),
-            local_transfer_slot_count);
+            local_transfer_slot_count,
+            static_cast<const DeviceMoETransferSlotClaimIndexView *>(
+                transfer_slot_claim_index));
         return finishLaunch("cudaMoE_project_rebalance_domain_commands");
     }
 
@@ -18425,17 +20666,29 @@ extern "C"
         void *runtime_layers,
         const void *local_transfer_slots,
         uint32_t local_transfer_slot_count,
+        void *transfer_slot_claim_index,
         int device_idx,
         void *stream)
     {
         if (!gathered_plan_entries || !gathered_command_headers ||
             !local_plan_entries || !local_plan_count || !local_command_header ||
             !config || !status || !runtime_layers || !local_transfer_slots ||
+            !transfer_slot_claim_index ||
             !stream || plan_capacity == 0u || payload_slot_capacity == 0u ||
             local_transfer_slot_count == 0u)
             return false;
         cudaSetDevice(device_idx);
         const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        build_transfer_slot_claim_index_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const DeviceMoELayerRuntimeView *>(runtime_layers),
+            static_cast<const DeviceMoEExpertDirectoryEntryView *>(
+                local_transfer_slots),
+            local_transfer_slot_count,
+            cfg,
+            static_cast<DeviceMoETransferSlotClaimIndexView *>(
+                transfer_slot_claim_index));
+        if (!finishLaunch("cudaMoE_build_prefill_transfer_slot_claim_index"))
+            return false;
         project_prefill_llep_domain_commands_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             static_cast<const DeviceMoERebalancePlanEntryView *>(gathered_plan_entries),
             static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(gathered_command_headers),
@@ -18450,7 +20703,9 @@ extern "C"
             static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
             static_cast<const DeviceMoEExpertDirectoryEntryView *>(
                 local_transfer_slots),
-            local_transfer_slot_count);
+            local_transfer_slot_count,
+            static_cast<const DeviceMoETransferSlotClaimIndexView *>(
+                transfer_slot_claim_index));
         return finishLaunch("cudaMoE_project_prefill_llep_domain_commands");
     }
 
@@ -18495,6 +20750,43 @@ extern "C"
             layer_idx,
             command_buffer_count);
         return finishLaunch("cudaMoE_materialize_prefill_llep_transfer_commands");
+    }
+
+    bool cudaMoE_materialize_prefill_llep_mirrored_domain_commands(
+        const void *runtime_layer,
+        void *mirrored_plan_entries,
+        void *mirrored_command_headers,
+        uint32_t plan_capacity,
+        void *status,
+        const void *config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime_layer || !mirrored_plan_entries ||
+            !mirrored_command_headers || !status || !config || !stream ||
+            plan_capacity == 0u || payload_slot_capacity == 0u)
+        {
+            return false;
+        }
+        cudaSetDevice(device_idx);
+        const auto cfg =
+            *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        materialize_prefill_llep_mirrored_domain_commands_kernel<<<
+            1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const DeviceMoELayerRuntimeView *>(runtime_layer),
+            static_cast<DeviceMoERebalancePlanEntryView *>(
+                mirrored_plan_entries),
+            static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(
+                mirrored_command_headers),
+            plan_capacity,
+            static_cast<DeviceMoERebalanceStatusView *>(status),
+            cfg,
+            payload_slot_capacity,
+            layer_idx);
+        return finishLaunch(
+            "cudaMoE_materialize_prefill_llep_mirrored_domain_commands");
     }
 
     bool cudaMoE_pack_rebalance_compact_payloads(
@@ -18699,7 +20991,8 @@ extern "C"
             target_layer,
             nullptr,
             false,
-            1u);
+            1u,
+            nullptr);
         return finishLaunch("cudaMoE_apply_rebalance_arrivals");
     }
 
@@ -18794,6 +21087,7 @@ extern "C"
         void *controller_state,
         int target_layer,
         uint32_t command_buffer_count,
+        const void *overlay_reservation_status,
         int device_idx,
         void *stream)
     {
@@ -18817,8 +21111,42 @@ extern "C"
             target_layer,
             static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
             true,
-            command_buffer_count);
+            command_buffer_count,
+            static_cast<const llaminar2::DeviceMoEOverlayEpochStatus *>(
+                overlay_reservation_status));
         return finishLaunch("cudaMoE_apply_ready_rebalance_wave");
+    }
+
+    bool cudaMoE_finalize_overlay_rebalance_publication(
+        void *runtime_layers,
+        uint32_t layer_count,
+        uint32_t expert_count,
+        llaminar2::DeviceMoEOverlayEpochControl *control,
+        uint64_t *candidate_epoch,
+        llaminar2::DeviceMoEOverlayEpochStatus *status,
+        const void *apply_status,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime_layers || layer_count == 0u || expert_count == 0u ||
+            !control || !candidate_epoch || !status || !apply_status ||
+            !stream)
+        {
+            return false;
+        }
+        cudaSetDevice(device_idx);
+        finalize_overlay_rebalance_publication_kernel<<<
+            1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
+            layer_count,
+            expert_count,
+            control,
+            candidate_epoch,
+            status,
+            static_cast<const DeviceMoERebalanceApplyStatusView *>(
+                apply_status));
+        return finishLaunch(
+            "cudaMoE_finalize_overlay_rebalance_publication");
     }
 
     bool cudaMoE_float_to_int(const float *input, int *output, int count, int device_idx, void *stream)
@@ -19166,7 +21494,8 @@ extern "C"
                 /*up_descs=*/nullptr,
                 /*down_descs=*/nullptr,
                 /*active_expert_ids=*/nullptr,
-                /*max_active_experts=*/0);
+                /*max_active_experts=*/0,
+                llaminar2::DeviceMoEWeightFormat::NativeVNNI);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_group_small_runtime", cuda_stream);
         }
@@ -19219,6 +21548,7 @@ extern "C"
         int max_active_experts,
         int filter_to_local_runtime_experts,
         int retain_routes_for_deferred_commit,
+        llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
         void *stream)
     {
@@ -19228,7 +21558,10 @@ extern "C"
             current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
             top_k <= 0 || top_k > kMaxTopK ||
-            max_active_experts <= 0 || max_active_experts > num_experts)
+            max_active_experts <= 0 || max_active_experts > num_experts ||
+            (expected_format !=
+                 llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+             !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)))
         {
             return false;
         }
@@ -19255,7 +21588,8 @@ extern "C"
                 up_descs,
                 down_descs,
                 active_expert_ids,
-                max_active_experts);
+                max_active_experts,
+                expected_format);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_group_and_plan_small_runtime", cuda_stream);
         }
@@ -19285,7 +21619,10 @@ extern "C"
             down_descs,
             num_experts,
             active_expert_ids,
-            max_active_experts);
+            max_active_experts,
+            current_slots,
+            retain_routes_for_deferred_commit == 0 ? 1 : 0,
+            expected_format);
         return finishGroupedPrefillLaunch(
             "cudaMoE_prefill_group_and_plan_scalable_runtime", cuda_stream);
     }
@@ -19331,7 +21668,8 @@ extern "C"
                 /*up_descs=*/nullptr,
                 /*down_descs=*/nullptr,
                 /*active_expert_ids=*/nullptr,
-                /*max_active_experts=*/0);
+                /*max_active_experts=*/0,
+                llaminar2::DeviceMoEWeightFormat::NativeVNNI);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_regroup_small_runtime", cuda_stream);
         }
@@ -19379,6 +21717,7 @@ extern "C"
         int top_k,
         int max_active_experts,
         int retain_routes_for_deferred_commit,
+        llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
         void *stream)
     {
@@ -19388,7 +21727,10 @@ extern "C"
             current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
             top_k <= 0 || top_k > kMaxTopK ||
-            max_active_experts <= 0 || max_active_experts > num_experts)
+            max_active_experts <= 0 || max_active_experts > num_experts ||
+            (expected_format !=
+                 llaminar2::DeviceMoEWeightFormat::NativeVNNI &&
+             !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)))
         {
             return false;
         }
@@ -19415,7 +21757,8 @@ extern "C"
                 up_descs,
                 down_descs,
                 active_expert_ids,
-                max_active_experts);
+                max_active_experts,
+                expected_format);
             return finishGroupedPrefillLaunch(
                 "cudaMoE_prefill_regroup_and_plan_small_runtime", cuda_stream);
         }
@@ -19442,7 +21785,10 @@ extern "C"
             down_descs,
             num_experts,
             active_expert_ids,
-            max_active_experts);
+            max_active_experts,
+            current_slots,
+            retain_routes_for_deferred_commit == 0 ? 1 : 0,
+            expected_format);
         return finishGroupedPrefillLaunch(
             "cudaMoE_prefill_regroup_and_plan_scalable_runtime", cuda_stream);
     }
@@ -19551,8 +21897,8 @@ extern "C"
         uint32_t lambda_denominator,
         uint64_t min_spread_improvement,
         uint32_t min_spread_improvement_divisor,
-        uint64_t min_spread_improvement_per_transfer,
-        uint64_t min_foreign_rows_per_transfer,
+        uint64_t min_spread_improvement_per_critical_path_slot,
+        uint64_t min_foreign_rows_per_critical_path_slot,
         uint32_t max_weight_transfers,
         uint32_t max_non_owner_experts_per_participant,
         int enable_balanced_skip,
@@ -19597,8 +21943,8 @@ extern "C"
             lambda_denominator,
             min_spread_improvement,
             min_spread_improvement_divisor,
-            min_spread_improvement_per_transfer,
-            min_foreign_rows_per_transfer,
+            min_spread_improvement_per_critical_path_slot,
+            min_foreign_rows_per_critical_path_slot,
             max_weight_transfers,
             max_non_owner_experts_per_participant,
             enable_balanced_skip);
@@ -19693,13 +22039,17 @@ extern "C"
         cudaSetDevice(device_idx);
         materialize_runtime_prefill_descriptor_tables_kernel<<<1, kThreads, 0,
                                                                static_cast<cudaStream_t>(stream)>>>(
-            static_cast<const DeviceMoELayerRuntimeView *>(runtime),
+            static_cast<DeviceMoELayerRuntimeView *>(
+                const_cast<void *>(runtime)),
             gate_descs,
             up_descs,
             down_descs,
             num_experts,
             /*active_expert_ids=*/nullptr,
-            /*max_active_experts=*/0);
+            /*max_active_experts=*/0,
+            /*current_slots=*/0,
+            /*publish_prefill_histogram=*/0,
+            llaminar2::DeviceMoEWeightFormat::NativeVNNI);
         return finishGroupedPrefillLaunch(
             "cudaMoE_materialize_runtime_prefill_descriptor_tables",
             static_cast<cudaStream_t>(stream));
@@ -19730,13 +22080,17 @@ extern "C"
         cudaSetDevice(device_idx);
         materialize_runtime_prefill_descriptor_tables_kernel<<<
             1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-            static_cast<const DeviceMoELayerRuntimeView *>(runtime),
+            static_cast<DeviceMoELayerRuntimeView *>(
+                const_cast<void *>(runtime)),
             gate_descs,
             up_descs,
             down_descs,
             num_experts,
             active_expert_ids,
-            max_active_experts);
+            max_active_experts,
+            /*current_slots=*/0,
+            /*publish_prefill_histogram=*/0,
+            llaminar2::DeviceMoEWeightFormat::NativeVNNI);
         return finishGroupedPrefillLaunch(
             "cudaMoE_materialize_runtime_prefill_plan",
             static_cast<cudaStream_t>(stream));
@@ -19827,6 +22181,221 @@ extern "C"
         return finishLaunch("cudaMoE_scatter_expert_fixed");
     }
 
+    /** @brief Materialize a graph-stable floating runtime descriptor family. */
+    bool cudaMoE_materialize_runtime_floating_descriptor_tables(
+        const void *d_runtime_layer,
+        llaminar2::DeviceMoEFloatingMatrixDesc *d_gate_descs,
+        llaminar2::DeviceMoEFloatingMatrixDesc *d_up_descs,
+        llaminar2::DeviceMoEFloatingMatrixDesc *d_down_descs,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_runtime_layer || !d_gate_descs || !d_up_descs || !d_down_descs ||
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+            !llaminar2::deviceMoEWeightFormatIsFloating(format) || !stream)
+        {
+            std::fprintf(
+                stderr,
+                "[cudaMoE_materialize_runtime_floating_descriptor_tables] invalid arguments\n");
+            return false;
+        }
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return false;
+        materialize_runtime_floating_descriptor_tables_kernel<<<
+            1,
+            kThreads,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+                static_cast<const DeviceMoELayerRuntimeView *>(d_runtime_layer),
+                d_gate_descs,
+                d_up_descs,
+                d_down_descs,
+                num_experts,
+                format);
+        return finishLaunch(
+            "cudaMoE_materialize_runtime_floating_descriptor_tables");
+    }
+
+    /** @brief Launch fixed-tree floating gate/up decode. */
+    bool cudaMoE_grouped_gate_up_floating_decode_table(
+        const float *d_hidden,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_gate_descs,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_up_descs,
+        const int *d_expert_ids,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
+        int num_active,
+        int intermediate,
+        int d_model,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_hidden || !d_gate_descs || !d_up_descs || !d_expert_ids ||
+            !d_gate_outputs || !d_up_outputs || num_active <= 0 ||
+            intermediate <= 0 || d_model <= 0 || num_experts <= 0 ||
+            !llaminar2::deviceMoEWeightFormatIsFloating(format) || !stream)
+        {
+            return false;
+        }
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return false;
+        grouped_floating_gate_up_decode_kernel<<<
+            make_row_major_grid(
+                static_cast<unsigned int>(intermediate), num_active),
+            kThreads,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+                d_hidden,
+                d_gate_descs,
+                d_up_descs,
+                d_expert_ids,
+                d_gate_outputs,
+                d_up_outputs,
+                num_active,
+                intermediate,
+                d_model,
+                num_experts,
+                format);
+        return finishLaunch("cudaMoE_grouped_gate_up_floating_decode_table");
+    }
+
+    /** @brief Launch fixed-tree floating SwiGLU/down decode. */
+    bool cudaMoE_grouped_swiglu_down_floating_decode_table(
+        const float *const *d_gate_rows,
+        const float *const *d_up_rows,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_down_descs,
+        const int *d_expert_ids,
+        const float *d_route_weights,
+        float *d_output,
+        float *d_canonical_routes,
+        int num_active,
+        int d_model,
+        int intermediate,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_gate_rows || !d_up_rows || !d_down_descs || !d_expert_ids ||
+            !d_route_weights || (!d_output && !d_canonical_routes) ||
+            num_active <= 0 || d_model <= 0 || intermediate <= 0 ||
+            num_experts <= 0 ||
+            !llaminar2::deviceMoEWeightFormatIsFloating(format) || !stream)
+        {
+            return false;
+        }
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return false;
+        const int publication_rows = d_canonical_routes ? num_active : 1;
+        grouped_floating_swiglu_down_decode_kernel<<<
+            make_row_major_grid(
+                static_cast<unsigned int>(d_model), publication_rows),
+            kThreads,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+                d_gate_rows,
+                d_up_rows,
+                d_down_descs,
+                d_expert_ids,
+                d_route_weights,
+                d_output,
+                d_canonical_routes,
+                num_active,
+                d_model,
+                intermediate,
+                num_experts,
+                format);
+        return finishLaunch(
+            "cudaMoE_grouped_swiglu_down_floating_decode_table");
+    }
+
+    /** @brief Launch the fixed-tree floating grouped-prefill pipeline. */
+    bool cudaMoE_grouped_floating_prefill_pipeline(
+        const float *d_hidden,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_gate_descs,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_up_descs,
+        const llaminar2::DeviceMoEFloatingMatrixDesc *d_down_descs,
+        const int *d_original_to_grouped,
+        const int *d_original_expert_ids,
+        const float *d_grouped_weights,
+        float *d_grouped_gate,
+        float *d_grouped_up,
+        float *d_output,
+        float *d_canonical_routes,
+        int seq_len,
+        int total_slots,
+        int top_k,
+        int d_model,
+        int intermediate,
+        int num_experts,
+        llaminar2::DeviceMoEWeightFormat format,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_hidden || !d_gate_descs || !d_up_descs || !d_down_descs ||
+            !d_original_to_grouped ||
+            (!d_original_expert_ids && num_experts != 1) ||
+            !d_grouped_weights || !d_grouped_gate || !d_grouped_up ||
+            (!d_output && !d_canonical_routes) || seq_len <= 0 ||
+            total_slots != seq_len * top_k || top_k <= 0 || d_model <= 0 ||
+            intermediate <= 0 || num_experts <= 0 ||
+            !llaminar2::deviceMoEWeightFormatIsFloating(format) || !stream)
+        {
+            return false;
+        }
+        if (cudaSetDevice(device_idx) != cudaSuccess)
+            return false;
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        grouped_floating_gate_up_prefill_kernel<<<
+            make_row_major_grid(
+                static_cast<unsigned int>(intermediate), total_slots),
+            kThreads,
+            0,
+            cuda_stream>>>(
+                d_hidden,
+                d_gate_descs,
+                d_up_descs,
+                d_original_to_grouped,
+                d_original_expert_ids,
+                d_grouped_gate,
+                d_grouped_up,
+                total_slots,
+                top_k,
+                intermediate,
+                d_model,
+                num_experts,
+                format);
+        if (!finishLaunch("cudaMoE_grouped_floating_prefill_gate_up"))
+            return false;
+        const int publication_rows = d_canonical_routes ? total_slots : seq_len;
+        grouped_floating_swiglu_down_prefill_kernel<<<
+            make_row_major_grid(
+                static_cast<unsigned int>(d_model), publication_rows),
+            kThreads,
+            0,
+            cuda_stream>>>(
+                d_grouped_gate,
+                d_grouped_up,
+                d_down_descs,
+                d_original_to_grouped,
+                d_original_expert_ids,
+                d_grouped_weights,
+                d_output,
+                d_canonical_routes,
+                seq_len,
+                total_slots,
+                top_k,
+                d_model,
+                intermediate,
+                num_experts,
+                format);
+        return finishLaunch("cudaMoE_grouped_floating_prefill_down");
+    }
+
     bool cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
         const float *d_hidden,
         const DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
@@ -19903,6 +22472,7 @@ extern "C"
         case 16: LAUNCH_GROUPED_GATE_UP_KPART(16); break;
         case 17: LAUNCH_GROUPED_GATE_UP_KPART(17); break;
         case 19: LAUNCH_GROUPED_GATE_UP_KPART(19); break;
+        case llaminar2::kNativeVnniExpandedInt8MinCodebook: LAUNCH_GROUPED_GATE_UP_KPART(llaminar2::kNativeVnniExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP_KPART(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n",
@@ -19996,6 +22566,7 @@ extern "C"
         case 16: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(16); break;
         case 17: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(17); break;
         case 19: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(19); break;
+        case llaminar2::kNativeVnniExpandedInt8MinCodebook: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(llaminar2::kNativeVnniExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart] unsupported codebook_id=%u\n",
@@ -20099,6 +22670,7 @@ extern "C"
         case 16: LAUNCH_GROUPED_DOWN_KPART(16); break;
         case 17: LAUNCH_GROUPED_DOWN_KPART(17); break;
         case 19: LAUNCH_GROUPED_DOWN_KPART(19); break;
+        case llaminar2::kNativeVnniExpandedInt8MinCodebook: LAUNCH_GROUPED_DOWN_KPART(llaminar2::kNativeVnniExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN_KPART(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n",
@@ -20204,6 +22776,7 @@ extern "C"
         case 16: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(16); break;
         case 17: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(17); break;
         case 19: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(19); break;
+        case llaminar2::kNativeVnniExpandedInt8MinCodebook: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(llaminar2::kNativeVnniExpandedInt8MinCodebook); break;
         case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart] unsupported codebook_id=%u\n",
@@ -20555,6 +23128,8 @@ extern "C"
                 LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(16);
                 LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(17);
                 LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(19);
+                LAUNCH_GROUPED_GATEUP_ORDERED_KPART_IF_PRESENT(
+                    llaminar2::kNativeVnniExpandedInt8MinCodebook);
                 if (!launched_gateup)
                 {
                     std::fprintf(
@@ -20654,6 +23229,8 @@ extern "C"
             LAUNCH_GROUPED_GATEUP_IF_PRESENT(16);
             LAUNCH_GROUPED_GATEUP_IF_PRESENT(17);
             LAUNCH_GROUPED_GATEUP_IF_PRESENT(19);
+            LAUNCH_GROUPED_GATEUP_IF_PRESENT(
+                llaminar2::kNativeVnniExpandedInt8MinCodebook);
             if (!launched_gateup)
             {
                 std::fprintf(
@@ -20807,6 +23384,8 @@ extern "C"
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(16);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(17);
                     LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(19);
+                    LAUNCH_GROUPED_DOWN_ORDERED_KPART_IF_PRESENT(
+                        llaminar2::kNativeVnniExpandedInt8MinCodebook);
                 }
                 if (!launched_down)
                 {
@@ -20904,6 +23483,8 @@ extern "C"
             LAUNCH_GROUPED_DOWN_IF_PRESENT(16);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(17);
             LAUNCH_GROUPED_DOWN_IF_PRESENT(19);
+            LAUNCH_GROUPED_DOWN_IF_PRESENT(
+                llaminar2::kNativeVnniExpandedInt8MinCodebook);
             if (!launched_down)
             {
                 std::fprintf(stderr,

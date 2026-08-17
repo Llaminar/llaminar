@@ -39,6 +39,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #ifdef __AVX512F__
@@ -46,8 +47,10 @@
 #endif
 
 #include "CPUNativeVNNIDecode.h"
+#include "CPUNativeVNNIPreparedFootprint.h"
 #include "kernels/cpu/rotation/ActivationRotation.h"
 #include "tensors/AlignedVector.h"
+#include "tensors/BlockStructures.h"
 #include "tensors/FP16Utils.h"
 #include "tensors/TensorClasses.h"
 #include "tensors/NativeVnniFormatInfo.h"
@@ -55,6 +58,52 @@
 
 namespace llaminar2::cpu::native_vnni
 {
+    /**
+     * @brief Select the physical CPU execution encoding for a source codebook.
+     *
+     * @param codebook_id NativeVNNI execution codebook identifier.
+     * @param rotation_enabled Whether preparation applies activation rotation;
+     *        rotated values are requantized to the expanded INT8 encoding.
+     * @return Physical encoding consumed by CPU GEMV/GEMM kernels.
+     */
+    [[nodiscard]] inline CPUNativeVNNIEncoding preparedEncodingForCodebook(
+        uint8_t codebook_id,
+        bool rotation_enabled = false) noexcept
+    {
+        if (rotation_enabled)
+            return CPUNativeVNNIEncoding::ExpandedInt8;
+        if (is_nibble_lut_format(codebook_id))
+            return CPUNativeVNNIEncoding::NibbleLUT;
+        if (codebook_id == 8)
+            return CPUNativeVNNIEncoding::Q6KNativeDualScale;
+        return CPUNativeVNNIEncoding::ExpandedInt8;
+    }
+
+    /**
+     * @brief Build an exact cache footprint without materializing a matrix.
+     *
+     * This helper is used by planning/corpus tools that know format metadata
+     * but intentionally do not allocate production-sized weights.
+     */
+    [[nodiscard]] inline NativeVNNIPreparedFootprint preparedFootprintForFormat(
+        uint8_t codebook_id,
+        bool is_asymmetric,
+        bool rotation_enabled = false) noexcept
+    {
+        const CPUNativeVNNIEncoding encoding =
+            preparedEncodingForCodebook(codebook_id, rotation_enabled);
+        const bool prepared_is_asymmetric =
+            rotation_enabled ? false : is_asymmetric;
+        return NativeVNNIPreparedFootprint{
+            .encoding = encoding,
+            .is_asymmetric = prepared_is_asymmetric,
+            .weight_bytes_per_n_chunk_k_block =
+                static_cast<std::uint64_t>(preparedInterleavedBlockStride(
+                    encoding, prepared_is_asymmetric)),
+            .activation_bytes_per_row_k_block = sizeof(Q8_1Block),
+            .output_bytes_per_row_n_chunk = 64u * sizeof(float),
+        };
+    }
 
     /**
      * @brief CPU-packed native VNNI weights.
@@ -113,8 +162,8 @@ namespace llaminar2::cpu::native_vnni
     struct CPUNativeVNNIPackedWeights
     {
         /// Raw native payload bytes in [N_chunks][blocks_per_row][64][payload_bytes] layout
-        /// Only populated for nibble-LUT formats (is_nibble_lut == true).
-        std::vector<uint8_t> payload;
+        /// Only populated for the legacy scalar nibble-format oracle.
+        AlignedVector<uint8_t> payload;
 
         /// VNNI-interleaved weight data with inline metadata (64-byte aligned).
         ///
@@ -132,7 +181,7 @@ namespace llaminar2::cpu::native_vnni
         /// Flat INT8 buffer used as intermediate during packing (INT8 pre-decoded formats only).
         /// Layout: [N_chunks][blocks_per_row][64][32] int8_t
         /// Freed after interleaving; only retained when keepDecodedBuffer is true (scalar tests).
-        std::vector<int8_t> int8_flat;
+        AlignedVector<int8_t> int8_flat;
 
         /// Original dimensions
         int N = 0;
@@ -156,10 +205,8 @@ namespace llaminar2::cpu::native_vnni
         /// Whether format uses 256-element superblocks
         bool is_superblock = false;
 
-        /// Whether this format uses vpshufb nibble LUT decode in the GEMV inner loop.
-        /// True for: Q4_0, IQ4_NL, Q4_1, IQ4_XS (4-bit nibble formats).
-        /// False for: Q5_0, Q5_1, Q6_K, Q3_K, Q2_K, IQ2/3/1* (pre-decoded INT8).
-        bool is_nibble_lut = false;
+        /// Physical prepared encoding consumed by serial and grouped kernels.
+        CPUNativeVNNIEncoding encoding = CPUNativeVNNIEncoding::ExpandedInt8;
 
         /// Bytes of pure group data per K-block (before metadata).
         /// 1024 for nibble-LUT (4 groups × 4 ZMMs × 64 bytes).
@@ -169,6 +216,60 @@ namespace llaminar2::cpu::native_vnni
         /// Total bytes per K-block including inline metadata.
         /// = data_stride + 128 (comp) + 128 (scales) [+ 128 (mins) if asymmetric]
         int interleaved_block_stride = 1280;
+
+        /** @brief Return whether this matrix uses native four-bit interleaving. */
+        [[nodiscard]] bool usesNibbleLUT() const noexcept
+        {
+            return encoding == CPUNativeVNNIEncoding::NibbleLUT;
+        }
+
+        /** @brief Return whether this matrix was expanded to signed INT8. */
+        [[nodiscard]] bool usesExpandedInt8() const noexcept
+        {
+            return encoding == CPUNativeVNNIEncoding::ExpandedInt8;
+        }
+
+        /** @brief Return whether this matrix retains native dual-scale Q6_K. */
+        [[nodiscard]] bool usesQ6KNativeDualScale() const noexcept
+        {
+            return encoding == CPUNativeVNNIEncoding::Q6KNativeDualScale;
+        }
+
+        /**
+         * @brief Return whether each prepared block carries weight compensation.
+         *
+         * Nibble and expanded-INT8 kernels bias signed weights by shifting the
+         * activation to unsigned bytes, and therefore need one per-column
+         * weight sum. Q6_K reverses the VNNI operands: unsigned six-bit weights
+         * multiply signed activations, so its centering correction depends only
+         * on the activation half sums and no weight compensation is stored.
+         */
+        [[nodiscard]] bool usesInlineCompensation() const noexcept
+        {
+            return !usesQ6KNativeDualScale();
+        }
+
+        /**
+         * @brief Describe the exact prepared bytes consumed by cache tiling.
+         *
+         * `payload_bytes` describes one source-format block and is deliberately
+         * absent from this contract.  The execution stream is
+         * `interleaved_block_stride` bytes for each 64-column by 32-K unit,
+         * including all metadata laid out by the packer.
+         *
+         * @return Complete prepared-weight, activation, and output footprint.
+         */
+        [[nodiscard]] NativeVNNIPreparedFootprint preparedFootprint() const noexcept
+        {
+            return NativeVNNIPreparedFootprint{
+                .encoding = encoding,
+                .is_asymmetric = is_asymmetric,
+                .weight_bytes_per_n_chunk_k_block =
+                    static_cast<std::uint64_t>(interleaved_block_stride),
+                .activation_bytes_per_row_k_block = sizeof(Q8_1Block),
+                .output_bytes_per_row_n_chunk = 64u * sizeof(float),
+            };
+        }
 
         // -------------------------------------------------------------------
         // Deferred packing (workspace) support
@@ -221,16 +322,19 @@ namespace llaminar2::cpu::native_vnni
         inline const uint16_t *chunkScales(int c, int kb) const
         {
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
+            const size_t compensation_bytes = usesInlineCompensation() ? 128u : 0u;
             return reinterpret_cast<const uint16_t *>(
-                interleavedBase() + block_offset + data_stride + 128);
+                interleavedBase() + block_offset + data_stride + compensation_bytes);
         }
 
         /// Mins pointer for N-chunk c, K-block kb (contiguous 64 FP16 values, inline in native_interleaved)
         inline const uint16_t *chunkMins(int c, int kb) const
         {
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
+            const size_t metadata_offset =
+                usesInlineCompensation() ? 256u : 128u;
             return reinterpret_cast<const uint16_t *>(
-                interleavedBase() + block_offset + data_stride + 256);
+                interleavedBase() + block_offset + data_stride + metadata_offset);
         }
 
         /// Payload pointer for N-chunk c, K-block kb (contiguous 64 × payload_bytes)
@@ -253,13 +357,49 @@ namespace llaminar2::cpu::native_vnni
         /// Pre-computed compensation for N-chunk c, K-block kb (contiguous 64 INT16, inline in native_interleaved)
         inline const int16_t *chunkComp(int c, int kb) const
         {
+            if (!usesInlineCompensation())
+                throw std::logic_error(
+                    "Q6_K native dual-scale weights do not carry compensation metadata");
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
             return reinterpret_cast<const int16_t *>(
                 interleavedBase() + block_offset + data_stride);
         }
 
+        /**
+         * @brief Return Q6_K high-bit planes for one K group/ZMM.
+         *
+         * The native Q6_K data region stores the familiar 1024-byte nibble
+         * transpose first, followed by eight 64-byte group regions. Each
+         * group/ZMM region contains two little-endian 64-bit masks. Mask bit
+         * `lane * 4 + k` is the low or high bit of the two-bit Q6 high part
+         * for byte `lane * 4 + k` in the corresponding VNNI weight vector.
+         * This retains the native two-bits-per-weight footprint while allowing
+         * AVX-512 to expand all 64 bytes with two masked broadcasts.
+         *
+         * @param c Output-column chunk.
+         * @param kb Logical 32-value K block.
+         * @param group VNNI group in [0, 7].
+         * @param z Sixteen-column vector within the chunk in [0, 3].
+         * @return Pointer to the low-bit mask followed by the high-bit mask.
+         */
+        inline const uint8_t *q6KHighBitplanes(
+            int c, int kb, int group, int z) const
+        {
+            if (!usesQ6KNativeDualScale() || group < 0 || group >= 8 ||
+                z < 0 || z >= 4)
+            {
+                throw std::logic_error(
+                    "q6KHighBitplanes requires native Q6_K encoding and valid group/ZMM indices");
+            }
+            const size_t block_offset =
+                ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
+            return interleavedBase() + block_offset + 1024u +
+                   static_cast<size_t>(group) * 64u +
+                   static_cast<size_t>(z) * 16u;
+        }
+
         /// Flat INT8 values for N-chunk c, K-block kb, column n_local (32 INT8 values)
-        /// Only valid for INT8 pre-decoded formats (is_nibble_lut == false).
+        /// Only valid for ExpandedInt8 preparation.
         /// Only available if keepDecodedBuffer was true during packing.
         inline const int8_t *blockInt8(int c, int kb, int n_local) const
         {
@@ -326,6 +466,12 @@ namespace llaminar2::cpu::native_vnni
         const CPUNativeVNNIPackedWeights &meta,
         uint8_t *workspace)
     {
+        if (meta.usesQ6KNativeDualScale())
+        {
+            throw std::invalid_argument(
+                "Deferred native-block repacking does not own the Q6_K "
+                "superblock context required by the native dual-scale layout");
+        }
         const int N = meta.N;
         const int bpr = meta.blocks_per_row;
         const int N_chunks = (meta.N_padded) / 64;
@@ -334,7 +480,7 @@ namespace llaminar2::cpu::native_vnni
         // Row stride in native_blocks array (bytes between adjacent rows)
         const size_t native_row_stride = static_cast<size_t>(bpr) * block_size;
 
-        if (meta.is_nibble_lut)
+        if (meta.usesNibbleLUT())
         {
             // ---------------------------------------------------------------
             // NIBBLE-LUT PATH (Q4_0, IQ4_NL, Q4_1)
@@ -639,7 +785,6 @@ namespace llaminar2::cpu::native_vnni
         out.codebook_id = fmt->codebook_id;
         out.is_asymmetric = fmt->is_asymmetric;
         out.is_superblock = fmt->is_superblock;
-        out.is_nibble_lut = is_nibble_lut_format(fmt->codebook_id);
 
         // When rotation is active, rotation mixes values across the 32-element
         // quantization block boundaries, so we must dequant → rotate → requant.
@@ -648,10 +793,24 @@ namespace llaminar2::cpu::native_vnni
         // for diagnostic purposes, but the packed layout uses the INT8 path.
         const bool use_rotated_path = (rotation != nullptr);
         if (use_rotated_path)
-            out.is_nibble_lut = false; // Force INT8 pre-decoded path
+            out.is_asymmetric = false;
+        out.encoding = preparedEncodingForCodebook(
+            fmt->codebook_id, use_rotated_path);
 
-        out.data_stride = out.is_nibble_lut ? 1024 : 2048;
-        out.interleaved_block_stride = out.data_stride + 256 + (out.is_asymmetric ? 128 : 0);
+        switch (out.encoding)
+        {
+        case CPUNativeVNNIEncoding::NibbleLUT:
+            out.data_stride = 1024;
+            break;
+        case CPUNativeVNNIEncoding::ExpandedInt8:
+            out.data_stride = 2048;
+            break;
+        case CPUNativeVNNIEncoding::Q6KNativeDualScale:
+            out.data_stride = 1536;
+            break;
+        }
+        out.interleaved_block_stride = preparedInterleavedBlockStride(
+            out.encoding, out.is_asymmetric);
 
         // Temporary per-column metadata arrays used during packing.
         // These get copied inline into native_interleaved during the interleaving pass.
@@ -679,9 +838,6 @@ namespace llaminar2::cpu::native_vnni
             // Asymmetric formats become symmetric after rotation (the rotation
             // distributes outliers evenly, centering the distribution).
             // =================================================================
-
-            out.is_asymmetric = false; // Rotated weights are always symmetric
-            out.interleaved_block_stride = 2048 + 256; // Recompute without mins
 
             size_t int8_total = (size_t)N_chunks * blocks_per_row * 64 * 32;
             out.int8_flat.resize(int8_total, 0);
@@ -799,7 +955,180 @@ namespace llaminar2::cpu::native_vnni
 
             // Fall through to the INT8 interleaving path below
         }
-        else if (out.is_nibble_lut)
+        else if (out.usesQ6KNativeDualScale())
+        {
+            // =================================================================
+            // NATIVE Q6_K DUAL-SCALE PATH
+            //
+            // Preserve the exact 24-byte payload emitted for each logical
+            // 32-value block.  The first sixteen bytes carry paired low
+            // nibbles and the final eight bytes carry four two-bit high parts
+            // each.  The two FP16 metadata arrays are independent scales for
+            // values [0,16) and [16,32); they are not scale/min correction.
+            //
+            // Prepared bytes per 64-column/K block:
+            //   1024 B low-nibble transpose
+            //    512 B high-two-bit transpose
+            //    128 B low-half scales
+            //    128 B high-half scales
+            // = 1792 B, versus 2304 B for the previous requantized INT8 path.
+            // =================================================================
+            std::vector<uint8_t> temp_payload(
+                static_cast<size_t>(blocks_per_row) * N_padded *
+                    fmt->payload_bytes,
+                0);
+            std::vector<uint16_t> temp_primary_scales(
+                static_cast<size_t>(blocks_per_row) * N_padded,
+                0);
+            std::vector<uint16_t> temp_secondary_scales(
+                static_cast<size_t>(blocks_per_row) * N_padded,
+                0);
+
+            VnniPackContext native_context;
+            native_context.raw_bytes = nullptr;
+            native_context.N = N_padded;
+            native_context.K = K;
+            native_context.blocks_per_row = blocks_per_row;
+            native_context.payload_bytes = fmt->payload_bytes;
+            native_context.payload_array = temp_payload.data();
+            native_context.scales_array = temp_primary_scales.data();
+            native_context.mins_array = temp_secondary_scales.data();
+            native_context.emins_array = nullptr;
+
+#pragma omp parallel for schedule(static)
+            for (int n = 0; n < N; ++n)
+            {
+                const int src_row = row_start + n;
+                for (int kb = 0; kb < blocks_per_row; ++kb)
+                    unpackable->packVnniBlock(native_context, src_row, n, kb);
+            }
+
+            const size_t interleaved_total =
+                static_cast<size_t>(N_chunks) * blocks_per_row *
+                out.interleaved_block_stride;
+            out.native_interleaved.resize_uninitialized(interleaved_total);
+
+#pragma omp parallel for schedule(static) collapse(2)
+            for (int chunk = 0; chunk < N_chunks; ++chunk)
+            {
+                for (int kb = 0; kb < blocks_per_row; ++kb)
+                {
+                    const int n_cols = std::min(64, N - chunk * 64);
+                    const size_t block_offset =
+                        (static_cast<size_t>(chunk) * blocks_per_row + kb) *
+                        out.interleaved_block_stride;
+                    uint8_t *const destination =
+                        out.native_interleaved.data() + block_offset;
+
+                    // Low nibbles retain the established four-group/ZMM layout.
+                    for (int group = 0; group < 4; ++group)
+                    {
+                        for (int z = 0; z < 4; ++z)
+                        {
+                            uint8_t *const zmm_destination =
+                                destination + group * 256 + z * 64;
+                            for (int lane = 0; lane < 16; ++lane)
+                            {
+                                const int local_column = z * 16 + lane;
+                                if (local_column >= n_cols)
+                                {
+                                    std::memset(zmm_destination + lane * 4, 0, 4);
+                                    continue;
+                                }
+                                const int column = chunk * 64 + local_column;
+                                const size_t linear =
+                                    static_cast<size_t>(kb) * N_padded + column;
+                                const uint8_t *const source =
+                                    temp_payload.data() +
+                                    linear * fmt->payload_bytes + group * 4;
+                                std::memcpy(zmm_destination + lane * 4, source, 4);
+                            }
+                        }
+                    }
+
+                    /*
+                     * Transpose the native two-bit fields into two bitplanes
+                     * for each group/ZMM. The low-nibble vector is ordered as
+                     * sixteen columns of four adjacent K values, so mask bit
+                     * `lane * 4 + index` directly addresses its destination
+                     * byte. Invalid padded columns remain clear.
+                     */
+                    for (int group = 0; group < 8; ++group)
+                    {
+                        for (int z = 0; z < 4; ++z)
+                        {
+                            uint64_t low_bitplane = 0;
+                            uint64_t high_bitplane = 0;
+                            for (int lane = 0; lane < 16; ++lane)
+                            {
+                                const int local_column = z * 16 + lane;
+                                if (local_column >= n_cols)
+                                    continue;
+
+                                const int column =
+                                    chunk * 64 + local_column;
+                                const size_t linear =
+                                    static_cast<size_t>(kb) * N_padded +
+                                    column;
+                                const uint8_t packed_high =
+                                    temp_payload[
+                                        linear * fmt->payload_bytes +
+                                        16 + group];
+                                for (int index = 0; index < 4; ++index)
+                                {
+                                    const uint64_t bit =
+                                        static_cast<uint64_t>(lane * 4 + index);
+                                    const uint8_t high_part =
+                                        static_cast<uint8_t>(
+                                            (packed_high >> (index * 2)) &
+                                            0x03u);
+                                    low_bitplane |=
+                                        static_cast<uint64_t>(high_part & 1u)
+                                        << bit;
+                                    high_bitplane |=
+                                        static_cast<uint64_t>(high_part >> 1)
+                                        << bit;
+                                }
+                            }
+
+                            uint8_t *const high_destination =
+                                destination + 1024 + group * 64 + z * 16;
+                            std::memcpy(
+                                high_destination,
+                                &low_bitplane,
+                                sizeof(low_bitplane));
+                            std::memcpy(
+                                high_destination + sizeof(low_bitplane),
+                                &high_bitplane,
+                                sizeof(high_bitplane));
+                        }
+                    }
+
+                    auto *const primary_scales =
+                        reinterpret_cast<uint16_t *>(destination + 1536);
+                    auto *const secondary_scales =
+                        reinterpret_cast<uint16_t *>(destination + 1664);
+                    for (int local_column = 0; local_column < 64;
+                         ++local_column)
+                    {
+                        if (local_column >= n_cols)
+                        {
+                            primary_scales[local_column] = 0;
+                            secondary_scales[local_column] = 0;
+                            continue;
+                        }
+                        const int column = chunk * 64 + local_column;
+                        const size_t linear =
+                            static_cast<size_t>(kb) * N_padded + column;
+                        primary_scales[local_column] =
+                            temp_primary_scales[linear];
+                        secondary_scales[local_column] =
+                            temp_secondary_scales[linear];
+                    }
+                }
+            }
+        }
+        else if (out.usesNibbleLUT())
         {
             // =================================================================
             // NIBBLE-LUT PATH (Q4_0, IQ4_NL, Q4_1, IQ4_XS)
@@ -866,9 +1195,10 @@ namespace llaminar2::cpu::native_vnni
 #pragma omp parallel for schedule(static)
             for (int n = 0; n < N; ++n)
             {
+                const int src_row = row_start + n;
                 for (int kb = 0; kb < blocks_per_row; ++kb)
                 {
-                    unpackable->packVnniBlock(gpu_ctx, n, kb);
+                    unpackable->packVnniBlock(gpu_ctx, src_row, n, kb);
                 }
             }
 
@@ -1037,7 +1367,7 @@ namespace llaminar2::cpu::native_vnni
         // Build VNNI-interleaved INT8 buffer (8 groups) + inline comp/scales/mins.
         // Both paths populate int8_flat + temp_scales before reaching here.
         // =================================================================
-        if (!out.is_nibble_lut)
+        if (out.usesExpandedInt8())
         {
             size_t interleaved_total = (size_t)N_chunks * blocks_per_row * out.interleaved_block_stride;
             // The following parallel pass writes every byte. Avoid a

@@ -3,9 +3,11 @@
  * @brief CPU all-format grouped residual-add decode-equivalence integration gate.
  *
  * Residual addition is row-independent, so the economical CPU implementation
- * is one flat OpenMP workshare over all active verifier values. This suite
- * compares FP32, BF16, and FP16 native output bytes against production M=1
- * decode across the runtime-M inventory and requires exactly one grouped workshare counter.
+ * is one contiguous invocation over all active verifier values. Small spans
+ * use caller-thread SIMD, larger grouped spans use a bounded team, and prefill
+ * spans use the configured team. This suite compares FP32, BF16, and FP16
+ * native output bytes against production M=1 decode across the runtime-M
+ * inventory and requires exactly one grouped production counter.
  */
 
 #include <gtest/gtest.h>
@@ -128,6 +130,17 @@ namespace
         return it == record.tags.end()
                    ? std::string("<missing:") + name + '>'
                    : it->second;
+    }
+
+    /** @brief Return the production policy expected for a standalone span. */
+    std::string expectedInvocationPolicy(size_t active_elements)
+    {
+        if (active_elements <=
+            residual_add_detail::kCallerThreadElementLimit)
+        {
+            return "caller_thread_simd";
+        }
+        return "full_flat_workshare";
     }
 
     /** @brief Require native byte equality and report the first mismatch. */
@@ -260,7 +273,12 @@ namespace
                     std::to_string(active_elements));
                 EXPECT_EQ(
                     tag(record, "invocation_policy"),
-                    "single_flat_workshare");
+                    expectedInvocationPolicy(active_elements));
+                EXPECT_EQ(
+                    tag(record, "standalone_team_threads"),
+                    std::to_string(
+                        residual_add_detail::standaloneTeamSize(
+                            active_elements)));
             }
         }
     }

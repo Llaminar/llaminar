@@ -1,3 +1,15 @@
+/**
+ * @file MoERoutedExpertPlacementPlanner.cpp
+ * @brief Deterministic implementation of routed-expert placement objectives.
+ *
+ * Static policies fill setup-resolved quotas in strict integer-priority order.
+ * Dynamic policies may consume exact decode, prefill, and grouped-verifier
+ * demand together with a complete service profile. That path solves a fixed-
+ * quota bipartite min-cost flow using integer arithmetic, so every distributed
+ * participant derives the same placement without floating-point or declaration-
+ * order ambiguity.
+ */
+
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
 
 #include "execution/moe/DecodeExpertHistogram.h"
@@ -5,9 +17,14 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <numeric>
+#include <optional>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 
 namespace llaminar2
@@ -73,9 +90,7 @@ namespace llaminar2
                       {
             const auto &left = plan.routed_tiers[lhs];
             const auto &right = plan.routed_tiers[rhs];
-            if (left.priority != right.priority)
-                return left.priority < right.priority;
-            return lhs < rhs; });
+            return left.priority < right.priority; });
             return tier_indices;
         }
 
@@ -86,7 +101,210 @@ namespace llaminar2
             return expert_order;
         }
 
-        bool histogramLayerHasCounts(const DecodeExpertHistogram &histogram, int layer, int num_experts)
+        /** @brief Uniform read-only view over live or frozen histogram evidence. */
+        struct HistogramEvidence
+        {
+            const DecodeExpertHistogram *live = nullptr;
+            const DecodeExpertHistogramWindow *frozen = nullptr;
+
+            explicit operator bool() const noexcept
+            {
+                return live != nullptr || frozen != nullptr;
+            }
+
+            int numLayers() const noexcept
+            {
+                return frozen ? frozen->num_layers
+                              : (live ? live->config().num_layers : 0);
+            }
+
+            int numExperts() const noexcept
+            {
+                return frozen ? frozen->num_experts
+                              : (live ? live->config().num_experts : 0);
+            }
+
+            uint64_t activationCount(int layer, int expert) const
+            {
+                return frozen ? frozen->activationCount(layer, expert)
+                              : live->activationCount(layer, expert);
+            }
+
+            uint64_t activationCount(
+                ExpertHistogramSource source,
+                int layer,
+                int expert) const
+            {
+                return frozen
+                           ? frozen->activationCount(source, layer, expert)
+                           : live->activationCount(source, layer, expert);
+            }
+        };
+
+        /** @brief Convert one retained production source to its profile column. */
+        std::size_t servicePhaseIndex(ExpertHistogramSource source)
+        {
+            switch (source)
+            {
+            case ExpertHistogramSource::DecodeToken:
+                return 0;
+            case ExpertHistogramSource::PrefillChunk:
+                return 1;
+            case ExpertHistogramSource::GroupedVerifier:
+                return 2;
+            case ExpertHistogramSource::SyntheticTest:
+                break;
+            }
+            throw std::invalid_argument(
+                "Synthetic or unknown histogram sources have no service-profile column");
+        }
+
+        /** @brief Validated constant-time view over a complete service profile. */
+        struct PhaseServiceProfileView
+        {
+            const MoERoutedTierServiceProfile *profile = nullptr;
+            int tier_count = 0;
+            int layer_count = 0;
+            std::vector<const MoERoutedTierLayerPhaseServiceCost *> rows;
+
+            explicit operator bool() const noexcept
+            {
+                return profile != nullptr;
+            }
+
+            /** @return Whether the immutable runtime can produce this phase. */
+            bool active(ExpertHistogramSource source) const
+            {
+                return profile->active_sources[servicePhaseIndex(source)];
+            }
+
+            /** @return Certified cost, rejecting demand for a disabled phase. */
+            uint64_t cost(
+                int tier,
+                int layer,
+                ExpertHistogramSource source) const
+            {
+                if (!active(source))
+                {
+                    throw std::logic_error(
+                        "MoE service cost requested for a runtime-disabled inference phase");
+                }
+                const auto offset =
+                    static_cast<std::size_t>(tier) *
+                        static_cast<std::size_t>(layer_count) +
+                    static_cast<std::size_t>(layer);
+                return rows.at(offset)
+                    ->nanoseconds_per_activation[servicePhaseIndex(source)];
+            }
+        };
+
+        /**
+         * @brief Validate and index one complete measured service profile.
+         *
+         * Integer priority owns capacity fill and deterministic tie-breaking;
+         * it is not a claim that one backend wins every phase and geometry.
+         * Real CPU/GPU kernels can cross over for small sparse batches, so the
+         * exact phase costs remain authoritative for the runtime objective.
+         */
+        PhaseServiceProfileView phaseServiceProfileView(
+            const MoERoutedExpertPlacementPlan &plan,
+            const MoERoutedExpertModelMetadata &metadata,
+            const MoERoutedTierServiceProfile *profile)
+        {
+            if (!profile)
+                return {};
+            if (profile->identity.empty())
+            {
+                throw std::invalid_argument(
+                    "MoE tier phase service profile requires a non-empty setup identity");
+            }
+            if (!validExpertHistogramProductionSourceMask(
+                    profile->active_sources))
+            {
+                throw std::invalid_argument(
+                    "MoE tier phase service profile has an invalid runtime phase mask");
+            }
+
+            PhaseServiceProfileView view;
+            view.profile = profile;
+            view.tier_count = static_cast<int>(plan.routed_tiers.size());
+            view.layer_count = metadata.num_layers;
+            const auto expected_rows =
+                static_cast<std::size_t>(view.tier_count) *
+                static_cast<std::size_t>(view.layer_count);
+            if (profile->costs.size() != expected_rows)
+            {
+                throw std::invalid_argument(
+                    "MoE tier phase service profile must contain exactly one row per tier and layer");
+            }
+            view.rows.assign(expected_rows, nullptr);
+            for (const auto &row : profile->costs)
+            {
+                if (row.tier_index < 0 || row.tier_index >= view.tier_count ||
+                    row.layer < 0 || row.layer >= view.layer_count)
+                {
+                    throw std::invalid_argument(
+                        "MoE tier phase service profile row lies outside plan geometry");
+                }
+                bool invalid_phase_cost = false;
+                for (std::size_t phase = 0;
+                     phase < kExpertHistogramProductionSourceCount;
+                     ++phase)
+                {
+                    const uint64_t value =
+                        row.nanoseconds_per_activation[phase];
+                    invalid_phase_cost = invalid_phase_cost ||
+                                         (profile->active_sources[phase]
+                                              ? value == 0
+                                              : value != 0);
+                }
+                if (invalid_phase_cost)
+                {
+                    throw std::invalid_argument(
+                        "MoE tier phase service times must be positive exactly for runtime-active phases");
+                }
+                const auto offset =
+                    static_cast<std::size_t>(row.tier_index) *
+                        static_cast<std::size_t>(view.layer_count) +
+                    static_cast<std::size_t>(row.layer);
+                if (view.rows[offset] != nullptr)
+                {
+                    throw std::invalid_argument(
+                        "MoE tier phase service profile repeats a tier/layer row");
+                }
+                view.rows[offset] = &row;
+            }
+            if (std::any_of(
+                    view.rows.begin(),
+                    view.rows.end(),
+                    [](const auto *row)
+                    { return row == nullptr; }))
+            {
+                throw std::invalid_argument(
+                    "MoE tier phase service profile omitted a tier/layer row");
+            }
+
+            return view;
+        }
+
+        HistogramEvidence histogramEvidence(
+            const MoERoutedExpertPlacementPlannerOptions &options)
+        {
+            if (options.decode_histogram && options.decode_histogram_window)
+            {
+                throw std::invalid_argument(
+                    "MoE placement planner accepts either a live or frozen histogram, not both");
+            }
+            return {
+                .live = options.decode_histogram,
+                .frozen = options.decode_histogram_window,
+            };
+        }
+
+        bool histogramLayerHasCounts(
+            const HistogramEvidence &histogram,
+            int layer,
+            int num_experts)
         {
             for (int expert_id = 0; expert_id < num_experts; ++expert_id)
             {
@@ -96,7 +314,10 @@ namespace llaminar2
             return false;
         }
 
-        std::vector<int> histogramExpertOrder(const DecodeExpertHistogram &histogram, int layer, int num_experts)
+        std::vector<int> histogramExpertOrder(
+            const HistogramEvidence &histogram,
+            int layer,
+            int num_experts)
         {
             std::vector<std::pair<int, uint64_t>> expert_counts;
             expert_counts.reserve(static_cast<size_t>(num_experts));
@@ -122,9 +343,22 @@ namespace llaminar2
 
         size_t tierCapacityPerLayer(
             const RoutedExpertTier &tier,
+            int layer,
             int num_experts,
             size_t routed_expert_bytes_per_expert)
         {
+            if (!tier.resolved_live_experts_per_layer.empty())
+            {
+                if (layer < 0 || static_cast<size_t>(layer) >=
+                                     tier.resolved_live_experts_per_layer.size())
+                {
+                    throw std::invalid_argument(
+                        "Resolved routed-tier quota does not cover requested layer");
+                }
+                return static_cast<size_t>(
+                    tier.resolved_live_experts_per_layer[
+                        static_cast<size_t>(layer)]);
+            }
             size_t capacity = static_cast<size_t>(num_experts);
             if (tier.max_experts_per_layer > 0)
             {
@@ -157,7 +391,11 @@ namespace llaminar2
             for (const int tier_idx : tier_indices)
             {
                 const auto &tier = plan.routed_tiers[tier_idx];
-                const size_t capacity = tierCapacityPerLayer(tier, metadata.num_experts, routed_expert_bytes_per_expert);
+                const size_t capacity = tierCapacityPerLayer(
+                    tier,
+                    layer,
+                    metadata.num_experts,
+                    routed_expert_bytes_per_expert);
                 size_t assigned = 0;
                 while (assigned < capacity && next_expert < expert_order.size())
                 {
@@ -176,6 +414,471 @@ namespace llaminar2
                 throw std::invalid_argument(message.str());
             }
 
+            return placement;
+        }
+
+        /** @brief Lexicographic exact objective used by fixed-quota assignment. */
+        struct ExactAssignmentCost
+        {
+            __int128 service_time_ns = 0;
+            int64_t moved_experts = 0;
+            int64_t expert_id_tie = 0;
+
+            friend bool operator<(
+                const ExactAssignmentCost &lhs,
+                const ExactAssignmentCost &rhs) noexcept
+            {
+                return std::tie(
+                           lhs.service_time_ns,
+                           lhs.moved_experts,
+                           lhs.expert_id_tie) <
+                       std::tie(
+                           rhs.service_time_ns,
+                           rhs.moved_experts,
+                           rhs.expert_id_tie);
+            }
+
+            friend bool operator==(
+                const ExactAssignmentCost &lhs,
+                const ExactAssignmentCost &rhs) noexcept = default;
+        };
+
+        /** @brief Checked component-wise addition for min-cost residual paths. */
+        ExactAssignmentCost addExactCost(
+            const ExactAssignmentCost &lhs,
+            const ExactAssignmentCost &rhs)
+        {
+            ExactAssignmentCost result;
+            if (__builtin_add_overflow(
+                    lhs.service_time_ns,
+                    rhs.service_time_ns,
+                    &result.service_time_ns) ||
+                __builtin_add_overflow(
+                    lhs.moved_experts,
+                    rhs.moved_experts,
+                    &result.moved_experts) ||
+                __builtin_add_overflow(
+                    lhs.expert_id_tie,
+                    rhs.expert_id_tie,
+                    &result.expert_id_tie))
+            {
+                throw std::overflow_error(
+                    "MoE exact tier-assignment objective overflowed");
+            }
+            return result;
+        }
+
+        /** @brief Checked additive inverse for one residual edge cost. */
+        ExactAssignmentCost negateExactCost(
+            const ExactAssignmentCost &value)
+        {
+            ExactAssignmentCost result;
+            if (__builtin_sub_overflow(
+                    static_cast<__int128>(0),
+                    value.service_time_ns,
+                    &result.service_time_ns) ||
+                __builtin_sub_overflow(
+                    static_cast<int64_t>(0),
+                    value.moved_experts,
+                    &result.moved_experts) ||
+                __builtin_sub_overflow(
+                    static_cast<int64_t>(0),
+                    value.expert_id_tie,
+                    &result.expert_id_tie))
+            {
+                throw std::overflow_error(
+                    "MoE exact tier-assignment residual objective overflowed");
+            }
+            return result;
+        }
+
+        /** @brief Build one non-negative exact phase-weighted service cost. */
+        __int128 phaseWeightedServiceTime(
+            const HistogramEvidence &histogram,
+            const PhaseServiceProfileView &profile,
+            int tier,
+            int layer,
+            int expert)
+        {
+            constexpr std::array<ExpertHistogramSource,
+                                 kExpertHistogramProductionSourceCount>
+                sources{
+                    ExpertHistogramSource::DecodeToken,
+                    ExpertHistogramSource::PrefillChunk,
+                    ExpertHistogramSource::GroupedVerifier,
+                };
+            constexpr unsigned __int128 kSigned128Max =
+                (~static_cast<unsigned __int128>(0)) >> 1;
+            unsigned __int128 total = 0;
+            for (const auto source : sources)
+            {
+                const auto demand = histogram.activationCount(
+                    source, layer, expert);
+                if (!profile.active(source))
+                {
+                    if (demand != 0)
+                    {
+                        throw std::logic_error(
+                            "MoE histogram contains demand for a runtime-disabled inference phase");
+                    }
+                    continue;
+                }
+                const auto service = profile.cost(
+                    tier, layer, source);
+                unsigned __int128 product = 0;
+                if (__builtin_mul_overflow(
+                        static_cast<unsigned __int128>(demand),
+                        static_cast<unsigned __int128>(service),
+                        &product) ||
+                    product > kSigned128Max - total)
+                {
+                    throw std::overflow_error(
+                        "MoE phase-weighted service objective overflowed signed 128-bit capacity");
+                }
+                total += product;
+            }
+            return static_cast<__int128>(total);
+        }
+
+        /** @brief Validate and index optional incumbent placements by layer. */
+        std::vector<const RoutedExpertLayerPlacement *> previousByLayer(
+            const MoERoutedExpertPlacementPlan &plan,
+            const MoERoutedExpertModelMetadata &metadata,
+            const MoERoutedTierRebalancerOptions &options)
+        {
+            std::vector<const RoutedExpertLayerPlacement *> result(
+                static_cast<std::size_t>(metadata.num_layers), nullptr);
+            if (options.previous_placements.empty())
+                return result;
+
+            for (const auto &placement : options.previous_placements)
+            {
+                if (placement.layer < 0 ||
+                    placement.layer >= metadata.num_layers ||
+                    placement.routed_expert_tier.size() !=
+                        static_cast<std::size_t>(metadata.num_experts))
+                {
+                    throw std::invalid_argument(
+                        "MoE previous placements do not match model geometry");
+                }
+                auto &slot = result.at(
+                    static_cast<std::size_t>(placement.layer));
+                if (slot != nullptr)
+                {
+                    throw std::invalid_argument(
+                        "MoE previous placements repeat a model layer");
+                }
+                for (const int tier : placement.routed_expert_tier)
+                {
+                    if (tier < 0 ||
+                        tier >= static_cast<int>(plan.routed_tiers.size()))
+                    {
+                        throw std::invalid_argument(
+                            "MoE previous placement references an unknown tier");
+                    }
+                }
+                slot = &placement;
+            }
+            if (std::any_of(
+                    result.begin(),
+                    result.end(),
+                    [](const auto *placement)
+                    { return placement == nullptr; }))
+            {
+                throw std::invalid_argument(
+                    "MoE previous placements must cover every model layer");
+            }
+            return result;
+        }
+
+        /**
+         * @brief Solve the exact phase-weighted fixed-quota assignment.
+         *
+         * This is a deterministic successive-shortest-path solver over the
+         * bipartite expert-to-tier graph. Primary cost is exact integer
+         * nanoseconds, secondary cost is the number of incumbent moves, and
+         * the final expert-id term assigns lower ids to more-preferred tiers.
+         * Reverse residual edges make the result globally optimal rather than
+         * a sequence of locally attractive swaps.
+         */
+        RoutedExpertLayerPlacement buildMinimumCostPlacement(
+            const MoERoutedExpertPlacementPlan &plan,
+            const MoERoutedExpertModelMetadata &metadata,
+            int layer,
+            const HistogramEvidence &histogram,
+            const PhaseServiceProfileView &profile,
+            const RoutedExpertLayerPlacement *previous,
+            size_t routed_expert_bytes_per_expert)
+        {
+            const auto quota_seed = buildPlacementFromExpertOrder(
+                plan,
+                metadata,
+                layer,
+                byIdExpertOrder(metadata.num_experts),
+                routed_expert_bytes_per_expert);
+            const int tier_count = static_cast<int>(plan.routed_tiers.size());
+            std::vector<int> quotas(static_cast<std::size_t>(tier_count), 0);
+            for (const int tier : quota_seed.routed_expert_tier)
+                ++quotas.at(static_cast<std::size_t>(tier));
+
+            std::vector<int> priority_order(
+                static_cast<std::size_t>(tier_count));
+            std::iota(priority_order.begin(), priority_order.end(), 0);
+            std::sort(
+                priority_order.begin(),
+                priority_order.end(),
+                [&](int lhs, int rhs)
+                {
+                    return plan.routed_tiers[static_cast<std::size_t>(lhs)]
+                               .priority <
+                           plan.routed_tiers[static_cast<std::size_t>(rhs)]
+                               .priority;
+                });
+            std::vector<int> priority_rank(
+                static_cast<std::size_t>(tier_count), -1);
+            for (int rank = 0; rank < tier_count; ++rank)
+            {
+                priority_rank[static_cast<std::size_t>(
+                    priority_order[static_cast<std::size_t>(rank)])] = rank;
+            }
+
+            struct ResidualEdge
+            {
+                int to = -1;
+                int reverse = -1;
+                int capacity = 0;
+                ExactAssignmentCost cost;
+                int assignment_tier = -1;
+            };
+            const int source = 0;
+            const int expert_begin = 1;
+            const int tier_begin = expert_begin + metadata.num_experts;
+            const int sink = tier_begin + tier_count;
+            const int node_count = sink + 1;
+            std::vector<std::vector<ResidualEdge>> graph(
+                static_cast<std::size_t>(node_count));
+            const auto add_edge = [&graph](
+                                      int from,
+                                      int to,
+                                      int capacity,
+                                      ExactAssignmentCost cost,
+                                      int assignment_tier = -1)
+            {
+                const int reverse_at_to =
+                    static_cast<int>(graph[static_cast<std::size_t>(to)].size());
+                const int reverse_at_from =
+                    static_cast<int>(graph[static_cast<std::size_t>(from)].size());
+                graph[static_cast<std::size_t>(from)].push_back({
+                    .to = to,
+                    .reverse = reverse_at_to,
+                    .capacity = capacity,
+                    .cost = cost,
+                    .assignment_tier = assignment_tier,
+                });
+                graph[static_cast<std::size_t>(to)].push_back({
+                    .to = from,
+                    .reverse = reverse_at_from,
+                    .capacity = 0,
+                    .cost = negateExactCost(cost),
+                    .assignment_tier = -1,
+                });
+            };
+
+            const ExactAssignmentCost zero;
+            for (int expert = 0; expert < metadata.num_experts; ++expert)
+            {
+                add_edge(source, expert_begin + expert, 1, zero);
+                for (int tier = 0; tier < tier_count; ++tier)
+                {
+                    const auto tie_value =
+                        static_cast<__int128>(expert) *
+                        static_cast<__int128>(
+                            tier_count - 1 -
+                            priority_rank[static_cast<std::size_t>(tier)]);
+                    if (tie_value >
+                        static_cast<__int128>(
+                            std::numeric_limits<int64_t>::max()))
+                    {
+                        throw std::overflow_error(
+                            "MoE deterministic expert-id assignment tie overflowed");
+                    }
+                    add_edge(
+                        expert_begin + expert,
+                        tier_begin + tier,
+                        1,
+                        {
+                            .service_time_ns = phaseWeightedServiceTime(
+                                histogram,
+                                profile,
+                                tier,
+                                layer,
+                                expert),
+                            .moved_experts =
+                                previous &&
+                                        previous->routed_expert_tier[
+                                            static_cast<std::size_t>(expert)] !=
+                                            tier
+                                    ? 1
+                                    : 0,
+                            .expert_id_tie =
+                                static_cast<int64_t>(tie_value),
+                        },
+                        tier);
+                }
+            }
+            for (int tier = 0; tier < tier_count; ++tier)
+            {
+                add_edge(
+                    tier_begin + tier,
+                    sink,
+                    quotas[static_cast<std::size_t>(tier)],
+                    zero);
+            }
+
+            std::vector<ExactAssignmentCost> potential(
+                static_cast<std::size_t>(node_count));
+            for (int flow = 0; flow < metadata.num_experts; ++flow)
+            {
+                struct QueueEntry
+                {
+                    ExactAssignmentCost distance;
+                    int node = -1;
+                };
+                struct QueueGreater
+                {
+                    bool operator()(
+                        const QueueEntry &lhs,
+                        const QueueEntry &rhs) const noexcept
+                    {
+                        if (rhs.distance < lhs.distance)
+                            return true;
+                        if (lhs.distance < rhs.distance)
+                            return false;
+                        return lhs.node > rhs.node;
+                    }
+                };
+
+                std::vector<std::optional<ExactAssignmentCost>> distance(
+                    static_cast<std::size_t>(node_count));
+                std::vector<int> previous_node(
+                    static_cast<std::size_t>(node_count), -1);
+                std::vector<int> previous_edge(
+                    static_cast<std::size_t>(node_count), -1);
+                std::priority_queue<
+                    QueueEntry,
+                    std::vector<QueueEntry>,
+                    QueueGreater>
+                    queue;
+                distance[static_cast<std::size_t>(source)] = zero;
+                queue.push({zero, source});
+
+                while (!queue.empty())
+                {
+                    const auto current = queue.top();
+                    queue.pop();
+                    const auto &known =
+                        distance[static_cast<std::size_t>(current.node)];
+                    if (!known || !(current.distance == *known))
+                        continue;
+                    const auto &edges =
+                        graph[static_cast<std::size_t>(current.node)];
+                    for (int edge_index = 0;
+                         edge_index < static_cast<int>(edges.size());
+                         ++edge_index)
+                    {
+                        const auto &edge =
+                            edges[static_cast<std::size_t>(edge_index)];
+                        if (edge.capacity <= 0)
+                            continue;
+                        auto reduced = addExactCost(
+                            edge.cost,
+                            potential[static_cast<std::size_t>(current.node)]);
+                        reduced = addExactCost(
+                            reduced,
+                            negateExactCost(
+                                potential[static_cast<std::size_t>(edge.to)]));
+                        if (reduced < zero)
+                        {
+                            throw std::logic_error(
+                                "MoE exact tier-assignment residual cost became negative");
+                        }
+                        const auto candidate = addExactCost(
+                            current.distance, reduced);
+                        auto &next_distance =
+                            distance[static_cast<std::size_t>(edge.to)];
+                        if (!next_distance || candidate < *next_distance)
+                        {
+                            next_distance = candidate;
+                            previous_node[static_cast<std::size_t>(edge.to)] =
+                                current.node;
+                            previous_edge[static_cast<std::size_t>(edge.to)] =
+                                edge_index;
+                            queue.push({candidate, edge.to});
+                        }
+                    }
+                }
+                if (!distance[static_cast<std::size_t>(sink)])
+                {
+                    throw std::logic_error(
+                        "MoE exact tier-assignment graph cannot satisfy fixed quotas");
+                }
+                for (int node = 0; node < node_count; ++node)
+                {
+                    const auto &node_distance =
+                        distance[static_cast<std::size_t>(node)];
+                    if (node_distance)
+                    {
+                        potential[static_cast<std::size_t>(node)] =
+                            addExactCost(
+                                potential[static_cast<std::size_t>(node)],
+                                *node_distance);
+                    }
+                }
+                for (int node = sink; node != source;)
+                {
+                    const int from =
+                        previous_node[static_cast<std::size_t>(node)];
+                    const int edge_index =
+                        previous_edge[static_cast<std::size_t>(node)];
+                    if (from < 0 || edge_index < 0)
+                    {
+                        throw std::logic_error(
+                            "MoE exact tier-assignment augmenting path is incomplete");
+                    }
+                    auto &edge = graph[static_cast<std::size_t>(from)]
+                                      [static_cast<std::size_t>(edge_index)];
+                    --edge.capacity;
+                    ++graph[static_cast<std::size_t>(node)]
+                           [static_cast<std::size_t>(edge.reverse)]
+                               .capacity;
+                    node = from;
+                }
+            }
+
+            RoutedExpertLayerPlacement placement;
+            placement.layer = layer;
+            placement.routed_expert_tier.assign(
+                static_cast<std::size_t>(metadata.num_experts), -1);
+            for (int expert = 0; expert < metadata.num_experts; ++expert)
+            {
+                for (const auto &edge :
+                     graph[static_cast<std::size_t>(expert_begin + expert)])
+                {
+                    if (edge.assignment_tier >= 0 && edge.capacity == 0)
+                    {
+                        placement.routed_expert_tier[
+                            static_cast<std::size_t>(expert)] =
+                            edge.assignment_tier;
+                        break;
+                    }
+                }
+                if (placement.routed_expert_tier[
+                        static_cast<std::size_t>(expert)] < 0)
+                {
+                    throw std::logic_error(
+                        "MoE exact tier-assignment omitted an expert");
+                }
+            }
             return placement;
         }
 
@@ -254,24 +957,63 @@ namespace llaminar2
             const MoERoutedExpertPlacementPlannerOptions &options,
             size_t routed_expert_bytes_per_expert)
         {
-            if (!options.decode_histogram)
+            const auto histogram = histogramEvidence(options);
+            if (!histogram)
                 return staticByIdPlacements(plan, metadata, routed_expert_bytes_per_expert);
 
-            const auto &histogram = *options.decode_histogram;
-            if (histogram.config().num_layers < metadata.num_layers || histogram.config().num_experts < metadata.num_experts)
+            if (histogram.numLayers() < metadata.num_layers ||
+                histogram.numExperts() < metadata.num_experts)
             {
                 throw std::invalid_argument("DecodeExpertHistogram shape is smaller than MoE expert planner model metadata");
             }
+
+            const auto service_profile = phaseServiceProfileView(
+                plan,
+                metadata,
+                options.phase_service_profile);
+            const auto previous = previousByLayer(
+                plan,
+                metadata,
+                options.rebalancer);
 
             std::vector<RoutedExpertLayerPlacement> placements;
             placements.reserve(static_cast<size_t>(metadata.num_layers));
             const auto by_id_order = byIdExpertOrder(metadata.num_experts);
             for (int layer = 0; layer < metadata.num_layers; ++layer)
             {
-                const auto expert_order = histogramLayerHasCounts(histogram, layer, metadata.num_experts)
-                                              ? histogramExpertOrder(histogram, layer, metadata.num_experts)
+                const bool has_counts = histogramLayerHasCounts(
+                    histogram, layer, metadata.num_experts);
+                if (has_counts && service_profile)
+                {
+                    placements.push_back(buildMinimumCostPlacement(
+                        plan,
+                        metadata,
+                        layer,
+                        histogram,
+                        service_profile,
+                        previous[static_cast<std::size_t>(layer)],
+                        routed_expert_bytes_per_expert));
+                    continue;
+                }
+                if (!has_counts &&
+                    previous[static_cast<std::size_t>(layer)] != nullptr)
+                {
+                    placements.push_back(
+                        *previous[static_cast<std::size_t>(layer)]);
+                    continue;
+                }
+                const auto expert_order = has_counts
+                                              ? histogramExpertOrder(
+                                                    histogram,
+                                                    layer,
+                                                    metadata.num_experts)
                                               : by_id_order;
-                placements.push_back(buildPlacementFromExpertOrder(plan, metadata, layer, expert_order, routed_expert_bytes_per_expert));
+                placements.push_back(buildPlacementFromExpertOrder(
+                    plan,
+                    metadata,
+                    layer,
+                    expert_order,
+                    routed_expert_bytes_per_expert));
             }
             return placements;
         }
@@ -343,7 +1085,7 @@ namespace llaminar2
         }
 
         // ---------------------------------------------------------------------------
-        // RoutedTierRebalanced: deterministic hot-cache placement with diagnostics
+        // RoutedTierRebalanced: deterministic demand-ranked placement with diagnostics
         // ---------------------------------------------------------------------------
 
         int findFallbackTierIndexRebalanced(const MoERoutedExpertPlacementPlan &plan)
@@ -355,7 +1097,7 @@ namespace llaminar2
             const MoERoutedExpertPlacementPlan &plan,
             const MoERoutedExpertModelMetadata &metadata,
             const RoutedExpertLayerPlacement &placement,
-            const DecodeExpertHistogram *histogram,
+            const HistogramEvidence &histogram,
             int layer,
             size_t routed_expert_bytes_per_expert)
         {
@@ -376,14 +1118,14 @@ namespace llaminar2
                     ++diag.tier_expert_counts[static_cast<size_t>(tier_idx)];
 
                 if (histogram)
-                    total_activations += histogram->activationCount(layer, expert_id);
+                    total_activations += histogram.activationCount(layer, expert_id);
 
                 const bool is_fallback = (tier_idx == fallback_tier) && (fallback_tier >= 0);
                 if (!is_fallback && tier_idx >= 0)
                 {
                     ++gpu_experts;
                     if (histogram)
-                        gpu_tier_activations += histogram->activationCount(layer, expert_id);
+                        gpu_tier_activations += histogram.activationCount(layer, expert_id);
                     diag.gpu_tier_memory_bytes += routed_expert_bytes_per_expert;
                 }
             }
@@ -418,17 +1160,34 @@ namespace llaminar2
             const MoERoutedExpertPlacementPlannerOptions &options,
             size_t routed_expert_bytes_per_expert)
         {
-            const DecodeExpertHistogram *histogram = options.decode_histogram;
+            const auto histogram = histogramEvidence(options);
 
-            if (histogram && (histogram->config().num_layers < metadata.num_layers ||
-                              histogram->config().num_experts < metadata.num_experts))
+            if (histogram &&
+                (histogram.numLayers() < metadata.num_layers ||
+                 histogram.numExperts() < metadata.num_experts))
             {
                 throw std::invalid_argument("DecodeExpertHistogram shape is smaller than MoE expert planner model metadata");
             }
 
+            const auto service_profile = phaseServiceProfileView(
+                plan,
+                metadata,
+                options.phase_service_profile);
+            const auto previous = previousByLayer(
+                plan,
+                metadata,
+                options.rebalancer);
+
             RoutedTierRebalancedResult result;
             result.placements.reserve(static_cast<size_t>(metadata.num_layers));
-            result.diagnostics.histogram_used = (histogram != nullptr);
+            result.diagnostics.histogram_used = static_cast<bool>(histogram);
+            result.diagnostics.phase_service_profile_used =
+                static_cast<bool>(service_profile);
+            if (service_profile)
+            {
+                result.diagnostics.phase_service_profile_identity =
+                    service_profile.profile->identity;
+            }
 
             const auto by_id_order = byIdExpertOrder(metadata.num_experts);
 
@@ -438,12 +1197,41 @@ namespace llaminar2
 
             for (int layer = 0; layer < metadata.num_layers; ++layer)
             {
-                const auto expert_order = (histogram && histogramLayerHasCounts(*histogram, layer, metadata.num_experts))
-                                              ? histogramExpertOrder(*histogram, layer, metadata.num_experts)
-                                              : by_id_order;
-
-                auto placement = buildPlacementFromExpertOrder(
-                    plan, metadata, layer, expert_order, routed_expert_bytes_per_expert);
+                const bool has_counts = histogram && histogramLayerHasCounts(
+                    histogram, layer, metadata.num_experts);
+                RoutedExpertLayerPlacement placement;
+                if (has_counts && service_profile)
+                {
+                    placement = buildMinimumCostPlacement(
+                        plan,
+                        metadata,
+                        layer,
+                        histogram,
+                        service_profile,
+                        previous[static_cast<std::size_t>(layer)],
+                        routed_expert_bytes_per_expert);
+                }
+                else if (!has_counts &&
+                         previous[static_cast<std::size_t>(layer)] != nullptr)
+                {
+                    placement =
+                        *previous[static_cast<std::size_t>(layer)];
+                }
+                else
+                {
+                    const auto expert_order = has_counts
+                                                  ? histogramExpertOrder(
+                                                        histogram,
+                                                        layer,
+                                                        metadata.num_experts)
+                                                  : by_id_order;
+                    placement = buildPlacementFromExpertOrder(
+                        plan,
+                        metadata,
+                        layer,
+                        expert_order,
+                        routed_expert_bytes_per_expert);
+                }
                 result.placements.push_back(placement);
 
                 auto layer_diag = buildLayerDiagnostics(

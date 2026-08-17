@@ -39,11 +39,29 @@ namespace llaminar2
         uint8_t allocation_payload_bytes_per_block = 0;
         uint8_t allocation_has_mins = 0;
         uint8_t allocation_has_emins = 0;
+        uint8_t source_codebook_id = 0; ///< Original GGUF arithmetic-policy codebook.
+        uint8_t source_is_superblock = 0; ///< Original source block-family discriminator.
+        uint8_t source_identity_present = 0; ///< Whether the two source fields are authoritative.
+        uint8_t reserved = 0;             ///< Reserved ABI byte; producers write zero.
+        uint32_t reserved_tail = 0;       ///< Explicit tail padding for byte-stable publication.
 
         /** @return Whether the descriptor names a minimally valid matrix. */
         [[nodiscard]] constexpr bool valid() const noexcept
         {
             return payload && scales && n > 0 && k > 0 && blocks_per_row > 0;
+        }
+
+        /**
+         * @brief Return the codebook whose FP32 reduction tree must be retained.
+         *
+         * CPU-tier promotion can normalize several compact formats into one
+         * expanded accelerator representation. The execution codebook selects
+         * the decoder, while the source codebook keeps migration from changing
+         * split-K partition boundaries and therefore output bits mid-request.
+         */
+        [[nodiscard]] constexpr uint8_t arithmeticPolicyCodebookId() const noexcept
+        {
+            return source_identity_present ? source_codebook_id : codebook_id;
         }
     };
 
@@ -53,4 +71,7 @@ namespace llaminar2
     static_assert(
         std::is_trivially_copyable_v<DeviceNativeVNNIMatrixDesc>,
         "NativeVNNI device descriptors must remain directly uploadable");
+    static_assert(
+        sizeof(DeviceNativeVNNIMatrixDesc) == 56,
+        "NativeVNNI device descriptors must retain the backend ABI size");
 } // namespace llaminar2

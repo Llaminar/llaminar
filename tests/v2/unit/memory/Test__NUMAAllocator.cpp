@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 #include "memory/NUMAAllocator.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -181,6 +182,37 @@ TEST(Test__NUMAAllocator, AllocateAndTouchZeroInit)
     }
 
     allocator.free(ptr, size);
+}
+
+TEST(Test__NUMAAllocator, BindUntouchedExternalRangeControlsFirstTouch)
+{
+    NUMAAllocator &allocator = NUMAAllocator::instance();
+    if (!allocator.isNUMAAvailable())
+        GTEST_SKIP() << "NUMA policy APIs are unavailable";
+
+    constexpr size_t page_size = 4096;
+    constexpr size_t bytes = 3 * page_size;
+    void *ptr = std::aligned_alloc(page_size, bytes);
+    ASSERT_NE(ptr, nullptr);
+
+    const int target_node = allocator.getCurrentNUMANode();
+    ASSERT_GE(target_node, 0);
+    ASSERT_TRUE(allocator.bindUntouchedExternalRangeToNode(
+        ptr, bytes, target_node));
+
+    // Simulate a transport overwriting the final receive allocation only after
+    // its policy has been installed.
+    std::memset(ptr, 0xA5, bytes);
+    const auto *data = static_cast<const uint8_t *>(ptr);
+    for (size_t offset = 0; offset < bytes; offset += page_size)
+    {
+        EXPECT_EQ(
+            allocator.getNUMANodeForAddress(data + offset),
+            target_node)
+            << "page offset " << offset << " ignored the receive policy";
+    }
+
+    std::free(ptr);
 }
 
 // ============================================================================

@@ -109,37 +109,13 @@ namespace llaminar2
     extern "C" bool hip_tq_quantize_grouped_ring_dynamic(
         const float *d_k_input, const float *d_v_input,
         const float *d_rotations,
-        void *d_k_ring, void *d_v_ring,
-        const int *d_ring_head, const int *d_row_count, int max_seq_len,
+        void *d_k_ring, void *d_v_ring, float *d_k_anchor,
+        const int *d_ring_head, const int *d_cached_count,
+        const int *d_row_count, int max_seq_len,
         int verifier_rows, int n_kv_heads, int head_dim,
         bool k_head_major, bool v_head_major,
         TurboQuantKVMode mode,
-        hipStream_t stream);
-
-    /** @brief Publish prepared device TQ8-K/TQ4-V rows in one D2D kernel. */
-    extern "C" bool hip_tq_copy_prepared_rows_ring(
-        const void *source_k, const void *source_v,
-        void *ring_k, void *ring_v,
-        int ring_head, int max_seq_len, int rows,
-        size_t k_row_bytes, size_t v_row_bytes,
-        bool k_head_major, bool v_head_major,
-        int n_kv_heads,
-        hipStream_t stream);
-
-    /**
-     * @brief Device-head graph-capture variant of prepared TQ row publication.
-     *
-     * @p d_row_count optionally limits fixed bucket geometry to the request's
-     * real resident row count.
-     */
-    extern "C" bool hip_tq_copy_prepared_rows_ring_dynamic(
-        const void *source_k, const void *source_v,
-        void *ring_k, void *ring_v,
-        const int *d_ring_head, const int *d_row_count,
-        int max_seq_len, int rows,
-        size_t k_row_bytes, size_t v_row_bytes,
-        bool k_head_major, bool v_head_major,
-        int n_kv_heads,
+        AttentionKeyAnchorPolicy anchor_policy,
         hipStream_t stream);
 
     // =========================================================================
@@ -237,6 +213,7 @@ namespace llaminar2
     extern "C" bool hip_tq_ring_linearize_dequant_fp16(
         _Float16 *d_K_out, _Float16 *d_V_out,
         const void *d_K_cache, const void *d_V_cache,
+        const float *d_K_anchor,
         const float *d_K_rotations_t, const float *d_V_rotations_t,
         const float *d_K_rotations, const float *d_V_rotations,
         int tail, int count, int max_seq_len,
@@ -256,6 +233,7 @@ namespace llaminar2
         _Float16 *d_V_out,
         const void *const *d_K_entry_table,
         const void *const *d_V_entry_table,
+        const void *const *d_K_anchor_table,
         const int *d_heads,
         const int *d_counts,
         const float *d_rotations,

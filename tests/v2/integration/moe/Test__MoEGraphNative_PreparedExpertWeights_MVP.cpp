@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -114,12 +115,13 @@ namespace llaminar2::test
                           TensorBase *routing_weights,
                           const ExpertWeights &weights,
                           TensorBase *output,
-                          std::vector<bool> expert_mask = {true, true, true, true})
+                          std::vector<bool> expert_mask = {true, true, true, true},
+                          int seq_len = kSeqLen)
         {
             MoEExpertComputeStage::Params params;
             params.device_id = DeviceId::cpu();
             params.input = input;
-            params.seq_len = kSeqLen;
+            params.seq_len = seq_len;
             params.d_model = kDModel;
             params.num_experts = kNumExperts;
             params.top_k = kTopK;
@@ -272,6 +274,7 @@ namespace llaminar2::test
             sp.top_k = kTopK;
             sp.d_model = kDModel;
             sp.tier_dispatch = &dispatch.tiers[0];
+            sp.fixed_residency_epoch = dispatch.residency_epoch;
             sp.inbound_rows = &inbound_dispatch;
             MoESparseDispatchStage ss(std::move(sp));
             ASSERT_TRUE(ss.execute(cpu_ctx_.get()));
@@ -440,6 +443,7 @@ namespace llaminar2::test
             sp.top_k = kTopK;
             sp.d_model = kDModel;
             sp.tier_dispatch = &dispatch.tiers[0];
+            sp.fixed_residency_epoch = dispatch.residency_epoch;
             sp.inbound_rows = &inbound_dispatch;
             MoESparseDispatchStage ss(std::move(sp));
             ASSERT_TRUE(ss.execute(cpu_ctx_.get()));
@@ -505,6 +509,245 @@ namespace llaminar2::test
         }
 
         expectTensorNear(overlay_output.get(), reference_output.get());
+    }
+
+    TEST_F(Test__MoEGraphNative_PreparedExpertWeights_MVP,
+           FixedCapacityTicketProtocolReusesCPUStagesAcrossLogicalPrefixes)
+    {
+        constexpr int bucket_rows = 5;
+        auto weights = makeWeights();
+        auto ticket_storage =
+            std::make_shared<MoEOverlayDispatchTicketStorage>();
+        ticket_storage->bindFixedCapacity(
+            kLayer,
+            bucket_rows,
+            kTopK,
+            kDModel,
+            DeviceId::cpu(),
+            /*workspace_generation=*/61);
+
+        auto &ticket = ticket_storage->ticket();
+        auto *const header_address = ticket.header;
+        auto *const hidden_address = ticket.hidden_rows_fp32;
+        auto *const return_address = ticket.return_rows_fp32;
+
+        MoEOverlayCollectiveWorkspace workspace;
+        workspace.ensureCapacity(
+            bucket_rows,
+            bucket_rows * kTopK,
+            kDModel,
+            kTopK,
+            DeviceId::cpu());
+        workspace.resetForStep(61, 0);
+        MoEOverlayLocalSparseCollectiveContext collective(
+            {.participant_count = 1, .slot_count = 8});
+
+        MoEExpertDispatchOutput dispatch;
+        MoEExpertDispatchStage::Params dispatch_params;
+        dispatch_params.device_id = DeviceId::cpu();
+        dispatch_params.ticket_storage = ticket_storage;
+        dispatch_params.seq_len = bucket_rows;
+        dispatch_params.top_k = kTopK;
+        dispatch_params.d_model = kDModel;
+        dispatch_params.continuation_domain = "local";
+        dispatch_params.placement = RoutedExpertLayerPlacement{
+            .layer = kLayer,
+            .routed_expert_tier = {0, 0, 0, 0}};
+        dispatch_params.routed_tiers = {routedTier("local", "local")};
+        dispatch_params.output = &dispatch;
+        MoEExpertDispatchStage dispatch_stage(std::move(dispatch_params));
+        ASSERT_TRUE(dispatch_stage.requiresHostGraphTicketFence());
+        ASSERT_TRUE(dispatch_stage.bufferContract().inputs.empty());
+
+        auto inbound_dispatch = workspace.dispatchReceive(kLayer, 0);
+        MoESparseDispatchStage::Params sparse_params;
+        sparse_params.device_id = DeviceId::cpu();
+        sparse_params.collective_context = &collective;
+        sparse_params.workspace = &workspace;
+        sparse_params.key = keyFor(
+            0,
+            MoEOverlayCollectiveDirection::Dispatch,
+            501);
+        sparse_params.source_participant = 0;
+        sparse_params.target_participant = 0;
+        sparse_params.seq_len = bucket_rows;
+        sparse_params.top_k = kTopK;
+        sparse_params.d_model = kDModel;
+        sparse_params.tier_index = 0;
+        sparse_params.ticket_storage = ticket_storage;
+        sparse_params.dispatch_output = &dispatch;
+        sparse_params.inbound_rows = &inbound_dispatch;
+        MoESparseDispatchStage sparse_stage(std::move(sparse_params));
+        ASSERT_TRUE(sparse_stage.requiresHostGraphTicketFence());
+        ASSERT_TRUE(sparse_stage.bufferContract().inputs.empty());
+
+        MoEExpertComputeStage::Params prep;
+        prep.device_id = DeviceId::cpu();
+        prep.num_experts = kNumExperts;
+        prep.top_k = kTopK;
+        prep.d_model = kDModel;
+        prep.expert_intermediate = kIntermediate;
+        prep.layer_idx = kLayer;
+        prep.gate_exps = weights.gate.get();
+        prep.up_exps = weights.up.get();
+        prep.down_exps = weights.down.get();
+        prep.expert_mask = {true, true, true, true};
+        ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(prep));
+        ASSERT_TRUE(MoEExpertComputeStage::prepareExpertGemmEngines(prep));
+
+        auto local_output = workspace.localExpertOutput(kLayer, 0);
+        MoELocalExpertStage::Params local_params;
+        local_params.device_id = DeviceId::cpu();
+        local_params.input_rows = &inbound_dispatch;
+        local_params.output_rows = &local_output;
+        local_params.num_experts = kNumExperts;
+        local_params.top_k = kTopK;
+        local_params.d_model = kDModel;
+        local_params.expert_intermediate = kIntermediate;
+        local_params.layer_idx = kLayer;
+        local_params.expert_mask = {true, true, true, true};
+        local_params.prepared_gate_gemm = std::move(prep.prepared_gate_gemm);
+        local_params.prepared_up_gemm = std::move(prep.prepared_up_gemm);
+        local_params.prepared_down_gemm = std::move(prep.prepared_down_gemm);
+        local_params.moe_owned_kernels = std::move(prep.moe_owned_kernels);
+        MoELocalExpertStage local_stage(std::move(local_params));
+
+        auto inbound_return = workspace.returnReceive(kLayer, 0);
+        MoESparseReturnReduceStage::Params return_params;
+        return_params.device_id = DeviceId::cpu();
+        return_params.collective_context = &collective;
+        return_params.key = keyFor(
+            0,
+            MoEOverlayCollectiveDirection::ReturnReduce,
+            601);
+        return_params.source_participant = 0;
+        return_params.target_participant = 0;
+        return_params.outbound_rows = &local_output;
+        return_params.inbound_rows = &inbound_return;
+        return_params.ticket_storage = ticket_storage;
+        return_params.publish_ticket_completion = true;
+        return_params.seq_len = bucket_rows;
+        return_params.d_model = kDModel;
+        return_params.clear_output_before_scatter = true;
+        MoESparseReturnReduceStage return_stage(std::move(return_params));
+        ASSERT_TRUE(return_stage.bufferContract().outputs.empty());
+
+        const auto run_transaction = [&](int logical_rows, float offset)
+        {
+            auto hidden = fp32(
+                {static_cast<size_t>(logical_rows), kDModel});
+            auto routing_indices = fp32(
+                {static_cast<size_t>(logical_rows), kTopK});
+            auto routing_weights = fp32(
+                {static_cast<size_t>(logical_rows), kTopK});
+            for (int row = 0; row < logical_rows; ++row)
+            {
+                for (int col = 0; col < kDModel; ++col)
+                {
+                    hidden->mutable_data()[
+                        static_cast<size_t>(row) * kDModel + col] =
+                        offset + 0.05f * static_cast<float>(row + 1) +
+                        0.01f * static_cast<float>(col + 1);
+                }
+                routing_indices->mutable_data()[
+                    static_cast<size_t>(row) * kTopK] =
+                    static_cast<float>((row * 2) % kNumExperts);
+                routing_indices->mutable_data()[
+                    static_cast<size_t>(row) * kTopK + 1] =
+                    static_cast<float>((row * 2 + 1) % kNumExperts);
+                routing_weights->mutable_data()[
+                    static_cast<size_t>(row) * kTopK] = 0.65f;
+                routing_weights->mutable_data()[
+                    static_cast<size_t>(row) * kTopK + 1] = 0.35f;
+            }
+
+            std::fill_n(
+                ticket.routing_indices_fp32,
+                bucket_rows * kTopK,
+                99.0f);
+            std::fill_n(
+                ticket.routing_weights_fp32,
+                bucket_rows * kTopK,
+                std::numeric_limits<float>::quiet_NaN());
+            std::fill_n(
+                ticket.hidden_rows_fp32,
+                bucket_rows * kDModel,
+                std::numeric_limits<float>::quiet_NaN());
+            std::copy_n(
+                routing_indices->data(),
+                logical_rows * kTopK,
+                ticket.routing_indices_fp32);
+            std::copy_n(
+                routing_weights->data(),
+                logical_rows * kTopK,
+                ticket.routing_weights_fp32);
+            std::copy_n(
+                hidden->data(),
+                logical_rows * kDModel,
+                ticket.hidden_rows_fp32);
+            ticket.header->logical_row_count = logical_rows;
+
+            auto reference = fp32(
+                {static_cast<size_t>(logical_rows), kDModel});
+            ASSERT_TRUE(runReference(
+                cpu_ctx_.get(),
+                hidden.get(),
+                routing_indices.get(),
+                routing_weights.get(),
+                weights,
+                reference.get(),
+                {true, true, true, true},
+                logical_rows));
+
+            ASSERT_TRUE(dispatch_stage.execute(cpu_ctx_.get()));
+            ASSERT_EQ(dispatch.logical_seq_len, logical_rows);
+            ASSERT_TRUE(sparse_stage.execute(cpu_ctx_.get()));
+            ASSERT_EQ(
+                inbound_dispatch.live_row_count,
+                static_cast<size_t>(logical_rows));
+            ASSERT_TRUE(local_stage.execute(cpu_ctx_.get()));
+            ASSERT_TRUE(return_stage.execute(cpu_ctx_.get()));
+            ASSERT_TRUE(return_stage.manualGraphBoundaryComplete());
+            ASSERT_TRUE(ticket.returnPayloadReady());
+
+            for (int row = 0; row < logical_rows; ++row)
+            {
+                for (int col = 0; col < kDModel; ++col)
+                {
+                    const size_t index =
+                        static_cast<size_t>(row) * kDModel + col;
+                    EXPECT_NEAR(
+                        ticket.return_rows_fp32[index],
+                        reference->data()[index],
+                        1e-4f)
+                        << "row=" << row << " col=" << col;
+                }
+            }
+            for (int row = logical_rows; row < bucket_rows; ++row)
+            {
+                for (int col = 0; col < kDModel; ++col)
+                {
+                    EXPECT_FLOAT_EQ(
+                        ticket.return_rows_fp32[
+                            static_cast<size_t>(row) * kDModel + col],
+                        0.0f)
+                        << "padding row=" << row << " col=" << col;
+                }
+            }
+        };
+
+        run_transaction(/*logical_rows=*/3, /*offset=*/0.0f);
+        workspace.resetForStep(61, 1);
+        run_transaction(/*logical_rows=*/2, /*offset=*/0.4f);
+
+        EXPECT_EQ(ticket.header, header_address);
+        EXPECT_EQ(ticket.hidden_rows_fp32, hidden_address);
+        EXPECT_EQ(ticket.return_rows_fp32, return_address);
+        EXPECT_TRUE(ticket_storage->hasValidBoundIdentity());
+
+        ticket.header->workspace_generation = 62;
+        EXPECT_FALSE(dispatch_stage.execute(cpu_ctx_.get()));
+        EXPECT_FALSE(ticket_storage->hasValidBoundIdentity());
     }
 
 } // namespace llaminar2::test

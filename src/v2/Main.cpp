@@ -4,6 +4,7 @@
  */
 
 #include "app/AppLifecycle.h"
+#include "utils/DebugEnv.h"
 #include <cstdlib>
 #include <unistd.h>
 #include <iostream>
@@ -17,7 +18,8 @@ int main(int argc, char *argv[])
     std::cout.flush();
     std::cerr.flush();
 
-    if (result == 0)
+    if (result == 0 &&
+        !llaminar2::debugEnv().runtime_debug.profiler_normal_exit)
     {
         // Skip C++ static destructors via _exit() to avoid RCCL/ROCm CLR bugs.
         // RCCL's internal atexit handler segfaults when cleaning up communicators
@@ -26,5 +28,8 @@ int main(int argc, char *argv[])
         // up by this point — the OS reclaims the rest.
         _exit(0);
     }
+    /* Profilers flush process-owned trace buffers from normal-exit handlers.
+     * This opt-in diagnostic path is deliberately never selected implicitly:
+     * the ordinary ROCm/RCCL lifecycle keeps the proven `_exit(0)` policy. */
     return result;
 }

@@ -910,7 +910,6 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_UsesUnifiedDecodeBoundaryMaint
         .WillByDefault(Return(false));
 
     EXPECT_CALL(*runner_, clearCache()).Times(2);
-    EXPECT_CALL(*runner_, usesDeviceSideMoERebalanceController()).Times(0);
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(42, true)));
     EXPECT_CALL(*runner_, maybeApplyMoERebalance())
@@ -2334,7 +2333,6 @@ TEST_F(Test__ChatCompletionHandler, Streaming_UsesUnifiedDecodeBoundaryMaintenan
     ON_CALL(*tokenizer_, is_stop_token(_))
         .WillByDefault(Return(false));
 
-    EXPECT_CALL(*runner_, usesDeviceSideMoERebalanceController()).Times(0);
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(1, true)));
     EXPECT_CALL(*runner_, maybeApplyMoERebalance())

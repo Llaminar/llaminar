@@ -5,6 +5,8 @@
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
 
+#include "backends/BackendManager.h"
+#include "backends/IBackend.h"
 #include "interfaces/IMPIContext.h"
 
 #include <algorithm>
@@ -19,10 +21,260 @@
 
 namespace llaminar2
 {
+    bool MoEOverlayDispatchTicketHeader::isValid() const noexcept
+    {
+        if (magic != kMagic || abi_version != kABIVersion ||
+            workspace_generation == 0 || layer_idx < 0 ||
+            bucket_row_capacity <= 0 || top_k <= 0 || d_model <= 0 ||
+            logical_row_count <= 0 ||
+            logical_row_count > bucket_row_capacity ||
+            return_logical_row_count < 0 ||
+            return_logical_row_count > bucket_row_capacity)
+        {
+            return false;
+        }
+
+        const uint64_t expected_routes =
+            static_cast<uint64_t>(bucket_row_capacity) *
+            static_cast<uint64_t>(top_k);
+        return expected_routes <=
+                   static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) &&
+               route_capacity == static_cast<int32_t>(expected_routes) &&
+               source_device_kind >=
+                   static_cast<int32_t>(DeviceType::CPU) &&
+               source_device_kind <=
+                   static_cast<int32_t>(DeviceType::ROCm) &&
+               source_device_ordinal >= 0;
+    }
+
+    bool MoEOverlayDispatchTicket::isValid() const noexcept
+    {
+        return header && header->isValid() && routing_indices_fp32 &&
+               routing_weights_fp32 && hidden_rows_fp32 && return_rows_fp32;
+    }
+
+    bool MoEOverlayDispatchTicket::returnPayloadReady() const noexcept
+    {
+        return isValid() &&
+               header->return_logical_row_count ==
+                   header->logical_row_count;
+    }
+
+    namespace
+    {
+        size_t checkedTicketProduct(
+            size_t lhs,
+            size_t rhs,
+            const char *description)
+        {
+            if (lhs != 0 &&
+                rhs > std::numeric_limits<size_t>::max() / lhs)
+            {
+                throw std::overflow_error(
+                    std::string("MoE overlay ticket ") + description +
+                    " size overflow");
+            }
+            return lhs * rhs;
+        }
+
+        size_t checkedTicketAdd(
+            size_t lhs,
+            size_t rhs,
+            const char *description)
+        {
+            if (rhs > std::numeric_limits<size_t>::max() - lhs)
+            {
+                throw std::overflow_error(
+                    std::string("MoE overlay ticket ") + description +
+                    " size overflow");
+            }
+            return lhs + rhs;
+        }
+
+        size_t alignTicketOffset(size_t offset, size_t alignment)
+        {
+            const size_t remainder = offset % alignment;
+            return remainder == 0
+                       ? offset
+                       : checkedTicketAdd(
+                             offset,
+                             alignment - remainder,
+                             "alignment");
+        }
+    } // namespace
+
+    MoEOverlayDispatchTicketStorage::~MoEOverlayDispatchTicketStorage()
+    {
+        release();
+    }
+
+    void MoEOverlayDispatchTicketStorage::release() noexcept
+    {
+        if (backend_pinned_ && allocation_ && backend_ &&
+            source_device_.is_gpu())
+        {
+            backend_->freePinned(
+                allocation_, source_device_.gpu_ordinal());
+        }
+        cpu_storage_.clear();
+        allocation_ = nullptr;
+        allocation_bytes_ = 0;
+        backend_ = nullptr;
+        backend_pinned_ = false;
+        source_device_ = DeviceId::cpu();
+        layer_idx_ = -1;
+        bucket_rows_ = 0;
+        top_k_ = 0;
+        d_model_ = 0;
+        workspace_generation_ = 0;
+        ticket_ = {};
+    }
+
+    void MoEOverlayDispatchTicketStorage::bindFixedCapacity(
+        int layer_idx,
+        int bucket_rows,
+        int top_k,
+        int d_model,
+        DeviceId source_device,
+        uint64_t workspace_generation)
+    {
+        if (layer_idx < 0 || bucket_rows <= 0 || top_k <= 0 ||
+            d_model <= 0 || !source_device.is_valid() ||
+            workspace_generation == 0)
+        {
+            throw std::invalid_argument(
+                "MoE overlay dispatch ticket requires valid layer, geometry, "
+                "source device, and workspace generation");
+        }
+        if (allocation_)
+        {
+            throw std::logic_error(
+                "MoE overlay dispatch ticket capacity is immutable after binding");
+        }
+
+        const size_t row_count = static_cast<size_t>(bucket_rows);
+        const size_t route_count = checkedTicketProduct(
+            row_count, static_cast<size_t>(top_k), "route capacity");
+        if (route_count >
+            static_cast<size_t>(std::numeric_limits<int32_t>::max()))
+        {
+            throw std::invalid_argument(
+                "MoE overlay dispatch ticket route capacity exceeds INT32 ABI");
+        }
+        const size_t hidden_count = checkedTicketProduct(
+            row_count, static_cast<size_t>(d_model), "hidden capacity");
+
+        size_t offset = sizeof(MoEOverlayDispatchTicketHeader);
+        offset = alignTicketOffset(offset, alignof(float));
+        const size_t routing_indices_offset = offset;
+        offset = checkedTicketAdd(
+            offset,
+            checkedTicketProduct(route_count, sizeof(float), "route ids"),
+            "route ids");
+        offset = alignTicketOffset(offset, alignof(float));
+        const size_t routing_weights_offset = offset;
+        offset = checkedTicketAdd(
+            offset,
+            checkedTicketProduct(route_count, sizeof(float), "route weights"),
+            "route weights");
+        offset = alignTicketOffset(offset, alignof(float));
+        const size_t hidden_offset = offset;
+        offset = checkedTicketAdd(
+            offset,
+            checkedTicketProduct(hidden_count, sizeof(float), "hidden rows"),
+            "hidden rows");
+        offset = alignTicketOffset(offset, alignof(float));
+        const size_t return_rows_offset = offset;
+        offset = checkedTicketAdd(
+            offset,
+            checkedTicketProduct(hidden_count, sizeof(float), "return rows"),
+            "return rows");
+        allocation_bytes_ = offset;
+
+        if (source_device.is_gpu())
+        {
+            backend_ = getBackendFor(source_device);
+            if (!backend_)
+            {
+                throw std::runtime_error(
+                    "MoE overlay dispatch ticket has no backend for " +
+                    source_device.toString());
+            }
+            allocation_ = backend_->allocatePinned(
+                allocation_bytes_, source_device.gpu_ordinal());
+            if (!allocation_)
+            {
+                throw std::runtime_error(
+                    "MoE overlay dispatch ticket pinned allocation failed for " +
+                    source_device.toString());
+            }
+            backend_pinned_ = true;
+        }
+        else
+        {
+            const size_t words =
+                (allocation_bytes_ + sizeof(std::max_align_t) - 1u) /
+                sizeof(std::max_align_t);
+            cpu_storage_.resize(words);
+            allocation_ = cpu_storage_.data();
+        }
+
+        std::memset(allocation_, 0, allocation_bytes_);
+        auto *const base = static_cast<std::byte *>(allocation_);
+        ticket_.header =
+            reinterpret_cast<MoEOverlayDispatchTicketHeader *>(base);
+        ticket_.routing_indices_fp32 = reinterpret_cast<float *>(
+            base + routing_indices_offset);
+        ticket_.routing_weights_fp32 = reinterpret_cast<float *>(
+            base + routing_weights_offset);
+        ticket_.hidden_rows_fp32 = reinterpret_cast<float *>(
+            base + hidden_offset);
+        ticket_.return_rows_fp32 = reinterpret_cast<float *>(
+            base + return_rows_offset);
+
+        *ticket_.header = MoEOverlayDispatchTicketHeader{
+            .magic = MoEOverlayDispatchTicketHeader::kMagic,
+            .abi_version = MoEOverlayDispatchTicketHeader::kABIVersion,
+            .workspace_generation = workspace_generation,
+            .residency_epoch = 0,
+            .layer_idx = layer_idx,
+            .bucket_row_capacity = bucket_rows,
+            .route_capacity = static_cast<int32_t>(route_count),
+            .top_k = top_k,
+            .d_model = d_model,
+            .logical_row_count = bucket_rows,
+            .return_logical_row_count = 0,
+            .source_device_kind = static_cast<int32_t>(source_device.type),
+            .source_device_ordinal = source_device.ordinal,
+        };
+        source_device_ = source_device;
+        layer_idx_ = layer_idx;
+        bucket_rows_ = bucket_rows;
+        top_k_ = top_k;
+        d_model_ = d_model;
+        workspace_generation_ = workspace_generation;
+    }
+
+    bool MoEOverlayDispatchTicketStorage::hasValidBoundIdentity() const noexcept
+    {
+        if (!allocation_ || !ticket_.isValid() || !ticket_.header)
+            return false;
+        const auto &header = *ticket_.header;
+        return header.layer_idx == layer_idx_ &&
+               header.bucket_row_capacity == bucket_rows_ &&
+               header.top_k == top_k_ &&
+               header.d_model == d_model_ &&
+               header.workspace_generation == workspace_generation_ &&
+               header.source_device_kind ==
+                   static_cast<int32_t>(source_device_.type) &&
+               header.source_device_ordinal == source_device_.ordinal;
+    }
+
     namespace
     {
         constexpr uint32_t kPacketMagic = 0x32454f4dU; // "MOE2"
-        constexpr uint32_t kPacketVersion = 2;
+        /* Version 4 makes the typed inference phase part of the wire identity. */
+        constexpr uint32_t kPacketVersion = 4;
         constexpr uint8_t kPacketKindDispatch = 1;
         constexpr uint8_t kPacketKindReturn = 2;
 
@@ -50,6 +302,7 @@ namespace llaminar2
         {
             std::ostringstream ss;
             ss << static_cast<int>(key.key_namespace) << ':'
+               << static_cast<int>(key.histogram_source) << ':'
                << key.generation_id << ':'
                << key.step_id << ':'
                << key.mtp_depth << ':'
@@ -107,6 +360,13 @@ namespace llaminar2
                     *error = "sparse payload live counts exceed capacity";
                 return false;
             }
+            if ((rows.live_row_count != 0 || rows.live_entry_count != 0) &&
+                rows.residency_epoch == 0)
+            {
+                if (error)
+                    *error = "non-empty sparse payload is missing a residency epoch";
+                return false;
+            }
             return true;
         }
 
@@ -129,6 +389,12 @@ namespace llaminar2
             {
                 if (error)
                     *error = "return payload live row count exceeds capacity";
+                return false;
+            }
+            if (rows.live_row_count != 0 && rows.residency_epoch == 0)
+            {
+                if (error)
+                    *error = "non-empty return payload is missing a residency epoch";
                 return false;
             }
             return true;
@@ -177,6 +443,7 @@ namespace llaminar2
         struct DispatchPayloadCopy
         {
             MoEOverlayCollectiveKey key;
+            uint64_t residency_epoch = 0;
             int32_t source_participant = -1;
             int32_t target_participant = -1;
             int32_t d_model = 0;
@@ -191,6 +458,7 @@ namespace llaminar2
         struct ReturnPayloadCopy
         {
             MoEOverlayCollectiveKey key;
+            uint64_t residency_epoch = 0;
             int32_t source_participant = -1;
             int32_t target_participant = -1;
             int32_t d_model = 0;
@@ -202,6 +470,7 @@ namespace llaminar2
         {
             DispatchPayloadCopy copy;
             copy.key = rows.key;
+            copy.residency_epoch = rows.residency_epoch;
             copy.source_participant = rows.source_participant;
             copy.target_participant = rows.target_participant;
             copy.d_model = rows.d_model;
@@ -222,6 +491,7 @@ namespace llaminar2
         {
             ReturnPayloadCopy copy;
             copy.key = rows.key;
+            copy.residency_epoch = rows.residency_epoch;
             copy.source_participant = rows.source_participant;
             copy.target_participant = rows.target_participant;
             copy.d_model = rows.d_model;
@@ -247,6 +517,24 @@ namespace llaminar2
                 if (error)
                     *error = "inbound sparse payload dimension mismatch";
                 return false;
+            }
+
+            /*
+             * Several sources may contribute to one participant packet. They
+             * must all have routed against the same immutable residency
+             * snapshot; combining epochs would make the selected prepared
+             * expert bank ambiguous.
+             */
+            if (payload.residency_epoch != 0)
+            {
+                if (inbound->residency_epoch != 0 &&
+                    inbound->residency_epoch != payload.residency_epoch)
+                {
+                    if (error)
+                        *error = "inbound sparse payload mixes residency epochs";
+                    return false;
+                }
+                inbound->residency_epoch = payload.residency_epoch;
             }
 
             std::copy(payload.row_ids.begin(),
@@ -303,6 +591,18 @@ namespace llaminar2
                 return false;
             }
 
+            if (payload.residency_epoch != 0)
+            {
+                if (inbound->residency_epoch != 0 &&
+                    inbound->residency_epoch != payload.residency_epoch)
+                {
+                    if (error)
+                        *error = "inbound return payload mixes residency epochs";
+                    return false;
+                }
+                inbound->residency_epoch = payload.residency_epoch;
+            }
+
             const size_t d_model = static_cast<size_t>(inbound->d_model);
             std::copy(payload.row_ids.begin(),
                       payload.row_ids.end(),
@@ -329,6 +629,7 @@ namespace llaminar2
             appendPod(bytes, kPacketVersion);
             appendPod(bytes, kPacketKindDispatch);
             appendPod(bytes, static_cast<uint8_t>(payload.key.key_namespace));
+            appendPod(bytes, static_cast<uint8_t>(payload.key.histogram_source));
             appendPod(bytes, payload.key.generation_id);
             appendPod(bytes, payload.key.step_id);
             appendPod(bytes, payload.key.mtp_depth);
@@ -338,6 +639,7 @@ namespace llaminar2
             appendPod(bytes, payload.key.participant_id);
             appendPod(bytes, static_cast<uint8_t>(payload.key.direction));
             appendPod(bytes, payload.key.sequence);
+            appendPod(bytes, payload.residency_epoch);
             appendPod(bytes, payload.source_participant);
             appendPod(bytes, payload.target_participant);
             appendPod(bytes, payload.d_model);
@@ -403,10 +705,12 @@ namespace llaminar2
             }
 
             uint8_t key_namespace = 0;
+            uint8_t histogram_source = 0;
             uint8_t direction = 0;
             uint32_t row_count = 0;
             uint32_t entry_count = 0;
             if (!readPod(data, size, &offset, &key_namespace) ||
+                !readPod(data, size, &offset, &histogram_source) ||
                 !readPod(data, size, &offset, &out->key.generation_id) ||
                 !readPod(data, size, &offset, &out->key.step_id) ||
                 !readPod(data, size, &offset, &out->key.mtp_depth) ||
@@ -416,6 +720,7 @@ namespace llaminar2
                 !readPod(data, size, &offset, &out->key.participant_id) ||
                 !readPod(data, size, &offset, &direction) ||
                 !readPod(data, size, &offset, &out->key.sequence) ||
+                !readPod(data, size, &offset, &out->residency_epoch) ||
                 !readPod(data, size, &offset, &out->source_participant) ||
                 !readPod(data, size, &offset, &out->target_participant) ||
                 !readPod(data, size, &offset, &out->d_model) ||
@@ -429,6 +734,8 @@ namespace llaminar2
             }
 
             out->key.key_namespace = static_cast<MoEOverlayCollectiveNamespace>(key_namespace);
+            out->key.histogram_source =
+                static_cast<ExpertHistogramSource>(histogram_source);
             out->key.direction = static_cast<MoEOverlayCollectiveDirection>(direction);
             if (out->key.direction != MoEOverlayCollectiveDirection::Dispatch)
             {
@@ -440,6 +747,13 @@ namespace llaminar2
             {
                 if (error)
                     *error = "dispatch packet has invalid collective key";
+                return false;
+            }
+            if ((row_count != 0u || entry_count != 0u) &&
+                out->residency_epoch == 0)
+            {
+                if (error)
+                    *error = "non-empty dispatch packet has no residency epoch";
                 return false;
             }
 
@@ -489,6 +803,7 @@ namespace llaminar2
             appendPod(bytes, kPacketVersion);
             appendPod(bytes, kPacketKindReturn);
             appendPod(bytes, static_cast<uint8_t>(payload.key.key_namespace));
+            appendPod(bytes, static_cast<uint8_t>(payload.key.histogram_source));
             appendPod(bytes, payload.key.generation_id);
             appendPod(bytes, payload.key.step_id);
             appendPod(bytes, payload.key.mtp_depth);
@@ -498,6 +813,7 @@ namespace llaminar2
             appendPod(bytes, payload.key.participant_id);
             appendPod(bytes, static_cast<uint8_t>(payload.key.direction));
             appendPod(bytes, payload.key.sequence);
+            appendPod(bytes, payload.residency_epoch);
             appendPod(bytes, payload.source_participant);
             appendPod(bytes, payload.target_participant);
             appendPod(bytes, payload.d_model);
@@ -548,9 +864,11 @@ namespace llaminar2
             }
 
             uint8_t key_namespace = 0;
+            uint8_t histogram_source = 0;
             uint8_t direction = 0;
             uint32_t row_count = 0;
             if (!readPod(data, size, &offset, &key_namespace) ||
+                !readPod(data, size, &offset, &histogram_source) ||
                 !readPod(data, size, &offset, &out->key.generation_id) ||
                 !readPod(data, size, &offset, &out->key.step_id) ||
                 !readPod(data, size, &offset, &out->key.mtp_depth) ||
@@ -560,6 +878,7 @@ namespace llaminar2
                 !readPod(data, size, &offset, &out->key.participant_id) ||
                 !readPod(data, size, &offset, &direction) ||
                 !readPod(data, size, &offset, &out->key.sequence) ||
+                !readPod(data, size, &offset, &out->residency_epoch) ||
                 !readPod(data, size, &offset, &out->source_participant) ||
                 !readPod(data, size, &offset, &out->target_participant) ||
                 !readPod(data, size, &offset, &out->d_model) ||
@@ -571,6 +890,8 @@ namespace llaminar2
             }
 
             out->key.key_namespace = static_cast<MoEOverlayCollectiveNamespace>(key_namespace);
+            out->key.histogram_source =
+                static_cast<ExpertHistogramSource>(histogram_source);
             out->key.direction = static_cast<MoEOverlayCollectiveDirection>(direction);
             if (out->key.direction != MoEOverlayCollectiveDirection::ReturnReduce)
             {
@@ -582,6 +903,12 @@ namespace llaminar2
             {
                 if (error)
                     *error = "return packet has invalid collective key";
+                return false;
+            }
+            if (row_count != 0u && out->residency_epoch == 0)
+            {
+                if (error)
+                    *error = "non-empty return packet has no residency epoch";
                 return false;
             }
 
@@ -677,9 +1004,15 @@ namespace llaminar2
         switch (key_namespace)
         {
         case MoEOverlayCollectiveNamespace::Main:
-            return mtp_depth < 0;
+            return mtp_depth < 0 &&
+                   (histogram_source ==
+                        ExpertHistogramSource::DecodeToken ||
+                    histogram_source ==
+                        ExpertHistogramSource::PrefillChunk);
         case MoEOverlayCollectiveNamespace::MTP:
-            return mtp_depth >= 0;
+            return mtp_depth >= 0 &&
+                   histogram_source ==
+                       ExpertHistogramSource::GroupedVerifier;
         }
         return false;
     }
@@ -694,6 +1027,7 @@ namespace llaminar2
         return lhs.generation_id == rhs.generation_id &&
                lhs.step_id == rhs.step_id &&
                lhs.key_namespace == rhs.key_namespace &&
+               lhs.histogram_source == rhs.histogram_source &&
                lhs.mtp_depth == rhs.mtp_depth &&
                lhs.layer_idx == rhs.layer_idx &&
                lhs.tier_idx == rhs.tier_idx &&
@@ -713,6 +1047,7 @@ namespace llaminar2
         return std::tie(lhs.generation_id,
                         lhs.step_id,
                         lhs.key_namespace,
+                        lhs.histogram_source,
                         lhs.mtp_depth,
                         lhs.layer_idx,
                         lhs.tier_idx,
@@ -723,6 +1058,7 @@ namespace llaminar2
                std::tie(rhs.generation_id,
                         rhs.step_id,
                         rhs.key_namespace,
+                        rhs.histogram_source,
                         rhs.mtp_depth,
                         rhs.layer_idx,
                         rhs.tier_idx,
@@ -745,6 +1081,7 @@ namespace llaminar2
         key.generation_id = generation_id;
         key.step_id = step_id;
         key.key_namespace = MoEOverlayCollectiveNamespace::Main;
+        key.histogram_source = ExpertHistogramSource::DecodeToken;
         key.mtp_depth = -1;
         key.layer_idx = layer_idx;
         key.tier_idx = tier_idx;
@@ -774,6 +1111,7 @@ namespace llaminar2
         key.generation_id = generation_id;
         key.step_id = decode_step_id;
         key.key_namespace = MoEOverlayCollectiveNamespace::MTP;
+        key.histogram_source = ExpertHistogramSource::GroupedVerifier;
         key.mtp_depth = mtp_depth;
         key.layer_idx = layer_idx;
         key.tier_idx = tier_idx;
@@ -855,12 +1193,42 @@ namespace llaminar2
         return counters;
     }
 
+    MoEOverlayCollectiveWorkspace::MoEOverlayCollectiveWorkspace(
+        FixedCapacityConfig config)
+        : max_rows_(config.max_rows),
+          max_entries_(config.max_entries),
+          d_model_(config.d_model),
+          top_k_(config.top_k),
+          device_(config.device),
+          reuse_policy_(config.reuse_policy),
+          fixed_capacity_(true)
+    {
+        if (max_rows_ == 0 || max_entries_ == 0 || d_model_ <= 0 ||
+            top_k_ <= 0 || !device_.is_valid())
+        {
+            throw std::invalid_argument(
+                "Fixed ExpertOverlay collective workspace requires positive "
+                "geometry and a valid device");
+        }
+    }
+
     void MoEOverlayCollectiveWorkspace::ensureCapacity(size_t max_rows,
                                                        size_t max_entries,
                                                        int d_model,
                                                        int top_k,
                                                        DeviceId device)
     {
+        if (fixed_capacity_)
+        {
+            if (max_rows != max_rows_ || max_entries != max_entries_ ||
+                d_model != d_model_ || top_k != top_k_ || device != device_)
+            {
+                throw std::logic_error(
+                    "Fixed ExpertOverlay collective workspace cannot be rebound");
+            }
+            return;
+        }
+
         max_rows_ = std::max(max_rows_, max_rows);
         max_entries_ = std::max(max_entries_, max_entries);
         d_model_ = std::max(d_model_, d_model);
@@ -894,7 +1262,17 @@ namespace llaminar2
     MoEOverlayCollectiveWorkspace::LayerTierBuffers &
     MoEOverlayCollectiveWorkspace::buffersFor(int layer_idx, int tier_idx)
     {
-        auto &buffers = buffers_by_layer_tier_[{layer_idx, tier_idx}];
+        /*
+         * A participant graph executes dispatch, local compute, and return in
+         * strict graph order. Its typed SerialGraphFamily policy therefore
+         * aliases all semantic keys to one physical slot. Other callers retain
+         * the full key so independently runnable nodes can never overlap.
+         */
+        const std::pair<int, int> storage_key =
+            reuse_policy_ == StorageReusePolicy::SerialGraphFamily
+                ? std::pair<int, int>{0, 0}
+                : std::pair<int, int>{layer_idx, tier_idx};
+        auto &buffers = buffers_by_layer_tier_[storage_key];
         ensureSparseStorage(buffers.dispatch_receive);
         ensureSparseStorage(buffers.local_expert_input);
         ensureReturnStorage(buffers.local_expert_output);
@@ -1148,6 +1526,7 @@ namespace llaminar2
         if (inbound)
         {
             inbound->key = key;
+            inbound->residency_epoch = 0;
             inbound->source_participant = outbound.source_participant;
             inbound->target_participant = outbound.source_participant;
             inbound->d_model = outbound.d_model;
@@ -1271,6 +1650,7 @@ namespace llaminar2
         if (inbound)
         {
             inbound->key = key;
+            inbound->residency_epoch = 0;
             inbound->source_participant = outbound.source_participant;
             inbound->target_participant = outbound.source_participant;
             inbound->d_model = outbound.d_model;
@@ -1308,17 +1688,42 @@ namespace llaminar2
     MoEOverlayMPISparseCollectiveContext::MoEOverlayMPISparseCollectiveContext(Config config)
         : config_(std::move(config))
     {
+        if (!config_.mpi_ctx)
+        {
+            throw std::invalid_argument(
+                "MPI sparse collective requires a non-null MPI context");
+        }
+
+        std::sort(
+            config_.local_participant_ids.begin(),
+            config_.local_participant_ids.end());
+        if (std::any_of(
+                config_.local_participant_ids.begin(),
+                config_.local_participant_ids.end(),
+                [](int participant) { return participant < 0; }))
+        {
+            throw std::invalid_argument(
+                "MPI sparse collective local participant ids must be non-negative");
+        }
+        if (std::adjacent_find(
+                config_.local_participant_ids.begin(),
+                config_.local_participant_ids.end()) !=
+            config_.local_participant_ids.end())
+        {
+            throw std::invalid_argument(
+                "MPI sparse collective local participant ids must be unique");
+        }
     }
 
     MoEOverlayMPISparseCollectiveContext::~MoEOverlayMPISparseCollectiveContext() = default;
 
-    int MoEOverlayMPISparseCollectiveContext::localParticipantId() const
+    bool MoEOverlayMPISparseCollectiveContext::ownsLocalParticipant(
+        int participant_id) const noexcept
     {
-        if (config_.local_participant_id >= 0)
-            return config_.local_participant_id;
-        if (!config_.mpi_ctx)
-            return 0;
-        return config_.mpi_ctx->rank();
+        return std::binary_search(
+            config_.local_participant_ids.begin(),
+            config_.local_participant_ids.end(),
+            participant_id);
     }
 
     MoEOverlayCollectiveResult MoEOverlayMPISparseCollectiveContext::dispatch(const MoEOverlayCollectiveKey &key,
@@ -1397,8 +1802,9 @@ namespace llaminar2
         if (inbound)
         {
             inbound->key = key;
-            inbound->source_participant = localParticipantId();
-            inbound->target_participant = localParticipantId();
+            inbound->residency_epoch = 0;
+            inbound->source_participant = -1;
+            inbound->target_participant = -1;
             inbound->d_model = outbound.d_model;
             inbound->top_k = outbound.top_k;
             inbound->live_row_count = 0;
@@ -1407,7 +1813,6 @@ namespace llaminar2
                 inbound->entry_offsets_host[0] = 0;
         }
 
-        const int target = localParticipantId();
         for (int rank = 0; rank < config_.mpi_ctx->world_size(); ++rank)
         {
             const int count = recv_counts[static_cast<size_t>(rank)];
@@ -1431,17 +1836,44 @@ namespace llaminar2
             {
                 result.ok = false;
                 result.error_code = 6;
-                result.error = "dispatch key mismatch across MPI ranks";
+                result.error =
+                    "dispatch key mismatch across MPI ranks: expected=" +
+                    key.toString() + " received=" +
+                    packet.key.toString() + " sender_rank=" +
+                    std::to_string(rank);
                 return result;
             }
 
-            if (inbound && packet.target_participant == target)
+            /*
+             * Address packets by participant ownership, never by MPI rank.
+             * This is what permits one socket-local process to own a CUDA hot
+             * endpoint, a ROCm warm endpoint, and a CPU cold endpoint while
+             * still entering this collective exactly once.
+             */
+            if (inbound &&
+                ownsLocalParticipant(packet.target_participant))
             {
+                if (inbound->target_participant < 0)
+                {
+                    inbound->source_participant =
+                        packet.source_participant;
+                    inbound->target_participant =
+                        packet.target_participant;
+                }
+                else if (inbound->target_participant !=
+                         packet.target_participant)
+                {
+                    result.ok = false;
+                    result.error_code = 7;
+                    result.error =
+                        "dispatch key addressed multiple local participants";
+                    return result;
+                }
                 std::string append_error;
                 if (!appendDispatchInbound(packet, inbound, &append_error))
                 {
                     result.ok = false;
-                    result.error_code = 7;
+                    result.error_code = 8;
                     result.error = append_error;
                     return result;
                 }
@@ -1507,13 +1939,13 @@ namespace llaminar2
         if (inbound)
         {
             inbound->key = key;
-            inbound->source_participant = localParticipantId();
-            inbound->target_participant = localParticipantId();
+            inbound->residency_epoch = 0;
+            inbound->source_participant = -1;
+            inbound->target_participant = -1;
             inbound->d_model = outbound.d_model;
             inbound->live_row_count = 0;
         }
 
-        const int target = localParticipantId();
         for (int rank = 0; rank < config_.mpi_ctx->world_size(); ++rank)
         {
             const int count = recv_counts[static_cast<size_t>(rank)];
@@ -1537,17 +1969,38 @@ namespace llaminar2
             {
                 result.ok = false;
                 result.error_code = 6;
-                result.error = "return key mismatch across MPI ranks";
+                result.error =
+                    "return key mismatch across MPI ranks: expected=" +
+                    key.toString() + " received=" +
+                    packet.key.toString() + " sender_rank=" +
+                    std::to_string(rank);
                 return result;
             }
 
-            if (inbound && packet.target_participant == target)
+            if (inbound &&
+                ownsLocalParticipant(packet.target_participant))
             {
+                if (inbound->target_participant < 0)
+                {
+                    inbound->source_participant =
+                        packet.source_participant;
+                    inbound->target_participant =
+                        packet.target_participant;
+                }
+                else if (inbound->target_participant !=
+                         packet.target_participant)
+                {
+                    result.ok = false;
+                    result.error_code = 7;
+                    result.error =
+                        "return key addressed multiple local participants";
+                    return result;
+                }
                 std::string append_error;
                 if (!appendReturnInbound(packet, inbound, &append_error))
                 {
                     result.ok = false;
-                    result.error_code = 7;
+                    result.error_code = 8;
                     result.error = append_error;
                     return result;
                 }

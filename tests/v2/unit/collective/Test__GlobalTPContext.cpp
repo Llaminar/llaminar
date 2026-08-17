@@ -627,7 +627,7 @@ TEST_F(Test__GlobalTPContext, CreateForTest_MismatchedWorldRanksSize)
  * @test All ranks on same node → isAllRanksOnSameNode() true, scope() NODE_LOCAL
  *
  * When all ranks share the same node_id, the context is conceptually
- * NodeLocalTP and scope() reflects this.
+ * NodeTP and scope() reflects this.
  */
 TEST_F(Test__GlobalTPContext, NodeAwareness_AllSameNode)
 {

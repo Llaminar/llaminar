@@ -18,6 +18,10 @@
 #define QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION 0
 #endif
 
+#ifndef QWEN36_MOE_PREFIX_MTP_EXPECTS_SIDECAR_MAIN_STATE_PRESERVED
+#define QWEN36_MOE_PREFIX_MTP_EXPECTS_SIDECAR_MAIN_STATE_PRESERVED 0
+#endif
+
 #ifndef QWEN36_MOE_PREFIX_MTP_EXPECTS_PERSISTENT_SIDECAR_METADATA
 #define QWEN36_MOE_PREFIX_MTP_EXPECTS_PERSISTENT_SIDECAR_METADATA 0
 #endif
@@ -87,11 +91,81 @@ TEST(QWEN36_MOE_PREFIX_MTP_SUITE, PrefixCacheMTPRestore)
     runMoEMTPParity(QWEN36_MOE_PREFIX_MTP_CASE(), true);
 }
 
-TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPBenchmarkPromptSidecarStageBreakdown)
+/*
+ * The ProductionParity_ prefix is a registration contract: discovery groups
+ * these exact depth cells into one real-weight process campaign per backend.
+ * That keeps MTP checkpoint evidence inside the globally budgeted matrix and
+ * amortizes the immutable model/sidecar weight authority without weakening any
+ * per-depth stage or CSV comparison.
+ */
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, ProductionParity_MTPCheckpointFixedDepth1)
 {
     runMoEMTPSidecarStageBreakdownDiagnostic(
         QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
-        4);
+        4,
+        1);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, ProductionParity_MTPCheckpointFixedDepth2)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        4,
+        2);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, ProductionParity_MTPCheckpointFixedDepth3)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        4,
+        3);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, ProductionParity_MTPCheckpointDynamicDepth)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        4,
+        3,
+        qwen36MoEStochasticDynamicDepthPolicy(3));
+}
+
+/*
+ * These cells retain the same full PyTorch sidecar checkpoint oracle and CSV
+ * schema, but collect it from a second request after a proven terminal prefix
+ * hit. Depth two, depth three, and dynamic policy are separate graph/cache
+ * identities; grouping them in the backend process campaign amortizes only the
+ * immutable prepared-weight authority.
+ */
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, ProductionParity_MTPCheckpointPrefixRestoreFixedDepth2)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        4,
+        2,
+        {},
+        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, ProductionParity_MTPCheckpointPrefixRestoreFixedDepth3)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        4,
+        3,
+        {},
+        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
+}
+
+TEST(QWEN36_MOE_PREFIX_MTP_SUITE, ProductionParity_MTPCheckpointPrefixRestoreDynamicDepth)
+{
+    runMoEMTPSidecarStageBreakdownDiagnostic(
+        QWEN36_MOE_PREFIX_MTP_BENCHMARK_CASE(),
+        4,
+        3,
+        qwen36MoEStochasticDynamicDepthPolicy(3),
+        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
 }
 
 TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPBenchmarkStyleSkipGatherGreedyMatchesReference)
@@ -179,7 +253,7 @@ TEST(QWEN36_MOE_PREFIX_MTP_SUITE, VerifierRowsGroupedDecodeEquivalentM4)
         4);
 }
 
-#if QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION
+#if QWEN36_MOE_PREFIX_MTP_EXPECTS_SIDECAR_MAIN_STATE_PRESERVED
 TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPSidecarPreservesMainRuntimeState)
 {
     ScopedEnvironmentValues sidecar_preservation_check({
@@ -194,7 +268,9 @@ TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MTPSidecarPreservesMainRuntimeState)
         {},
         true);
 }
+#endif
 
+#if QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION
 TEST(QWEN36_MOE_PREFIX_MTP_SUITE, MainVerifierAllPositionRowsMatchSerialDecode)
 {
     runMoEMainVerifierAllPositionRowsMatchSerialDecode(
@@ -345,5 +421,6 @@ TEST(QWEN36_MOE_PREFIX_MTP_SUITE, NoMTPBenchmarkStyleSkipGatherGreedyMatchesGath
 #undef QWEN36_MOE_PREFIX_MTP_CASE
 #undef QWEN36_MOE_PREFIX_MTP_TESTS_DEVICE_RESIDENT_PUBLICATION
 #undef QWEN36_MOE_PREFIX_MTP_EXPECTS_SIDECAR_REPLAY_PRESERVED
+#undef QWEN36_MOE_PREFIX_MTP_EXPECTS_SIDECAR_MAIN_STATE_PRESERVED
 #undef QWEN36_MOE_PREFIX_MTP_EXPECTS_DIRECT_PUBLICATION
 #undef QWEN36_MOE_PREFIX_MTP_SUITE

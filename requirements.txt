@@ -27,6 +27,10 @@ xgboost==3.1.3
 
 # Testing
 pytest>=8.0.0
+# Keep this synchronized with the container build argument. Ninja command-log
+# hashes are version-specific, so the workspace venv and CMake's system tool
+# must never install different releases.
+ninja==1.13.0
 
 # Charting (CI: parity trend graphs in step summary)
 matplotlib>=3.8.0

@@ -27,7 +27,6 @@
 #include <print>
 #include <sstream>
 #include <stdexcept>
-#include <mpi.h>
 #include <numeric>
 #include <nlohmann/json.hpp>
 
@@ -891,9 +890,8 @@ namespace llaminar2
 
     BenchmarkRunner::BenchmarkRunner(
         std::shared_ptr<IInferenceRunner> runner,
-        std::shared_ptr<ITokenizer> tokenizer,
-        std::shared_ptr<IMPIContext> mpi_ctx)
-        : runner_(std::move(runner)), tokenizer_(std::move(tokenizer)), mpi_ctx_(std::move(mpi_ctx))
+        std::shared_ptr<ITokenizer> tokenizer)
+        : runner_(std::move(runner)), tokenizer_(std::move(tokenizer))
     {
     }
 
@@ -921,10 +919,6 @@ namespace llaminar2
                 "benchmark runner rejected fixed-length stop policy at request admission";
             return {false, 0.0};
         }
-
-        // Synchronize all ranks before timing (skip for single-rank)
-        if (mpi_ctx_->world_size() > 1)
-            mpi_ctx_->barrier();
 
         auto start = std::chrono::high_resolution_clock::now();
 
@@ -977,8 +971,13 @@ namespace llaminar2
             success = false;
         }
 
-        // Propagate local execution/event failures to every MPI rank.
-        success = synchronizeSuccess(success, synchronization_phase);
+        /*
+         * The orchestrated runner synchronizes its participant ranks inside
+         * forward().  BenchmarkRunner deliberately owns no second MPI
+         * protocol: a second barrier/all-reduce schedule can race the worker
+         * command loop and deadlock at request boundaries.
+         */
+        (void)synchronization_phase;
 
         auto end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -1039,10 +1038,6 @@ namespace llaminar2
                 {},
                 std::move(tags));
         };
-
-        // Synchronize before timing decode phase (skip for single-rank)
-        if (mpi_ctx_->world_size() > 1)
-            mpi_ctx_->barrier();
 
         auto start = std::chrono::high_resolution_clock::now();
         // Track the end of the last forward() call for inter-step measurement
@@ -1120,7 +1115,7 @@ namespace llaminar2
                     static_cast<int>(step.tokens_by_request.size()) == request_batch &&
                     (step.is_complete_by_request.empty() ||
                      static_cast<int>(step.is_complete_by_request.size()) == request_batch);
-                if (!synchronizeSuccess(local_step_ok, "request-batched decode step"))
+                if (!local_step_ok)
                 {
                     last_failure_reason_ = !step.error.empty()
                                                ? step.error
@@ -1199,7 +1194,7 @@ namespace llaminar2
                         {"implementation", "decode_boundary_maintenance"},
                         {"request_batch", std::to_string(request_batch)},
                     });
-                if (!synchronizeSuccess(maintenance_success, "request-batched decode maintenance"))
+                if (!maintenance_success)
                 {
                     last_failure_reason_ = "request-batched decode maintenance failed";
                     auto end = std::chrono::high_resolution_clock::now();
@@ -1209,7 +1204,7 @@ namespace llaminar2
                     return result;
                 }
 
-                if (mpi_ctx_->rank() == 0 && emitted_this_step > 0)
+                if (emitted_this_step > 0)
                 {
                     const auto step_end = std::chrono::high_resolution_clock::now();
                     const double per_token_ms =
@@ -1222,13 +1217,10 @@ namespace llaminar2
                 }
             }
 
-            const bool decode_success = synchronizeSuccess(true, "request-batched decode complete");
             auto end = std::chrono::high_resolution_clock::now();
-            result.success = decode_success;
+            result.success = true;
             result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
             result.tokens_generated = tokens_generated;
-            if (!decode_success)
-                last_failure_reason_ = "request-batched decode synchronization failed";
             return result;
         }
 
@@ -1254,7 +1246,7 @@ namespace llaminar2
                     });
                 runner_->setDecodeStepTokenBudget(0);
 
-                if (!synchronizeSuccess(step.error.empty(), "decode step"))
+                if (!step.error.empty())
                 {
                     last_failure_reason_ = step.error.empty() ? "decode step failed" : step.error;
                     auto end = std::chrono::high_resolution_clock::now();
@@ -1264,13 +1256,8 @@ namespace llaminar2
                     return result;
                 }
 
-                int step_token_count = mpi_ctx_->rank() == 0
-                                           ? static_cast<int>(std::min<size_t>(
-                                                 step.tokens.size(),
-                                                 static_cast<size_t>(remaining)))
-                                           : 0;
-                if (mpi_ctx_->world_size() > 1)
-                    mpi_ctx_->broadcast_int32(&step_token_count, 1, 0);
+                const int step_token_count = static_cast<int>(std::min<size_t>(
+                    step.tokens.size(), static_cast<size_t>(remaining)));
 
                 if (step_token_count <= 0)
                 {
@@ -1289,31 +1276,26 @@ namespace llaminar2
                 }
 
                 int stop_reached = 0;
-                if (mpi_ctx_->rank() == 0)
+                for (int j = 0; j < step_token_count; ++j)
                 {
-                    for (int j = 0; j < step_token_count; ++j)
+                    const int32_t token = step.tokens[static_cast<size_t>(j)];
+                    result.generated_token_ids.push_back(token);
+                    if (!tokenizer_->is_stop_token(token))
                     {
-                        const int32_t token = step.tokens[static_cast<size_t>(j)];
-                        result.generated_token_ids.push_back(token);
-                        if (!tokenizer_->is_stop_token(token))
-                        {
-                            result.generated_text += tokenizer_->decode_token(token);
-                        }
-                        else if (!ignore_stop_tokens)
-                        {
-                            stop_reached = 1;
-                            break;
-                        }
+                        result.generated_text += tokenizer_->decode_token(token);
+                    }
+                    else if (!ignore_stop_tokens)
+                    {
+                        stop_reached = 1;
+                        break;
                     }
                 }
-                if (mpi_ctx_->world_size() > 1)
-                    mpi_ctx_->broadcast_int32(&stop_reached, 1, 0);
 
                 tokens_generated += step_token_count;
 
                 if (stop_reached != 0)
                 {
-                    if (mpi_ctx_->rank() == 0 && step_token_count > 0)
+                    if (step_token_count > 0)
                     {
                         const auto step_end = std::chrono::high_resolution_clock::now();
                         const double per_token_ms =
@@ -1338,7 +1320,7 @@ namespace llaminar2
                         {"implementation", "decode_boundary_maintenance"},
                         {"request_batch", "1"},
                     });
-                if (!synchronizeSuccess(maintenance_success, "decode maintenance"))
+                if (!maintenance_success)
                 {
                     last_failure_reason_ = "decode maintenance failed";
                     auto end = std::chrono::high_resolution_clock::now();
@@ -1348,7 +1330,7 @@ namespace llaminar2
                     return result;
                 }
 
-                if (mpi_ctx_->rank() == 0 && step_token_count > 0)
+                if (step_token_count > 0)
                 {
                     const auto step_end = std::chrono::high_resolution_clock::now();
                     const double per_token_ms =
@@ -1361,9 +1343,8 @@ namespace llaminar2
                 }
             }
 
-            const bool decode_success = synchronizeSuccess(true, "decode complete");
             auto end = std::chrono::high_resolution_clock::now();
-            result.success = decode_success;
+            result.success = true;
             result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
             result.tokens_generated = tokens_generated;
             return result;
@@ -1374,65 +1355,56 @@ namespace llaminar2
             const auto token_start = std::chrono::high_resolution_clock::now();
             int next_token = -1;
 
-            // Rank 0: Sample next token (greedy for deterministic benchmark)
-            if (mpi_ctx_->rank() == 0)
+            // The sole benchmark controller samples deterministically.
+            auto t0 = profile_sampler ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+
+            // Try device-side argmax first. CPU-only runners then use the
+            // host-logits CPU implementation; GPU runners fail loudly
+            // instead of silently paying a D2H logits transfer.
+            next_token = runner_->sampleGreedyOnDevice();
+
+            if (next_token < 0)
             {
-                auto t0 = profile_sampler ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
-
-                // Try device-side argmax first. CPU-only runners then use the
-                // host-logits CPU implementation; GPU runners fail loudly
-                // instead of silently paying a D2H logits transfer.
-                next_token = runner_->sampleGreedyOnDevice();
-
-                if (next_token < 0)
+                if (runner_->primaryDeviceId().is_gpu())
                 {
-                    if (runner_->primaryDeviceId().is_gpu())
-                    {
-                        LOG_ERROR("GPU device sampling failed at decode step " << i
-                                                                                << "; host logits sampling is CPU-only.");
-                        last_failure_reason_ =
-                            "GPU device sampling failed: host logits sampling is CPU-only";
-                        auto end = std::chrono::high_resolution_clock::now();
-                        result.success = false;
-                        result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-                        result.tokens_generated = tokens_generated;
-                        return result;
-                    }
-
-                    // CPU-only host sampling over local logits.
-                    const float *logit_data = runner_->logits();
-                    if (!logit_data)
-                    {
-                        LOG_ERROR("CPU host sampling failed at decode step " << i
-                                                                             << ": logits() returned nullptr.");
-                        last_failure_reason_ = "CPU host sampling failed: logits unavailable";
-                        auto end = std::chrono::high_resolution_clock::now();
-                        result.success = false;
-                        result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-                        result.tokens_generated = tokens_generated;
-                        return result;
-                    }
-                    const int vs = runner_->vocab_size();
-                    next_token = static_cast<int>(
-                        std::distance(logit_data, std::max_element(logit_data, logit_data + vs)));
+                    LOG_ERROR("GPU device sampling failed at decode step " << i
+                                                                            << "; host logits sampling is CPU-only.");
+                    last_failure_reason_ =
+                        "GPU device sampling failed: host logits sampling is CPU-only";
+                    auto end = std::chrono::high_resolution_clock::now();
+                    result.success = false;
+                    result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    result.tokens_generated = tokens_generated;
+                    return result;
                 }
 
-                if (profile_sampler)
+                // CPU-only host sampling over local logits.
+                const float *logit_data = runner_->logits();
+                if (!logit_data)
                 {
-                    auto t1 = std::chrono::high_resolution_clock::now();
-                    sampler_total_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+                    LOG_ERROR("CPU host sampling failed at decode step " << i
+                                                                         << ": logits() returned nullptr.");
+                    last_failure_reason_ = "CPU host sampling failed: logits unavailable";
+                    auto end = std::chrono::high_resolution_clock::now();
+                    result.success = false;
+                    result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    result.tokens_generated = tokens_generated;
+                    return result;
                 }
-
-                // Collect generated text for verification (but don't print during benchmark)
-                if (!tokenizer_->is_stop_token(next_token))
-                {
-                    result.generated_text += tokenizer_->decode_token(next_token);
-                }
+                const int vs = runner_->vocab_size();
+                next_token = static_cast<int>(
+                    std::distance(logit_data, std::max_element(logit_data, logit_data + vs)));
             }
 
-            // Broadcast token to all ranks (skip for single-rank)
-            if (mpi_ctx_->world_size() > 1)
-                mpi_ctx_->broadcast_int32(&next_token, 1, 0);
+            if (profile_sampler)
+            {
+                auto t1 = std::chrono::high_resolution_clock::now();
+                sampler_total_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+            }
+
+            // Collect generated text for verification (but don't print during benchmark)
+            if (!tokenizer_->is_stop_token(next_token))
+                result.generated_text += tokenizer_->decode_token(next_token);
 
             // Check for stop token (unless benchmarking throughput)
             if (!ignore_stop_tokens && tokenizer_->is_stop_token(next_token))
@@ -1440,10 +1412,7 @@ namespace llaminar2
                 break;
             }
 
-            if (mpi_ctx_->rank() == 0)
-            {
-                result.generated_token_ids.push_back(next_token);
-            }
+            result.generated_token_ids.push_back(next_token);
             tokens_generated++;
 
             // Measure inter-step gap: time from last forward() return to this forward() call
@@ -1459,7 +1428,7 @@ namespace llaminar2
             if (profile_sampler)
                 last_forward_end = std::chrono::high_resolution_clock::now();
 
-            if (!synchronizeSuccess(forward_success, "decode forward"))
+            if (!forward_success)
             {
                 last_failure_reason_ = "decode forward failed";
                 auto end = std::chrono::high_resolution_clock::now();
@@ -1473,31 +1442,16 @@ namespace llaminar2
             if (decode_step_cb_)
                 decode_step_cb_();
 
-            if (mpi_ctx_->rank() == 0)
-            {
-                const auto token_end = std::chrono::high_resolution_clock::now();
-                result.token_latencies_ms.push_back(
-                    std::chrono::duration<double, std::milli>(token_end - token_start).count());
-            }
+            const auto token_end = std::chrono::high_resolution_clock::now();
+            result.token_latencies_ms.push_back(
+                std::chrono::duration<double, std::milli>(token_end - token_start).count());
         }
-
-        // Synchronize after decode phase (skip for single-rank)
-        const bool decode_success = synchronizeSuccess(true, "decode complete");
 
         auto end = std::chrono::high_resolution_clock::now();
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
 
-        if (!decode_success)
-        {
-            last_failure_reason_ = "decode synchronization failed";
-            result.success = false;
-            result.time_ms = time_ms;
-            result.tokens_generated = tokens_generated;
-            return result;
-        }
-
         // Accumulate inter-step profiling data across benchmark iterations
-        if (profile_sampler && mpi_ctx_->rank() == 0 && tokens_generated > 0)
+        if (profile_sampler && tokens_generated > 0)
         {
             decode_loop_profile_.sampler_total_us += sampler_total_us;
             decode_loop_profile_.inter_step_total_us += inter_step_total_us;
@@ -1527,38 +1481,6 @@ namespace llaminar2
         return result;
     }
 
-    bool BenchmarkRunner::synchronizeSuccess(bool local_success, const char *phase) const
-    {
-        if (!mpi_ctx_ || mpi_ctx_->world_size() <= 1)
-            return local_success;
-
-        const float local = local_success ? 1.0f : 0.0f;
-        float global_sum = 0.0f;
-
-        try
-        {
-            mpi_ctx_->allreduce_sum(&local, &global_sum, 1);
-        }
-        catch (const std::exception &e)
-        {
-            LOG_ERROR("Benchmark " << phase << " failure synchronization failed: " << e.what());
-            return false;
-        }
-        catch (...)
-        {
-            LOG_ERROR("Benchmark " << phase << " failure synchronization failed: unknown exception");
-            return false;
-        }
-
-        const bool global_success = global_sum >= static_cast<float>(mpi_ctx_->world_size()) - 0.5f;
-        if (!global_success && mpi_ctx_->rank() == 0)
-        {
-            LOG_ERROR("Benchmark " << phase << " failed on at least one rank (success_sum="
-                                   << global_sum << "/" << mpi_ctx_->world_size() << ")");
-        }
-        return global_success;
-    }
-
     BenchmarkResult BenchmarkRunner::run(const OrchestrationConfig &config)
     {
         BenchmarkResult result;
@@ -1581,54 +1503,46 @@ namespace llaminar2
             return result;
         };
 
-        // Resolve and tokenize on rank 0. Other ranks receive token IDs only,
-        // so a prompt file never needs to exist on every distributed host.
+        // Resolve and tokenize once in the sole benchmark controller.
         std::string prompt;
         std::vector<int> tokens;
         int token_count = 0;
 
-        if (mpi_ctx_->rank() == 0)
+        try
         {
-            try
-            {
-                const ResolvedBenchmarkPrompt resolved = resolveBenchmarkPrompt(config);
-                prompt = resolved.text;
-                result.prompt_source = resolved.source;
-                result.prompt_file_path = resolved.file_path;
-                result.prompt_bytes = resolved.text.size();
-                result.prompt_sha256 = resolved.sha256;
+            const ResolvedBenchmarkPrompt resolved = resolveBenchmarkPrompt(config);
+            prompt = resolved.text;
+            result.prompt_source = resolved.source;
+            result.prompt_file_path = resolved.file_path;
+            result.prompt_bytes = resolved.text.size();
+            result.prompt_sha256 = resolved.sha256;
 
-                LOG_DEBUG("Benchmark prompt source="
-                          << benchmarkPromptSourceToString(resolved.source)
-                          << " bytes=" << resolved.text.size()
-                          << " sha256=" << resolved.sha256);
+            LOG_DEBUG("Benchmark prompt source="
+                      << benchmarkPromptSourceToString(resolved.source)
+                      << " bytes=" << resolved.text.size()
+                      << " sha256=" << resolved.sha256);
 
-                tokens = tokenizer_->encode(prompt, /*add_bos=*/false, /*add_eos=*/false);
-                token_count = static_cast<int>(tokens.size());
-                if (tokens.empty())
-                {
-                    last_failure_reason_ = "benchmark prompt tokenization failed";
-                    LOG_ERROR(last_failure_reason_);
-                    token_count = -1;
-                }
-            }
-            catch (const std::exception &error)
+            tokens = tokenizer_->encode(prompt, /*add_bos=*/false, /*add_eos=*/false);
+            token_count = static_cast<int>(tokens.size());
+            if (tokens.empty())
             {
-                last_failure_reason_ =
-                    std::string("benchmark prompt resolution failed: ") + error.what();
+                last_failure_reason_ = "benchmark prompt tokenization failed";
                 LOG_ERROR(last_failure_reason_);
                 token_count = -1;
             }
         }
-
-        // Broadcast token count (skip for single-rank)
-        if (mpi_ctx_->world_size() > 1)
-            mpi_ctx_->broadcast_int32(&token_count, 1, 0);
+        catch (const std::exception &error)
+        {
+            last_failure_reason_ =
+                std::string("benchmark prompt resolution failed: ") + error.what();
+            LOG_ERROR(last_failure_reason_);
+            token_count = -1;
+        }
 
         if (token_count <= 0)
         {
             if (last_failure_reason_.empty())
-                last_failure_reason_ = "benchmark prompt resolution or tokenization failed on rank 0";
+                last_failure_reason_ = "benchmark prompt resolution or tokenization failed";
             return capture_and_return(); // Return empty result on error
         }
         result.prefill_tokens = token_count;
@@ -1641,20 +1555,9 @@ namespace llaminar2
                 "benchmark prompt has " + std::to_string(token_count) +
                 " tokens but context length is " + std::to_string(config.max_seq_len) +
                 "; pass a shorter -p/--prompt or --prompt-file, or increase -c/--context-length";
-            if (mpi_ctx_->rank() == 0)
-            {
-                LOG_ERROR(last_failure_reason_);
-            }
+            LOG_ERROR(last_failure_reason_);
             return capture_and_return();
         }
-
-        // Broadcast tokens to all ranks
-        if (mpi_ctx_->rank() != 0)
-        {
-            tokens.resize(token_count);
-        }
-        if (mpi_ctx_->world_size() > 1)
-            mpi_ctx_->broadcast_int32(tokens.data(), token_count, 0);
 
         // Determine number of decode tokens
         // -1 means "use default" (128 for benchmark)
@@ -1679,23 +1582,17 @@ namespace llaminar2
                     " decode) but context length is " + std::to_string(config.max_seq_len) +
                     "; reduce -n/--n-predict, pass a shorter -p/--prompt or --prompt-file, "
                     "or increase -c/--context-length";
-                if (mpi_ctx_->rank() == 0)
-                {
-                    LOG_ERROR(last_failure_reason_);
-                }
+                LOG_ERROR(last_failure_reason_);
                 return capture_and_return();
             }
         }
 
-        if (mpi_ctx_->rank() == 0)
-        {
-            LOG_DEBUG("Benchmark configuration:");
-            LOG_DEBUG("  Prefill tokens: " << token_count);
-            LOG_DEBUG("  Decode tokens:  " << n_decode);
-            LOG_DEBUG("  Warmup runs:    " << warmup_iterations);
-            LOG_DEBUG("  Benchmark runs: " << benchmark_iterations);
-            LOG_DEBUG("");
-        }
+        LOG_DEBUG("Benchmark configuration:");
+        LOG_DEBUG("  Prefill tokens: " << token_count);
+        LOG_DEBUG("  Decode tokens:  " << n_decode);
+        LOG_DEBUG("  Warmup runs:    " << warmup_iterations);
+        LOG_DEBUG("  Benchmark runs: " << benchmark_iterations);
+        LOG_DEBUG("");
 
         // Enable GPU-side greedy sampling to skip D2H logits gather during decode.
         // Only enabled on GPU — CPU has no device-side argmax, so logits must be
@@ -1721,10 +1618,8 @@ namespace llaminar2
         // ========================================================================
         // Warmup Phase - Run before measurement to warm caches, JIT, etc.
         // ========================================================================
-        if (mpi_ctx_->rank() == 0 && warmup_iterations > 0)
-        {
+        if (warmup_iterations > 0)
             LOG_INFO("Running warmup...");
-        }
 
         // Suppress GPU stage timeline during warmup — warmup includes one-time costs
         // (weight H2D transfers, buffer allocation, kernel JIT) that inflate overhead
@@ -1750,8 +1645,7 @@ namespace llaminar2
                 reason << " after " << context;
             reason << " (" << summarizePrefillGraphProbe(snapshot) << ")";
             last_failure_reason_ = reason.str();
-            if (mpi_ctx_->rank() == 0)
-                LOG_ERROR(last_failure_reason_);
+            LOG_ERROR(last_failure_reason_);
             return false;
         };
 
@@ -1763,8 +1657,7 @@ namespace llaminar2
                 {
                     last_failure_reason_ =
                         "LLAMINAR_PREFILL_GRAPH_REQUIRED=1 but the benchmark runner is CPU-only";
-                    if (mpi_ctx_->rank() == 0)
-                        LOG_ERROR(last_failure_reason_);
+                    LOG_ERROR(last_failure_reason_);
                     return false;
                 }
                 return true;
@@ -1776,17 +1669,13 @@ namespace llaminar2
                 {
                     last_failure_reason_ =
                         "LLAMINAR_PREFILL_GRAPH_REQUIRED=1 but GPU graphs are disabled";
-                    if (mpi_ctx_->rank() == 0)
-                        LOG_ERROR(last_failure_reason_);
+                    LOG_ERROR(last_failure_reason_);
                     return false;
                 }
                 return true;
             }
 
-            if (mpi_ctx_->rank() == 0)
-            {
-                LOG_INFO("Preparing prefill graph capture for steady-state benchmark...");
-            }
+            LOG_INFO("Preparing prefill graph capture for steady-state benchmark...");
 
             for (int iter = 0; iter < PREFILL_GRAPH_WARMUP_ITERATIONS; ++iter)
             {
@@ -1794,10 +1683,7 @@ namespace llaminar2
                 auto [graph_warmup_success, graph_warmup_time] = runPrefill(tokens);
                 if (!graph_warmup_success)
                 {
-                    if (mpi_ctx_->rank() == 0)
-                    {
-                        LOG_ERROR("Prefill graph warmup failed on iteration " << (iter + 1));
-                    }
+                    LOG_ERROR("Prefill graph warmup failed on iteration " << (iter + 1));
                     return false;
                 }
             }
@@ -1824,10 +1710,7 @@ namespace llaminar2
             auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
             if (!warmup_prefill_success)
             {
-                if (mpi_ctx_->rank() == 0)
-                {
-                    LOG_ERROR("Warmup prefill failed on iteration " << (iter + 1));
-                }
+                LOG_ERROR("Warmup prefill failed on iteration " << (iter + 1));
                 if (last_failure_reason_.empty())
                     last_failure_reason_ = "warmup prefill failed";
                 return capture_and_return();
@@ -1839,14 +1722,11 @@ namespace llaminar2
                 auto warmup_decode = runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
                 if (!warmup_decode.success)
                 {
-                    if (mpi_ctx_->rank() == 0)
+                    LOG_ERROR("Warmup decode failed on iteration " << (iter + 1));
+                    if (!last_failure_reason_.empty())
                     {
-                        LOG_ERROR("Warmup decode failed on iteration " << (iter + 1));
-                        if (!last_failure_reason_.empty())
-                        {
-                            LOG_ERROR("Warmup decode failure reason: "
-                                      << last_failure_reason_);
-                        }
+                        LOG_ERROR("Warmup decode failure reason: "
+                                  << last_failure_reason_);
                     }
                     if (last_failure_reason_.empty())
                         last_failure_reason_ = "warmup decode failed";
@@ -1855,10 +1735,8 @@ namespace llaminar2
             }
         }
 
-        if (mpi_ctx_->rank() == 0 && warmup_iterations > 0)
-        {
+        if (warmup_iterations > 0)
             LOG_INFO("Warmup complete.");
-        }
         logGPUMemorySnapshot("after-warmup");
 
         // Post-warmup callback (e.g., MoE expert rebalancing)
@@ -1869,8 +1747,7 @@ namespace llaminar2
             // Re-warm caches after post-warmup work (e.g., MPI expert weight
             // transfers can evict hot data from LLC, causing the first benchmark
             // iteration to measure cold-cache performance).
-            if (mpi_ctx_->rank() == 0)
-                LOG_DEBUG("Re-warming caches after post-warmup setup...");
+            LOG_DEBUG("Re-warming caches after post-warmup setup...");
             runner_->clear_cache();
             auto [rw_ok, rw_time] = runPrefill(tokens);
             if (rw_ok && n_decode > 0)
@@ -1897,16 +1774,12 @@ namespace llaminar2
             {
                 last_failure_reason_ =
                     "required prefill graph was absent immediately before the measured replay";
-                if (mpi_ctx_->rank() == 0)
-                    LOG_ERROR(last_failure_reason_);
+                LOG_ERROR(last_failure_reason_);
                 return capture_and_return();
             }
         }
 
-        if (mpi_ctx_->rank() == 0)
-        {
-            LOG_INFO("Running " << benchmark_iterations << " benchmark iterations...");
-        }
+        LOG_INFO("Running " << benchmark_iterations << " benchmark iterations...");
 
         // Reset profiling after warmup (only track actual benchmark iterations)
         if (KernelProfiler::isEnabled())
@@ -1940,6 +1813,8 @@ namespace llaminar2
                 {"forward_graph", "prefill_graph_lifecycle"},
                 {"forward_graph", "prefill_graph_phase"},
                 {"forward_graph", "decode_graph_phase"},
+                {"moe_overlay_activation_epoch",
+                 "shared_physical_dispatch_d2h_bytes"},
                 {"kernel", "rocm_moe_grouped_prefill_batch_invariant_calls"},
                 {"kernel", "cuda_moe_grouped_prefill_active_expert_grid_calls"},
                 {"kernel", "cuda_moe_grouped_prefill_swiglu_path_calls"},
@@ -1972,10 +1847,7 @@ namespace llaminar2
             runner_->clear_cache();
             logGPUMemorySnapshot(("after-clear-cache iter=" + std::to_string(iter + 1)).c_str());
 
-            if (mpi_ctx_->rank() == 0)
-            {
-                LOG_DEBUG("  Iteration " << (iter + 1) << "/" << benchmark_iterations << "...");
-            }
+            LOG_DEBUG("  Iteration " << (iter + 1) << "/" << benchmark_iterations << "...");
 
             // Run prefill
             KernelProfiler::setCurrentPhase(KernelProfiler::Phase::PREFILL);
@@ -1986,10 +1858,7 @@ namespace llaminar2
             auto [prefill_success, prefill_time] = runPrefill(tokens);
             if (!prefill_success)
             {
-                if (mpi_ctx_->rank() == 0)
-                {
-                    LOG_ERROR("Prefill failed on iteration " << (iter + 1));
-                }
+                LOG_ERROR("Prefill failed on iteration " << (iter + 1));
                 if (last_failure_reason_.empty())
                     last_failure_reason_ = "prefill failed on benchmark iteration";
                 logGPUMemorySnapshot(("prefill-fail iter=" + std::to_string(iter + 1)).c_str());
@@ -2014,8 +1883,7 @@ namespace llaminar2
                         "; after: " +
                         summarizePrefillGraphProbe(
                             measured_prefill_graph_after) + ")";
-                    if (mpi_ctx_->rank() == 0)
-                        LOG_ERROR(last_failure_reason_);
+                    LOG_ERROR(last_failure_reason_);
                     logGPUMemorySnapshot(("prefill-graph-replay-required-fail iter=" + std::to_string(iter + 1)).c_str());
                     return capture_and_return();
                 }
@@ -2038,14 +1906,11 @@ namespace llaminar2
                     runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
                 if (!decode_result.success)
                 {
-                    if (mpi_ctx_->rank() == 0)
+                    LOG_ERROR("Decode failed on iteration " << (iter + 1));
+                    if (!last_failure_reason_.empty())
                     {
-                        LOG_ERROR("Decode failed on iteration " << (iter + 1));
-                        if (!last_failure_reason_.empty())
-                        {
-                            LOG_ERROR("Decode failure reason: "
-                                      << last_failure_reason_);
-                        }
+                        LOG_ERROR("Decode failure reason: "
+                                  << last_failure_reason_);
                     }
                     if (last_failure_reason_.empty())
                         last_failure_reason_ = "decode failed on benchmark iteration";
@@ -2072,11 +1937,8 @@ namespace llaminar2
                 }
                 logGPUMemorySnapshot(("after-decode iter=" + std::to_string(iter + 1)).c_str());
             }
-            if (mpi_ctx_->rank() == 0)
-            {
-                LOG_DEBUG("    Prefill: " << std::fixed << std::setprecision(2) << prefill_time << " ms"
-                                          << (n_decode > 0 ? ", Decode: " + std::to_string(static_cast<int>(decode_times.back())) + " ms" : ""));
-            }
+            LOG_DEBUG("    Prefill: " << std::fixed << std::setprecision(2) << prefill_time << " ms"
+                                      << (n_decode > 0 ? ", Decode: " + std::to_string(static_cast<int>(decode_times.back())) + " ms" : ""));
         }
 
         // ========================================================================
@@ -2122,10 +1984,7 @@ namespace llaminar2
         result.success = result.prefill_success && result.decode_success;
         result.failure_reason.clear();
 
-        if (mpi_ctx_->rank() == 0)
-        {
-            LOG_INFO("Benchmark complete.");
-        }
+        LOG_INFO("Benchmark complete.");
 
         if (runner_)
             runner_->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
@@ -2135,10 +1994,6 @@ namespace llaminar2
 
     void BenchmarkRunner::printResults(const BenchmarkResult &result)
     {
-        if (mpi_ctx_->rank() != 0)
-        {
-            return; // Only rank 0 prints
-        }
         const int measurement_iterations = std::max(1, result.measurement_iterations);
 
         std::print("\n");

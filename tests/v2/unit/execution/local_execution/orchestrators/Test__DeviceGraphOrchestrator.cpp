@@ -9,6 +9,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "backends/BackendManager.h"
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/local_execution/collective/CollectiveContext.h"
@@ -30,6 +31,7 @@
 #include "backends/ComputeBackend.h"
 #include "../../../../mocks/MockModelContext.h"
 #include "../../../../mocks/MockModelLoader.h"
+#include "../../../../mocks/MockComputeStage.h"
 #include "../../../../mocks/MockLocalTPContext.h"
 #include "utils/Logger.h"
 #include "tensors/Tensors.h"
@@ -54,6 +56,10 @@ class Test__DeviceGraphOrchestrator : public ::testing::Test
 protected:
     void SetUp() override
     {
+        // This unit-test process intentionally models one aggregate CPU domain.
+        // Production MPI ranks initialize an exact node in RuntimeInitPhase.
+        initCPUBackend(-1);
+
         // Initialize DeviceManager (required for DeviceContext creation)
         DeviceManager::instance().initialize(-1); // -1 = no NUMA filtering
 
@@ -203,6 +209,88 @@ namespace
             << "Request reset must release stale verifier stream ownership.";
     }
 
+    TEST_F(Test__DeviceGraphOrchestrator,
+           DevicePositionAuthorityIsNotShadowedBySynthesizedHostRows)
+    {
+        const std::string source =
+            readSourceFileForDeviceGraphOrchestratorTest(
+                "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+        ASSERT_FALSE(source.empty());
+
+        const auto execute_pos = source.find(
+            "bool DeviceGraphOrchestrator::executeForward(");
+        const auto next_method_pos = source.find(
+            "bool DeviceGraphOrchestrator::waitForLastForwardCompletionForBenchmark(",
+            execute_pos);
+        ASSERT_NE(execute_pos, std::string::npos);
+        ASSERT_NE(next_method_pos, std::string::npos);
+        const std::string execute_body =
+            source.substr(execute_pos, next_method_pos - execute_pos);
+
+        EXPECT_NE(
+            execute_body.find(
+                "if (!input.position_ids && !input.position_ids_device)"),
+            std::string::npos)
+            << "A permanent device position row is the sole graph-input "
+               "authority and must suppress host position synthesis.";
+        EXPECT_EQ(
+            execute_body.find("if (!input.position_ids)"),
+            std::string::npos)
+            << "Testing only the host pointer would silently create a second "
+               "position authority for device-resident graph inputs.";
+    }
+
+    /**
+     * @brief The forward boundary follows explicit PP ownership on CPU too.
+     */
+    TEST_F(Test__DeviceGraphOrchestrator,
+           ForwardResultBoundarySelectsHiddenOnlyForNonHeadPPStage)
+    {
+        llaminar2::testing::MockDeviceContext cpu_ctx(DeviceId::cpu());
+        FP32Tensor logits(std::vector<size_t>{1, 16}, DeviceId::cpu());
+        FP32Tensor hidden(std::vector<size_t>{1, 8}, DeviceId::cpu());
+
+        DeviceGraphOrchestrator nonterminal(graph_builder_, nullptr);
+        nonterminal.setPPStageConfig(FactoryPPStageConfig{
+            .first_layer = 0,
+            .last_layer = 12,
+            .has_embedding = true,
+            .has_lm_head = false});
+        IForwardExecutionHost &nonterminal_host = nonterminal;
+
+        ForwardOutput hidden_output;
+        hidden_output.hidden = &hidden;
+        EXPECT_TRUE(nonterminal_host.publishForwardResultAtBoundary(
+            hidden_output,
+            &cpu_ctx));
+
+        ForwardOutput missing_hidden;
+        missing_hidden.logits = &logits;
+        EXPECT_FALSE(nonterminal_host.publishForwardResultAtBoundary(
+            missing_hidden,
+            &cpu_ctx));
+
+        DeviceGraphOrchestrator terminal(graph_builder_, nullptr);
+        terminal.setPPStageConfig(FactoryPPStageConfig{
+            .first_layer = 12,
+            .last_layer = 24,
+            .has_embedding = false,
+            .has_lm_head = true});
+        IForwardExecutionHost &terminal_host = terminal;
+
+        ForwardOutput logits_output;
+        logits_output.logits = &logits;
+        EXPECT_TRUE(terminal_host.publishForwardResultAtBoundary(
+            logits_output,
+            &cpu_ctx));
+
+        ForwardOutput missing_logits;
+        missing_logits.hidden = &hidden;
+        EXPECT_FALSE(terminal_host.publishForwardResultAtBoundary(
+            missing_logits,
+            &cpu_ctx));
+    }
+
     class ScopedEnv
     {
     public:
@@ -249,6 +337,17 @@ namespace
         bool allreduce(TensorBase *) override { return false; }
         bool broadcast(TensorBase *, int = 0) override { return false; }
         bool allgather(const TensorBase *, TensorBase *) override { return false; }
+        bool gatherVariableFloatRecordsToRoot(
+            const float *, size_t, float *, size_t, size_t, int,
+            size_t &, const std::string &) override
+        {
+            return false;
+        }
+        bool broadcastFloatElements(
+            TensorBase *, size_t, int, const std::string &) override
+        {
+            return false;
+        }
         bool send(const TensorBase *, int) override { return false; }
         bool recv(TensorBase *, int) override { return false; }
 
@@ -277,9 +376,11 @@ namespace
         for (int s = 0; s < num_sockets; ++s)
             cfg.sockets.push_back(DeviceId(DeviceType::CPU, s));
 
-        cfg.initial_expert_to_socket.resize(num_experts);
+        std::vector<int> owners(static_cast<size_t>(num_experts));
         for (int e = 0; e < num_experts; ++e)
-            cfg.initial_expert_to_socket[e] = e % num_sockets;
+            owners[static_cast<size_t>(e)] = e % num_sockets;
+        cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+            num_layers, num_sockets, owners);
 
         cfg.rebalance_config.imbalance_threshold = 1.3f;
         cfg.rebalance_config.max_swaps_per_layer = 4;
@@ -577,7 +678,7 @@ TEST_F(Test__DeviceGraphOrchestrator, NullGraphBuilderThrows)
         std::invalid_argument);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarMainStatePreservationIsInitializedAndTopologyBounded)
+TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarStateContractIsGraphDeclaredAndInitializationBounded)
 {
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.mtp.enabled = true;
@@ -589,9 +690,9 @@ TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarMainStatePreservationIsInitializ
         nullptr);
     ASSERT_TRUE(moe_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
-    EXPECT_FALSE(moe_orchestrator.supportsMTPSidecarPreservesMainState())
-        << "MoE all-position verifier row parity is not enough to prove that the "
-           "preceding sidecar left every routed live-state surface untouched.";
+    EXPECT_TRUE(moe_orchestrator.supportsMTPSidecarPreservesMainState())
+        << "Qwen3.6 MoE declares MTP scratch, shifted KV, and depth-scoped "
+           "router metadata as sidecar-owned on every backend.";
     EXPECT_FALSE(moe_orchestrator.supportsMTPShiftedRowReuseFromSidecar())
         << "MoE must publish the first shifted MTP row from the target verifier "
            "accepted row, not reuse sidecar-local routed expert state.";
@@ -608,20 +709,19 @@ TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarMainStatePreservationIsInitializ
         << "CPU MoE grouped publication is a required host-native contract; it "
            "does not advertise a separate economy or device-residency capability.";
 
-    auto dense_config = config_;
-    dense_config.mtp.enabled = true;
+    auto dense_config = moe_config;
+    dense_config.moe = {};
     DeviceGraphOrchestrator dense_orchestrator(
-        std::make_shared<QwenStandardGraph>(dense_config, nullptr),
+        std::make_shared<Qwen35Graph>(dense_config, nullptr),
         nullptr);
     EXPECT_FALSE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
         << "The capability requires initialized KV/MTP cache state, not just config.";
     ASSERT_TRUE(dense_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     /*
-     * Dense sidecars use MTP-prefixed activation buffers and request-local MTP
-     * KV.  Real-model ROCm preservation coverage compares verifier rows before
-     * and after sidecar execution; this unit guard keeps the advertised
-     * capability narrow enough for that proof to remain meaningful.
+     * Dense Qwen3.5/3.6 sidecars use MTP-prefixed activation buffers and
+     * request-local shifted KV. Real-model preservation coverage compares
+     * verifier rows and state payloads before and after sidecar execution.
      */
     EXPECT_TRUE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
         << "Initialized dense MTP runners can skip the full verifier-base restore; "
@@ -643,6 +743,18 @@ TEST_F(Test__DeviceGraphOrchestrator, CpuSidecarMainStatePreservationIsInitializ
            "contract for M=1..4.";
     EXPECT_FALSE(cpu_dense_capability.supportsDenseDirectAllPositionRows(1, false))
         << "CPU dense direct publication is intentionally not promoted.";
+
+    auto undeclared_config = config_;
+    undeclared_config.mtp.enabled = true;
+    DeviceGraphOrchestrator undeclared_orchestrator(
+        std::make_shared<QwenStandardGraph>(undeclared_config, nullptr),
+        nullptr);
+    ASSERT_TRUE(undeclared_orchestrator.initializeInferenceStateFromArena(
+        1, 16, DeviceId::cpu()));
+    EXPECT_FALSE(
+        undeclared_orchestrator.supportsMTPSidecarPreservesMainState())
+        << "A graph family without a concrete MTP sidecar implementation must "
+           "not inherit preservation merely because it is dense or runs on CPU.";
 
 }
 
@@ -719,8 +831,21 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeL
         DeviceId::cpu());
     capturing_builder->setPreparedWeightStore(&store);
 
-    auto graph_ref = capturing_builder->exposePreparedRefForGraphWeight(
+    /*
+     * Store registration and graph binding publication are separate typed
+     * lifecycle edges. The store must not infer a representation from a bare
+     * numeric binding id: embedding and GEMM registries can deliberately reuse
+     * that id. Production WeightManager attaches the returned prepared
+     * descriptor before publishing the binding set, so mirror that exact
+     * materialized state here instead of relying on the retired untyped lookup.
+     */
+    EXPECT_FALSE(capturing_builder->exposePreparedRefForGraphWeight(
         gdn_binding,
+        DeviceId::cpu()).has_value());
+    WeightBinding prepared_gdn_binding = *gdn_binding;
+    prepared_gdn_binding.prepared = registered_ref;
+    auto graph_ref = capturing_builder->exposePreparedRefForGraphWeight(
+        &prepared_gdn_binding,
         DeviceId::cpu());
     ASSERT_TRUE(graph_ref.has_value());
     EXPECT_EQ(graph_ref->binding_id, registered_ref.binding_id);
@@ -1645,8 +1770,8 @@ TEST_F(Test__DeviceGraphOrchestrator, ReplicatedDenseVerifierUsesFullAllPosition
     EXPECT_NE(predicate_body.find("return false"), std::string::npos)
         << "Decode-replicated all-position verifier rows must write full logits so "
            "their LM-head binding matches rowwise serial decode.";
-    EXPECT_NE(predicate_body.find("mtpTerminalHeadIsMirrored(config.mtp.terminal_head_policy)"), std::string::npos)
-        << "Mirrored LocalTP MTP sidecars must advertise full replicated logits.";
+    EXPECT_NE(predicate_body.find("config.mtpParticipantOwnsFullVocabulary()"), std::string::npos)
+        << "Mirrored MTP sidecars at every TP scope must advertise full replicated logits.";
     EXPECT_EQ(predicate_body.find("config.tp_ctx->degree() > 1"), std::string::npos)
         << "Degree-based local shard advertisement reintroduces the serial-logit mismatch.";
 
@@ -1668,6 +1793,54 @@ TEST_F(Test__DeviceGraphOrchestrator, ReplicatedDenseVerifierUsesFullAllPosition
     const std::string has_local_body = header.substr(has_local_pos, get_info_pos - has_local_pos);
     EXPECT_NE(has_local_body.find("activeAllPositionLogitsAreColumnParallel()"),
               std::string::npos);
+}
+
+/**
+ * @brief Guard mirrored GlobalTP sidecars against stale gathered-logits wiring.
+ *
+ * The terminal head's typed layout is the only authority allowed to request a
+ * compact vocabulary allgather. A previous orchestration path looked only at
+ * the primary LM-head sharding bit, then treated the mirrored schema's 1x1
+ * placeholder as a real gathered result and emitted false PerfStats. This
+ * architecture check keeps buffer validation, graph output binding, and
+ * successful-execution accounting under one resolved predicate.
+ */
+TEST_F(Test__DeviceGraphOrchestrator,
+       MirroredGlobalTPMTPDoesNotAdvertiseGatheredLogits)
+{
+    const std::string source =
+        readSourceFileForDeviceGraphOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto begin = source.find(
+        "bool DeviceGraphOrchestrator::executeMTPDepth0Batched");
+    const auto end = source.find(
+        "bool DeviceGraphOrchestrator::bindShiftedMTPPrefillTransaction",
+        begin);
+    ASSERT_NE(begin, std::string::npos);
+    ASSERT_NE(end, std::string::npos);
+    ASSERT_LT(begin, end);
+
+    const std::string body = source.substr(begin, end - begin);
+    EXPECT_NE(
+        body.find(
+            "mtpSidecarRequiresGlobalLogitsGather(kv_cache_only)"),
+        std::string::npos)
+        << "MTP execution must resolve its collective from typed terminal-head ownership.";
+    EXPECT_EQ(
+        body.find("graph_builder_->config().lm_head_column_parallel"),
+        std::string::npos)
+        << "The primary LM-head sharding bit cannot independently authorize an MTP allgather.";
+    EXPECT_NE(
+        body.find(
+            "output.gathered_logits = requires_global_mtp_logits_gather"),
+        std::string::npos)
+        << "A mirrored sidecar must expose null gathered output rather than a schema placeholder.";
+    EXPECT_NE(
+        body.find("if (ok && requires_global_mtp_logits_gather)"),
+        std::string::npos)
+        << "PerfStats may report a logits allgather only after that typed collective executes.";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, LiveHybridPrefixLayoutRefreshRekeysBeforeHarvest)
@@ -2386,6 +2559,43 @@ TEST_F(
         sampler_prepare_body.find(
             "DeviceTimelineRole::TargetSampler"),
         std::string::npos);
+    const auto host_prepare_pos =
+        source.find(
+            "void *DeviceGraphOrchestrator::prepareLogitsHostObservation(");
+    const auto host_publish_pos =
+        source.find(
+            "const float *DeviceGraphOrchestrator::publishLogitsTensorToHost(",
+            host_prepare_pos);
+    ASSERT_NE(host_prepare_pos, std::string::npos);
+    ASSERT_NE(host_publish_pos, std::string::npos);
+    const std::string host_prepare_body =
+        source.substr(host_prepare_pos, host_publish_pos - host_prepare_pos);
+    EXPECT_NE(
+        host_prepare_body.find(
+            "MainLogitsPublicationSource::PrefixTerminalRestore"),
+        std::string::npos)
+        << "Host observation must distinguish restored terminal logits from a "
+           "forward-graph publication.";
+    EXPECT_NE(
+        host_prepare_body.find(
+            "ForwardGraphOutputKind::GroupedVerifier"),
+        std::string::npos)
+        << "Once grouped-verifier admission consumes the restore event, its "
+           "durable completion must order observation of canonical restored logits.";
+    EXPECT_NE(
+        host_prepare_body.find("has_grouped_prefix_restore_successor"),
+        std::string::npos)
+        << "The host bridge must model the verifier event as a typed transitive "
+           "successor rather than accepting any unrelated durable publication.";
+    EXPECT_NE(
+        host_prepare_body.find("joinPublishedLiveStateHandoffs("),
+        std::string::npos)
+        << "Restored logits D2H must wait on the exact live-prefix mutation event.";
+    EXPECT_NE(
+        host_prepare_body.find("DeviceTimelineRole::HostResultBridge"),
+        std::string::npos)
+        << "The event join must name the host-result owner rather than "
+           "impersonating a sampler or diagnostic stream.";
     const auto restore_clear_pos =
         source.find(
             "void DeviceGraphOrchestrator::clearLivePrefixRestoreTransientHandoffs(");
@@ -2589,8 +2799,13 @@ TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochIsTrackedWithoutRekeyingP
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
 
     auto controller_config = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
+    std::vector<int> owners(8);
     for (int expert = 0; expert < 8; ++expert)
-        controller_config.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+        owners[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+    controller_config.initial_ownership = MoELayeredExpertOwnership::uniform(
+        controller_config.num_layers,
+        static_cast<int>(controller_config.sockets.size()),
+        owners);
 
     auto controller = std::make_unique<MoERebalanceController>(controller_config);
     auto *controller_ptr = controller.get();
@@ -2766,8 +2981,11 @@ TEST_F(Test__DeviceGraphOrchestrator, CompleteExpertPlacementPersistsAcrossFresh
 
     ExpertReplicaSet replicas;
     replicas.domain_id = "single_cpu_moe";
-    replicas.owner_socket = {1, 1, 1, 1};
-    replicas.num_sockets = 3;
+    replicas.base_ownership = MoELayeredExpertOwnership::uniform(
+        1, 3, {1, 1, 1, 1});
+    replicas.replica_participants_by_layer.assign(
+        1,
+        std::vector<std::vector<bool>>(4, std::vector<bool>(3, false)));
     replicas.setReplicaOnParticipant(
         /*layer_idx=*/0, /*expert_id=*/1, /*participant_id=*/2);
     replicas.setReplicaOnParticipant(
@@ -2995,8 +3213,13 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceHookAppliesLocalMoE
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     auto cfg = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
+    std::vector<int> owners(8);
     for (int expert = 0; expert < 8; ++expert)
-        cfg.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+        owners[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+    cfg.initial_ownership = MoELayeredExpertOwnership::uniform(
+        cfg.num_layers,
+        static_cast<int>(cfg.sockets.size()),
+        owners);
 
     auto controller = std::make_unique<MoERebalanceController>(cfg);
     auto *controller_ptr = controller.get();

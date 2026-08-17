@@ -11,6 +11,7 @@
 #include <limits>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -55,8 +56,9 @@ namespace llaminar2
 
         int num_layers = static_cast<int>(layer_metrics.size());
         std::ostringstream ss;
-        ss << "SocketRebalanceProposal: " << numSwaps() << " swap"
-           << (numSwaps() != 1 ? "s" : "") << " across " << num_layers
+        ss << "SocketRebalanceProposal: " << numSwapPairs() << " swap pair"
+           << (numSwapPairs() != 1 ? "s" : "") << " ("
+           << numOwnershipChanges() << " ownership changes) across " << num_layers
            << " layer" << (num_layers != 1 ? "s" : "")
            << " (gen=" << window_generation << ")";
 
@@ -80,7 +82,8 @@ namespace llaminar2
     }
 
     SocketRebalanceProposal SocketAwareRebalancer::propose(
-        const DecodeExpertHistogram& histogram) const
+        const DecodeExpertHistogram &histogram,
+        const MoELayeredExpertOwnership &ownership) const
     {
         SocketRebalanceProposal proposal;
         proposal.window_generation = histogram.windowGeneration();
@@ -91,6 +94,13 @@ namespace llaminar2
 
         if (num_layers <= 0 || num_sockets < 2) {
             return proposal;
+        }
+        if (ownership.layerCount() != num_layers ||
+            ownership.expertCount() != hcfg.num_experts ||
+            ownership.participantCount() != num_sockets)
+        {
+            throw std::invalid_argument(
+                "SocketAwareRebalancer ownership geometry does not match the histogram");
         }
 
         // Ensure cooldown vector is sized (UINT64_MAX = never rebalanced)
@@ -115,22 +125,34 @@ namespace llaminar2
             if (total_activations < config_.min_window_activations)
                 continue;
 
-            // Get current placement
-            const auto& expert_to_socket = hcfg.expert_to_socket;
+            // Every routed layer owns its own complete placement row.  Never
+            // substitute a global expert map here: conflicting layer-local
+            // swaps are both valid and must survive publication.
+            const auto &expert_to_socket = ownership.ownersForLayer(l);
 
             auto layer_swaps = proposeForLayer(l, expert_counts, expert_to_socket, num_sockets);
             if (layer_swaps.empty())
                 continue;
 
-            // Enforce max_total_swaps
+            // Enforce the total entry budget without ever splitting a paired
+            // swap. A half-pair would change participant expert capacity.
             int remaining = config_.max_total_swaps - total_swaps;
-            if (remaining <= 0)
+            remaining -= remaining % 2;
+            if (remaining < 2)
                 break;
             if (static_cast<int>(layer_swaps.size()) > remaining)
                 layer_swaps.resize(remaining);
 
             // Compute estimated imbalance after swaps
-            float imbalance_before = histogram.socketImbalanceRatio(l);
+            std::vector<uint64_t> current_loads(static_cast<size_t>(num_sockets), 0);
+            for (int e = 0; e < static_cast<int>(expert_counts.size()); ++e)
+            {
+                current_loads[static_cast<size_t>(expert_to_socket[static_cast<size_t>(e)])] +=
+                    expert_counts[static_cast<size_t>(e)];
+            }
+            const auto [current_min_it, current_max_it] =
+                std::minmax_element(current_loads.begin(), current_loads.end());
+            float imbalance_before = imbalanceRatio(*current_max_it, *current_min_it);
 
             // Simulate the swaps to estimate new imbalance
             std::vector<int> simulated_placement = expert_to_socket;
@@ -166,8 +188,6 @@ namespace llaminar2
             total_swaps += static_cast<int>(layer_swaps.size());
             proposal.swaps.insert(proposal.swaps.end(), layer_swaps.begin(), layer_swaps.end());
 
-            // Record cooldown
-            layer_last_rebalanced_[l] = current_gen;
         }
 
         if (!proposal.empty()) {
@@ -177,15 +197,33 @@ namespace llaminar2
         return proposal;
     }
 
-    std::vector<int> SocketAwareRebalancer::apply(
-        const std::vector<int>& current_placement,
-        const SocketRebalanceProposal& proposal) const
+    void SocketAwareRebalancer::recordApplied(
+        const SocketRebalanceProposal &proposal) const
     {
-        std::vector<int> new_placement = current_placement;
-        for (const auto& swap : proposal.swaps) {
-            new_placement[swap.expert_id] = swap.to_socket;
+        if (proposal.empty())
+            return;
+
+        const int required_layers = proposal.layer_metrics.empty()
+                                        ? 0
+                                        : 1 + std::max_element(
+                                                  proposal.layer_metrics.begin(),
+                                                  proposal.layer_metrics.end(),
+                                                  [](const auto &lhs, const auto &rhs)
+                                                  {
+                                                      return lhs.layer_idx < rhs.layer_idx;
+                                                  })
+                                                  ->layer_idx;
+        if (required_layers > static_cast<int>(layer_last_rebalanced_.size()))
+        {
+            layer_last_rebalanced_.resize(
+                static_cast<size_t>(required_layers), UINT64_MAX);
         }
-        return new_placement;
+
+        for (const auto &metrics : proposal.layer_metrics)
+        {
+            layer_last_rebalanced_.at(static_cast<size_t>(metrics.layer_idx)) =
+                proposal.window_generation;
+        }
     }
 
     std::vector<ExpertSwap> SocketAwareRebalancer::proposeForLayer(

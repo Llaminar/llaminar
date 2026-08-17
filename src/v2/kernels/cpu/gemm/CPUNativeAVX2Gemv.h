@@ -1,6 +1,6 @@
 /**
  * @file CPUNativeAVX2Gemv.h
- * @brief AVX2 GEMV/GEMM kernels using emulated VNNI (maddubs+madd pattern).
+ * @brief AVX2 GEMV/GEMM kernels using saturation-safe emulated VNNI.
  *
  * These kernels read the SAME packed weight format as the AVX512 VNNI kernels
  * (CPUNativeVNNIGemv.h). Each 64-byte ZMM slot is processed as two 32-byte
@@ -23,6 +23,8 @@
 #include <algorithm>
 
 #include "CPUNativeVNNIWeightPacker.h"
+#include "CPUNativeVNNIFP16.h"
+#include "CPUNativeVNNIQ6Kernels.h"
 #include "VNNIEmulation.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/SIMDHelpers.h"
@@ -72,6 +74,22 @@ namespace llaminar2::cpu::native_vnni
         return isa::build_decode_lut_avx2(lut_data);
     }
 
+    /**
+     * @brief Pack four signed Q8_1 bytes as unsigned VNNI input lanes.
+     *
+     * Flipping each sign bit is exactly equivalent to adding 128 modulo 256,
+     * but keeps activation preparation in general-purpose registers.  The
+     * corresponding `128 * sum(weights)` compensation is applied after every
+     * complete INT32 dot product.
+     */
+    inline int32_t pack_q8_1_unsigned_word_avx2(
+        const Q8_1Block &block, int base_index) noexcept
+    {
+        uint32_t raw = 0;
+        std::memcpy(&raw, block.qs + base_index, sizeof(raw));
+        return static_cast<int32_t>(raw ^ 0x80808080u);
+    }
+
     // =========================================================================
     // AVX2 GEMV: nibble-LUT path (Q4_0, IQ4_NL, Q4_1, IQ4_XS)
     // =========================================================================
@@ -81,6 +99,13 @@ namespace llaminar2::cpu::native_vnni
     // The nibble decode and VNNI accumulation use AVX2 equivalents.
     // =========================================================================
 
+    /**
+     * @brief Execute one serial-shaped AVX2 nibble chunk over a K range.
+     *
+     * @param accumulate Load `C` as the initial FP32 accumulator. Tile callers
+     *        use this mode to materialize cache boundaries without changing
+     *        the serial per-K-block reduction tree.
+     */
     inline void gemv_avx2_chunk_native(
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8,
@@ -88,376 +113,200 @@ namespace llaminar2::cpu::native_vnni
         int chunk,
         int kb_start,
         int kb_end,
-        const __m256i decode_lut)
+        const __m256i decode_lut,
+        bool accumulate = false)
     {
-        // 8 FP32 accumulators covering 64 columns (8 columns each)
-        __m256 fp_acc0 = _mm256_setzero_ps();
-        __m256 fp_acc1 = _mm256_setzero_ps();
-        __m256 fp_acc2 = _mm256_setzero_ps();
-        __m256 fp_acc3 = _mm256_setzero_ps();
-        __m256 fp_acc4 = _mm256_setzero_ps();
-        __m256 fp_acc5 = _mm256_setzero_ps();
-        __m256 fp_acc6 = _mm256_setzero_ps();
-        __m256 fp_acc7 = _mm256_setzero_ps();
-
         const __m256i bias_128_i32 = _mm256_set1_epi32(128);
         const __m256i mask_0F = _mm256_set1_epi8(0x0F);
-
-        for (int kb = kb_start; kb < kb_end; ++kb)
+        for (int segment = 0; segment < 8; ++segment)
         {
-            const Q8_1Block &a_blk = A_q8[kb];
-            float a_scale = simd::fp16_to_fp32(a_blk.d);
-            int16_t a_sum = a_blk.sum_qs;
+            const int z = segment / 2;
+            const int byte_offset = (segment % 2) * 32;
+            __m256 fp_accumulator = accumulate
+                ? _mm256_loadu_ps(C + segment * 8)
+                : _mm256_setzero_ps();
 
-            // 8 INT32 accumulators
-            __m256i int_acc0 = _mm256_setzero_si256();
-            __m256i int_acc1 = _mm256_setzero_si256();
-            __m256i int_acc2 = _mm256_setzero_si256();
-            __m256i int_acc3 = _mm256_setzero_si256();
-            __m256i int_acc4 = _mm256_setzero_si256();
-            __m256i int_acc5 = _mm256_setzero_si256();
-            __m256i int_acc6 = _mm256_setzero_si256();
-            __m256i int_acc7 = _mm256_setzero_si256();
-
-            // 4 groups: each covers 4 native bytes per column.
-            // Low nibbles → K-elements [g*4..g*4+3]
-            // High nibbles → K-elements [g*4+16..g*4+19]
-            for (int group = 0; group < 4; ++group)
+            for (int kb = kb_start; kb < kb_end; ++kb)
             {
-                // A broadcast for low-nibble sub
-                uint8_t a_lo[4];
-                a_lo[0] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 0]) + 128);
-                a_lo[1] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 1]) + 128);
-                a_lo[2] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 2]) + 128);
-                a_lo[3] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 3]) + 128);
-                int32_t a_lo_i32;
-                std::memcpy(&a_lo_i32, a_lo, 4);
-                __m256i a_lo_bcast = _mm256_set1_epi32(a_lo_i32);
-
-                // A broadcast for high-nibble sub
-                uint8_t a_hi[4];
-                a_hi[0] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 16]) + 128);
-                a_hi[1] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 17]) + 128);
-                a_hi[2] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 18]) + 128);
-                a_hi[3] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 19]) + 128);
-                int32_t a_hi_i32;
-                std::memcpy(&a_hi_i32, a_hi, 4);
-                __m256i a_hi_bcast = _mm256_set1_epi32(a_hi_i32);
-
-                // Process 4 ZMM slots, each split into 2 YMM halves
-                for (int z = 0; z < 4; ++z)
+                const Q8_1Block &activation = A_q8[kb];
+                __m256i dot_low = _mm256_setzero_si256();
+                __m256i dot_high = _mm256_setzero_si256();
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+                for (int group = 0; group < 4; ++group)
                 {
-                    const uint8_t *base = packed.interleavedB(chunk, kb, group, z);
-                    __m256i raw_lo = _mm256_load_si256(reinterpret_cast<const __m256i *>(base));
-                    __m256i raw_hi = _mm256_load_si256(reinterpret_cast<const __m256i *>(base + 32));
+                    const uint8_t *base =
+                        packed.interleavedB(chunk, kb, group, z) + byte_offset;
+                    const __m256i raw = _mm256_load_si256(
+                        reinterpret_cast<const __m256i *>(base));
+                    const __m256i low = _mm256_shuffle_epi8(
+                        decode_lut, _mm256_and_si256(raw, mask_0F));
+                    const __m256i high = _mm256_shuffle_epi8(
+                        decode_lut,
+                        _mm256_and_si256(
+                            _mm256_srli_epi16(raw, 4), mask_0F));
+                    /*
+                     * The even/odd-byte products inside `avx2_dpbusd_epi32`
+                     * have a short enough live set for two independent nibble
+                     * chains when this fixed group loop is not unrolled. This
+                     * restores dot-product ILP without exceeding AVX2's sixteen
+                     * architectural registers.
+                     */
+                    dot_low = isa::avx2_dpbusd_epi32(
+                        dot_low,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            activation, group * 4)),
+                        low);
+                    dot_high = isa::avx2_dpbusd_epi32(
+                        dot_high,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            activation, group * 4 + 16)),
+                        high);
+                }
 
-                    // Decode low nibbles
-                    __m256i lo_lo = _mm256_shuffle_epi8(decode_lut, _mm256_and_si256(raw_lo, mask_0F));
-                    __m256i lo_hi = _mm256_shuffle_epi8(decode_lut, _mm256_and_si256(raw_hi, mask_0F));
+                const __m256i compensation = _mm256_cvtepi16_epi32(
+                    _mm_load_si128(reinterpret_cast<const __m128i *>(
+                        packed.chunkComp(chunk, kb) + segment * 8)));
+                const __m256i corrected = _mm256_sub_epi32(
+                    _mm256_add_epi32(dot_low, dot_high),
+                    _mm256_mullo_epi32(bias_128_i32, compensation));
+                const __m256 weight_scale = _mm256_cvtph_ps(
+                    _mm_load_si128(reinterpret_cast<const __m128i *>(
+                        packed.chunkScales(chunk, kb) + segment * 8)));
+                const __m256 combined_scale = _mm256_mul_ps(
+                    _mm256_set1_ps(nativeVNNIFP16ScaleToFP32(activation.d)),
+                    weight_scale);
+                fp_accumulator = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(corrected),
+                    combined_scale,
+                    fp_accumulator);
 
-                    // Accumulate low nibbles
-                    int idx = z * 2;
-                    __m256i *acc_ptr = &int_acc0 + idx; // Won't work with stack vars...
-                    // Use explicit indexing instead
-                    switch (z)
-                    {
-                    case 0:
-                        int_acc0 = isa::avx2_dpbusd_epi32(int_acc0, a_lo_bcast, lo_lo);
-                        int_acc1 = isa::avx2_dpbusd_epi32(int_acc1, a_lo_bcast, lo_hi);
-                        break;
-                    case 1:
-                        int_acc2 = isa::avx2_dpbusd_epi32(int_acc2, a_lo_bcast, lo_lo);
-                        int_acc3 = isa::avx2_dpbusd_epi32(int_acc3, a_lo_bcast, lo_hi);
-                        break;
-                    case 2:
-                        int_acc4 = isa::avx2_dpbusd_epi32(int_acc4, a_lo_bcast, lo_lo);
-                        int_acc5 = isa::avx2_dpbusd_epi32(int_acc5, a_lo_bcast, lo_hi);
-                        break;
-                    case 3:
-                        int_acc6 = isa::avx2_dpbusd_epi32(int_acc6, a_lo_bcast, lo_lo);
-                        int_acc7 = isa::avx2_dpbusd_epi32(int_acc7, a_lo_bcast, lo_hi);
-                        break;
-                    }
-
-                    // Decode high nibbles
-                    __m256i hi_lo = _mm256_shuffle_epi8(decode_lut,
-                                                        _mm256_and_si256(_mm256_srli_epi16(raw_lo, 4), mask_0F));
-                    __m256i hi_hi = _mm256_shuffle_epi8(decode_lut,
-                                                        _mm256_and_si256(_mm256_srli_epi16(raw_hi, 4), mask_0F));
-
-                    // Accumulate high nibbles
-                    switch (z)
-                    {
-                    case 0:
-                        int_acc0 = isa::avx2_dpbusd_epi32(int_acc0, a_hi_bcast, hi_lo);
-                        int_acc1 = isa::avx2_dpbusd_epi32(int_acc1, a_hi_bcast, hi_hi);
-                        break;
-                    case 1:
-                        int_acc2 = isa::avx2_dpbusd_epi32(int_acc2, a_hi_bcast, hi_lo);
-                        int_acc3 = isa::avx2_dpbusd_epi32(int_acc3, a_hi_bcast, hi_hi);
-                        break;
-                    case 2:
-                        int_acc4 = isa::avx2_dpbusd_epi32(int_acc4, a_hi_bcast, hi_lo);
-                        int_acc5 = isa::avx2_dpbusd_epi32(int_acc5, a_hi_bcast, hi_hi);
-                        break;
-                    case 3:
-                        int_acc6 = isa::avx2_dpbusd_epi32(int_acc6, a_hi_bcast, hi_lo);
-                        int_acc7 = isa::avx2_dpbusd_epi32(int_acc7, a_hi_bcast, hi_hi);
-                        break;
-                    }
+                if (packed.is_asymmetric)
+                {
+                    const __m256 weight_min = _mm256_cvtph_ps(
+                        _mm_load_si128(reinterpret_cast<const __m128i *>(
+                            packed.chunkMins(chunk, kb) + segment * 8)));
+                    const float correction =
+                        static_cast<float>(activation.sum_qs) *
+                        nativeVNNIFP16ScaleToFP32(activation.d);
+                    fp_accumulator = _mm256_fmadd_ps(
+                        _mm256_set1_ps(correction),
+                        weight_min,
+                        fp_accumulator);
                 }
             }
-
-            // Bias correction: corrected = int_acc - 128 * comp
-            // comp is 64 contiguous INT16; process as 8 groups of 8
-            const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
-            for (int z = 0; z < 8; ++z)
-            {
-                __m256i comp = _mm256_cvtepi16_epi32(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(comp_ptr + z * 8)));
-                __m256i bias_correction = _mm256_mullo_epi32(bias_128_i32, comp);
-                __m256i *acc;
-                switch (z)
-                {
-                case 0:
-                    int_acc0 = _mm256_sub_epi32(int_acc0, bias_correction);
-                    break;
-                case 1:
-                    int_acc1 = _mm256_sub_epi32(int_acc1, bias_correction);
-                    break;
-                case 2:
-                    int_acc2 = _mm256_sub_epi32(int_acc2, bias_correction);
-                    break;
-                case 3:
-                    int_acc3 = _mm256_sub_epi32(int_acc3, bias_correction);
-                    break;
-                case 4:
-                    int_acc4 = _mm256_sub_epi32(int_acc4, bias_correction);
-                    break;
-                case 5:
-                    int_acc5 = _mm256_sub_epi32(int_acc5, bias_correction);
-                    break;
-                case 6:
-                    int_acc6 = _mm256_sub_epi32(int_acc6, bias_correction);
-                    break;
-                case 7:
-                    int_acc7 = _mm256_sub_epi32(int_acc7, bias_correction);
-                    break;
-                }
-            }
-
-            // Convert to FP32 and scale: fp_val = int32_val * a_scale * b_scale[n]
-            // scales are 64 contiguous FP16; process as 8 groups of 8
-            __m256 a_scale_v = _mm256_set1_ps(a_scale);
-            const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-
-#define AVX2_SCALE_ACC(IDX, INT_ACC, FP_ACC)                                                      \
-    {                                                                                              \
-        __m256 cs = _mm256_mul_ps(a_scale_v,                                                       \
-                                  _mm256_cvtph_ps(_mm_load_si128(                                  \
-                                      reinterpret_cast<const __m128i *>(b_scales + (IDX) * 8))));  \
-        FP_ACC = _mm256_fmadd_ps(_mm256_cvtepi32_ps(INT_ACC), cs, FP_ACC);                        \
-    }
-
-            AVX2_SCALE_ACC(0, int_acc0, fp_acc0)
-            AVX2_SCALE_ACC(1, int_acc1, fp_acc1)
-            AVX2_SCALE_ACC(2, int_acc2, fp_acc2)
-            AVX2_SCALE_ACC(3, int_acc3, fp_acc3)
-            AVX2_SCALE_ACC(4, int_acc4, fp_acc4)
-            AVX2_SCALE_ACC(5, int_acc5, fp_acc5)
-            AVX2_SCALE_ACC(6, int_acc6, fp_acc6)
-            AVX2_SCALE_ACC(7, int_acc7, fp_acc7)
-#undef AVX2_SCALE_ACC
-
-            // Asymmetric correction: acc += a_scale * sum_qs * b_min[n]
-            if (packed.is_asymmetric)
-            {
-                const uint16_t *b_mins = packed.chunkMins(chunk, kb);
-                __m256 a_corr_v = _mm256_set1_ps(static_cast<float>(a_sum) * a_scale);
-
-#define AVX2_ASYM_CORR(IDX, FP_ACC)                                                             \
-    FP_ACC = _mm256_fmadd_ps(a_corr_v,                                                          \
-                              _mm256_cvtph_ps(_mm_load_si128(                                    \
-                                  reinterpret_cast<const __m128i *>(b_mins + (IDX) * 8))),       \
-                              FP_ACC);
-
-                AVX2_ASYM_CORR(0, fp_acc0)
-                AVX2_ASYM_CORR(1, fp_acc1)
-                AVX2_ASYM_CORR(2, fp_acc2)
-                AVX2_ASYM_CORR(3, fp_acc3)
-                AVX2_ASYM_CORR(4, fp_acc4)
-                AVX2_ASYM_CORR(5, fp_acc5)
-                AVX2_ASYM_CORR(6, fp_acc6)
-                AVX2_ASYM_CORR(7, fp_acc7)
-#undef AVX2_ASYM_CORR
-            }
+            _mm256_storeu_ps(C + segment * 8, fp_accumulator);
         }
-
-        // Store 64 floats (8 × 8)
-        _mm256_storeu_ps(C, fp_acc0);
-        _mm256_storeu_ps(C + 8, fp_acc1);
-        _mm256_storeu_ps(C + 16, fp_acc2);
-        _mm256_storeu_ps(C + 24, fp_acc3);
-        _mm256_storeu_ps(C + 32, fp_acc4);
-        _mm256_storeu_ps(C + 40, fp_acc5);
-        _mm256_storeu_ps(C + 48, fp_acc6);
-        _mm256_storeu_ps(C + 56, fp_acc7);
     }
 
     // =========================================================================
-    // AVX2 GEMV: INT8 pre-decoded path (Q5_0, Q5_1, Q6_K, Q3_K, Q2_K, etc.)
+    // AVX2 GEMV: non-nibble prepared encodings
     // =========================================================================
 
-    inline void gemv_avx2_chunk_int8(
+    /**
+     * @brief Dispatch one non-nibble AVX2 chunk by its typed prepared encoding.
+     *
+     * Q6_K consumes its native dual-scale payload. Remaining codebooks use the
+     * explicitly expanded INT8 encoding below. Keeping the decision here makes
+     * every serial and K-partition caller exhaustive over the packed ABI.
+     *
+     * @param accumulate Load `C` as the initial FP32 accumulator. The flag is
+     *        forwarded to native Q6 as well as the expanded-INT8 path so every
+     *        prepared encoding has identical tile-boundary semantics.
+     */
+    inline void gemv_avx2_chunk_non_nibble(
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8,
         float *C,
         int chunk,
         int kb_start,
-        int kb_end)
+        int kb_end,
+        bool accumulate = false)
     {
-        __m256 fp_acc0 = _mm256_setzero_ps();
-        __m256 fp_acc1 = _mm256_setzero_ps();
-        __m256 fp_acc2 = _mm256_setzero_ps();
-        __m256 fp_acc3 = _mm256_setzero_ps();
-        __m256 fp_acc4 = _mm256_setzero_ps();
-        __m256 fp_acc5 = _mm256_setzero_ps();
-        __m256 fp_acc6 = _mm256_setzero_ps();
-        __m256 fp_acc7 = _mm256_setzero_ps();
+        if (packed.usesQ6KNativeDualScale())
+        {
+            gemvQ6KNativeAVX2Chunk(
+                packed, A_q8, C, chunk, kb_start, kb_end, accumulate);
+            return;
+        }
+        if (!packed.usesExpandedInt8())
+            throw std::invalid_argument(
+                "AVX2 non-nibble GEMV received an unsupported packed encoding");
 
         const __m256i bias_128_i32 = _mm256_set1_epi32(128);
-
-        for (int kb = kb_start; kb < kb_end; ++kb)
+        for (int segment = 0; segment < 8; ++segment)
         {
-            const Q8_1Block &a_blk = A_q8[kb];
-            float a_scale = simd::fp16_to_fp32(a_blk.d);
-            int16_t a_sum = a_blk.sum_qs;
-
-            __m256i int_acc0 = _mm256_setzero_si256();
-            __m256i int_acc1 = _mm256_setzero_si256();
-            __m256i int_acc2 = _mm256_setzero_si256();
-            __m256i int_acc3 = _mm256_setzero_si256();
-            __m256i int_acc4 = _mm256_setzero_si256();
-            __m256i int_acc5 = _mm256_setzero_si256();
-            __m256i int_acc6 = _mm256_setzero_si256();
-            __m256i int_acc7 = _mm256_setzero_si256();
-
-            // 8 groups × 4 K-elements each = 32 K-elements per block
-            for (int group = 0; group < 8; ++group)
+            const int z = segment / 2;
+            const int byte_offset = (segment % 2) * 32;
+            __m256 fp_accumulator = accumulate
+                ? _mm256_loadu_ps(C + segment * 8)
+                : _mm256_setzero_ps();
+            for (int kb = kb_start; kb < kb_end; ++kb)
             {
-                // A broadcast: convert signed→unsigned via +128
-                uint8_t a_u8[4];
-                a_u8[0] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 0]) + 128);
-                a_u8[1] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 1]) + 128);
-                a_u8[2] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 2]) + 128);
-                a_u8[3] = static_cast<uint8_t>(static_cast<int16_t>(a_blk.qs[group * 4 + 3]) + 128);
-                int32_t a_i32;
-                std::memcpy(&a_i32, a_u8, 4);
-                __m256i a_bcast = _mm256_set1_epi32(a_i32);
-
-                // Process 4 ZMM slots, each split into 2 YMM halves
-                for (int z = 0; z < 4; ++z)
+                const Q8_1Block &activation = A_q8[kb];
+                __m256i dot_even = _mm256_setzero_si256();
+                __m256i dot_odd = _mm256_setzero_si256();
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+                for (int group = 0; group < 8; group += 2)
                 {
-                    const uint8_t *base = packed.interleavedB(chunk, kb, group, z);
-                    __m256i b_lo = _mm256_load_si256(reinterpret_cast<const __m256i *>(base));
-                    __m256i b_hi = _mm256_load_si256(reinterpret_cast<const __m256i *>(base + 32));
+                    const __m256i weight_even = _mm256_load_si256(
+                        reinterpret_cast<const __m256i *>(
+                            packed.interleavedB(
+                                chunk, kb, group, z) + byte_offset));
+                    const __m256i weight_odd = _mm256_load_si256(
+                        reinterpret_cast<const __m256i *>(
+                            packed.interleavedB(
+                                chunk, kb, group + 1, z) + byte_offset));
+                    dot_even = isa::avx2_dpbusd_epi32(
+                        dot_even,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            activation, group * 4)),
+                        weight_even);
+                    dot_odd = isa::avx2_dpbusd_epi32(
+                        dot_odd,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            activation, (group + 1) * 4)),
+                        weight_odd);
+                }
 
-                    switch (z)
-                    {
-                    case 0:
-                        int_acc0 = isa::avx2_dpbusd_epi32(int_acc0, a_bcast, b_lo);
-                        int_acc1 = isa::avx2_dpbusd_epi32(int_acc1, a_bcast, b_hi);
-                        break;
-                    case 1:
-                        int_acc2 = isa::avx2_dpbusd_epi32(int_acc2, a_bcast, b_lo);
-                        int_acc3 = isa::avx2_dpbusd_epi32(int_acc3, a_bcast, b_hi);
-                        break;
-                    case 2:
-                        int_acc4 = isa::avx2_dpbusd_epi32(int_acc4, a_bcast, b_lo);
-                        int_acc5 = isa::avx2_dpbusd_epi32(int_acc5, a_bcast, b_hi);
-                        break;
-                    case 3:
-                        int_acc6 = isa::avx2_dpbusd_epi32(int_acc6, a_bcast, b_lo);
-                        int_acc7 = isa::avx2_dpbusd_epi32(int_acc7, a_bcast, b_hi);
-                        break;
-                    }
+                const __m256i compensation = _mm256_cvtepi16_epi32(
+                    _mm_load_si128(reinterpret_cast<const __m128i *>(
+                        packed.chunkComp(chunk, kb) + segment * 8)));
+                const __m256i corrected = _mm256_sub_epi32(
+                    _mm256_add_epi32(dot_even, dot_odd),
+                    _mm256_mullo_epi32(bias_128_i32, compensation));
+                const __m256 weight_scale = _mm256_cvtph_ps(
+                    _mm_load_si128(reinterpret_cast<const __m128i *>(
+                        packed.chunkScales(chunk, kb) + segment * 8)));
+                const float activation_scale =
+                    nativeVNNIFP16ScaleToFP32(activation.d);
+                fp_accumulator = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(corrected),
+                    _mm256_mul_ps(
+                        _mm256_set1_ps(activation_scale), weight_scale),
+                    fp_accumulator);
+                if (packed.is_asymmetric)
+                {
+                    const __m256 weight_min = _mm256_cvtph_ps(
+                        _mm_load_si128(reinterpret_cast<const __m128i *>(
+                            packed.chunkMins(chunk, kb) + segment * 8)));
+                    fp_accumulator = _mm256_fmadd_ps(
+                        _mm256_set1_ps(
+                            static_cast<float>(activation.sum_qs) *
+                            activation_scale),
+                        weight_min,
+                        fp_accumulator);
                 }
             }
-
-            // Bias correction
-            const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
-
-#define AVX2_BIAS_CORRECT(IDX, INT_ACC)                                                           \
-    {                                                                                              \
-        __m256i comp = _mm256_cvtepi16_epi32(                                                      \
-            _mm_load_si128(reinterpret_cast<const __m128i *>(comp_ptr + (IDX) * 8)));              \
-        INT_ACC = _mm256_sub_epi32(INT_ACC, _mm256_mullo_epi32(bias_128_i32, comp));              \
-    }
-
-            AVX2_BIAS_CORRECT(0, int_acc0)
-            AVX2_BIAS_CORRECT(1, int_acc1)
-            AVX2_BIAS_CORRECT(2, int_acc2)
-            AVX2_BIAS_CORRECT(3, int_acc3)
-            AVX2_BIAS_CORRECT(4, int_acc4)
-            AVX2_BIAS_CORRECT(5, int_acc5)
-            AVX2_BIAS_CORRECT(6, int_acc6)
-            AVX2_BIAS_CORRECT(7, int_acc7)
-#undef AVX2_BIAS_CORRECT
-
-            // Scale conversion
-            __m256 a_scale_v = _mm256_set1_ps(a_scale);
-            const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-
-#define AVX2_SCALE_ACC(IDX, INT_ACC, FP_ACC)                                                      \
-    {                                                                                              \
-        __m256 cs = _mm256_mul_ps(a_scale_v,                                                       \
-                                  _mm256_cvtph_ps(_mm_load_si128(                                  \
-                                      reinterpret_cast<const __m128i *>(b_scales + (IDX) * 8))));  \
-        FP_ACC = _mm256_fmadd_ps(_mm256_cvtepi32_ps(INT_ACC), cs, FP_ACC);                        \
-    }
-
-            AVX2_SCALE_ACC(0, int_acc0, fp_acc0)
-            AVX2_SCALE_ACC(1, int_acc1, fp_acc1)
-            AVX2_SCALE_ACC(2, int_acc2, fp_acc2)
-            AVX2_SCALE_ACC(3, int_acc3, fp_acc3)
-            AVX2_SCALE_ACC(4, int_acc4, fp_acc4)
-            AVX2_SCALE_ACC(5, int_acc5, fp_acc5)
-            AVX2_SCALE_ACC(6, int_acc6, fp_acc6)
-            AVX2_SCALE_ACC(7, int_acc7, fp_acc7)
-#undef AVX2_SCALE_ACC
-
-            // Asymmetric correction
-            if (packed.is_asymmetric)
-            {
-                const uint16_t *b_mins = packed.chunkMins(chunk, kb);
-                __m256 a_corr_v = _mm256_set1_ps(static_cast<float>(a_sum) * a_scale);
-
-#define AVX2_ASYM_CORR(IDX, FP_ACC)                                                             \
-    FP_ACC = _mm256_fmadd_ps(a_corr_v,                                                          \
-                              _mm256_cvtph_ps(_mm_load_si128(                                    \
-                                  reinterpret_cast<const __m128i *>(b_mins + (IDX) * 8))),       \
-                              FP_ACC);
-
-                AVX2_ASYM_CORR(0, fp_acc0)
-                AVX2_ASYM_CORR(1, fp_acc1)
-                AVX2_ASYM_CORR(2, fp_acc2)
-                AVX2_ASYM_CORR(3, fp_acc3)
-                AVX2_ASYM_CORR(4, fp_acc4)
-                AVX2_ASYM_CORR(5, fp_acc5)
-                AVX2_ASYM_CORR(6, fp_acc6)
-                AVX2_ASYM_CORR(7, fp_acc7)
-#undef AVX2_ASYM_CORR
-            }
+            _mm256_storeu_ps(C + segment * 8, fp_accumulator);
         }
-
-        _mm256_storeu_ps(C, fp_acc0);
-        _mm256_storeu_ps(C + 8, fp_acc1);
-        _mm256_storeu_ps(C + 16, fp_acc2);
-        _mm256_storeu_ps(C + 24, fp_acc3);
-        _mm256_storeu_ps(C + 32, fp_acc4);
-        _mm256_storeu_ps(C + 40, fp_acc5);
-        _mm256_storeu_ps(C + 48, fp_acc6);
-        _mm256_storeu_ps(C + 56, fp_acc7);
     }
 
     // =========================================================================
@@ -474,7 +323,7 @@ namespace llaminar2::cpu::native_vnni
         int N,
         const __m256i decode_lut)
     {
-        const bool use_nibble_lut = packed.is_nibble_lut;
+        const bool use_nibble_lut = packed.usesNibbleLUT();
 
         for (int ci = 0; ci < chunk_count; ++ci)
         {
@@ -488,7 +337,7 @@ namespace llaminar2::cpu::native_vnni
                 if (use_nibble_lut)
                     gemv_avx2_chunk_native(packed, A_q8, tmp, chunk, 0, K_blocks, decode_lut);
                 else
-                    gemv_avx2_chunk_int8(packed, A_q8, tmp, chunk, 0, K_blocks);
+                    gemv_avx2_chunk_non_nibble(packed, A_q8, tmp, chunk, 0, K_blocks);
                 std::memcpy(C + n_start, tmp, n_cols * sizeof(float));
             }
             else
@@ -496,7 +345,7 @@ namespace llaminar2::cpu::native_vnni
                 if (use_nibble_lut)
                     gemv_avx2_chunk_native(packed, A_q8, C + n_start, chunk, 0, K_blocks, decode_lut);
                 else
-                    gemv_avx2_chunk_int8(packed, A_q8, C + n_start, chunk, 0, K_blocks);
+                    gemv_avx2_chunk_non_nibble(packed, A_q8, C + n_start, chunk, 0, K_blocks);
             }
         }
     }
@@ -506,11 +355,13 @@ namespace llaminar2::cpu::native_vnni
     // =========================================================================
 
     /**
-     * @brief AVX2 2-row nibble-LUT GEMM microkernel for one 64-col chunk.
+     * @brief Register-resident AVX2 two-row nibble-LUT verifier kernel.
      *
-     * Uses 16 YMM FP accumulators (8 per row) + 16 YMM INT accumulators
-     * This exceeds 16 YMM registers, so the compiler will spill some to stack.
-     * For correctness-first AVX2, this is acceptable.
+     * One eight-column segment is carried through the complete increasing-K
+     * loop. Independent row chains provide two-way ILP while each decoded
+     * weight vector is shared across both rows. Low and high nibbles are folded
+     * into those row chains so the saturation-safe emulation fits the sixteen-
+     * register AVX2 ABI without hot-loop spills.
      */
     inline void gemm_2row_native_chunk_avx2(
         const CPUNativeVNNIPackedWeights &packed,
@@ -524,127 +375,116 @@ namespace llaminar2::cpu::native_vnni
         const __m256i decode_lut,
         bool accumulate)
     {
-        // 8 FP accumulators per row = 16 total
-        __m256 fp0[8], fp1[8];
-        for (int i = 0; i < 8; ++i)
-        {
-            fp0[i] = accumulate ? _mm256_loadu_ps(C_row0 + i * 8) : _mm256_setzero_ps();
-            fp1[i] = accumulate ? _mm256_loadu_ps(C_row1 + i * 8) : _mm256_setzero_ps();
-        }
-
         const __m256i bias_128_i32 = _mm256_set1_epi32(128);
         const __m256i mask_0F = _mm256_set1_epi8(0x0F);
-
-        for (int kb = kb_start; kb < kb_end; ++kb)
+        for (int segment = 0; segment < 8; ++segment)
         {
-            const Q8_1Block &a0 = A_q8_row0[kb];
-            const Q8_1Block &a1 = A_q8_row1[kb];
-            float a0_scale = simd::fp16_to_fp32(a0.d);
-            float a1_scale = simd::fp16_to_fp32(a1.d);
+            const int z = segment / 2;
+            const int byte_offset = (segment % 2) * 32;
+            __m256 fp0 = accumulate
+                ? _mm256_loadu_ps(C_row0 + segment * 8)
+                : _mm256_setzero_ps();
+            __m256 fp1 = accumulate
+                ? _mm256_loadu_ps(C_row1 + segment * 8)
+                : _mm256_setzero_ps();
 
-            __m256i ia0[8], ia1[8];
-            for (int i = 0; i < 8; ++i)
+            for (int kb = kb_start; kb < kb_end; ++kb)
             {
-                ia0[i] = _mm256_setzero_si256();
-                ia1[i] = _mm256_setzero_si256();
-            }
+                const Q8_1Block &a0 = A_q8_row0[kb];
+                const Q8_1Block &a1 = A_q8_row1[kb];
+                __m256i dot0_low = _mm256_setzero_si256();
+                __m256i dot0_high = _mm256_setzero_si256();
+                __m256i dot1_low = _mm256_setzero_si256();
+                __m256i dot1_high = _mm256_setzero_si256();
 
-            for (int group = 0; group < 4; ++group)
-            {
-                // Row 0 & 1 A broadcasts for low nibbles
-                auto make_a_bcast = [](const Q8_1Block &blk, int base_idx) -> __m256i
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+                for (int group = 0; group < 4; ++group)
                 {
-                    uint8_t vals[4];
-                    vals[0] = static_cast<uint8_t>(static_cast<int16_t>(blk.qs[base_idx + 0]) + 128);
-                    vals[1] = static_cast<uint8_t>(static_cast<int16_t>(blk.qs[base_idx + 1]) + 128);
-                    vals[2] = static_cast<uint8_t>(static_cast<int16_t>(blk.qs[base_idx + 2]) + 128);
-                    vals[3] = static_cast<uint8_t>(static_cast<int16_t>(blk.qs[base_idx + 3]) + 128);
-                    int32_t v;
-                    std::memcpy(&v, vals, 4);
-                    return _mm256_set1_epi32(v);
-                };
+                    const uint8_t *base =
+                        packed.interleavedB(chunk, kb, group, z) + byte_offset;
+                    const __m256i raw = _mm256_load_si256(
+                        reinterpret_cast<const __m256i *>(base));
+                    const __m256i low = _mm256_shuffle_epi8(
+                        decode_lut, _mm256_and_si256(raw, mask_0F));
+                    const __m256i high = _mm256_shuffle_epi8(
+                        decode_lut,
+                        _mm256_and_si256(
+                            _mm256_srli_epi16(raw, 4), mask_0F));
+                    dot0_low = isa::avx2_dpbusd_epi32(
+                        dot0_low,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            a0, group * 4)),
+                        low);
+                    dot1_low = isa::avx2_dpbusd_epi32(
+                        dot1_low,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            a1, group * 4)),
+                        low);
+                    dot0_high = isa::avx2_dpbusd_epi32(
+                        dot0_high,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            a0, group * 4 + 16)),
+                        high);
+                    dot1_high = isa::avx2_dpbusd_epi32(
+                        dot1_high,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            a1, group * 4 + 16)),
+                        high);
+                }
 
-                __m256i a0_lo = make_a_bcast(a0, group * 4);
-                __m256i a1_lo = make_a_bcast(a1, group * 4);
-                __m256i a0_hi = make_a_bcast(a0, group * 4 + 16);
-                __m256i a1_hi = make_a_bcast(a1, group * 4 + 16);
-
-                for (int z = 0; z < 4; ++z)
+                const __m256i compensation = _mm256_cvtepi16_epi32(
+                    _mm_load_si128(reinterpret_cast<const __m128i *>(
+                        packed.chunkComp(chunk, kb) + segment * 8)));
+                const __m256i bias =
+                    _mm256_mullo_epi32(bias_128_i32, compensation);
+                const __m256i corrected0 = _mm256_sub_epi32(
+                    _mm256_add_epi32(dot0_low, dot0_high), bias);
+                const __m256i corrected1 = _mm256_sub_epi32(
+                    _mm256_add_epi32(dot1_low, dot1_high), bias);
+                const __m256 weight_scale = _mm256_cvtph_ps(
+                    _mm_load_si128(reinterpret_cast<const __m128i *>(
+                        packed.chunkScales(chunk, kb) + segment * 8)));
+                const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
+                const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
+                fp0 = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(corrected0),
+                    _mm256_mul_ps(_mm256_set1_ps(a0_scale), weight_scale),
+                    fp0);
+                fp1 = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(corrected1),
+                    _mm256_mul_ps(_mm256_set1_ps(a1_scale), weight_scale),
+                    fp1);
+                if (packed.is_asymmetric)
                 {
-                    const uint8_t *base = packed.interleavedB(chunk, kb, group, z);
-                    __m256i raw_lo = _mm256_load_si256(reinterpret_cast<const __m256i *>(base));
-                    __m256i raw_hi = _mm256_load_si256(reinterpret_cast<const __m256i *>(base + 32));
-
-                    // Decode nibbles
-                    __m256i lo_dec_lo = _mm256_shuffle_epi8(decode_lut, _mm256_and_si256(raw_lo, mask_0F));
-                    __m256i lo_dec_hi = _mm256_shuffle_epi8(decode_lut, _mm256_and_si256(raw_hi, mask_0F));
-                    __m256i hi_dec_lo = _mm256_shuffle_epi8(decode_lut,
-                                                            _mm256_and_si256(_mm256_srli_epi16(raw_lo, 4), mask_0F));
-                    __m256i hi_dec_hi = _mm256_shuffle_epi8(decode_lut,
-                                                            _mm256_and_si256(_mm256_srli_epi16(raw_hi, 4), mask_0F));
-
-                    int idx = z * 2;
-                    // Row 0 accumulation
-                    ia0[idx] = isa::avx2_dpbusd_epi32(ia0[idx], a0_lo, lo_dec_lo);
-                    ia0[idx + 1] = isa::avx2_dpbusd_epi32(ia0[idx + 1], a0_lo, lo_dec_hi);
-                    ia0[idx] = isa::avx2_dpbusd_epi32(ia0[idx], a0_hi, hi_dec_lo);
-                    ia0[idx + 1] = isa::avx2_dpbusd_epi32(ia0[idx + 1], a0_hi, hi_dec_hi);
-
-                    // Row 1 accumulation (same B data, different A)
-                    ia1[idx] = isa::avx2_dpbusd_epi32(ia1[idx], a1_lo, lo_dec_lo);
-                    ia1[idx + 1] = isa::avx2_dpbusd_epi32(ia1[idx + 1], a1_lo, lo_dec_hi);
-                    ia1[idx] = isa::avx2_dpbusd_epi32(ia1[idx], a1_hi, hi_dec_lo);
-                    ia1[idx + 1] = isa::avx2_dpbusd_epi32(ia1[idx + 1], a1_hi, hi_dec_hi);
+                    const __m256 weight_min = _mm256_cvtph_ps(
+                        _mm_load_si128(reinterpret_cast<const __m128i *>(
+                            packed.chunkMins(chunk, kb) + segment * 8)));
+                    fp0 = _mm256_fmadd_ps(
+                        _mm256_set1_ps(
+                            static_cast<float>(a0.sum_qs) * a0_scale),
+                        weight_min,
+                        fp0);
+                    fp1 = _mm256_fmadd_ps(
+                        _mm256_set1_ps(
+                            static_cast<float>(a1.sum_qs) * a1_scale),
+                        weight_min,
+                        fp1);
                 }
             }
-
-            // Bias correction + scale (shared comp/scales, per-row a_scale)
-            const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
-            const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-
-            for (int z = 0; z < 8; ++z)
-            {
-                __m256i comp = _mm256_cvtepi16_epi32(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(comp_ptr + z * 8)));
-                __m256i bc = _mm256_mullo_epi32(bias_128_i32, comp);
-                ia0[z] = _mm256_sub_epi32(ia0[z], bc);
-                ia1[z] = _mm256_sub_epi32(ia1[z], bc);
-
-                __m256 bs = _mm256_cvtph_ps(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(b_scales + z * 8)));
-
-                __m256 cs0 = _mm256_mul_ps(_mm256_set1_ps(a0_scale), bs);
-                __m256 cs1 = _mm256_mul_ps(_mm256_set1_ps(a1_scale), bs);
-                fp0[z] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia0[z]), cs0, fp0[z]);
-                fp1[z] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia1[z]), cs1, fp1[z]);
-            }
-
-            if (packed.is_asymmetric)
-            {
-                const uint16_t *b_mins = packed.chunkMins(chunk, kb);
-                __m256 corr0 = _mm256_set1_ps(static_cast<float>(a0.sum_qs) * a0_scale);
-                __m256 corr1 = _mm256_set1_ps(static_cast<float>(a1.sum_qs) * a1_scale);
-                for (int z = 0; z < 8; ++z)
-                {
-                    __m256 bm = _mm256_cvtph_ps(
-                        _mm_load_si128(reinterpret_cast<const __m128i *>(b_mins + z * 8)));
-                    fp0[z] = _mm256_fmadd_ps(corr0, bm, fp0[z]);
-                    fp1[z] = _mm256_fmadd_ps(corr1, bm, fp1[z]);
-                }
-            }
-        }
-
-        for (int i = 0; i < 8; ++i)
-        {
-            _mm256_storeu_ps(C_row0 + i * 8, fp0[i]);
-            _mm256_storeu_ps(C_row1 + i * 8, fp1[i]);
+            _mm256_storeu_ps(C_row0 + segment * 8, fp0);
+            _mm256_storeu_ps(C_row1 + segment * 8, fp1);
         }
     }
 
     /**
      * @brief AVX2 2-row INT8 pre-decoded GEMM microkernel for one 64-col chunk.
      */
-    inline void gemm_2row_int8_chunk_avx2(
+    /** @brief Dispatch a two-row non-nibble AVX2 verifier chunk. */
+    inline void gemm_2row_non_nibble_chunk_avx2(
         const CPUNativeVNNIPackedWeights &packed,
         const Q8_1Block *A_q8_row0,
         const Q8_1Block *A_q8_row1,
@@ -655,94 +495,121 @@ namespace llaminar2::cpu::native_vnni
         int kb_end,
         bool accumulate)
     {
-        __m256 fp0[8], fp1[8];
-        for (int i = 0; i < 8; ++i)
+        if (packed.usesQ6KNativeDualScale())
         {
-            fp0[i] = accumulate ? _mm256_loadu_ps(C_row0 + i * 8) : _mm256_setzero_ps();
-            fp1[i] = accumulate ? _mm256_loadu_ps(C_row1 + i * 8) : _mm256_setzero_ps();
+            gemmQ6KNativeTwoRowsAVX2Chunk(
+                packed,
+                A_q8_row0,
+                A_q8_row1,
+                C_row0,
+                C_row1,
+                chunk,
+                kb_start,
+                kb_end,
+                accumulate);
+            return;
         }
+        if (!packed.usesExpandedInt8())
+            throw std::invalid_argument(
+                "AVX2 non-nibble two-row kernel received an unsupported packed encoding");
 
         const __m256i bias_128_i32 = _mm256_set1_epi32(128);
-
-        for (int kb = kb_start; kb < kb_end; ++kb)
+        for (int segment = 0; segment < 8; ++segment)
         {
-            const Q8_1Block &a0 = A_q8_row0[kb];
-            const Q8_1Block &a1 = A_q8_row1[kb];
-            float a0_scale = simd::fp16_to_fp32(a0.d);
-            float a1_scale = simd::fp16_to_fp32(a1.d);
-
-            __m256i ia0[8], ia1[8];
-            for (int i = 0; i < 8; ++i)
+            const int z = segment / 2;
+            const int byte_offset = (segment % 2) * 32;
+            __m256 fp0 = accumulate
+                ? _mm256_loadu_ps(C_row0 + segment * 8)
+                : _mm256_setzero_ps();
+            __m256 fp1 = accumulate
+                ? _mm256_loadu_ps(C_row1 + segment * 8)
+                : _mm256_setzero_ps();
+            for (int kb = kb_start; kb < kb_end; ++kb)
             {
-                ia0[i] = _mm256_setzero_si256();
-                ia1[i] = _mm256_setzero_si256();
-            }
-
-            for (int group = 0; group < 8; ++group)
-            {
-                // GPR-only A-prep: XOR with 0x80 converts signed→unsigned
-                int32_t raw0, raw1;
-                std::memcpy(&raw0, &a0.qs[group * 4], 4);
-                std::memcpy(&raw1, &a1.qs[group * 4], 4);
-                __m256i a0_bc = _mm256_set1_epi32(static_cast<int32_t>(
-                    static_cast<uint32_t>(raw0) ^ 0x80808080u));
-                __m256i a1_bc = _mm256_set1_epi32(static_cast<int32_t>(
-                    static_cast<uint32_t>(raw1) ^ 0x80808080u));
-
-                for (int z = 0; z < 4; ++z)
+                const Q8_1Block &a0 = A_q8_row0[kb];
+                const Q8_1Block &a1 = A_q8_row1[kb];
+                __m256i dot0_even = _mm256_setzero_si256();
+                __m256i dot0_odd = _mm256_setzero_si256();
+                __m256i dot1_even = _mm256_setzero_si256();
+                __m256i dot1_odd = _mm256_setzero_si256();
+#if defined(__clang__)
+#pragma clang loop unroll(disable)
+#elif defined(__GNUC__)
+#pragma GCC unroll 1
+#endif
+                for (int group = 0; group < 8; group += 2)
                 {
-                    const uint8_t *base = packed.interleavedB(chunk, kb, group, z);
-                    __m256i b_lo = _mm256_load_si256(reinterpret_cast<const __m256i *>(base));
-                    __m256i b_hi = _mm256_load_si256(reinterpret_cast<const __m256i *>(base + 32));
+                    const __m256i weight_even = _mm256_load_si256(
+                        reinterpret_cast<const __m256i *>(
+                            packed.interleavedB(
+                                chunk, kb, group, z) + byte_offset));
+                    const __m256i weight_odd = _mm256_load_si256(
+                        reinterpret_cast<const __m256i *>(
+                            packed.interleavedB(
+                                chunk, kb, group + 1, z) + byte_offset));
+                    dot0_even = isa::avx2_dpbusd_epi32(
+                        dot0_even,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            a0, group * 4)),
+                        weight_even);
+                    dot1_even = isa::avx2_dpbusd_epi32(
+                        dot1_even,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            a1, group * 4)),
+                        weight_even);
+                    dot0_odd = isa::avx2_dpbusd_epi32(
+                        dot0_odd,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            a0, (group + 1) * 4)),
+                        weight_odd);
+                    dot1_odd = isa::avx2_dpbusd_epi32(
+                        dot1_odd,
+                        _mm256_set1_epi32(pack_q8_1_unsigned_word_avx2(
+                            a1, (group + 1) * 4)),
+                        weight_odd);
+                }
 
-                    int idx = z * 2;
-                    ia0[idx] = isa::avx2_dpbusd_epi32(ia0[idx], a0_bc, b_lo);
-                    ia0[idx + 1] = isa::avx2_dpbusd_epi32(ia0[idx + 1], a0_bc, b_hi);
-                    ia1[idx] = isa::avx2_dpbusd_epi32(ia1[idx], a1_bc, b_lo);
-                    ia1[idx + 1] = isa::avx2_dpbusd_epi32(ia1[idx + 1], a1_bc, b_hi);
+                const __m256i compensation = _mm256_cvtepi16_epi32(
+                    _mm_load_si128(reinterpret_cast<const __m128i *>(
+                        packed.chunkComp(chunk, kb) + segment * 8)));
+                const __m256i bias =
+                    _mm256_mullo_epi32(bias_128_i32, compensation);
+                const __m256i corrected0 = _mm256_sub_epi32(
+                    _mm256_add_epi32(dot0_even, dot0_odd), bias);
+                const __m256i corrected1 = _mm256_sub_epi32(
+                    _mm256_add_epi32(dot1_even, dot1_odd), bias);
+                const __m256 weight_scale = _mm256_cvtph_ps(
+                    _mm_load_si128(reinterpret_cast<const __m128i *>(
+                        packed.chunkScales(chunk, kb) + segment * 8)));
+                const float a0_scale = nativeVNNIFP16ScaleToFP32(a0.d);
+                const float a1_scale = nativeVNNIFP16ScaleToFP32(a1.d);
+                fp0 = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(corrected0),
+                    _mm256_mul_ps(_mm256_set1_ps(a0_scale), weight_scale),
+                    fp0);
+                fp1 = _mm256_fmadd_ps(
+                    _mm256_cvtepi32_ps(corrected1),
+                    _mm256_mul_ps(_mm256_set1_ps(a1_scale), weight_scale),
+                    fp1);
+                if (packed.is_asymmetric)
+                {
+                    const __m256 weight_min = _mm256_cvtph_ps(
+                        _mm_load_si128(reinterpret_cast<const __m128i *>(
+                            packed.chunkMins(chunk, kb) + segment * 8)));
+                    fp0 = _mm256_fmadd_ps(
+                        _mm256_set1_ps(
+                            static_cast<float>(a0.sum_qs) * a0_scale),
+                        weight_min,
+                        fp0);
+                    fp1 = _mm256_fmadd_ps(
+                        _mm256_set1_ps(
+                            static_cast<float>(a1.sum_qs) * a1_scale),
+                        weight_min,
+                        fp1);
                 }
             }
-
-            // Bias correction + scale
-            const int16_t *comp_ptr = packed.chunkComp(chunk, kb);
-            const uint16_t *b_scales = packed.chunkScales(chunk, kb);
-
-            for (int z = 0; z < 8; ++z)
-            {
-                __m256i comp = _mm256_cvtepi16_epi32(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(comp_ptr + z * 8)));
-                __m256i bc = _mm256_mullo_epi32(bias_128_i32, comp);
-                ia0[z] = _mm256_sub_epi32(ia0[z], bc);
-                ia1[z] = _mm256_sub_epi32(ia1[z], bc);
-
-                __m256 bs = _mm256_cvtph_ps(
-                    _mm_load_si128(reinterpret_cast<const __m128i *>(b_scales + z * 8)));
-
-                fp0[z] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia0[z]),
-                                          _mm256_mul_ps(_mm256_set1_ps(a0_scale), bs), fp0[z]);
-                fp1[z] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia1[z]),
-                                          _mm256_mul_ps(_mm256_set1_ps(a1_scale), bs), fp1[z]);
-            }
-
-            if (packed.is_asymmetric)
-            {
-                const uint16_t *b_mins = packed.chunkMins(chunk, kb);
-                __m256 corr0 = _mm256_set1_ps(static_cast<float>(a0.sum_qs) * a0_scale);
-                __m256 corr1 = _mm256_set1_ps(static_cast<float>(a1.sum_qs) * a1_scale);
-                for (int z = 0; z < 8; ++z)
-                {
-                    __m256 bm = _mm256_cvtph_ps(
-                        _mm_load_si128(reinterpret_cast<const __m128i *>(b_mins + z * 8)));
-                    fp0[z] = _mm256_fmadd_ps(corr0, bm, fp0[z]);
-                    fp1[z] = _mm256_fmadd_ps(corr1, bm, fp1[z]);
-                }
-            }
-        }
-
-        for (int i = 0; i < 8; ++i)
-        {
-            _mm256_storeu_ps(C_row0 + i * 8, fp0[i]);
-            _mm256_storeu_ps(C_row1 + i * 8, fp1[i]);
+            _mm256_storeu_ps(C_row0 + segment * 8, fp0);
+            _mm256_storeu_ps(C_row1 + segment * 8, fp1);
         }
     }
 

@@ -414,15 +414,9 @@ namespace llaminar2
 
     bool ShortConv1dStage::restoreCPUVerifierStateCaptureRowDirect(int row)
     {
-        if (!hasVerifierStateCapture() || params_.device_id.is_gpu())
-            return false;
-        if (!ensureVerifierStateCaptureWorkspaceBound())
-            return false;
-        if (row < 0 || row >= verifier_capture_rows_bound_)
-            return false;
-
-        const float *capture = cpuVerifierStateCaptureSource();
-        if (!capture || !params_.conv_state)
+        const CPUVerifierStateRestorePlan plan =
+            planCPUVerifierStateRestoreRow(row);
+        if (!plan.ready())
             return false;
 
         /*
@@ -431,11 +425,55 @@ namespace llaminar2
          * avoiding races through the shared backend kernel binding.
          */
         std::memcpy(
-            params_.conv_state,
-            capture + static_cast<size_t>(row) *
-                          static_cast<size_t>(verifier_capture_state_size_bound_),
-            static_cast<size_t>(verifier_capture_state_size_bound_) * sizeof(float));
+            plan.destination,
+            plan.source,
+            plan.bytes);
         return true;
+    }
+
+    CPUVerifierStateRestorePlan
+    ShortConv1dStage::planCPUVerifierStateRestoreRow(int row)
+    {
+        if (params_.device_id.is_gpu())
+            return {};
+        if (!hasVerifierStateCapture() ||
+            !ensureVerifierStateCaptureWorkspaceBound())
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+        if (row < 0)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::NoOp,
+            };
+        }
+        if (row >= verifier_capture_rows_bound_ ||
+            verifier_capture_state_size_bound_ <= 0)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+
+        const float *capture = cpuVerifierStateCaptureSource();
+        if (!capture || !params_.conv_state)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+
+        return {
+            .status = CPUVerifierStateRestorePlanStatus::Ready,
+            .destination = params_.conv_state,
+            .source = capture +
+                static_cast<size_t>(row) *
+                    static_cast<size_t>(verifier_capture_state_size_bound_),
+            .bytes = static_cast<size_t>(verifier_capture_state_size_bound_) *
+                     sizeof(float),
+        };
     }
 
     bool ShortConv1dStage::restoreVerifierStateCaptureRow(int row, void *stream)

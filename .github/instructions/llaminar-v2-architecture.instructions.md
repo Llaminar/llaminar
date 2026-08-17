@@ -91,7 +91,7 @@ not reparse user strings.
 ### 2.3 Topology status
 
 Named domains are the installed interface for cross-rank PP and global or
-node-local TP. `ExecutionDomainDefinition` describes device/rank membership,
+NodeTP. `ExecutionDomainDefinition` describes device/rank membership,
 scope, collective backend, and optional proportional work. `PPStageDefinition`
 assigns a layer interval to a domain.
 

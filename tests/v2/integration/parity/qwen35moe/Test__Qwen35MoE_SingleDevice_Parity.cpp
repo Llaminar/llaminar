@@ -127,47 +127,9 @@ public:
 // Test Cases
 // =============================================================================
 
-TEST_P(Qwen35MoESingleDeviceParityTest, PrefillParity)
+TEST_P(Qwen35MoESingleDeviceParityTest, ProductionParity)
 {
-    auto summary = runSingleDevicePrefillParity();
-    assertParity(summary);
-}
-
-TEST_P(Qwen35MoESingleDeviceParityTest, DecodeParity)
-{
-    auto summary = runSingleDeviceDecodeParity();
-    assertDecodeParity(summary);
-}
-
-TEST_P(Qwen35MoESingleDeviceParityTest, SnapshotInfrastructure)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    auto embedding = loadPyTorchSnapshot("EMBEDDING");
-    ASSERT_FALSE(embedding.empty()) << "Failed to load EMBEDDING snapshot";
-
-    ASSERT_TRUE(runner_ != nullptr);
-    runner_->forward(config_.token_ids.data(), config_.token_ids.size());
-
-    auto keys = runner_->getSnapshotKeys();
-    EXPECT_GT(keys.size(), 0) << "No snapshots captured";
-
-    bool has_embedding = std::find(keys.begin(), keys.end(), "EMBEDDING") != keys.end();
-    bool has_lm_head = std::find(keys.begin(), keys.end(), "LM_HEAD") != keys.end();
-    EXPECT_TRUE(has_embedding) << "Missing EMBEDDING snapshot";
-    EXPECT_TRUE(has_lm_head) << "Missing LM_HEAD snapshot";
-
-    // MoE-specific: verify that FFN_RESIDUAL snapshots exist (MoE combined output + residual)
-    bool has_ffn_residual = false;
-    for (const auto &key : keys)
-    {
-        if (key.find("FFN_RESIDUAL") != std::string::npos)
-        {
-            has_ffn_residual = true;
-            break;
-        }
-    }
-    EXPECT_TRUE(has_ffn_residual) << "Missing FFN_RESIDUAL snapshot (MoE combined output path)";
+    runProductionParityCampaign();
 }
 
 // =============================================================================

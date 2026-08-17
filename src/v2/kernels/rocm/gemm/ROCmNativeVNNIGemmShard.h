@@ -10,8 +10,8 @@
  * ROCmNativeVNNIGemmDispatch.cpp.
  *
  * These functions are internal build artifacts. Callers outside the dispatcher
- * must continue to use rocmGemm_native_vnni_fp32() and
- * rocmInitIQGridTables_gemm().
+ * must continue to use rocmGemm_native_vnni_fp32_with_policy() (or the
+ * self-describing compatibility wrapper) and rocmInitIQGridTables_gemm().
  */
 
 #pragma once
@@ -32,6 +32,7 @@ using ROCmNativeVNNIGemmShardFn = bool (*)(
     int N,
     int K,
     uint8_t codebook_id,
+    uint8_t arithmetic_policy_codebook_id,
     int device_id,
     void *stream);
 
@@ -108,7 +109,7 @@ extern "C" bool rocmNativeVNNIPrefill_getLastLaunchResources(
     extern "C" bool rocmGemm_native_vnni_fp32_shard_##INDEX(           \
         const int8_t *, const uint8_t *, const void *, const void *,    \
         const void *, float *, const float *, const float *, int, int,  \
-        int, uint8_t, int, void *);                                     \
+        int, uint8_t, uint8_t, int, void *);                            \
     extern "C" bool rocmInitIQGridTables_gemm_shard_##INDEX(            \
         int, const void *, const void *, const void *, const void *,     \
         const void *, const void *)

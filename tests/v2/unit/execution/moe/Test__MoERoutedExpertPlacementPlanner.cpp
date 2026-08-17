@@ -28,14 +28,14 @@ namespace llaminar2::test
         {
             RoutedExpertDomain domain;
             domain.name = name;
-            domain.scope = ExecutionDomainScope::LOCAL;
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
             domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
             return domain;
         }
 
-        RoutedExpertDomain cpuNodeLocalTPDomain(const std::string &name)
+        RoutedExpertDomain cpuNodeTPDomain(const std::string &name)
         {
             RoutedExpertDomain domain;
             domain.name = name;
@@ -78,6 +78,19 @@ namespace llaminar2::test
             return result;
         }
 
+        /** Bind histogram load accounting to one inert test participant. */
+        void bindSingleParticipantOwnership(
+            DecodeExpertHistogramConfig &config)
+        {
+            config.sockets = {DeviceId::cpu()};
+            config.ownership = MoELayeredExpertOwnership::uniform(
+                config.num_layers,
+                /*participant_count=*/1,
+                std::vector<int>(
+                    static_cast<size_t>(config.num_experts),
+                    /*owner=*/0));
+        }
+
         MoERoutedExpertPlacementPlan twoTierRocmCpuPlan(RoutedExpertResidencyPolicy policy = RoutedExpertResidencyPolicy::StaticById)
         {
             MoERoutedExpertPlacementPlan plan;
@@ -88,7 +101,7 @@ namespace llaminar2::test
             plan.residency_policy = policy;
             plan.domains = {
                 rocmLocalTPDomain("rocm_hot"),
-                cpuNodeLocalTPDomain("cpu_cold"),
+                cpuNodeTPDomain("cpu_cold"),
             };
             plan.routed_tiers = {
                 tier("hot", "rocm_hot", 0),
@@ -108,7 +121,7 @@ namespace llaminar2::test
             plan.domains = {
                 cudaSingleDomain("cuda_fast"),
                 rocmLocalTPDomain("rocm_warm"),
-                cpuNodeLocalTPDomain("cpu_cold"),
+                cpuNodeTPDomain("cpu_cold"),
             };
             plan.routed_tiers = {
                 tier("hottest", "cuda_fast", 0),
@@ -166,6 +179,7 @@ namespace llaminar2::test
         config.num_layers = 1;
         config.num_experts = 6;
         config.top_k = 2;
+        bindSingleParticipantOwnership(config);
         DecodeExpertHistogram histogram(config);
         const int first_route[] = {4, 2};
         const int second_route[] = {2, 4};
@@ -198,6 +212,7 @@ namespace llaminar2::test
         config.num_layers = 2;
         config.num_experts = 6;
         config.top_k = 1;
+        bindSingleParticipantOwnership(config);
         DecodeExpertHistogram zero_histogram(config);
         MoERoutedExpertPlacementPlannerOptions options;
         options.decode_histogram = &zero_histogram;

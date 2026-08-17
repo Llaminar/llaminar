@@ -41,6 +41,7 @@
 #include "../../compute_stages/ComputeStages.h"        // For StageDumpInfo
 #include "../../moe/ExpertWeightTransfer.h"            // For ReceivedWeightsMap, ExpertMigration
 #include "../../moe/MoERebalanceController.h"          // For ExpertReplicaSet
+#include "../../moe/CPUCurrentBatchLLEP.h"             // CPU transient LLEP authority
 #include "../../moe/MoEExpertOverlayProfiler.h"        // For overlay profiling summary flush
 #include "../../factory/InferenceRunnerFactory.h"      // For FactoryPPStageConfig
 #include "../../../snapshots/SnapshotCapture.h"        // Snapshot capture (extracted Phase 2)
@@ -70,6 +71,7 @@
 #include <cstdio>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <shared_mutex>
 #include <span>
@@ -528,7 +530,9 @@ namespace llaminar2
      *
      * Implements IInferenceRunner for unified inference API.
      */
-    class DeviceGraphOrchestrator : public IInferenceRunner, public IForwardExecutionHost
+    class DeviceGraphOrchestrator : public IInferenceRunner,
+                                    public IForwardExecutionHost,
+                                    public ICPUCurrentBatchLLEPPhysicalExecutor
     {
     public:
         // =========================================================================
@@ -994,7 +998,9 @@ namespace llaminar2
         std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
         MoERebalanceController *moeRebalanceControllerForDomain(
             const std::string &domain_id) const override;
-        bool usesDeviceSideMoERebalanceController() const override;
+        MoEOverlayAuthorityExecutionKind
+        moeOverlayAuthorityExecution() const override;
+        bool deviceResidentMoEOverlayMaintenanceReady() const override;
         int moeRebalanceParticipantId() const override;
 
         /// Apply expert masks to all MoEExpertComputeStages in cached FFN graphs.
@@ -1003,11 +1009,13 @@ namespace llaminar2
         /// @param received_weights Optional transferred packed weights from MPI transfer
         void applyExpertMasks(
             const std::vector<std::vector<bool>> &masks,
-            const ReceivedWeightsMap &received_weights = {});
+            const ReceivedWeightsMap &received_weights = {},
+            const ReceivedPreparedExpertsMap &received_prepared_experts = {});
         void applyExpertMasksForDomain(
             const std::string &domain_id,
             const std::vector<std::vector<bool>> &masks,
-            const ReceivedWeightsMap &received_weights = {});
+            const ReceivedWeightsMap &received_weights = {},
+            const ReceivedPreparedExpertsMap &received_prepared_experts = {});
 
         /// Non-destructively collect packed expert weights for experts requested
         /// by masks. Used for intra-rank migration between composed TP domains
@@ -1095,20 +1103,31 @@ namespace llaminar2
         bool prepareMTPMoEExpertSlabs(DeviceId device);
 
         /// Transfer packed weights for migrating experts via MPI.
-        /// Returns received weights map: [layer_idx][expert_id] → blobs.
-        ReceivedWeightsMap transferExpertWeights(
-            const std::vector<ExpertMigration> &manifest,
-            int num_layers);
+        /// Homogeneous CPU arrivals are final prepared engines; conversion
+        /// domains use explicit serialized payloads.
+        ExpertTransferResult transferExpertWeights(
+            const std::vector<ExpertMigration> &manifest);
 
         /// Transfer packed weights for replicated experts via MPI.
         /// Unlike transferExpertWeights(), the sender keeps its weights (non-destructive).
         /// The receiver gets pre-packed weights to avoid VNNI repacking from raw.
         /// @param replicas The active replica set describing which experts to transfer
         /// @param num_layers Number of MoE layers
-        /// @return Received weights map for this rank's new replicas
-        ReceivedWeightsMap transferReplicaWeights(
-            const ExpertReplicaSet &replicas,
-            int num_layers);
+        /// @return Backend-explicit arrivals for this rank's new replicas
+        ExpertTransferResult transferReplicaWeights(
+            const ExpertReplicaSet &replicas);
+
+        /** @copydoc ICPUCurrentBatchLLEPPhysicalExecutor::materializeCPUCurrentBatchLLEPTransaction */
+        bool materializeCPUCurrentBatchLLEPTransaction(
+            CPUCurrentBatchLLEPTransactionState &state,
+            ICPUCurrentBatchLLEPExpertConsumer &expert_consumer,
+            IGlobalTPContext &tp_ctx) override;
+
+        /** @copydoc ICPUCurrentBatchLLEPPhysicalExecutor::restoreCPUCurrentBatchLLEPPhysicalState */
+        bool restoreCPUCurrentBatchLLEPPhysicalState(
+            CPUCurrentBatchLLEPTransactionState &state,
+            ICPUCurrentBatchLLEPExpertConsumer &expert_consumer,
+            IGlobalTPContext &tp_ctx) override;
 
         /**
          * @brief Set GlobalTPContext for cross-MPI-rank tensor parallelism
@@ -2166,7 +2185,7 @@ namespace llaminar2
             int row_count,
             int32_t *out_tokens) override;
         bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
-        bool usesMirroredLocalTPMTPHeadForVerifier() const override;
+        bool usesMirroredMTPHeadForVerifier() const override;
         bool verifyGreedyAllPositionBatchOutcomeOnDevice(
             const int32_t *draft_tokens,
             int draft_token_count,
@@ -2529,6 +2548,34 @@ namespace llaminar2
 
         bool forwardPrefill(const int *tokens, int seq_len) override;
 
+        /** @copydoc IInferenceRunner::materializeServingGraphFamilyWithoutLaunch */
+        bool materializeServingGraphFamilyWithoutLaunch(
+            const ServingGraphFamilyMaterializationPlan &plan) override;
+
+        /**
+         * @brief Install the root-published request generation for sparse MoE keys.
+         *
+         * This value is deliberately separate from @ref session_epoch_: the
+         * latter authenticates local device state and can advance during local
+         * graph/cache lifecycle work, whereas this generation must remain
+         * equal on independently captured overlay ranks.
+         */
+        bool setMoEOverlayCollectiveRequestGeneration(
+            uint64_t generation_id) override;
+
+        /**
+         * @brief Bind this participant to the rank-wide heterogeneous graph authority.
+         *
+         * The binding is installed once during orchestration setup.  The
+         * participant index is stable for the lifetime of the LocalTP cell and
+         * is used to prove that every symmetric continuation graph entered and
+         * finished the same remote transaction.
+         */
+        bool setMoEOverlayInferenceTransactionCoordinator(
+            std::shared_ptr<MoEOverlayInferenceTransactionCoordinator>
+                coordinator,
+            int continuation_participant_index) override;
+
         bool supportsPrefillChunkSchedule(int seq_len) const override;
 
         bool forwardPrefillChunkSchedule(
@@ -2754,6 +2801,15 @@ namespace llaminar2
         bool observeDeviceGenerationDispatchTicket(
             sampling_math::DeviceGenerationDispatchTicket *out_ticket)
             override;
+        bool beginHostScheduledDeviceGenerationAdvance(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket,
+            size_t *out_fragment_count) override;
+        bool submitHostScheduledDeviceGenerationFragment(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket,
+            size_t fragment_index) override;
+        bool finishHostScheduledDeviceGenerationAdvance(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket)
+            override;
         bool submitHostScheduledDeviceGenerationAdvance(
             const sampling_math::DeviceGenerationDispatchTicket &ticket)
             override;
@@ -2877,6 +2933,25 @@ namespace llaminar2
             std::string *error = nullptr) const;
 
         /**
+         * @brief Borrow one captured ExpertOverlay reader boundary for composition.
+         *
+         * The returned acquire/release graph is the same executable used by the
+         * externally orchestrated first transaction. Native CUDA and hosted HIP
+         * generation loops clone it as the first/last unconditional child of
+         * every transaction branch, so maintenance can publish only after the
+         * complete main/MTP reader family has drained.
+         *
+         * @param operation Acquire or release edge to export.
+         * @param error Optional first violated capture/lifetime invariant.
+         * @return Strict monolithic child capture, or empty for no overlay binding.
+         */
+        std::optional<
+            DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>
+        moeOverlayEpochBoundaryDeviceLoopGraphTemplate(
+            MoEOverlayEpochBoundaryStage::Operation operation,
+            std::string *error = nullptr) const;
+
+        /**
          * @brief Borrow captured penalty-plus-distribution verifier preparation.
          *
          * Only the canonical zero-based all-position row and target-slot
@@ -2975,6 +3050,7 @@ namespace llaminar2
                 Constructed,
                 DrainMaintenanceDiagnostics,
                 JoinPriorProducers,
+                ReleaseOverlayEpoch,
                 ResetReplaySessions,
                 ResetMaintenanceRequestState,
                 ResetMaintenanceGraph,
@@ -3153,6 +3229,8 @@ namespace llaminar2
                     return "drain_maintenance_diagnostics";
                 case Phase::JoinPriorProducers:
                     return "join_prior_producers";
+                case Phase::ReleaseOverlayEpoch:
+                    return "release_overlay_epoch";
                 case Phase::ResetReplaySessions:
                     return "reset_replay_sessions";
                 case Phase::ResetMaintenanceRequestState:
@@ -3343,6 +3421,19 @@ namespace llaminar2
                               << " device=" << state_.device_id.toString());
                     std::terminate();
                 }
+                reset_transaction.enter(
+                    RequestStateResetTransaction::Phase::
+                        ReleaseOverlayEpoch);
+                if (moe_overlay_epoch_external_reader_active_ &&
+                    !releaseMoEOverlayEpochForExternalTransaction(
+                        reset_transaction.executionStream(),
+                        "request_state_reset"))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Request-state reset could not release its durable ExpertOverlay reader"
+                              << " reason=" << reset_reason
+                              << " device=" << state_.device_id.toString());
+                    std::terminate();
+                }
             }
             reset_transaction.enter(
                 RequestStateResetTransaction::Phase::
@@ -3391,7 +3482,11 @@ namespace llaminar2
                         ResetMaintenanceRequestState);
                 if (!device_moe_rebalance_maintenance_graph_
                          .resetRequestOwnedDeviceTransaction(
-                             reset_transaction.executionStream()))
+                             reset_transaction.executionStream()) ||
+                    session_epoch_ == std::numeric_limits<uint64_t>::max() ||
+                    !initializeDeviceMoERebalanceDispatchTicketOnStream(
+                        reset_transaction.executionStream(),
+                        session_epoch_ + 1u))
                 {
                     LOG_ERROR("[DeviceGraphOrchestrator] Device MoE maintenance transaction could not begin a fresh request"
                               << " reason=" << reset_reason
@@ -3663,6 +3758,40 @@ namespace llaminar2
         bool maybeApplyDecodeBoundaryMaintenance() override;
 
         /**
+         * @brief Select this participant's backend-exact MoE scheduler.
+         * @return Native CUDA, hosted-ticket HIP, inactive, or unsupported.
+         */
+        DeviceMoERebalanceMaintenanceExecutionPolicy
+        deviceMoERebalanceMaintenanceExecutionPolicy()
+            const noexcept override;
+
+        /** @brief Return the setup-authenticated HIP observation cadence. */
+        DeviceMoERebalanceHostedObservationSchedule
+        deviceMoERebalanceHostedObservationSchedule()
+            const noexcept override;
+
+        /** @brief Validate one graph-embedded, D2H-free boundary known not to be due. */
+        bool submitHostScheduledDeviceMoERebalanceKnownNonDueBoundary()
+            override;
+
+        /**
+         * @brief Publish and authenticate one HIP cadence decision.
+         * @param out_ticket Non-null host destination for the immutable ticket.
+         * @return true only after the exact ticket-ready event has completed
+         *         and the snapshot matches this request, arena, and participant.
+         */
+        bool observeDeviceMoERebalanceDispatchTicket(
+            DeviceMoERebalanceDispatchTicket *out_ticket) override;
+
+        /**
+         * @brief Submit the captured branch selected by a validated rank ticket.
+         * @param ticket Rank-validated decision for this exact participant.
+         * @return true only when maintenance or acknowledgement was enqueued.
+         */
+        bool submitHostScheduledDeviceMoERebalanceMaintenance(
+            const DeviceMoERebalanceDispatchTicket &ticket) override;
+
+        /**
          * @brief Get current position (IInferenceRunner override)
          */
         int get_position() const override { return getPosition(0); }
@@ -3756,10 +3885,31 @@ namespace llaminar2
         // Snapshot Capture API (delegated to SnapshotCapture — Phase 2 extract)
         // =========================================================================
 
+        /**
+         * @brief Enable graph-stable diagnostic snapshots for subsequent forwards.
+         * @param output_dir Retained for the runner interface; snapshots are held in memory.
+         *
+         * Repeating this call clears request-local values without changing the
+         * executor's snapshot topology epoch. Captured graphs therefore remain
+         * reusable when a parity caller restates an unchanged diagnostics policy.
+         */
         void enableSnapshotCapture(const std::string &output_dir = "") override
         {
             (void)output_dir;
             snapshot_capture_.clear();
+            prefill_chunk_snapshot_previous_context_.reset();
+            prefill_chunk_snapshot_sequence_.clear();
+
+            /*
+             * Enabling an already-enabled sink clears its request-local values,
+             * but it does not change the set of D2D snapshot nodes embedded in
+             * a captured graph.  Reinstalling an equivalent std::function would
+             * advance DeviceGraphExecutor's topology epoch and needlessly throw
+             * away a proven decode executable before every parity token.
+             */
+            if (snapshot_enabled_)
+                return;
+
             snapshot_enabled_ = true;
 
             LOG_DEBUG("[DeviceGraphOrchestrator::enableSnapshotCapture] Setting callback on executor_");
@@ -3773,39 +3923,81 @@ namespace llaminar2
                 });
         }
 
+        /**
+         * @brief Select the stage keys copied into graph-stable snapshot slots.
+         * @param keys Snapshot keys; order, duplicates, and empty entries have no meaning.
+         *
+         * A semantic filter change invalidates captured graph topology exactly
+         * once. Reapplying an equivalent set preserves the current executable.
+         */
         void setSnapshotCaptureFilter(const std::vector<std::string> &keys) override
         {
-            snapshot_capture_filter_.clear();
-            snapshot_capture_filter_.reserve(keys.size());
+            std::unordered_set<std::string> requested_filter;
+            requested_filter.reserve(keys.size());
             for (const auto &key : keys)
             {
                 if (!key.empty())
-                    snapshot_capture_filter_.insert(key);
+                    requested_filter.insert(key);
             }
+
+            /*
+             * Filter order and duplicates have no graph meaning.  Compare the
+             * normalized semantic set before touching the executor so a caller
+             * may restate its diagnostics policy on every request without
+             * turning steady replay into perpetual recapture.
+             */
+            if (requested_filter == snapshot_capture_filter_)
+                return;
+
+            snapshot_capture_filter_ = std::move(requested_filter);
+            if (!snapshot_enabled_)
+                return;
             applySnapshotCaptureFilter();
         }
 
+        /**
+         * @brief Disable diagnostic snapshots and remove their captured graph nodes.
+         *
+         * The first transition advances the executor topology epoch; repeating
+         * the disabled state is an idempotent request-local cleanup operation.
+         */
         void disableSnapshotCapture() override
         {
+            if (!snapshot_enabled_)
+            {
+                snapshot_capture_.clear();
+                snapshot_capture_filter_.clear();
+                prefill_chunk_snapshot_previous_context_.reset();
+                prefill_chunk_snapshot_sequence_.clear();
+                return;
+            }
+
             snapshot_enabled_ = false;
             snapshot_capture_.clear();
             snapshot_capture_filter_.clear();
+            prefill_chunk_snapshot_previous_context_.reset();
+            prefill_chunk_snapshot_sequence_.clear();
             executor_.setSnapshotStageFilter(nullptr);
             executor_.setSnapshotCallback(nullptr);
         }
 
+        /**
+         * @brief Clear published snapshot values without changing graph topology.
+         */
         void clearSnapshots() override
         {
             snapshot_capture_.clear();
+            prefill_chunk_snapshot_previous_context_.reset();
+            prefill_chunk_snapshot_sequence_.clear();
         }
 
         const float *getSnapshot(const std::string &key, size_t &out_size) const override
         {
-            const auto *snap = snapshot_capture_.get(key);
+            const StoredSnapshotHandle snap = snapshot_capture_.getShared(key);
             if (!snap)
             {
                 LOG_DEBUG("[DeviceGraphOrchestrator::getSnapshot] Key NOT FOUND: " << key
-                                                                                   << " (have " << snapshot_capture_.all().size() << " snapshots)");
+                                                                                   << " (have " << snapshot_capture_.size() << " snapshots)");
                 out_size = 0;
                 return nullptr;
             }
@@ -3816,10 +4008,22 @@ namespace llaminar2
 
         SnapshotInfo getSnapshotWithShape(const std::string &key) const override
         {
-            const auto *snap = snapshot_capture_.get(key);
+            const StoredSnapshotHandle snap = snapshot_capture_.getShared(key);
             if (!snap)
                 return {};
-            return {snap->data.data(), snap->data.size(), snap->rows, snap->cols};
+            return SnapshotInfo{
+                .data = snap->data.data(),
+                .size = snap->data.size(),
+                .rows = snap->rows,
+                .cols = snap->cols,
+                /*
+                 * Keep the immutable publication alive after this lookup
+                 * returns. Rank/global parity routers intentionally copy the
+                 * FP32 payload outside SnapshotCapture's map lock, while a
+                 * later graph callback may replace or clear that map entry.
+                 */
+                .lifetime_owner = std::move(snap),
+            };
         }
 
         std::vector<std::string> getSnapshotKeys() const override
@@ -3940,6 +4144,15 @@ namespace llaminar2
         struct PinnedDispatchTicketScratch;
 
         /**
+         * @brief Fixed pinned destination for HIP MoE cadence decisions.
+         *
+         * This allocation is one ticket wide and exists only to let the rank
+         * compare participant predicates before submitting an RCCL graph. It is
+         * never a source buffer and exposes no routing or expert payload state.
+         */
+        struct PinnedMoERebalanceDispatchTicketScratch;
+
+        /**
          * @brief Shared implementation for host-token and device-token forwards.
          *
          * `tokens` is always the host shadow used for request bookkeeping. When
@@ -3989,6 +4202,21 @@ namespace llaminar2
         int localLogitsVocabOffset() const;
         bool activeMainLogitsAreColumnParallel() const;
         bool mtpSidecarLogitsAreColumnParallel() const;
+
+        /**
+         * @brief Decide whether one MTP sidecar graph owns a logits allgather.
+         * @param kv_cache_only True for the shifted-prefill cache-population graph.
+         * @return True only for a full sidecar whose participant output is a
+         *         vocabulary shard inside a multi-rank GlobalTP domain.
+         *
+         * The decision deliberately delegates participant output ownership to
+         * `GraphConfig::mtpTerminalLogitsLayout()`. This prevents orchestration
+         * from reconstructing terminal-head placement from the primary LM-head
+         * sharding bit and accidentally gathering a mirrored full-vocabulary
+         * result.
+         */
+        bool mtpSidecarRequiresGlobalLogitsGather(bool kv_cache_only) const;
+
         bool allPositionVerifierGraphWritesLocalLogits(int graph_token_count = -1) const;
         bool activeAllPositionLogitsAreColumnParallel(int graph_token_count = -1) const;
 
@@ -4021,7 +4249,24 @@ namespace llaminar2
             size_t rows,
             size_t columns) const;
 
-        bool usesGraphStableGpuMoERebalance() const;
+        /**
+         * @brief Return whether stable epoch tickets decouple placement from graph identity.
+         *
+         * ExpertOverlay mutates model-lifetime runtime banks and publishes an
+         * epoch selector. Captured graphs retain those stable addresses, so
+         * neither host-coordinated nor device-resident publication requires
+         * graph recapture.
+         */
+        bool usesGraphStableMoEOverlayResidency() const;
+
+        /**
+         * @brief Return whether this participant runs the homogeneous device backend.
+         *
+         * The predicate is derived exclusively from the frozen graph topology
+         * and sole-authority contract. Hot-cache capacity and diagnostic
+         * environment settings must never change publication ownership.
+         */
+        bool usesHomogeneousDeviceResidentMoEOverlayAuthority() const;
 
         /**
          * @brief Update dynamic parameters in a cached graph
@@ -4082,10 +4327,9 @@ namespace llaminar2
          * @param producer_stream Exact non-null logits producer stream.
          * @return true when device ownership and completion are published.
          */
-        bool publishLogitsAtBoundary(
-            TensorBase *logits,
-            IDeviceContext *ctx,
-            void *producer_stream) override;
+        bool publishForwardResultAtBoundary(
+            const ForwardOutput &output,
+            IDeviceContext *ctx) override;
 
         /**
          * @brief Build decode-time capture policy from runtime and graph context
@@ -4110,10 +4354,15 @@ namespace llaminar2
          * @brief Check whether a proven heterogeneous collective domain can
          *        execute manual collective boundaries safely.
          */
-        bool collectivesSupportSegmentedReplay() const;
+        bool supportsHeterogeneousSegmentedReplay() const;
 
         /**
-         * @brief Check whether LocalTP collectives may be captured inside GPU graphs
+         * @brief Check whether this graph's homogeneous LocalTP subdomain can
+         *        capture its collectives inside GPU graph segments.
+         *
+         * Explicit heterogeneous ExpertOverlay boundaries do not weaken this
+         * capability: they remain separate manual segments while the local
+         * NCCL/RCCL domain retains native collective capture.
          */
         bool collectivesSupportCapturedGraph(std::string *reason_out = nullptr) const;
 
@@ -4195,6 +4444,12 @@ namespace llaminar2
         bool prepareLiveStateForForwardGraphExecution(
             const ForwardInput &input,
             void *execution_stream,
+            DeviceId execution_device) override;
+
+        /** Queue the cold graph-build publication onto a setup capture stream. */
+        bool prepareGraphBuildStateForMaterialization(
+            const ForwardInput &input,
+            void *capture_stream,
             DeviceId execution_device) override;
 
         /** Complete the exact-stream live-state reader transaction begun by the prelude. */
@@ -5039,13 +5294,89 @@ namespace llaminar2
         bool materializeDeviceMoERebalanceMaintenanceGraphForFamily();
 
         /**
+         * @brief Append HIP serial-decode cadence ownership to a main graph.
+         *
+         * ROCm has no native conditional graph node. Its ordinary decode graph
+         * therefore ends with the allocation-free device publish/acknowledge
+         * pair, while the host observes an authenticated ticket only at a
+         * conservative potentially-due boundary. Grouped MTP is excluded
+         * because accepted-state publication and the next verifier admission
+         * already own the same device marker transaction.
+         *
+         * @param graph Fully built participant-local production graph.
+         * @param input Typed role and mathematical phase for that graph.
+         * @param error Optional construction diagnostic.
+         * @return true when inapplicable or the exact terminal stage was added.
+         */
+        bool appendHostedDeviceMoEDecodeCommitBoundary(
+            ComputeGraph &graph,
+            const ForwardInput &input,
+            std::string *error = nullptr);
+
+        /**
          * @brief Resolve the persistent device-owned MoE controller record.
          *
          * The returned value is a device address used only as a kernel
          * argument. The host never dereferences or mirrors the record.
+         *
+         * @param error Optional diagnostic explaining which immutable graph-
+         *              family binding is incomplete.
+         * @return Device address of the controller record, or nullptr when the
+         *         retained maintenance participant is not fully bound.
          */
         DeviceMoERebalanceGraphControllerState *
-        deviceMoERebalanceControllerStateDevice();
+        deviceMoERebalanceControllerStateDevice(
+            std::string *error = nullptr);
+
+        /**
+         * @brief Capture the cheap serial-boundary fragments for sparse maintenance.
+         *
+         * CUDA owns one native conditional parent whose unconditional head
+         * publishes (or recognizes an MTP-published) commit edge and whose
+         * unconditional tail acknowledges a skipped non-due edge. HIP captures
+         * a ticket-only publisher and a due-boundary acknowledgement; ordinary
+         * non-due publication is already part of its complete decode graph.
+         * This method preflights those exact sources before the expensive
+         * maintenance capture is composed.
+         *
+         * @param gpu_ctx Persistent worker context owning graph resources.
+         * @param backend Backend used to enqueue the graph-capturable kernels.
+         * @param maintenance_stream Exact non-null scheduler stream.
+         * @param error Optional construction diagnostic.
+         * @return true when sources are ready or native composition is unsupported.
+         */
+        bool prepareDeviceMoERebalanceCadenceTransactionSources(
+            IWorkerGPUContext *gpu_ctx,
+            IBackend *backend,
+            void *maintenance_stream,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Compose the captured maintenance graph behind its device predicate.
+         *
+         * The ordered transaction is `publish -> IF(due) maintenance -> ack`.
+         * Source captures and every embedded controller address are persistent
+         * model-lifetime bindings. The resulting graph is instantiated once and
+         * reused; no host predicate read, callback, recapture, or eager fallback
+         * participates in replay.
+         *
+         * @param error Optional construction diagnostic.
+         * @return true when native composition is unavailable or fully ready.
+         */
+        bool composeDeviceMoERebalanceCadenceTransaction(
+            std::string *error = nullptr);
+
+        /**
+         * @brief Initialize the persistent MoE ticket on a request-reset stream.
+         *
+         * The controller must already have been reset on @p stream. This method
+         * binds its embedded ticket to the current session/workspace generation
+         * and clears all host observation bookkeeping before reset readiness is
+         * published.
+         */
+        bool initializeDeviceMoERebalanceDispatchTicketOnStream(
+            void *stream,
+            uint64_t ticket_session_epoch);
 
         /**
          * @brief Launch graph-captured device-side MoE maintenance when due.
@@ -5059,7 +5390,8 @@ namespace llaminar2
          * @return true when no launch was due or the scheduled graph completed
          *         successfully; false when graph preparation or launch failed.
          */
-        bool maybeRunDeviceMoERebalanceMaintenanceGraph();
+        bool maybeRunDeviceMoERebalanceMaintenanceGraph(
+            bool boundary_already_published = false);
 
         /**
          * @brief Order a live graph consumer after pending device-side MoE maintenance.
@@ -5090,7 +5422,77 @@ namespace llaminar2
         bool waitForPendingDeviceMoERebalanceMaintenance(
             void *consumer_stream,
             DeviceTimelineRole consumer_role,
+            const char *consumer_name,
+            bool acquire_overlay_epoch = true);
+
+        /**
+         * @brief Resolve and validate the model-lifetime epoch binding at setup.
+         *
+         * This method may allocate the graph-builder-owned arena and the one
+         * persistent acquired-event. It is never called from inference replay.
+         * Empty bindings are an explicit non-overlay topology.
+         */
+        bool initializeMoEOverlayEpochExecutionBinding();
+
+        /**
+         * @brief Materialize immutable acquire and release graph definitions.
+         * @return true when both definitions match the current binding.
+         */
+        bool materializeMoEOverlayEpochBoundaryGraphs();
+
+        /**
+         * @brief Execute one retained epoch boundary on an exact consumer stream.
+         *
+         * The auxiliary capture stream is joined to and from @p execution_stream
+         * with backend events. No host synchronization or device-state readback
+         * occurs.
+         */
+        bool executeMoEOverlayEpochBoundaryCaptured(
+            MoEOverlayEpochBoundaryStage::Operation operation,
+            void *execution_stream,
             const char *consumer_name);
+
+        /**
+         * @brief Acquire once for an externally orchestrated inference transaction.
+         *
+         * Later graph streams wait on the persistent acquired-event instead of
+         * attempting to mutate the same request ticket twice.
+         */
+        bool acquireMoEOverlayEpochForExternalTransaction(
+            void *consumer_stream,
+            DeviceTimelineRole consumer_role,
+            const char *consumer_name);
+
+        /**
+         * @brief Release an active external reader after its complete state commit.
+         *
+         * The caller must first join every main/MTP producer onto @p release_stream.
+         * Maintenance then follows on that same stream, making publication unable
+         * to overlap an older placement reader while inference itself remains
+         * asynchronous.
+         */
+        bool releaseMoEOverlayEpochForExternalTransaction(
+            void *release_stream,
+            const char *boundary_name);
+
+        /**
+         * @brief Close/join the host-scheduled reader before an internal parent.
+         *
+         * Main prefill/decode is submitted outside the resident MTP parent and
+         * therefore acquires through the host lifecycle. Every parent branch
+         * contains its own captured acquire/release pair. Before launching that
+         * parent, the exact loop stream must either release the still-active
+         * external ticket (static/no-maintenance topology) or consume the prior
+         * external release event (maintenance topology). This prevents the first
+         * child acquire from double-acquiring one request slot.
+         *
+         * @param parent_stream Exact stream that will launch the parent/branch.
+         * @param parent_name Stable diagnostic owner of the boundary.
+         * @return true when the parent stream is ordered after external release.
+         */
+        bool prepareMoEOverlayEpochForInternalParent(
+            void *parent_stream,
+            const char *parent_name);
 
         struct DeviceMoERebalanceMaintenanceOutcome
         {
@@ -5299,15 +5701,16 @@ namespace llaminar2
             const char *reset_operation = nullptr);
 
         /**
-         * @brief Export current-batch LLEP evidence at a snapshot-only epilogue.
+         * @brief Export current-batch LLEP evidence at a PerfStats epilogue.
          *
-         * Production generation appends the same device reduction to its
-         * existing terminal-control bridge. Manual parity does not launch that
-         * generation controller, so snapshot mode may perform one explicitly
-         * ordered diagnostic readback after the latest forward publication.
-         * This method is a no-op outside snapshot+PerfStats diagnostics.
+         * Production MTP generation appends the same device reduction to its
+         * existing terminal-control bridge. Ordinary decode, parity, and
+         * benchmark execution do not launch that controller, so an explicitly
+         * requested PerfStats run performs one ordered two-word readback after
+         * measured inference has ended. This is a terminal observer only: it
+         * never runs in a graph or token hot path and never mutates placement.
          */
-        void publishSnapshotCurrentBatchLLEPEvidenceDiagnostics();
+        void publishTerminalCurrentBatchLLEPEvidenceDiagnostics();
 
         /** Report host-side safety state for chunk-boundary maintenance. */
         PrefillChunkMaintenanceState prefillChunkMaintenanceState(
@@ -5317,6 +5720,70 @@ namespace llaminar2
         bool onPrefillChunkMaintenance(
             const PrefillChunkPlan &chunk,
             const PrefillChunkMaintenanceDecision &decision) override;
+
+        /**
+         * @brief Bind one scheduled prefill chunk to the ExpertOverlay authority.
+         *
+         * Multi-chunk prefill reuses one captured physical bucket, but every
+         * replay is a distinct sparse transaction with its own authenticated
+         * remote-follower ticket.  This hook opens that transaction, stamps the
+         * coordinator-owned wire identity into the chunk input, and returns a
+         * lease whose lifetime covers the exact executable launch.
+         *
+         * @param chunk_input Chunk-specific forward input about to execute.
+         * @param chunk Scheduler-owned real and physical row geometry.
+         * @param lease Receives the active transaction lease, or remains empty
+         *        when this runner has no heterogeneous overlay authority.
+         * @param error Receives a precise admission or lifecycle diagnostic.
+         * @return True when the graph may be submitted.
+         */
+        bool beginPrefillChunkGraphSubmission(
+            ForwardInput &chunk_input,
+            const PrefillChunkPlan &chunk,
+            std::unique_ptr<IPrefillChunkGraphSubmissionLease> *lease,
+            std::string *error) override;
+
+        /**
+         * @brief Scope parity snapshots to one scheduled prefill chunk.
+         *
+         * This host-only diagnostic hook runs immediately before the graph
+         * executor publishes its immutable snapshot slots. It changes only the
+         * capture-key namespace; graph inputs, device state, and stream order
+         * remain exactly those selected by ForwardExecutionEngine.
+         *
+         * @param chunk Real/bucket geometry currently being executed.
+         */
+        void beginPrefillChunkSnapshotDiagnostics(
+            const PrefillChunkPlan &chunk) override;
+
+        /**
+         * @brief Restore the snapshot namespace that preceded one prefill chunk.
+         * @param chunk Chunk whose diagnostic scope has completed.
+         */
+        void endPrefillChunkSnapshotDiagnostics(
+            const PrefillChunkPlan &chunk) override;
+
+        /**
+         * @brief Join every sequence-shaped chunk snapshot into the normal parity keys.
+         *
+         * The graph executor has already projected padded bucket rows to their
+         * real prefixes. This validates and concatenates those host-visible
+         * values after the final chunk, restoring the full-prompt checkpoint
+         * contract consumed by the existing CSV comparator.
+         *
+         * @param schedule Successfully executed chunk order.
+         * @return False when a chunk is missing or has incompatible geometry.
+         */
+        bool finalizePrefillChunkSnapshotDiagnostics(
+            const PrefillChunkSchedule &schedule) override;
+
+        /**
+         * @brief Forget a partial segmented-prefill capture after a failed request.
+         *
+         * Diagnostic data is discarded as a sequence candidate; no captured
+         * graph allocation, model weight, or live KV state is modified here.
+         */
+        void cancelPrefillChunkSnapshotDiagnostics() noexcept override;
 
         /** Create and return the ForwardExecutionEngine with current config. */
         void ensureForwardEngine();
@@ -5671,12 +6138,35 @@ namespace llaminar2
          *
          * @param input Main-prefill input receiving the typed graph binding.
          * @param request_count Number of independent request rows in the graph.
+         * @param purpose Runtime execution or setup-only graph-family
+         *        declaration. Declaration bindings expose identical stage
+         *        topology but cannot enter ForwardExecutionEngine.
          * @return true when the binding is either unnecessary or complete;
          *         false when enabled GPU MTP lacks a required owner.
          */
         bool bindShiftedMTPPrefillTransaction(
             ForwardInput &input,
-            int request_count);
+            int request_count,
+            ShiftedMTPPrefillGraphBinding::Purpose purpose =
+                ShiftedMTPPrefillGraphBinding::Purpose::RuntimeExecution);
+
+        /**
+         * @brief Construct the one canonical captured prefill-chunk binding.
+         *
+         * Setup materialization and live request scheduling both call this
+         * helper.  Consequently the workspace generation, backend, KV counter,
+         * arena addresses, bucket geometry, and pad token are hashed in one
+         * place and cannot drift into distinct graph-cache identities.
+         *
+         * @param bucket_seq_len Physical captured row count.
+         * @param pad_token_id Token written to inactive rows.
+         * @return Complete binding, or std::nullopt when any permanent owner is
+         *         absent or the requested bucket exceeds admitted capacity.
+         */
+        std::optional<DevicePrefillChunkGraphBinding>
+        makeDevicePrefillChunkGraphBinding(
+            int bucket_seq_len,
+            int pad_token_id);
 
         /**
          * @brief Record the hidden-state ownership produced by main forward.
@@ -5730,6 +6220,9 @@ namespace llaminar2
              */
             std::string capture_perf_context;
             std::vector<IComputeStage *> dynamic_param_stages;
+            /** Sparse stages whose wire identity changes for every ticket. */
+            std::vector<IComputeStage *>
+                moe_overlay_collective_runtime_stages;
             std::unordered_set<std::string> collective_nodes;
             TensorBase *terminal_hidden = nullptr;
             uint64_t workspace_generation = 0;
@@ -5803,6 +6296,7 @@ namespace llaminar2
                 graph.reset();
                 capture_perf_context.clear();
                 dynamic_param_stages.clear();
+                moe_overlay_collective_runtime_stages.clear();
                 collective_nodes.clear();
                 terminal_hidden = nullptr;
                 workspace_generation = 0;
@@ -6582,6 +7076,46 @@ namespace llaminar2
         };
 
         /**
+         * @brief One semantic unit in a hosted retained generation branch.
+         *
+         * Local controller/sampler/publication units are ordinary captured
+         * children. Sidecar and grouped-verifier units retain their production
+         * segmented ComputeGraph plan because a heterogeneous sparse boundary
+         * cannot be cloned into one native CUDA child. The kind makes that
+         * distinction structural; no null capture is interpreted as a fallback.
+         */
+        struct HostedDeviceGenerationFragment
+        {
+            enum class Kind : uint8_t
+            {
+                CapturedLocal = 0,
+                MTPFullSidecarReplay,
+                MTPChainedSidecarReplay,
+                MTPGroupedVerifierReplay,
+            };
+
+            const char *name = nullptr;
+            Kind kind = Kind::CapturedLocal;
+            const IGPUGraphCapture *capture = nullptr;
+            const ComputeGraph *semantic_graph = nullptr;
+            ForwardGraphSignature forward_signature{};
+            DeviceControlledLoopFragmentExecution execution =
+                DeviceControlledLoopFragmentExecution::Always;
+            const uint32_t *condition_word_device = nullptr;
+
+            /** @return Whether two plans embed the same immutable executable identity. */
+            [[nodiscard]] bool hasSameExecutionIdentity(
+                const HostedDeviceGenerationFragment &other) const noexcept
+            {
+                return kind == other.kind && capture == other.capture &&
+                       semantic_graph == other.semantic_graph &&
+                       forward_signature == other.forward_signature &&
+                       execution == other.execution &&
+                       condition_word_device == other.condition_word_device;
+            }
+        };
+
+        /**
          * @brief Persistent owner for one policy-complete device generation loop.
          *
          * Fixed policy owns one immutable transaction body. Dynamic policy owns
@@ -6608,8 +7142,14 @@ namespace llaminar2
 
             std::shared_ptr<void> stream;
             std::unique_ptr<IGPUGraphCapture> capture;
+            /** Scheduler-to-retained-fragment event, allocated before admission. */
+            std::shared_ptr<void> handoff_to_fragment_event;
+            /** Retained-fragment-to-scheduler event, allocated before admission. */
+            std::shared_ptr<void> handoff_from_fragment_event;
             /** Exact child capture, policy, and predicate identities in the executable. */
             std::vector<DeviceControlledLoopFragment> source_fragments;
+            /** Exact semantic branch inventory for hosted heterogeneous replay. */
+            std::vector<HostedDeviceGenerationFragment> hosted_fragments;
             /** Flat source-fragment span owned by each legal draft depth. */
             std::array<
                 size_t,
@@ -6642,6 +7182,9 @@ namespace llaminar2
             ExecutionKind execution_kind = ExecutionKind::Unmaterialized;
             bool valid = false;
             bool launched = false;
+            bool hosted_advance_active = false;
+            size_t hosted_advance_fragment_count = 0;
+            size_t hosted_advance_next_fragment = 0;
 
             /**
              * @brief Retire one successfully materialized request launch.
@@ -6681,13 +7224,19 @@ namespace llaminar2
                 execution_kind = ExecutionKind::Unmaterialized;
                 valid = false;
                 launched = false;
+                hosted_advance_active = false;
+                hosted_advance_fragment_count = 0;
+                hosted_advance_next_fragment = 0;
                 source_fragments.clear();
+                hosted_fragments.clear();
             }
 
             void release() noexcept
             {
                 invalidateGraph();
                 capture.reset();
+                handoff_to_fragment_event.reset();
+                handoff_from_fragment_event.reset();
                 stream.reset();
             }
         };
@@ -6780,6 +7329,35 @@ namespace llaminar2
             }
         };
 
+        /**
+         * @brief Capture owner for one ExpertOverlay reader lifecycle edge.
+         *
+         * Acquire and release each own one graph because the complete inference
+         * transaction can contain an arbitrary number of main/MTP child graphs
+         * between them. The arena and request slot are model-lifetime topology;
+         * the workspace generation authenticates the capture/executor lifetime.
+         */
+        struct MoEOverlayEpochBoundaryGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            DeviceGraphExecutor::GraphSegmentCache segment_cache;
+            MoEOverlayEpochBoundaryStage *stage = nullptr;
+            uint64_t workspace_generation = 0;
+            bool valid = false;
+
+            /** @brief Destroy capture state and every borrowed stage pointer. */
+            void invalidate()
+            {
+                segment_cache.reset(
+                    DeviceGraphExecutor::GraphSegmentCache::
+                        StreamResetPolicy::Destroy);
+                graph.reset();
+                stage = nullptr;
+                workspace_generation = 0;
+                valid = false;
+            }
+        };
+
         MTPTerminalHiddenRowSelectGraphCache mtp_terminal_hidden_row_select_cache_;
         /// CPU/direct-fixture arbitrary-row selector. Production GPU paths use one of the typed caches below.
         MTPTerminalHiddenRowsSelectGraphCache mtp_terminal_hidden_rows_select_cache_;
@@ -6855,6 +7433,16 @@ namespace llaminar2
             mtp_device_generation_loop_fragment_scratch_;
 
         /**
+         * @brief Allocation-free hosted branch inventory assembled beside native children.
+         *
+         * This storage is used only by authenticated hosted scheduling. Its
+         * semantic sidecar/verifier entries retain segmented production graphs;
+         * every other entry names the same captured child used by native CUDA.
+         */
+        std::vector<HostedDeviceGenerationFragment>
+            mtp_device_generation_loop_hosted_fragment_scratch_;
+
+        /**
          * @brief Allocation-free native SWITCH branch descriptors.
          *
          * Entry `d` names the complete transaction for resident draft depth `d`.
@@ -6885,6 +7473,43 @@ namespace llaminar2
         /// Active verifier penalty/distribution fragment for resident MTP.
         MTPStochasticTargetDistributionGraphCache
             mtp_stochastic_target_distribution_graph_;
+
+        /// First unconditional fragment of every durable overlay transaction.
+        MoEOverlayEpochBoundaryGraphCache
+            moe_overlay_epoch_acquire_graph_;
+
+        /// Last unconditional fragment before any placement maintenance.
+        MoEOverlayEpochBoundaryGraphCache
+            moe_overlay_epoch_release_graph_;
+
+        /// Stable graph-builder-owned arena and immutable request-slot identity.
+        DeviceMoEOverlayEpochExecutionBinding
+            moe_overlay_epoch_execution_binding_;
+
+        /**
+         * Durable publication from the first acquire stream to every later child.
+         * The event is model-runner lifetime and may be waited by multiple streams.
+         */
+        std::shared_ptr<void> moe_overlay_epoch_acquired_event_;
+
+        /// Exact stream that most recently published the acquired-event.
+        void *moe_overlay_epoch_acquire_producer_stream_ = nullptr;
+
+        /// Completion edge preventing a later acquire from racing prior release.
+        std::shared_ptr<void> moe_overlay_epoch_released_event_;
+
+        /// Exact stream that most recently published the released-event.
+        void *moe_overlay_epoch_release_producer_stream_ = nullptr;
+
+        /// Whether the next external acquire owes the released-event a wait.
+        bool moe_overlay_epoch_release_pending_ = false;
+
+        /**
+         * Host lifecycle ownership only; never a mirror of epoch/selector state.
+         * true means one enqueued acquire owns the immutable request ticket until
+         * a correspondingly ordered release is submitted.
+         */
+        bool moe_overlay_epoch_external_reader_active_ = false;
 
         /**
          * @brief Device-checkpoint bank written by the last successful hidden producer.
@@ -6950,6 +7575,27 @@ namespace llaminar2
              */
             std::unordered_set<std::string> collective_nodes;
             DeviceGraphExecutor::GraphSegmentCache segment_cache;
+            /** Captured one-kernel serial/MTP boundary publisher. */
+            std::unique_ptr<IGPUGraphCapture>
+                cadence_boundary_publication_capture;
+            /** Captured one-kernel skipped-boundary acknowledgement. */
+            std::unique_ptr<IGPUGraphCapture>
+                cadence_boundary_acknowledgement_capture;
+            /** CUDA native `publish -> IF(due) maintenance -> ack` parent. */
+            std::unique_ptr<IGPUGraphCapture> cadence_transaction_capture;
+            /**
+             * @brief Whether main HIP decode topology owns non-due cadence.
+             *
+             * This is immutable graph-construction evidence, not live device
+             * state. It proves the rank's known-non-due branch can remain a
+             * host no-op without skipping the device clock transaction.
+             */
+            bool hosted_decode_commit_boundary_embedded = false;
+            /** True after the backend's native-transaction capability is known. */
+            bool cadence_transaction_capability_checked = false;
+            /** Immutable setup bounds used only to elide impossible HIP reads. */
+            DeviceMoERebalanceHostedObservationSchedule
+                hosted_observation_schedule;
             uint64_t workspace_generation = 0;
             uint64_t launch_count = 0;
             /**
@@ -7030,6 +7676,11 @@ namespace llaminar2
             void resetReplayState()
             {
                 segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
+                cadence_transaction_capture.reset();
+                cadence_boundary_acknowledgement_capture.reset();
+                cadence_boundary_publication_capture.reset();
+                cadence_transaction_capability_checked = false;
+                hosted_observation_schedule = {};
             }
 
             /**
@@ -7072,6 +7723,12 @@ namespace llaminar2
 
             void invalidate()
             {
+                cadence_transaction_capture.reset();
+                cadence_boundary_acknowledgement_capture.reset();
+                cadence_boundary_publication_capture.reset();
+                cadence_transaction_capability_checked = false;
+                hosted_decode_commit_boundary_embedded = false;
+                hosted_observation_schedule = {};
                 segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
                 graph.reset();
                 collective_nodes.clear();
@@ -7086,6 +7743,16 @@ namespace llaminar2
 
         DeviceMoERebalanceMaintenanceGraphCache device_moe_rebalance_maintenance_graph_;
 
+        /** One-way pinned observer and event for the HIP MoE ticket boundary. */
+        std::unique_ptr<PinnedMoERebalanceDispatchTicketScratch>
+            device_moe_rebalance_dispatch_ticket_host_scratch_;
+        std::shared_ptr<void>
+            device_moe_rebalance_dispatch_ticket_ready_event_;
+        std::optional<DeviceMoERebalanceDispatchTicket>
+            last_device_moe_rebalance_dispatch_ticket_;
+        bool device_moe_rebalance_dispatch_ticket_copy_pending_ = false;
+        uint32_t hosted_device_moe_rebalance_last_committed_round_ = 0;
+
         /// Padded sequence length from last forward_batch() call
         int padded_seq_len_ = 0;
 
@@ -7098,6 +7765,24 @@ namespace llaminar2
 
         /// Optional execution context prefix for disambiguating repeated stage keys.
         std::string snapshot_context_;
+
+        /**
+         * @brief Namespace to restore when the currently executing prefill chunk ends.
+         *
+         * ForwardExecutionEngine invokes the begin/end pair through an RAII
+         * scope, so this optional value is populated for at most one chunk on
+         * this single-threaded runner.
+         */
+        std::optional<std::string> prefill_chunk_snapshot_previous_context_;
+
+        /**
+         * @brief Ordered live-row chunks awaiting prompt-wide snapshot aggregation.
+         *
+         * The entries name host diagnostics only. Their row counts were already
+         * enforced by the graph scheduler and do not duplicate a device-owned
+         * execution cursor.
+         */
+        std::vector<SnapshotChunkSequencePart> prefill_chunk_snapshot_sequence_;
 
         /// Snapshot capture engine (owns storage + routing logic)
         SnapshotCapture snapshot_capture_;
@@ -8665,7 +9350,7 @@ namespace llaminar2
         /// Global TP context for cross-MPI-rank tensor parallelism (owns communicator lifetime)
         std::shared_ptr<IGlobalTPContext> global_tp_ctx_;
 
-        /// Resolve the active GlobalTP/NodeLocalTP domain context for scalar MTP coordination.
+        /// Resolve the active GlobalTP/NodeTP domain context for scalar MTP coordination.
         IGlobalTPContext *globalTPContextForMTPCoordination() const;
 
         // =========================================================================
@@ -8714,6 +9399,26 @@ namespace llaminar2
          * ticket from an earlier session fail lifecycle authentication.
          */
         uint64_t session_epoch_ = 1;
+        /**
+         * Root-published generation consumed by graph-native sparse MoE stages.
+         *
+         * Zero means this runner has no admitted distributed overlay request.
+         * It is assigned only through the typed IInferenceRunner contract at
+         * initialization and request reset, never inferred from graph capture
+         * or a stage-object execution count.
+         */
+        uint64_t moe_overlay_collective_request_generation_ = 0;
+        /**
+         * Rank-owned control authority for heterogeneous sparse graph launches.
+         *
+         * Homogeneous device-resident overlay execution deliberately leaves
+         * this null: its device controller remains the sole authority and no
+         * host ticket is introduced into the captured generation loop.
+         */
+        std::shared_ptr<MoEOverlayInferenceTransactionCoordinator>
+            moe_overlay_inference_transaction_coordinator_;
+        /** Stable LocalTP participant index authenticated by the coordinator. */
+        int moe_overlay_inference_transaction_participant_index_ = -1;
         uint64_t live_replay_state_epoch_ = 1;
         uint64_t live_state_mutation_count_ = 0;
         uint64_t live_state_accepted_publications_ = 0;
@@ -8873,6 +9578,11 @@ namespace llaminar2
         std::vector<std::vector<bool>> current_expert_masks_;
         uint64_t current_expert_mask_epoch_ = 0;
         uint64_t moe_runtime_movement_epoch_ = 0;
+
+        /** Exact active transient CPU LLEP transaction, if any. */
+        CPUCurrentBatchLLEPTransactionState *active_cpu_llep_state_ = nullptr;
+        ICPUCurrentBatchLLEPExpertConsumer *active_cpu_llep_expert_consumer_ = nullptr;
+        const IGlobalTPContext *active_cpu_llep_tp_ctx_ = nullptr;
 
         /// Optional expert weight payload provider for metadata-based host retention (owned)
         std::unique_ptr<ExpertWeightPayloadProvider> expert_payload_provider_;
@@ -9175,6 +9885,57 @@ namespace llaminar2
         bool bindMTPVerifierForwardGraphPair(
             const MTPVerifierPreparationGraphKey &key,
             std::string *error = nullptr);
+
+        /**
+         * @brief Validate one retained sidecar plan for hosted branch replay.
+         *
+         * The plan may contain explicit heterogeneous sparse boundaries but
+         * must already be in steady replay state with stable device token and
+         * position inputs. No warmup or capture is performed by validation.
+         */
+        bool validateHostedMTPSidecarReplay(
+            MTPSidecarCaptureRole role,
+            int row_count,
+            const ComputeGraph **out_graph,
+            std::string *error = nullptr) const;
+
+        /**
+         * @brief Enqueue an exact retained sidecar on its production replay stream.
+         *
+         * The scheduler and sidecar streams are connected with setup-owned
+         * events. Every continuation participant enters the shared transaction
+         * group before its sparse stages receive the root-assigned wire id.
+         */
+        bool replayHostedMTPSidecar(
+            MTPSidecarCaptureRole role,
+            int draft_depth,
+            void **out_producer_stream,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Enqueue the exact retained grouped-verifier production plan.
+         *
+         * The preparation capture has already populated stable device rows.
+         * This method stamps the transaction binding, replays the paired
+         * ForwardExecutionEngine cache entry, and returns its exact stream.
+         */
+        bool replayHostedMTPGroupedVerifier(
+            const ForwardGraphSignature &signature,
+            int draft_depth,
+            void **out_producer_stream,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Order a retained semantic replay after the scheduler stream.
+         * @param fragment_stream Exact retained replay stream.
+         */
+        bool beginHostedSemanticFragmentHandoff(void *fragment_stream);
+
+        /**
+         * @brief Return retained semantic replay completion to the scheduler stream.
+         * @param fragment_stream Exact retained replay producer stream.
+         */
+        bool finishHostedSemanticFragmentHandoff(void *fragment_stream);
 
         /**
          * @brief Resolve one typed preparation key to its deterministic slot.

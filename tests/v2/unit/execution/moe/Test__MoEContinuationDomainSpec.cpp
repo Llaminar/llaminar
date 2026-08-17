@@ -38,7 +38,7 @@ namespace llaminar2::test
         {
             RoutedExpertDomain domain;
             domain.name = name;
-            domain.scope = ExecutionDomainScope::LOCAL;
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
             domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
             domain.backend = CollectiveBackendType::RCCL;
             domain.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
@@ -84,7 +84,7 @@ namespace llaminar2::test
     {
         const std::vector<ExecutionDomainDefinition> domains = {
             denseDomain("single_cont", ExecutionDomainScope::SINGLE, {GlobalDeviceAddress::cuda(0)}),
-            denseDomain("local_cont", ExecutionDomainScope::LOCAL, {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}),
+            denseDomain("local_cont", ExecutionDomainScope::RANK_LOCAL, {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}),
             denseDomain("node_cont", ExecutionDomainScope::NODE_LOCAL, {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)}),
             denseDomain("global_cont", ExecutionDomainScope::GLOBAL, {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)}),
         };
@@ -117,7 +117,7 @@ namespace llaminar2::test
     TEST(Test__MoEContinuationDomainSpec, AcceptsExplicitRoutedExpertTensorSharding)
     {
         auto plan = basePlanWithContinuation(
-            denseDomain("local_cont", ExecutionDomainScope::LOCAL,
+            denseDomain("local_cont", ExecutionDomainScope::RANK_LOCAL,
                         {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}));
         plan.domains = {routedTensorParallelDomain("rocm_warm")};
         plan.routed_tiers = {routedTier("warm", "rocm_warm", true)};
@@ -130,7 +130,7 @@ namespace llaminar2::test
     TEST(Test__MoEContinuationDomainSpec, RejectsTensorShardingWithoutCollectiveParticipants)
     {
         auto plan = basePlanWithContinuation(
-            denseDomain("local_cont", ExecutionDomainScope::LOCAL,
+            denseDomain("local_cont", ExecutionDomainScope::RANK_LOCAL,
                         {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}));
         auto invalid_domain = routedTensorParallelDomain("rocm_warm");
         invalid_domain.scope = ExecutionDomainScope::SINGLE;

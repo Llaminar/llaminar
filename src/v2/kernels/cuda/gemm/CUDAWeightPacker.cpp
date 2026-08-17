@@ -85,6 +85,11 @@ namespace llaminar2::cuda
             }
             out.native_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
             out.native_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
+            out.native_source_identity = {
+                .codebook_id = info->codebook_id,
+                .is_superblock = info->is_superblock,
+                .present = true,
+            };
 
             VnniPackContext ctx{};
             ctx.raw_bytes = nullptr;
@@ -102,7 +107,7 @@ namespace llaminar2::cuda
             {
                 for (int b = 0; b < blocks_per_row; ++b)
                 {
-                    quant_accessor->packVnniBlock(ctx, n, b);
+                    quant_accessor->packVnniBlock(ctx, n, n, b);
                 }
             }
 
@@ -169,6 +174,7 @@ namespace llaminar2::cuda
         out.native_emins.clear();
         out.native_codebook_id = 0;
         out.native_blocks_per_row = 0;
+        out.native_source_identity = {};
 
         const int N = static_cast<int>(tensor->rows());
         const int K = static_cast<int>(tensor->cols());
@@ -384,7 +390,7 @@ namespace llaminar2::cuda
             {
                 for (int b = 0; b < blocks_per_row; ++b)
                 {
-                    eq->packVnniBlock(ctx, n, b);
+                    eq->packVnniBlock(ctx, n, n, b);
                 }
             }
         }

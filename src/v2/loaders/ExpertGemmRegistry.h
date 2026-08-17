@@ -1,3 +1,13 @@
+/**
+ * @file ExpertGemmRegistry.h
+ * @brief Thread-safe prepared MoE GEMM identity and lifetime registry.
+ *
+ * Weight preparation publishes device-, domain-, or participant-scoped
+ * engines here. Graph construction may borrow raw pointers for fixed model
+ * lifetime execution, while epoch-indexed ExpertOverlay residency explicitly
+ * acquires shared ownership so old banks survive concurrent migration.
+ */
+
 #pragma once
 
 #include "backends/DeviceId.h"
@@ -74,6 +84,58 @@ namespace llaminar2
         ITensorGemm *getEngineForParticipant(const std::string &domain_name,
                 DeviceId device, int participant_world_rank, int participant_index,
                 int layer, int expert, WeightRole role) const;
+
+        /**
+         * @brief Acquire shared ownership of one device-scoped engine.
+         * @param device Exact execution device.
+         * @param layer Transformer layer index.
+         * @param expert Global expert id.
+         * @param role Gate, up, or down projection.
+         * @return Exact engine lifetime, or null when absent or not owned.
+         */
+        [[nodiscard]] std::shared_ptr<ITensorGemm> getEngineLifetime(
+            DeviceId device,
+            int layer,
+            int expert,
+            WeightRole role) const;
+
+        /**
+         * @brief Acquire shared ownership of one domain-scoped engine.
+         * @param domain_name Logical overlay execution domain.
+         * @param device Exact execution device.
+         * @param layer Transformer layer index.
+         * @param expert Global expert id.
+         * @param role Gate, up, or down projection.
+         * @return Exact engine lifetime, or null when absent or not owned.
+         */
+        [[nodiscard]] std::shared_ptr<ITensorGemm>
+        getEngineLifetimeForDomain(
+            const std::string &domain_name,
+            DeviceId device,
+            int layer,
+            int expert,
+            WeightRole role) const;
+
+        /**
+         * @brief Acquire shared ownership of one participant-scoped engine.
+         * @param domain_name Logical overlay execution domain.
+         * @param device Exact execution device.
+         * @param participant_world_rank Resolved MPI owner rank, or -1.
+         * @param participant_index Stable index inside the logical domain.
+         * @param layer Transformer layer index.
+         * @param expert Global expert id.
+         * @param role Gate, up, or down projection.
+         * @return Exact engine lifetime, or null when absent or not owned.
+         */
+        [[nodiscard]] std::shared_ptr<ITensorGemm>
+        getEngineLifetimeForParticipant(
+            const std::string &domain_name,
+            DeviceId device,
+            int participant_world_rank,
+            int participant_index,
+            int layer,
+            int expert,
+            WeightRole role) const;
 
         /// Check if a full role is registered for every expert in a layer.
         bool hasCompleteRole(DeviceId device, int layer, int num_experts, WeightRole role) const;

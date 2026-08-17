@@ -33,12 +33,22 @@ SUPPORTED_BACKENDS = frozenset(("cpu", "cpu-prefill", "cuda", "rocm"))
 _IGNORED_DIRECTORY_NAMES = frozenset(("fit-cache", "policy_fit_cache"))
 _IDENTITY_NEUTRAL_REFRESH_FLAGS = frozenset((
     "--resume-cpu-partials",
+    "--stop-after-cpu-decode",
+    "--resume-after-cpu-decode",
     "--reuse-rocm-development",
 ))
 _IDENTITY_NEUTRAL_REFRESH_OPTIONS = frozenset((
     "--cpu-batch-limit",
+    "--cpu-decode-burned-sealed-paired-dir",
+    "--cpu-decode-burned-sealed-plan",
+    "--cpu-decode-max-leaves",
+    "--cpu-grouped-burned-sealed-paired-dir",
+    "--cpu-grouped-burned-sealed-plan",
+    "--cpu-grouped-max-leaves",
     "--cpu-minimum-promotion-samples",
     "--cpu-minimum-promotion-warmups",
+    "--cuda-generic-max-leaves",
+    "--rocm-generic-max-leaves",
     "--rocm-development-build-change-audit",
 ))
 _PRODUCTION_REQUIRED_PAYLOADS: dict[str, tuple[str, ...]] = {

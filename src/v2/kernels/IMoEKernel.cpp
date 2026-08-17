@@ -313,6 +313,32 @@ namespace llaminar2
         weightedAdd(output->mutable_data(), input->data(), weight, count);
     }
 
+    bool IMoEKernel::materializePrefillLeastLoadedMirroredDomainCommands(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoELayerRuntime *runtime_layer,
+        DeviceMoERebalancePlanEntry *mirrored_plan_entries,
+        DeviceMoERebalanceCommandBufferHeader *mirrored_command_headers,
+        uint32_t plan_capacity,
+        DeviceMoERebalanceStatus *status,
+        const DeviceMoERebalanceConfig &config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx)
+    {
+        (void)launch;
+        (void)runtime_layer;
+        (void)mirrored_plan_entries;
+        (void)mirrored_command_headers;
+        (void)plan_capacity;
+        (void)status;
+        (void)config;
+        (void)payload_slot_capacity;
+        (void)layer_idx;
+        LOG_ERROR("[IMoEKernel] Mirrored LLEP domain command materialization "
+                  "was requested on a backend that does not implement it");
+        throw std::logic_error(
+            "Mirrored LLEP domain command materialization is not implemented by this MoE kernel");
+    }
+
     bool IMoEKernel::materializePrefillLeastLoadedTransferCommands(
         const MoEKernelLaunchContext &launch,
         const DeviceMoELayerRuntime *runtime_layer,

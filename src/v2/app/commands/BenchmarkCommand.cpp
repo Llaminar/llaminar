@@ -58,9 +58,9 @@ namespace llaminar2
         /*
          * The original launcher can reject an unreadable or empty prompt file
          * before paying model-load and MPI startup costs. Once already under an
-         * explicit MPI launcher, only BenchmarkRunner rank 0 reads the file and
-         * broadcasts the resulting token IDs; this avoids requiring a shared
-         * prompt-file path on every host.
+         * explicit MPI launcher, the benchmark request controller reads the
+         * file after model initialization. Participant ranks stay in the
+         * production worker loop and therefore never require that path.
          */
         if (!MPIBootstrap::detectMPIEnvironment().is_mpi_process)
         {

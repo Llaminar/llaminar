@@ -3422,41 +3422,60 @@ namespace llaminar
             std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::createExpertGemmFromTransferBlob(
                 const std::vector<uint8_t> &blob)
             {
-                if (blob.empty())
+                return createExpertGemmFromTransferBlob(blob.data(), blob.size());
+            }
+
+            std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::createExpertGemmFromTransferBlob(
+                const uint8_t *data,
+                size_t size)
+            {
+                if (!data || size == 0)
                     return nullptr;
 
                 auto packed_weights = llaminar2::packed_weights_serialization::deserialize(
-                    blob.data(), blob.size());
+                    data, size);
                 if (!packed_weights)
                 {
                     LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
                               "Failed to deserialize transferred blob ("
-                              << blob.size() << " bytes)");
+                              << size << " bytes)");
                     return nullptr;
                 }
+
+                return createExpertGemmFromPackedWeights(
+                    std::move(packed_weights));
+            }
+
+            std::shared_ptr<llaminar2::ITensorGemm>
+            KernelFactory::createExpertGemmFromPackedWeights(
+                std::unique_ptr<llaminar2::IPackedWeights> packed_weights)
+            {
+                if (!packed_weights)
+                    return nullptr;
 
                 auto *cpu_pw = dynamic_cast<llaminar2::cpu::native_vnni::CPUPackedWeights *>(
                     packed_weights.get());
                 if (!cpu_pw)
                 {
-                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
-                              "Deserialized weights are not CPUPackedWeights");
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromPackedWeights] "
+                              "Weights are not CPU NativeVNNI packed weights");
                     return nullptr;
                 }
 
-                if (dynamic_cast<llaminar2::cpu::native_vnni::CPUPackedWeightsWithNativeBlocks *>(
-                        packed_weights.get()))
-                {
-                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
-                              "Deferred/native-block CPU VNNI blobs are no longer accepted; expected eager interleaved packed weights");
-                    return nullptr;
-                }
-
+                /*
+                 * A portable ExpertOverlay archive record deliberately carries
+                 * both eager CPU NativeVNNI data and the original quantized
+                 * blocks used by CUDA/ROCm repack.  The CPU destination consumes
+                 * the eager representation below and discards the additional
+                 * native-block section with the transfer wrapper.  Presence of
+                 * native blocks is therefore not a deferred-packing request;
+                 * hasInterleavedData() remains the authoritative CPU gate.
+                 */
                 auto kernel = std::make_shared<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
                     cpu_pw->takePacked());
                 if (!kernel->isValid())
                 {
-                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromPackedWeights] "
                               "Transferred CPU VNNI blob did not contain eager interleaved weights");
                     return nullptr;
                 }
@@ -3654,6 +3673,17 @@ namespace llaminar
                         gemm_gate_->clearGPUStreamBinding();
                     if (gemm_up_)
                         gemm_up_->clearGPUStreamBinding();
+                }
+
+                bool prepareFusedProjectionGraphCapture(
+                    size_t projection_count) override
+                {
+                    if (projection_count != 2 || !gemm_gate_ || !gemm_up_)
+                        return false;
+                    return gemm_gate_->prepareFusedProjectionGraphCapture(
+                               projection_count) &&
+                           gemm_up_->prepareFusedProjectionGraphCapture(
+                               projection_count);
                 }
 
                 bool execute(
@@ -3870,15 +3900,29 @@ namespace llaminar
                 case ::llaminar2::ActivationPrecision::FP32:
                     prec_str = "fp32";
                     break;
+                case ::llaminar2::ActivationPrecision::BF16:
+                    prec_str = "bf16";
+                    break;
                 case ::llaminar2::ActivationPrecision::FP16:
                     prec_str = "fp16";
                     break;
                 case ::llaminar2::ActivationPrecision::Q8_1:
                     prec_str = "q8_1";
                     break;
-                default:
-                    prec_str = "fp16";
+                case ::llaminar2::ActivationPrecision::Q16_1:
+                    prec_str = "q16_1";
                     break;
+                case ::llaminar2::ActivationPrecision::TQ4:
+                    prec_str = "tq4";
+                    break;
+                case ::llaminar2::ActivationPrecision::TQ8:
+                    prec_str = "tq";
+                    break;
+                case ::llaminar2::ActivationPrecision::Hybrid:
+                case ::llaminar2::ActivationPrecision::HybridQ16:
+                case ::llaminar2::ActivationPrecision::AQ8:
+                    throw std::invalid_argument(
+                        "KVCacheConfig::estimateBytes received a non-storage activation precision");
                 }
 
                 return ::llaminar2::KVCacheMemoryEstimator::estimate(
@@ -3906,7 +3950,8 @@ namespace llaminar
                 {
 #ifdef HAVE_CUDA
                     // TQ precision uses a separate non-template class
-                    if (config.precision == llaminar2::ActivationPrecision::TQ4 ||
+                    if (config.precision == llaminar2::ActivationPrecision::Q8_1 ||
+                        config.precision == llaminar2::ActivationPrecision::TQ4 ||
                         config.precision == llaminar2::ActivationPrecision::TQ8)
                     {
                         const int cuda_device = config.device.cuda_ordinal();
@@ -3935,7 +3980,8 @@ namespace llaminar
                 {
 #ifdef HAVE_ROCM
                     // TQ precision uses a separate non-template class
-                    if (config.precision == llaminar2::ActivationPrecision::TQ4 ||
+                    if (config.precision == llaminar2::ActivationPrecision::Q8_1 ||
+                        config.precision == llaminar2::ActivationPrecision::TQ4 ||
                         config.precision == llaminar2::ActivationPrecision::TQ8)
                     {
                         const int rocm_device = config.device.rocm_ordinal();

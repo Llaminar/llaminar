@@ -7,6 +7,7 @@
  */
 
 #include "CPUMoEKernel.h"
+#include "../../../execution/moe/MoEOverlayDeviceEpochProtocol.h"
 #include "../../cpu/primitives/SoftmaxPrimitives_New.h"
 #include "../../cpu/primitives/SwiGLUPrimitives.h"
 #include "../../cpu/primitives/VectorPrimitives.h"
@@ -18,10 +19,429 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <numeric>
+#include <stdexcept>
 
 namespace llaminar2
 {
+    namespace
+    {
+        /** @brief Publish one complete CPU epoch-operation diagnostic. */
+        void writeOverlayEpochStatus(
+            DeviceMoEOverlayEpochStatus *status,
+            DeviceMoEOverlayEpochOperation operation,
+            DeviceMoEOverlayEpochStatusCode code,
+            std::uint64_t epoch = 0u,
+            std::uint64_t selector = 0u,
+            std::uint32_t bank = kDeviceMoEOverlayInvalidBank,
+            DeviceMoEOverlayEpochBankState state =
+                DeviceMoEOverlayEpochBankState::Empty) noexcept
+        {
+            if (!status)
+                return;
+            *status = {
+                .epoch = epoch,
+                .selector = selector,
+                .operation = static_cast<std::uint32_t>(operation),
+                .code = static_cast<std::uint32_t>(code),
+                .bank = bank,
+                .observed_state = static_cast<std::uint32_t>(state),
+            };
+        }
+
+        /** @return Current CPU selector reconstructed from atomic protocol reads. */
+        std::uint64_t currentOverlaySelector(
+            const MoEOverlayDeviceEpochProtocol &protocol) noexcept
+        {
+            const std::uint64_t generation =
+                protocol.publicationGeneration();
+            const std::uint32_t bank = protocol.publishedBank();
+            if (generation == 0u || bank >= kDeviceMoEOverlayEpochBankCount)
+                return 0u;
+            return deviceMoEOverlayEpochSelector(generation, bank);
+        }
+
+        /** @return Bank retaining @p epoch in the authoritative CPU control block. */
+        std::uint32_t overlayBankForEpoch(
+            const MoEOverlayDeviceEpochProtocol &protocol,
+            std::uint64_t epoch) noexcept
+        {
+            for (std::uint32_t bank = 0u;
+                 bank < kDeviceMoEOverlayEpochBankCount;
+                 ++bank)
+            {
+                if (protocol.bankEpoch(bank) == epoch)
+                    return bank;
+            }
+            return kDeviceMoEOverlayInvalidBank;
+        }
+    } // namespace
+
+    bool CPUMoEKernel::acquireMoEOverlayEpoch(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        DeviceMoEOverlayEpochTicket *ticket,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        (void)launch;
+        if (!status)
+            return false;
+        if (!control)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::Acquire,
+                DeviceMoEOverlayEpochStatusCode::InvalidControl);
+            return true;
+        }
+        if (!ticket || ticket->epoch != 0u || ticket->selector != 0u)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::Acquire,
+                DeviceMoEOverlayEpochStatusCode::InvalidTicket);
+            return true;
+        }
+
+        MoEOverlayDeviceEpochProtocol protocol(*control);
+        const auto acquired = protocol.tryAcquirePublished();
+        if (!acquired.has_value())
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::Acquire,
+                DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                0u,
+                currentOverlaySelector(protocol));
+            return true;
+        }
+
+        *ticket = *acquired;
+        writeOverlayEpochStatus(
+            status,
+            DeviceMoEOverlayEpochOperation::Acquire,
+            DeviceMoEOverlayEpochStatusCode::Success,
+            ticket->epoch,
+            ticket->selector,
+            ticket->bank(),
+            protocol.bankState(ticket->bank()));
+        return true;
+    }
+
+    bool CPUMoEKernel::releaseMoEOverlayEpoch(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        DeviceMoEOverlayEpochTicket *ticket,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        (void)launch;
+        if (!status)
+            return false;
+        if (!control)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::Release,
+                DeviceMoEOverlayEpochStatusCode::InvalidControl);
+            return true;
+        }
+        if (!ticket || !ticket->valid())
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::Release,
+                DeviceMoEOverlayEpochStatusCode::InvalidTicket);
+            return true;
+        }
+
+        MoEOverlayDeviceEpochProtocol protocol(*control);
+        const DeviceMoEOverlayEpochTicket released = *ticket;
+        const bool released_reader = protocol.release(released);
+        if (released_reader)
+            *ticket = {};
+        writeOverlayEpochStatus(
+            status,
+            DeviceMoEOverlayEpochOperation::Release,
+            released_reader
+                ? DeviceMoEOverlayEpochStatusCode::Success
+                : DeviceMoEOverlayEpochStatusCode::ReaderUnderflow,
+            released.epoch,
+            released.selector,
+            released.bank(),
+            protocol.bankState(released.bank()));
+        return true;
+    }
+
+    bool CPUMoEKernel::reserveMoEOverlayEpochCandidate(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        const std::uint64_t *candidate_epoch,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        (void)launch;
+        if (!status)
+            return false;
+        if (!control)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::ReserveCandidate,
+                DeviceMoEOverlayEpochStatusCode::InvalidControl);
+            return true;
+        }
+        if (!candidate_epoch || *candidate_epoch == 0u)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::ReserveCandidate,
+                DeviceMoEOverlayEpochStatusCode::InvalidArgument);
+            return true;
+        }
+
+        MoEOverlayDeviceEpochProtocol protocol(*control);
+        try
+        {
+            const std::uint32_t reusable_bank =
+                1u - protocol.publishedBank();
+            if (protocol.bankState(reusable_bank) ==
+                DeviceMoEOverlayEpochBankState::Retiring)
+            {
+                /* Match the GPU captured reserve contract: a later maintenance
+                 * poll reclaims the predecessor itself after all readers and
+                 * delayed admissions drain. */
+                (void)protocol.tryRetire(
+                    protocol.bankEpoch(reusable_bank));
+            }
+            const auto bank = protocol.reserveCandidate(*candidate_epoch);
+            const auto code = bank.has_value()
+                                  ? DeviceMoEOverlayEpochStatusCode::Success
+                                  : DeviceMoEOverlayEpochStatusCode::Busy;
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::ReserveCandidate,
+                code,
+                *candidate_epoch,
+                currentOverlaySelector(protocol),
+                bank.value_or(kDeviceMoEOverlayInvalidBank),
+                bank.has_value()
+                    ? protocol.bankState(*bank)
+                    : DeviceMoEOverlayEpochBankState::Empty);
+        }
+        catch (const std::invalid_argument &)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::ReserveCandidate,
+                DeviceMoEOverlayEpochStatusCode::InvalidArgument,
+                *candidate_epoch,
+                currentOverlaySelector(protocol));
+        }
+        catch (const std::logic_error &)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::ReserveCandidate,
+                DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                *candidate_epoch,
+                currentOverlaySelector(protocol));
+        }
+        return true;
+    }
+
+    bool CPUMoEKernel::markMoEOverlayEpochCandidateReady(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        const std::uint64_t *candidate_epoch,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        (void)launch;
+        if (!status)
+            return false;
+        if (!control || !candidate_epoch || *candidate_epoch == 0u)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::MarkCandidateReady,
+                control
+                    ? DeviceMoEOverlayEpochStatusCode::InvalidArgument
+                    : DeviceMoEOverlayEpochStatusCode::InvalidControl);
+            return true;
+        }
+
+        MoEOverlayDeviceEpochProtocol protocol(*control);
+        const std::uint32_t bank =
+            overlayBankForEpoch(protocol, *candidate_epoch);
+        try
+        {
+            protocol.markCandidateReady(*candidate_epoch);
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::MarkCandidateReady,
+                DeviceMoEOverlayEpochStatusCode::Success,
+                *candidate_epoch,
+                currentOverlaySelector(protocol),
+                bank,
+                protocol.bankState(bank));
+        }
+        catch (const std::logic_error &)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::MarkCandidateReady,
+                DeviceMoEOverlayEpochStatusCode::NotReady,
+                *candidate_epoch,
+                currentOverlaySelector(protocol),
+                bank,
+                protocol.bankState(bank));
+        }
+        return true;
+    }
+
+    bool CPUMoEKernel::publishMoEOverlayEpochCandidate(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        const std::uint64_t *candidate_epoch,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        (void)launch;
+        if (!status)
+            return false;
+        if (!control || !candidate_epoch || *candidate_epoch == 0u)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::PublishCandidate,
+                control
+                    ? DeviceMoEOverlayEpochStatusCode::InvalidArgument
+                    : DeviceMoEOverlayEpochStatusCode::InvalidControl);
+            return true;
+        }
+
+        MoEOverlayDeviceEpochProtocol protocol(*control);
+        const std::uint32_t bank =
+            overlayBankForEpoch(protocol, *candidate_epoch);
+        try
+        {
+            const auto publication =
+                protocol.publishReadyCandidate(*candidate_epoch);
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::PublishCandidate,
+                DeviceMoEOverlayEpochStatusCode::Success,
+                publication.published_epoch,
+                deviceMoEOverlayEpochSelector(
+                    publication.generation,
+                    publication.published_bank),
+                publication.published_bank,
+                protocol.bankState(publication.published_bank));
+        }
+        catch (const std::logic_error &)
+        {
+            const bool generation_exhausted =
+                protocol.publicationGeneration() ==
+                (std::numeric_limits<std::uint64_t>::max() >> 1u);
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::PublishCandidate,
+                generation_exhausted
+                    ? DeviceMoEOverlayEpochStatusCode::GenerationOverflow
+                    : DeviceMoEOverlayEpochStatusCode::NotReady,
+                *candidate_epoch,
+                currentOverlaySelector(protocol),
+                bank,
+                protocol.bankState(bank));
+        }
+        return true;
+    }
+
+    bool CPUMoEKernel::abortMoEOverlayEpochCandidate(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        const std::uint64_t *candidate_epoch,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        (void)launch;
+        if (!status)
+            return false;
+        if (!control || !candidate_epoch || *candidate_epoch == 0u)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::AbortCandidate,
+                control
+                    ? DeviceMoEOverlayEpochStatusCode::InvalidArgument
+                    : DeviceMoEOverlayEpochStatusCode::InvalidControl);
+            return true;
+        }
+
+        MoEOverlayDeviceEpochProtocol protocol(*control);
+        const std::uint32_t bank =
+            overlayBankForEpoch(protocol, *candidate_epoch);
+        const bool aborted = protocol.abortCandidate(*candidate_epoch);
+        writeOverlayEpochStatus(
+            status,
+            DeviceMoEOverlayEpochOperation::AbortCandidate,
+            aborted
+                ? DeviceMoEOverlayEpochStatusCode::Success
+                : DeviceMoEOverlayEpochStatusCode::NotReady,
+            *candidate_epoch,
+            currentOverlaySelector(protocol),
+            bank,
+            protocol.bankState(bank));
+        return true;
+    }
+
+    bool CPUMoEKernel::retireMoEOverlayEpoch(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayEpochControl *control,
+        const std::uint64_t *retiring_epoch,
+        DeviceMoEOverlayEpochStatus *status)
+    {
+        (void)launch;
+        if (!status)
+            return false;
+        if (!control || !retiring_epoch || *retiring_epoch == 0u)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::Retire,
+                control
+                    ? DeviceMoEOverlayEpochStatusCode::InvalidArgument
+                    : DeviceMoEOverlayEpochStatusCode::InvalidControl);
+            return true;
+        }
+
+        MoEOverlayDeviceEpochProtocol protocol(*control);
+        const std::uint32_t bank =
+            overlayBankForEpoch(protocol, *retiring_epoch);
+        try
+        {
+            const bool retired = protocol.tryRetire(*retiring_epoch);
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::Retire,
+                retired
+                    ? DeviceMoEOverlayEpochStatusCode::Success
+                    : DeviceMoEOverlayEpochStatusCode::Busy,
+                *retiring_epoch,
+                currentOverlaySelector(protocol),
+                bank,
+                protocol.bankState(bank));
+        }
+        catch (const std::logic_error &)
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::Retire,
+                DeviceMoEOverlayEpochStatusCode::NotReady,
+                *retiring_epoch,
+                currentOverlaySelector(protocol),
+                bank,
+                protocol.bankState(bank));
+        }
+        return true;
+    }
 
     void CPUMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
     {
@@ -119,6 +539,14 @@ namespace llaminar2
         return router_q8_hidden_.data();
     }
 
+    bool CPUMoEKernel::publishTransportedRouterQ8Hidden(
+        const float *source,
+        int rows,
+        int d_model)
+    {
+        return publishRouterQ8Hidden(source, rows, d_model);
+    }
+
     bool CPUMoEKernel::route(
         const float *hidden,
         const float *gate_weights,
@@ -151,98 +579,93 @@ namespace llaminar2
         result.expert_weights.resize(static_cast<size_t>(seq_len) * top_k);
         result.router_logits.resize(static_cast<size_t>(seq_len) * num_experts);
 
-        auto do_routing = [&]()
+        /*
+         * One schedule serves both serial decode and grouped verification.
+         * Parallelizing only the outer row loop leaves almost the whole socket
+         * idle at the production MTP depths: M=3 engages three workers while
+         * each worker streams a complete 2 MiB Qwen3.6-35B gate matrix. Flatten
+         * the independent (row, expert) dot products across the whole team so
+         * every positive M retains the M=1 router's expert parallelism.
+         *
+         * The first workshare writes each independent scalar logit with the
+         * exact ISA-dispatched dot product used by M=1. Its implicit barrier
+         * publishes the complete matrix before the second workshare assigns
+         * whole rows to workers. Softmax, partial_sort, top-k summation, and
+         * normalization then retain their serial per-row operation order. The
+         * schedule changes ownership only; it cannot change any row's bytes.
+         */
+        auto route_rows = [&]()
         {
-            // Thread-local scratch (allocated per-thread inside parallel region)
-            std::vector<float> logits(num_experts);
-            std::vector<int> indices(num_experts);
+#pragma omp for collapse(2) schedule(static)
+            for (int row = 0; row < seq_len; ++row)
+            {
+                for (int expert = 0; expert < num_experts; ++expert)
+                {
+                    result.router_logits[
+                        static_cast<size_t>(row) * num_experts + expert] =
+                        primitives::vec_dot(
+                            gate_weights +
+                                static_cast<size_t>(expert) * d_model,
+                            hidden + static_cast<size_t>(row) * d_model,
+                            d_model);
+                }
+            }
 
 #pragma omp for schedule(static)
-            for (int t = 0; t < seq_len; ++t)
+            for (int row = 0; row < seq_len; ++row)
             {
-                const float *h = hidden + t * d_model;
+                float *probabilities =
+                    result.router_logits.data() +
+                    static_cast<size_t>(row) * num_experts;
+                primitives::softmax_row_fp32(probabilities, num_experts);
 
-                // Compute router logits via ISA-dispatched dot products
-                for (int e = 0; e < num_experts; ++e)
-                    logits[e] = primitives::vec_dot(gate_weights + e * d_model, h, d_model);
-
-                // Vectorized softmax with fast_exp (SIMD-dispatched)
-                primitives::softmax_row_fp32(logits.data(), num_experts);
-
-                // Stash post-softmax probabilities
-                std::copy(logits.begin(), logits.end(),
-                          result.router_logits.begin() + static_cast<size_t>(t) * num_experts);
-
-                // Top-k selection (reuse pre-allocated indices)
+                /*
+                 * The vector is private to one OpenMP worker and retains its
+                 * capacity across calls. Consequently, warmed decode and MTP
+                 * routing perform no per-transaction heap allocation.
+                 */
+                thread_local std::vector<int> indices;
+                indices.resize(static_cast<size_t>(num_experts));
                 std::iota(indices.begin(), indices.end(), 0);
-                std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
-                                  [&logits](int a, int b)
-                                  { return logits[a] > logits[b]; });
+                std::partial_sort(
+                    indices.begin(),
+                    indices.begin() + top_k,
+                    indices.end(),
+                    [probabilities](int left, int right)
+                    {
+                        return probabilities[left] > probabilities[right];
+                    });
 
-                // Normalize top-k weights
                 float topk_sum = 0.0f;
                 for (int k = 0; k < top_k; ++k)
-                    topk_sum += logits[indices[k]];
+                    topk_sum += probabilities[indices[k]];
 
                 for (int k = 0; k < top_k; ++k)
                 {
-                    result.expert_indices[t * top_k + k] = indices[k];
-                    result.expert_weights[t * top_k + k] = normalize_weights
-                                                                ? logits[indices[k]] / topk_sum
-                                                                : logits[indices[k]];
+                    const size_t route_index =
+                        static_cast<size_t>(row) * top_k + k;
+                    result.expert_indices[route_index] = indices[k];
+                    result.expert_weights[route_index] =
+                        normalize_weights
+                            ? probabilities[indices[k]] / topk_sum
+                            : probabilities[indices[k]];
                 }
             }
         };
+        OMP_WORKSHARE_REGION(route_rows);
 
-        // For single token (decode), parallelize the 256 dot products across
-        // threads.  The gate-weight matrix is 256×d_model ≈ 2 MB — streaming it
-        // through a single core is L3-bandwidth-bound (~15 GB/s → ~130 µs).
-        // With 28 threads the aggregate L3 BW exceeds 400 GB/s, bringing the
-        // dot-product phase down to ~5–10 µs.  The serial softmax + top-k that
-        // follows costs only ~5 µs and is not worth parallelizing.
-        //
-        // For multi-token (prefill), parallelize across tokens as before.
-        if (seq_len <= 1)
+        if (seq_len > 1)
         {
-            float *logits_ptr = result.router_logits.data();
-            const float *h = hidden;
-
-            // Phase 1: parallel dot products over experts
-            auto do_dot_products = [&]()
-            {
-#pragma omp for schedule(static)
-                for (int e = 0; e < num_experts; ++e)
-                    logits_ptr[e] = primitives::vec_dot(
-                        gate_weights + e * d_model, h, d_model);
-            };
-            OMP_WORKSHARE_REGION(do_dot_products);
-
-            // Phase 2: vectorized softmax (uses fast_exp via SIMD primitives)
-            primitives::softmax_row_fp32(logits_ptr, num_experts);
-
-            // Phase 3: top-k selection (thread_local avoids per-call alloc)
-            thread_local std::vector<int> indices;
-            indices.resize(num_experts);
-            std::iota(indices.begin(), indices.end(), 0);
-            std::partial_sort(indices.begin(), indices.begin() + top_k, indices.end(),
-                              [logits_ptr](int a, int b)
-                              { return logits_ptr[a] > logits_ptr[b]; });
-
-            float topk_sum = 0.0f;
-            for (int k = 0; k < top_k; ++k)
-                topk_sum += logits_ptr[indices[k]];
-
-            for (int k = 0; k < top_k; ++k)
-            {
-                result.expert_indices[k] = indices[k];
-                result.expert_weights[k] = normalize_weights
-                                                ? logits_ptr[indices[k]] / topk_sum
-                                                : logits_ptr[indices[k]];
-            }
-        }
-        else
-        {
-            OMP_WORKSHARE_REGION(do_routing);
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_moe_grouped_router_calls",
+                1.0,
+                "verifier",
+                "cpu",
+                {{"rows", std::to_string(seq_len)},
+                 {"num_experts", std::to_string(num_experts)},
+                 {"schedule", "row_expert_then_row_finalize"},
+                 {"arithmetic_order", "serial_decode_per_row"}});
         }
 
         return true;

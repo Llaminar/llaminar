@@ -32,7 +32,7 @@ namespace llaminar2
     {
         AUTO,
         SINGLE,
-        LOCAL,
+        RANK_LOCAL,
         NODE_LOCAL,
         GLOBAL,
     };
@@ -78,6 +78,15 @@ namespace llaminar2
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
         ExecutionDomainScope scope = ExecutionDomainScope::AUTO;
         std::optional<int> owner_rank;
+        /**
+         * Participant-indexed MPI ownership map.
+         *
+         * When present, this vector has one entry per physical participant.
+         * Repeated ranks are intentional: one MPI process may own several
+         * devices in a node-local domain. Communicator builders must derive
+         * their distinct rank membership from this map rather than treating
+         * it as an already-deduplicated MPI group.
+         */
         std::vector<int> ranks;
         RoutedExpertComputePolicy routed_compute_policy =
             RoutedExpertComputePolicy::Unspecified;

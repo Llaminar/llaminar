@@ -1,4 +1,17 @@
+/**
+ * @file Qwen36DenseParityTestBase.h
+ * @brief Real-weight Qwen3.6 dense parity, prefix-cache, and MTP test support.
+ *
+ * The helpers in this file keep the live production runner as the system under
+ * test while authenticating every reusable CPU/FP32 Hugging Face reference
+ * pack against the exact GGUF, prompt, and tokenization.  Checkpoint campaigns
+ * retain captured graph, device-state, depth-policy, and CSV evidence instead
+ * of reducing correctness to final-token agreement.
+ */
+
 #pragma once
+
+#include "../ParityTestBase.h"
 
 #include <cnpy.h>
 #include <gtest/gtest.h>
@@ -17,12 +30,15 @@
 #include "kernels/KernelFactory.h"
 #include "loaders/ModelContext.h"
 #include "utils/DebugEnv.h"
+#include "utils/MTPParitySnapshotContext.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/Sampler.h"
+#include "utils/Sha256.h"
 #include "utils/Tokenizer.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -34,9 +50,11 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -50,7 +68,7 @@ namespace llaminar2::test::parity::qwen36
         SingleDevice,
         LocalTP,
         LocalPP,
-        NodeLocalTP,
+        NodeTP,
     };
 
     enum class PrefixRestoreParityMode
@@ -403,7 +421,7 @@ namespace llaminar2::test::parity::qwen36
      *
      * Token equality proves the visible response, but not the performance path.
      * This guard makes the parity matrix fail if a GPU LocalTP, single-device,
-     * CPU, or NodeLocalTP request silently drifts away from the grouped
+     * CPU, or NodeTP request silently drifts away from the grouped
      * decode-equivalent verifier rows after those rows have already been proven
      * correct.
      *
@@ -714,6 +732,23 @@ namespace llaminar2::test::parity::qwen36
     }
 
     /**
+     * @brief Resolve the first configured model path through campaign tmpfs.
+     * @param names Ordered environment-variable overrides for the model.
+     * @param fallback Test-owned default GGUF path.
+     * @return The staged path in an aggregate campaign, otherwise the selected
+     *         source path.
+     * @throws std::runtime_error when aggregate staging did not declare or
+     *         publish the model selected by the concrete test.
+     */
+    inline std::string firstModelEnvOrDefault(
+        const std::vector<std::string> &names,
+        const std::string &fallback)
+    {
+        return productionParityResolvedModelPath(
+            firstEnvOrDefault(names, fallback));
+    }
+
+    /**
      * @brief Return true when a parity case will stage weights for a GPU backend.
      *
      * The distinction matters before any runner is built: GPU model loads should
@@ -743,7 +778,10 @@ namespace llaminar2::test::parity::qwen36
         model_config.strategy = strategy;
         model_config.weight_precision = weight_precision;
         model_config.use_mmap = true;
-        model_config.target_is_gpu = isQwen36GpuParityDevice(device);
+        model_config.payload_access_pattern =
+            isQwen36GpuParityDevice(device)
+                ? ModelPayloadAccessPattern::DeviceStaging
+                : ModelPayloadAccessPattern::DenseCpuResident;
         return ModelContext::create(model_path, model_config);
     }
 
@@ -1594,6 +1632,817 @@ namespace llaminar2::test::parity::qwen36
                << ", rel_l2<=" << rel_l2_threshold << ")";
     }
 
+    /**
+     * @brief Semantic kind of one production checkpoint artifact row.
+     */
+    enum class Qwen36CheckpointKind
+    {
+        Numeric,
+        RoutingIndices,
+        RoutingWeights,
+    };
+
+    /**
+     * @brief Collect rigorous checkpoint comparisons and emit standard parity CSVs.
+     *
+     * Prefix/MTP tests use production generation APIs rather than the classic
+     * fixture's raw forward loop.  This recorder keeps that execution path but
+     * feeds its checkpoints through the same metric and CSV authorities as the
+     * established PyTorch parity suite.  A cell cannot finalize without both
+     * prefill and decode stage evidence.
+     */
+    class Qwen36CheckpointArtifactRecorder final
+    {
+    public:
+        Qwen36CheckpointArtifactRecorder(
+            std::string backend,
+            float prefill_cosine_threshold,
+            float decode_cosine_threshold,
+            float logit_kl_threshold,
+            int routing_top_k = 8,
+            int num_experts = 256)
+            : backend_(std::move(backend)),
+              prefill_cosine_threshold_(prefill_cosine_threshold),
+              decode_cosine_threshold_(decode_cosine_threshold),
+              logit_kl_threshold_(logit_kl_threshold),
+              routing_top_k_(routing_top_k),
+              num_experts_(num_experts)
+        {
+            if (routing_top_k_ <= 0 || num_experts_ < routing_top_k_)
+                throw std::invalid_argument("invalid Qwen3.6 routing geometry");
+        }
+
+        /** @brief Record one prefill checkpoint against its PyTorch tensor. */
+        void recordPrefill(
+            int layer,
+            const std::string &stage,
+            const std::vector<float> &actual,
+            const std::vector<float> &expected,
+            Qwen36CheckpointKind kind = Qwen36CheckpointKind::Numeric)
+        {
+            auto comparison = compare(
+                stage,
+                actual,
+                expected,
+                kind,
+                routingContext("prefill", -1, layer, stage),
+                prefill_cosine_threshold_);
+            if (!comparison)
+                return;
+
+            if (stage == "EMBEDDING")
+            {
+                prefill_.embedding_cosine = comparison->cosine_similarity;
+                prefill_.embedding_passed = comparison->passed;
+                saw_prefill_embedding_ = true;
+                return;
+            }
+            if (stage == "LM_HEAD")
+            {
+                populatePrefillLogits(*comparison, actual, expected);
+                saw_prefill_logits_ = true;
+                return;
+            }
+            addStage(
+                prefill_.layer_stats,
+                layer,
+                std::move(*comparison),
+                prefill_cosine_threshold_);
+            ++prefill_checkpoint_count_;
+        }
+
+        /** @brief Record the expected and emitted token for a decode row. */
+        void recordDecodeToken(int step, int actual_token, int expected_token)
+        {
+            DecodeStepStats &stats = decodeStep(step);
+            stats.llaminar_token = actual_token;
+            stats.pytorch_token = expected_token;
+            stats.token_match = actual_token == expected_token;
+        }
+
+        /** @brief Record one decode or MTP-sidecar checkpoint. */
+        void recordDecode(
+            int step,
+            int layer,
+            const std::string &stage,
+            const std::vector<float> &actual,
+            const std::vector<float> &expected,
+            Qwen36CheckpointKind kind = Qwen36CheckpointKind::Numeric)
+        {
+            auto comparison = compare(
+                stage,
+                actual,
+                expected,
+                kind,
+                routingContext("decode", step, layer, stage),
+                decode_cosine_threshold_);
+            if (!comparison)
+                return;
+
+            DecodeStepStats &stats = decodeStep(step);
+            if (stage == "LM_HEAD")
+            {
+                populateDecodeLogits(stats, *comparison, actual, expected);
+                ++decode_checkpoint_count_;
+                return;
+            }
+            if (stage.ends_with("_LM_HEAD"))
+                populateDecodeLogits(stats, *comparison, actual, expected);
+            addStage(
+                stats.layer_stats,
+                layer,
+                std::move(*comparison),
+                decode_cosine_threshold_);
+            ++decode_checkpoint_count_;
+            observed_decode_stages_.insert(stage);
+        }
+
+        /**
+         * @brief Require at least one recorded decode stage with this suffix.
+         */
+        void requireDecodeStageSuffix(std::string suffix)
+        {
+            required_decode_stage_suffixes_.insert(std::move(suffix));
+        }
+
+        /**
+         * @brief Assert the numerical contract and write all standard CSVs.
+         */
+        void finalize()
+        {
+            finalizePrefillSummary();
+            finalizeDecodeSummary();
+
+            EXPECT_TRUE(saw_prefill_embedding_)
+                << "Production checkpoint parity recorded no prefill EMBEDDING";
+            EXPECT_TRUE(saw_prefill_logits_)
+                << "Production checkpoint parity recorded no prefill LM_HEAD";
+            EXPECT_GT(prefill_checkpoint_count_, 0u)
+                << "Production checkpoint parity recorded no prefill layer stages";
+            EXPECT_GT(decode_checkpoint_count_, 0u)
+                << "Production checkpoint parity recorded no decode stages";
+
+            for (const std::string &suffix : required_decode_stage_suffixes_)
+            {
+                const bool observed = std::any_of(
+                    observed_decode_stages_.begin(),
+                    observed_decode_stages_.end(),
+                    [&suffix](const std::string &stage)
+                    {
+                        return stage.size() >= suffix.size() &&
+                               stage.compare(
+                                   stage.size() - suffix.size(),
+                                   suffix.size(),
+                                   suffix) == 0;
+                    });
+                EXPECT_TRUE(observed)
+                    << "Production checkpoint parity missing required stage suffix "
+                    << suffix;
+            }
+
+            EXPECT_GE(prefill_.early_layers_passed, min_early_layers_passed_)
+                << "At least " << min_early_layers_passed_ << " of embedding plus the first "
+                << early_layers_count_ << " layers must pass prefill parity";
+            EXPECT_TRUE(prefill_.lm_head_passed)
+                << "Prefill LM_HEAD failed KL/top-k parity";
+            EXPECT_TRUE(decode_.overall_passed)
+                << "Decode checkpoint/logit campaign failed established parity gates";
+
+            const auto results_dir = ParityCSVArtifactWriter::resultsDir();
+            EXPECT_TRUE(ParityCSVArtifactWriter::writePrefill(
+                results_dir, backend_, prefill_))
+                << "Failed to write standard prefill CSV artifacts";
+            EXPECT_TRUE(ParityCSVArtifactWriter::writeDecode(
+                results_dir, backend_, decode_))
+                << "Failed to write standard decode CSV artifacts";
+        }
+
+    private:
+        std::optional<StageComparisonResult> compare(
+            const std::string &stage,
+            const std::vector<float> &actual,
+            const std::vector<float> &reference,
+            Qwen36CheckpointKind kind,
+            const std::string &routing_context,
+            float cosine_threshold)
+        {
+            if (actual.empty() || reference.empty())
+            {
+                ADD_FAILURE() << stage << " has an empty production/reference payload";
+                return std::nullopt;
+            }
+
+            const float *expected = reference.data();
+            size_t expected_size = reference.size();
+            if (reference.size() > actual.size() &&
+                reference.size() % actual.size() == 0)
+            {
+                expected = reference.data() + (reference.size() - actual.size());
+                expected_size = actual.size();
+            }
+            if (actual.size() != expected_size)
+            {
+                ADD_FAILURE()
+                    << stage << " checkpoint size mismatch: production="
+                    << actual.size() << " reference=" << reference.size();
+                return std::nullopt;
+            }
+
+            if (kind == Qwen36CheckpointKind::RoutingIndices)
+            {
+                std::vector<float> aligned_expected(
+                    expected,
+                    expected + expected_size);
+                routing_indices_[routing_context] = {
+                    actual,
+                    aligned_expected};
+                return compareRoutingIndices(
+                    stage,
+                    actual,
+                    aligned_expected,
+                    cosine_threshold);
+            }
+            if (kind == Qwen36CheckpointKind::RoutingWeights)
+            {
+                const auto indices = routing_indices_.find(routing_context);
+                if (indices == routing_indices_.end())
+                {
+                    ADD_FAILURE()
+                        << stage << " has no paired routing-index checkpoint in "
+                        << routing_context;
+                    return std::nullopt;
+                }
+                return compareRoutingWeights(
+                    stage,
+                    actual,
+                    std::vector<float>(expected, expected + expected_size),
+                    indices->second.first,
+                    indices->second.second,
+                    cosine_threshold);
+            }
+
+            StageComparisonResult result = compareParityTensorData(
+                actual.data(),
+                expected,
+                actual.size(),
+                stage,
+                cosine_threshold);
+            return result;
+        }
+
+        static std::string routingContext(
+            std::string_view phase,
+            int step,
+            int layer,
+            const std::string &stage)
+        {
+            const size_t suffix = stage.find("MOE_ROUTING_");
+            const std::string family =
+                suffix == std::string::npos ? stage : stage.substr(0, suffix);
+            return std::string(phase) + '/' + std::to_string(step) + '/' +
+                   std::to_string(layer) + '/' + family;
+        }
+
+        StageComparisonResult compareRoutingIndices(
+            const std::string &stage,
+            const std::vector<float> &actual,
+            const std::vector<float> &expected,
+            float cosine_threshold) const
+        {
+            StageComparisonResult result;
+            result.stage_name = stage;
+            result.total_elements = actual.size();
+            result.is_routing_stage = true;
+            if (actual.size() != expected.size() ||
+                actual.size() % static_cast<size_t>(routing_top_k_) != 0)
+            {
+                return result;
+            }
+
+            const size_t rows =
+                actual.size() / static_cast<size_t>(routing_top_k_);
+            double overlap_sum = 0.0;
+            size_t top1_matches = 0;
+            for (size_t row = 0; row < rows; ++row)
+            {
+                std::set<int> actual_experts;
+                std::set<int> expected_experts;
+                for (int route = 0; route < routing_top_k_; ++route)
+                {
+                    const size_t index =
+                        row * static_cast<size_t>(routing_top_k_) +
+                        static_cast<size_t>(route);
+                    actual_experts.insert(static_cast<int>(actual[index]));
+                    expected_experts.insert(static_cast<int>(expected[index]));
+                }
+                size_t intersection = 0;
+                for (const int expert : actual_experts)
+                    intersection += expected_experts.contains(expert) ? 1u : 0u;
+                overlap_sum += static_cast<double>(intersection) /
+                               static_cast<double>(routing_top_k_);
+                top1_matches +=
+                    static_cast<int>(actual[row * routing_top_k_]) ==
+                            static_cast<int>(expected[row * routing_top_k_])
+                        ? 1u
+                        : 0u;
+            }
+            result.routing_overlap = static_cast<float>(
+                overlap_sum / static_cast<double>(rows));
+            result.routing_top1_match = static_cast<float>(
+                static_cast<double>(top1_matches) / static_cast<double>(rows));
+            result.cosine_similarity = result.routing_overlap;
+            result.max_abs_diff = 1.0f - result.routing_overlap;
+            result.passed = result.routing_overlap >= cosine_threshold;
+            return result;
+        }
+
+        StageComparisonResult compareRoutingWeights(
+            const std::string &stage,
+            const std::vector<float> &actual_weights,
+            const std::vector<float> &expected_weights,
+            const std::vector<float> &actual_indices,
+            const std::vector<float> &expected_indices,
+            float cosine_threshold) const
+        {
+            StageComparisonResult result;
+            result.stage_name = stage;
+            result.total_elements = actual_weights.size();
+            result.is_routing_stage = true;
+            if (actual_weights.size() != expected_weights.size() ||
+                actual_weights.size() != actual_indices.size() ||
+                actual_indices.size() != expected_indices.size() ||
+                actual_weights.size() % static_cast<size_t>(routing_top_k_) != 0)
+            {
+                return result;
+            }
+
+            const size_t rows =
+                actual_weights.size() / static_cast<size_t>(routing_top_k_);
+            double cosine_sum = 0.0;
+            double l1_sum = 0.0;
+            float max_difference = 0.0f;
+            std::vector<float> actual_sparse(
+                static_cast<size_t>(num_experts_));
+            std::vector<float> expected_sparse(
+                static_cast<size_t>(num_experts_));
+            for (size_t row = 0; row < rows; ++row)
+            {
+                std::fill(actual_sparse.begin(), actual_sparse.end(), 0.0f);
+                std::fill(expected_sparse.begin(), expected_sparse.end(), 0.0f);
+                for (int route = 0; route < routing_top_k_; ++route)
+                {
+                    const size_t index =
+                        row * static_cast<size_t>(routing_top_k_) +
+                        static_cast<size_t>(route);
+                    const int actual_expert =
+                        static_cast<int>(actual_indices[index]);
+                    const int expected_expert =
+                        static_cast<int>(expected_indices[index]);
+                    if (actual_expert >= 0 && actual_expert < num_experts_)
+                        actual_sparse[static_cast<size_t>(actual_expert)] =
+                            actual_weights[index];
+                    if (expected_expert >= 0 && expected_expert < num_experts_)
+                        expected_sparse[static_cast<size_t>(expected_expert)] =
+                            expected_weights[index];
+                }
+
+                double dot = 0.0;
+                double actual_norm = 0.0;
+                double expected_norm = 0.0;
+                double row_l1 = 0.0;
+                for (int expert = 0; expert < num_experts_; ++expert)
+                {
+                    const double actual =
+                        actual_sparse[static_cast<size_t>(expert)];
+                    const double expected =
+                        expected_sparse[static_cast<size_t>(expert)];
+                    const double difference = std::abs(actual - expected);
+                    dot += actual * expected;
+                    actual_norm += actual * actual;
+                    expected_norm += expected * expected;
+                    row_l1 += difference;
+                    max_difference = std::max(
+                        max_difference,
+                        static_cast<float>(difference));
+                }
+                const double denominator =
+                    std::sqrt(actual_norm * expected_norm);
+                cosine_sum += denominator > 1.0e-30 ? dot / denominator : 0.0;
+                l1_sum += row_l1;
+            }
+            result.routing_overlap = static_cast<float>(
+                cosine_sum / static_cast<double>(rows));
+            result.routing_weight_l1 = static_cast<float>(
+                l1_sum / static_cast<double>(rows));
+            result.cosine_similarity = result.routing_overlap;
+            result.max_abs_diff = max_difference;
+            result.passed = result.routing_overlap >= cosine_threshold;
+            return result;
+        }
+
+        static void addStage(
+            std::vector<LayerStats> &layers,
+            int layer_index,
+            StageComparisonResult result,
+            float cosine_threshold)
+        {
+            auto layer_it = std::find_if(
+                layers.begin(),
+                layers.end(),
+                [layer_index](const LayerStats &layer)
+                {
+                    return layer.layer_idx == layer_index;
+                });
+            if (layer_it == layers.end())
+            {
+                layers.push_back(LayerStats{.layer_idx = layer_index});
+                layer_it = std::prev(layers.end());
+            }
+            layer_it->stage_results.push_back(std::move(result));
+            recomputeLayer(*layer_it, cosine_threshold);
+            std::sort(
+                layers.begin(),
+                layers.end(),
+                [](const LayerStats &left, const LayerStats &right)
+                {
+                    return left.layer_idx < right.layer_idx;
+                });
+        }
+
+        static void recomputeLayer(
+            LayerStats &layer,
+            float cosine_threshold)
+        {
+            layer.avg_cosine_sim = 0.0f;
+            layer.min_cosine_sim = 1.0f;
+            layer.max_cosine_drop = 0.0f;
+            layer.stages_compared = 0;
+            layer.passed = false;
+            layer.worst_stage.clear();
+            layer.max_drop_stage.clear();
+            layer.max_kurtosis = 0.0f;
+            layer.max_kurtosis_stage.clear();
+
+            float previous_cosine = 0.0f;
+            bool have_previous = false;
+            for (auto &stage : layer.stage_results)
+            {
+                if (stage.llaminar_stats.kurtosis > layer.max_kurtosis)
+                {
+                    layer.max_kurtosis = stage.llaminar_stats.kurtosis;
+                    layer.max_kurtosis_stage = stage.stage_name;
+                }
+                if (stage.is_routing_stage)
+                    continue;
+
+                ++layer.stages_compared;
+                layer.avg_cosine_sim += stage.cosine_similarity;
+                if (stage.cosine_similarity < layer.min_cosine_sim)
+                {
+                    layer.min_cosine_sim = stage.cosine_similarity;
+                    layer.worst_stage = stage.stage_name;
+                }
+                if (have_previous)
+                {
+                    stage.cosine_drop = previous_cosine - stage.cosine_similarity;
+                    if (stage.cosine_drop > layer.max_cosine_drop)
+                    {
+                        layer.max_cosine_drop = stage.cosine_drop;
+                        layer.max_drop_stage = stage.stage_name;
+                    }
+                }
+                previous_cosine = stage.cosine_similarity;
+                have_previous = true;
+            }
+            if (layer.stages_compared > 0)
+            {
+                layer.avg_cosine_sim /=
+                    static_cast<float>(layer.stages_compared);
+                layer.passed =
+                    layer.avg_cosine_sim >= cosine_threshold;
+            }
+        }
+
+        DecodeStepStats &decodeStep(int step)
+        {
+            auto it = std::find_if(
+                decode_.step_stats.begin(),
+                decode_.step_stats.end(),
+                [step](const DecodeStepStats &stats)
+                {
+                    return stats.step_idx == step;
+                });
+            if (it == decode_.step_stats.end())
+            {
+                decode_.step_stats.push_back(DecodeStepStats{.step_idx = step});
+                std::sort(
+                    decode_.step_stats.begin(),
+                    decode_.step_stats.end(),
+                    [](const DecodeStepStats &left, const DecodeStepStats &right)
+                    {
+                        return left.step_idx < right.step_idx;
+                    });
+                it = std::find_if(
+                    decode_.step_stats.begin(),
+                    decode_.step_stats.end(),
+                    [step](const DecodeStepStats &stats)
+                    {
+                        return stats.step_idx == step;
+                    });
+            }
+            return *it;
+        }
+
+        void populatePrefillLogits(
+            const StageComparisonResult &comparison,
+            const std::vector<float> &actual,
+            const std::vector<float> &reference)
+        {
+            const size_t size = std::min(actual.size(), reference.size());
+            const float *expected = reference.data() + (reference.size() - size);
+            const float *observed = actual.data() + (actual.size() - size);
+            prefill_.lm_head_cosine = comparison.cosine_similarity;
+            prefill_.lm_head_kl = computeKLDivergence(
+                observed, expected, size, size);
+            prefill_.lm_head_top1 = computeTopKOverlap(
+                observed, expected, size, size, 1);
+            prefill_.lm_head_top5 = computeTopKOverlap(
+                observed, expected, size, size, 5);
+            prefill_.lm_head_pytorch_top1_in_top3 =
+                pytorchTop1InLlaminarTopK(
+                    observed, expected, size, size, 3) >= 1.0f - 1.0e-6f;
+            prefill_.lm_head_passed =
+                prefill_.lm_head_kl < logit_kl_threshold_ &&
+                prefill_.lm_head_top1 * 100.0f >= min_top1_accuracy_ &&
+                prefill_.lm_head_top5 * 100.0f >= min_top5_accuracy_ &&
+                prefill_.lm_head_pytorch_top1_in_top3;
+        }
+
+        void populateDecodeLogits(
+            DecodeStepStats &stats,
+            const StageComparisonResult &comparison,
+            const std::vector<float> &actual,
+            const std::vector<float> &reference)
+        {
+            stats.has_logit_data = true;
+            const size_t size = std::min(actual.size(), reference.size());
+            const float *expected = reference.data() + (reference.size() - size);
+            const float *observed = actual.data() + (actual.size() - size);
+            stats.cosine_similarity = comparison.cosine_similarity;
+            stats.kl_divergence = computeKLDivergence(
+                observed, expected, size, size);
+            stats.top1_overlap = computeTopKOverlap(
+                observed, expected, size, size, 1);
+            stats.top5_overlap = computeTopKOverlap(
+                observed, expected, size, size, 5);
+            stats.top3_match = pytorchTop1InLlaminarTopK(
+                                   observed, expected, size, size, 3) >=
+                               1.0f - 1.0e-6f;
+            stats.top5_match = pytorchTop1InLlaminarTopK(
+                                   observed, expected, size, size, 5) >=
+                               1.0f - 1.0e-6f;
+            stats.passed =
+                comparison.cosine_similarity >= decode_cosine_threshold_ ||
+                stats.kl_divergence < logit_kl_threshold_;
+        }
+
+        void finalizePrefillSummary()
+        {
+            prefill_.early_layers_passed = prefill_.embedding_passed ? 1 : 0;
+            prefill_.total_layers_passed = prefill_.embedding_passed ? 1 : 0;
+            for (const auto &layer : prefill_.layer_stats)
+            {
+                if (layer.passed)
+                {
+                    ++prefill_.total_layers_passed;
+                    if (layer.layer_idx >= 0 &&
+                        layer.layer_idx < early_layers_count_)
+                        ++prefill_.early_layers_passed;
+                }
+            }
+            prefill_.overall_passed =
+                prefill_.early_layers_passed >= min_early_layers_passed_ &&
+                prefill_.lm_head_passed;
+        }
+
+        void finalizeDecodeSummary()
+        {
+            decode_.steps_total = static_cast<int>(decode_.step_stats.size());
+            for (auto &step : decode_.step_stats)
+            {
+                if (step.passed)
+                    ++decode_.steps_passed;
+                if (step.token_match)
+                    ++decode_.top1_matches;
+                if (step.top3_match)
+                    ++decode_.top3_matches;
+                if (step.top5_match)
+                    ++decode_.top5_matches;
+                decode_.avg_cosine += step.cosine_similarity;
+                decode_.avg_kl += step.kl_divergence;
+            }
+            if (decode_.steps_total > 0)
+            {
+                const float denominator =
+                    static_cast<float>(decode_.steps_total);
+                decode_.avg_cosine /= denominator;
+                decode_.avg_kl /= denominator;
+                decode_.top1_accuracy =
+                    100.0f * static_cast<float>(decode_.top1_matches) /
+                    denominator;
+                decode_.top3_accuracy =
+                    100.0f * static_cast<float>(decode_.top3_matches) /
+                    denominator;
+                decode_.top5_accuracy =
+                    100.0f * static_cast<float>(decode_.top5_matches) /
+                    denominator;
+            }
+            const int minimum_steps = static_cast<int>(
+                static_cast<float>(decode_.steps_total) *
+                minimum_decode_pass_rate_);
+            decode_.overall_passed =
+                decode_.steps_total > 0 &&
+                decode_.steps_passed >= minimum_steps &&
+                decode_.top5_accuracy >= min_top5_accuracy_ &&
+                decode_.avg_cosine >= decode_cosine_threshold_ &&
+                decode_.top3_matches == decode_.steps_total;
+        }
+
+        std::string backend_;
+        float prefill_cosine_threshold_ = 0.96f;
+        float decode_cosine_threshold_ = 0.98f;
+        float logit_kl_threshold_ = 0.03f;
+        int early_layers_count_ = 6;
+        int min_early_layers_passed_ = 5;
+        float min_top1_accuracy_ = 80.0f;
+        float min_top5_accuracy_ = 60.0f;
+        float minimum_decode_pass_rate_ = 0.8f;
+        int routing_top_k_ = 8;
+        int num_experts_ = 256;
+        ParityTestSummary prefill_;
+        DecodeParitySummary decode_;
+        bool saw_prefill_embedding_ = false;
+        bool saw_prefill_logits_ = false;
+        size_t prefill_checkpoint_count_ = 0;
+        size_t decode_checkpoint_count_ = 0;
+        std::map<
+            std::string,
+            std::pair<std::vector<float>, std::vector<float>>>
+            routing_indices_;
+        std::set<std::string> observed_decode_stages_;
+        std::set<std::string> required_decode_stage_suffixes_;
+    };
+
+    /** @brief Split a canonical snapshot key into its layer and stage fields. */
+    inline std::pair<int, std::string> qwen36CheckpointLayerAndStage(
+        const std::string &key)
+    {
+        if (key.rfind("layer", 0) != 0)
+            return {-1, key};
+        size_t digit_end = 5;
+        while (digit_end < key.size() &&
+               std::isdigit(static_cast<unsigned char>(key[digit_end])))
+        {
+            ++digit_end;
+        }
+        if (digit_end == 5 || digit_end >= key.size() || key[digit_end] != '_')
+            return {-1, key};
+        return {
+            std::stoi(key.substr(5, digit_end - 5)),
+            key.substr(digit_end + 1)};
+    }
+
+    /** @brief Select the semantically correct comparison for a stage. */
+    inline Qwen36CheckpointKind qwen36CheckpointKind(const std::string &stage)
+    {
+        if (stage.ends_with("MOE_ROUTING_INDICES"))
+            return Qwen36CheckpointKind::RoutingIndices;
+        if (stage.ends_with("MOE_ROUTING_WEIGHTS"))
+            return Qwen36CheckpointKind::RoutingWeights;
+        return Qwen36CheckpointKind::Numeric;
+    }
+
+    /**
+     * @brief Select the real prompt rows from a fixed-capacity captured tensor.
+     *
+     * GPU prefill graphs execute a bucket-sized physical matrix while PyTorch
+     * snapshots contain only logical prompt rows.  The graph contract places
+     * the logical prefix at the leading rows and masks the remaining capacity.
+     * Project that explicit row interval before numerical comparison; treating
+     * a shape mismatch as an absent checkpoint would silently erase nearly all
+     * prefill coverage under graph capture.
+     */
+    inline std::optional<std::vector<float>> qwen36ProjectCapturedPrefillRows(
+        const std::string &key,
+        const float *actual,
+        size_t actual_size,
+        const std::vector<float> &expected,
+        size_t logical_rows)
+    {
+        if (!actual || actual_size == 0 || expected.empty() || logical_rows == 0)
+            return std::nullopt;
+        if (actual_size == expected.size())
+            return std::vector<float>(actual, actual + actual_size);
+
+        if (expected.size() % logical_rows == 0)
+        {
+            const size_t columns = expected.size() / logical_rows;
+            if (key == "LM_HEAD" && actual_size == columns)
+            {
+                return std::vector<float>(actual, actual + actual_size);
+            }
+            if (columns > 0 && actual_size % columns == 0)
+            {
+                const size_t physical_rows = actual_size / columns;
+                if (physical_rows >= logical_rows)
+                {
+                    return std::vector<float>(
+                        actual,
+                        actual + logical_rows * columns);
+                }
+            }
+        }
+
+        /*
+         * Terminal-only stages such as LM_HEAD may publish one selected row
+         * even when their producer owns the full physical bucket.  Select the
+         * last logical row, never the padded physical tail.
+         */
+        if (actual_size > expected.size() &&
+            actual_size % expected.size() == 0)
+        {
+            const size_t physical_rows = actual_size / expected.size();
+            if (physical_rows >= logical_rows)
+            {
+                const size_t row = logical_rows - 1;
+                const float *begin = actual + row * expected.size();
+                return std::vector<float>(begin, begin + expected.size());
+            }
+        }
+
+        ADD_FAILURE()
+            << key << " cannot project captured prefill shape: production="
+            << actual_size << " reference=" << expected.size()
+            << " logical_rows=" << logical_rows;
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Compare every available production prefill checkpoint to PyTorch.
+     */
+    inline void recordQwen36PrefillArtifacts(
+        Qwen36CheckpointArtifactRecorder &recorder,
+        IOrchestrationRunner &runner,
+        const std::filesystem::path &reference_dir,
+        size_t logical_rows,
+        const ParityGDNHeadConfig &gdn_config = {})
+    {
+        size_t comparable = 0;
+        auto keys = runner.getSnapshotKeys();
+        std::sort(keys.begin(), keys.end());
+        for (const std::string &key : keys)
+        {
+            const std::vector<float> expected =
+                loadDensePyTorchSnapshot(reference_dir, key);
+            if (expected.empty())
+                continue;
+            size_t actual_size = 0;
+            const float *actual_data = runner.getSnapshot(key, actual_size);
+            if (!actual_data || actual_size == 0)
+            {
+                ADD_FAILURE() << "Production prefill advertised an empty checkpoint "
+                              << key;
+                continue;
+            }
+            auto projected = qwen36ProjectCapturedPrefillRows(
+                key,
+                actual_data,
+                actual_size,
+                expected,
+                logical_rows);
+            if (!projected)
+                continue;
+            const auto [layer, stage] = qwen36CheckpointLayerAndStage(key);
+            auto permuted = applyParityGDNHeadPermutation(
+                projected->data(),
+                projected->size(),
+                stage,
+                gdn_config);
+            const std::vector<float> &production =
+                permuted.empty() ? *projected : permuted;
+            recorder.recordPrefill(
+                layer,
+                stage,
+                production,
+                expected,
+                qwen36CheckpointKind(stage));
+            ++comparable;
+        }
+        EXPECT_GT(comparable, 0u)
+            << "No production prefill checkpoints matched references in "
+            << reference_dir;
+    }
+
     inline std::vector<std::string> denseOrderedDecodeSnapshotKeys(
         const DenseDecodeSnapshotComparisonPolicy &policy)
     {
@@ -1756,6 +2605,39 @@ namespace llaminar2::test::parity::qwen36
             snapshot.cols = info.cols;
             snapshot.data.assign(info.data, info.data + info.size);
             snapshots.emplace(key, std::move(snapshot));
+        }
+        return snapshots;
+    }
+
+    /**
+     * @brief Copy orchestration-level snapshots without inventing tensor shape.
+     *
+     * The orchestration API intentionally exposes only authenticated element
+     * cardinality because TP/PP reconstruction may have joined participant
+     * shapes. Dense MTP checkpoint comparisons need the exact flat payload,
+     * not a guessed row/column decomposition, so the diagnostic records one
+     * logical row and the complete cardinality here.
+     */
+    inline std::map<std::string, DenseStageSnapshot> captureDenseStageSnapshots(
+        IOrchestrationRunner &runner)
+    {
+        std::map<std::string, DenseStageSnapshot> snapshots;
+        auto keys = runner.getSnapshotKeys();
+        std::sort(keys.begin(), keys.end());
+        for (const std::string &key : keys)
+        {
+            size_t size = 0;
+            const float *data = runner.getSnapshot(key, size);
+            if (!data || size == 0)
+                continue;
+            snapshots.emplace(
+                key,
+                DenseStageSnapshot{
+                    .key = key,
+                    .data = std::vector<float>(data, data + size),
+                    .rows = 1,
+                    .cols = size,
+                });
         }
         return snapshots;
     }
@@ -2144,6 +3026,96 @@ namespace llaminar2::test::parity::qwen36
                decode_tokens.size() >= static_cast<size_t>(required_decode_steps);
     }
 
+    /**
+     * @brief Authenticate one CPU/FP32 PyTorch pack against live model inputs.
+     *
+     * Directory names and model path strings are not identity authorities.
+     * Long-lived dense and MoE packs are reusable only when their metadata
+     * proves the exact GGUF bytes, prompt bytes, and tokenizer output.  The
+     * aggregate runner's identity-bound digest cache prevents every backend
+     * process from rescanning the same read-only RAM-disk model.
+     */
+    inline bool qwen36ReferenceIdentityMatches(
+        const std::filesystem::path &metadata_path,
+        const std::string &model_path,
+        const std::string &prompt,
+        std::string *reason = nullptr)
+    {
+        const auto fail = [reason](std::string message)
+        {
+            if (reason)
+                *reason = std::move(message);
+            return false;
+        };
+        const auto expect = [&](const char *key, const char *value)
+        {
+            const auto observed = readStringFromMetadata(metadata_path, key);
+            return observed.has_value() && *observed == value;
+        };
+        if (!expect("reference_identity_version", "1") ||
+            !expect("reference_engine", "pytorch") ||
+            !expect("reference_device", "cpu") ||
+            !expect("reference_dtype", "float32"))
+        {
+            return fail("missing or incompatible CPU/FP32 PyTorch identity");
+        }
+
+        std::string digest_error;
+        const auto digest_cache =
+            productionParityDigestCacheFromEnvironment();
+        const auto model_digest = digest_cache
+                                      ? sha256FileHexShared(
+                                            model_path,
+                                            *digest_cache,
+                                            &digest_error)
+                                      : sha256FileHex(
+                                            model_path,
+                                            &digest_error);
+        const auto observed_model_digest =
+            readStringFromMetadata(metadata_path, "model_sha256");
+        if (!model_digest || !observed_model_digest ||
+            *observed_model_digest != *model_digest)
+        {
+            return fail(
+                "model_sha256 does not match the live GGUF bytes" +
+                (digest_error.empty() ? std::string{} : ": " + digest_error));
+        }
+
+        const auto prompt_digest = sha256BytesHex(prompt, &digest_error);
+        const auto observed_prompt_digest =
+            readStringFromMetadata(metadata_path, "prompt_sha256");
+        if (!prompt_digest || !observed_prompt_digest ||
+            *observed_prompt_digest != *prompt_digest)
+        {
+            return fail("prompt_sha256 does not match the configured prompt");
+        }
+
+        const auto token_ids =
+            readTokenListFromMetadata(metadata_path, "token_ids");
+        if (token_ids.empty())
+            return fail("token_ids is missing or malformed");
+        std::ostringstream canonical_tokens;
+        for (size_t index = 0; index < token_ids.size(); ++index)
+        {
+            if (index != 0)
+                canonical_tokens << ',';
+            canonical_tokens << token_ids[index];
+        }
+        const auto token_digest =
+            sha256BytesHex(canonical_tokens.str(), &digest_error);
+        const auto observed_token_digest =
+            readStringFromMetadata(metadata_path, "token_ids_sha256");
+        if (!token_digest || !observed_token_digest ||
+            *observed_token_digest != *token_digest)
+        {
+            return fail("token_ids_sha256 does not authenticate token_ids");
+        }
+
+        if (reason)
+            reason->clear();
+        return true;
+    }
+
     inline bool regenerateQwen36Metadata(
         const std::string &model_path,
         const std::filesystem::path &metadata_path,
@@ -2193,7 +3165,8 @@ namespace llaminar2::test::parity::qwen36
 
     inline bool qwen36DecodeSnapshotsLookUsable(
         const std::filesystem::path &snapshot_dir,
-        int required_decode_steps)
+        int required_decode_steps,
+        bool require_mtp_sidecar_snapshots = false)
     {
         if (required_decode_steps <= 0)
         {
@@ -2221,7 +3194,73 @@ namespace llaminar2::test::parity::qwen36
                 }
             }
         }
-        return true;
+
+        if (!require_mtp_sidecar_snapshots)
+            return true;
+
+        /*
+         * Schema 5 binds recursive depth N to the preceding predictor's
+         * shared-head-normalized hidden result.  Older experimental packs
+         * chained the pre-normalized decoder residual and cannot certify the
+         * production MTP graph even when their filenames happen to match.
+         */
+        constexpr int kMTPSidecarSnapshotSchema = 5;
+        std::ifstream schema_file(
+            snapshot_dir / "mtp_sidecar_snapshot_schema.txt");
+        int observed_schema = 0;
+        if (!(schema_file >> observed_schema) ||
+            observed_schema != kMTPSidecarSnapshotSchema)
+        {
+            return false;
+        }
+
+        const std::vector<std::string_view> sidecar_stage_suffixes = {
+            "TERMINAL_HIDDEN_ROW_SELECT",
+            "EMBEDDING",
+            "NORM_HIDDEN",
+            "NORM_EMBEDDING",
+            "CONCAT",
+            "FC",
+            "ATTENTION_NORM",
+            "Q_PROJECTION",
+            "FA_GATE",
+            "K_PROJECTION",
+            "V_PROJECTION",
+            "Q_NORM",
+            "K_NORM",
+            "ATTENTION_CONTEXT",
+            "ATTENTION_CONTEXT_GATED",
+            "ATTENTION_OUTPUT",
+            "FFN_NORM",
+            "FFN_GATE",
+            "FFN_UP",
+            "FFN_SWIGLU",
+            "FFN_DOWN",
+            "FFN_RESIDUAL",
+            "FINAL_NORM",
+            "LM_HEAD",
+        };
+        if (!std::filesystem::is_regular_file(
+                snapshot_dir /
+                "decode_step0_MTP_TERMINAL_HIDDEN_ROW_SELECT.npy"))
+        {
+            return false;
+        }
+        for (int depth = 0; depth <= 2; ++depth)
+        {
+            for (const std::string_view suffix : sidecar_stage_suffixes)
+            {
+                const auto path = snapshot_dir /
+                    ("decode_step0_MTP" + std::to_string(depth) + "_" +
+                     std::string(suffix) + ".npy");
+                if (!std::filesystem::is_regular_file(path))
+                    return false;
+            }
+        }
+        return std::filesystem::is_regular_file(
+            snapshot_dir /
+            ("decode_step" + std::to_string(required_decode_steps - 1) +
+             "_MTP2_LM_HEAD.npy"));
     }
 
     inline bool regenerateQwen36DecodeSnapshots(
@@ -2229,6 +3268,7 @@ namespace llaminar2::test::parity::qwen36
         const std::filesystem::path &metadata_path,
         const std::string &prompt,
         int decode_steps,
+        bool require_mtp_sidecar_snapshots,
         std::string *output)
     {
         std::filesystem::create_directories(metadata_path.parent_path());
@@ -2244,6 +3284,8 @@ namespace llaminar2::test::parity::qwen36
         script += " --decode-steps " + std::to_string(decode_steps);
         script += " --output " + shellQuote(metadata_path.parent_path().string());
         script += " --decode-snapshots-only";
+        if (require_mtp_sidecar_snapshots)
+            script += " --mtp-sidecar-snapshots";
 
         const std::string command = "bash -c " + shellQuote(script) + " 2>&1";
         FILE *pipe = popen(command.c_str(), "r");
@@ -2274,11 +3316,24 @@ namespace llaminar2::test::parity::qwen36
     inline void ensurePyTorchDecodeSnapshots(
         const DensePrefixRestoreParityCase &test_case,
         const std::string &model_path,
-        const std::filesystem::path &metadata_path)
+        const std::filesystem::path &metadata_path,
+        bool require_mtp_sidecar_snapshots = false)
     {
         const auto snapshot_dir = metadata_path.parent_path();
-        if (qwen36DecodeSnapshotsLookUsable(snapshot_dir, test_case.decode_steps) &&
-            metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
+        std::string identity_error;
+        if (qwen36DecodeSnapshotsLookUsable(
+                snapshot_dir,
+                test_case.decode_steps,
+                require_mtp_sidecar_snapshots) &&
+            metadataLooksUsable(
+                metadata_path,
+                test_case.prompt,
+                test_case.decode_steps) &&
+            qwen36ReferenceIdentityMatches(
+                metadata_path,
+                model_path,
+                test_case.prompt,
+                &identity_error))
         {
             return;
         }
@@ -2289,16 +3344,30 @@ namespace llaminar2::test::parity::qwen36
             metadata_path,
             test_case.prompt,
             test_case.decode_steps,
+            require_mtp_sidecar_snapshots,
             &output))
             << test_case.name << " failed to regenerate PyTorch decode snapshots at "
             << snapshot_dir << "\n"
             << output;
 
-        ASSERT_TRUE(metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
+        ASSERT_TRUE(
+            metadataLooksUsable(
+                metadata_path,
+                test_case.prompt,
+                test_case.decode_steps) &&
+            qwen36ReferenceIdentityMatches(
+                metadata_path,
+                model_path,
+                test_case.prompt,
+                &identity_error))
             << test_case.name << " regenerated metadata is incomplete at "
             << metadata_path << "\n"
+            << identity_error << "\n"
             << output;
-        ASSERT_TRUE(qwen36DecodeSnapshotsLookUsable(snapshot_dir, test_case.decode_steps))
+        ASSERT_TRUE(qwen36DecodeSnapshotsLookUsable(
+            snapshot_dir,
+            test_case.decode_steps,
+            require_mtp_sidecar_snapshots))
             << test_case.name << " regenerated decode snapshots are incomplete at "
             << snapshot_dir << "\n"
             << output;
@@ -2309,7 +3378,16 @@ namespace llaminar2::test::parity::qwen36
         const std::string &model_path,
         const std::filesystem::path &metadata_path)
     {
-        if (metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
+        std::string identity_error;
+        if (metadataLooksUsable(
+                metadata_path,
+                test_case.prompt,
+                test_case.decode_steps) &&
+            qwen36ReferenceIdentityMatches(
+                metadata_path,
+                model_path,
+                test_case.prompt,
+                &identity_error))
         {
             return;
         }
@@ -2325,9 +3403,19 @@ namespace llaminar2::test::parity::qwen36
             << metadata_path << "\n"
             << output;
 
-        ASSERT_TRUE(metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
+        ASSERT_TRUE(
+            metadataLooksUsable(
+                metadata_path,
+                test_case.prompt,
+                test_case.decode_steps) &&
+            qwen36ReferenceIdentityMatches(
+                metadata_path,
+                model_path,
+                test_case.prompt,
+                &identity_error))
             << test_case.name << " regenerated metadata is incomplete at "
             << metadata_path << "\n"
+            << identity_error << "\n"
             << output;
     }
 
@@ -2335,7 +3423,7 @@ namespace llaminar2::test::parity::qwen36
         const DensePrefixRestoreParityCase &test_case)
     {
         const int world_size = mpiWorldSize();
-        if (test_case.topology == DensePrefixParityTopology::NodeLocalTP)
+        if (test_case.topology == DensePrefixParityTopology::NodeTP)
         {
             if (world_size != test_case.mpi_ranks)
             {
@@ -2492,7 +3580,7 @@ namespace llaminar2::test::parity::qwen36
 
         case DensePrefixParityTopology::LocalTP:
             config.tp_degree = static_cast<int>(test_case.devices.size());
-            config.tp_scope = TPScope::LOCAL;
+            config.tp_scope = TPScope::RANK_LOCAL;
             config.tp_devices = test_case.devices;
             config.pp_degree = 1;
             config.default_backend = denseLocalTPBackendForDevices(test_case.devices);
@@ -2509,14 +3597,14 @@ namespace llaminar2::test::parity::qwen36
                 DomainDefinition domain;
                 domain.name = "stage" + std::to_string(i);
                 domain.devices = {test_case.devices[i]};
-                domain.scope = TPScope::LOCAL;
+                domain.scope = TPScope::RANK_LOCAL;
                 domain.owner_rank = 0;
                 domain.backend = CollectiveBackendType::AUTO;
                 config.domain_definitions.push_back(std::move(domain));
             }
             break;
 
-        case DensePrefixParityTopology::NodeLocalTP:
+        case DensePrefixParityTopology::NodeTP:
             config.tp_degree = test_case.mpi_ranks;
             config.tp_scope = TPScope::NODE_LOCAL;
             config.pp_degree = 1;
@@ -2584,7 +3672,7 @@ namespace llaminar2::test::parity::qwen36
             };
             test_case.required_rocm_devices = 2;
             break;
-        case DensePrefixParityTopology::NodeLocalTP:
+        case DensePrefixParityTopology::NodeTP:
             test_case.devices = {
                 GlobalDeviceAddress::cpu(0),
                 GlobalDeviceAddress::cpu(1),
@@ -2727,7 +3815,7 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << *skip_reason;
         }
 
-        *model_path = firstEnvOrDefault(
+        *model_path = firstModelEnvOrDefault(
             test_case.model_envs,
             test_case.default_model_path);
         if (!std::filesystem::exists(*model_path))
@@ -2886,6 +3974,674 @@ namespace llaminar2::test::parity::qwen36
         split->shutdown();
 
         EXPECT_EQ(split_tokens_out, expected_tokens);
+    }
+
+    /**
+     * @brief Bounded immutable model authority shared by one dense MTP campaign.
+     *
+     * Depth changes controller and graph geometry but not the GGUF tensors or
+     * their backend-specific prepared representation.  Each depth cell still
+     * owns a fresh runner, arena, streams, graphs, controller, and request
+     * state; this sole process-local slot retains only the model context and
+     * the production plan that certified its prepared weights.
+     */
+    struct DenseMTPModelContextCampaignCache
+    {
+        std::mutex mutex;
+        std::string key;
+        std::optional<ModelContextReuseContract> contract;
+    };
+
+    /** @brief Return the one bounded prepared-weight cache for this process. */
+    inline DenseMTPModelContextCampaignCache &
+    denseMTPModelContextCampaignCache()
+    {
+        static DenseMTPModelContextCampaignCache cache;
+        return cache;
+    }
+
+    /**
+     * @brief Return whether the aggregate may amortize immutable dense weights.
+     *
+     * Focused GTest invocations retain fresh-load isolation.  The aggregate
+     * driver groups only equivalent single-device depth cells and opts into
+     * reuse explicitly through its process-campaign environment contract.
+     */
+    inline bool mayReuseDenseMTPModelContext(
+        const DensePrefixRestoreParityCase &test_case)
+    {
+        return test_case.topology == DensePrefixParityTopology::SingleDevice &&
+               DebugEnv::isTruthyEnv(
+                   "LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN");
+    }
+
+    /** @brief Build the physical identity of reusable prepared dense weights. */
+    inline std::string denseMTPModelContextCampaignKey(
+        const DensePrefixRestoreParityCase &test_case,
+        const std::string &model_path)
+    {
+        std::ostringstream key;
+        key << "model=" << model_path
+            << "|topology=" << static_cast<int>(test_case.topology)
+            << "|devices=";
+        for (const auto &device : test_case.devices)
+            key << device.toString() << ',';
+        return key.str();
+    }
+
+    /**
+     * @brief Find a plan-certified context retained by an earlier depth cell.
+     *
+     * A miss never constructs a guessed context.  The first production runner
+     * is the sole authority for main-layer versus trailing-nextn ownership and
+     * for the exact prepared-weight plan.
+     */
+    inline std::optional<ModelContextReuseContract>
+    findDenseMTPModelContext(
+        const DensePrefixRestoreParityCase &test_case,
+        const std::string &model_path,
+        bool *cache_hit)
+    {
+        if (cache_hit)
+            *cache_hit = false;
+        if (!mayReuseDenseMTPModelContext(test_case))
+            return std::nullopt;
+
+        const std::string key =
+            denseMTPModelContextCampaignKey(test_case, model_path);
+        auto &cache = denseMTPModelContextCampaignCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.contract && cache.key == key)
+        {
+            if (cache_hit)
+                *cache_hit = true;
+            return cache.contract;
+        }
+        if (cache.contract)
+        {
+            llaminar::v2::kernels::KernelFactory::clearCache();
+            cache.contract.reset();
+            cache.key.clear();
+        }
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Publish the first initialized runner's reusable model authority.
+     */
+    inline bool publishDenseMTPModelContext(
+        const DensePrefixRestoreParityCase &test_case,
+        const std::string &model_path,
+        const ModelContextReuseContract &contract,
+        std::string *error)
+    {
+        if (!mayReuseDenseMTPModelContext(test_case) || !contract.context)
+        {
+            if (error)
+                *error = "cannot publish an ineligible dense MTP model context";
+            return false;
+        }
+        if (contract.context->path() != model_path)
+        {
+            if (error)
+                *error = "production runner returned a different model authority";
+            return false;
+        }
+
+        const std::string key =
+            denseMTPModelContextCampaignKey(test_case, model_path);
+        auto &cache = denseMTPModelContextCampaignCache();
+        std::lock_guard<std::mutex> lock(cache.mutex);
+        if (cache.contract)
+        {
+            if (cache.key == key &&
+                cache.contract->context == contract.context)
+            {
+                return true;
+            }
+            if (error)
+                *error = "dense MTP campaign attempted to replace a live model authority";
+            return false;
+        }
+        cache.key = key;
+        cache.contract = contract;
+        return true;
+    }
+
+    /**
+     * @brief Return the complete dense predictor checkpoint surface.
+     *
+     * ``FFN_SWIGLU`` is intentionally absent: production fuses that activation
+     * into the down-projection kernel and exposes its gate/up inputs plus final
+     * projection output.  Requiring a test-only materialization would alter the
+     * optimized graph being certified.
+     */
+    inline const std::vector<std::string_view> &
+    qwen36DenseMTPSidecarStageSuffixes()
+    {
+        static const std::vector<std::string_view> suffixes = {
+            "EMBEDDING",
+            "NORM_HIDDEN",
+            "NORM_EMBEDDING",
+            "CONCAT",
+            "FC",
+            "ATTENTION_NORM",
+            "Q_PROJECTION",
+            "FA_GATE",
+            "K_PROJECTION",
+            "V_PROJECTION",
+            "Q_NORM",
+            "K_NORM",
+            "ATTENTION_CONTEXT",
+            "ATTENTION_CONTEXT_GATED",
+            "ATTENTION_OUTPUT",
+            "FFN_NORM",
+            "FFN_GATE",
+            "FFN_UP",
+            "FFN_DOWN",
+            "FFN_RESIDUAL",
+            "FINAL_NORM",
+            "LM_HEAD",
+        };
+        return suffixes;
+    }
+
+    /**
+     * @brief Run one real-weight production MTP checkpoint/CSV campaign cell.
+     *
+     * The runner executes its ordinary captured sidecar, verifier, sampling,
+     * and device-state publication path.  The harness maps only the graph
+     * context selected by the live depth controller to recursive MTP0..MTP2
+     * CPU/FP32 Hugging Face checkpoints generated from the same GGUF nextn
+     * weights.  Token parity, stage metrics, depth telemetry, full-capture
+     * evidence, and all seven canonical CSVs are fail-closed requirements.
+     */
+    inline void runDenseMTPCheckpointProductionParity(
+        DensePrefixRestoreParityCase test_case,
+        int decode_token_budget,
+        int mtp_draft_tokens,
+        MTPDepthPolicyConfig depth_policy = {})
+    {
+        const auto campaign_started_at = std::chrono::steady_clock::now();
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+        });
+        ASSERT_GT(decode_token_budget, 0);
+        ASSERT_GE(mtp_draft_tokens, 1);
+        ASSERT_LE(mtp_draft_tokens, 3);
+
+        test_case.decode_steps = std::max(
+            test_case.decode_steps,
+            std::max(decode_token_budget, 8));
+        test_case.max_seq_len = std::max(test_case.max_seq_len, 128);
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_phase138_continuation_snapshots/metadata.txt";
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+            GTEST_SKIP() << *skip_reason;
+        const std::string model_path = firstModelEnvOrDefault(
+            test_case.model_envs,
+            test_case.default_model_path);
+        if (!std::filesystem::is_regular_file(model_path))
+            GTEST_SKIP() << test_case.name << " model not found: " << model_path;
+
+        const std::filesystem::path metadata_path = firstEnvOrDefault(
+            test_case.metadata_envs,
+            test_case.default_metadata_path);
+        ensurePyTorchDecodeSnapshots(
+            test_case,
+            model_path,
+            metadata_path,
+            /*require_mtp_sidecar_snapshots=*/true);
+        const std::filesystem::path sidecar_reference_dir =
+            metadata_path.parent_path();
+        const std::vector<int32_t> prompt_tokens =
+            readTokenListFromMetadata(metadata_path, "token_ids");
+        const std::vector<int32_t> expected_tokens =
+            readTokenListFromMetadata(metadata_path, "decode_tokens");
+        ASSERT_FALSE(prompt_tokens.empty());
+        ASSERT_GE(
+            expected_tokens.size(),
+            static_cast<size_t>(decode_token_budget));
+
+        const std::filesystem::path full_reference_dir =
+            "pytorch_qwen36_dense_singledevice_snapshots";
+        const std::filesystem::path full_reference_metadata =
+            full_reference_dir / "metadata.txt";
+        ASSERT_TRUE(std::filesystem::is_regular_file(full_reference_metadata))
+            << "Dense full-checkpoint reference is missing: "
+            << full_reference_metadata;
+        std::string full_identity_error;
+        ASSERT_TRUE(qwen36ReferenceIdentityMatches(
+            full_reference_metadata,
+            model_path,
+            test_case.prompt,
+            &full_identity_error))
+            << "Dense full-checkpoint reference is unauthenticated: "
+            << full_identity_error;
+        const std::vector<int32_t> artifact_prefill_tokens =
+            readTokenListFromMetadata(full_reference_metadata, "token_ids");
+        ASSERT_FALSE(artifact_prefill_tokens.empty());
+
+        const ModelContextConfig metadata_context_config{
+            .strategy = WeightDistributionStrategy::REPLICATED,
+            .use_mmap = true,
+            .payload_access_pattern =
+                ModelPayloadAccessPattern::DeviceStaging,
+        };
+        auto metadata_context =
+            ModelContext::create(model_path, metadata_context_config);
+        ASSERT_NE(metadata_context, nullptr)
+            << "Could not inspect dense GDN checkpoint geometry";
+        const ParityGDNHeadConfig gdn_config =
+            parityGDNHeadConfigFromModel(metadata_context.get());
+        /*
+         * Dense Qwen3.6 uses the reference head order directly.  The same
+         * typed configuration is still passed to the common recorder so a
+         * future dense checkpoint with unequal heads cannot accidentally
+         * inherit guessed geometry from the test name.
+         */
+        EXPECT_FALSE(gdn_config.is_moe);
+        metadata_context.reset();
+
+        const bool dynamic_depth =
+            depth_policy.mode == MTPDepthPolicyMode::Dynamic;
+        const std::string artifact_backend =
+            test_case.name +
+            (dynamic_depth
+                 ? "_MTP_DYNAMIC"
+                 : "_MTP_DEPTH" + std::to_string(mtp_draft_tokens));
+        Qwen36CheckpointArtifactRecorder artifact_recorder(
+            artifact_backend,
+            /*prefill_cosine_threshold=*/0.96f,
+            /*decode_cosine_threshold=*/0.98f,
+            /*logit_kl_threshold=*/0.08f);
+
+        PerfStatsCollector::reset();
+        auto factory = createOrchestrationRunnerFactory();
+        const OrchestrationConfig config = makeDensePrefixRestoreConfig(
+            test_case,
+            model_path,
+            /*enable_prefix_cache=*/false,
+            /*block_size=*/2,
+            /*enable_mtp=*/true,
+            mtp_draft_tokens,
+            depth_policy);
+
+        const bool reuse_enabled =
+            mayReuseDenseMTPModelContext(test_case);
+        bool model_context_reused = false;
+        std::string model_context_error;
+        auto reuse_contract = findDenseMTPModelContext(
+            test_case,
+            model_path,
+            &model_context_reused);
+        auto mtp = reuse_contract
+                       ? factory->createFromOrchestrationConfig(
+                             config,
+                             *reuse_contract)
+                       : factory->createFromOrchestrationConfig(config);
+        ASSERT_NE(mtp, nullptr);
+        ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+        if (reuse_enabled && !model_context_reused)
+        {
+            reuse_contract = mtp->modelContextReuseContract();
+            ASSERT_TRUE(reuse_contract.has_value())
+                << "Dense production runner exposed no prepared-weight reuse contract";
+            ASSERT_TRUE(publishDenseMTPModelContext(
+                test_case,
+                model_path,
+                *reuse_contract,
+                &model_context_error))
+                << model_context_error;
+        }
+        if (reuse_enabled)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                model_context_reused
+                    ? "dense_parity_campaign_model_context_cache_hits"
+                    : "dense_parity_campaign_model_context_cache_misses",
+                1.0,
+                "setup",
+                mtp->primaryDeviceId().toString(),
+                {{"depth", std::to_string(mtp_draft_tokens)},
+                 {"policy", dynamic_depth ? "dynamic" : "fixed"}});
+        }
+
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        mtp->setSamplingParams(greedy);
+        mtp->setSkipLogitsGatherPrefill(false);
+        mtp->setSkipLogitsGatherDecode(false);
+        mtp->enableSnapshotCapture();
+
+        ASSERT_TRUE(mtp->prefill(artifact_prefill_tokens)) << mtp->lastError();
+        recordQwen36PrefillArtifacts(
+            artifact_recorder,
+            *mtp,
+            full_reference_dir,
+            artifact_prefill_tokens.size(),
+            gdn_config);
+        mtp->clearSnapshots();
+        mtp->clearCache();
+
+        ASSERT_TRUE(mtp->prefill(prompt_tokens)) << mtp->lastError();
+        const bool host_owned_sidecar = mtp->primaryDeviceId().is_cpu();
+        std::vector<int32_t> emitted_tokens;
+        int speculative_transaction_count = 0;
+        int observation_index = 0;
+
+        struct ActiveCheckpointContext
+        {
+            std::string production_prefix;
+            int reference_depth = 0;
+        };
+
+        while (static_cast<int>(emitted_tokens.size()) < decode_token_budget)
+        {
+            const int remaining =
+                decode_token_budget - static_cast<int>(emitted_tokens.size());
+            const auto before = mtp->prefixStateProbe();
+            const int reference_step =
+                mtpParityReferenceStepForConditionPosition(
+                    before.mtp_next_condition_position,
+                    static_cast<int>(prompt_tokens.size()));
+            ASSERT_GE(reference_step, 0)
+                << "Production MTP transaction began before the authenticated "
+                   "prefill boundary: next_condition_position="
+                << before.mtp_next_condition_position
+                << " prompt_tokens=" << prompt_tokens.size();
+            int selected_depth = before.mtp_current_depth;
+            if (selected_depth <= 0)
+                selected_depth = mtp_draft_tokens;
+            selected_depth = std::clamp(
+                selected_depth,
+                1,
+                mtp_draft_tokens);
+
+            mtp->clearSnapshots();
+            mtp->setDecodeStepTokenBudget(
+                std::min(remaining, mtp_draft_tokens + 1));
+            GenerationResult step = mtp->decodeStep();
+            mtp->setDecodeStepTokenBudget(0);
+            ASSERT_TRUE(step.error.empty()) << step.error;
+            ASSERT_FALSE(step.tokens.empty());
+            emitted_tokens.insert(
+                emitted_tokens.end(),
+                step.tokens.begin(),
+                step.tokens.end());
+            ASSERT_LE(
+                emitted_tokens.size(),
+                static_cast<size_t>(decode_token_budget));
+
+            const auto after = mtp->prefixStateProbe();
+            const MTPParityTransactionCounters before_counters{
+                .draft_steps = before.mtp_draft_steps,
+                .verifier_runs = before.mtp_verifier_runs,
+            };
+            const MTPParityTransactionCounters after_counters{
+                .draft_steps = after.mtp_draft_steps,
+                .verifier_runs = after.mtp_verifier_runs,
+            };
+            const auto activity = classifyMTPParityTransactionActivity(
+                before_counters,
+                after_counters);
+            ASSERT_NE(activity, MTPParityTransactionActivity::Inconsistent)
+                << "Dense MTP draft/verifier counters disagree around decodeStep";
+
+            std::vector<ActiveCheckpointContext> active_contexts;
+            if (activity == MTPParityTransactionActivity::Speculative)
+            {
+                const uint64_t transaction_delta =
+                    mtpParityExecutedTransactionCount(
+                        before_counters,
+                        after_counters);
+                const uint64_t draft_delta =
+                    mtpParityAttemptedDraftTokenCount(
+                        before_counters,
+                        after_counters);
+                ASSERT_GE(transaction_delta, 1u);
+                ASSERT_GE(draft_delta, transaction_delta);
+                ASSERT_LE(
+                    draft_delta,
+                    transaction_delta *
+                        static_cast<uint64_t>(mtp_draft_tokens));
+
+                const int last_depth =
+                    after.mtp_last_transaction_draft_depth;
+                ASSERT_GE(last_depth, 1);
+                ASSERT_LE(last_depth, mtp_draft_tokens);
+                int captured_depth = selected_depth;
+                if (host_owned_sidecar)
+                {
+                    ASSERT_EQ(transaction_delta, 1u)
+                        << "CPU snapshot observation must own one transaction";
+                    captured_depth = last_depth;
+                }
+                else if (!dynamic_depth)
+                {
+                    ASSERT_EQ(last_depth, selected_depth)
+                        << "Fixed-depth device controller changed depth in-call";
+                }
+                speculative_transaction_count +=
+                    static_cast<int>(transaction_delta);
+
+                active_contexts.push_back({
+                    .production_prefix = std::string(
+                        host_owned_sidecar
+                            ? mtpParityCheckpointContextPrefix(
+                                  MTPParityCheckpointContext::
+                                      HostConditionTokenLivePosition)
+                            : reference_step == 0
+                                  ? mtpParityCheckpointContextPrefix(
+                                        MTPParityCheckpointContext::
+                                            DeviceTargetTokenLivePosition)
+                                  : mtpParityCheckpointContextPrefix(
+                                        MTPParityCheckpointContext::
+                                            DeviceResidentLogicalState)),
+                    .reference_depth = 0,
+                });
+                if (captured_depth > 1)
+                {
+                    active_contexts.push_back({
+                        .production_prefix = std::string(
+                            host_owned_sidecar
+                                ? mtpParityCheckpointContextPrefix(
+                                      MTPParityCheckpointContext::
+                                          HostChainedDraftLivePosition)
+                                : mtpParityCheckpointContextPrefix(
+                                      MTPParityCheckpointContext::
+                                          DeviceChainedTokenLivePosition)),
+                        .reference_depth = captured_depth - 1,
+                    });
+                }
+            }
+
+            const auto snapshots = captureDenseStageSnapshots(*mtp);
+            for (const auto &context : active_contexts)
+            {
+                SCOPED_TRACE(
+                    "dense MTP observation=" +
+                    std::to_string(observation_index) +
+                    " context=" + context.production_prefix +
+                    " reference_depth=" +
+                    std::to_string(context.reference_depth));
+                for (const std::string_view suffix :
+                     qwen36DenseMTPSidecarStageSuffixes())
+                {
+                    const std::string production_key =
+                        context.production_prefix + "MTP0_" +
+                        std::string(suffix);
+                    const auto production = snapshots.find(production_key);
+                    ASSERT_NE(production, snapshots.end())
+                        << "Selected production sidecar omitted "
+                        << production_key;
+
+                    const std::string reference_stage =
+                        "MTP" + std::to_string(context.reference_depth) +
+                        "_" + std::string(suffix);
+                    const std::string reference_key =
+                        "decode_step" + std::to_string(reference_step) +
+                        "_" + reference_stage;
+                    const std::vector<float> reference =
+                        loadDensePyTorchSnapshot(
+                            sidecar_reference_dir,
+                            reference_key);
+                    ASSERT_FALSE(reference.empty())
+                        << "Authenticated dense MTP pack omitted "
+                        << reference_key;
+                    ASSERT_EQ(production->second.data.size(), reference.size())
+                        << production_key << " shape differs from "
+                        << reference_key;
+
+                    const StageComparisonResult stage_result =
+                        compareParityTensorData(
+                            production->second.data.data(),
+                            reference.data(),
+                            reference.size(),
+                            reference_stage,
+                            /*cosine_threshold=*/0.98f);
+                    EXPECT_TRUE(stage_result.passed)
+                        << production_key << " failed dense MTP checkpoint "
+                        << "parity against " << reference_key
+                        << " cosine=" << stage_result.cosine_similarity
+                        << " max_abs=" << stage_result.max_abs_diff;
+
+                    artifact_recorder.requireDecodeStageSuffix(reference_stage);
+                    artifact_recorder.recordDecode(
+                        reference_step,
+                        /*layer=*/-1,
+                        reference_stage,
+                        production->second.data,
+                        reference);
+                    if (suffix == "LM_HEAD")
+                    {
+                        artifact_recorder.recordDecodeToken(
+                            reference_step,
+                            denseArgmaxToken(
+                                production->second.data.data(),
+                                static_cast<int>(
+                                    production->second.data.size())),
+                            denseArgmaxToken(
+                                reference.data(),
+                                static_cast<int>(reference.size())));
+                    }
+                }
+            }
+            ++observation_index;
+        }
+
+        const auto mtp_state = mtp->prefixStateProbe();
+        const bool graph_execution = mtp->executorStats() != nullptr;
+        const std::string production_device =
+            mtp->primaryDeviceId().toString();
+        const auto production_records = PerfStatsCollector::snapshot(
+            {"forward_graph", "mtp", "weight_loading"});
+        mtp->disableSnapshotCapture();
+        mtp->shutdown();
+
+        ASSERT_EQ(
+            emitted_tokens,
+            std::vector<int32_t>(
+                expected_tokens.begin(),
+                expected_tokens.begin() + decode_token_budget));
+        EXPECT_FALSE(mtp_state.mtp_bypassed) << mtp_state.mtp_bypass_reason;
+        EXPECT_GE(mtp_state.mtp_verifier_runs, 1u);
+        EXPECT_GE(speculative_transaction_count, 1);
+        if (dynamic_depth)
+        {
+            EXPECT_TRUE(mtp_state.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(mtp_state.mtp_request.depth_policy_mode, "dynamic");
+            EXPECT_GE(mtp_state.mtp_depth_policy_windows, 1u);
+            EXPECT_GE(mtp_state.mtp_depth_policy_updates, 1u);
+            EXPECT_GE(mtp_state.mtp_depth_policy_demotions, 1u);
+            EXPECT_EQ(mtp_state.mtp_min_depth, depth_policy.min_depth);
+            EXPECT_EQ(mtp_state.mtp_max_depth, depth_policy.max_depth);
+            EXPECT_GE(mtp_state.mtp_current_depth, depth_policy.min_depth);
+            EXPECT_LE(mtp_state.mtp_current_depth, depth_policy.max_depth);
+        }
+        else
+        {
+            EXPECT_FALSE(mtp_state.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(mtp_state.mtp_request.depth_policy_mode, "fixed");
+            EXPECT_EQ(mtp_state.mtp_current_depth, mtp_draft_tokens);
+            EXPECT_EQ(mtp_state.mtp_max_depth, mtp_draft_tokens);
+            EXPECT_EQ(mtp_state.mtp_depth_policy_updates, 0u);
+        }
+
+        if (reuse_enabled)
+        {
+            const auto counter_sum = [&](std::string_view name)
+            {
+                double total = 0.0;
+                for (const auto &record : production_records)
+                {
+                    if (record.kind == PerfStatRecord::Kind::Counter &&
+                        record.domain == "mtp" && record.name == name)
+                        total += record.value;
+                }
+                return total;
+            };
+            EXPECT_EQ(
+                counter_sum(
+                    "dense_parity_campaign_model_context_cache_hits"),
+                model_context_reused ? 1.0 : 0.0);
+            EXPECT_EQ(
+                counter_sum(
+                    "dense_parity_campaign_model_context_cache_misses"),
+                model_context_reused ? 0.0 : 1.0);
+        }
+
+        artifact_recorder.finalize();
+
+        const bool homogeneous_gpu =
+            denseCaseUsesHomogeneousGPU(test_case);
+        const ProductionParityEvidence production_evidence =
+            collectProductionParityEvidence(
+                production_records,
+                graph_execution,
+                homogeneous_gpu,
+                model_context_reused,
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - campaign_started_at)
+                    .count());
+        EXPECT_TRUE(production_evidence.graph_execution)
+            << "Dense MTP checkpoint parity did not use the production graph runner";
+        if (homogeneous_gpu)
+        {
+            EXPECT_TRUE(production_evidence.device_generation_controller)
+                << "Dense MTP parity published no device-generation controller evidence";
+            EXPECT_TRUE(production_evidence.generation_loop_certified)
+                << "Dense MTP parity used outer-loop policy '"
+                << productionDeviceGenerationPolicyName(
+                       production_evidence.generation_execution_policy)
+                << "' without satisfying its backend-specific authority and dispatch proof: "
+                << production_evidence.generation_certification_detail;
+            EXPECT_TRUE(
+                productionParityHasRequiredGenerationGraph(
+                    production_evidence))
+                << "Dense MTP parity did not certify the captured graph body required by its generation policy";
+            expectDenseHomogeneousGPUFullGraphReplay(
+                test_case,
+                production_records,
+                "real-weight dense MTP checkpoint campaign");
+            EXPECT_TRUE(
+                production_evidence.decode_graph_capture ||
+                production_evidence.decode_graph_replay)
+                << "Dense MTP campaign produced no native capture/replay evidence";
+        }
+        EXPECT_TRUE(ParityCSVArtifactWriter::writeProductionPath(
+            ParityCSVArtifactWriter::resultsDir(),
+            artifact_backend,
+            production_device,
+            production_evidence))
+            << "Failed to write dense MTP production_path.csv";
+        PerfStatsCollector::reset();
     }
 
     inline void runDenseMTPParity(
@@ -3687,7 +5443,7 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << *skip_reason;
         }
 
-        const std::string model_path = firstEnvOrDefault(
+        const std::string model_path = firstModelEnvOrDefault(
             test_case.model_envs,
             test_case.default_model_path);
         if (!std::filesystem::exists(model_path))
@@ -3978,7 +5734,7 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << *skip_reason;
         }
 
-        model_path = firstEnvOrDefault(
+        model_path = firstModelEnvOrDefault(
             test_case.model_envs,
             test_case.default_model_path);
         if (!std::filesystem::exists(model_path))
@@ -4752,7 +6508,7 @@ namespace llaminar2::test::parity::qwen36
             GTEST_SKIP() << *skip_reason;
         }
 
-        const std::string model_path = firstEnvOrDefault(
+        const std::string model_path = firstModelEnvOrDefault(
             test_case.model_envs,
             test_case.default_model_path);
         if (!std::filesystem::exists(model_path))

@@ -42,7 +42,7 @@
  * 2. LOCAL TP (single-rank): One MPI rank with multiple devices
  *    - Configured via ILocalTPContext in InferenceRunnerConfig
  *    - Collectives via NCCL/RCCL/HOST
- *    - Use: llaminar2 --tp 2 --tp-scope local --tp-devices cuda:0,rocm:0
+ *    - Use: llaminar2 --tp 2 --tp-scope rank_local --tp-devices cuda:0,rocm:0
  *
  * @code
  * // GLOBAL TP: via MPI world_size
@@ -82,12 +82,16 @@ namespace llaminar2
     class ITPContext;
     class ILocalTPContext;
     class IRankOrchestrator;
-    class MoERebalanceController;
+    class DecodeExpertHistogram;
+    class MoEOverlayResidencyAuthority;
+    class MoEOverlayParticipantResidencyRegistry;
     class PreparedWeightStore;
     class MoEExpertOverlayRuntimePlan;
+    class MoEOverlayNodeLocalRouteExchange;
     struct GraphConfig;
     struct MoEExpertOverlayExecutionPlan;
     struct MoERoutedExpertPlacementPlan;
+    struct MoERoutedExpertModelMetadata;
 
     using DomainTPContextMap = std::map<std::string, std::shared_ptr<ITPContext>>;
 
@@ -136,6 +140,10 @@ namespace llaminar2
 
         /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
         RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
+
+        /// Static whole-expert owner ordering for apportioned execution.
+        RoutedExpertOwnerOrder routed_expert_owner_order =
+            RoutedExpertOwnerOrder::Ordinal;
 
         /// Bounded remote-expert cache for dynamic routed-row assignment.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
@@ -195,6 +203,37 @@ namespace llaminar2
         /// Optional same-layer MoE expert overlay plan propagated into GraphConfig.
         std::shared_ptr<MoERoutedExpertPlacementPlan> moe_routed_expert_plan;
 
+        /**
+         * @brief Shared live residency authority for every participant graph.
+         *
+         * The production orchestration runner creates this once after model-aware
+         * placement is frozen. Child device and pipeline runners must retain this
+         * exact instance; constructing an authority per graph would permit two
+         * different owner epochs to coexist inside one sparse collective.
+         */
+        std::shared_ptr<MoEOverlayResidencyAuthority>
+            moe_expert_overlay_residency_authority;
+
+        /**
+         * @brief Process-local epoch-indexed prepared banks for overlay endpoints.
+         *
+         * This is created beside the global residency authority and retained by
+         * every cached graph.  Dispatch selects a global owner-map epoch while
+         * local expert stages resolve the matching immutable prepared bank here.
+         */
+        std::shared_ptr<MoEOverlayParticipantResidencyRegistry>
+            moe_expert_overlay_participant_residency;
+
+        /**
+         * @brief Shared histogram lifetime consumed by the residency authority.
+         *
+         * GraphConfig carries a non-owning pointer for allocation-free route
+         * recording, while this shared owner keeps the two-bank histogram alive
+         * through every cached graph and background migration wave.
+         */
+        std::shared_ptr<DecodeExpertHistogram>
+            moe_expert_overlay_decode_histogram;
+
         /// True when a parent RankOrchestrator has already prepared overlay
         /// expert weights for the whole LocalTP domain. Child device runners
         /// still receive the overlay plan for graph routing, but skip the
@@ -202,6 +241,10 @@ namespace llaminar2
 
         /// Optional MPI context used by MoE overlay domain-worker commands.
         std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
+
+        /** Shared sparse continuation-route fabric for sibling device graphs. */
+        std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
+            moe_node_local_route_exchange;
 
         /// Optional graph-level cancellation hook. Queried before each stage,
         /// usually backed by a TP collective abort flag.
@@ -234,6 +277,8 @@ namespace llaminar2
             config.kv_cache_scale_k = plan.runtime.kv_cache_scale_k;
             config.kv_cache_scale_v = plan.runtime.kv_cache_scale_v;
             config.routed_expert_compute_policy = plan.runtime.routed_expert_compute_policy;
+            config.routed_expert_owner_order =
+                plan.runtime.routed_expert_owner_order;
             config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
             config.moe_routed_prefill = plan.runtime.moe_routed_prefill;
             config.moe_rebalance = plan.runtime.moe_rebalance;
@@ -284,9 +329,41 @@ namespace llaminar2
         DeviceId device,
         const InferenceRunnerConfig &config = {});
 
+    /**
+     * @brief Freeze one tiered-overlay plan for the graph family that will run.
+     *
+     * Placement geometry is runtime-policy dependent for models whose GGUF
+     * stores a routed-MoE NextN block after the ordinary decoder layers.  A
+     * non-MTP runner must not allocate or wait for that inactive bank, while an
+     * MTP runner must include it so sidecar graph construction can publish the
+     * same residency epoch as the main graph.
+     *
+     * @param model_ctx Loaded model and tensor-inventory authority.
+     * @param config Exact runner policy, including whether MTP is enabled.
+     * @return The immutable runtime-active plan, or null when no plan was supplied.
+     * @throws std::invalid_argument when model geometry, explicit placement,
+     *         or the requested MTP sidecar cannot form a complete plan.
+     */
     std::shared_ptr<MoERoutedExpertPlacementPlan> resolveMoERoutedExpertPlacementPlanForModel(
         IModelContext &model_ctx,
         const InferenceRunnerConfig &config);
+
+    /**
+     * @brief Resolve routed-expert geometry for one runtime graph family.
+     *
+     * Main decoder layers are always included. Routed-MoE NextN source layers
+     * are included only when @p mtp is enabled, because only that graph family
+     * constructs and publishes those prepared expert banks.
+     *
+     * @param model_ctx Loaded model metadata authority.
+     * @param mtp Exact MTP graph policy for the runner being constructed.
+     * @return Exact runtime-active layer/expert/hidden/intermediate geometry.
+     * @throws std::invalid_argument when enabled MTP metadata is incomplete or
+     *         routed sidecar layer identities are not contiguous after the main graph.
+     */
+    MoERoutedExpertModelMetadata resolveMoERoutedExpertModelMetadataForModel(
+        IModelContext &model_ctx,
+        const MTPRuntimeConfig &mtp);
 
     bool applyMoEExpertOverlayConfigToGraphForTesting(
         IModelContext &model_ctx,
@@ -302,14 +379,24 @@ namespace llaminar2
         DeviceId requested_device,
         const std::string &log_prefix = "[InferenceRunner]");
 
-    std::vector<std::unique_ptr<MoERebalanceController>> createMoERebalanceControllersForGraph(
+    /**
+     * @brief Reject any multi-participant MoE graph without its sole RCU owner.
+     *
+     * Orchestration normalizes every supported multi-device routed-expert
+     * topology into ExpertOverlay before factory graph construction. This
+     * boundary prevents an incomplete caller from silently recreating the
+     * retired per-domain controller path.
+     *
+     * @param graph_config Fully resolved graph configuration.
+     * @param local_tp_ctx Optional rank-local participant topology.
+     * @param tp_ctx Optional generic/global participant topology.
+     * @throws std::logic_error for missing, inconsistent, or unnormalized
+     *         durable residency ownership.
+     */
+    void validateMoEDurableResidencyAuthorityForGraph(
         const GraphConfig &graph_config,
         const ILocalTPContext *local_tp_ctx,
         const ITPContext *tp_ctx);
-
-    MoERebalanceController *bindActiveMoERebalanceControllerForGraph(
-        GraphConfig &graph_config,
-        const std::vector<std::unique_ptr<MoERebalanceController>> &controllers);
 
     /**
      * @brief Factory function to create a unified LOCAL PP runner
@@ -389,7 +476,7 @@ namespace llaminar2
      * @brief Factory function to create RankOrchestrator for LOCAL TP
      *
      * Creates a RankOrchestrator that coordinates multiple devices within
-     * a single MPI rank. Use this when LOCAL TP is configured via --tp-scope local.
+     * a single MPI rank. Use this when LOCAL TP is configured via --tp-scope rank_local.
      *
      * @param model_ctx Model context with weights
      * @param tp_ctx Pre-constructed LOCAL TP context (ownership transferred)

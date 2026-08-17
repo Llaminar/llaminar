@@ -11,6 +11,8 @@
 #include "../../../utils/Logger.h"
 #include <queue>
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -18,6 +20,16 @@ namespace llaminar2
     // =============================================================================
     // ComputeGraph Implementation
     // =============================================================================
+
+    void ComputeGraph::noteTopologyMutation()
+    {
+        if (topology_generation_ == std::numeric_limits<uint64_t>::max())
+        {
+            throw std::overflow_error(
+                "ComputeGraph topology generation exhausted");
+        }
+        ++topology_generation_;
+    }
 
     ComputeGraph &ComputeGraph::addNode(const std::string &name,
                                         std::unique_ptr<IComputeStage> stage,
@@ -30,6 +42,14 @@ namespace llaminar2
             nodes_[idx]->stage = std::move(stage);
             nodes_[idx]->device = device;
             nodes_[idx]->completed = false;
+            // A replacement stage must opt into the scheduling contract again;
+            // retaining metadata from the previous stage could align the wrong
+            // native capture transaction across LocalTP participants.
+            nodes_[idx]->graph_capture_wave.reset();
+            cached_execution_stages_.clear();
+            execution_stages_dirty_ = true;
+            fast_schedule_.clear();
+            noteTopologyMutation();
             return *this;
         }
 
@@ -37,6 +57,86 @@ namespace llaminar2
         node_index_[name] = nodes_.size();
         nodes_.push_back(std::move(node));
         order_dirty_ = true;
+        execution_stages_dirty_ = true;
+        fast_schedule_.clear();
+        noteTopologyMutation();
+        return *this;
+    }
+
+    ComputeGraph &ComputeGraph::setGraphCaptureWaveContract(
+        const std::string &node_name,
+        GraphCaptureWaveContract contract)
+    {
+        auto it = node_index_.find(node_name);
+        if (it == node_index_.end())
+        {
+            throw std::out_of_range(
+                "Cannot attach capture-wave contract to missing graph node '" +
+                node_name + "'");
+        }
+        if (contract.identity.empty())
+        {
+            throw std::invalid_argument(
+                "Capture-wave contract for node '" + node_name +
+                "' requires a non-empty identity");
+        }
+        const auto *const stage = nodes_[it->second]->stage.get();
+        if (contract.participation ==
+                GraphCaptureWaveParticipation::Passive &&
+            (!stage || !stage->isPassiveGraphCaptureNoOp()))
+        {
+            throw std::invalid_argument(
+                "Capture-wave contract for node '" + node_name +
+                "' declares passive participation, but its stage is not an "
+                "immutable graph-capture no-op");
+        }
+
+        std::unordered_set<std::string> passive_identities;
+        for (const auto &identity : contract.passive_following_identities)
+        {
+            if (identity.empty())
+            {
+                throw std::invalid_argument(
+                    "Capture-wave contract for node '" + node_name +
+                    "' contains an empty passive identity");
+            }
+            if (!passive_identities.insert(identity).second)
+            {
+                throw std::invalid_argument(
+                    "Capture-wave contract for node '" + node_name +
+                    "' repeats passive identity '" + identity + "'");
+            }
+            if (identity == contract.identity)
+            {
+                throw std::invalid_argument(
+                    "Capture-wave contract for node '" + node_name +
+                    "' repeats its own wave identity as a passive follower");
+            }
+        }
+
+        nodes_[it->second]->graph_capture_wave = std::move(contract);
+        noteTopologyMutation();
+        return *this;
+    }
+
+    ComputeGraph &ComputeGraph::setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope envelope)
+    {
+        if (native_capture_envelope_ == envelope)
+            return *this;
+        if (native_capture_envelope_ != GraphNativeCaptureEnvelope::Ordinary &&
+            envelope != GraphNativeCaptureEnvelope::Ordinary)
+        {
+            throw std::logic_error(
+                "ComputeGraph cannot replace one non-ordinary native-capture envelope with another");
+        }
+        if (envelope == GraphNativeCaptureEnvelope::Ordinary)
+        {
+            throw std::logic_error(
+                "ComputeGraph cannot weaken an installed native-capture envelope");
+        }
+        native_capture_envelope_ = envelope;
+        noteTopologyMutation();
         return *this;
     }
 
@@ -58,6 +158,9 @@ namespace llaminar2
 
         nodes_[it->second]->dependencies.push_back(depends_on);
         order_dirty_ = true;
+        execution_stages_dirty_ = true;
+        fast_schedule_.clear();
+        noteTopologyMutation();
         return *this;
     }
 
@@ -125,6 +228,24 @@ namespace llaminar2
         cached_order_ = std::move(order);
         order_dirty_ = false;
         return cached_order_;
+    }
+
+    const std::vector<IComputeStage *> &ComputeGraph::getExecutionStages()
+    {
+        if (!execution_stages_dirty_)
+            return cached_execution_stages_;
+
+        const std::vector<std::string> &order = getExecutionOrder();
+        cached_execution_stages_.clear();
+        cached_execution_stages_.reserve(order.size());
+        for (const std::string &name : order)
+        {
+            ComputeNode *node = getNode(name);
+            cached_execution_stages_.push_back(
+                node && node->stage ? node->stage.get() : nullptr);
+        }
+        execution_stages_dirty_ = false;
+        return cached_execution_stages_;
     }
 
     std::vector<std::string> ComputeGraph::getReadyNodes() const
@@ -236,8 +357,13 @@ namespace llaminar2
     {
         nodes_.clear();
         node_index_.clear();
+        cached_order_.clear();
+        cached_execution_stages_.clear();
         fast_schedule_.clear();
         order_dirty_ = true;
+        execution_stages_dirty_ = true;
+        native_capture_envelope_ = GraphNativeCaptureEnvelope::Ordinary;
+        noteTopologyMutation();
     }
 
     void ComputeGraph::buildFastSchedule(const std::unordered_set<std::string> *collective_nodes)
@@ -277,6 +403,19 @@ namespace llaminar2
         if (other.nodes_.empty())
         {
             return *this;
+        }
+
+        if (native_capture_envelope_ != GraphNativeCaptureEnvelope::Ordinary &&
+            other.native_capture_envelope_ !=
+                GraphNativeCaptureEnvelope::Ordinary &&
+            native_capture_envelope_ != other.native_capture_envelope_)
+        {
+            throw std::logic_error(
+                "ComputeGraph merge received incompatible native-capture envelopes");
+        }
+        if (native_capture_envelope_ == GraphNativeCaptureEnvelope::Ordinary)
+        {
+            native_capture_envelope_ = other.native_capture_envelope_;
         }
 
         // Find root nodes in the source graph (nodes with no dependencies)
@@ -320,8 +459,19 @@ namespace llaminar2
         // Clear the source graph
         other.nodes_.clear();
         other.node_index_.clear();
+        other.cached_order_.clear();
+        other.cached_execution_stages_.clear();
+        other.fast_schedule_.clear();
+        other.order_dirty_ = true;
+        other.execution_stages_dirty_ = true;
+        other.native_capture_envelope_ =
+            GraphNativeCaptureEnvelope::Ordinary;
 
         order_dirty_ = true;
+        execution_stages_dirty_ = true;
+        fast_schedule_.clear();
+        noteTopologyMutation();
+        other.noteTopologyMutation();
         return *this;
     }
 

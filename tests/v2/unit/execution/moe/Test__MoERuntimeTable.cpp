@@ -4,6 +4,7 @@
  */
 
 #include "execution/moe/MoERuntimeTable.h"
+#include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/moe/DecodeExpertHistogram.h"
 
@@ -156,6 +157,75 @@ namespace llaminar2::test
         EXPECT_EQ(layer0->active_epoch, 0u);
         EXPECT_EQ(layer0->participant_id, 0u);
         EXPECT_EQ(layer0->participant_count, 1u);
+    }
+
+    TEST(Test__MoERuntimeTable,
+         OverlayEpochTicketIsStableTopologyAcrossEveryResetTemplate)
+    {
+        auto arena = std::make_shared<DeviceMoEOverlayEpochArena>(
+            DeviceMoEOverlayEpochArena::Config{
+                .device_id = DeviceId::cpu(),
+                .initial_epoch = 41u,
+                .initial_bank = 1u,
+                .request_slot_capacity = 3u,
+            });
+        DeviceMoERuntimeTable::Config config{
+            .device_id = DeviceId::cpu(),
+            .num_layers = 2,
+            .num_experts = 4,
+            .top_k = 2,
+            .overlay_epoch_arena = arena,
+            .overlay_epoch_ticket_slot = 2u,
+        };
+        MoERuntimeTable table(config);
+
+        const auto *const expected_ticket = arena->requestTicket(2u);
+        ASSERT_TRUE(table.usesOverlayEpochTicket());
+        ASSERT_EQ(table.overlayEpochTicket(), expected_ticket);
+        EXPECT_EQ(table.hostLayerState(0).overlay_epoch_ticket,
+                  expected_ticket);
+        EXPECT_EQ(table.hostLayerState(1).overlay_epoch_ticket,
+                  expected_ticket);
+
+        auto update = updateForEpoch(1u, 4);
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1u, nullptr));
+        table.restoreInitialRuntimeState();
+        EXPECT_EQ(table.hostLayerState(0).overlay_epoch_ticket,
+                  expected_ticket);
+        EXPECT_EQ(table.hostLayerState(1).overlay_epoch_ticket,
+                  expected_ticket);
+
+        table.resetDecodeRuntimeState();
+        EXPECT_EQ(table.hostLayerState(0).overlay_epoch_ticket,
+                  expected_ticket);
+        EXPECT_EQ(table.hostLayerState(1).overlay_epoch_ticket,
+                  expected_ticket);
+    }
+
+    TEST(Test__MoERuntimeTable,
+         OverlayEpochTicketConfigurationRejectsUnboundOrOutOfRangeSlots)
+    {
+        DeviceMoERuntimeTable::Config config{
+            .device_id = DeviceId::cpu(),
+            .num_layers = 1,
+            .num_experts = 4,
+            .top_k = 2,
+            .overlay_epoch_ticket_slot = 1u,
+        };
+        EXPECT_THROW({ MoERuntimeTable table(config); },
+                     std::invalid_argument);
+
+        config.overlay_epoch_arena =
+            std::make_shared<DeviceMoEOverlayEpochArena>(
+                DeviceMoEOverlayEpochArena::Config{
+                    .device_id = DeviceId::cpu(),
+                    .initial_epoch = 1u,
+                    .initial_bank = 0u,
+                    .request_slot_capacity = 1u,
+                });
+        EXPECT_THROW({ MoERuntimeTable table(config); },
+                     std::invalid_argument);
     }
 
     TEST(Test__MoERuntimeTable, FullyReplicatedTopologyPublishesEveryParticipantAndCanonicalOwner)
@@ -448,6 +518,51 @@ namespace llaminar2::test
             << "No-work waves must not look like empty payload-bucket transfers.";
     }
 
+    TEST(Test__MoERuntimeTable,
+         DeviceRebalanceRequestMovementEvidenceSurvivesEmptyFinalWave)
+    {
+        constexpr uint64_t kSlotBytes = 1024;
+
+        const auto dynamic = deviceMoERebalanceRequestMovementEvidence(
+            /*wave_copied_arrivals=*/3,
+            /*wave_applied_arrivals=*/2,
+            /*prefill_current_batch_movement_layers=*/0,
+            kSlotBytes);
+        EXPECT_EQ(dynamic.copied_payload_lower_bound, 3u);
+        EXPECT_EQ(dynamic.applied_payload_lower_bound, 2u);
+        EXPECT_EQ(dynamic.completed_payload_lower_bound, 2u);
+        EXPECT_EQ(dynamic.useful_payload_bytes_lower_bound, 2u * kSlotBytes);
+
+        const auto current_batch_llep =
+            deviceMoERebalanceRequestMovementEvidence(
+                /*wave_copied_arrivals=*/0,
+                /*wave_applied_arrivals=*/0,
+                /*prefill_current_batch_movement_layers=*/40,
+                kSlotBytes);
+        EXPECT_EQ(current_batch_llep.copied_payload_lower_bound, 40u);
+        EXPECT_EQ(current_batch_llep.applied_payload_lower_bound, 40u);
+        EXPECT_EQ(current_batch_llep.completed_payload_lower_bound, 40u);
+        EXPECT_EQ(current_batch_llep.useful_payload_bytes_lower_bound,
+                  40u * kSlotBytes)
+            << "The sticky LLEP apply marker must retain physical movement "
+               "evidence after its layer-local status buffer is reused.";
+
+        const auto overlapping = deviceMoERebalanceRequestMovementEvidence(
+            /*wave_copied_arrivals=*/4,
+            /*wave_applied_arrivals=*/4,
+            /*prefill_current_batch_movement_layers=*/3,
+            kSlotBytes);
+        EXPECT_EQ(overlapping.completed_payload_lower_bound, 4u)
+            << "Overlapping durable authorities form a lower bound and must "
+               "not be double counted.";
+
+        const auto no_payload_lane =
+            deviceMoERebalanceRequestMovementEvidence(1, 1, 0, 0);
+        EXPECT_EQ(no_payload_lane.useful_payload_bytes_lower_bound, 0u)
+            << "Logical placement without whole-expert payload bytes cannot "
+               "certify physical movement.";
+    }
+
     TEST(Test__MoERuntimeTable, DeviceRebalanceRouterBenefitFloorAllowsBootstrapThenRejectsLowValueWaves)
     {
         using moe_rebalance_policy::transferWaveMeetsRealizedRouterBenefitFloor;
@@ -506,6 +621,35 @@ namespace llaminar2::test
         EXPECT_EQ(bank.experts[2].gate.payload, update.experts[2].gate.payload);
         EXPECT_EQ(bank.experts[2].up.scales, update.experts[2].up.scales);
         EXPECT_EQ(bank.experts[2].down.n, update.experts[2].down.n);
+    }
+
+    TEST(Test__MoERuntimeTable,
+         OverlayRouteParticipantsAreVersionedIndependentlyOfDomainLocalOwners)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 2;
+        update.overlay_route_participant = {17, 23, 17, 41};
+
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        const auto &prepared = table.hostLayerState(0).banks[1];
+        EXPECT_EQ(prepared.experts[1].owner_participant, 1)
+            << "compute ownership remains domain-local";
+        EXPECT_EQ(prepared.overlay_route_participant[1], 23)
+            << "sparse dispatch uses the overlay-wide logical participant";
+
+        auto malformed = updateForEpoch(1, 4);
+        malformed.overlay_route_participant = {0, 1};
+        EXPECT_THROW(
+            table.prepareInactiveBank(0, malformed),
+            std::invalid_argument);
+
+        malformed = updateForEpoch(1, 4);
+        malformed.overlay_route_participant = {0, 1, -2, 1};
+        EXPECT_THROW(
+            table.prepareInactiveBank(0, malformed),
+            std::invalid_argument);
     }
 
     TEST(Test__MoERuntimeTable, ExplicitResidentParticipantMasksRoundTripAndValidate)
@@ -942,6 +1086,10 @@ namespace llaminar2::test
         snapshot[0].active_epoch = 91u;
         snapshot[0].selected_histogram[1] = 1234u;
         snapshot[0].local_histogram[1] = 567u;
+        snapshot[0].prefill_selected_histogram[2] = 222u;
+        snapshot[0].prefill_local_histogram[2] = 111u;
+        snapshot[0].grouped_verifier_selected_histogram[3] = 44u;
+        snapshot[0].grouped_verifier_local_histogram[3] = 22u;
 
         const DeviceMoEPortableRuntimeRestoreResult history_restore =
             table.restorePortableRuntimeState(snapshot);
@@ -953,6 +1101,14 @@ namespace llaminar2::test
         EXPECT_FALSE(history_restore.requires_device_payload_rehydration);
         EXPECT_EQ(table.hostLayerState(0).decode_histogram[1], 1234u);
         EXPECT_EQ(table.hostLayerState(0).decode_local_histogram[1], 567u);
+        EXPECT_EQ(table.hostLayerState(0).prefill_histogram[2], 222u);
+        EXPECT_EQ(table.hostLayerState(0).prefill_local_histogram[2], 111u);
+        EXPECT_EQ(
+            table.hostLayerState(0).grouped_verifier_histogram[3],
+            44u);
+        EXPECT_EQ(
+            table.hostLayerState(0).grouped_verifier_local_histogram[3],
+            22u);
 
         snapshot[0].experts[0].owner_participant = 1;
         snapshot[0].experts[0].replica_role =
@@ -1593,6 +1749,14 @@ namespace llaminar2::test
         table.hostLayerState(1).decode_histogram[3] = 2;
         table.hostLayerState(1).decode_local_histogram[1] = 1;
         table.hostLayerState(1).decode_local_histogram[3] = 2;
+        table.hostLayerState(0).prefill_histogram[1] = 1;
+        table.hostLayerState(0).prefill_local_histogram[1] = 1;
+        table.hostLayerState(1).prefill_histogram[0] = 2;
+        table.hostLayerState(1).prefill_histogram[2] = 2;
+        table.hostLayerState(1).prefill_local_histogram[0] = 2;
+        table.hostLayerState(1).grouped_verifier_histogram[0] = 1;
+        table.hostLayerState(1).grouped_verifier_histogram[3] = 1;
+        table.hostLayerState(1).grouped_verifier_local_histogram[3] = 1;
         table.hostLayerState(0).router_hot_cache_eligible_dispatches = 2;
         table.hostLayerState(0).router_hot_cache_used_dispatches = 1;
         table.hostLayerState(0).router_hot_cache_improved_dispatches = 1;
@@ -1614,23 +1778,49 @@ namespace llaminar2::test
         cfg.top_k = 2;
         cfg.window_size = 8;
         cfg.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
-        cfg.expert_to_socket = {0, 1, 0, 1};
+        cfg.ownership = MoELayeredExpertOwnership::uniform(
+            2, 2, {0, 1, 0, 1});
         DecodeExpertHistogram hist(cfg);
 
         hist.recordTokenBoundary(1);
         ASSERT_TRUE(table.syncDecodeHistogramToHost(hist));
 
         EXPECT_EQ(hist.activationCount(0, 0), 3u);
+        EXPECT_EQ(hist.activationCount(0, 1), 1u);
         EXPECT_EQ(hist.activationCount(0, 2), 1u);
+        EXPECT_EQ(hist.activationCount(1, 0), 3u);
         EXPECT_EQ(hist.activationCount(1, 1), 2u);
-        EXPECT_EQ(hist.activationCount(1, 3), 2u);
-        EXPECT_EQ(hist.windowTokenCount(), 1u);
+        EXPECT_EQ(hist.activationCount(1, 2), 2u);
+        EXPECT_EQ(hist.activationCount(1, 3), 3u);
+        EXPECT_EQ(
+            hist.activationCount(
+                ExpertHistogramSource::DecodeToken, 1, 1),
+            2u);
+        EXPECT_EQ(
+            hist.activationCount(
+                ExpertHistogramSource::PrefillChunk, 1, 2),
+            2u);
+        EXPECT_EQ(
+            hist.activationCount(
+                ExpertHistogramSource::GroupedVerifier, 1, 3),
+            1u);
+        EXPECT_EQ(hist.windowTokenCount(), 4u);
 
         for (int layer = 0; layer < 2; ++layer)
             for (int expert = 0; expert < 4; ++expert)
             {
                 EXPECT_EQ(table.hostLayerState(layer).decode_histogram[expert], 0u);
                 EXPECT_EQ(table.hostLayerState(layer).decode_local_histogram[expert], 0u);
+                EXPECT_EQ(table.hostLayerState(layer).prefill_histogram[expert], 0u);
+                EXPECT_EQ(table.hostLayerState(layer).prefill_local_histogram[expert], 0u);
+                EXPECT_EQ(
+                    table.hostLayerState(layer)
+                        .grouped_verifier_histogram[expert],
+                    0u);
+                EXPECT_EQ(
+                    table.hostLayerState(layer)
+                        .grouped_verifier_local_histogram[expert],
+                    0u);
             }
         for (int layer = 0; layer < 2; ++layer)
         {
@@ -1646,6 +1836,7 @@ namespace llaminar2::test
         ASSERT_TRUE(table.syncDecodeHistogramToHost(hist));
         EXPECT_EQ(hist.activationCount(0, 0), 3u);
         EXPECT_EQ(hist.activationCount(1, 1), 2u);
+        EXPECT_EQ(hist.windowTokenCount(), 4u);
     }
 
     TEST(Test__MoERuntimeTable, DeviceRebalancePolicyPublishesHotReplicasFromResidentMasks)

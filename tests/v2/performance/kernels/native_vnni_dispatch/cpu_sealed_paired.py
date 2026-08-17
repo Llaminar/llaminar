@@ -344,16 +344,21 @@ def load_cpu_burned_seal_development(
 def _validated_cpu_sealed_cells(
     requests: Sequence[CPUSealedRequest],
     evidence_paths: Iterable[Path],
+    *,
+    require_promotion_eligible_timing: bool,
 ) -> dict[
     tuple[int, str],
     list[tuple[PairedTimingRequest, PairedCellEvidence]],
 ]:
     """Authenticate paired CSV rows and group complete challenger surfaces.
 
-    Certification and failed-seal adaptation must consume exactly the same
-    evidence transaction. Keeping request replay in one helper prevents a
-    future development adapter from accepting a relabeled M, geometry, source
-    alias, ISA regime, or candidate edge that final certification would reject.
+    Certification and failed-seal adaptation authenticate exactly the same
+    request fields. Keeping request replay in one helper prevents a future
+    development adapter from accepting a relabeled M, geometry, source alias,
+    ISA regime, or candidate edge that final certification would reject. The
+    timing-environment threshold is intentionally explicit: final promotion
+    requires process-isolated v4 evidence, while an already-burned legacy v3
+    seal may remain a non-authoritative development prior.
     """
 
     single_candidate_request_ids = frozenset(
@@ -368,6 +373,18 @@ def _validated_cpu_sealed_cells(
             (Path(path),),
             allow_identical_request_ids=single_candidate_request_ids,
         ))
+    if require_promotion_eligible_timing:
+        nonisolated = [
+            cell.request_id
+            for cell in cells
+            if not cell.promotion_eligible_timing
+        ]
+        if nonisolated:
+            raise ValueError(
+                "CPU sealed paired evidence was collected with an "
+                "unauthenticated co-run environment: "
+                f"request_ids={sorted(nonisolated)!r}"
+            )
     by_request = {}
     for cell in cells:
         if cell.request_id in by_request:
@@ -442,7 +459,11 @@ def cpu_sealed_development_costs(
     witnesses_by_rule = {item.rule_index: item for item in witnesses}
     if len(witnesses_by_rule) != len(witnesses):
         raise ValueError("burned CPU seal repeats a rule witness")
-    grouped = _validated_cpu_sealed_cells(requests, evidence_paths)
+    grouped = _validated_cpu_sealed_cells(
+        requests,
+        evidence_paths,
+        require_promotion_eligible_timing=False,
+    )
     surfaces_by_rule: dict[
         int, dict[str, dict[str, float]]
     ] = defaultdict(dict)
@@ -715,7 +736,11 @@ def certify_cpu_sealed_pairs(
     if len(witnesses) != len(rules):
         raise ValueError("CPU paired seal does not witness every frozen rule")
 
-    grouped = _validated_cpu_sealed_cells(requests, evidence_paths)
+    grouped = _validated_cpu_sealed_cells(
+        requests,
+        evidence_paths,
+        require_promotion_eligible_timing=True,
+    )
 
     tasks = []
     metadata = []

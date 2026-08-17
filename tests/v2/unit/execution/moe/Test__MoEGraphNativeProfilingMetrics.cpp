@@ -140,9 +140,11 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeLocalExpert_Popula
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
         /*layer=*/5,
         /*tier_index=*/2,
+        /*participant_id=*/3,
         /*device_key=*/"cpu:0",
         /*is_cpu=*/true,
-        /*input_rows=*/20,
+        /*inbound_rows=*/20,
+        /*active_routes=*/24,
         /*output_rows=*/20,
         /*unique_expert_ids=*/{0, 2, 4},
         /*compute_ms=*/3.14);
@@ -152,7 +154,11 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeLocalExpert_Popula
     EXPECT_EQ(rows[0].phase, "gn_local_expert");
     EXPECT_EQ(rows[0].layer, 5);
     EXPECT_EQ(rows[0].tier_index, 2);
+    EXPECT_EQ(rows[0].participant_id, 3);
     EXPECT_EQ(rows[0].domain_kind, "CPU");
+    EXPECT_EQ(rows[0].inbound_rows, 20u);
+    EXPECT_EQ(rows[0].active_routes, 24u);
+    EXPECT_EQ(rows[0].routed_entries, 24u);
     EXPECT_EQ(rows[0].selected_rows, 20u);
     EXPECT_EQ(rows[0].cpu_fallback_rows, 20u);
     EXPECT_EQ(rows[0].gpu_cached_rows, 0u);
@@ -164,11 +170,48 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeLocalExpert_Popula
 TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeLocalExpert_GpuFlag)
 {
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-        2, 0, "cuda:0", /*is_cpu=*/false, 8, 8, {1, 3}, 0.5);
+        2, 0, /*participant_id=*/0, "cuda:0", /*is_cpu=*/false,
+        /*inbound_rows=*/8, /*active_routes=*/8, /*output_rows=*/8,
+        {1, 3}, 0.5);
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0].domain_kind, "GPU");
+}
+
+/**
+ * @brief CPU/NUMA endpoints sharing one backend must remain separate CSV rows.
+ *
+ * A zero-work participant is important evidence: it proves the graph reached
+ * that owner and lets a production campaign distinguish an idle expert shard
+ * from an accidentally omitted one.
+ */
+TEST_F(Test__MoEGraphNativeProfilingMetrics,
+       RecordGraphNativeLocalExpert_ParticipantIdentityPreservesZeroWork)
+{
+    MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
+        /*layer=*/3, /*tier_index=*/2, /*participant_id=*/2,
+        /*device_key=*/"CPU", /*is_cpu=*/true,
+        /*inbound_rows=*/5, /*active_routes=*/0, /*output_rows=*/0,
+        /*unique_expert_ids=*/{}, /*compute_ms=*/0.0);
+    MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
+        /*layer=*/3, /*tier_index=*/2, /*participant_id=*/3,
+        /*device_key=*/"CPU", /*is_cpu=*/true,
+        /*inbound_rows=*/5, /*active_routes=*/4, /*output_rows=*/3,
+        /*unique_expert_ids=*/{224, 225}, /*compute_ms=*/0.2);
+
+    const auto rows = MoEExpertOverlayProfiler::rows();
+    ASSERT_EQ(rows.size(), 2u);
+    const auto p2 = std::find_if(rows.begin(), rows.end(), [](const auto &row)
+                                 { return row.participant_id == 2; });
+    const auto p3 = std::find_if(rows.begin(), rows.end(), [](const auto &row)
+                                 { return row.participant_id == 3; });
+    ASSERT_NE(p2, rows.end());
+    ASSERT_NE(p3, rows.end());
+    EXPECT_EQ(p2->active_routes, 0u);
+    EXPECT_EQ(p2->selected_rows, 0u);
+    EXPECT_EQ(p3->active_routes, 4u);
+    EXPECT_EQ(p3->selected_rows, 3u);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -226,7 +269,9 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, AllThreePhases_AllPresent)
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
         0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.1);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-        0, 1, "cpu:0", true, 6, 6, {0, 1}, 1.0);
+        0, 1, /*participant_id=*/2, "cpu:0", true,
+        /*inbound_rows=*/6, /*active_routes=*/8, /*output_rows=*/6,
+        {0, 1}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
         0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.2, 0.1, 0.0);
 
@@ -242,7 +287,9 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, GraphNativeRowsPublishUnifiedPerfSt
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
         0, 1, "dispatch_domain", 0, 1, 8, 16, 6, 1024, 4096, 0.1);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-        0, 1, "rocm:0", false, 6, 6, {0, 2}, 1.25);
+        0, 1, /*participant_id=*/1, "rocm:0", false,
+        /*inbound_rows=*/6, /*active_routes=*/6, /*output_rows=*/6,
+        {0, 2}, 1.25);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
         0, 1, "return_domain", 1, 0, 6, 8, 512, 2048, 0.2, 0.05, 0.03);
 
@@ -273,7 +320,9 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, CsvIncludesGraphNativePhases)
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
         0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-        0, 1, "cpu:0", true, 6, 6, {0}, 1.0);
+        0, 1, /*participant_id=*/2, "cpu:0", true,
+        /*inbound_rows=*/6, /*active_routes=*/6, /*output_rows=*/6,
+        {0}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
         0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
 
@@ -283,6 +332,8 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, CsvIncludesGraphNativePhases)
     EXPECT_NE(csv.find("gn_return_reduce"), std::string::npos);
     // New CSV columns must be present in header
     EXPECT_NE(csv.find("tier_index"), std::string::npos);
+    EXPECT_NE(csv.find("participant_id"), std::string::npos);
+    EXPECT_NE(csv.find("active_routes"), std::string::npos);
     EXPECT_NE(csv.find("dense_bytes_avoided"), std::string::npos);
     EXPECT_NE(csv.find("inbound_rows"), std::string::npos);
     EXPECT_NE(csv.find("compact_dispatch_bytes"), std::string::npos);
@@ -298,7 +349,9 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, SummaryIncludesGraphNativePhases)
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
         0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-        0, 1, "cpu:0", true, 6, 6, {0}, 1.0);
+        0, 1, /*participant_id=*/2, "cpu:0", true,
+        /*inbound_rows=*/6, /*active_routes=*/6, /*output_rows=*/6,
+        {0}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
         0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
 
@@ -313,7 +366,9 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, WhenProfilingDisabled_NoRowsRecorde
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
         0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-        0, 1, "cpu:0", true, 6, 6, {0}, 1.0);
+        0, 1, /*participant_id=*/2, "cpu:0", true,
+        /*inbound_rows=*/6, /*active_routes=*/6, /*output_rows=*/6,
+        {0}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
         0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
 

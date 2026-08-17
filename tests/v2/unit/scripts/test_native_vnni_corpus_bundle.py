@@ -115,6 +115,29 @@ def test_checkpoint_option_requires_its_value() -> None:
         configuration_digest(("--cpu-batch-limit",))
 
 
+@pytest.mark.parametrize(
+    "phase_arguments",
+    (
+        ("--stop-after-cpu-decode",),
+        ("--resume-after-cpu-decode",),
+        ("--resume-after-cpu-decode", "--resume-cpu-partials"),
+    ),
+)
+def test_cpu_decode_phase_controls_share_one_collection_identity(
+    phase_arguments: tuple[str, ...],
+) -> None:
+    """M=1 checkpoint and grouped continuation reopen one CPU corpus."""
+
+    evidence_arguments = ("--cpu-format-shards",)
+
+    assert canonical_refresh_arguments(
+        (*evidence_arguments, *phase_arguments)
+    ) == evidence_arguments
+    assert configuration_digest(
+        (*evidence_arguments, *phase_arguments)
+    ) == configuration_digest(evidence_arguments)
+
+
 def test_rocm_development_resume_keeps_the_paid_corpus_identity() -> None:
     """A post-profiler continuation must reopen the existing staging root."""
 
@@ -145,6 +168,51 @@ def test_fit_only_evidence_floors_do_not_change_collection_identity() -> None:
     )
 
     assert configuration_digest(adjusted) == configuration_digest(baseline)
+
+
+@pytest.mark.parametrize(
+    "surface",
+    ("decode", "grouped"),
+)
+def test_burned_seal_inputs_do_not_change_collection_identity(
+    surface: str,
+) -> None:
+    """Opened holdout evidence refines a policy without recollecting timings."""
+
+    baseline = ("--cpu-format-shards",)
+    replay = (
+        *baseline,
+        f"--cpu-{surface}-burned-sealed-plan",
+        f"/corpus/{surface}/generation-000/plan.json",
+        f"--cpu-{surface}-burned-sealed-paired-dir=/corpus/{surface}/generation-000",
+    )
+
+    assert canonical_refresh_arguments(replay) == baseline
+    assert configuration_digest(replay) == configuration_digest(baseline)
+
+
+@pytest.mark.parametrize(
+    "option",
+    (
+        "--cpu-decode-max-leaves",
+        "--cpu-grouped-max-leaves",
+        "--cuda-generic-max-leaves",
+        "--rocm-generic-max-leaves",
+    ),
+)
+def test_fit_leaf_budgets_do_not_change_collection_identity(
+    option: str,
+) -> None:
+    """Tree capacity changes refit retained evidence instead of recollecting it."""
+
+    baseline = ("--cpu-format-shards",)
+    split = (*baseline, option, "32")
+    joined = (*baseline, f"{option}=32")
+
+    assert canonical_refresh_arguments(split) == baseline
+    assert canonical_refresh_arguments(joined) == baseline
+    assert configuration_digest(split) == configuration_digest(baseline)
+    assert configuration_digest(joined) == configuration_digest(baseline)
 
 
 def test_sealed_manifest_omits_checkpoint_controls(tmp_path: Path) -> None:

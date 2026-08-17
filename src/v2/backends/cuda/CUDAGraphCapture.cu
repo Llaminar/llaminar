@@ -28,6 +28,238 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        /**
+         * @brief Publish mapped timeline state after flushing prior GPU writes.
+         *
+         * A driver batch-memory write can make its signal visible to another
+         * vendor before mapped writes inside a preceding child graph have
+         * reached system scope. The explicit fence and aligned volatile store
+         * make the publication edge part of the retained device transaction.
+         */
+        __global__ void publishSystemReleaseValue64(
+            std::uint64_t *signal,
+            std::uint64_t value)
+        {
+            if (blockIdx.x == 0u && threadIdx.x == 0u)
+            {
+                __threadfence_system();
+                *reinterpret_cast<volatile std::uint64_t *>(signal) = value;
+            }
+        }
+
+        /**
+         * @brief Append one system-release mapped publication kernel node.
+         * @return CUDA status from validation or graph construction.
+         */
+        cudaError_t addSystemReleaseValue64Node(
+            cudaGraphNode_t *node,
+            cudaGraph_t graph,
+            const cudaGraphNode_t *dependencies,
+            std::size_t dependency_count,
+            void *signal,
+            std::uint64_t value) noexcept
+        {
+            if (!node || !graph || !signal || value == 0u ||
+                (dependency_count > 0u && !dependencies) ||
+                (reinterpret_cast<std::uintptr_t>(signal) &
+                 (alignof(std::uint64_t) - 1u)) != 0u)
+            {
+                return cudaErrorInvalidValue;
+            }
+            auto *signal_argument = static_cast<std::uint64_t *>(signal);
+            std::uint64_t value_argument = value;
+            void *arguments[] = {&signal_argument, &value_argument};
+            cudaKernelNodeParams params{};
+            params.func = reinterpret_cast<void *>(publishSystemReleaseValue64);
+            params.gridDim = dim3(1u, 1u, 1u);
+            params.blockDim = dim3(1u, 1u, 1u);
+            params.sharedMemBytes = 0u;
+            params.kernelParams = arguments;
+            params.extra = nullptr;
+            return cudaGraphAddKernelNode(
+                node,
+                graph,
+                dependencies,
+                dependency_count,
+                &params);
+        }
+    } // namespace
+
+    bool appendCUDAActiveCaptureTimelineWait64(
+        cudaStream_t stream,
+        void *signal,
+        std::uint64_t value) noexcept
+    {
+        if (!stream || !signal || value == 0u ||
+            (reinterpret_cast<std::uintptr_t>(signal) &
+             (alignof(std::uint64_t) - 1u)) != 0u)
+        {
+            LOG_ERROR(
+                "[CUDAGraphCapture] Active timeline wait has an invalid stream, signal, or value");
+            return false;
+        }
+
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        unsigned long long capture_id = 0u;
+        cudaGraph_t graph = nullptr;
+        const cudaGraphNode_t *dependencies = nullptr;
+        const cudaGraphEdgeData *edge_data = nullptr;
+        std::size_t dependency_count = 0u;
+        cudaError_t runtime_status = cudaStreamGetCaptureInfo(
+            stream,
+            &capture_status,
+            &capture_id,
+            &graph,
+            &dependencies,
+            &edge_data,
+            &dependency_count);
+        if (runtime_status != cudaSuccess ||
+            capture_status != cudaStreamCaptureStatusActive || !graph ||
+            capture_id == 0u ||
+            (dependency_count != 0u && !dependencies))
+        {
+            LOG_ERROR(
+                "[CUDAGraphCapture] Active timeline wait could not resolve its capture frontier: "
+                << cudaGetErrorString(runtime_status));
+            return false;
+        }
+
+        CUcontext context = nullptr;
+        CUresult driver_status = cuCtxGetCurrent(&context);
+        if (driver_status != CUDA_SUCCESS || !context)
+        {
+            LOG_ERROR(
+                "[CUDAGraphCapture] Active timeline wait has no current CUDA context");
+            return false;
+        }
+
+        CUstreamBatchMemOpParams operation{};
+        operation.waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
+        operation.waitValue.address = static_cast<CUdeviceptr>(
+            reinterpret_cast<std::uintptr_t>(signal));
+        operation.waitValue.value64 = value;
+        operation.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
+        CUDA_BATCH_MEM_OP_NODE_PARAMS params{
+            .ctx = context,
+            .count = 1u,
+            .paramArray = &operation,
+            .flags = 0u,
+        };
+
+        std::vector<CUgraphNode> driver_dependencies;
+        driver_dependencies.reserve(dependency_count);
+        for (std::size_t index = 0u; index < dependency_count; ++index)
+        {
+            driver_dependencies.push_back(
+                reinterpret_cast<CUgraphNode>(dependencies[index]));
+        }
+        CUgraphNode driver_node = nullptr;
+        driver_status = cuGraphAddBatchMemOpNode(
+            &driver_node,
+            reinterpret_cast<CUgraph>(graph),
+            driver_dependencies.empty() ? nullptr
+                                        : driver_dependencies.data(),
+            driver_dependencies.size(),
+            &params);
+        if (driver_status != CUDA_SUCCESS || !driver_node)
+        {
+            const char *description = nullptr;
+            (void)cuGetErrorString(driver_status, &description);
+            LOG_ERROR(
+                "[CUDAGraphCapture] cuGraphAddBatchMemOpNode(active timeline wait) failed: "
+                << (description ? description : "unknown CUDA error"));
+            return false;
+        }
+
+        cudaGraphNode_t runtime_node =
+            reinterpret_cast<cudaGraphNode_t>(driver_node);
+        runtime_status = cudaStreamUpdateCaptureDependencies(
+            stream,
+            &runtime_node,
+            /*dependencyData=*/nullptr,
+            1u,
+            cudaStreamSetCaptureDependencies);
+        if (runtime_status != cudaSuccess)
+        {
+            LOG_ERROR(
+                "[CUDAGraphCapture] cudaStreamUpdateCaptureDependencies(active timeline wait) failed: "
+                << cudaGetErrorString(runtime_status));
+            return false;
+        }
+        return true;
+    }
+
+    bool appendCUDAActiveCaptureTimelinePublish64(
+        cudaStream_t stream,
+        void *signal,
+        std::uint64_t value) noexcept
+    {
+        if (!stream || !signal || value == 0u ||
+            (reinterpret_cast<std::uintptr_t>(signal) &
+             (alignof(std::uint64_t) - 1u)) != 0u)
+        {
+            LOG_ERROR(
+                "[CUDAGraphCapture] Active timeline publication has an invalid stream, signal, or value");
+            return false;
+        }
+
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        unsigned long long capture_id = 0u;
+        cudaGraph_t graph = nullptr;
+        const cudaGraphNode_t *dependencies = nullptr;
+        const cudaGraphEdgeData *edge_data = nullptr;
+        std::size_t dependency_count = 0u;
+        cudaError_t status = cudaStreamGetCaptureInfo(
+            stream,
+            &capture_status,
+            &capture_id,
+            &graph,
+            &dependencies,
+            &edge_data,
+            &dependency_count);
+        if (status != cudaSuccess ||
+            capture_status != cudaStreamCaptureStatusActive || !graph ||
+            capture_id == 0u ||
+            (dependency_count != 0u && !dependencies))
+        {
+            LOG_ERROR(
+                "[CUDAGraphCapture] Active timeline publication could not resolve its capture frontier: "
+                << cudaGetErrorString(status));
+            return false;
+        }
+
+        cudaGraphNode_t node = nullptr;
+        status = addSystemReleaseValue64Node(
+            &node,
+            graph,
+            dependencies,
+            dependency_count,
+            signal,
+            value);
+        if (status != cudaSuccess || !node)
+        {
+            LOG_ERROR(
+                "[CUDAGraphCapture] addSystemReleaseValue64Node(active timeline publication) failed: "
+                << cudaGetErrorString(status));
+            return false;
+        }
+        status = cudaStreamUpdateCaptureDependencies(
+            stream,
+            &node,
+            /*dependencyData=*/nullptr,
+            1u,
+            cudaStreamSetCaptureDependencies);
+        if (status != cudaSuccess)
+        {
+            LOG_ERROR(
+                "[CUDAGraphCapture] cudaStreamUpdateCaptureDependencies(active timeline publication) failed: "
+                << cudaGetErrorString(status));
+            return false;
+        }
+        return true;
+    }
 
 #if CUDART_VERSION >= 12030
     CUDAActiveCaptureConditional::CUDAActiveCaptureConditional(
@@ -1354,6 +1586,276 @@ namespace llaminar2
             return false;
         }
         return true;
+    }
+
+    bool CUDAGraphCapture::buildDeviceControlledTransaction(
+        std::span<const DeviceControlledLoopFragment> ordered_fragments)
+    {
+#if CUDART_VERSION < 12030
+        (void)ordered_fragments;
+        LOG_ERROR("[CUDAGraphCapture] Device-controlled graph transactions require CUDA 12.3 or newer");
+        return false;
+#else
+        if (!activateOwner("buildDeviceControlledTransaction"))
+            return false;
+        if (ordered_fragments.empty())
+        {
+            LOG_ERROR("[CUDAGraphCapture] A device-controlled transaction requires at least one fragment");
+            return false;
+        }
+
+        size_t transaction_node_count = 0;
+        std::vector<const CUDAGraphCapture *> validated_fragments;
+        validated_fragments.reserve(ordered_fragments.size());
+        for (size_t fragment_index = 0;
+             fragment_index < ordered_fragments.size();
+             ++fragment_index)
+        {
+            const DeviceControlledLoopFragment &fragment =
+                ordered_fragments[fragment_index];
+            const auto *cuda_fragment =
+                dynamic_cast<const CUDAGraphCapture *>(fragment.capture);
+            if (!fragment.valid() || !cuda_fragment || cuda_fragment == this ||
+                cuda_fragment->deviceOrdinal() != device_ordinal_ ||
+                !cuda_fragment->graph() || cuda_fragment->nodeCount() == 0)
+            {
+                LOG_ERROR(
+                    "[CUDAGraphCapture] Invalid one-shot transaction fragment"
+                    << " index=" << fragment_index
+                    << " name=" << (fragment.name ? fragment.name : "<unnamed>")
+                    << " execution=" << static_cast<int>(fragment.execution)
+                    << " condition_word="
+                    << static_cast<const void *>(fragment.condition_word_device)
+                    << " backend="
+                    << (fragment.capture
+                            ? fragment.capture->backendName()
+                            : "<null>")
+                    << " nodes="
+                    << (fragment.capture
+                            ? fragment.capture->nodeCount()
+                            : 0)
+                    << " self=" << (cuda_fragment == this)
+                    << " parent_device=" << device_ordinal_
+                    << " fragment_device="
+                    << (cuda_fragment ? cuda_fragment->deviceOrdinal() : -1));
+                return false;
+            }
+            if (!validateCudaConditionalBodyFragmentGraph(
+                    cuda_fragment->graph(),
+                    fragment.name,
+                    fragment_index,
+                    "root"))
+            {
+                return false;
+            }
+            validated_fragments.push_back(cuda_fragment);
+            transaction_node_count += cuda_fragment->nodeCount();
+        }
+
+        reset();
+        cudaError_t error = cudaGraphCreate(&graph_, 0);
+        if (error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAGraphCapture] cudaGraphCreate failed for one-shot transaction: "
+                      << cudaGetErrorString(error));
+            return false;
+        }
+
+        auto fail = [&](const char *operation, cudaError_t operation_error)
+        {
+            LOG_ERROR("[CUDAGraphCapture] " << operation
+                      << " failed for one-shot transaction: "
+                      << cudaGetErrorString(operation_error));
+            reset();
+            return false;
+        };
+
+        cudaGraphNode_t transaction_tail = nullptr;
+        size_t conditional_fragment_count = 0;
+        for (size_t fragment_index = 0;
+             fragment_index < ordered_fragments.size();
+             ++fragment_index)
+        {
+            const DeviceControlledLoopFragment &fragment =
+                ordered_fragments[fragment_index];
+            const DeviceControlledFragmentAppendResult appended =
+                appendDeviceControlledFragment(
+                    graph_,
+                    transaction_tail,
+                    fragment,
+                    *validated_fragments[fragment_index]);
+            if (!appended.succeeded())
+                return fail(appended.operation, appended.error);
+            transaction_tail = appended.tail;
+            conditional_fragment_count +=
+                fragment.execution ==
+                        DeviceControlledLoopFragmentExecution::
+                            IfDeviceWordNonZero
+                    ? 1u
+                    : 0u;
+        }
+
+        size_t count = 0;
+        error = cudaGraphGetNodes(graph_, nullptr, &count);
+        if (error != cudaSuccess)
+            return fail("cudaGraphGetNodes", error);
+        node_count_ = count;
+        LOG_DEBUG("[CUDAGraphCapture] Built one-shot device-controlled transaction"
+                  << " parent_nodes=" << node_count_
+                  << " fragments=" << ordered_fragments.size()
+                  << " conditional_fragments=" << conditional_fragment_count
+                  << " transaction_nodes=" << transaction_node_count);
+        return transaction_tail != nullptr;
+#endif
+    }
+
+    bool CUDAGraphCapture::buildOrderedTimelineTransaction(
+        std::span<const GPUOrderedTimelineStep> ordered_steps)
+    {
+        if (!activateOwner("buildOrderedTimelineTransaction") ||
+            ordered_steps.empty())
+        {
+            LOG_ERROR("[CUDAGraphCapture] Ordered timeline transaction requires an exact owner and non-empty steps");
+            return false;
+        }
+
+        std::vector<const CUDAGraphCapture *> fragments(
+            ordered_steps.size(), nullptr);
+        for (std::size_t index = 0u; index < ordered_steps.size(); ++index)
+        {
+            const auto &step = ordered_steps[index];
+            if (!step.valid())
+            {
+                LOG_ERROR("[CUDAGraphCapture] Invalid ordered timeline step index="
+                          << index);
+                return false;
+            }
+            if (step.kind !=
+                GPUOrderedTimelineStepKind::CapturedFragment)
+            {
+                continue;
+            }
+            const auto *fragment =
+                dynamic_cast<const CUDAGraphCapture *>(step.capture);
+            if (!fragment || fragment == this ||
+                fragment->deviceOrdinal() != device_ordinal_ ||
+                !fragment->graph() || fragment->nodeCount() == 0u)
+            {
+                LOG_ERROR("[CUDAGraphCapture] Ordered timeline fragment has incompatible ownership"
+                          << " index=" << index
+                          << " name=" << step.name);
+                return false;
+            }
+            fragments[index] = fragment;
+        }
+
+        reset();
+        cudaError_t runtime_error = cudaGraphCreate(&graph_, 0u);
+        if (runtime_error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAGraphCapture] cudaGraphCreate failed for ordered timeline transaction: "
+                      << cudaGetErrorString(runtime_error));
+            return false;
+        }
+        auto failRuntime = [&](const char *operation, cudaError_t error)
+        {
+            LOG_ERROR("[CUDAGraphCapture] " << operation
+                      << " failed for ordered timeline transaction: "
+                      << cudaGetErrorString(error));
+            reset();
+            return false;
+        };
+        auto failDriver = [&](const char *operation, CUresult error)
+        {
+            const char *description = nullptr;
+            (void)cuGetErrorString(error, &description);
+            LOG_ERROR("[CUDAGraphCapture] " << operation
+                      << " failed for ordered timeline transaction: "
+                      << (description ? description : "unknown CUDA error"));
+            reset();
+            return false;
+        };
+
+        CUcontext context = nullptr;
+        const CUresult context_result = cuCtxGetCurrent(&context);
+        if (context_result != CUDA_SUCCESS || !context)
+            return failDriver("cuCtxGetCurrent", context_result);
+
+        cudaGraphNode_t tail = nullptr;
+        for (std::size_t index = 0u; index < ordered_steps.size(); ++index)
+        {
+            const auto &step = ordered_steps[index];
+            if (step.kind ==
+                GPUOrderedTimelineStepKind::CapturedFragment)
+            {
+                cudaGraphNode_t node = nullptr;
+                runtime_error = cudaGraphAddChildGraphNode(
+                    &node,
+                    graph_,
+                    tail ? &tail : nullptr,
+                    tail ? 1u : 0u,
+                    fragments[index]->graph());
+                if (runtime_error != cudaSuccess)
+                    return failRuntime(
+                        "cudaGraphAddChildGraphNode", runtime_error);
+                tail = node;
+                continue;
+            }
+
+            CUstreamBatchMemOpParams operation{};
+            if (step.kind == GPUOrderedTimelineStepKind::WaitValue64)
+            {
+                operation.waitValue.operation =
+                    CU_STREAM_MEM_OP_WAIT_VALUE_64;
+                operation.waitValue.address = static_cast<CUdeviceptr>(
+                    reinterpret_cast<std::uintptr_t>(step.signal));
+                operation.waitValue.value64 = step.value;
+                operation.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
+            }
+            else
+            {
+                cudaGraphNode_t node = nullptr;
+                runtime_error = addSystemReleaseValue64Node(
+                    &node,
+                    graph_,
+                    tail ? &tail : nullptr,
+                    tail ? 1u : 0u,
+                    step.signal,
+                    step.value);
+                if (runtime_error != cudaSuccess)
+                {
+                    return failRuntime(
+                        "addSystemReleaseValue64Node", runtime_error);
+                }
+                tail = node;
+                continue;
+            }
+            CUDA_BATCH_MEM_OP_NODE_PARAMS params{
+                .ctx = context,
+                .count = 1u,
+                .paramArray = &operation,
+                .flags = 0u,
+            };
+            CUgraphNode driver_node = nullptr;
+            CUgraphNode driver_dependency =
+                reinterpret_cast<CUgraphNode>(tail);
+            const CUresult result = cuGraphAddBatchMemOpNode(
+                &driver_node,
+                reinterpret_cast<CUgraph>(graph_),
+                tail ? &driver_dependency : nullptr,
+                tail ? 1u : 0u,
+                &params);
+            if (result != CUDA_SUCCESS)
+                return failDriver("cuGraphAddBatchMemOpNode", result);
+            tail = reinterpret_cast<cudaGraphNode_t>(driver_node);
+        }
+
+        std::size_t count = 0u;
+        runtime_error = cudaGraphGetNodes(graph_, nullptr, &count);
+        if (runtime_error != cudaSuccess)
+            return failRuntime("cudaGraphGetNodes", runtime_error);
+        node_count_ = count;
+        return tail != nullptr && node_count_ == ordered_steps.size();
     }
 
     bool CUDAGraphCapture::buildDeviceControlledWhileLoop(

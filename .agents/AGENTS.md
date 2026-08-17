@@ -44,14 +44,22 @@ broken, or uneconomical implementation.
 ### GPU Execution and Memory
 
 8. **GPU inference is device-resident end to end.** After request admission,
-   planning, sampling, MTP verification, state publication, and loop control
-   stay on device. The ordinary host boundary is one small terminal result.
-   Explicit RAM/SSD KV-cache tiers and initial/final I/O are intentional
+   planning, sampling, MTP verification, state publication, and loop decisions
+   stay on device. The ordinary host boundary is one small terminal result. A
+   GPU graph API without conditional nodes may additionally publish one fixed-
+   size immutable scheduler ticket that names a retained captured transaction;
+   it may not expose mutable model, sampler, verifier, KV, or response state.
+   Explicit RAM/SSD KV-cache tiers and initial/final I/O are other intentional
    exceptions, not permission for host-owned execution state.
-9. **Homogeneous GPU execution uses one complete captured graph.** Segmented or
-   eager execution is a hard error for CUDA-only or ROCm-only production cells.
-   Segmentation is permitted only at an explicitly declared heterogeneous
-   device/collective boundary that cannot be represented by one native graph.
+9. **Homogeneous GPU execution uses a complete captured generation policy.**
+   Ordinary inference and a conditional-capable MTP backend use one complete
+   captured parent. HIP MTP uses retained complete transaction graphs selected
+   by an authenticated scheduler ticket because HIP graphs have no conditional
+   nodes; the device controller remains the sole decision/state authority and
+   the host only submits the named branch. Segmented or eager homogeneous
+   execution is a hard error. Segmentation is permitted only at an explicitly
+   declared heterogeneous device/collective boundary that cannot be represented
+   by one native graph.
 10. **Every GPU operation has an exact non-null stream.** Kernel launches,
     libraries, copies, memset, events, and publication APIs must reject null or
     default streams. The producer publishes its exact stream/event and the
@@ -207,6 +215,9 @@ single-source.
   analysis, and ROCm kernel tuning.
 - `.agents/mtp-tuning/SKILL.md`: speculative decode, prefix-cache interaction,
   verifier parity, grouped MTP economics, and depth-controller work.
+- `.agents/model-parity-testing/SKILL.md`: real-weight production campaign
+  execution, PyTorch/Hugging Face reference packs, CSV-led diagnosis, matrix
+  extension, and the aggregate correctness/economy gate.
 - `.agents/nativevnni-gemm-tuning/SKILL.md`: cross-backend NativeVNNI
   GEMV/GEMM candidate tuning, evidence collection, dispatch installation, and
   corpus certification.
@@ -228,7 +239,7 @@ documentation.
 | CLI conflict rules | `src/v2/config/ConfigValidator.*` |
 | Runtime environment variables | `src/v2/utils/DebugEnv.h` |
 | Test names, labels, and registration | `tests/v2/CMakeLists.txt` |
-| Parity workflow | `tests/v2/integration/parity/README.md` and CMake registration |
+| Parity workflow | `.agents/model-parity-testing/SKILL.md`, `tests/v2/integration/parity/README.md`, and CMake registration |
 | Backend tuning procedure | `.agents/*-tuning/SKILL.md` |
 
 Files under `docs/v2/projects/` are dated plans, investigations, and handoffs.
@@ -258,22 +269,34 @@ ownership.
 
 ## Build
 
-Use an out-of-tree Ninja build and unrestricted build parallelism.
+Use an out-of-tree Ninja build and unrestricted build parallelism. The
+container image and workspace environment pin the same Ninja release. Resolve
+that active executable once when configuring, record it in
+`CMAKE_MAKE_PROGRAM`, and invoke builds through `cmake --build`. Never
+alternate Ninja executables on one build tree: incompatible command-log hashes
+can make every object appear dirty. If an existing tree names another
+executable, reconfigure it once with the active devcontainer path before
+building.
 
 ```bash
+LLAMINAR_NINJA_BIN="$(command -v ninja)"
+
 # Debug: assertions/snapshots, no optimization
 cmake -B build_v2 -S src/v2 -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+  -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  -DCMAKE_MAKE_PROGRAM:FILEPATH="${LLAMINAR_NINJA_BIN}"
 cmake --build build_v2 --parallel
 
 # Release: production and performance measurements
 cmake -B build_v2_release -S src/v2 -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_MAKE_PROGRAM:FILEPATH="${LLAMINAR_NINJA_BIN}"
 cmake --build build_v2_release --parallel
 
 # Integration: -O3, symbols, assertions, and snapshots
 cmake -B build_v2_integration -S src/v2 -G Ninja \
-  -DCMAKE_BUILD_TYPE=Integration
+  -DCMAKE_BUILD_TYPE=Integration \
+  -DCMAKE_MAKE_PROGRAM:FILEPATH="${LLAMINAR_NINJA_BIN}"
 cmake --build build_v2_integration --parallel
 ```
 
@@ -283,7 +306,8 @@ for example:
 
 ```bash
 cmake -B build_v2_cpu -S src/v2 -G Ninja \
-  -DCMAKE_BUILD_TYPE=Integration -DHAVE_CUDA=OFF -DHAVE_ROCM=OFF
+  -DCMAKE_BUILD_TYPE=Integration -DHAVE_CUDA=OFF -DHAVE_ROCM=OFF \
+  -DCMAKE_MAKE_PROGRAM:FILEPATH="${LLAMINAR_NINJA_BIN}"
 ```
 
 `llaminar2_core` is the core implementation target and `llaminar2` is the
@@ -393,11 +417,13 @@ gate are:
 - `src/v2/execution/debug/AsyncStageDumper.h`
 - `tests/v2/integration/execution/debug/Test__StageDumpIntegrity.cpp`
 
-For model parity, start with
-`tests/v2/integration/parity/README.md`, then discover the exact registered
-CTest cases. Keep reference generation, native execution, comparison policy,
-and CSV/result artifacts associated with the same model and configuration.
-Local result directories are generated debris and must not be committed.
+For model parity, use `.agents/model-parity-testing/SKILL.md`, then read
+`tests/v2/integration/parity/README.md` and discover the exact registered
+production campaigns. The aggregate campaign system replaces the historical
+hand-picked PyTorch parity baseline: it keeps reference generation, live-path
+execution, every checkpoint comparison, CSV evidence, and the shared economy
+target in one registered matrix. Local reports and result directories are
+generated debris and must not be committed.
 
 For a debugger attached directly to `llaminar2`, pass
 `--no-mpi-bootstrap`; otherwise it may attach to the MPI wrapper. Record any

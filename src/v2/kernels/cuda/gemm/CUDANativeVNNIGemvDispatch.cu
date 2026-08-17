@@ -10,6 +10,7 @@
  */
 
 #include "CUDANativeVNNIGemvShard.h"
+#include "tensors/NativeVnniFormatInfo.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -44,6 +45,7 @@ constexpr int shardIndexForCodebook(uint8_t codebook_id)
         return 6;
     case 17:
     case 19:
+    case llaminar2::kNativeVnniExpandedInt8MinCodebook:
         return 7;
     default:
         return -1;
@@ -133,6 +135,68 @@ bool cudaNativeVNNIGemvTuned_queryGeneratedDispatch(
         exact_kb);
 }
 
+/**
+ * @brief Resolve a complete source arithmetic policy on its owning shard.
+ *
+ * Physical codebook 19/23 shards call this only when CPU residency changed the
+ * execution representation.  Routing policy lookup back to the source shard
+ * avoids multiplying generated selector instantiations across decoder shards.
+ */
+bool cudaNativeVNNIGemvTuned_resolveArithmeticPolicy(
+    uint8_t codebook_id,
+    int graph_captured,
+    int m,
+    int n,
+    int k,
+    int *shape_id,
+    int *tile_n,
+    int *cpt,
+    int *target_waves,
+    int *mkg,
+    int *max_kb,
+    int *force_two_phase,
+    int *exact_kb)
+{
+    LLAMINAR_ROUTE_CUDA_NVNNI_SHARD(
+        cudaNativeVNNIGemvTuned_queryCompleteGeneratedDispatch,
+        false,
+        codebook_id,
+        graph_captured,
+        m,
+        n,
+        k,
+        shape_id,
+        tile_n,
+        cpt,
+        target_waves,
+        mkg,
+        max_kb,
+        force_two_phase,
+        exact_kb);
+}
+
+/** Resolve a source codebook's grouped-row policy on its owning shard. */
+bool cudaNativeVNNIGemvTuned_resolveGroupedArithmeticPolicy(
+    uint8_t codebook_id,
+    int graph_captured,
+    int m,
+    int n,
+    int k,
+    int *kernel,
+    int *grouped_rows)
+{
+    LLAMINAR_ROUTE_CUDA_NVNNI_SHARD(
+        cudaNativeVNNIGemvTuned_queryGeneratedGroupedDispatch,
+        false,
+        codebook_id,
+        graph_captured,
+        m,
+        n,
+        k,
+        kernel,
+        grouped_rows);
+}
+
 bool cudaNativeVNNIGemvTuned_queryCanonicalM1Schedule(
     uint8_t codebook_id,
     int n,
@@ -218,6 +282,58 @@ bool cudaNativeVNNIGemvTuned_fp32(
         rm_slot);
 }
 
+/**
+ * @brief Route a physical CUDA decoder with an independent arithmetic policy.
+ *
+ * ExpertOverlay CPU residency may normalize compact source bytes into codebook
+ * 19 or 23.  The physical codebook selects the decoder shard; the policy
+ * codebook selects the source model's generated launch and reduction tree.
+ */
+bool cudaNativeVNNIGemvTuned_fp32_withPolicy(
+    const int8_t *d_A_int8,
+    const uint8_t *d_payload,
+    const uint16_t *d_scales,
+    const uint16_t *d_mins,
+    const uint32_t *d_emins,
+    float *d_C_fp32,
+    const float *d_scales_A_block,
+    int N,
+    int K,
+    float alpha,
+    float beta,
+    const float *d_C_existing,
+    const float *d_bias,
+    uint8_t codebook_id,
+    uint8_t arithmetic_policy_codebook_id,
+    int cuda_device_id,
+    void *stream,
+    CUDAGemvContext *gemv_ctx,
+    CUDARowMajorWeights **rm_slot)
+{
+    LLAMINAR_ROUTE_CUDA_NVNNI_SHARD(
+        cudaNativeVNNIGemvTuned_fp32_withPolicy,
+        false,
+        d_A_int8,
+        d_payload,
+        d_scales,
+        d_mins,
+        d_emins,
+        d_C_fp32,
+        d_scales_A_block,
+        N,
+        K,
+        alpha,
+        beta,
+        d_C_existing,
+        d_bias,
+        codebook_id,
+        arithmetic_policy_codebook_id,
+        cuda_device_id,
+        stream,
+        gemv_ctx,
+        rm_slot);
+}
+
 bool cudaNativeVNNIGemvTuned_small_m_fp32(
     const int8_t *d_A_int8,
     const uint8_t *d_payload,
@@ -257,6 +373,54 @@ bool cudaNativeVNNIGemvTuned_small_m_fp32(
         d_C_existing,
         d_bias,
         codebook_id,
+        cuda_device_id,
+        stream,
+        gemv_ctx,
+        rm_slot);
+}
+
+/** Route grouped CUDA decode with source-format arithmetic identity. */
+bool cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy(
+    const int8_t *d_A_int8,
+    const uint8_t *d_payload,
+    const uint16_t *d_scales,
+    const uint16_t *d_mins,
+    const uint32_t *d_emins,
+    float *d_C_fp32,
+    const float *d_scales_A_block,
+    int M,
+    int N,
+    int K,
+    float alpha,
+    float beta,
+    const float *d_C_existing,
+    const float *d_bias,
+    uint8_t codebook_id,
+    uint8_t arithmetic_policy_codebook_id,
+    int cuda_device_id,
+    void *stream,
+    CUDAGemvContext *gemv_ctx,
+    CUDARowMajorWeights **rm_slot)
+{
+    LLAMINAR_ROUTE_CUDA_NVNNI_SHARD(
+        cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy,
+        false,
+        d_A_int8,
+        d_payload,
+        d_scales,
+        d_mins,
+        d_emins,
+        d_C_fp32,
+        d_scales_A_block,
+        M,
+        N,
+        K,
+        alpha,
+        beta,
+        d_C_existing,
+        d_bias,
+        codebook_id,
+        arithmetic_policy_codebook_id,
         cuda_device_id,
         stream,
         gemv_ctx,

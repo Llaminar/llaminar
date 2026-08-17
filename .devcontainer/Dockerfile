@@ -7,6 +7,7 @@ FROM ubuntu:24.04
 
 ARG INSTALL_CUDA=false
 ARG INSTALL_ROCM=false
+ARG NINJA_VERSION=1.13.0
 ENV INSTALL_CUDA=${INSTALL_CUDA}
 ENV INSTALL_ROCM=${INSTALL_ROCM}
 
@@ -33,7 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # so the dev environment tracks production 1:1.
 COPY scripts/docker /tmp/install-scripts
 RUN chmod +x /tmp/install-scripts/*.sh
-RUN MODE=build /tmp/install-scripts/install-system-deps.sh
+RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
+    /tmp/install-scripts/install-system-deps.sh
 
 # Dev-only extras not in the release image: debuggers, editors, perf tools,
 # graphics libs for GPU debug, linux-tools for `perf`.

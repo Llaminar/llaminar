@@ -13,9 +13,12 @@
 
 #include "../compute_stages/IComputeStage.h"
 #include "../local_execution/graph/ComputeGraph.h"
+#include "../../utils/OpenMPUtils.h"
 #include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <cstring>
+#include <limits>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -341,6 +344,218 @@ namespace llaminar2
         if (!any_restore)
         {
             result.skipped_stage_count = static_cast<int>(state_stages.size());
+            return result;
+        }
+
+        if (plans.request_count == 1)
+        {
+            /*
+             * The overwhelmingly common server transaction owns one request
+             * and one independent live-state allocation per recurrent stage.
+             * Planning every copy first makes bad rows, stale workspaces, and
+             * overlapping destinations fatal before any byte becomes live.
+             * Once validated, one persistent OpenMP team fans the independent
+             * layer copies across physical cores. This replaces dozens of
+             * serial memory-bandwidth operations without changing one byte or
+             * replaying any recurrence arithmetic.
+             */
+            std::vector<CPUVerifierStateRestorePlan> restore_plans;
+            restore_plans.reserve(state_stages.size());
+            struct RestoreCopyChunk
+            {
+                void *destination = nullptr;
+                const void *source = nullptr;
+                size_t bytes = 0;
+            };
+            constexpr size_t kRestoreCopyChunkBytes = 128u * 1024u;
+            std::vector<RestoreCopyChunk> restore_chunks;
+            size_t restore_bytes = 0;
+            const int restore_row = host_verifier_restore_rows[0];
+
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "spec_state_cpu_parallel_restore_plan",
+                    "decode");
+                for (size_t i = 0; i < state_stages.size(); ++i)
+                {
+                    IComputeStage *stage = state_stages[i];
+                    if (!stage)
+                    {
+                        std::ostringstream msg;
+                        msg << "single-request CPU MTP publication received null stage at index "
+                            << i;
+                        return batchPublicationFailure(plans, msg.str());
+                    }
+                    if (!stage->hasVerifierStateCapture())
+                    {
+                        if (require_captured_stage &&
+                            stage->requiresVerifierStateCaptureForPublication())
+                        {
+                            std::ostringstream msg;
+                            msg << "single-request CPU MTP publication required verifier capture for stage "
+                                << stage->name() << " at index " << i;
+                            return batchPublicationFailure(plans, msg.str());
+                        }
+                        continue;
+                    }
+
+                    CPUVerifierStateRestorePlan restore =
+                        stage->planCPUVerifierStateRestoreRow(restore_row);
+                    if (!restore.ready())
+                    {
+                        std::ostringstream msg;
+                        msg << "single-request CPU MTP publication could not plan a native restore for captured stage "
+                            << stage->name() << " at index " << i
+                            << " status=" << static_cast<int>(restore.status);
+                        return batchPublicationFailure(plans, msg.str());
+                    }
+
+                    const uintptr_t destination_begin =
+                        reinterpret_cast<uintptr_t>(restore.destination);
+                    const uintptr_t source_begin =
+                        reinterpret_cast<uintptr_t>(restore.source);
+                    if (restore.bytes >
+                            std::numeric_limits<uintptr_t>::max() - destination_begin ||
+                        restore.bytes >
+                            std::numeric_limits<uintptr_t>::max() - source_begin ||
+                        restore.bytes >
+                            std::numeric_limits<size_t>::max() - restore_bytes)
+                    {
+                        return batchPublicationFailure(
+                            plans,
+                            "single-request CPU MTP publication restore span overflowed its address domain");
+                    }
+                    const uintptr_t destination_end =
+                        destination_begin + restore.bytes;
+                    const uintptr_t source_end = source_begin + restore.bytes;
+                    if (destination_begin < source_end &&
+                        source_begin < destination_end)
+                    {
+                        std::ostringstream msg;
+                        msg << "single-request CPU MTP publication source aliases its live destination for stage "
+                            << stage->name() << " at index " << i;
+                        return batchPublicationFailure(plans, msg.str());
+                    }
+                    for (const CPUVerifierStateRestorePlan &planned : restore_plans)
+                    {
+                        const uintptr_t planned_begin =
+                            reinterpret_cast<uintptr_t>(planned.destination);
+                        const uintptr_t planned_end = planned_begin + planned.bytes;
+                        if (destination_begin < planned_end &&
+                            planned_begin < destination_end)
+                        {
+                            std::ostringstream msg;
+                            msg << "single-request CPU MTP publication found overlapping live-state destinations at stage "
+                                << stage->name() << " index " << i;
+                            return batchPublicationFailure(plans, msg.str());
+                        }
+                    }
+
+                    restore_bytes += restore.bytes;
+                    restore_plans.push_back(restore);
+                }
+
+                restore_chunks.reserve(
+                    restore_bytes / kRestoreCopyChunkBytes +
+                    restore_plans.size());
+                for (const CPUVerifierStateRestorePlan &restore : restore_plans)
+                {
+                    auto *destination = static_cast<std::byte *>(restore.destination);
+                    const auto *source = static_cast<const std::byte *>(restore.source);
+                    for (size_t offset = 0; offset < restore.bytes;
+                         offset += kRestoreCopyChunkBytes)
+                    {
+                        const size_t bytes = std::min(
+                            kRestoreCopyChunkBytes,
+                            restore.bytes - offset);
+                        restore_chunks.push_back({
+                            .destination = destination + offset,
+                            .source = source + offset,
+                            .bytes = bytes,
+                        });
+                    }
+                }
+            }
+
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "spec_state_cpu_parallel_restore_copy",
+                    "decode");
+                auto copy_restore_plans = [&]()
+                {
+#pragma omp for schedule(static)
+                for (std::ptrdiff_t i = 0;
+                     i < static_cast<std::ptrdiff_t>(restore_chunks.size());
+                     ++i)
+                {
+                    const RestoreCopyChunk &restore =
+                        restore_chunks[static_cast<size_t>(i)];
+                        std::memcpy(
+                            restore.destination,
+                            restore.source,
+                            restore.bytes);
+                    }
+                };
+                OMP_WORKSHARE_REGION(copy_restore_plans);
+            }
+
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "spec_state_cpu_parallel_restore_finalize",
+                    "decode");
+                for (size_t i = 0; i < state_stages.size(); ++i)
+                {
+                    IComputeStage *stage = state_stages[i];
+                    if (stage->hasVerifierStateCapture())
+                    {
+                        ++result.restored_stage_count;
+                        const std::string post_error = publishPostRestoreStage(
+                            stage,
+                            i,
+                            device,
+                            stream,
+                            "single-request CPU MTP publication",
+                            result);
+                        if (!post_error.empty())
+                            return batchPublicationFailure(plans, post_error);
+                        stage->clearVerifierStateCaptureBindingAfterPublication();
+                        continue;
+                    }
+
+                    const std::string post_error = publishPostRestoreStage(
+                        stage,
+                        i,
+                        device,
+                        stream,
+                        "single-request CPU MTP publication",
+                        result);
+                    if (!post_error.empty())
+                        return batchPublicationFailure(plans, post_error);
+                    if (!stage->requiresPostVerifierStatePublication())
+                        ++result.skipped_stage_count;
+                }
+            }
+
+            if (require_captured_stage && result.restored_stage_count == 0)
+            {
+                return batchPublicationFailure(
+                    plans,
+                    "single-request CPU MTP publication required a captured stage but restored none");
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "spec_state_cpu_parallel_restore_bytes",
+                static_cast<double>(restore_bytes),
+                "decode",
+                device.toString(),
+                {{"restore_spans", std::to_string(restore_plans.size())},
+                 {"restore_chunks", std::to_string(restore_chunks.size())},
+                 {"copy_chunk_bytes", std::to_string(kRestoreCopyChunkBytes)},
+                 {"publication_policy", "validated_parallel_layer_copies"}});
             return result;
         }
 
@@ -748,35 +963,10 @@ namespace llaminar2
         void *stream,
         bool require_captured_stage)
     {
-        std::vector<IComputeStage *> stages;
-        const auto &order = graph.getExecutionOrder();
-        stages.reserve(order.size());
-
-        for (const auto &node_name : order)
-        {
-            ComputeNode *node = graph.getNode(node_name);
-            if (node == nullptr)
-            {
-                return publicationFailure(
-                    plan,
-                    "MTP spec-state graph publication references missing node '" +
-                        node_name + "'");
-            }
-            if (!node->stage)
-            {
-                return publicationFailure(
-                    plan,
-                    "MTP spec-state graph publication found node '" +
-                        node_name + "' without a stage");
-            }
-
-            stages.push_back(node->stage.get());
-        }
-
         return publishAcceptedMTPSpecStateFromVerifierRow(
             plan,
             verifier_restore_row,
-            stages,
+            graph.getExecutionStages(),
             device,
             stream,
             require_captured_stage);
@@ -790,32 +980,10 @@ namespace llaminar2
         void *stream,
         bool require_captured_stage)
     {
-        std::vector<IComputeStage *> stages;
-        const auto &order = graph.getExecutionOrder();
-        stages.reserve(order.size());
-        for (const auto &node_name : order)
-        {
-            ComputeNode *node = graph.getNode(node_name);
-            if (!node)
-            {
-                return batchPublicationFailure(
-                    plans,
-                    "host-indexed batched MTP spec-state graph publication references missing node '" +
-                        node_name + "'");
-            }
-            if (!node->stage)
-            {
-                return batchPublicationFailure(
-                    plans,
-                    "host-indexed batched MTP spec-state graph publication found node '" +
-                        node_name + "' without a stage");
-            }
-            stages.push_back(node->stage.get());
-        }
         return publishAcceptedMTPSpecStateFromVerifierRows(
             plans,
             host_verifier_restore_rows,
-            stages,
+            graph.getExecutionStages(),
             device,
             stream,
             require_captured_stage);
@@ -829,35 +997,10 @@ namespace llaminar2
         void *stream,
         bool require_captured_stage)
     {
-        std::vector<IComputeStage *> stages;
-        const auto &order = graph.getExecutionOrder();
-        stages.reserve(order.size());
-
-        for (const auto &node_name : order)
-        {
-            ComputeNode *node = graph.getNode(node_name);
-            if (node == nullptr)
-            {
-                return publicationFailure(
-                    plan,
-                    "device-indexed MTP spec-state graph publication references missing node '" +
-                        node_name + "'");
-            }
-            if (!node->stage)
-            {
-                return publicationFailure(
-                    plan,
-                    "device-indexed MTP spec-state graph publication found node '" +
-                        node_name + "' without a stage");
-            }
-
-            stages.push_back(node->stage.get());
-        }
-
         return publishAcceptedMTPSpecStateFromDeviceVerifierRow(
             plan,
             device_verifier_restore_row,
-            stages,
+            graph.getExecutionStages(),
             device,
             stream,
             require_captured_stage);
@@ -871,35 +1014,10 @@ namespace llaminar2
         void *stream,
         bool require_captured_stage)
     {
-        std::vector<IComputeStage *> stages;
-        const auto &order = graph.getExecutionOrder();
-        stages.reserve(order.size());
-
-        for (const auto &node_name : order)
-        {
-            ComputeNode *node = graph.getNode(node_name);
-            if (node == nullptr)
-            {
-                return devicePublicationFailure(
-                    shape,
-                    "device-indexed MTP spec-state graph publication references missing node '" +
-                        node_name + "'");
-            }
-            if (!node->stage)
-            {
-                return devicePublicationFailure(
-                    shape,
-                    "device-indexed MTP spec-state graph publication found node '" +
-                        node_name + "' without a stage");
-            }
-
-            stages.push_back(node->stage.get());
-        }
-
         return publishAcceptedMTPSpecStateFromDeviceVerifierRow(
             shape,
             device_verifier_restore_row,
-            stages,
+            graph.getExecutionStages(),
             device,
             stream,
             require_captured_stage);
@@ -914,37 +1032,12 @@ namespace llaminar2
         void *stream,
         bool require_captured_stage)
     {
-        std::vector<IComputeStage *> stages;
-        const auto &order = graph.getExecutionOrder();
-        stages.reserve(order.size());
-
-        for (const auto &node_name : order)
-        {
-            ComputeNode *node = graph.getNode(node_name);
-            if (node == nullptr)
-            {
-                return batchPublicationFailure(
-                    plans,
-                    "batched device-indexed MTP spec-state graph publication references missing node '" +
-                        node_name + "'");
-            }
-            if (!node->stage)
-            {
-                return batchPublicationFailure(
-                    plans,
-                    "batched device-indexed MTP spec-state graph publication found node '" +
-                        node_name + "' without a stage");
-            }
-
-            stages.push_back(node->stage.get());
-        }
-
         MTPSpecStatePublicationResult result =
             publishAcceptedMTPSpecStateFromDeviceVerifierRows(
                 plans,
                 device_verifier_restore_rows,
                 row_index_stride,
-                stages,
+                graph.getExecutionStages(),
                 device,
                 stream,
                 require_captured_stage);
@@ -961,36 +1054,11 @@ namespace llaminar2
         void *stream,
         bool require_captured_stage)
     {
-        std::vector<IComputeStage *> stages;
-        const auto &order = graph.getExecutionOrder();
-        stages.reserve(order.size());
-
-        for (const auto &node_name : order)
-        {
-            ComputeNode *node = graph.getNode(node_name);
-            if (node == nullptr)
-            {
-                return devicePublicationFailure(
-                    shape,
-                    "batched device-indexed MTP spec-state graph publication references missing node '" +
-                        node_name + "'");
-            }
-            if (!node->stage)
-            {
-                return devicePublicationFailure(
-                    shape,
-                    "batched device-indexed MTP spec-state graph publication found node '" +
-                        node_name + "' without a stage");
-            }
-
-            stages.push_back(node->stage.get());
-        }
-
         return publishAcceptedMTPSpecStateFromDeviceVerifierRows(
             shape,
             device_verifier_restore_rows,
             row_index_stride,
-            stages,
+            graph.getExecutionStages(),
             device,
             stream,
             require_captured_stage);

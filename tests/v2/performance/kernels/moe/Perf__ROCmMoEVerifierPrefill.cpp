@@ -69,6 +69,7 @@ extern "C" bool rocmMoE_grouped_prefill_query_kernel_resources(
 #include <set>
 #include <string>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 /**
@@ -454,12 +455,75 @@ namespace
     }
 
     /**
+     * @brief Build one production-shaped compact overlay-follower route packet.
+     *
+     * A four-participant secondary tier holding roughly 56 of 256 experts sees
+     * 1.75 of each token's global top-eight routes on average. The mapped
+     * packet consumer preserves those weights, compacts the locally owned
+     * routes into an increasing prefix, and fills every unused slot with the
+     * `expert=-1, weight=0` sentinel. This fixture reproduces that contract
+     * without materializing experts owned by the other three participants.
+     *
+     * @param rows Physical prefill rows in the captured follower bucket.
+     * @param top_k Fixed global route width; the Qwen 3.5 model uses eight.
+     * @param first_expert First globally numbered expert owned by the follower.
+     * @param local_expert_count Number of consecutive experts owned locally.
+     * @return Row-major compact expert IDs and their unrenormalized weights.
+     */
+    std::pair<std::vector<float>, std::vector<float>>
+    makeCompactOverlayFollowerRoutes(
+        int rows,
+        int top_k,
+        int first_expert,
+        int local_expert_count)
+    {
+        if (rows <= 0 || top_k != 8 || first_expert < 0 ||
+            local_expert_count <= 0 ||
+            first_expert + local_expert_count > 256)
+        {
+            throw std::invalid_argument(
+                "compact Qwen overlay routes require positive rows, top-8, "
+                "and a valid participant-local expert interval");
+        }
+
+        std::vector<float> indices(
+            static_cast<size_t>(rows * top_k), -1.0f);
+        std::vector<float> weights(
+            static_cast<size_t>(rows * top_k), 0.0f);
+        const std::vector<float> global_weights =
+            makeRoutingWeights(rows, top_k);
+
+        for (int row = 0; row < rows; ++row)
+        {
+            /* Three two-route rows followed by one one-route row gives the
+             * exact 7/4 routes-per-token expectation for 56/256 ownership. */
+            const int local_routes = (row % 4 == 3) ? 1 : 2;
+            for (int local_slot = 0; local_slot < local_routes; ++local_slot)
+            {
+                const size_t compact =
+                    static_cast<size_t>(row * top_k + local_slot);
+                const int expert_offset =
+                    (row * 5 + local_slot * 17) % local_expert_count;
+                const int original_route_slot =
+                    (row + local_slot * 3) % top_k;
+                indices[compact] =
+                    static_cast<float>(first_expert + expert_offset);
+                weights[compact] = global_weights[
+                    static_cast<size_t>(
+                        row * top_k + original_route_slot)];
+            }
+        }
+        return {std::move(indices), std::move(weights)};
+    }
+
+    /**
      * @brief Return sorted unique routed expert IDs present in a route table.
      *
      * The speedometer keeps production-sized descriptor tables but should not
      * spend minutes preparing inactive expert payloads before the timed GPU work.
      * Active slots still get real prepared descriptors and therefore hard-fail on
-     * unsupported formats or broken prepared-weight wiring.
+     * unsupported formats or broken prepared-weight wiring. `-1` is the public
+     * inactive-route sentinel used by compact overlay follower packets.
      */
     std::vector<int> uniqueExpertIdsFromRoutes(
         const std::vector<float> &routing_indices,
@@ -470,8 +534,7 @@ namespace
         for (float value : routing_indices)
         {
             const int id = static_cast<int>(value);
-            EXPECT_GE(id, 0);
-            EXPECT_LT(id, num_experts);
+            EXPECT_TRUE(id == -1 || (id >= 0 && id < num_experts));
             if (id >= 0 && id < num_experts)
                 ids.push_back(id);
         }
@@ -1063,43 +1126,46 @@ namespace
                 const auto row_begin = hidden_values.begin() + static_cast<ptrdiff_t>(row) * d_model;
                 std::vector<float> row_hidden_values(row_begin, row_begin + d_model);
                 auto row_hidden = makeTensor({1, static_cast<size_t>(d_model)}, row_hidden_values);
-                EXPECT_TRUE(row_hidden->ensureOnDevice(device, stream));
-
-                std::vector<int> expert_ids(static_cast<size_t>(top_k));
+                std::vector<float> expert_ids(static_cast<size_t>(top_k));
                 std::vector<float> expert_weights(static_cast<size_t>(top_k));
                 for (int k = 0; k < top_k; ++k)
                 {
                     const size_t slot = static_cast<size_t>(row) * top_k + k;
-                    expert_ids[static_cast<size_t>(k)] = static_cast<int>(routing_indices[slot]);
+                    expert_ids[static_cast<size_t>(k)] = routing_indices[slot];
                     expert_weights[static_cast<size_t>(k)] = routing_weights[slot];
                 }
-
-                std::vector<std::shared_ptr<llaminar2::FP32Tensor>> gate_owned;
-                std::vector<std::shared_ptr<llaminar2::FP32Tensor>> up_owned;
-                std::vector<llaminar2::ITensor *> gate_outputs(static_cast<size_t>(top_k));
-                std::vector<llaminar2::ITensor *> up_outputs(static_cast<size_t>(top_k));
-                gate_owned.reserve(top_k);
-                up_owned.reserve(top_k);
-                for (int k = 0; k < top_k; ++k)
-                {
-                    gate_owned.push_back(makeZeros({static_cast<size_t>(intermediate)}));
-                    up_owned.push_back(makeZeros({static_cast<size_t>(intermediate)}));
-                    EXPECT_TRUE(gate_owned.back()->ensureOnDevice(device, stream));
-                    EXPECT_TRUE(up_owned.back()->ensureOnDevice(device, stream));
-                    gate_outputs[static_cast<size_t>(k)] = gate_owned.back().get();
-                    up_outputs[static_cast<size_t>(k)] = up_owned.back().get();
-                }
-
+                auto row_expert_ids = makeTensor(
+                    {1, static_cast<size_t>(top_k)}, expert_ids);
+                auto row_expert_weights = makeTensor(
+                    {1, static_cast<size_t>(top_k)}, expert_weights);
                 auto decode_output = makeZeros({static_cast<size_t>(d_model)});
-                EXPECT_TRUE(decode_output->ensureOnDevice(device, stream));
-                EXPECT_TRUE(moe->groupedExpertGateUpDecodeFromTable(
-                    row_hidden.get(), expert_ids.data(), gateup_table, top_k,
-                    gate_outputs.data(), up_outputs.data(), d_model, intermediate));
-                EXPECT_TRUE(moe->groupedExpertDownDecodeFromTable(
-                    gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(),
-                    down_table, top_k, decode_output.get(), d_model, intermediate));
-                EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
-                TransferEngine::publishDeviceWrite(decode_output, device, stream);
+
+                TransferEngine::prepareDeviceInput(
+                    row_hidden.get(), device, stream);
+                TransferEngine::prepareDeviceInput(
+                    row_expert_ids.get(), device, stream);
+                TransferEngine::prepareDeviceInput(
+                    row_expert_weights.get(), device, stream);
+                TransferEngine::prepareDeviceOutput(
+                    decode_output.get(), device, stream);
+                requireHipBenchBody(
+                    moe->groupedExpertDecodeFromRouting(
+                        row_hidden.get(),
+                        row_expert_ids.get(),
+                        row_expert_weights.get(),
+                        gateup_table,
+                        down_table,
+                        top_k,
+                        decode_output.get(),
+                        d_model,
+                        intermediate),
+                    "serial device-routed row oracle");
+                if (hipStreamSynchronize(stream) != hipSuccess ||
+                    !decode_output->ensureOnHost(stream))
+                {
+                    throw std::runtime_error(
+                        "failed to materialize serial device-routed row oracle");
+                }
                 decoded.insert(
                     decoded.end(),
                     decode_output->data(),
@@ -1130,7 +1196,9 @@ namespace
         int intermediate = 512,
         const llaminar2::test::QuantizedVerifierFormatCase *gateup_format = nullptr,
         const llaminar2::test::QuantizedVerifierFormatCase *down_format = nullptr,
-        bool canonical_route_split = false)
+        bool canonical_route_split = false,
+        const std::vector<float> *routing_indices_override = nullptr,
+        const std::vector<float> *routing_weights_override = nullptr)
     {
         /*
          * Keep this harness aligned with the Qwen3.6 MoE model shape.  The
@@ -1196,12 +1264,32 @@ namespace
         workspace_consumer->bindWorkspace(workspace.get());
 
         const auto hidden_values = makeHiddenValues(rows, d_model);
-        auto routing_indices = unique_routes
-                                   ? makeUniqueRoutingIndices(rows, top_k, num_experts)
-                                   : makeRoutingIndices(rows, top_k, num_experts);
+        if ((routing_indices_override == nullptr) !=
+            (routing_weights_override == nullptr))
+        {
+            throw std::invalid_argument(
+                "ROCm MoE route overrides must provide IDs and weights together");
+        }
+        auto routing_indices = routing_indices_override
+                                   ? *routing_indices_override
+                                   : (unique_routes
+                                          ? makeUniqueRoutingIndices(
+                                                rows, top_k, num_experts)
+                                          : makeRoutingIndices(
+                                                rows, top_k, num_experts));
         if (include_terminal_expert)
             publishTerminalExpertRoute(routing_indices, rows, top_k, num_experts);
-        const auto routing_weights = makeRoutingWeights(rows, top_k);
+        auto routing_weights = routing_weights_override
+                                   ? *routing_weights_override
+                                   : makeRoutingWeights(rows, top_k);
+        const size_t expected_route_values =
+            static_cast<size_t>(rows * top_k);
+        if (routing_indices.size() != expected_route_values ||
+            routing_weights.size() != expected_route_values)
+        {
+            throw std::invalid_argument(
+                "ROCm MoE route override geometry does not match rows*top_k");
+        }
         auto tables = prepareExpertTables(
             moe.get(), device, num_experts, d_model, intermediate,
             uniqueExpertIdsFromRoutes(routing_indices, num_experts),
@@ -1342,6 +1430,238 @@ namespace
             graph_ms,
             rowwise_ms,
             metrics};
+    }
+
+    /**
+     * @brief Timing and byte-parity evidence for one overlay follower decode.
+     *
+     * `valid_routes` models the subset of a global top-8 row assigned to one
+     * overlay follower.  The mapped dispatch consumer compacts those routes
+     * into a valid prefix and publishes `expert=-1, weight=0` in every tail
+     * slot.  Keeping that packet geometry here is essential: sparse global
+     * route positions are not the tensors consumed by the follower graph.
+     */
+    struct OverlayFollowerDecodeResult
+    {
+        int valid_routes = 0;
+        double eager_ms = 0.0;
+        double graph_ms = 0.0;
+        double canonical_oracle_ms = 0.0;
+        CloseMetrics metrics;
+    };
+
+    /**
+     * @brief Measure the exact captured Qwen 122B overlay follower entrypoint.
+     *
+     * Unlike `runROCmCase()`, this function does not route grouped-prefill rows
+     * through `executeGroupedPrefillPipeline()`.  It invokes the same
+     * `groupedExpertDecodeFromRouting()` contract used by a production mapped
+     * M=1 follower stage, including its fixed top-8 geometry, participant mask,
+     * direct output fold, and compact prefix of participant-local route slots.
+     *
+     * @param valid_routes Number of the eight route slots owned by this
+     *                     participant; must be one or two for the canonical
+     *                     four-device secondary tier.
+     * @return Timings plus byte comparison against canonical per-route
+     *         publication followed by the production ordered reducer.
+     */
+    OverlayFollowerDecodeResult runROCmOverlayFollowerDecodeCase(
+        int valid_routes)
+    {
+        constexpr int d_model = 3072;
+        constexpr int intermediate = 1024;
+        constexpr int num_experts = 256;
+        constexpr int top_k = 8;
+        if (valid_routes < 1 || valid_routes > 2)
+        {
+            throw std::invalid_argument(
+                "overlay follower decode requires one or two valid routes");
+        }
+
+        const int iterations = envInt(
+            "LLAMINAR_MOE_OVERLAY_FOLLOWER_DECODE_ITERS", 400);
+        const int warmups = envInt(
+            "LLAMINAR_MOE_OVERLAY_FOLLOWER_DECODE_WARMUPS", 40);
+        const auto device = llaminar2::DeviceId::rocm(0);
+        const auto &q8_0 = llaminar2::test::quantizedVerifierFormat("Q8_0");
+
+        EXPECT_EQ(hipSetDevice(0), hipSuccess);
+        hipStream_t stream = nullptr;
+        EXPECT_EQ(
+            hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+            hipSuccess);
+
+        auto moe = KernelFactory::createMoEKernel(device);
+        EXPECT_NE(moe, nullptr);
+        moe->setGPUStream(stream);
+        auto *workspace_consumer =
+            dynamic_cast<llaminar2::IWorkspaceConsumer *>(moe.get());
+        EXPECT_NE(workspace_consumer, nullptr);
+        auto requirements = llaminar2::MoEWorkspaceBuffers::rocmMoE(
+            /*max_seq_len=*/1,
+            d_model,
+            intermediate,
+            num_experts,
+            top_k);
+        auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+            device,
+            requirements.total_bytes_with_alignment() + 8 * 1024 * 1024);
+        EXPECT_TRUE(workspace->allocate(requirements));
+        workspace_consumer->bindWorkspace(workspace.get());
+
+        std::vector<int> materialized_experts;
+        for (int route = 0; route < valid_routes; ++route)
+            materialized_experts.push_back(route);
+        auto tables = prepareExpertTables(
+            moe.get(),
+            device,
+            num_experts,
+            d_model,
+            intermediate,
+            materialized_experts,
+            q8_0,
+            q8_0);
+
+        auto hidden = makeTensor(
+            {1, static_cast<size_t>(d_model)},
+            makeHiddenValues(/*rows=*/1, d_model));
+        auto output = makeZeros({1, static_cast<size_t>(d_model)});
+        auto canonical_output = makeZeros(
+            {1, static_cast<size_t>(d_model)});
+        auto canonical_routes = makeZeros(
+            {static_cast<size_t>(top_k), static_cast<size_t>(d_model)});
+
+        std::vector<float> expert_ids(static_cast<size_t>(top_k), -1.0f);
+        std::vector<float> expert_weights(static_cast<size_t>(top_k), 0.0f);
+        const std::vector<float> global_expert_weights =
+            makeRoutingWeights(/*rows=*/1, top_k);
+        static constexpr std::array<int, 2> kGlobalRouteSlots = {1, 5};
+        std::vector<uint8_t> expert_mask(
+            static_cast<size_t>(num_experts), 0u);
+        for (int route = 0; route < valid_routes; ++route)
+        {
+            const size_t compact_slot = static_cast<size_t>(route);
+            expert_ids[compact_slot] = static_cast<float>(route);
+            expert_weights[compact_slot] = global_expert_weights[
+                static_cast<size_t>(kGlobalRouteSlots[route])];
+            expert_mask[compact_slot] = 1u;
+        }
+        auto routing_indices = makeTensor(
+            {1, static_cast<size_t>(top_k)}, expert_ids);
+        auto routing_weights = makeTensor(
+            {1, static_cast<size_t>(top_k)}, expert_weights);
+
+        EXPECT_TRUE(hidden->ensureOnDevice(device, stream));
+        EXPECT_TRUE(output->ensureOnDevice(device, stream));
+        EXPECT_TRUE(canonical_output->ensureOnDevice(device, stream));
+        EXPECT_TRUE(canonical_routes->ensureOnDevice(device, stream));
+        EXPECT_TRUE(routing_indices->ensureOnDevice(device, stream));
+        EXPECT_TRUE(routing_weights->ensureOnDevice(device, stream));
+
+        EXPECT_TRUE(moe->prepareGroupedRuntimeDecodeLaunchState(
+            tables.gateup_table_id,
+            tables.down_table_id,
+            top_k,
+            d_model,
+            intermediate,
+            llaminar2::MoEDecodeDescriptorSource::StaticDescriptorTable));
+
+        auto run_production = [&]()
+        {
+            return moe->groupedExpertDecodeFromRouting(
+                hidden.get(),
+                routing_indices.get(),
+                routing_weights.get(),
+                tables.gateup_table_id,
+                tables.down_table_id,
+                top_k,
+                output.get(),
+                d_model,
+                intermediate,
+                expert_mask.data(),
+                /*canonical_route_contributions=*/nullptr);
+        };
+        auto run_canonical_oracle = [&]()
+        {
+            if (!moe->groupedExpertDecodeFromRouting(
+                hidden.get(),
+                routing_indices.get(),
+                routing_weights.get(),
+                tables.gateup_table_id,
+                tables.down_table_id,
+                top_k,
+                output.get(),
+                d_model,
+                intermediate,
+                expert_mask.data(),
+                canonical_routes.get()))
+            {
+                return false;
+            }
+            return moe->reduceCanonicalRouteContributions(
+                canonical_routes.get(),
+                canonical_output.get(),
+                /*seq_len=*/1,
+                top_k,
+                d_model);
+        };
+
+        for (int warmup = 0; warmup < warmups; ++warmup)
+            requireHipBenchBody(
+                run_production(), "overlay follower warmup");
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        const double eager_ms = timeHipEvents(
+            stream, iterations, run_production);
+        const double canonical_oracle_ms = timeHipEvents(
+            stream, iterations, run_canonical_oracle);
+
+        double graph_ms = 0.0;
+        {
+            ScopedHipPerfGraph graph(
+                stream,
+                /*device_ordinal=*/0,
+                "ROCm Qwen 122B overlay follower decode capture");
+            requireHipBenchBody(
+                run_production(), "overlay follower graph capture");
+            if (!graph.finishAndInstantiate())
+            {
+                throw std::runtime_error(
+                    "ROCm overlay follower decode graph instantiate failed");
+            }
+            for (int warmup = 0; warmup < warmups; ++warmup)
+                requireHipBenchBody(
+                    graph.launch(), "overlay follower graph warmup");
+            EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            graph_ms = timeHipEvents(
+                stream,
+                iterations,
+                [&]() { return graph.launch(); });
+            EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        }
+
+        requireHipBenchBody(
+            run_canonical_oracle(), "overlay follower byte oracle");
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        TransferEngine::publishDeviceWrite(output, device, stream);
+        TransferEngine::publishDeviceWrite(canonical_output, device, stream);
+        const std::vector<float> production_values(
+            output->data(), output->data() + output->numel());
+        const std::vector<float> canonical_values(
+            canonical_output->data(),
+            canonical_output->data() + canonical_output->numel());
+        const CloseMetrics metrics = compareVectors(
+            production_values,
+            canonical_values,
+            static_cast<size_t>(d_model));
+
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+        return {
+            .valid_routes = valid_routes,
+            .eager_ms = eager_ms,
+            .graph_ms = graph_ms,
+            .canonical_oracle_ms = canonical_oracle_ms,
+            .metrics = metrics,
+        };
     }
 
     /**
@@ -3012,6 +3332,17 @@ namespace
                 "failed to complete production route preparation");
         }
 
+        /*
+         * The hidden-state upload is an external producer for every captured
+         * candidate graph.  Join its durable completion event before the first
+         * begin-capture boundary; importing an eager event from inside HIP
+         * capture is illegal and would make the tournament exercise a lifecycle
+         * that production explicitly rejects.  The immutable hidden tensor and
+         * exact stream are reused by all candidates, so this one edge remains
+         * valid throughout the cell.
+         */
+        TransferEngine::requireDeviceInput(hidden.get(), device, stream);
+
         const MoEPrefillCandidatePair reference_candidate{
             {4, 64},
             {4, 64},
@@ -4428,6 +4759,238 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M832256_RoutedExpertBatchInvariantEconomy)
                    {"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
         printResult(routed);
     }
+#endif
+}
+
+/**
+ * @brief Certify the exact routed-expert geometry used by the 122B overlay.
+ *
+ * The production sparse endpoint retains an eight-route graph family and
+ * presents one route per compact row. Its Qwen3.5-122B-A10B expert slabs are
+ * Q8_0 for gate, up, and down, with hidden width 3072 and expert width 1024.
+ * Keeping this as a named speedometer prevents tuning a smaller proxy shape
+ * while the real overlay remains dominated by its ROCm participant kernels.
+ */
+TEST(Perf__MoEVerifierPrefill, ROCm_Qwen35_122B_Q8_0_OverlayDecodeM8)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    const auto &q8_0 = llaminar2::test::quantizedVerifierFormat("Q8_0");
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    const auto result = runROCmCase(
+        /*shared=*/false,
+        /*rows=*/8,
+        /*routed_top_k=*/1,
+        /*routed_num_experts=*/256,
+        /*case_name_override=*/"qwen35_122b_q8_0_overlay_decode_m8",
+        /*unique_routes=*/true,
+        /*include_terminal_expert=*/true,
+        /*d_model=*/3072,
+        /*intermediate=*/1024,
+        &q8_0,
+        &q8_0,
+        /*canonical_route_split=*/false);
+    expectClose(result.metrics);
+    EXPECT_EQ(result.metrics.bit_mismatch_count, 0u);
+    EXPECT_EQ(result.metrics.nonfinite_count, 0u);
+    expectGraphReplayFasterThanReference(result);
+    printResult(result);
+#endif
+}
+
+/**
+ * @brief Measure the exact per-participant route counts in 122B overlay decode.
+ *
+ * The complete token has eight routes, but a four-device secondary domain
+ * normally assigns only one or two of them to each follower. M=1/2/4 therefore
+ * distinguishes follower expert arithmetic from mapped packet latency while
+ * retaining the same Q8_0 descriptors, hidden width, graph capture, and
+ * serial-row byte oracle as the aggregate M=8 production speedometer.
+ */
+TEST(Perf__MoEVerifierPrefill, ROCm_Qwen35_122B_Q8_0_OverlayDecodeM1M2M4)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    const auto &q8_0 = llaminar2::test::quantizedVerifierFormat("Q8_0");
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    for (const int rows : {1, 2, 4})
+    {
+        SCOPED_TRACE(rows);
+        const std::string case_name =
+            "qwen35_122b_q8_0_overlay_decode_m" + std::to_string(rows);
+        const auto result = runROCmCase(
+            /*shared=*/false,
+            rows,
+            /*routed_top_k=*/1,
+            /*routed_num_experts=*/256,
+            case_name.c_str(),
+            /*unique_routes=*/true,
+            /*include_terminal_expert=*/true,
+            /*d_model=*/3072,
+            /*intermediate=*/1024,
+            &q8_0,
+            &q8_0,
+            /*canonical_route_split=*/false);
+        expectClose(result.metrics);
+        EXPECT_EQ(result.metrics.bit_mismatch_count, 0u);
+        EXPECT_EQ(result.metrics.nonfinite_count, 0u);
+        expectGraphReplayFasterThanReference(result);
+        printResult(result);
+    }
+#endif
+}
+
+/**
+ * @brief Prove and time the real M=1 explicit-routing overlay follower.
+ *
+ * One and two local routes cover the normal four-way secondary-tier split of
+ * a global top-8 row.  The test retains the fixed top-8 tensor geometry after
+ * compact packet consumption and requires byte identity between direct output
+ * and canonical route publication followed by the ordered reducer.
+ */
+TEST(Perf__MoEVerifierPrefill,
+     ROCm_Qwen35_122B_Q8_0_OverlayFollowerExplicitDecodeTop8)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    std::cout
+        << "backend,case,valid_routes,top_k,num_experts,d_model,intermediate,"
+           "eager_ms,graph_ms,canonical_oracle_ms,bit_mismatch_count,"
+           "nonfinite_count\n";
+    for (const int valid_routes : {1, 2})
+    {
+        SCOPED_TRACE(valid_routes);
+        const OverlayFollowerDecodeResult result =
+            runROCmOverlayFollowerDecodeCase(valid_routes);
+        expectClose(result.metrics);
+        EXPECT_EQ(result.metrics.bit_mismatch_count, 0u);
+        EXPECT_EQ(result.metrics.nonfinite_count, 0u);
+        EXPECT_GT(result.eager_ms, 0.0);
+        EXPECT_GT(result.graph_ms, 0.0);
+        EXPECT_GT(result.canonical_oracle_ms, 0.0);
+        std::cout << std::fixed << std::setprecision(4)
+                  << "rocm,qwen35_122b_q8_0_overlay_follower_explicit_decode,"
+                  << result.valid_routes
+                  << ",8,256,3072,1024,"
+                  << result.eager_ms << ','
+                  << result.graph_ms << ','
+                  << result.canonical_oracle_ms << ','
+                  << result.metrics.bit_mismatch_count << ','
+                  << result.metrics.nonfinite_count << '\n';
+    }
+#endif
+}
+
+/**
+ * @brief Measure the larger retained sparse-endpoint buckets for Qwen 122B.
+ *
+ * M=16 and M=32 are uncommon during steady-state depth-three verification but
+ * are retained production capacities and can be selected by prefill
+ * segmentation or a wider future speculative policy.  They also straddle the
+ * current route-owned/expert-tiled boundary, making this test the production-
+ * shape speedometer for training that dispatch decision instead of inferring
+ * it from a smaller model or a dense top-k route profile.
+ */
+TEST(Perf__MoEVerifierPrefill, ROCm_Qwen35_122B_Q8_0_OverlayDecodeM16M32)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    const auto &q8_0 = llaminar2::test::quantizedVerifierFormat("Q8_0");
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    for (const int rows : {16, 32})
+    {
+        SCOPED_TRACE(rows);
+        const auto result = runROCmCase(
+            /*shared=*/false,
+            rows,
+            /*routed_top_k=*/1,
+            /*routed_num_experts=*/256,
+            rows == 16
+                ? "qwen35_122b_q8_0_overlay_decode_m16"
+                : "qwen35_122b_q8_0_overlay_decode_m32",
+            /*unique_routes=*/true,
+            /*include_terminal_expert=*/true,
+            /*d_model=*/3072,
+            /*intermediate=*/1024,
+            &q8_0,
+            &q8_0,
+            /*canonical_route_split=*/false);
+        expectClose(result.metrics);
+        EXPECT_EQ(result.metrics.bit_mismatch_count, 0u);
+        EXPECT_EQ(result.metrics.nonfinite_count, 0u);
+        expectGraphReplayFasterThanReference(result);
+        printResult(result);
+    }
+#endif
+}
+
+/**
+ * @brief Certify the exact 600-row secondary-participant prefill workload.
+ *
+ * The canonical 595-token prompt is padded into the retained 600-row graph
+ * family. With 30 experts resident on the continuation tier, each secondary
+ * GPU owns about 56 of 256 experts and receives 1.75 compact top-eight routes
+ * per physical row. This speedometer therefore times the same Q8_0 geometry,
+ * compact packet convention, grouped prefill pipeline, independent route-slot
+ * publication, ordered fold, and captured replay used by production.
+ */
+TEST(Perf__MoEVerifierPrefill,
+     ROCm_Qwen35_122B_Q8_0_OverlayFollowerPrefillM600)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    constexpr int rows = 600;
+    constexpr int top_k = 8;
+    constexpr int num_experts = 256;
+    constexpr int first_local_expert = 30;
+    constexpr int local_experts = 56;
+    const auto &q8_0 =
+        llaminar2::test::quantizedVerifierFormat("Q8_0");
+    auto [routing_indices, routing_weights] =
+        makeCompactOverlayFollowerRoutes(
+            rows, top_k, first_local_expert, local_experts);
+
+    ScopedEnvOverride stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    const auto result = runROCmCase(
+        /*shared=*/false,
+        rows,
+        top_k,
+        num_experts,
+        "qwen35_122b_q8_0_overlay_follower_prefill_m600",
+        /*unique_routes=*/false,
+        /*include_terminal_expert=*/false,
+        /*d_model=*/3072,
+        /*intermediate=*/1024,
+        &q8_0,
+        &q8_0,
+        /*canonical_route_split=*/true,
+        &routing_indices,
+        &routing_weights);
+    expectClose(result.metrics);
+    EXPECT_EQ(result.metrics.bit_mismatch_count, 0u);
+    EXPECT_EQ(result.metrics.nonfinite_count, 0u);
+    expectGraphReplayFasterThanReference(result);
+    printResult(result);
 #endif
 }
 

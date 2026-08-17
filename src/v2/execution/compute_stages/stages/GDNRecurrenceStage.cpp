@@ -5,16 +5,18 @@
  * Pure glue: extracts raw pointers from tensors, validates them, and
  * delegates all computation to the ITensorGatedDeltaNet kernel.
  *
- * When Q, K, V all point to the same merged QKV buffer (interleaved layout
- * [seq_len, q_dim + k_dim + v_dim]), this stage deinterleaves them into
- * separate contiguous arrays before passing to the kernel.
+ * When Q, K, V identify one merged QKV buffer with row layout
+ * `[Q | K | V]`, the stage passes that layout and its TP head mapping directly
+ * through the mandatory backend contract. CPU recurrence consumes source-row
+ * strides in place. GPU recurrence performs any required device-only layout
+ * transform in caller-owned graph workspace on the exact stage stream.
  *
  * GPU path: The executor and TransferEngine prepare arena bindings on the
  * stage's explicit stream; this stage consumes device pointers only. Merged
  * QKV deinterleave is done on-device via deinterleave_qkv_device(). No H2D/D2H
  * copies occur in the hot path.
  *
- * CPU path: Uses data() / mutable_data() host pointers with CPU-side deinterleave.
+ * CPU execution never materializes temporary Q/K/V matrices in the stage.
  *
  * All preprocessing (L2 normalization, query scaling, gate computation)
  * is handled by the kernel, keeping this stage device-agnostic.
@@ -34,7 +36,6 @@
 #include <atomic>
 #include <cstring>
 #include <limits>
-#include <vector>
 
 namespace llaminar2
 {
@@ -71,79 +72,6 @@ namespace llaminar2
     namespace
     {
         std::atomic<uint32_t> g_gdn_recurrence_workspace_slice_counter{0};
-
-        /**
-         * Deinterleave a merged QKV buffer into separate contiguous Q, K, V arrays.
-         *
-         * Merged layout per row t (length = q_src_dim + k_src_dim + v_dim):
-         *   [ Q (nkh * d_k) | K (nkh * d_k) | V (n_v_heads_local * d_v) ]
-         *
-         * Output layout:
-         *   q_dst, k_dst : [T, n_v_heads_local * d_k]
-         *   v_dst        : [T, n_v_heads_local * d_v]  (straight copy)
-         *
-         * Head mapping: for each local V-head j in [0, n_v_heads_local),
-         *   k_idx = (j + global_v_offset) % nkh
-         *   q_dst[t, j] = q_src[t, k_idx]
-         *   k_dst[t, j] = k_src[t, k_idx]
-         *
-         * This mirrors the Qwen3.5/Qwen3.6 reference implementation, which
-         * tiles Q/K heads with repeat() rather than contiguous repeat_interleave().
-         *
-         * Fast path: when global_v_offset == 0 AND nkh == n_v_heads_local, the
-         * Q and K regions become a contiguous copy of the source buffer — emitted
-         * as a single memcpy per token.
-         */
-        void deinterleaveMergedQKV(
-            const float *qkv, int T, int qkv_stride,
-            int nkh, int n_v_heads_local, int d_k, int d_v,
-            int global_v_offset,
-            float *q_dst_buf, float *k_dst_buf, float *v_dst_buf)
-        {
-            const int q_src_dim = nkh * d_k;
-            const int k_src_dim = nkh * d_k;
-            const int v_dim = n_v_heads_local * d_v;
-            const int q_dst_dim = n_v_heads_local * d_k;
-            const int k_dst_dim = n_v_heads_local * d_k;
-
-            const bool identity_fast_path =
-                (global_v_offset == 0) && (nkh == n_v_heads_local);
-
-            for (int t = 0; t < T; ++t)
-            {
-                const float *row = qkv + static_cast<size_t>(t) * qkv_stride;
-                const float *q_src = row;
-                const float *k_src = row + q_src_dim;
-                const float *v_src = row + q_src_dim + k_src_dim;
-                float *q_dst = q_dst_buf + static_cast<size_t>(t) * q_dst_dim;
-                float *k_dst = k_dst_buf + static_cast<size_t>(t) * k_dst_dim;
-                float *v_dst = v_dst_buf + static_cast<size_t>(t) * v_dim;
-
-                if (identity_fast_path)
-                {
-                    std::memcpy(q_dst, q_src, q_dst_dim * sizeof(float));
-                    std::memcpy(k_dst, k_src, k_dst_dim * sizeof(float));
-                }
-                else
-                {
-                    for (int j = 0; j < n_v_heads_local; ++j)
-                    {
-                        int k_idx = (j + global_v_offset) % nkh;
-                        if (k_idx < 0)
-                            k_idx += nkh;
-                        std::memcpy(q_dst + j * d_k,
-                                    q_src + k_idx * d_k,
-                                    d_k * sizeof(float));
-                        std::memcpy(k_dst + j * d_k,
-                                    k_src + k_idx * d_k,
-                                    d_k * sizeof(float));
-                    }
-                }
-
-                // V is already n_v_heads_local wide — straight copy.
-                std::memcpy(v_dst, v_src, v_dim * sizeof(float));
-            }
-        }
     } // namespace
 
     GDNRecurrenceStage::GDNRecurrenceStage(Params params)
@@ -474,15 +402,9 @@ namespace llaminar2
 
     bool GDNRecurrenceStage::restoreCPUVerifierStateCaptureRowDirect(int row)
     {
-        if (!hasVerifierStateCapture() || params_.device_id.is_gpu())
-            return false;
-        if (!ensureVerifierStateCaptureWorkspaceBound())
-            return false;
-        if (row < 0 || row >= verifier_capture_rows_bound_)
-            return false;
-
-        const float *capture = cpuVerifierStateCaptureWorkspace();
-        if (!capture || !params_.recurrence_state)
+        const CPUVerifierStateRestorePlan plan =
+            planCPUVerifierStateRestoreRow(row);
+        if (!plan.ready())
             return false;
 
         /*
@@ -493,11 +415,55 @@ namespace llaminar2
          * slots live on device and must stay ordered on the explicit stream.
          */
         std::memcpy(
-            params_.recurrence_state,
-            capture + static_cast<size_t>(row) *
-                          static_cast<size_t>(verifier_capture_state_size_bound_),
-            static_cast<size_t>(verifier_capture_state_size_bound_) * sizeof(float));
+            plan.destination,
+            plan.source,
+            plan.bytes);
         return true;
+    }
+
+    CPUVerifierStateRestorePlan
+    GDNRecurrenceStage::planCPUVerifierStateRestoreRow(int row)
+    {
+        if (params_.device_id.is_gpu())
+            return {};
+        if (!hasVerifierStateCapture() ||
+            !ensureVerifierStateCaptureWorkspaceBound())
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+        if (row < 0)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::NoOp,
+            };
+        }
+        if (row >= verifier_capture_rows_bound_ ||
+            verifier_capture_state_size_bound_ <= 0)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+
+        const float *capture = cpuVerifierStateCaptureWorkspace();
+        if (!capture || !params_.recurrence_state)
+        {
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Invalid,
+            };
+        }
+
+        return {
+            .status = CPUVerifierStateRestorePlanStatus::Ready,
+            .destination = params_.recurrence_state,
+            .source = capture +
+                static_cast<size_t>(row) *
+                    static_cast<size_t>(verifier_capture_state_size_bound_),
+            .bytes = static_cast<size_t>(verifier_capture_state_size_bound_) *
+                     sizeof(float),
+        };
     }
 
     bool GDNRecurrenceStage::restoreVerifierStateCaptureRow(int row, void *stream)
@@ -1086,7 +1052,7 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // CPU path: use host pointers, CPU-side deinterleave
+        // CPU path: host-owned tensors, with merged rows consumed in place.
         // =====================================================================
         const float *q_data = q_base->data();
         const float *k_data = k_base->data();
@@ -1097,7 +1063,7 @@ namespace llaminar2
         const float *dtbias_data = dtbias_base->data();
         float *output_data = out_base->mutable_data();
 
-        // When Q, K, V all point to the same merged QKV buffer, deinterleave them.
+        // When Q, K, V identify one merged QKV buffer, preserve that layout.
         // Merged layout: [seq_len, q_dim + k_dim + v_dim] per row.
         // q_dim = k_dim = n_k_heads * d_k, v_dim = n_heads * d_v (n_heads = n_v_heads)
         //
@@ -1106,7 +1072,7 @@ namespace llaminar2
         //   2) n_k == n_v_local: Identity deinterleave (TP where n_k is replicated and equals n_v_local)
         //   3) n_k > n_v_local: Selection — pick the correct K-head subset for each V-head (high-degree TP)
         //
-        // The kernel expects separate contiguous [seq_len, n_v_local * dim] arrays.
+        // The mandatory merged-layout backend contract owns these mappings.
         const bool merged_qkv = (q_data == k_data && k_data == v_data);
 
         // Effective key head count for QKV split (may be full count if Q/K replicated for TP)
@@ -1255,49 +1221,65 @@ namespace llaminar2
                 return true;
             }
 
-            // Dimensions after deinterleave (what the kernel expects: n_v_local heads)
-            const int q_dst_dim = params_.n_heads * params_.d_k;
-            const int k_dst_dim = params_.n_heads * params_.d_k;
-            const int T = params_.seq_len;
-
-            // Grow-only reusable scratch (no allocation after first call at max seq_len)
-            const size_t q_size = static_cast<size_t>(T) * q_dst_dim;
-            const size_t k_size = static_cast<size_t>(T) * k_dst_dim;
-            const size_t v_size = static_cast<size_t>(T) * v_dim;
-            if (q_deinterleave_.size() < q_size)
-                q_deinterleave_.resize(q_size);
-            if (k_deinterleave_.size() < k_size)
-                k_deinterleave_.resize(k_size);
-            if (v_deinterleave_.size() < v_size)
-                v_deinterleave_.resize(v_size);
-
-            const float *qkv = q_data; // merged buffer
+            const int effective_seq_len = effectivePrefillSeqLen();
+            const int kernel_seq_len = params_.seq_len > 1
+                                           ? effective_seq_len
+                                           : params_.seq_len;
+            const bool padded_effective_len =
+                prefill_replay_params_set_ && effective_seq_len < params_.seq_len;
+            if (padded_effective_len && !supportsPaddedPrefillRealLengthContract())
+            {
+                LOG_ERROR("[GDNRecurrenceStage] Padded CPU merged-QKV prefill "
+                          "requires a real-length contract");
+                return false;
+            }
 
             {
                 PerfStatsCollector::ScopedTimer timer(
                     "gdn_recurrence_cpu_detail",
-                    "host_deinterleave",
+                    params_.seq_len == 1
+                        ? "direct_merged_decode"
+                        : "direct_merged_prefill",
                     "execute",
                     params_.device_id.toString(),
                     detail_tags);
-                deinterleaveMergedQKV(
-                    qkv, T, qkv_stride,
-                    nkh, params_.n_heads, params_.d_k, params_.d_v,
+                ok = params_.kernel->chunkForwardMergedQKV(
+                    q_data,
+                    qkv_stride,
+                    alpha_data,
+                    beta_data,
+                    alog_data,
+                    dtbias_data,
+                    output_data,
+                    params_.recurrence_state,
+                    kernel_seq_len,
+                    nkh,
+                    params_.n_heads,
+                    params_.d_k,
+                    params_.d_v,
                     params_.global_v_head_offset,
-                    q_deinterleave_.data(),
-                    k_deinterleave_.data(),
-                    v_deinterleave_.data());
+                    params_.chunk_size,
+                    params_.use_qk_l2norm);
             }
-
-            q_data = q_deinterleave_.data();
-            k_data = k_deinterleave_.data();
-            v_data = v_deinterleave_.data();
-
-            LOG_TRACE("[GDNRecurrenceStage] Deinterleaved merged QKV: "
-                      << T << "x" << qkv_stride << " -> Q(" << T << "x" << q_dst_dim
-                      << "), K(" << T << "x" << k_dst_dim << "), V(" << T << "x" << v_dim << ")"
-                      << " nkh=" << nkh << " n_heads=" << params_.n_heads
-                      << " global_v_offset=" << params_.global_v_head_offset);
+            if (!ok)
+            {
+                LOG_ERROR("[GDNRecurrenceStage] Mandatory CPU merged-QKV kernel failed");
+                return false;
+            }
+            if (kernel_seq_len < params_.seq_len)
+            {
+                const size_t first_pad =
+                    static_cast<size_t>(kernel_seq_len) *
+                    static_cast<size_t>(params_.n_heads * params_.d_v);
+                const size_t pad_count =
+                    static_cast<size_t>(params_.seq_len - kernel_seq_len) *
+                    static_cast<size_t>(params_.n_heads * params_.d_v);
+                std::memset(
+                    output_data + first_pad,
+                    0,
+                    pad_count * sizeof(float));
+            }
+            return true;
         }
 
         if (request_batched)

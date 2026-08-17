@@ -29,6 +29,7 @@
 #include "../execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "../backends/DeviceId.h"
 #include "../config/TensorParallelConfig.h"
+#include "../config/GDNHeadAssignment.h"
 #include "../execution/local_execution/graph/GraphSchema.h"
 #include "IWeightManager.h"
 #include "../utils/MPIContext.h"
@@ -297,6 +298,9 @@ namespace llaminar2
          * Called after the first forward pass completes. Unlike releaseAllHostWeightData()
          * which retains host-resident tensors because they haven't been uploaded yet,
          * this method releases them because the GPU kernels have now created their own copies.
+         * This method deliberately does not advise mmap pages: borrowed views must be
+         * unregistered through adviseMmapDontneed() before the shared mapping may be
+         * reclaimed.
          *
          * @return Number of tensors whose host data was released
          */
@@ -395,6 +399,13 @@ namespace llaminar2
             {
                 tp_config_ = config.tp_config;
             }
+
+            if (!config.routed_expert_assignment.valid())
+            {
+                throw std::invalid_argument(
+                    "WeightManager routed-expert assignment has invalid participant coordinates");
+            }
+            routed_expert_assignment_ = config.routed_expert_assignment;
 
             // Preprocessor
             if (config.preprocessor)
@@ -895,6 +906,7 @@ namespace llaminar2
         WeightShardingConfig sharding_config_;                                      ///< Model-specific sharding patterns
         bool has_sharding_config_ = false;                                          ///< True if config was set explicitly
         WeightPreprocessor weight_preprocessor_;                                    ///< Optional per-weight transform before packing
+        RoutedExpertWeightAssignment routed_expert_assignment_;                     ///< Static owner policy shared with graph construction
 
         // =========================================================================
         // Model head dimensions for FusedQKV sub-block computation
@@ -932,6 +944,69 @@ namespace llaminar2
             const std::shared_ptr<TensorBase> &clone,
             DeviceId device);
         WeightSliceSpec fullSliceSpec(const TensorBase &tensor) const;
+
+        /**
+         * @brief Resolve the exact ordered routed-expert IDs for one owner.
+         *
+         * Expert slices with different owner policies can have identical tensor
+         * shapes. Cache identity therefore cannot be inferred from dimensions;
+         * it must be derived from the same layer-aware ownership policy used by
+         * graph construction and physical GGUF loading.
+         *
+         * @param name Canonical three-dimensional routed-expert weight name.
+         * @param participant_index Static owner index requesting the weight.
+         * @param participant_count Number of static whole-expert owners.
+         * @param layer_idx Explicit layer index, or a negative value to derive it
+         *        from @p name.
+         * @return Sorted global expert IDs in packed source-tensor order.
+         * @throws std::runtime_error when the tensor geometry or layer identity
+         *         cannot establish an unambiguous ownership set.
+         */
+        std::vector<int> expectedRoutedExpertIds(
+            const std::string &name,
+            int participant_index,
+            int participant_count,
+            int layer_idx) const;
+
+        /**
+         * @brief Identify an exact full source that may precede TP slicing.
+         *
+         * Model-context construction can cache a complete immutable routed
+         * tensor before the final TP topology is installed. Such a source is
+         * not a stale expert slice: its typed source/clone derivation, canonical
+         * name, and complete GGUF geometry make it an unambiguous input from
+         * which the configured expert selection must subsequently be loaded.
+         *
+         * @param name Canonical routed-expert weight name.
+         * @param tensor Candidate cached tensor.
+         * @return true only for an unsliced full source or full device clone.
+         */
+        bool isCachedFullRoutedExpertSource(
+            const std::string &name,
+            const std::shared_ptr<TensorBase> &tensor) const;
+
+        /**
+         * @brief Prove that a cached expert tensor has the requested identity.
+         *
+         * A cache hit is accepted only when registry metadata identifies an
+         * explicit expert slice with the exact global expert-ID sequence and a
+         * packed tensor shape consistent with that sequence. Missing or stale
+         * metadata is fatal; callers must never erase and silently reconstruct
+         * an ambiguously identified expert tensor. A separately typed complete
+         * source recognized by isCachedFullRoutedExpertSource() is a lifecycle
+         * input rather than a candidate slice and is handled before this check.
+         *
+         * @param name Canonical routed-expert weight name.
+         * @param tensor Candidate cached tensor.
+         * @param expected_expert_ids Exact IDs requested by the active policy.
+         * @param cache_key Human-readable cache key for diagnostics.
+         * @throws std::runtime_error when any cache identity invariant fails.
+         */
+        void validateCachedRoutedExpertSlice(
+            const std::string &name,
+            const std::shared_ptr<TensorBase> &tensor,
+            const std::vector<int> &expected_expert_ids,
+            const std::string &cache_key) const;
 
         // =========================================================================
         // Layer range for Pipeline Parallelism (LAYER_PARTITIONED strategy)
@@ -1221,6 +1296,98 @@ namespace llaminar2
             const std::string &name,
             DeviceId device,
             const DeviceShardingAssignment &assignment,
+            const std::vector<size_t> &dimensions);
+
+        /**
+         * @brief Resolve economical modulo-linked GDN ownership for one TP participant.
+         *
+         * The attention-head partition is used only as a backend-independent
+         * proportional partition space. The returned assignment owns a true
+         * Q/K shard and every V head whose @c global_v % global_k falls inside
+         * that shard.
+         */
+        GDNHeadAssignment gdnHeadAssignmentFor(
+            const DeviceShardingAssignment &assignment) const;
+
+        /**
+         * @brief Resolve economical modulo-linked ownership for equal-rank TP.
+         *
+         * This is the global-MPI companion to @ref gdnHeadAssignmentFor. Both
+         * entry points produce the same typed ownership object, so rank-local
+         * and LocalTP loading cannot drift into different GDN layouts.
+         */
+        GDNHeadAssignment gdnHeadAssignmentForEqualRank(
+            int rank,
+            int world_size) const;
+
+        /**
+         * @brief Return the logical element width of a GDN value head.
+         *
+         * @return One for per-head scalar projections, @c gdn_d_state for
+         *         value-channel projections, or zero when @p name/@p total_size
+         *         is not an exact GDN value-head tensor.
+         */
+        int gdnValueElementsPerHead(
+            const std::string &name,
+            size_t total_size) const;
+
+        /**
+         * @brief Load and concatenate non-contiguous source row intervals.
+         *
+         * Every interval is read directly in native format and concatenated in
+         * the supplied order. This preserves source quantization bytes while
+         * constructing the packed local GDN head order once during loading.
+         */
+        std::shared_ptr<TensorBase> loadNativeRowSpanConcat(
+            const std::string &name,
+            DeviceId device,
+            const std::vector<GDNHeadSpan> &spans,
+            size_t source_cols);
+
+        /**
+         * @brief Load and row-wise concatenate non-contiguous source columns.
+         *
+         * This is the input-parallel companion to
+         * @ref loadNativeRowSpanConcat. Quantized intervals must be naturally
+         * block aligned; an unrepresentable geometry fails explicitly.
+         */
+        std::shared_ptr<TensorBase> loadNativeColumnSpanConcat(
+            const std::string &name,
+            DeviceId device,
+            const std::vector<GDNHeadSpan> &spans,
+            size_t source_rows);
+
+        /**
+         * @brief Load a CPU TP GDN fused [Q|K|V] tensor in linked local order.
+         */
+        std::shared_ptr<TensorBase> loadCPUGDNFusedQKVColumnParallel(
+            const std::string &name,
+            DeviceId device,
+            const GDNHeadAssignment &head_assignment,
+            int rank,
+            int world_size,
+            const std::vector<size_t> &dimensions);
+
+        /**
+         * @brief Load a CPU TP value-associated row-sharded GDN tensor.
+         */
+        std::shared_ptr<TensorBase> loadCPUGDNValueRows(
+            const std::string &name,
+            DeviceId device,
+            const GDNHeadAssignment &head_assignment,
+            int rank,
+            int world_size,
+            const std::vector<size_t> &dimensions);
+
+        /**
+         * @brief Load a CPU TP value-associated input-sharded GDN tensor.
+         */
+        std::shared_ptr<TensorBase> loadCPUGDNValueColumns(
+            const std::string &name,
+            DeviceId device,
+            const GDNHeadAssignment &head_assignment,
+            int rank,
+            int world_size,
             const std::vector<size_t> &dimensions);
 
     public:

@@ -3,6 +3,8 @@
 #include "Perf__MoELLEPDeterminismCommon.h"
 
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/moe/DeviceMoELLEPPlannerScratch.h"
+#include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/IMoEKernel.h"
@@ -77,6 +79,7 @@ namespace
         int max_active_experts,
         int filter_to_local_runtime_experts,
         int retain_routes_for_deferred_commit,
+        llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
         void *stream);
 
@@ -103,6 +106,7 @@ namespace
         int top_k,
         int max_active_experts,
         int retain_routes_for_deferred_commit,
+        llaminar2::DeviceMoEWeightFormat expected_format,
         int device_idx,
         void *stream);
 
@@ -549,8 +553,9 @@ TEST(Perf__MoELLEPDeterminism, ROCm_RuntimePrefillPlanPublication)
  * The baseline deliberately invokes the former route grouping, inverse-map
  * publication, and descriptor/active-list publications separately. The fused
  * candidate must reproduce every byte of runtime route state and every
- * compute-plan product before its timing can be considered. Allocations and
- * host copies remain outside the timed interval.
+ * reachable compute-plan product before its timing can be considered. It must
+ * also leave inactive descriptor slots untouched. Allocations and host copies
+ * remain outside the timed interval.
  */
 TEST(Perf__MoELLEPDeterminism, ROCm_CompleteRuntimePrefillPlanFusion)
 {
@@ -669,6 +674,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CompleteRuntimePrefillPlanFusion)
             max_active_experts,
             /*filter_to_local_runtime_experts=*/0,
             /*retain_routes_for_deferred_commit=*/0,
+            llaminar2::DeviceMoEWeightFormat::NativeVNNI,
             /*device_idx=*/0,
             harness.stream_);
     };
@@ -687,6 +693,18 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CompleteRuntimePrefillPlanFusion)
             hipSuccess);
         return result;
     };
+    const auto copy_ints = [](const int32_t *device_ptr, std::size_t count)
+    {
+        std::vector<int32_t> result(count);
+        EXPECT_EQ(
+            hipMemcpy(result.data(),
+                      device_ptr,
+                      count * sizeof(int32_t),
+                      hipMemcpyDeviceToHost),
+            hipSuccess);
+        return result;
+    };
+    constexpr uint8_t inactive_descriptor_poison = 0xa5u;
     const auto baseline_gate_bytes = copy_bytes(baseline_gate, descriptor_bytes);
     const auto baseline_up_bytes = copy_bytes(baseline_up, descriptor_bytes);
     const auto baseline_down_bytes = copy_bytes(baseline_down, descriptor_bytes);
@@ -700,12 +718,53 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CompleteRuntimePrefillPlanFusion)
     const auto baseline_grouped_ids = copy_bytes(runtime.grouped_token_ids, route_int_bytes);
     const auto baseline_grouped_weights =
         copy_bytes(runtime.grouped_route_weights, route_float_bytes);
+    const auto baseline_active_ids =
+        copy_ints(baseline_active, static_cast<size_t>(max_active_experts));
 
+    ASSERT_EQ(hipMemsetAsync(fused_gate,
+                             inactive_descriptor_poison,
+                             descriptor_bytes,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(fused_up,
+                             inactive_descriptor_poison,
+                             descriptor_bytes,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(fused_down,
+                             inactive_descriptor_poison,
+                             descriptor_bytes,
+                             harness.stream_),
+              hipSuccess);
     ASSERT_TRUE(launch_fused());
     ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
-    EXPECT_EQ(copy_bytes(fused_gate, descriptor_bytes), baseline_gate_bytes);
-    EXPECT_EQ(copy_bytes(fused_up, descriptor_bytes), baseline_up_bytes);
-    EXPECT_EQ(copy_bytes(fused_down, descriptor_bytes), baseline_down_bytes);
+    const auto fused_gate_bytes = copy_bytes(fused_gate, descriptor_bytes);
+    const auto fused_up_bytes = copy_bytes(fused_up, descriptor_bytes);
+    const auto fused_down_bytes = copy_bytes(fused_down, descriptor_bytes);
+    const auto gate_error = validateSparseDescriptorPublication(
+        fused_gate_bytes,
+        baseline_gate_bytes,
+        baseline_active_ids,
+        shape.num_experts,
+        sizeof(DeviceNativeVNNIMatrixDesc),
+        inactive_descriptor_poison);
+    const auto up_error = validateSparseDescriptorPublication(
+        fused_up_bytes,
+        baseline_up_bytes,
+        baseline_active_ids,
+        shape.num_experts,
+        sizeof(DeviceNativeVNNIMatrixDesc),
+        inactive_descriptor_poison);
+    const auto down_error = validateSparseDescriptorPublication(
+        fused_down_bytes,
+        baseline_down_bytes,
+        baseline_active_ids,
+        shape.num_experts,
+        sizeof(DeviceNativeVNNIMatrixDesc),
+        inactive_descriptor_poison);
+    EXPECT_TRUE(gate_error.empty()) << gate_error;
+    EXPECT_TRUE(up_error.empty()) << up_error;
+    EXPECT_TRUE(down_error.empty()) << down_error;
     EXPECT_EQ(copy_bytes(fused_active, active_bytes), baseline_active_bytes);
     EXPECT_EQ(copy_bytes(fused_inverse, route_int_bytes), baseline_inverse_bytes);
     EXPECT_EQ(copy_bytes(runtime.expert_counts, expert_int_bytes), baseline_counts);
@@ -828,6 +887,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CompleteRuntimePrefillPlanFusion)
             shape.top_k,
             max_active_experts,
             /*retain_routes_for_deferred_commit=*/0,
+            llaminar2::DeviceMoEWeightFormat::NativeVNNI,
             /*device_idx=*/0,
             harness.stream_);
     };
@@ -858,15 +918,50 @@ TEST(Perf__MoELLEPDeterminism, ROCm_CompleteRuntimePrefillPlanFusion)
         copy_bytes(runtime.grouped_token_ids, route_int_bytes);
     const auto assigned_baseline_grouped_weights =
         copy_bytes(runtime.grouped_route_weights, route_float_bytes);
+    const auto assigned_baseline_active_ids =
+        copy_ints(baseline_active, static_cast<size_t>(max_active_experts));
 
+    ASSERT_EQ(hipMemsetAsync(fused_gate,
+                             inactive_descriptor_poison,
+                             descriptor_bytes,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(fused_up,
+                             inactive_descriptor_poison,
+                             descriptor_bytes,
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(fused_down,
+                             inactive_descriptor_poison,
+                             descriptor_bytes,
+                             harness.stream_),
+              hipSuccess);
     ASSERT_TRUE(launch_assigned_fused());
     ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
-    EXPECT_EQ(copy_bytes(fused_gate, descriptor_bytes),
-              assigned_baseline_gate_bytes);
-    EXPECT_EQ(copy_bytes(fused_up, descriptor_bytes),
-              assigned_baseline_up_bytes);
-    EXPECT_EQ(copy_bytes(fused_down, descriptor_bytes),
-              assigned_baseline_down_bytes);
+    const auto assigned_gate_error = validateSparseDescriptorPublication(
+        copy_bytes(fused_gate, descriptor_bytes),
+        assigned_baseline_gate_bytes,
+        assigned_baseline_active_ids,
+        shape.num_experts,
+        sizeof(DeviceNativeVNNIMatrixDesc),
+        inactive_descriptor_poison);
+    const auto assigned_up_error = validateSparseDescriptorPublication(
+        copy_bytes(fused_up, descriptor_bytes),
+        assigned_baseline_up_bytes,
+        assigned_baseline_active_ids,
+        shape.num_experts,
+        sizeof(DeviceNativeVNNIMatrixDesc),
+        inactive_descriptor_poison);
+    const auto assigned_down_error = validateSparseDescriptorPublication(
+        copy_bytes(fused_down, descriptor_bytes),
+        assigned_baseline_down_bytes,
+        assigned_baseline_active_ids,
+        shape.num_experts,
+        sizeof(DeviceNativeVNNIMatrixDesc),
+        inactive_descriptor_poison);
+    EXPECT_TRUE(assigned_gate_error.empty()) << assigned_gate_error;
+    EXPECT_TRUE(assigned_up_error.empty()) << assigned_up_error;
+    EXPECT_TRUE(assigned_down_error.empty()) << assigned_down_error;
     EXPECT_EQ(copy_bytes(fused_active, active_bytes),
               assigned_baseline_active_bytes);
     EXPECT_EQ(copy_bytes(fused_inverse, route_int_bytes),
@@ -1004,6 +1099,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_TransferCommandMaterializationDeterministic)
     auto runtime = harness.copyRuntime();
     ASSERT_GT(runtime.reserved_u64[2], 0u);
     ASSERT_GT(runtime.reserved_u64[3], 0u);
+    DeviceMoERebalanceConfig materialize_config = rebalanceConfig(shape);
+    materialize_config.participant_id = 1u;
 
     constexpr uint32_t plan_capacity = kDeviceMoEMaxExperts * kDeviceMoEMaxParticipants;
     DeviceMoERebalancePlanEntry *d_plan = nullptr;
@@ -1037,8 +1134,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_TransferCommandMaterializationDeterministic)
             plan_capacity,
             d_header,
             d_status,
-            rebalanceConfig(shape),
-            plan_capacity,
+            materialize_config,
+            static_cast<uint32_t>(kDeviceMoEMaxExperts),
             0));
     }
     ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
@@ -1055,8 +1152,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_TransferCommandMaterializationDeterministic)
             plan_capacity,
             d_header,
             d_status,
-            rebalanceConfig(shape),
-            plan_capacity,
+            materialize_config,
+            static_cast<uint32_t>(kDeviceMoEMaxExperts),
             0));
     }
     ASSERT_EQ(hipEventRecord(events.stop, harness.stream_), hipSuccess);
@@ -1072,6 +1169,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_TransferCommandMaterializationDeterministic)
     ASSERT_EQ(status.plan_overflow, 0u);
     ASSERT_EQ(status.payload_bucket_overflow, 0u);
     ASSERT_EQ(status.planned_arrivals, count);
+    ASSERT_EQ(status.llep_weight_transfer_count,
+              static_cast<uint32_t>(runtime.reserved_u64[3]));
     ASSERT_EQ(status.payload_bucket_requested_slots, count);
     ASSERT_GE(status.payload_bucket_slots, count);
     ASSERT_LT(status.payload_bucket_slots, plan_capacity);
@@ -1083,8 +1182,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_TransferCommandMaterializationDeterministic)
         const auto &entry = first[static_cast<size_t>(i)];
         ASSERT_EQ(entry.op, static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival));
         ASSERT_EQ(entry.source_participant, 0u);
-        ASSERT_GT(entry.destination_participant, 0u);
-        ASSERT_LT(entry.destination_participant, static_cast<uint32_t>(shape.participant_count));
+        ASSERT_EQ(entry.destination_participant,
+                  materialize_config.participant_id);
         EXPECT_EQ(entry.payload_slot, i);
         EXPECT_LT(entry.payload_slot, status.payload_bucket_slots);
         EXPECT_EQ(entry.destination_slot, kDeviceMoEInvalidSlot);
@@ -1100,8 +1199,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_TransferCommandMaterializationDeterministic)
             plan_capacity,
             d_header,
             d_status,
-            rebalanceConfig(shape),
-            plan_capacity,
+            materialize_config,
+            static_cast<uint32_t>(kDeviceMoEMaxExperts),
             0));
         ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
         uint32_t repeat_count = 0;
@@ -1557,7 +1656,17 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
         GTEST_SKIP() << "No ROCm device available";
 
     const Shape shape{};
-    const SyntheticPayloadSpec payload_spec{};
+    constexpr uint32_t projection_runtime_layers = 40u;
+    /*
+     * Match the payload-size class of one production Qwen3.6 routed expert.
+     * A small synthetic expert cannot expose whether pack/unpack bandwidth
+     * scales to the 1,900,800-byte slots used by the real-weight campaign.
+     */
+    const SyntheticPayloadSpec payload_spec{
+        .n = 512,
+        .k = 2048,
+        .codebook_id = 5,
+    };
     const uint64_t expert_bytes = syntheticExpertDataBytes(payload_spec);
     const uint64_t payload_slot_bytes = syntheticPayloadSlotBytes(payload_spec);
     ASSERT_GT(expert_bytes, 0u);
@@ -1575,6 +1684,13 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
     uint32_t *d_plan_count = nullptr;
     DeviceMoERebalanceCommandBufferHeader *d_header = nullptr;
     DeviceMoERebalanceStatus *d_plan_status = nullptr;
+    DeviceMoERebalancePlanEntry *d_source_plan = nullptr;
+    uint32_t *d_source_plan_count = nullptr;
+    DeviceMoERebalanceCommandBufferHeader *d_source_header = nullptr;
+    DeviceMoERebalancePlanEntry *d_destination_plan = nullptr;
+    uint32_t *d_destination_plan_count = nullptr;
+    DeviceMoERebalanceCommandBufferHeader *d_destination_header = nullptr;
+    DeviceMoERebalanceStatus *d_projection_status = nullptr;
     DeviceMoEExpertDirectoryEntry *d_source_descriptors = nullptr;
     DeviceMoERebalanceApplyStatus *d_pack_status = nullptr;
     DeviceMoERebalanceApplyStatus *d_unpack_status = nullptr;
@@ -1584,6 +1700,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
     uint8_t *d_local_payload = nullptr;
     uint8_t *d_gathered_payload = nullptr;
     DeviceMoEExpertDirectoryEntry *d_transfer_slots = nullptr;
+    DeviceMoETransferSlotClaimIndex *d_transfer_slot_claim_index = nullptr;
 
     const uint32_t source_experts =
         static_cast<uint32_t>((shape.num_experts + shape.participant_count - 1) /
@@ -1606,20 +1723,41 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
         source_runtime, shape, payload_spec, 0, d_source_slab, expert_bytes);
     harness.uploadRuntime(source_runtime);
 
-    ASSERT_EQ(hipMalloc(&d_plan, plan_capacity * sizeof(DeviceMoERebalancePlanEntry)), hipSuccess);
+    const size_t gathered_plan_entries =
+        static_cast<size_t>(shape.participant_count) * plan_capacity;
+    ASSERT_EQ(hipMalloc(&d_plan,
+                        gathered_plan_entries * sizeof(DeviceMoERebalancePlanEntry)),
+              hipSuccess);
     ASSERT_EQ(hipMalloc(&d_plan_count, sizeof(uint32_t)), hipSuccess);
-    ASSERT_EQ(hipMalloc(&d_header, sizeof(DeviceMoERebalanceCommandBufferHeader)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_header,
+                        static_cast<size_t>(shape.participant_count) *
+                            sizeof(DeviceMoERebalanceCommandBufferHeader)),
+              hipSuccess);
     ASSERT_EQ(hipMalloc(&d_plan_status, sizeof(DeviceMoERebalanceStatus)), hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_plan,
+                             0,
+                             gathered_plan_entries *
+                                 sizeof(DeviceMoERebalancePlanEntry),
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_header,
+                             0,
+                             static_cast<size_t>(shape.participant_count) *
+                                 sizeof(DeviceMoERebalanceCommandBufferHeader),
+                             harness.stream_),
+              hipSuccess);
+    DeviceMoERebalanceConfig request_config = rebalanceConfig(shape);
+    request_config.participant_id = 1u;
     ASSERT_TRUE(harness.kernel_->materializePrefillLeastLoadedTransferCommands(
         harness.launchContext(),
         harness.runtime_table_->deviceLayerState(0),
-        d_plan,
+        d_plan + plan_capacity,
         d_plan_count,
         plan_capacity,
-        d_header,
+        d_header + 1u,
         d_plan_status,
-        rebalanceConfig(shape),
-        plan_capacity,
+        request_config,
+        static_cast<uint32_t>(kDeviceMoEMaxExperts),
         0));
     ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
 
@@ -1642,7 +1780,7 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
     ASSERT_EQ(plan_status.plan_overflow, 0u);
     ASSERT_EQ(plan_status.payload_bucket_overflow, 0u);
 
-    const auto plan = harness.copyPlan(d_plan, plan_count);
+    const auto plan = harness.copyPlan(d_plan + plan_capacity, plan_count);
     uint32_t destination_one_arrivals = 0;
     for (const auto &entry : plan)
     {
@@ -1650,6 +1788,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
             ++destination_one_arrivals;
     }
     ASSERT_GT(destination_one_arrivals, 0u);
+    const uint32_t transfer_slot_count = destination_one_arrivals;
+    ASSERT_GT(transfer_slot_count, 0u);
     const uint32_t payload_slot_count = plan_status.payload_bucket_slots;
     ASSERT_GE(payload_slot_count, plan_count);
 
@@ -1670,16 +1810,20 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
                             static_cast<size_t>(payload_slot_bytes)),
               hipSuccess);
     ASSERT_EQ(hipMalloc(&d_destination_slab,
-                        static_cast<size_t>(plan_count) *
+                        static_cast<size_t>(transfer_slot_count) *
                             static_cast<size_t>(expert_bytes)),
               hipSuccess);
     ASSERT_EQ(hipMalloc(&d_transfer_slots,
-                        static_cast<size_t>(plan_count) *
+                        static_cast<size_t>(transfer_slot_count) *
                             sizeof(DeviceMoEExpertDirectoryEntry)),
               hipSuccess);
+    ASSERT_EQ(hipMalloc(
+                  &d_transfer_slot_claim_index,
+                  deviceMoETransferSlotClaimIndexBytes(transfer_slot_count)),
+              hipSuccess);
 
-    std::vector<DeviceMoEExpertDirectoryEntry> transfer_slots(plan_count);
-    for (uint32_t slot = 0; slot < plan_count; ++slot)
+    std::vector<DeviceMoEExpertDirectoryEntry> transfer_slots(transfer_slot_count);
+    for (uint32_t slot = 0; slot < transfer_slot_count; ++slot)
     {
         transfer_slots[slot] = makeSyntheticTransferSlot(
             d_destination_slab + static_cast<uint64_t>(slot) * expert_bytes,
@@ -1694,33 +1838,260 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
                              harness.stream_),
               hipSuccess);
 
+    ASSERT_EQ(hipMalloc(&d_source_plan,
+                        plan_capacity * sizeof(DeviceMoERebalancePlanEntry)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_source_plan_count, sizeof(uint32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_source_header,
+                        sizeof(DeviceMoERebalanceCommandBufferHeader)),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_source_plan,
+                             0,
+                             plan_capacity * sizeof(DeviceMoERebalancePlanEntry),
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_source_plan_count,
+                             0,
+                             sizeof(uint32_t),
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_source_header,
+                             0,
+                             sizeof(DeviceMoERebalanceCommandBufferHeader),
+                             harness.stream_),
+              hipSuccess);
+    DeviceMoERebalanceConfig source_projection_config = rebalanceConfig(shape);
+    source_projection_config.active_transfer_slot_capacity = transfer_slot_count;
+    source_projection_config.transfer_slot_directory_capacity = transfer_slot_count;
+    ASSERT_TRUE(harness.kernel_->projectPrefillLeastLoadedDomainCommands(
+        harness.launchContext(),
+        d_plan,
+        d_header,
+        plan_capacity,
+        d_source_plan,
+        d_source_plan_count,
+        d_source_header,
+        source_projection_config,
+        d_plan_status,
+        static_cast<uint32_t>(kDeviceMoEMaxExperts),
+        harness.runtime_table_->deviceLayerState(0),
+        d_transfer_slots,
+        transfer_slot_count,
+        d_transfer_slot_claim_index,
+        /*command_buffer_count=*/1u));
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    uint32_t source_plan_count = 0;
+    ASSERT_EQ(hipMemcpy(&source_plan_count,
+                        d_source_plan_count,
+                        sizeof(source_plan_count),
+                        hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_EQ(source_plan_count, plan_count);
     ASSERT_TRUE(harness.kernel_->packDeviceRebalanceSourceDescriptors(
         harness.launchContext(),
         harness.runtime_table_->deviceLayerState(0),
-        d_plan,
-        d_header,
+        d_source_plan,
+        d_source_header,
         plan_capacity,
         d_source_descriptors,
         rebalanceConfig(shape),
         nullptr));
     ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
 
-    auto destination_runtime = harness.copyRuntime();
-    configureRuntimeLayer(destination_runtime, shape, /*all_participants_resident=*/false, 1);
-    harness.uploadRuntime(destination_runtime);
+    /* A current-batch arrival is applied to a request-local child, never by
+     * mutating the source participant or the canonical overlay placement.
+     * Build the same parent/child/ticket relationship used by the Qwen graph
+     * so this performance test cannot pass by bypassing epoch admission. */
+    auto destination_epoch_arena =
+        std::make_shared<DeviceMoEOverlayEpochArena>(
+            DeviceMoEOverlayEpochArena::Config{
+                .device_id = DeviceId::rocm(0),
+                .initial_epoch = 1u,
+                .initial_bank = 0u,
+                .request_slot_capacity = 1u,
+            });
+    DeviceMoERuntimeTable::Config destination_parent_config;
+    destination_parent_config.device_id = DeviceId::rocm(0);
+    destination_parent_config.num_layers =
+        static_cast<int>(projection_runtime_layers);
+    destination_parent_config.num_experts = shape.num_experts;
+    destination_parent_config.top_k = shape.top_k;
+    destination_parent_config.mirror_to_device = true;
+    destination_parent_config.overlay_epoch_arena = destination_epoch_arena;
+    auto destination_parent_runtime =
+        std::make_unique<MoERuntimeTable>(destination_parent_config);
+    for (uint32_t layer = 0; layer < projection_runtime_layers; ++layer)
+    {
+        auto destination_parent_layer =
+            destination_parent_runtime->hostLayerState(static_cast<int>(layer));
+        configureRuntimeLayer(
+            destination_parent_layer,
+            shape,
+            /*all_participants_resident=*/false,
+            /*participant_id=*/1);
+        ASSERT_EQ(hipMemcpyAsync(
+                      destination_parent_runtime->deviceLayerState(
+                          static_cast<int>(layer)),
+                      &destination_parent_layer,
+                      sizeof(destination_parent_layer),
+                      hipMemcpyHostToDevice,
+                      harness.stream_),
+                  hipSuccess);
+    }
+
+    DeviceMoERuntimeTable::Config destination_child_config =
+        destination_parent_config;
+    destination_child_config.overlay_placement_source =
+        destination_parent_runtime.get();
+    auto destination_llep_runtime =
+        std::make_unique<MoERuntimeTable>(destination_child_config);
+    for (uint32_t layer = 0; layer < projection_runtime_layers; ++layer)
+    {
+        auto destination_child_layer =
+            destination_llep_runtime->hostLayerState(static_cast<int>(layer));
+        configureRuntimeLayer(
+            destination_child_layer,
+            shape,
+            /*all_participants_resident=*/false,
+            /*participant_id=*/1);
+        ASSERT_EQ(hipMemcpyAsync(
+                      destination_llep_runtime->deviceLayerState(
+                          static_cast<int>(layer)),
+                      &destination_child_layer,
+                      sizeof(destination_child_layer),
+                      hipMemcpyHostToDevice,
+                      harness.stream_),
+                  hipSuccess);
+    }
+    ASSERT_TRUE(harness.kernel_->acquireMoEOverlayEpoch(
+        harness.launchContext(),
+        destination_epoch_arena->control(),
+        destination_epoch_arena->requestTicket(0u),
+        destination_epoch_arena->requestStatus(0u)));
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+    DeviceMoEOverlayEpochTicket destination_ticket{};
+    DeviceMoEOverlayEpochStatus destination_epoch_status{};
+    ASSERT_EQ(hipMemcpy(
+                  &destination_ticket,
+                  destination_epoch_arena->requestTicket(0u),
+                  sizeof(destination_ticket),
+                  hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(
+                  &destination_epoch_status,
+                  destination_epoch_arena->requestStatus(0u),
+                  sizeof(destination_epoch_status),
+                  hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_TRUE(destination_ticket.valid());
+    ASSERT_TRUE(destination_epoch_status.succeeded());
+    ASSERT_EQ(destination_ticket.epoch, 1u);
+
+    ASSERT_EQ(hipMalloc(&d_destination_plan,
+                        plan_capacity * sizeof(DeviceMoERebalancePlanEntry)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_destination_plan_count, sizeof(uint32_t)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_destination_header,
+                        sizeof(DeviceMoERebalanceCommandBufferHeader)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_projection_status,
+                        sizeof(DeviceMoERebalanceStatus)),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_destination_plan,
+                             0,
+                             plan_capacity * sizeof(DeviceMoERebalancePlanEntry),
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_destination_plan_count,
+                             0,
+                             sizeof(uint32_t),
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_destination_header,
+                             0,
+                             sizeof(DeviceMoERebalanceCommandBufferHeader),
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(d_projection_status,
+                             0,
+                             sizeof(DeviceMoERebalanceStatus),
+                             harness.stream_),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(d_projection_status,
+                             d_plan_status,
+                             sizeof(DeviceMoERebalanceStatus),
+                             hipMemcpyDeviceToDevice,
+                             harness.stream_),
+              hipSuccess);
+    DeviceMoERebalanceConfig destination_projection_config = rebalanceConfig(shape);
+    destination_projection_config.num_layers = projection_runtime_layers;
+    destination_projection_config.participant_id = 1u;
+    destination_projection_config.active_transfer_slot_capacity = transfer_slot_count;
+    destination_projection_config.transfer_slot_directory_capacity = transfer_slot_count;
+    auto project_destination_once = [&]()
+    {
+        ASSERT_TRUE(harness.kernel_->projectPrefillLeastLoadedDomainCommands(
+            harness.launchContext(),
+            d_plan,
+            d_header,
+            plan_capacity,
+            d_destination_plan,
+            d_destination_plan_count,
+            d_destination_header,
+            destination_projection_config,
+            d_projection_status,
+            static_cast<uint32_t>(kDeviceMoEMaxExperts),
+            destination_llep_runtime->deviceLayerState(0),
+            d_transfer_slots,
+            transfer_slot_count,
+            d_transfer_slot_claim_index,
+            /*command_buffer_count=*/1u));
+    };
+    project_destination_once();
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
+    uint32_t destination_plan_count = 0;
+    DeviceMoERebalanceStatus projection_status{};
+    ASSERT_EQ(hipMemcpy(&destination_plan_count,
+                        d_destination_plan_count,
+                        sizeof(destination_plan_count),
+                        hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(&projection_status,
+                        d_projection_status,
+                        sizeof(projection_status),
+                        hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_EQ(destination_plan_count, plan_count);
+    ASSERT_EQ(projection_status.invalid_runtime_layers, 0u);
+    ASSERT_EQ(projection_status.capacity_limited_candidates, 0u);
+    const auto destination_plan =
+        harness.copyPlan(d_destination_plan, destination_plan_count);
+    uint32_t leased_destination_slots = 0;
+    for (const auto &entry : destination_plan)
+    {
+        if (entry.destination_participant == 1u)
+        {
+            ASSERT_LT(entry.destination_slot, transfer_slot_count);
+            ++leased_destination_slots;
+        }
+    }
+    ASSERT_EQ(leased_destination_slots, destination_one_arrivals);
 
     auto run_payload_wave = [&]()
     {
         const DeviceMoERebalanceConfig source_config = rebalanceConfig(shape);
         DeviceMoERebalanceConfig destination_config = rebalanceConfig(shape);
+        destination_config.num_layers = projection_runtime_layers;
         destination_config.participant_id = 1u;
 
         auto pack_payloads = [&]()
         {
             ASSERT_TRUE(harness.kernel_->packDeviceRebalanceCompactPayloads(
                 harness.launchContext(),
-                d_plan,
-                d_header,
+                d_source_plan,
+                d_source_header,
                 plan_capacity,
                 d_source_descriptors,
                 d_local_payload,
@@ -1743,15 +2114,15 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
         {
             ASSERT_TRUE(harness.kernel_->unpackDeviceRebalanceCollectivePayloads(
                 harness.launchContext(),
-                d_plan,
-                d_plan_count,
+                d_destination_plan,
+                d_destination_plan_count,
                 plan_capacity,
-                nullptr,
+                d_destination_header,
                 d_gathered_payload,
                 payload_slot_count,
                 payload_slot_bytes,
                 d_transfer_slots,
-                plan_count,
+                transfer_slot_count,
                 destination_config,
                 d_unpack_status));
         };
@@ -1759,18 +2130,19 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
         {
             ASSERT_TRUE(harness.kernel_->applyDeviceRebalanceArrivals(
                 harness.launchContext(),
-                harness.runtime_table_->deviceLayerState(0),
-                d_plan,
-                d_plan_count,
+                destination_llep_runtime->deviceLayerState(0),
+                d_destination_plan,
+                d_destination_plan_count,
                 plan_capacity,
                 d_transfer_slots,
-                plan_count,
+                transfer_slot_count,
                 destination_config,
                 d_apply_status,
-                nullptr,
+                d_destination_header,
                 -1));
         };
 
+        project_destination_once();
         pack_payloads();
         copy_payload_bucket();
         unpack_payloads();
@@ -1780,8 +2152,8 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
     {
         ASSERT_TRUE(harness.kernel_->packDeviceRebalanceCompactPayloads(
             harness.launchContext(),
-            d_plan,
-            d_header,
+            d_source_plan,
+            d_source_header,
             plan_capacity,
             d_source_descriptors,
             d_local_payload,
@@ -1803,36 +2175,39 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
     auto unpack_payloads_once = [&]()
     {
         DeviceMoERebalanceConfig destination_config = rebalanceConfig(shape);
+        destination_config.num_layers = projection_runtime_layers;
         destination_config.participant_id = 1u;
+        project_destination_once();
         ASSERT_TRUE(harness.kernel_->unpackDeviceRebalanceCollectivePayloads(
             harness.launchContext(),
-            d_plan,
-            d_plan_count,
+            d_destination_plan,
+            d_destination_plan_count,
             plan_capacity,
-            nullptr,
+            d_destination_header,
             d_gathered_payload,
             payload_slot_count,
             payload_slot_bytes,
             d_transfer_slots,
-            plan_count,
+            transfer_slot_count,
             destination_config,
             d_unpack_status));
     };
     auto apply_arrivals_once = [&]()
     {
         DeviceMoERebalanceConfig destination_config = rebalanceConfig(shape);
+        destination_config.num_layers = projection_runtime_layers;
         destination_config.participant_id = 1u;
         ASSERT_TRUE(harness.kernel_->applyDeviceRebalanceArrivals(
             harness.launchContext(),
-            harness.runtime_table_->deviceLayerState(0),
-            d_plan,
-            d_plan_count,
+            destination_llep_runtime->deviceLayerState(0),
+            d_destination_plan,
+            d_destination_plan_count,
             plan_capacity,
             d_transfer_slots,
-            plan_count,
+            transfer_slot_count,
             destination_config,
             d_apply_status,
-            nullptr,
+            d_destination_header,
             -1));
     };
     auto time_component_us = [&](auto &&component)
@@ -1865,12 +2240,25 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
     ASSERT_EQ(hipEventElapsedTime(&elapsed_ms, events.start, events.stop), hipSuccess);
     const double pack_us = time_component_us(pack_payloads_once);
     const double bucket_copy_us = time_component_us(copy_payload_bucket_once);
+    const double projection_us = time_component_us(project_destination_once);
     const double unpack_us = time_component_us(unpack_payloads_once);
     const double apply_us = time_component_us(apply_arrivals_once);
 
     /*
-     * The unpack-only timing loop intentionally reuses an append-only status
-     * record so the measured interval contains only the kernel under test.
+     * The live Qwen3.6 trace executes this projection against forty runtime
+     * layers. The former implementation rescanned all 40x256 descriptors for
+     * every candidate and averaged 6.65 ms per call on this backend. Keep a
+     * deliberately hardware-tolerant 2 ms ceiling: it admits slower supported
+     * ROCm devices while rejecting a return to the nested whole-table scan.
+     */
+    EXPECT_LT(projection_us, 2000.0)
+        << "40-layer transfer-slot projection is no longer economical";
+
+    /*
+     * The projection-plus-unpack timing loop intentionally reuses an
+     * append-only status record. Reprojection refreshes the generation lease
+     * before every destructive copy, just as a new production transaction
+     * must; replaying one stale lease would measure only rejection handling.
      * Clear that diagnostic record and execute one untimed production-shaped
      * wave before validating counters; otherwise the assertion would compare
      * all microbenchmark repetitions against one wave's expected arrivals.
@@ -1913,11 +2301,26 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
     EXPECT_EQ(unpack_status.missing_source_descriptors, 0u);
     EXPECT_EQ(unpack_status.missing_destination_slots, 0u);
     EXPECT_EQ(unpack_status.descriptor_mismatches, 0u);
+    EXPECT_EQ(apply_status.status_code,
+              static_cast<uint32_t>(DeviceMoERebalanceApplyStatusCode::Ok));
+    EXPECT_EQ(apply_status.plan_entries_seen, destination_plan_count);
+    EXPECT_EQ(apply_status.invalid_plan_entries, 0u);
+    EXPECT_EQ(apply_status.required_local_arrivals, destination_one_arrivals);
+    EXPECT_EQ(apply_status.ready_local_arrivals, destination_one_arrivals);
+    EXPECT_EQ(apply_status.missing_source_descriptors, 0u);
+    EXPECT_EQ(apply_status.missing_destination_slots, 0u);
+    EXPECT_EQ(apply_status.descriptor_mismatches, 0u);
     EXPECT_EQ(apply_status.applied_arrivals, destination_one_arrivals);
     EXPECT_EQ(apply_status.copy_incomplete, 0u);
     EXPECT_EQ(apply_status.changed_layers, 1u);
 
-    const auto final_runtime = harness.copyRuntime();
+    DeviceMoELayerRuntime final_runtime{};
+    ASSERT_EQ(hipMemcpy(
+                  &final_runtime,
+                  destination_llep_runtime->deviceLayerState(0),
+                  sizeof(final_runtime),
+                  hipMemcpyDeviceToHost),
+              hipSuccess);
     const auto &active_bank = final_runtime.banks[final_runtime.active_bank];
     const uint64_t mask_hash = fnv1a64Bytes(
         active_bank.resident_participant_mask,
@@ -1947,7 +2350,15 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
                 payload_slot_count,
                 destination_one_arrivals);
     printTiming("rocm",
-                "payload_unpack_collective",
+                "payload_destination_projection",
+                shape,
+                iterations,
+                projection_us,
+                mask_hash,
+                payload_slot_count,
+                destination_one_arrivals);
+    printTiming("rocm",
+                "payload_project_unpack_collective",
                 shape,
                 iterations,
                 unpack_us,
@@ -1963,8 +2374,17 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
                 payload_slot_count,
                 destination_one_arrivals);
 
+    ASSERT_TRUE(harness.kernel_->releaseMoEOverlayEpoch(
+        harness.launchContext(),
+        destination_epoch_arena->control(),
+        destination_epoch_arena->requestTicket(0u),
+        destination_epoch_arena->requestStatus(0u)));
+    ASSERT_EQ(hipStreamSynchronize(harness.stream_), hipSuccess);
+
     if (d_transfer_slots)
         (void)hipFree(d_transfer_slots);
+    if (d_transfer_slot_claim_index)
+        (void)hipFree(d_transfer_slot_claim_index);
     if (d_destination_slab)
         (void)hipFree(d_destination_slab);
     if (d_gathered_payload)
@@ -1979,6 +2399,20 @@ TEST(Perf__MoELLEPDeterminism, ROCm_PayloadMovementAndApplyDeterministic)
         (void)hipFree(d_pack_status);
     if (d_source_descriptors)
         (void)hipFree(d_source_descriptors);
+    if (d_projection_status)
+        (void)hipFree(d_projection_status);
+    if (d_destination_header)
+        (void)hipFree(d_destination_header);
+    if (d_destination_plan_count)
+        (void)hipFree(d_destination_plan_count);
+    if (d_destination_plan)
+        (void)hipFree(d_destination_plan);
+    if (d_source_header)
+        (void)hipFree(d_source_header);
+    if (d_source_plan_count)
+        (void)hipFree(d_source_plan_count);
+    if (d_source_plan)
+        (void)hipFree(d_source_plan);
     if (d_plan_status)
         (void)hipFree(d_plan_status);
     if (d_header)

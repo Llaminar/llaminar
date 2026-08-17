@@ -3,7 +3,7 @@
 #
 # Covers: Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.6 (dense),
 #         Qwen3.5 27B LocalPP (dense Q4_K_M),
-#         Qwen3.5 MoE (sparse), NodeLocalTP (multi-device),
+#         Qwen3.5 MoE (sparse), NodeTP (multi-device),
 #         HybridPPTP (pipeline+tensor parallel),
 #         and ExpertOverlay (tiered same-layer expert residency, Qwen3.6 GPU
 #         Dynamic/LLEP rebalance).
@@ -74,20 +74,20 @@ TESTS=(
   # Qwen3.5 MoE SingleDevice CUDA Q3_K_S (2)
   "Qwen35MoESingleDeviceParityTest_PrefillParity_Qwen35MoE_35B_CUDA_Q3_K_S_KV_FP16$"
   "Qwen35MoESingleDeviceParityTest_DecodeParity_Qwen35MoE_35B_CUDA_Q3_K_S_KV_FP16$"
-  # Qwen2 NodeLocalTP CPU (2)
-  "Qwen2NodeLocalTPParityTest_PrefillParity_NodeLocalTP_2xMPI_CPU$"
-  "Qwen2NodeLocalTPParityTest_DecodeParity_NodeLocalTP_2xMPI_CPU$"
-  # Qwen3.5 MoE NodeLocalTP CPU (2)
-  "Qwen35MoENodeLocalTPParityTest_PrefillParity_NodeLocalTP_2xMPI_CPU_35B_MoE$"
-  "Qwen35MoENodeLocalTPParityTest_DecodeParity_NodeLocalTP_2xMPI_CPU_35B_MoE$"
+  # Qwen2 NodeTP CPU (2)
+  "Qwen2NodeTPParityTest_PrefillParity_NodeTP_2xMPI_CPU$"
+  "Qwen2NodeTPParityTest_DecodeParity_NodeTP_2xMPI_CPU$"
+  # Qwen3.5 MoE NodeTP CPU (2)
+  "Qwen35MoENodeTPParityTest_PrefillParity_NodeTP_2xMPI_CPU_35B_MoE$"
+  "Qwen35MoENodeTPParityTest_DecodeParity_NodeTP_2xMPI_CPU_35B_MoE$"
   # Qwen3.5 MoE HybridPPTP named-domain topology coverage (2)
   "Qwen35MoEHybridPPTPNamedDomainTopology_Rank0OwnsRocmLocalTPStage$"
   "Qwen35MoEHybridPPTPNamedDomainTopology_Rank1OwnsMirroredRocmLocalTPStage$"
   # Qwen3.5 MoE ExpertOverlay topology plus implemented ROCm-rooted parity (4)
-  "Qwen35MoEExpertOverlayTopology_OverlayPlanTopology_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold$"
-  "Qwen35MoEExpertOverlayTopology_OverlayPlanTopology_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold$"
-  "Qwen35MoEExpertOverlay_PrefillParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold$"
-  "Qwen35MoEExpertOverlay_DecodeParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold$"
+  "Qwen35MoEExpertOverlayTopology_OverlayPlanTopology_ROCm2TP_SharedHot_CPU2NodeTP_Cold$"
+  "Qwen35MoEExpertOverlayTopology_OverlayPlanTopology_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeTP_Cold$"
+  "Qwen35MoEExpertOverlay_PrefillParity_ROCm2TP_SharedHot_CPU2NodeTP_Cold$"
+  "Qwen35MoEExpertOverlay_DecodeParity_ROCm2TP_SharedHot_CPU2NodeTP_Cold$"
   # Qwen3.6 MoE ExpertOverlay GPU Dynamic/LLEP routed-domain parity (8)
   "V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_PrefillParity_CUDA2TP_Dynamic_PhaseSplit_FP16Transport$"
   "V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_DecodeParity_CUDA2TP_Dynamic_PhaseSplit_FP16Transport$"

@@ -24,6 +24,7 @@
 #include "tensors/IQQuantTables.h"   // iq3s_grid, ksigns_iq2xs, etc. (for IQ grid init)
 #include "tensors/TensorType.h"      // isNativeVnniFormat, isInt8VnniFormat
 #include "loaders/gpu_pipeline/RepackFormat.h"
+#include "kernels/rocm/repack/ROCmExpertTierWeightKernels.h"
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
 
@@ -113,6 +114,21 @@ namespace llaminar2
                 LOG_ERROR("[ROCmWeightPacker] IQ grid MoE prefill init failed on device " << device_id);
                 return false;
             }
+            if (!initializeExpertTierIQGridTablesROCm(
+                    device_id,
+                    llaminar2::iq3s_grid,
+                    llaminar2::iq3xxs_grid,
+                    llaminar2::iq2s_grid,
+                    llaminar2::iq2xs_grid,
+                    llaminar2::iq2xxs_grid,
+                    llaminar2::iq1s_grid))
+            {
+                LOG_ERROR(
+                    "[ROCmWeightPacker] IQ grid ExpertOverlay tier-stream "
+                    "init failed on device "
+                    << device_id);
+                return false;
+            }
 
             std::lock_guard<std::mutex> lock(iq_grid_mutex);
             iq_grids_initialized_devices.insert(device_id);
@@ -172,6 +188,11 @@ namespace llaminar2
                 out.native_vnni_emins.resize(static_cast<size_t>(blocks_per_row) * N);
             out.native_vnni_codebook_id = canonicalDeviceVnniCodebookId(info->codebook_id);
             out.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
+            out.native_source_identity = {
+                .codebook_id = info->codebook_id,
+                .is_superblock = info->is_superblock,
+                .present = true,
+            };
 
             // Per-row max-abs for CK prefill INT8 requantization compatibility
             out.scales.resize(N);
@@ -216,7 +237,7 @@ namespace llaminar2
             {
                 for (int b = 0; b < blocks_per_row; ++b)
                 {
-                    quant_accessor->packVnniBlock(ctx, n, b);
+                    quant_accessor->packVnniBlock(ctx, n, n, b);
                 }
             }
 
@@ -247,6 +268,20 @@ namespace llaminar2
             out.N = N;
 
             const TensorType wt = tensor->native_type();
+            const auto *source = dynamic_cast<const IINT8Unpackable *>(tensor);
+            const NativeVnniFormatInfo *source_format =
+                source ? source->vnniFormatInfo() : nullptr;
+            if (!source_format)
+            {
+                LOG_ERROR("[packWeightsToROCm] Tensor has no NativeVNNI source identity: "
+                          << tensorTypeName(wt));
+                return false;
+            }
+            out.native_source_identity = {
+                .codebook_id = source_format->codebook_id,
+                .is_superblock = source_format->is_superblock,
+                .present = true,
+            };
 
             // ---- Native-VNNI path (≤6-bit formats) ----
             if (isNativeVnniFormat(wt))
@@ -574,7 +609,7 @@ namespace llaminar2
             {
                 for (int b = 0; b < blocks_per_row; ++b)
                 {
-                    eq->packVnniBlock(ctx, n, b);
+                    eq->packVnniBlock(ctx, n, n, b);
                 }
             }
         }

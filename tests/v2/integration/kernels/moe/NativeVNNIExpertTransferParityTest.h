@@ -33,6 +33,8 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/moe/DeviceMoERebalanceABI.h"
 #include "execution/moe/DeviceMoETransferSlotDirectory.h"
+#include "execution/moe/ExpertTierWeightStream.h"
+#include "execution/moe/ExpertTierWeightTransferLane.h"
 #include "execution/moe/LeastLoadedExpertAssignment.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
@@ -47,12 +49,14 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -148,6 +152,12 @@ namespace llaminar2::test
                     .is_asymmetric = is_asymmetric != 0u,
                     .has_emins = has_emins != 0u,
                     .codebook_id = format.device_execution_codebook_id,
+                    .format = ExpertWeightFormat::nativeVnni(
+                        NativeVnniSourceIdentity{
+                            .codebook_id = format.source_codebook_id,
+                            .is_superblock = format.source_is_superblock,
+                            .present = true,
+                        }),
                 };
             };
             return {
@@ -1640,6 +1650,512 @@ namespace llaminar2::test
                     static_owner_canonical,
                     kDModel);
             }
+        }
+
+        ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+        workspace_consumer->unbindWorkspace();
+    }
+
+    namespace native_vnni_transfer_parity_detail
+    {
+        /**
+         * @brief Own one CPU-promoted asymmetric projection on a GPU endpoint.
+         *
+         * The three allocation owners keep the descriptor stable while grouped
+         * inference executes. `stats` is retained after the short-lived transfer
+         * lane is destroyed so the caller can prove promotion did not introduce
+         * an inference-stream wait or a blocking synchronization.
+         */
+        struct PromotedAsymmetricProjection final
+        {
+            std::unique_ptr<DeviceAllocation> payload;
+            std::unique_ptr<DeviceAllocation> scales;
+            std::unique_ptr<DeviceAllocation> mins;
+            DeviceNativeVNNIMatrixDesc descriptor{};
+            ExpertTierWeightTransferLaneStats stats{};
+        };
+
+        /**
+         * @brief Stream one CPU-native asymmetric matrix into executable GPU form.
+         *
+         * @param backend Exact destination backend.
+         * @param device CUDA or ROCm endpoint that owns the inactive allocation.
+         * @param cpu_weights Real CPU prepared bytes retaining source provenance.
+         * @param projection Stable gate/up/down role used in the transfer manifest.
+         * @param identity Unique diagnostic identity for the transaction.
+         * @return Stable codebook-23 descriptor and its device allocation owners.
+         * @throws std::runtime_error when materialization, streaming, or format
+         *         publication fails.
+         */
+        inline PromotedAsymmetricProjection promoteAsymmetricProjection(
+            IBackend *backend,
+            DeviceId device,
+            const cpu::native_vnni::CPUNativeVNNIPackedWeights &cpu_weights,
+            ExpertTierWeightProjection projection,
+            uint64_t identity)
+        {
+            if (!backend || !device.is_gpu() ||
+                !cpu_weights.usesExpandedInt8() ||
+                !cpu_weights.is_asymmetric)
+            {
+                throw std::invalid_argument(
+                    "Grouped promotion parity requires asymmetric expanded CPU weights");
+            }
+
+            const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
+                cpu_weights,
+                identity,
+                /*layer_id=*/0,
+                /*expert_id=*/0,
+                projection,
+                /*maximum_units_per_chunk=*/1);
+            const auto layout = manifest.deviceLayout();
+            if (!layout.valid() ||
+                layout.gpu_codebook_id !=
+                    kNativeVnniExpandedInt8MinCodebook)
+            {
+                throw std::runtime_error(
+                    "Asymmetric promotion did not select execution codebook 23");
+            }
+
+            const size_t blocks =
+                static_cast<size_t>(layout.N) *
+                static_cast<size_t>(layout.blocks_per_row);
+            PromotedAsymmetricProjection result;
+            result.payload = std::make_unique<DeviceAllocation>(
+                backend,
+                device.ordinal,
+                blocks * layout.gpu_payload_bytes_per_block);
+            result.scales = std::make_unique<DeviceAllocation>(
+                backend,
+                device.ordinal,
+                blocks * sizeof(uint16_t));
+            result.mins = std::make_unique<DeviceAllocation>(
+                backend,
+                device.ordinal,
+                blocks * sizeof(uint16_t));
+
+            ExpertTierGpuMutableProjectionView destination{
+                .payload = result.payload->as<uint8_t>(),
+                .scales = result.scales->as<uint16_t>(),
+                .mins = result.mins->as<uint16_t>(),
+                .emins = nullptr,
+                .payload_bytes = result.payload->bytes(),
+                .scales_bytes = result.scales->bytes(),
+                .mins_bytes = result.mins->bytes(),
+                .emins_bytes = 0u,
+            };
+            if (!destination.validFor(layout))
+            {
+                throw std::runtime_error(
+                    "Asymmetric promotion allocation does not satisfy its layout");
+            }
+
+            std::string error;
+            ExpertTierWeightTransferLane lane({
+                .device = device,
+                .staging_capacity_bytes = layout.chunkBytes(1),
+                .lane_name = "grouped_asymmetric_promotion_" +
+                             std::to_string(identity),
+                .perf_device = device.to_string(),
+                .collect_timing_measurements = true,
+            });
+            if (!lane.materialize(&error) ||
+                !lane.startCpuToGpu(
+                    layout,
+                    cpu_weights.native_interleaved,
+                    destination,
+                    &error))
+            {
+                throw std::runtime_error(
+                    "Failed to start grouped asymmetric promotion: " + error);
+            }
+
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            auto progress = lane.progress();
+            while (progress == ExpertTierWeightTransferProgress::Pending &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                progress = lane.poll(&error);
+                std::this_thread::yield();
+            }
+            if (progress != ExpertTierWeightTransferProgress::Ready)
+            {
+                throw std::runtime_error(
+                    "Grouped asymmetric promotion did not complete: " + error);
+            }
+            result.stats = lane.stats();
+            if (result.stats.transfers_completed != 1u ||
+                result.stats.timing_measurement_failures != 0u ||
+                !result.stats.last_measurement.valid() ||
+                result.stats.last_measurement.device_nanoseconds == 0u ||
+                result.stats.blocking_synchronizations != 0u ||
+                result.stats.inference_stream_waits != 0u)
+            {
+                throw std::runtime_error(
+                    "Grouped asymmetric promotion violated the async lane contract");
+            }
+
+            result.descriptor = DeviceNativeVNNIMatrixDesc{
+                .payload = result.payload->as<uint8_t>(),
+                .scales = result.scales->get(),
+                .mins = result.mins->get(),
+                .emins = nullptr,
+                .n = layout.N,
+                .k = layout.K,
+                .blocks_per_row =
+                    static_cast<uint32_t>(layout.blocks_per_row),
+                .codebook_id = layout.gpu_codebook_id,
+                .allocation_payload_bytes_per_block =
+                    layout.gpu_payload_bytes_per_block,
+                .allocation_has_mins =
+                    static_cast<uint8_t>(layout.gpu_is_asymmetric),
+                .allocation_has_emins =
+                    static_cast<uint8_t>(layout.gpu_has_emins),
+                .source_codebook_id = layout.gpu_source_codebook_id,
+                .source_is_superblock = layout.gpu_source_is_superblock,
+                .source_identity_present = 1u,
+            };
+            return result;
+        }
+    } // namespace native_vnni_transfer_parity_detail
+
+    /**
+     * @brief Prove promoted codebook-23 weights through grouped MoE execution.
+     *
+     * Three real Q5_1 projections are prepared twice: the ordinary compact GPU
+     * load path publishes codebook 7, while the CPU-cold promotion path streams
+     * the same mathematical weights into codebook 23. Both descriptor triplets
+     * then execute the production grouped route plan at verifier and long-prefill
+     * sizes. Final outputs and canonical route contributions must be byte equal.
+     *
+     * @param backend_label Stable diagnostic label (CUDA or ROCm).
+     * @param device Physical backend endpoint.
+     * @param stream Explicit non-null production stream.
+     */
+    inline void runExpandedAsymmetricGroupedMoEParity(
+        const char *backend_label,
+        DeviceId device,
+        void *stream)
+    {
+        using namespace native_vnni_transfer_parity_detail;
+        if (!backend_label || !device.is_gpu() || !stream)
+            throw std::invalid_argument(
+                "Grouped asymmetric parity requires a GPU and explicit stream");
+        IBackend *backend = getBackendFor(device);
+        if (!backend)
+            throw std::runtime_error(
+                "Grouped asymmetric parity backend is unavailable");
+
+        constexpr int kDModel = 2048;
+        constexpr int kIntermediate = 32;
+        constexpr int kNumExperts = 2;
+        constexpr int kTopK = 2;
+        constexpr int kMaxRows = 65;
+        constexpr int kLayer = 0;
+        const auto &format = quantizedVerifierFormat("Q5_1");
+
+        std::vector<std::unique_ptr<TensorBase>> weights;
+        std::vector<GpuPreparedGemm> prepared;
+        weights.reserve(3u);
+        prepared.reserve(3u);
+        const uint64_t model_base =
+            device.is_cuda() ? 2910000u : 2920000u;
+        const std::string prefix =
+            std::string("test.") + backend_label +
+            ".expanded_asymmetric_grouped";
+        const DeviceNativeVNNIMatrixDesc compact_gate =
+            prepareMatrixDescriptor(
+                format,
+                device,
+                stream,
+                kIntermediate,
+                kDModel,
+                99181u,
+                prefix + ".gate",
+                ModelContextId{model_base + 1u},
+                weights,
+                prepared);
+        const DeviceNativeVNNIMatrixDesc compact_up =
+            prepareMatrixDescriptor(
+                format,
+                device,
+                stream,
+                kIntermediate,
+                kDModel,
+                99182u,
+                prefix + ".up",
+                ModelContextId{model_base + 2u},
+                weights,
+                prepared);
+        const DeviceNativeVNNIMatrixDesc compact_down =
+            prepareMatrixDescriptor(
+                format,
+                device,
+                stream,
+                kDModel,
+                kIntermediate,
+                99183u,
+                prefix + ".down",
+                ModelContextId{model_base + 3u},
+                weights,
+                prepared);
+        ASSERT_EQ(compact_gate.codebook_id, 7u);
+        ASSERT_EQ(compact_up.codebook_id, 7u);
+        ASSERT_EQ(compact_down.codebook_id, 7u);
+
+        std::array<cpu::native_vnni::CPUNativeVNNIPackedWeights, 3>
+            cpu_weights;
+        for (size_t index = 0; index < cpu_weights.size(); ++index)
+        {
+            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+                weights[index].get(), cpu_weights[index]));
+            ASSERT_TRUE(cpu_weights[index].usesExpandedInt8());
+            ASSERT_TRUE(cpu_weights[index].is_asymmetric);
+        }
+        auto promoted_gate = promoteAsymmetricProjection(
+            backend,
+            device,
+            cpu_weights[0],
+            ExpertTierWeightProjection::Gate,
+            model_base + 11u);
+        auto promoted_up = promoteAsymmetricProjection(
+            backend,
+            device,
+            cpu_weights[1],
+            ExpertTierWeightProjection::Up,
+            model_base + 12u);
+        auto promoted_down = promoteAsymmetricProjection(
+            backend,
+            device,
+            cpu_weights[2],
+            ExpertTierWeightProjection::Down,
+            model_base + 13u);
+
+        const auto make_experts = [&](
+            const DeviceNativeVNNIMatrixDesc &gate,
+            const DeviceNativeVNNIMatrixDesc &up,
+            const DeviceNativeVNNIMatrixDesc &down)
+        {
+            std::vector<DeviceMoEExpertDescriptor> descriptors(kNumExperts);
+            for (int expert = 0; expert < kNumExperts; ++expert)
+            {
+                auto &descriptor = descriptors[expert];
+                descriptor.logical_expert_id = expert;
+                descriptor.owner_participant = 0;
+                descriptor.local_slot = expert;
+                descriptor.flags = toMoEExpertFlags(
+                    DeviceMoEExpertFlags::Valid |
+                    DeviceMoEExpertFlags::Resident |
+                    DeviceMoEExpertFlags::LocalCompute);
+                descriptor.gate = gate;
+                descriptor.up = up;
+                descriptor.down = down;
+            }
+            return descriptors;
+        };
+        const auto compact_experts =
+            make_experts(compact_gate, compact_up, compact_down);
+        const auto promoted_experts = make_experts(
+            promoted_gate.descriptor,
+            promoted_up.descriptor,
+            promoted_down.descriptor);
+
+        auto kernel_owner =
+            llaminar::v2::kernels::KernelFactory::createMoEKernel(device);
+        ASSERT_NE(kernel_owner, nullptr);
+        kernel_owner->setGPUStream(stream);
+        auto requirements = device.is_cuda()
+                                ? MoEWorkspaceBuffers::cudaMoE(
+                                      kMaxRows,
+                                      kDModel,
+                                      kIntermediate,
+                                      kNumExperts,
+                                      kTopK)
+                                : MoEWorkspaceBuffers::rocmMoE(
+                                      kMaxRows,
+                                      kDModel,
+                                      kIntermediate,
+                                      kNumExperts,
+                                      kTopK);
+        DeviceWorkspaceManager workspace(
+            device,
+            requirements.total_bytes_with_alignment() + 4u * 1024u * 1024u);
+        ASSERT_TRUE(workspace.allocate(requirements));
+        auto *workspace_consumer =
+            dynamic_cast<IWorkspaceConsumer *>(kernel_owner.get());
+        ASSERT_NE(workspace_consumer, nullptr);
+        workspace_consumer->bindWorkspace(&workspace);
+        IMoEKernel &kernel = *kernel_owner;
+
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> compact_gates{};
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> compact_ups{};
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> compact_downs{};
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> promoted_gates{};
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> promoted_ups{};
+        std::array<DeviceNativeVNNIMatrixDesc, kNumExperts> promoted_downs{};
+        for (int expert = 0; expert < kNumExperts; ++expert)
+        {
+            compact_gates[expert] = compact_gate;
+            compact_ups[expert] = compact_up;
+            compact_downs[expert] = compact_down;
+            promoted_gates[expert] = promoted_gate.descriptor;
+            promoted_ups[expert] = promoted_up.descriptor;
+            promoted_downs[expert] = promoted_down.descriptor;
+        }
+        const int compact_gateup_table =
+            kernel.uploadGroupedExpertGateUpDescriptorTables(
+                compact_gates.data(),
+                compact_ups.data(),
+                kNumExperts,
+                kDModel,
+                kIntermediate);
+        const int compact_down_table =
+            kernel.uploadGroupedExpertDownDescriptorTable(
+                compact_downs.data(),
+                kNumExperts,
+                kDModel,
+                kIntermediate);
+        const int promoted_gateup_table =
+            kernel.uploadGroupedExpertGateUpDescriptorTables(
+                promoted_gates.data(),
+                promoted_ups.data(),
+                kNumExperts,
+                kDModel,
+                kIntermediate);
+        const int promoted_down_table =
+            kernel.uploadGroupedExpertDownDescriptorTable(
+                promoted_downs.data(),
+                kNumExperts,
+                kDModel,
+                kIntermediate);
+        ASSERT_GE(compact_gateup_table, 0);
+        ASSERT_GE(compact_down_table, 0);
+        ASSERT_GE(promoted_gateup_table, 0);
+        ASSERT_GE(promoted_down_table, 0);
+
+        auto compact_runtime = makeRuntimeTable(
+            device,
+            stream,
+            compact_experts,
+            /*participant_id=*/0u,
+            std::vector<uint8_t>(kNumExperts, 1u),
+            std::vector<uint32_t>(kNumExperts, 0b01u),
+            /*num_layers=*/1,
+            kTopK,
+            kMaxRows);
+        auto promoted_runtime = makeRuntimeTable(
+            device,
+            stream,
+            promoted_experts,
+            /*participant_id=*/0u,
+            std::vector<uint8_t>(kNumExperts, 1u),
+            std::vector<uint32_t>(kNumExperts, 0b01u),
+            /*num_layers=*/1,
+            kTopK,
+            kMaxRows);
+
+        for (const int rows : {2, 4, 16, kMaxRows})
+        {
+            SCOPED_TRACE(
+                std::string(backend_label) + " grouped promoted M=" +
+                std::to_string(rows));
+            auto hidden = makeHidden(rows, kDModel, 77u);
+            auto routing_indices = TestTensorFactory::createFP32(
+                {static_cast<size_t>(rows), kTopK});
+            auto routing_weights = TestTensorFactory::createFP32(
+                {static_cast<size_t>(rows), kTopK});
+            for (int row = 0; row < rows; ++row)
+            {
+                routing_indices->mutable_data()[row * kTopK] =
+                    static_cast<float>(row & 1);
+                routing_indices->mutable_data()[row * kTopK + 1] =
+                    static_cast<float>((row + 1) & 1);
+                routing_weights->mutable_data()[row * kTopK] = 0.625f;
+                routing_weights->mutable_data()[row * kTopK + 1] = 0.375f;
+            }
+            ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+            ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
+            ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
+
+            ASSERT_TRUE(kernel.publishCompleteGroupedPrefillPlanFromRouter(
+                compact_runtime->deviceLayerState(kLayer),
+                routing_indices.get(),
+                routing_weights.get(),
+                rows,
+                rows,
+                kNumExperts,
+                kTopK,
+                compact_gateup_table,
+                compact_down_table,
+                /*filter_to_local_runtime_experts=*/true));
+            std::vector<float> compact_canonical;
+            const auto compact_output = executePublishedPlan(
+                backend,
+                kernel,
+                *compact_runtime,
+                device,
+                stream,
+                hidden.get(),
+                compact_gateup_table,
+                compact_down_table,
+                rows,
+                kDModel,
+                kIntermediate,
+                kNumExperts,
+                kTopK,
+                kLayer,
+                &compact_canonical);
+
+            ASSERT_TRUE(kernel.publishCompleteGroupedPrefillPlanFromRouter(
+                promoted_runtime->deviceLayerState(kLayer),
+                routing_indices.get(),
+                routing_weights.get(),
+                rows,
+                rows,
+                kNumExperts,
+                kTopK,
+                promoted_gateup_table,
+                promoted_down_table,
+                /*filter_to_local_runtime_experts=*/true));
+            std::vector<float> promoted_canonical;
+            const auto promoted_output = executePublishedPlan(
+                backend,
+                kernel,
+                *promoted_runtime,
+                device,
+                stream,
+                hidden.get(),
+                promoted_gateup_table,
+                promoted_down_table,
+                rows,
+                kDModel,
+                kIntermediate,
+                kNumExperts,
+                kTopK,
+                kLayer,
+                &promoted_canonical);
+
+            double norm_squared = 0.0;
+            for (const float value : compact_output)
+            {
+                ASSERT_TRUE(std::isfinite(value));
+                norm_squared += static_cast<double>(value) * value;
+            }
+            ASSERT_GT(norm_squared, 1.0e-14);
+            expectByteEqual(
+                std::string(backend_label) +
+                    " grouped promoted output M=" + std::to_string(rows),
+                promoted_output,
+                compact_output,
+                kDModel);
+            expectByteEqual(
+                std::string(backend_label) +
+                    " grouped promoted canonical M=" + std::to_string(rows),
+                promoted_canonical,
+                compact_canonical,
+                kDModel);
         }
 
         ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));

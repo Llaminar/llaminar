@@ -73,6 +73,37 @@ namespace llaminar2
         void *allocateAndTouch(size_t bytes, int numa_node, uint8_t init_value = 0);
 
         /**
+         * @brief Bind an externally owned, untouched allocation to one NUMA node.
+         *
+         * This installs `MPOL_BIND` before a transport or accelerator first
+         * touches the pages. It is intended for final receive buffers whose
+         * allocation lifetime is owned elsewhere, such as `AlignedVector`
+         * storage filled directly by MPI. The range must start on a page
+         * boundary and its underlying allocation must cover the page-rounded
+         * byte count.
+         *
+         * @param ptr Page-aligned beginning of the still-unfaulted allocation.
+         * @param bytes Logical bytes that the producer will overwrite.
+         * @param numa_node Exact destination NUMA node; aggregate `-1` is not
+         *        accepted because direct cross-rank receives require one owner.
+         * @return `true` only when the kernel accepted the binding policy.
+         */
+        bool bindUntouchedExternalRangeToNode(
+            void *ptr, size_t bytes, int numa_node) const;
+
+        /**
+         * @brief Required alignment for externally owned NUMA-bound ranges.
+         *
+         * The implementation applies policy to whole 4-KiB pages and rounds
+         * the byte extent upward to the same boundary.  Callers must therefore
+         * allocate both a page-aligned address and page-rounded capacity.
+         */
+        [[nodiscard]] static constexpr size_t externalRangeAlignment() noexcept
+        {
+            return 4096;
+        }
+
+        /**
          * Free NUMA-allocated memory
          */
         void free(void *ptr, size_t bytes);

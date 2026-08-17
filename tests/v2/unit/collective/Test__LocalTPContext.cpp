@@ -29,8 +29,10 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 
 #include "collective/LocalTPContext.h"
@@ -514,6 +516,32 @@ TEST_F(Test__LocalTPContext, OnStreamGpuCollectivesStayGroupedDuringGraphCapture
     EXPECT_EQ(grouped_policy.find("isGraphCaptureActive"), std::string::npos)
         << "NCCL/RCCL graph-captured on-stream allreduces must use the grouped "
            "explicit-stream launcher, not independent per-device captures.";
+}
+
+/**
+ * @test Mixed-vendor background progress never installs a future stream wait.
+ *
+ * HIP may map independently created streams onto one HSA hardware queue. A
+ * compute-stream wait for a value published by the transfer stream can then
+ * prevent the publishing transfer from running. Keep that structurally unsafe
+ * edge out of the production heterogeneous backend.
+ */
+TEST_F(Test__LocalTPContext,
+       HeterogeneousBackgroundBridgeUsesHostTicketsNotFutureStreamWaits)
+{
+    const std::string source =
+        readTextFile(LLAMINAR_HETEROGENEOUS_BACKEND_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    EXPECT_EQ(source.find("streamWaitTimelineSignal32"), std::string::npos);
+    EXPECT_EQ(source.find("streamPublishTimelineSignal32"), std::string::npos);
+    EXPECT_NE(
+        source.find("allreduceMultiOnStreamsWithHostCompletionTicket"),
+        std::string::npos);
+    EXPECT_NE(source.find("terminal H2D completion"), std::string::npos);
+    EXPECT_NE(
+        source.find("AsyncTransactionState::Completed"),
+        std::string::npos);
 }
 
 TEST_F(Test__LocalTPContext, CollectTimeoutPolicySeparatesCollectivesFromWorkerJoins)
@@ -1229,6 +1257,8 @@ public:
     std::atomic<int> allreduce_call_count{0};
     std::atomic<int> allreduce_multi_call_count{0};
     std::atomic<int> allreduce_multi_on_streams_call_count{0};
+    std::atomic<int> host_completion_ticket_submit_call_count{0};
+    std::atomic<int> host_completion_ticket_await_call_count{0};
     std::atomic<int> allreduce_on_stream_call_count{0};
     std::atomic<int> reduce_on_stream_call_count{0};
     std::atomic<int> broadcast_on_stream_call_count{0};
@@ -1238,6 +1268,11 @@ public:
     std::atomic<int> reduce_scatter_call_count{0};
     std::atomic<int> synchronize_call_count{0};
     std::atomic<int> broadcast_call_count{0};
+    std::atomic<int> graph_ticket_record_call_count{0};
+    std::atomic<int> graph_ticket_await_call_count{0};
+    std::atomic<bool> graph_ticket_protocol_violation{false};
+    std::atomic<void *> graph_ticket_slot0_stream{nullptr};
+    std::atomic<void *> graph_ticket_slot1_stream{nullptr};
 
     // Configurable behavior
     bool should_fail_initialize = false;
@@ -1249,6 +1284,12 @@ public:
     bool supports_reduce_on_stream = true;
     bool supports_broadcast_on_stream = true;
     bool supports_allgather_on_stream = true;
+    bool supports_graph_capture_tickets = false;
+    bool supports_host_completion_tickets = false;
+    bool fail_host_completion_ticket_submit = false;
+    bool fail_host_completion_ticket_await = false;
+    int graph_ticket_participant_count = 2;
+    int fail_graph_ticket_record_slot = -1;
 
     // Captured parameters from last call (for verification)
     size_t last_allreduce_count = 0;
@@ -1431,6 +1472,83 @@ public:
         return multi_gpu_mode;
     }
 
+    std::optional<CollectiveCompletionTicket>
+    allreduceMultiOnStreamsWithHostCompletionTicket(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        const std::vector<void *> &streams) override
+    {
+        if (!supports_host_completion_tickets ||
+            fail_host_completion_ticket_submit)
+        {
+            return std::nullopt;
+        }
+        host_completion_ticket_submit_call_count.fetch_add(
+            1,
+            std::memory_order_acq_rel);
+        last_multi_buffers = buffers;
+        last_allreduce_count = count;
+        last_dtype = dtype;
+        last_op = op;
+        last_allreduce_multi_streams = streams;
+
+        std::lock_guard<std::mutex> lock(host_completion_ticket_mutex_);
+        pending_host_completion_generation_ =
+            next_host_completion_generation_++;
+        return CollectiveCompletionTicket::hostObservedBackgroundTransfer(
+            this,
+            host_completion_lifecycle_epoch_,
+            pending_host_completion_generation_,
+            /*descriptor_index=*/0);
+    }
+
+    bool supportsAllreduceMultiOnStreamsWithHostCompletionTicket() const override
+    {
+        return supports_host_completion_tickets;
+    }
+
+    bool awaitHostCompletionTicket(
+        const CollectiveCompletionTicket &ticket,
+        int timeout_ms) override
+    {
+        host_completion_ticket_await_call_count.fetch_add(
+            1,
+            std::memory_order_acq_rel);
+        std::unique_lock<std::mutex> lock(host_completion_ticket_mutex_);
+        if (!supports_host_completion_tickets ||
+            fail_host_completion_ticket_await ||
+            ticket.owner() != this ||
+            ticket.lifecycleEpoch() != host_completion_lifecycle_epoch_ ||
+            ticket.generation() != pending_host_completion_generation_ ||
+            ticket.descriptorIndex() != 0 || timeout_ms <= 0)
+        {
+            return false;
+        }
+        return host_completion_ticket_cv_.wait_for(
+            lock,
+            std::chrono::milliseconds(timeout_ms),
+            [&]() { return release_host_completion_ticket_; });
+    }
+
+    /** @brief Hold the mock background transaction before terminal completion. */
+    void blockHostCompletionTicket()
+    {
+        std::lock_guard<std::mutex> lock(host_completion_ticket_mutex_);
+        release_host_completion_ticket_ = false;
+    }
+
+    /** @brief Publish terminal completion to the mock ticket observer. */
+    void releaseHostCompletionTicket()
+    {
+        {
+            std::lock_guard<std::mutex> lock(host_completion_ticket_mutex_);
+            release_host_completion_ticket_ = true;
+        }
+        host_completion_ticket_cv_.notify_all();
+    }
+
     bool allreduceSingleDeviceOnStream(
         void *buffer,
         size_t count,
@@ -1452,6 +1570,89 @@ public:
     bool supportsAllreduceSingleDeviceOnStream() const override
     {
         return supports_allreduce_on_stream;
+    }
+
+    bool supportsGraphCaptureLifecycleTickets() const override
+    {
+        return supports_graph_capture_tickets;
+    }
+
+    bool recordGraphCaptureLifecycleTicket(
+        int device_idx,
+        void *stream) override
+    {
+        if (!supports_graph_capture_tickets || !stream || device_idx < 0 ||
+            device_idx >= graph_ticket_participant_count ||
+            device_idx == fail_graph_ticket_record_slot)
+        {
+            return false;
+        }
+
+        if (device_idx == 0)
+            graph_ticket_slot0_stream.store(stream, std::memory_order_release);
+        else if (device_idx == 1)
+            graph_ticket_slot1_stream.store(stream, std::memory_order_release);
+        graph_ticket_record_call_count.fetch_add(1, std::memory_order_acq_rel);
+        return true;
+    }
+
+    bool awaitGraphCaptureLifecycleTicket(
+        int device_idx,
+        int timeout_ms) override
+    {
+        if (!supports_graph_capture_tickets || device_idx < 0 ||
+            device_idx >= graph_ticket_participant_count)
+        {
+            return false;
+        }
+
+        const int observation_index =
+            graph_ticket_await_call_count.fetch_add(1, std::memory_order_acq_rel);
+        const int generation =
+            observation_index / graph_ticket_participant_count;
+        const int required_records =
+            (generation + 1) * graph_ticket_participant_count;
+        if (graph_ticket_record_call_count.load(std::memory_order_acquire) <
+            required_records)
+        {
+            graph_ticket_protocol_violation.store(true, std::memory_order_release);
+            return false;
+        }
+
+        std::unique_lock<std::mutex> lock(graph_ticket_block_mutex_);
+        if (device_idx != blocked_graph_ticket_slot_ ||
+            release_blocked_graph_ticket_)
+        {
+            return true;
+        }
+        if (timeout_ms > 0)
+        {
+            return graph_ticket_block_cv_.wait_for(
+                lock,
+                std::chrono::milliseconds(timeout_ms),
+                [&]() { return release_blocked_graph_ticket_; });
+        }
+        graph_ticket_block_cv_.wait(
+            lock,
+            [&]() { return release_blocked_graph_ticket_; });
+        return true;
+    }
+
+    void blockGraphCaptureLifecycleTicket(int device_idx)
+    {
+        std::lock_guard<std::mutex> lock(graph_ticket_block_mutex_);
+        blocked_graph_ticket_slot_ = device_idx;
+        release_blocked_graph_ticket_ = false;
+    }
+
+    void releaseGraphCaptureLifecycleTicket()
+    {
+        {
+            std::lock_guard<std::mutex> lock(graph_ticket_block_mutex_);
+            release_blocked_graph_ticket_ = true;
+            blocked_graph_ticket_slot_ = -1;
+        }
+        graph_ticket_block_cv_.notify_all();
     }
 
     bool reduceSingleDeviceOnStream(
@@ -1551,6 +1752,8 @@ public:
         allreduce_call_count = 0;
         allreduce_multi_call_count = 0;
         allreduce_multi_on_streams_call_count = 0;
+        host_completion_ticket_submit_call_count = 0;
+        host_completion_ticket_await_call_count = 0;
         allreduce_on_stream_call_count = 0;
         reduce_on_stream_call_count = 0;
         broadcast_on_stream_call_count = 0;
@@ -1560,6 +1763,11 @@ public:
         reduce_scatter_call_count = 0;
         synchronize_call_count = 0;
         broadcast_call_count = 0;
+        graph_ticket_record_call_count = 0;
+        graph_ticket_await_call_count = 0;
+        graph_ticket_protocol_violation = false;
+        graph_ticket_slot0_stream = nullptr;
+        graph_ticket_slot1_stream = nullptr;
         should_fail_initialize = false;
         should_fail_allreduce = false;
         should_fail_allgather = false;
@@ -1569,6 +1777,14 @@ public:
         supports_reduce_on_stream = true;
         supports_broadcast_on_stream = true;
         supports_allgather_on_stream = true;
+        supports_graph_capture_tickets = false;
+        supports_host_completion_tickets = false;
+        fail_host_completion_ticket_submit = false;
+        fail_host_completion_ticket_await = false;
+        graph_ticket_participant_count = 2;
+        fail_graph_ticket_record_slot = -1;
+        releaseGraphCaptureLifecycleTicket();
+        releaseHostCompletionTicket();
         last_multi_buffers.clear();
         last_allreduce_multi_streams.clear();
         last_allreduce_on_stream_device_idx = -1;
@@ -1593,7 +1809,203 @@ private:
     DeviceGroup group_;
     bool initialized_ = false;
     std::string last_error_;
+    std::mutex graph_ticket_block_mutex_;
+    std::condition_variable graph_ticket_block_cv_;
+    int blocked_graph_ticket_slot_ = -1;
+    bool release_blocked_graph_ticket_ = true;
+    std::mutex host_completion_ticket_mutex_;
+    std::condition_variable host_completion_ticket_cv_;
+    bool release_host_completion_ticket_ = true;
+    uint64_t host_completion_lifecycle_epoch_ = 1;
+    uint64_t next_host_completion_generation_ = 1;
+    uint64_t pending_host_completion_generation_ = 0;
 };
+
+/**
+ * @test Mixed-vendor lifecycle tickets order and reuse capture generations.
+ *
+ * The fixture uses CPU addresses and a mock backend deliberately: it proves the
+ * three-phase host protocol without loading a driver or occupying a GPU.  The
+ * real-device regression below the unit layer proves the event implementation.
+ */
+TEST_F(Test__LocalTPContext,
+       HeterogeneousGraphCaptureLifecycleTicketsOrderAndReuseGenerations)
+{
+    auto ctx_base = createLocalTPContext(
+        {cpu0_, GlobalDeviceAddress::cpu(1)},
+        {},
+        CollectiveBackendType::HOST);
+    auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+    ASSERT_NE(ctx, nullptr);
+
+    auto backend = std::make_unique<MockCollectiveBackend>();
+    auto *backend_raw = backend.get();
+    backend_raw->supports_graph_capture_tickets = true;
+    backend_raw->blockGraphCaptureLifecycleTicket(/*device_idx=*/1);
+    ctx->setBackendForTesting(
+        std::move(backend),
+        CollectiveBackendType::HETEROGENEOUS,
+        /*initialized=*/true);
+
+    void *const stream0 = reinterpret_cast<void *>(0x1234);
+    void *const stream1 = reinterpret_cast<void *>(0x5678);
+    std::atomic<bool> slot0_returned{false};
+    std::atomic<bool> slot1_returned{false};
+    bool slot0_ok = false;
+    bool slot1_ok = false;
+
+    std::thread slot0([&]() {
+        slot0_ok = ctx->graphCaptureBoundaryOnStream(
+            "prefill_graph:unit_ticket_generation_0",
+            0,
+            stream0,
+            1000);
+        slot0_returned.store(true, std::memory_order_release);
+    });
+    std::thread slot1([&]() {
+        slot1_ok = ctx->graphCaptureBoundaryOnStream(
+            "prefill_graph:unit_ticket_generation_0",
+            1,
+            stream1,
+            1000);
+        slot1_returned.store(true, std::memory_order_release);
+    });
+
+    const auto observation_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (backend_raw->graph_ticket_await_call_count.load(
+               std::memory_order_acquire) < 2 &&
+           std::chrono::steady_clock::now() < observation_deadline)
+    {
+        std::this_thread::yield();
+    }
+    const bool both_tickets_reached_observation =
+        backend_raw->graph_ticket_await_call_count.load(
+            std::memory_order_acquire) == 2;
+
+    // Slot 0 has already observed its ticket, but the final generation
+    // rendezvous must retain it until delayed slot 1 is also safe.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    EXPECT_FALSE(slot0_returned.load(std::memory_order_acquire));
+    EXPECT_FALSE(slot1_returned.load(std::memory_order_acquire));
+
+    backend_raw->releaseGraphCaptureLifecycleTicket();
+    slot0.join();
+    slot1.join();
+
+    ASSERT_TRUE(both_tickets_reached_observation);
+    EXPECT_TRUE(slot0_ok);
+    EXPECT_TRUE(slot1_ok);
+    EXPECT_FALSE(backend_raw->graph_ticket_protocol_violation.load(
+        std::memory_order_acquire));
+    EXPECT_EQ(
+        backend_raw->graph_ticket_slot0_stream.load(std::memory_order_acquire),
+        stream0);
+    EXPECT_EQ(
+        backend_raw->graph_ticket_slot1_stream.load(std::memory_order_acquire),
+        stream1);
+
+    // Reuse the same context and persistent tickets with reversed host arrival
+    // order. A cyclic protocol must not retain generation-zero state.
+    bool second_slot0_ok = false;
+    bool second_slot1_ok = false;
+    std::thread second_slot1([&]() {
+        second_slot1_ok = ctx->graphCaptureBoundaryOnStream(
+            "decode_graph:unit_ticket_generation_1",
+            1,
+            stream1,
+            1000);
+    });
+    std::thread second_slot0([&]() {
+        second_slot0_ok = ctx->graphCaptureBoundaryOnStream(
+            "decode_graph:unit_ticket_generation_1",
+            0,
+            stream0,
+            1000);
+    });
+    second_slot1.join();
+    second_slot0.join();
+
+    EXPECT_TRUE(second_slot0_ok);
+    EXPECT_TRUE(second_slot1_ok);
+    EXPECT_EQ(backend_raw->graph_ticket_record_call_count.load(), 4);
+    EXPECT_EQ(backend_raw->graph_ticket_await_call_count.load(), 4);
+    EXPECT_FALSE(backend_raw->graph_ticket_protocol_violation.load());
+    EXPECT_FALSE(ctx->isAbortRequested());
+}
+
+/**
+ * @test A failed participant ticket aborts and releases every peer generation.
+ */
+TEST_F(Test__LocalTPContext,
+       HeterogeneousGraphCaptureLifecycleTicketFailureWakesPeer)
+{
+    auto ctx_base = createLocalTPContext(
+        {cpu0_, GlobalDeviceAddress::cpu(1)},
+        {},
+        CollectiveBackendType::HOST);
+    auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+    ASSERT_NE(ctx, nullptr);
+
+    auto backend = std::make_unique<MockCollectiveBackend>();
+    backend->supports_graph_capture_tickets = true;
+    backend->fail_graph_ticket_record_slot = 1;
+    ctx->setBackendForTesting(
+        std::move(backend),
+        CollectiveBackendType::HETEROGENEOUS,
+        /*initialized=*/true);
+
+    bool slot0_ok = true;
+    bool slot1_ok = true;
+    std::thread slot0([&]() {
+        slot0_ok = ctx->graphCaptureBoundaryOnStream(
+            "prefill_graph:unit_ticket_failure",
+            0,
+            reinterpret_cast<void *>(0x1234),
+            1000);
+    });
+    std::thread slot1([&]() {
+        slot1_ok = ctx->graphCaptureBoundaryOnStream(
+            "prefill_graph:unit_ticket_failure",
+            1,
+            reinterpret_cast<void *>(0x5678),
+            1000);
+    });
+    slot0.join();
+    slot1.join();
+
+    EXPECT_FALSE(slot0_ok);
+    EXPECT_FALSE(slot1_ok);
+    EXPECT_TRUE(ctx->isAbortRequested());
+}
+
+/**
+ * @test Heterogeneous graph capture fails closed without ticket capability.
+ */
+TEST_F(Test__LocalTPContext,
+       HeterogeneousGraphCaptureRejectsMissingLifecycleTicketCapability)
+{
+    auto ctx_base = createLocalTPContext(
+        {cpu0_, GlobalDeviceAddress::cpu(1)},
+        {},
+        CollectiveBackendType::HOST);
+    auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+    ASSERT_NE(ctx, nullptr);
+
+    auto backend = std::make_unique<MockCollectiveBackend>();
+    backend->supports_graph_capture_tickets = false;
+    ctx->setBackendForTesting(
+        std::move(backend),
+        CollectiveBackendType::HETEROGENEOUS,
+        /*initialized=*/true);
+
+    EXPECT_FALSE(ctx->graphCaptureBoundaryOnStream(
+        "prefill_graph:unit_ticket_unsupported",
+        0,
+        reinterpret_cast<void *>(0x1234),
+        1000));
+    EXPECT_TRUE(ctx->isAbortRequested());
+}
 
 // =============================================================================
 // Backend Initialization Tests
@@ -2098,6 +2510,98 @@ TEST_F(Test__LocalTPContext, GroupedOnStreamAllreduceResultSurvivesBackToBackGen
     EXPECT_TRUE(slot1_second_result.load(std::memory_order_acquire));
     EXPECT_EQ(backend_raw->allreduce_multi_call_count.load(), 0);
     EXPECT_EQ(backend_raw->allreduce_multi_on_streams_call_count.load(), 2);
+    ASSERT_EQ(backend_raw->last_allreduce_multi_streams.size(), 2u);
+    EXPECT_EQ(backend_raw->last_allreduce_multi_streams[0], slot0_stream);
+    EXPECT_EQ(backend_raw->last_allreduce_multi_streams[1], slot1_stream);
+}
+
+/**
+ * @test A heterogeneous generation cannot release before its host ticket.
+ *
+ * This device-free protocol test models a background D2H/reduce/H2D worker.
+ * Both LocalTP participants must remain parked after asynchronous submission,
+ * the legacy stream-ordered grouped entrypoint must remain unused, and terminal
+ * ticket publication must release the generation exactly once.
+ */
+TEST_F(Test__LocalTPContext,
+       HeterogeneousGroupedAllreduceWaitsForAuthenticatedHostCompletionTicket)
+{
+    auto ctx_base = createLocalTPContext(
+        {cpu0_, GlobalDeviceAddress::cpu(1)},
+        {},
+        CollectiveBackendType::HOST);
+    auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+    ASSERT_NE(ctx, nullptr);
+
+    auto backend = std::make_unique<MockCollectiveBackend>();
+    auto *const backend_raw = backend.get();
+    backend_raw->supports_host_completion_tickets = true;
+    backend_raw->blockHostCompletionTicket();
+    ctx->setBackendForTesting(
+        std::move(backend),
+        CollectiveBackendType::HETEROGENEOUS,
+        /*initialized=*/true);
+
+    int slot0_payload = 11;
+    int slot1_payload = 29;
+    void *const slot0_stream = reinterpret_cast<void *>(0x1234);
+    void *const slot1_stream = reinterpret_cast<void *>(0x5678);
+    std::atomic<bool> slot0_returned{false};
+    std::atomic<bool> slot1_returned{false};
+    bool slot0_result = false;
+    bool slot1_result = false;
+
+    std::thread slot0([&]() {
+        slot0_result = ctx->allreduceGroupedOnExplicitStreamsForTesting(
+            &slot0_payload,
+            1,
+            CollectiveDataType::INT32,
+            0,
+            slot0_stream,
+            "heterogeneous_ticket_unit",
+            "fp32");
+        slot0_returned.store(true, std::memory_order_release);
+    });
+    std::thread slot1([&]() {
+        slot1_result = ctx->allreduceGroupedOnExplicitStreamsForTesting(
+            &slot1_payload,
+            1,
+            CollectiveDataType::INT32,
+            1,
+            slot1_stream,
+            "heterogeneous_ticket_unit",
+            "fp32");
+        slot1_returned.store(true, std::memory_order_release);
+    });
+
+    const auto observation_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (backend_raw->host_completion_ticket_await_call_count.load(
+               std::memory_order_acquire) < 1 &&
+           std::chrono::steady_clock::now() < observation_deadline)
+    {
+        std::this_thread::yield();
+    }
+
+    EXPECT_EQ(
+        backend_raw->host_completion_ticket_submit_call_count.load(
+            std::memory_order_acquire),
+        1);
+    EXPECT_EQ(
+        backend_raw->host_completion_ticket_await_call_count.load(
+            std::memory_order_acquire),
+        1);
+    EXPECT_EQ(backend_raw->allreduce_multi_on_streams_call_count.load(), 0)
+        << "heterogeneous execution must not retain the unsafe stream-wait path";
+    EXPECT_FALSE(slot0_returned.load(std::memory_order_acquire));
+    EXPECT_FALSE(slot1_returned.load(std::memory_order_acquire));
+
+    backend_raw->releaseHostCompletionTicket();
+    slot0.join();
+    slot1.join();
+
+    EXPECT_TRUE(slot0_result);
+    EXPECT_TRUE(slot1_result);
     ASSERT_EQ(backend_raw->last_allreduce_multi_streams.size(), 2u);
     EXPECT_EQ(backend_raw->last_allreduce_multi_streams[0], slot0_stream);
     EXPECT_EQ(backend_raw->last_allreduce_multi_streams[1], slot1_stream);

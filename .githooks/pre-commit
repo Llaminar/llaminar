@@ -106,7 +106,7 @@ echo ""
 # stochastic Qwen3.6 matrix proves Dense and MoE speculative sampling at fixed
 # depths 1/2/3 and dynamic depth across CPU, CUDA, and ROCm, including Dense
 # CUDA/ROCm LocalTP, MoE CUDA/ROCm ExpertOverlay LocalTP, and MoE CPU
-# NodeLocalTP. It also covers MoE Dynamic/LLEP + prefix cache rows so TP/EP
+# NodeTP. It also covers MoE Dynamic/LLEP + prefix cache rows so TP/EP
 # path-exercise regressions fail before the heavier gates.
 FOCUSED_INTEG_STEP=3
 echo -e "${YELLOW}[${FOCUSED_INTEG_STEP}/${TOTAL_STEPS}] Running focused integration tests (grouped verifier rows + long prefill M-totality + stochastic MTP matrix)...${NC}"
@@ -149,7 +149,7 @@ if [ $LONG_PREFILL_M_TOTALITY_EXIT_CODE -ne 0 ]; then
     exit 1
 fi
 
-STOCHASTIC_MTP_REGEX='^(V2_Integration_Parity_Qwen36_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36MoE_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36_LocalTP_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfterClearCache|V2_Integration_Parity_Qwen36MoE_(ExpertOverlay|NodeLocalTP)_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfter(ClearCache|PrefixRestore).*|V2_Integration_Parity_Qwen36MoE_ExpertOverlay_.*PrefixCacheMTPRestore_(CUDA2TP|ROCm2TP)(Dynamic|LLEP)PhaseSplit)$'
+STOCHASTIC_MTP_REGEX='^(V2_Integration_Parity_Qwen36_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36MoE_(CPU|CUDA|ROCm)_SingleDevice_.*MTPStochastic(Depth[123]|DynamicDepth)VerifierRuns|V2_Integration_Parity_Qwen36_LocalTP_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfterClearCache|V2_Integration_Parity_Qwen36MoE_(ExpertOverlay|NodeTP)_.*StochasticMTP(Depth[123]|DynamicDepth)VerifierMatchesAfter(ClearCache|PrefixRestore).*|V2_Integration_Parity_Qwen36MoE_ExpertOverlay_.*PrefixCacheMTPRestore_(CUDA2TP|ROCm2TP)(Dynamic|LLEP)PhaseSplit)$'
 set +e
 ctest --test-dir "$BUILD_V2_INTEGRATION" -R "$STOCHASTIC_MTP_REGEX" --output-on-failure
 STOCHASTIC_MTP_EXIT_CODE=$?
@@ -200,7 +200,7 @@ fi
 
 # Step 4/5: Run Focused Parity Baseline (56 tests, all model families, sequential)
 # Covers Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 27B LocalPP (dense Q4_K_M),
-# Qwen3.5 MoE (sparse), NodeLocalTP (multi-device),
+# Qwen3.5 MoE (sparse), NodeTP (multi-device),
 # HybridPPTP (pipeline+tensor parallel),
 # and ExpertOverlay (tiered same-layer expert residency).
 # Runs on ALL branches to catch accuracy regressions early.

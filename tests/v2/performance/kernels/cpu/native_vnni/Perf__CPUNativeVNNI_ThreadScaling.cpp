@@ -256,9 +256,9 @@ TEST(Perf__CPUNativeVNNIThreadScaling, ProductionAutoRoutes)
                 << "OpenMP runtime did not honor the requested team width";
 
             const NativeVNNITileConfig serial_geometry = computeTileConfig(
-                n, k, 1, packed.payload_bytes, threads);
+                n, k, 1, packed.preparedFootprint(), threads);
             const NativeVNNITileConfig regime_geometry = computeTileConfig(
-                n, k, regime.m, packed.payload_bytes, threads);
+                n, k, regime.m, packed.preparedFootprint(), threads);
             std::string policy = "Auto";
             if (regime.m == 1)
             {

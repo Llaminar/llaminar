@@ -10,6 +10,8 @@
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "backends/rocm/HIPGraphCapture.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
@@ -30,6 +32,7 @@
 
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <cstdint>
 #include <cstdlib>
 #include <cmath>
@@ -41,6 +44,7 @@
 #include <sstream>
 #include <span>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -125,6 +129,45 @@ namespace
             const ScopedROCmNativeVNNITuningOverride &) = delete;
         ScopedROCmNativeVNNITuningOverride &operator=(
             const ScopedROCmNativeVNNITuningOverride &) = delete;
+    };
+
+    /**
+     * @brief Restore the calling thread's HIP device after a multi-device test.
+     *
+     * HIP's current device is thread-local process state. A test that walks
+     * participants can otherwise leave the GoogleTest thread on its final
+     * device, causing a later device-0 fixture to create a stream on device 1.
+     * The guard makes that ownership boundary exception- and assertion-safe.
+     */
+    class ScopedHIPCurrentDeviceRestore final
+    {
+    public:
+        /** @brief Snapshot the exact HIP device selected on the calling thread. */
+        ScopedHIPCurrentDeviceRestore()
+        {
+            const hipError_t status = hipGetDevice(&saved_device_);
+            if (status != hipSuccess)
+            {
+                throw std::runtime_error(
+                    std::string("Could not snapshot current HIP device: ") +
+                    hipGetErrorString(status));
+            }
+        }
+
+        /** @brief Restore the saved device even when a test assertion returns early. */
+        ~ScopedHIPCurrentDeviceRestore()
+        {
+            if (saved_device_ >= 0)
+                (void)hipSetDevice(saved_device_);
+        }
+
+        ScopedHIPCurrentDeviceRestore(
+            const ScopedHIPCurrentDeviceRestore &) = delete;
+        ScopedHIPCurrentDeviceRestore &operator=(
+            const ScopedHIPCurrentDeviceRestore &) = delete;
+
+    private:
+        int saved_device_ = -1; ///< Calling thread's device on scope entry.
     };
 
     class ScopedROCmSerialPartitionPolicy final
@@ -1265,7 +1308,8 @@ namespace
         config.strategy = WeightDistributionStrategy::REPLICATED;
         config.weight_precision = WeightPrecision::NATIVE;
         config.use_mmap = true;
-        config.target_is_gpu = true;
+        config.payload_access_pattern =
+            ModelPayloadAccessPattern::DeviceStaging;
         return ModelContext::create(model_path.string(), config);
     }
 
@@ -1352,24 +1396,24 @@ namespace
         if (graph_capture)
         {
 #ifdef HAVE_ROCM
-            hipGraph_t graph = nullptr;
-            hipGraphExec_t exec = nullptr;
-            ASSERT_EQ(hipStreamBeginCapture(static_cast<hipStream_t>(stream), hipStreamCaptureModeGlobal),
-                      hipSuccess);
-            ASSERT_TRUE(stage.execute(&ctx));
-            ASSERT_EQ(hipStreamEndCapture(static_cast<hipStream_t>(stream), &graph), hipSuccess);
-            ASSERT_NE(graph, nullptr);
-            ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
-            ASSERT_NE(exec, nullptr);
+            HIPGraphCapture capture(
+                static_cast<hipStream_t>(stream),
+                device.ordinal);
+            ScopedBackendGraphCapture capture_transaction(
+                capture,
+                "runGemmStageRows");
+            ASSERT_TRUE(capture_transaction.begin());
+            const bool capture_launch_ok = stage.execute(&ctx);
+            capture_transaction.finish();
+            ASSERT_TRUE(capture_launch_ok);
+            ASSERT_TRUE(capture.instantiate());
             ASSERT_EQ(hipMemsetAsync(
                           output->gpu_data_ptr(),
                           0,
                           static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(float),
                           static_cast<hipStream_t>(stream)),
                       hipSuccess);
-            ASSERT_EQ(hipGraphLaunch(exec, static_cast<hipStream_t>(stream)), hipSuccess);
-            ASSERT_EQ(hipGraphExecDestroy(exec), hipSuccess);
-            ASSERT_EQ(hipGraphDestroy(graph), hipSuccess);
+            ASSERT_TRUE(capture.launch());
 #else
             FAIL() << "graph_capture requested without HAVE_ROCM";
 #endif
@@ -2045,22 +2089,24 @@ namespace
         ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
 
 #ifdef HAVE_ROCM
-        hipGraph_t graph = nullptr;
-        hipGraphExec_t exec = nullptr;
+        std::unique_ptr<HIPGraphCapture> captured_graph;
         if (graph_capture)
         {
-            ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
-            ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(
+            captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
+            ScopedBackendGraphCapture capture_transaction(
+                *captured_graph,
+                "runFusedSwiGLUDownSmallMMatchesReference");
+            ASSERT_TRUE(capture_transaction.begin());
+            const bool capture_launch_ok = kernel.multiply_tensor_with_fused_swiglu(
                 gate.get(),
                 up.get(),
                 output.get(),
                 M,
                 N,
-                K));
-            ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-            ASSERT_NE(graph, nullptr);
-            ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
-            ASSERT_NE(exec, nullptr);
+                K);
+            capture_transaction.finish();
+            ASSERT_TRUE(capture_launch_ok);
+            ASSERT_TRUE(captured_graph->instantiate());
 
             for (int replay = 0; replay < graph_replays; ++replay)
             {
@@ -2069,7 +2115,7 @@ namespace
                                          static_cast<size_t>(M) * N * sizeof(float),
                                          stream),
                           hipSuccess);
-                ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess)
+                ASSERT_TRUE(captured_graph->launch())
                     << "replay=" << replay;
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess)
                     << "replay=" << replay;
@@ -2103,10 +2149,7 @@ namespace
         EXPECT_GT(cos, min_cosine);
 
 #ifdef HAVE_ROCM
-        if (exec)
-            EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
-        if (graph)
-            EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        captured_graph.reset();
         if (stream)
         {
             kernel.clearGPUStreamBinding();
@@ -2178,11 +2221,14 @@ namespace
         ASSERT_TRUE(up->ensureOnDevice(DeviceId::rocm(0), stream));
         ASSERT_TRUE(grouped_output->allocateOnDevice(DeviceId::rocm(0), stream));
 
-        hipGraph_t graph = nullptr;
-        hipGraphExec_t exec = nullptr;
+        std::unique_ptr<HIPGraphCapture> captured_graph;
         if (graph_capture)
         {
-            ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+            captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
+            ScopedBackendGraphCapture capture_transaction(
+                *captured_graph,
+                "runFusedSwiGLUDownSmallMMatchesSerialRows");
+            ASSERT_TRUE(capture_transaction.begin());
             /*
              * This helper is the verifier contract proof, not the generic
              * M-aware fused-SwiGLU throughput test.  The generated ROCm table
@@ -2192,7 +2238,8 @@ namespace
              * serial verifier reduction order while still launching as a
              * graph-capturable grouped kernel.
              */
-            ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+            const bool capture_launch_ok =
+                kernel.multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
                 gate.get(),
                 up.get(),
                 grouped_output.get(),
@@ -2201,11 +2248,10 @@ namespace
                 K,
                 1.0f,
                 0.0f,
-                grouped_workspace.get()));
-            ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-            ASSERT_NE(graph, nullptr);
-            ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
-            ASSERT_NE(exec, nullptr);
+                grouped_workspace.get());
+            capture_transaction.finish();
+            ASSERT_TRUE(capture_launch_ok);
+            ASSERT_TRUE(captured_graph->instantiate());
 
             for (int replay = 0; replay < graph_replays; ++replay)
             {
@@ -2214,7 +2260,7 @@ namespace
                                          static_cast<size_t>(M) * N * sizeof(float),
                                          stream),
                           hipSuccess);
-                ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess)
+                ASSERT_TRUE(captured_graph->launch())
                     << "replay=" << replay;
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess)
                     << "replay=" << replay;
@@ -2316,10 +2362,7 @@ namespace
             static_cast<size_t>(N));
 
 #ifdef HAVE_ROCM
-        if (exec)
-            EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
-        if (graph)
-            EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        captured_graph.reset();
         kernel.clearGPUStreamBinding();
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
@@ -2391,13 +2434,24 @@ namespace
             bias_v->mutable_data()[col] = 0.03125f * static_cast<float>((col % 5) - 2);
         }
 
-        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
-        ASSERT_TRUE(separate_q->allocateOnDevice(DeviceId::rocm(0)));
-        ASSERT_TRUE(separate_k->allocateOnDevice(DeviceId::rocm(0)));
-        ASSERT_TRUE(separate_v->allocateOnDevice(DeviceId::rocm(0)));
-        ASSERT_TRUE(fused_q->allocateOnDevice(DeviceId::rocm(0)));
-        ASSERT_TRUE(fused_k->allocateOnDevice(DeviceId::rocm(0)));
-        ASSERT_TRUE(fused_v->allocateOnDevice(DeviceId::rocm(0)));
+        /*
+         * Mirror request admission: production kernels consume already-placed
+         * activation and bias tensors and write into stable output storage.
+         * In particular, fused projection bias joining is not an implicit H2D
+         * upload boundary, so every learned bias must be published before the
+         * separate and fused production paths are compared.
+         */
+        const DeviceId device = DeviceId::rocm(0);
+        TransferEngine::prepareDeviceInput(input.get(), device, stream);
+        TransferEngine::prepareDeviceInput(bias_q.get(), device, stream);
+        TransferEngine::prepareDeviceInput(bias_k.get(), device, stream);
+        TransferEngine::prepareDeviceInput(bias_v.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(separate_q.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(separate_k.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(separate_v.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(fused_q.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(fused_k.get(), device, stream);
+        TransferEngine::prepareDeviceOutput(fused_v.get(), device, stream);
 
         ASSERT_TRUE(q_kernel.multiply_tensor(input.get(), separate_q.get(), M, Nq, K,
                                              true, 1.0f, 0.0f, bias_q.get()));
@@ -2765,19 +2819,21 @@ namespace
         };
 
 #ifdef HAVE_ROCM
-        hipGraph_t graph = nullptr;
-        hipGraphExec_t exec = nullptr;
+        std::unique_ptr<HIPGraphCapture> captured_graph;
         if (graph_capture)
         {
             ASSERT_TRUE(launch_fused_group());
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-            ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
-            ASSERT_TRUE(launch_fused_group());
-            ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-            ASSERT_NE(graph, nullptr);
-            ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
-            ASSERT_NE(exec, nullptr);
+            captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
+            ScopedBackendGraphCapture capture_transaction(
+                *captured_graph,
+                "runFusedQKVSmallMMatchesSeparate");
+            ASSERT_TRUE(capture_transaction.begin());
+            const bool capture_launch_ok = launch_fused_group();
+            capture_transaction.finish();
+            ASSERT_TRUE(capture_launch_ok);
+            ASSERT_TRUE(captured_graph->instantiate());
             for (int replay = 0; replay < graph_replays; ++replay)
             {
                 for (size_t i = 0; i < Ns.size(); ++i)
@@ -2788,7 +2844,7 @@ namespace
                                              stream),
                               hipSuccess);
                 }
-                ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess)
+                ASSERT_TRUE(captured_graph->launch())
                     << "replay=" << replay;
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess)
                     << "replay=" << replay;
@@ -2816,10 +2872,7 @@ namespace
         }
 
 #ifdef HAVE_ROCM
-        if (exec)
-            EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
-        if (graph)
-            EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        captured_graph.reset();
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
         for (auto &kernel : kernels)
@@ -2921,19 +2974,22 @@ namespace
         }
 
 #ifdef HAVE_ROCM
-        hipGraph_t graph = nullptr;
-        hipGraphExec_t exec = nullptr;
+        std::unique_ptr<HIPGraphCapture> captured_graph;
         if (graph_capture)
         {
             ASSERT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K));
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-            ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
-            ASSERT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K));
-            ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-            ASSERT_NE(graph, nullptr);
-            ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
-            ASSERT_NE(exec, nullptr);
+            captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
+            ScopedBackendGraphCapture capture_transaction(
+                *captured_graph,
+                "runFusedProjectionGroupSmallMMatchesReference");
+            ASSERT_TRUE(capture_transaction.begin());
+            const bool capture_launch_ok = kernels.front()->multiply_fused_tensor(
+                input.get(), projections, M, K);
+            capture_transaction.finish();
+            ASSERT_TRUE(capture_launch_ok);
+            ASSERT_TRUE(captured_graph->instantiate());
 
             for (int replay = 0; replay < graph_replays; ++replay)
             {
@@ -2945,7 +3001,7 @@ namespace
                                              stream),
                               hipSuccess);
                 }
-                ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess)
+                ASSERT_TRUE(captured_graph->launch())
                     << "replay=" << replay;
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess)
                     << "replay=" << replay;
@@ -2980,10 +3036,7 @@ namespace
         }
 
 #ifdef HAVE_ROCM
-        if (exec)
-            EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
-        if (graph)
-            EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        captured_graph.reset();
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
         for (auto &kernel : kernels)
@@ -3095,16 +3148,18 @@ namespace
         };
 
 #ifdef HAVE_ROCM
-        hipGraph_t graph = nullptr;
-        hipGraphExec_t exec = nullptr;
+        std::unique_ptr<HIPGraphCapture> captured_graph;
         if (graph_capture)
         {
-            ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
-            ASSERT_TRUE(launch_fused_group());
-            ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-            ASSERT_NE(graph, nullptr);
-            ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
-            ASSERT_NE(exec, nullptr);
+            captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
+            ScopedBackendGraphCapture capture_transaction(
+                *captured_graph,
+                "runMixedProjectionGroupSmallMMatchesSeparate");
+            ASSERT_TRUE(capture_transaction.begin());
+            const bool capture_launch_ok = launch_fused_group();
+            capture_transaction.finish();
+            ASSERT_TRUE(capture_launch_ok);
+            ASSERT_TRUE(captured_graph->instantiate());
             for (int replay = 0; replay < graph_replays; ++replay)
             {
                 for (size_t i = 0; i < Ns.size(); ++i)
@@ -3115,7 +3170,7 @@ namespace
                                              stream),
                               hipSuccess);
                 }
-                ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess)
+                ASSERT_TRUE(captured_graph->launch())
                     << "replay=" << replay;
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess)
                     << "replay=" << replay;
@@ -3143,10 +3198,7 @@ namespace
         }
 
 #ifdef HAVE_ROCM
-        if (exec)
-            EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
-        if (graph)
-            EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        captured_graph.reset();
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 #endif
         for (auto &kernel : kernels)
@@ -3508,18 +3560,20 @@ namespace
         ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
-        hipGraph_t graph = nullptr;
-        hipGraphExec_t exec = nullptr;
-        ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
-        ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
-        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
-        ASSERT_NE(graph, nullptr);
-        ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
-        ASSERT_NE(exec, nullptr);
+        auto captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
+        ScopedBackendGraphCapture capture_transaction(
+            *captured_graph,
+            "runGraphCapturedDispatchSmallMMatchesReference");
+        ASSERT_TRUE(capture_transaction.begin());
+        const bool capture_launch_ok =
+            kernel.multiply_tensor(input.get(), output.get(), M, N, K);
+        capture_transaction.finish();
+        ASSERT_TRUE(capture_launch_ok);
+        ASSERT_TRUE(captured_graph->instantiate());
 
         ASSERT_EQ(hipMemsetAsync(output->gpu_data_ptr(), 0, static_cast<size_t>(M) * N * sizeof(float), stream),
                   hipSuccess);
-        ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
+        ASSERT_TRUE(captured_graph->launch());
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
         TransferEngine::publishCurrentDeviceWrite(output, stream);
 
@@ -3530,10 +3584,7 @@ namespace
         LOG_INFO("[SmallM] " << label << " graph-captured M=" << M << " cosine=" << cos);
         EXPECT_GT(cos, min_cosine);
 
-        if (exec)
-            EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
-        if (graph)
-            EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        captured_graph.reset();
         kernel.clearGPUStreamBinding();
         EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
         kernel.unbindWorkspace();
@@ -6071,6 +6122,483 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36QKVM2MatchesSeparate)
         1024);
 }
 
+/**
+ * @test Captured concurrent prefill preserves asymmetric TP Q/K/V outputs.
+ *
+ * Qwen2.5-0.5B uses 14 query heads and two grouped-KV heads.  Under TP=2 the
+ * production projection widths are therefore Q=448, K=64, and V=64 for a
+ * nine-token prefill.  This exact mixed-width transaction exposed an ordering
+ * defect in the default ROCm multi-stream prefill route: the graph completed,
+ * but Q/K/V were read after shared activation scratch had been reused.  Keep
+ * the real graph-captured concurrent entry point and a shared graph workspace
+ * here so a serial or per-kernel substitute cannot satisfy the regression.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM,
+     GraphCapturedConcurrentQ40Qwen2TP2QKVM9MatchesSeparate)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifdef HAVE_ROCM
+    constexpr int M = 9;
+    constexpr int K = 896;
+    const std::array<int, 3> widths = {448, 64, 64};
+
+    std::array<std::unique_ptr<Q4_0Tensor>, 3> weights;
+    std::array<ROCmPackedWeights, 3> packed;
+    std::array<std::unique_ptr<ROCmQuantisedGemmKernel>, 3> kernels;
+    for (size_t i = 0; i < widths.size(); ++i)
+    {
+        weights[i] = TestTensorFactory::createQ4_0Random(
+            {static_cast<size_t>(widths[i]), static_cast<size_t>(K)},
+            static_cast<uint32_t>(2100 + i));
+        ASSERT_TRUE(packWeightsToROCm(weights[i].get(), packed[i]));
+        expectPackedPath(packed[i], PackedPath::NativeVNNI);
+        kernels[i] = std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0);
+    }
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    for (auto &kernel : kernels)
+        kernel->setGPUStream(stream);
+
+    WorkspaceRequirements combined;
+    for (size_t i = 0; i < widths.size(); ++i)
+        combined.merge(kernels[i]->getWorkspaceRequirements(M, widths[i], K));
+    auto workspace = std::make_unique<DeviceWorkspaceManager>(
+        DeviceId::rocm(0),
+        combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
+    ASSERT_TRUE(workspace->allocate(combined));
+    for (auto &kernel : kernels)
+        kernel->bindWorkspace(workspace.get());
+
+    auto input_a = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f, 3101);
+    auto input_b = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f, 3102);
+    ASSERT_TRUE(input_a->ensureOnDevice(DeviceId::rocm(0), stream));
+    ASSERT_TRUE(input_b->ensureOnDevice(DeviceId::rocm(0), stream));
+
+    std::array<std::unique_ptr<FP32Tensor>, 3> reference_a;
+    std::array<std::unique_ptr<FP32Tensor>, 3> reference_b;
+    std::array<std::unique_ptr<FP32Tensor>, 3> captured_a;
+    std::array<std::unique_ptr<FP32Tensor>, 3> captured_b;
+    std::array<std::unique_ptr<FP32Tensor>, 3> observed_a;
+    std::array<std::unique_ptr<TensorSlice>, 3> bias_slices;
+    for (size_t i = 0; i < widths.size(); ++i)
+    {
+        const std::vector<size_t> shape = {
+            static_cast<size_t>(M), static_cast<size_t>(widths[i])};
+        auto local_bias = TestTensorFactory::createFP32(
+            {static_cast<size_t>(widths[i])});
+        for (int column = 0; column < widths[i]; ++column)
+        {
+            const float magnitude = i == 1 ? 3.0f : 0.125f;
+            local_bias->mutable_data()[column] =
+                magnitude * static_cast<float>((column % 11) - 5);
+        }
+        std::unique_ptr<TensorBase> sliced_bias_storage =
+            std::move(local_bias);
+        bias_slices[i] = std::make_unique<TensorSlice>(
+            std::move(sliced_bias_storage),
+            SliceMetadata::forRowParallel(
+                static_cast<size_t>(widths[i] * 2),
+                1,
+                0,
+                2,
+                true));
+        reference_a[i] = TestTensorFactory::createFP32(shape);
+        reference_b[i] = TestTensorFactory::createFP32(shape);
+        captured_a[i] = TestTensorFactory::createFP32(shape);
+        captured_b[i] = TestTensorFactory::createFP32(shape);
+        observed_a[i] = TestTensorFactory::createFP32(shape);
+        ASSERT_TRUE(reference_a[i]->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(reference_b[i]->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(captured_a[i]->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(captured_b[i]->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(observed_a[i]->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(bias_slices[i]->ensureOnDevice(DeviceId::rocm(0), stream));
+
+        ASSERT_TRUE(kernels[i]->multiply_tensor(
+            input_a.get(), reference_a[i].get(), M, widths[i], K,
+            true, 1.0f, 0.0f, bias_slices[i].get()));
+        ASSERT_TRUE(kernels[i]->multiply_tensor(
+            input_b.get(), reference_b[i].get(), M, widths[i], K,
+            true, 1.0f, 0.0f, bias_slices[i].get()));
+    }
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    for (size_t i = 0; i < widths.size(); ++i)
+    {
+        TransferEngine::publishCurrentDeviceWrite(reference_a[i], stream);
+        TransferEngine::publishCurrentDeviceWrite(reference_b[i], stream);
+    }
+
+    std::vector<ITensorGemm::TensorProjectionDesc> projections_a;
+    std::vector<ITensorGemm::TensorProjectionDesc> projections_b;
+    for (size_t i = 0; i < widths.size(); ++i)
+    {
+        projections_a.emplace_back(
+            kernels[i].get(), captured_a[i].get(), widths[i],
+            bias_slices[i].get(), "qkv_a");
+        projections_b.emplace_back(
+            kernels[i].get(), captured_b[i].get(), widths[i],
+            bias_slices[i].get(), "qkv_b");
+    }
+
+    // Provision the persistent side-stream/event transaction before capture.
+    ASSERT_TRUE(kernels.front()->multiply_fused_tensor(
+        input_a.get(), projections_a, M, K, nullptr, workspace.get()));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    auto captured_graph = std::make_unique<HIPGraphCapture>(stream, 0);
+    {
+        ScopedBackendGraphCapture capture_transaction(
+            *captured_graph,
+            "GraphCapturedConcurrentQ40Qwen2TP2QKVM9MatchesSeparate");
+        ASSERT_TRUE(capture_transaction.begin());
+        // A Qwen2 forward graph reuses the per-device projection event pool for
+        // both QKV and gate/up fan-out in every layer.  Preserve that pressure
+        // here: an event dependency that aliases a later record can look sound
+        // in a two-transaction micrograph while allowing the first layer's
+        // shared activation scratch to be overwritten in the full 24-layer DAG.
+        for (int layer = 0; layer < 24; ++layer)
+        {
+            ASSERT_TRUE(kernels.front()->multiply_fused_tensor(
+                input_a.get(), projections_a, M, K, nullptr, workspace.get()));
+            if (layer == 0)
+            {
+                for (size_t i = 0; i < widths.size(); ++i)
+                {
+                    ASSERT_EQ(
+                        hipMemcpyAsync(
+                            observed_a[i]->gpu_data_ptr(),
+                            captured_a[i]->gpu_data_ptr(),
+                            static_cast<size_t>(M) * static_cast<size_t>(widths[i]) *
+                                sizeof(float),
+                            hipMemcpyDeviceToDevice,
+                            stream),
+                        hipSuccess);
+                }
+            }
+            ASSERT_TRUE(kernels.front()->multiply_fused_tensor(
+                input_b.get(), projections_b, M, K, nullptr, workspace.get()));
+        }
+        capture_transaction.finish();
+    }
+    ASSERT_TRUE(captured_graph->instantiate());
+
+    for (int replay = 0; replay < 4; ++replay)
+    {
+        ASSERT_TRUE(captured_graph->launch()) << "replay=" << replay;
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess) << "replay=" << replay;
+    }
+
+    for (size_t i = 0; i < widths.size(); ++i)
+    {
+        TransferEngine::publishCurrentDeviceWrite(captured_a[i], stream);
+        TransferEngine::publishCurrentDeviceWrite(captured_b[i], stream);
+        TransferEngine::publishCurrentDeviceWrite(observed_a[i], stream);
+        const size_t count = static_cast<size_t>(M) * static_cast<size_t>(widths[i]);
+        const float cosine_a = cosineSim(
+            captured_a[i]->data(), reference_a[i]->data(), count);
+        const float cosine_b = cosineSim(
+            captured_b[i]->data(), reference_b[i]->data(), count);
+        const float observed_cosine_a = cosineSim(
+            observed_a[i]->data(), reference_a[i]->data(), count);
+        LOG_INFO("[SmallM] Qwen2 captured sequential QKV projection=" << i
+                                                                       << " N=" << widths[i]
+                                                                       << " cosine_a=" << cosine_a
+                                                                       << " cosine_b=" << cosine_b
+                                                                       << " observed_cosine_a="
+                                                                       << observed_cosine_a);
+        EXPECT_GT(cosine_a, 0.9999f) << "first transaction projection=" << i;
+        EXPECT_GT(cosine_b, 0.9999f) << "second transaction projection=" << i;
+        EXPECT_GT(observed_cosine_a, 0.9999f)
+            << "main-stream consumer observed projection=" << i
+            << " before the concurrent side stream completed";
+    }
+
+    captured_graph.reset();
+    for (auto &kernel : kernels)
+    {
+        kernel->unbindWorkspace();
+        kernel->clearGPUStreamBinding();
+    }
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+/**
+ * @test Concurrent participant capture preserves Qwen2 TP projection outputs.
+ *
+ * LocalTP captures one complete graph per participant on persistent host
+ * workers.  The two workers enter HIP capture together, and each graph joins
+ * its device-local Q/K/V side streams through the concurrent projection pool.
+ * This fixture reproduces that ownership boundary without RCCL or later model
+ * stages obscuring the first projection divergence.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM,
+     ConcurrentTwoDeviceGraphCaptureQ40Qwen2TP2QKVM9MatchesSeparate)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifdef HAVE_ROCM
+    ScopedHIPCurrentDeviceRestore restore_calling_device;
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count < 2)
+        GTEST_SKIP() << "Two ROCm devices are required";
+
+    constexpr int M = 9;
+    constexpr int K = 896;
+    constexpr int kParticipants = 2;
+    const std::array<int, 3> widths = {448, 64, 64};
+
+    struct Participant
+    {
+        int device = -1;
+        hipStream_t stream = nullptr;
+        std::unique_ptr<HIPGraphCapture> captured_graph;
+        std::array<std::unique_ptr<Q4_0Tensor>, 3> weights;
+        std::array<ROCmPackedWeights, 3> packed;
+        std::array<std::unique_ptr<ROCmQuantisedGemmKernel>, 3> kernels;
+        std::unique_ptr<DeviceWorkspaceManager> workspace;
+        std::unique_ptr<FP32Tensor> input_a;
+        std::unique_ptr<FP32Tensor> input_b;
+        std::array<std::unique_ptr<FP32Tensor>, 3> reference_a;
+        std::array<std::unique_ptr<FP32Tensor>, 3> reference_b;
+        std::array<std::unique_ptr<FP32Tensor>, 3> captured_a;
+        std::array<std::unique_ptr<FP32Tensor>, 3> captured_b;
+        std::array<std::unique_ptr<FP32Tensor>, 3> observed_a;
+        std::vector<ITensorGemm::TensorProjectionDesc> projections_a;
+        std::vector<ITensorGemm::TensorProjectionDesc> projections_b;
+        std::string failure;
+    };
+
+    std::array<Participant, kParticipants> participants;
+    for (int device = 0; device < kParticipants; ++device)
+    {
+        Participant &participant = participants[device];
+        participant.device = device;
+        ASSERT_EQ(hipSetDevice(device), hipSuccess);
+        ASSERT_EQ(
+            hipStreamCreateWithFlags(&participant.stream, hipStreamNonBlocking),
+            hipSuccess);
+
+        WorkspaceRequirements combined;
+        for (size_t i = 0; i < widths.size(); ++i)
+        {
+            participant.weights[i] = TestTensorFactory::createQ4_0Random(
+                {static_cast<size_t>(widths[i]), static_cast<size_t>(K)},
+                static_cast<uint32_t>(4100 + device * 10 + i));
+            ASSERT_TRUE(packWeightsToROCm(
+                participant.weights[i].get(), participant.packed[i]));
+            expectPackedPath(participant.packed[i], PackedPath::NativeVNNI);
+            participant.kernels[i] =
+                std::make_unique<ROCmQuantisedGemmKernel>(
+                    &participant.packed[i], device);
+            participant.kernels[i]->setGPUStream(participant.stream);
+            combined.merge(
+                participant.kernels[i]->getWorkspaceRequirements(
+                    M, widths[i], K));
+        }
+
+        participant.workspace = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(device),
+            combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
+        ASSERT_TRUE(participant.workspace->allocate(combined));
+        for (auto &kernel : participant.kernels)
+            kernel->bindWorkspace(participant.workspace.get());
+
+        participant.input_a = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -0.75f, 0.75f, static_cast<uint32_t>(5101 + device * 2));
+        participant.input_b = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -0.75f, 0.75f, static_cast<uint32_t>(5102 + device * 2));
+        ASSERT_TRUE(participant.input_a->ensureOnDevice(
+            DeviceId::rocm(device), participant.stream));
+        ASSERT_TRUE(participant.input_b->ensureOnDevice(
+            DeviceId::rocm(device), participant.stream));
+
+        for (size_t i = 0; i < widths.size(); ++i)
+        {
+            const std::vector<size_t> shape = {
+                static_cast<size_t>(M), static_cast<size_t>(widths[i])};
+            participant.reference_a[i] = TestTensorFactory::createFP32(shape);
+            participant.reference_b[i] = TestTensorFactory::createFP32(shape);
+            participant.captured_a[i] = TestTensorFactory::createFP32(shape);
+            participant.captured_b[i] = TestTensorFactory::createFP32(shape);
+            participant.observed_a[i] = TestTensorFactory::createFP32(shape);
+            ASSERT_TRUE(participant.reference_a[i]->allocateOnDevice(
+                DeviceId::rocm(device)));
+            ASSERT_TRUE(participant.reference_b[i]->allocateOnDevice(
+                DeviceId::rocm(device)));
+            ASSERT_TRUE(participant.captured_a[i]->allocateOnDevice(
+                DeviceId::rocm(device)));
+            ASSERT_TRUE(participant.captured_b[i]->allocateOnDevice(
+                DeviceId::rocm(device)));
+            ASSERT_TRUE(participant.observed_a[i]->allocateOnDevice(
+                DeviceId::rocm(device)));
+
+            ASSERT_TRUE(participant.kernels[i]->multiply_tensor(
+                participant.input_a.get(), participant.reference_a[i].get(),
+                M, widths[i], K));
+            ASSERT_TRUE(participant.kernels[i]->multiply_tensor(
+                participant.input_b.get(), participant.reference_b[i].get(),
+                M, widths[i], K));
+
+            participant.projections_a.emplace_back(
+                participant.kernels[i].get(), participant.captured_a[i].get(),
+                widths[i], nullptr, "qkv_a");
+            participant.projections_b.emplace_back(
+                participant.kernels[i].get(), participant.captured_b[i].get(),
+                widths[i], nullptr, "qkv_b");
+        }
+        ASSERT_EQ(hipStreamSynchronize(participant.stream), hipSuccess);
+
+        // Materialize the device-local side-stream/event pool before either
+        // worker begins capture, matching production prepareGraphLaunch().
+        ASSERT_TRUE(participant.kernels.front()->multiply_fused_tensor(
+            participant.input_a.get(), participant.projections_a,
+            M, K, nullptr, participant.workspace.get()));
+        ASSERT_EQ(hipStreamSynchronize(participant.stream), hipSuccess);
+    }
+
+    std::barrier capture_start(kParticipants);
+    std::array<std::thread, kParticipants> workers;
+    for (int device = 0; device < kParticipants; ++device)
+    {
+        workers[device] = std::thread([&, device]()
+        {
+            Participant &participant = participants[device];
+            auto fail = [&](std::string message)
+            {
+                if (participant.failure.empty())
+                    participant.failure = std::move(message);
+            };
+
+            if (hipSetDevice(device) != hipSuccess)
+            {
+                fail("hipSetDevice failed");
+                return;
+            }
+            capture_start.arrive_and_wait();
+            participant.captured_graph = std::make_unique<HIPGraphCapture>(
+                participant.stream,
+                device);
+            ScopedBackendGraphCapture capture_transaction(
+                *participant.captured_graph,
+                "ConcurrentTwoDeviceGraphCaptureQ40Qwen2TP2QKVM9MatchesSeparate");
+            if (!capture_transaction.begin())
+            {
+                fail("backend graph capture begin failed");
+                return;
+            }
+            for (int layer = 0; layer < 24; ++layer)
+            {
+                if (!participant.kernels.front()->multiply_fused_tensor(
+                        participant.input_a.get(), participant.projections_a,
+                        M, K, nullptr, participant.workspace.get()))
+                {
+                    fail("first fused projection launch failed");
+                    return;
+                }
+                if (layer == 0)
+                {
+                    for (size_t i = 0; i < widths.size(); ++i)
+                    {
+                        if (hipMemcpyAsync(
+                                participant.observed_a[i]->gpu_data_ptr(),
+                                participant.captured_a[i]->gpu_data_ptr(),
+                                static_cast<size_t>(M) *
+                                    static_cast<size_t>(widths[i]) *
+                                    sizeof(float),
+                                hipMemcpyDeviceToDevice,
+                                participant.stream) != hipSuccess)
+                        {
+                            fail("captured observation copy failed");
+                            return;
+                        }
+                    }
+                }
+                if (!participant.kernels.front()->multiply_fused_tensor(
+                        participant.input_b.get(), participant.projections_b,
+                        M, K, nullptr, participant.workspace.get()))
+                {
+                    fail("second fused projection launch failed");
+                    return;
+                }
+            }
+            capture_transaction.finish();
+            if (!participant.captured_graph->instantiate())
+            {
+                fail("graph instantiate failed");
+                return;
+            }
+            for (int replay = 0; replay < 4; ++replay)
+            {
+                if (!participant.captured_graph->launch() ||
+                    hipStreamSynchronize(participant.stream) != hipSuccess)
+                {
+                    fail("captured graph replay failed");
+                    return;
+                }
+            }
+        });
+    }
+    for (auto &worker : workers)
+        worker.join();
+
+    for (Participant &participant : participants)
+    {
+        ASSERT_TRUE(participant.failure.empty())
+            << "device=" << participant.device << " " << participant.failure;
+        ASSERT_EQ(hipSetDevice(participant.device), hipSuccess);
+        for (size_t i = 0; i < widths.size(); ++i)
+        {
+            TransferEngine::publishCurrentDeviceWrite(
+                participant.reference_a[i], participant.stream);
+            TransferEngine::publishCurrentDeviceWrite(
+                participant.reference_b[i], participant.stream);
+            TransferEngine::publishCurrentDeviceWrite(
+                participant.captured_a[i], participant.stream);
+            TransferEngine::publishCurrentDeviceWrite(
+                participant.captured_b[i], participant.stream);
+            TransferEngine::publishCurrentDeviceWrite(
+                participant.observed_a[i], participant.stream);
+            const size_t count =
+                static_cast<size_t>(M) * static_cast<size_t>(widths[i]);
+            EXPECT_GT(
+                cosineSim(participant.captured_a[i]->data(),
+                          participant.reference_a[i]->data(), count),
+                0.9999f)
+                << "device=" << participant.device << " projection=" << i;
+            EXPECT_GT(
+                cosineSim(participant.captured_b[i]->data(),
+                          participant.reference_b[i]->data(), count),
+                0.9999f)
+                << "device=" << participant.device << " projection=" << i;
+            EXPECT_GT(
+                cosineSim(participant.observed_a[i]->data(),
+                          participant.reference_a[i]->data(), count),
+                0.9999f)
+                << "device=" << participant.device
+                << " first-layer main-stream consumer projection=" << i;
+        }
+
+        participant.captured_graph.reset();
+        for (auto &kernel : participant.kernels)
+        {
+            kernel->unbindWorkspace();
+            kernel->clearGPUStreamBinding();
+        }
+        ASSERT_EQ(hipStreamDestroy(participant.stream), hipSuccess);
+    }
+#endif
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36FFNGateUpM2MatchesSeparate)
 {
     if (!hasROCmDevice())
@@ -6510,6 +7038,182 @@ TEST(Test__ROCmQuantisedGemmSmallM, Qwen36GDNProjectionStageMixedQuantizedAndRaw
 
     stage.unbindWorkspace();
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+}
+
+/**
+ * @brief Prove captured ROCm GDN separates BF16 and FP32 floating weights.
+ *
+ * Qwen3.5 uses BF16 qkv/z matrices and FP32 alpha/beta matrices. The ROCm
+ * floating GEMM class represents both formats, so a production grouping key
+ * must include the exported physical weight type rather than only the dynamic
+ * implementation class. The captured stage must form two fused subgroups and
+ * retain CPU-reference numerical agreement without per-projection replay.
+ */
+TEST(Test__ROCmQuantisedGemmSmallM, GDNProjectionStageCapturedMixedBF16AndFP32UsesPhysicalFormatSubgroups)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "HAVE_ROCM not enabled";
+#else
+    constexpr int kM = 1;
+    constexpr int kK = 192;
+    constexpr int kNQKV = 160;
+    constexpr int kNZ = 96;
+    constexpr int kNAlpha = 12;
+    constexpr int kNBeta = 12;
+    const DeviceId device = DeviceId::rocm(0);
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    ASSERT_EQ(hipSetDevice(device.ordinal), hipSuccess);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+    auto input = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(kM), static_cast<size_t>(kK)}, -0.75f, 0.75f, 18831);
+    auto weights_qkv = TestTensorFactory::createBF16Random(
+        {static_cast<size_t>(kNQKV), static_cast<size_t>(kK)}, -0.1f, 0.1f, 18832);
+    auto weights_z = TestTensorFactory::createBF16Random(
+        {static_cast<size_t>(kNZ), static_cast<size_t>(kK)}, -0.1f, 0.1f, 18833);
+    auto weights_alpha = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(kNAlpha), static_cast<size_t>(kK)}, -0.1f, 0.1f, 18834);
+    auto weights_beta = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(kNBeta), static_cast<size_t>(kK)}, -0.1f, 0.1f, 18835);
+
+    auto output_qkv = TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(kM), static_cast<size_t>(kNQKV)});
+    auto output_z = TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(kM), static_cast<size_t>(kNZ)});
+    auto output_alpha = TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(kM), static_cast<size_t>(kNAlpha)});
+    auto output_beta = TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(kM), static_cast<size_t>(kNBeta)});
+
+    ASSERT_TRUE(input->ensureOnDevice(device, stream));
+    ASSERT_TRUE(output_qkv->allocateOnDevice(device, stream));
+    ASSERT_TRUE(output_z->allocateOnDevice(device, stream));
+    ASSERT_TRUE(output_alpha->allocateOnDevice(device, stream));
+    ASSERT_TRUE(output_beta->allocateOnDevice(device, stream));
+
+    auto prepared_qkv = makeGpuPreparedFloatingPointGemm(
+        weights_qkv.get(), device, "blk.46.attn_qkv.weight", ModelContextId{1883});
+    auto prepared_z = makeGpuPreparedFloatingPointGemm(
+        weights_z.get(), device, "blk.46.attn_gate.weight", ModelContextId{1883});
+    auto prepared_alpha = makeGpuPreparedFloatingPointGemm(
+        weights_alpha.get(), device, "blk.46.ssm_alpha.weight", ModelContextId{1883});
+    auto prepared_beta = makeGpuPreparedFloatingPointGemm(
+        weights_beta.get(), device, "blk.46.ssm_beta.weight", ModelContextId{1883});
+    ASSERT_NE(prepared_qkv.kernel, nullptr);
+    ASSERT_NE(prepared_z.kernel, nullptr);
+    ASSERT_NE(prepared_alpha.kernel, nullptr);
+    ASSERT_NE(prepared_beta.kernel, nullptr);
+
+    GDNProjectionStage::Params params;
+    params.device_id = device;
+    params.input = input.get();
+    params.m = kM;
+    params.k = kK;
+    params.w_qkv = weights_qkv.get();
+    params.output_qkv = output_qkv.get();
+    params.n_qkv = kNQKV;
+    params.w_z = weights_z.get();
+    params.output_z = output_z.get();
+    params.n_z = kNZ;
+    params.w_a = weights_alpha.get();
+    params.output_a = output_alpha.get();
+    params.n_a = kNAlpha;
+    params.w_b = weights_beta.get();
+    params.output_b = output_beta.get();
+    params.n_b = kNBeta;
+    params.gemm_qkv = prepared_qkv.kernel;
+    params.gemm_z = prepared_z.kernel;
+    params.gemm_a = prepared_alpha.kernel;
+    params.gemm_b = prepared_beta.kernel;
+
+    GDNProjectionStage stage(params);
+    stage.setGPUStream(stream);
+    const WorkspaceRequirements requirements =
+        stage.getWorkspaceRequirements(kM, 0, kK);
+    DeviceWorkspaceManager workspace(
+        device, requirements.total_bytes_with_alignment() + 64 * 1024 * 1024);
+    ASSERT_TRUE(workspace.allocate(requirements));
+    stage.bindWorkspace(&workspace);
+    ROCmDeviceContext context(device, device.ordinal);
+
+    ASSERT_TRUE(stage.execute(&context));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    auto captured_graph = std::make_unique<HIPGraphCapture>(stream, device.ordinal);
+    ScopedBackendGraphCapture capture_transaction(
+        *captured_graph, "ROCm mixed-floating GDN physical-format subgroups");
+    ASSERT_TRUE(capture_transaction.begin());
+    const bool capture_launch_ok = stage.execute(&context);
+    capture_transaction.finish();
+    ASSERT_TRUE(capture_launch_ok);
+    ASSERT_TRUE(captured_graph->instantiate());
+    ASSERT_TRUE(captured_graph->launch());
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    TransferEngine::publishCurrentDeviceWrite(output_qkv, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_z, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_alpha, stream);
+    TransferEngine::publishCurrentDeviceWrite(output_beta, stream);
+
+    std::vector<float> reference_qkv(static_cast<size_t>(kM) * kNQKV);
+    std::vector<float> reference_z(static_cast<size_t>(kM) * kNZ);
+    std::vector<float> reference_alpha(static_cast<size_t>(kM) * kNAlpha);
+    std::vector<float> reference_beta(static_cast<size_t>(kM) * kNBeta);
+    cpuFP32GemmRef(input->data(), weights_qkv->data(), reference_qkv.data(), kM, kNQKV, kK);
+    cpuFP32GemmRef(input->data(), weights_z->data(), reference_z.data(), kM, kNZ, kK);
+    cpuFP32GemmRef(input->data(), weights_alpha->data(), reference_alpha.data(), kM, kNAlpha, kK);
+    cpuFP32GemmRef(input->data(), weights_beta->data(), reference_beta.data(), kM, kNBeta, kK);
+
+    auto check_projection = [&](const char *name,
+                                FP32Tensor *actual,
+                                const std::vector<float> &reference)
+    {
+        const float cosine = cosineSim(actual->data(), reference.data(), reference.size());
+        const float relative_l2 = relativeL2(actual->data(), reference.data(), reference.size());
+        EXPECT_GT(cosine, 0.99999f) << name;
+        EXPECT_LT(relative_l2, 0.001f) << name;
+    };
+    check_projection("captured mixed-float GDN qkv", output_qkv.get(), reference_qkv);
+    check_projection("captured mixed-float GDN z", output_z.get(), reference_z);
+    check_projection("captured mixed-float GDN alpha", output_alpha.get(), reference_alpha);
+    check_projection("captured mixed-float GDN beta", output_beta.get(), reference_beta);
+
+    const auto routes = PerfStatsCollector::snapshot({"kernel.gdn_projection_route"});
+    auto has_pair = [&](const char *names)
+    {
+        return std::any_of(
+            routes.begin(), routes.end(),
+            [&](const PerfStatRecord &record)
+            {
+                const auto route = record.tags.find("route");
+                const auto projection_names = record.tags.find("names");
+                return record.domain == "kernel" &&
+                       record.name == "gdn_projection_route" &&
+                       route != record.tags.end() &&
+                       route->second == "same_kernel_mixed_codebook_subgroup" &&
+                       projection_names != record.tags.end() &&
+                       projection_names->second == names;
+            });
+    };
+    EXPECT_TRUE(has_pair("qkv+z"));
+    EXPECT_TRUE(has_pair("alpha+beta"));
+
+    captured_graph.reset();
+    stage.unbindWorkspace();
+    prepared_qkv.kernel->clearGPUStreamBinding();
+    prepared_z.kernel->clearGPUStreamBinding();
+    prepared_alpha.kernel->clearGPUStreamBinding();
+    prepared_beta.kernel->clearGPUStreamBinding();
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+    PerfStatsCollector::reset();
 #endif
 }
 

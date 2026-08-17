@@ -96,11 +96,14 @@ namespace llaminar2
          * @param[out] out_size Cache size in bytes
          * @param[out] out_max_cores_in_pkg If non-null and Intel leaf 0x04 was used,
          *        set to EAX[31:26]+1 (max addressable core IDs in package)
+         * @param[out] out_associativity If non-null, receives the detected
+         *        number of cache ways for the selected level.
          * @return true if cache level was found, false if not detected
          */
         inline bool detect_cache_by_level(int target_level, bool data_only,
                                           uint32_t &out_size,
-                                          uint32_t *out_max_cores_in_pkg = nullptr)
+                                          uint32_t *out_max_cores_in_pkg = nullptr,
+                                          uint32_t *out_associativity = nullptr)
         {
             // Ordered: try Intel 0x04 first (more fields), then AMD 0x8000001D
             struct LeafInfo
@@ -154,6 +157,9 @@ namespace llaminar2
                         uint32_t sets = regs[2] + 1;
 
                         out_size = ways * partitions * line_size * sets;
+
+                        if (out_associativity)
+                            *out_associativity = ways;
 
                         // EAX[31:26] = max cores in package (Intel leaf 0x04 only)
                         if (out_max_cores_in_pkg && !li.is_extended)
@@ -762,6 +768,27 @@ namespace llaminar2
     }
 
     /**
+     * @brief Get the associativity of the private L2 cache.
+     * @return Number of L2 ways, or one when topology detection is unavailable.
+     */
+    inline uint32_t cpu_l2_cache_associativity()
+    {
+        static const uint32_t cached_ways = []
+        {
+            uint32_t size = 0;
+            uint32_t ways = 0;
+            if (detail::detect_cache_by_level(
+                    2, /*data_only=*/false, size, nullptr, &ways) &&
+                ways > 0)
+            {
+                return ways;
+            }
+            return 1u;
+        }();
+        return cached_ways;
+    }
+
+    /**
      * @brief Get L3 cache size in bytes (shared across all cores)
      * @return L3 cache size in bytes, or 8MB if unknown
      *
@@ -784,6 +811,27 @@ namespace llaminar2
             return static_cast<uint32_t>(8 * 1024 * 1024); // Fallback: 8MB
         }();
         return cached_size;
+    }
+
+    /**
+     * @brief Get the associativity of the shared last-level cache.
+     * @return Number of L3 ways, or one when topology detection is unavailable.
+     */
+    inline uint32_t cpu_l3_cache_associativity()
+    {
+        static const uint32_t cached_ways = []
+        {
+            uint32_t size = 0;
+            uint32_t ways = 0;
+            if (detail::detect_cache_by_level(
+                    3, /*data_only=*/false, size, nullptr, &ways) &&
+                ways > 0)
+            {
+                return ways;
+            }
+            return 1u;
+        }();
+        return cached_ways;
     }
 
     /**
@@ -826,6 +874,8 @@ namespace llaminar2
     inline uint32_t cpu_l1_cache_size() { return 32 * 1024; }        // Conservative 32KB
     inline uint32_t cpu_l2_cache_size() { return 256 * 1024; }       // Conservative 256KB
     inline uint32_t cpu_l3_cache_size() { return 8 * 1024 * 1024; }  // Conservative 8MB
+    inline uint32_t cpu_l2_cache_associativity() { return 1; }
+    inline uint32_t cpu_l3_cache_associativity() { return 1; }
     inline uint32_t cpu_l2_cache_total() { return 8 * 1024 * 1024; } // Conservative 8MB
 #endif
 
@@ -847,12 +897,20 @@ namespace llaminar2
         uint32_t l3_size;    ///< L3 cache size in bytes (shared)
         uint32_t l2_total;   ///< Total L2 across all cores
         uint32_t cache_line; ///< Cache line size in bytes (typically 64)
+        uint32_t l2_ways;    ///< Associativity of the private L2 cache
+        uint32_t l3_ways;    ///< Associativity of the shared last-level cache
 
         /**
          * @brief Construct CacheInfo with detected values
          */
         CacheInfo()
-            : l1_size(cpu_l1_cache_size()), l2_size(cpu_l2_cache_size()), l3_size(cpu_l3_cache_size()), l2_total(cpu_l2_cache_total()), cache_line(64) // Standard x86 cache line
+            : l1_size(cpu_l1_cache_size()),
+              l2_size(cpu_l2_cache_size()),
+              l3_size(cpu_l3_cache_size()),
+              l2_total(cpu_l2_cache_total()),
+              cache_line(64), // Standard x86 cache line
+              l2_ways(cpu_l2_cache_associativity()),
+              l3_ways(cpu_l3_cache_associativity())
         {
         }
 
@@ -973,10 +1031,13 @@ namespace llaminar2
         {
             static char buf[256];
             snprintf(buf, sizeof(buf),
-                     "L1=%uKB L2=%uKB L3=%uMB (L2_total=%uMB)",
+                     "L1=%uKB L2=%uKB/%u-way L3=%uMB/%u-way "
+                     "(L2_total=%uMB)",
                      l1_size / 1024,
                      l2_size / 1024,
+                     l2_ways,
                      l3_size / (1024 * 1024),
+                     l3_ways,
                      l2_total / (1024 * 1024));
             return buf;
         }

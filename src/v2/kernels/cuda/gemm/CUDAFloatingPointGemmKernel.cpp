@@ -16,6 +16,7 @@
  */
 
 #include "CUDAFloatingPointGemmKernel.h"
+#include "kernels/common/FloatingPointGemmWorkspaceABI.h"
 #include "CuBLASGemmKernel.h"
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "tensors/Tensors.h"         // FP32Tensor, BF16Tensor, FP16Tensor
@@ -206,6 +207,34 @@ namespace llaminar2
         {
         }
 
+        bool CUDAFloatingPointGemmKernel::exportContiguousFloatingPointWeights(
+            ContiguousFloatingPointWeightDescriptor &out) const
+        {
+            TensorType type = TensorType::FP32;
+            std::size_t element_bytes = sizeof(float);
+            switch (precision_)
+            {
+            case Precision::FP16:
+                type = TensorType::FP16;
+                element_bytes = sizeof(std::uint16_t);
+                break;
+            case Precision::BF16:
+                type = TensorType::BF16;
+                element_bytes = sizeof(std::uint16_t);
+                break;
+            case Precision::FP32:
+                break;
+            }
+            out = {
+                .data = d_weights_,
+                .type = type,
+                .n = static_cast<int>(N_),
+                .k = static_cast<int>(K_),
+                .bytes = N_ * K_ * element_bytes,
+            };
+            return out.valid();
+        }
+
         CUDAFloatingPointGemmKernel::CUDAFloatingPointGemmKernel(CUDAFloatingPointGemmKernel &&other) noexcept
             : weights_(other.weights_),
               d_weights_(other.d_weights_),
@@ -261,6 +290,11 @@ namespace llaminar2
                 LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] Null input or output tensor");
                 return false;
             }
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] No explicit CUDA stream is bound");
+                return false;
+            }
 
             // Get dimensions from tensors
             int m = static_cast<int>(A->rows());
@@ -285,6 +319,11 @@ namespace llaminar2
             if (!A || !C)
             {
                 LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] Null input or output tensor");
+                return false;
+            }
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] No explicit CUDA stream is bound");
                 return false;
             }
 
@@ -993,14 +1032,15 @@ namespace llaminar2
                 return false;
             }
 
-            constexpr size_t kMaxBatchedFP32x16Projections = 8;
             auto *d_A_array = static_cast<const float **>(
                 effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS));
             auto *d_B_array = static_cast<const float **>(
                 effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_B_PTRS));
             auto *d_C_array = static_cast<float **>(
                 effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_BATCH_C_PTRS));
-            const size_t pointer_array_bytes = kMaxBatchedFP32x16Projections * sizeof(float *);
+            const size_t pointer_array_bytes =
+                floating_gemm_abi::kMaxBatchedProjections *
+                sizeof(float *);
             if (!d_A_array || !d_B_array || !d_C_array ||
                 effective_workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS) < pointer_array_bytes ||
                 effective_workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_BATCH_B_PTRS) < pointer_array_bytes ||
@@ -1051,7 +1091,9 @@ namespace llaminar2
                 while (group_offset < group_indices.size())
                 {
                     const size_t group_count =
-                        std::min(kMaxBatchedFP32x16Projections, group_indices.size() - group_offset);
+                        std::min(
+                            floating_gemm_abi::kMaxBatchedProjections,
+                            group_indices.size() - group_offset);
                     std::vector<const float *> a_ptrs(group_count, d_input);
                     std::vector<const float *> b_ptrs;
                     std::vector<float *> c_ptrs;
@@ -1459,8 +1501,9 @@ namespace llaminar2
             if (!cublas_kernel_)
                 return WorkspaceRequirements{};
             WorkspaceRequirements reqs = cublas_kernel_->getWorkspaceRequirements(m, n, k);
-            constexpr size_t kMaxBatchedFP32Projections = 8;
-            const size_t pointer_array_bytes = kMaxBatchedFP32Projections * sizeof(float *);
+            const size_t pointer_array_bytes =
+                floating_gemm_abi::kMaxBatchedProjections *
+                sizeof(float *);
             reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_BATCH_A_PTRS, pointer_array_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_BATCH_B_PTRS, pointer_array_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_BATCH_C_PTRS, pointer_array_bytes, 256, true});
@@ -1469,7 +1512,7 @@ namespace llaminar2
             if (m > 0 && n > 0)
             {
                 const size_t redirect_bytes =
-                    kMaxBatchedFP32Projections *
+                    floating_gemm_abi::kMaxBatchedProjections *
                     static_cast<size_t>(m) *
                     static_cast<size_t>(n) *
                     sizeof(float);

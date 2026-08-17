@@ -146,7 +146,7 @@ namespace llaminar2::test
         {
             RoutedExpertDomain domain;
             domain.name = "rocm_hot";
-            domain.scope = ExecutionDomainScope::LOCAL;
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {
                 GlobalDeviceAddress::rocm(0, 0),
@@ -299,7 +299,7 @@ namespace llaminar2::test
         class FakeLocalTPContinuationContext final : public ITPContext
         {
         public:
-            TPScope scope() const override { return TPScope::LOCAL; }
+            TPScope scope() const override { return TPScope::RANK_LOCAL; }
             int degree() const override { return static_cast<int>(participant_tensors_.size()); }
             int myIndex() const override { return 0; }
             CollectiveBackendType backend() const override { return CollectiveBackendType::HOST; }

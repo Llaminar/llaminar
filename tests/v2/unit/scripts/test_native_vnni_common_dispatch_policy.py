@@ -3302,6 +3302,7 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             exact_latency_us=(10.0,) * 30,
             selected_first_count=15,
             exact_first_count=15,
+            selected_ran_first=tuple(index % 2 == 0 for index in range(30)),
         ),))
         corrected = next(iter(build_candidate_point_costs(
             corpus,
@@ -3374,6 +3375,9 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
                 exact_latency_us=(10.0,) * 30,
                 selected_first_count=15,
                 exact_first_count=15,
+                selected_ran_first=tuple(
+                    index % 2 == 0 for index in range(30)
+                ),
             ))
 
         corrected = next(iter(build_candidate_point_costs(
@@ -4190,6 +4194,7 @@ class NativeVNNICommonDispatchPolicyTest(unittest.TestCase):
             exact_latency_us=(10.0,) * 30,
             selected_first_count=15,
             exact_first_count=15,
+            selected_ran_first=tuple(index % 2 == 0 for index in range(30)),
         ),))
 
         with tempfile.TemporaryDirectory() as directory:

@@ -2,8 +2,9 @@
  * @file Test__ExpertWeightTransfer.cpp
  * @brief Unit tests for ExpertWeightTransfer manifest building and tag helpers.
  *
- * Tests pure-logic helpers (no MPI required) plus serialization round-trip
- * through ExpertWeightBlobs to simulate the full transfer path.
+ * Tests pure-logic helpers (no MPI required), the explicit cross-backend blob
+ * representation, and homogeneous CPU direct-section reconstruction into the
+ * final packed-weight allocations.
  */
 
 #include <gtest/gtest.h>
@@ -16,6 +17,7 @@
 
 #include <cstring>
 #include <set>
+#include <stdexcept>
 #include <vector>
 
 using namespace llaminar2;
@@ -24,6 +26,16 @@ using namespace llaminar2::packed_weights_serialization;
 using namespace llaminar2::mpi_tags;
 
 namespace {
+
+/** @brief Repeat one owner row across all routed layers for test setup. */
+MoELayeredExpertOwnership uniformOwnership(
+    int layer_count,
+    int participant_count,
+    const std::vector<int> &owners)
+{
+    return MoELayeredExpertOwnership::uniform(
+        layer_count, participant_count, owners);
+}
 
 /// Fill a buffer with a deterministic pattern (matches Test__PackedWeightsSerialization).
 void fillPattern(uint8_t* data, size_t size)
@@ -46,7 +58,9 @@ CPUNativeVNNIPackedWeights buildTestPacked(
     packed.blocks_per_row           = blocks_per_row;
     packed.codebook_id              = codebook_id;
     packed.payload_bytes            = payload_bytes_val;
-    packed.is_nibble_lut            = is_nibble_lut;
+    packed.encoding = is_nibble_lut
+                          ? CPUNativeVNNIEncoding::NibbleLUT
+                          : CPUNativeVNNIEncoding::ExpandedInt8;
     packed.is_asymmetric            = is_asymmetric;
     packed.is_superblock            = is_superblock;
     packed.data_stride              = data_stride;
@@ -78,52 +92,67 @@ CPUNativeVNNIPackedWeights buildTestPacked(
 
 TEST(Test__ExpertWeightTransfer, BuildManifest_NoChanges)
 {
-    std::vector<int> placement = {0, 0, 1, 1};
-    auto manifest = ExpertWeightTransfer::buildManifest(placement, placement);
+    const auto ownership = uniformOwnership(2, 2, {0, 0, 1, 1});
+    auto manifest = ExpertWeightTransfer::buildManifest(ownership, ownership);
     EXPECT_TRUE(manifest.empty());
 }
 
 TEST(Test__ExpertWeightTransfer, BuildManifest_AllChange)
 {
-    std::vector<int> old_p = {0, 0, 0, 0};
-    std::vector<int> new_p = {1, 1, 1, 1};
-    auto manifest = ExpertWeightTransfer::buildManifest(old_p, new_p);
-    ASSERT_EQ(manifest.size(), 4u);
-    for (int i = 0; i < 4; ++i)
+    const auto old_ownership = uniformOwnership(2, 2, {0, 0, 0, 0});
+    const auto new_ownership = uniformOwnership(2, 2, {1, 1, 1, 1});
+    auto manifest = ExpertWeightTransfer::buildManifest(
+        old_ownership, new_ownership);
+    ASSERT_EQ(manifest.size(), 8u);
+    for (int layer = 0; layer < 2; ++layer)
     {
-        EXPECT_EQ(manifest[i].expert_id, i);
-        EXPECT_EQ(manifest[i].src_rank, 0);
-        EXPECT_EQ(manifest[i].dst_rank, 1);
+        for (int expert = 0; expert < 4; ++expert)
+        {
+            const auto &entry = manifest[static_cast<size_t>(layer * 4 + expert)];
+            EXPECT_EQ(entry.layer_idx, layer);
+            EXPECT_EQ(entry.expert_id, expert);
+            EXPECT_EQ(entry.src_rank, 0);
+            EXPECT_EQ(entry.dst_rank, 1);
+        }
     }
 }
 
-TEST(Test__ExpertWeightTransfer, BuildManifest_PartialChange)
+TEST(Test__ExpertWeightTransfer, BuildManifest_ChangesOnlyExactLayerExperts)
 {
-    // 8 experts, 2 sockets: experts 2,5 swap ranks
-    std::vector<int> old_p = {0, 0, 0, 0, 1, 1, 1, 1};
-    std::vector<int> new_p = {0, 0, 1, 0, 1, 0, 1, 1};
-    auto manifest = ExpertWeightTransfer::buildManifest(old_p, new_p);
+    const MoELayeredExpertOwnership old_ownership(
+        2,
+        {
+            {0, 0, 1, 1},
+            {0, 0, 1, 1},
+        });
+    const MoELayeredExpertOwnership new_ownership(
+        2,
+        {
+            {0, 0, 1, 1},
+            {1, 0, 0, 1},
+        });
+    auto manifest = ExpertWeightTransfer::buildManifest(
+        old_ownership, new_ownership);
     ASSERT_EQ(manifest.size(), 2u);
 
-    EXPECT_EQ(manifest[0].expert_id, 2);
+    EXPECT_EQ(manifest[0].layer_idx, 1);
+    EXPECT_EQ(manifest[0].expert_id, 0);
     EXPECT_EQ(manifest[0].src_rank, 0);
     EXPECT_EQ(manifest[0].dst_rank, 1);
 
-    EXPECT_EQ(manifest[1].expert_id, 5);
+    EXPECT_EQ(manifest[1].layer_idx, 1);
+    EXPECT_EQ(manifest[1].expert_id, 2);
     EXPECT_EQ(manifest[1].src_rank, 1);
     EXPECT_EQ(manifest[1].dst_rank, 0);
 }
 
-TEST(Test__ExpertWeightTransfer, BuildManifest_DifferentSizes)
+TEST(Test__ExpertWeightTransfer, BuildManifest_DifferentGeometryFails)
 {
-    // If vectors differ in size, only processes up to the shorter one
-    std::vector<int> old_p = {0, 1, 0};
-    std::vector<int> new_p = {0, 0};
-    auto manifest = ExpertWeightTransfer::buildManifest(old_p, new_p);
-    ASSERT_EQ(manifest.size(), 1u);
-    EXPECT_EQ(manifest[0].expert_id, 1);
-    EXPECT_EQ(manifest[0].src_rank, 1);
-    EXPECT_EQ(manifest[0].dst_rank, 0);
+    const auto old_ownership = uniformOwnership(2, 2, {0, 1, 0});
+    const auto new_ownership = uniformOwnership(2, 2, {0, 0});
+    EXPECT_THROW(
+        ExpertWeightTransfer::buildManifest(old_ownership, new_ownership),
+        std::invalid_argument);
 }
 
 // ─── Departing/Arriving Experts ───────────────────────────────────
@@ -131,50 +160,50 @@ TEST(Test__ExpertWeightTransfer, BuildManifest_DifferentSizes)
 TEST(Test__ExpertWeightTransfer, DepartingExperts_CorrectForRank)
 {
     std::vector<ExpertMigration> manifest = {
-        {2, 0, 1},  // expert 2: rank 0 → rank 1
-        {5, 1, 0},  // expert 5: rank 1 → rank 0
-        {7, 0, 1},  // expert 7: rank 0 → rank 1
+        {0, 2, 0, 1},
+        {1, 5, 1, 0},
+        {2, 7, 0, 1},
     };
 
-    auto departing_r0 = ExpertWeightTransfer::departingExperts(manifest, 0);
+    auto departing_r0 = ExpertWeightTransfer::departingMigrations(manifest, 0);
     ASSERT_EQ(departing_r0.size(), 2u);
-    EXPECT_EQ(departing_r0[0], 2);
-    EXPECT_EQ(departing_r0[1], 7);
+    EXPECT_EQ(departing_r0[0], manifest[0]);
+    EXPECT_EQ(departing_r0[1], manifest[2]);
 
-    auto departing_r1 = ExpertWeightTransfer::departingExperts(manifest, 1);
+    auto departing_r1 = ExpertWeightTransfer::departingMigrations(manifest, 1);
     ASSERT_EQ(departing_r1.size(), 1u);
-    EXPECT_EQ(departing_r1[0], 5);
+    EXPECT_EQ(departing_r1[0], manifest[1]);
 }
 
 TEST(Test__ExpertWeightTransfer, ArrivingExperts_CorrectForRank)
 {
     std::vector<ExpertMigration> manifest = {
-        {2, 0, 1},
-        {5, 1, 0},
-        {7, 0, 1},
+        {0, 2, 0, 1},
+        {1, 5, 1, 0},
+        {2, 7, 0, 1},
     };
 
-    auto arriving_r0 = ExpertWeightTransfer::arrivingExperts(manifest, 0);
+    auto arriving_r0 = ExpertWeightTransfer::arrivingMigrations(manifest, 0);
     ASSERT_EQ(arriving_r0.size(), 1u);
-    EXPECT_EQ(arriving_r0[0], 5);
+    EXPECT_EQ(arriving_r0[0], manifest[1]);
 
-    auto arriving_r1 = ExpertWeightTransfer::arrivingExperts(manifest, 1);
+    auto arriving_r1 = ExpertWeightTransfer::arrivingMigrations(manifest, 1);
     ASSERT_EQ(arriving_r1.size(), 2u);
-    EXPECT_EQ(arriving_r1[0], 2);
-    EXPECT_EQ(arriving_r1[1], 7);
+    EXPECT_EQ(arriving_r1[0], manifest[0]);
+    EXPECT_EQ(arriving_r1[1], manifest[2]);
 }
 
 TEST(Test__ExpertWeightTransfer, DepartingExperts_EmptyManifest)
 {
     std::vector<ExpertMigration> manifest;
-    auto departing = ExpertWeightTransfer::departingExperts(manifest, 0);
+    auto departing = ExpertWeightTransfer::departingMigrations(manifest, 0);
     EXPECT_TRUE(departing.empty());
 }
 
 TEST(Test__ExpertWeightTransfer, ArrivingExperts_EmptyManifest)
 {
     std::vector<ExpertMigration> manifest;
-    auto arriving = ExpertWeightTransfer::arrivingExperts(manifest, 0);
+    auto arriving = ExpertWeightTransfer::arrivingMigrations(manifest, 0);
     EXPECT_TRUE(arriving.empty());
 }
 
@@ -294,9 +323,9 @@ TEST(Test__ExpertWeightTransfer, RoundTrip_SerializeTransferDeserialize)
 
     // Serialize into blobs (as the sender would)
     ExpertWeightBlobs blobs;
-    blobs.gate = serialize(gate_weights);
-    blobs.up   = serialize(up_weights);
-    blobs.down = serialize(down_weights);
+    ASSERT_TRUE(serializeInto(gate_weights, blobs.gate));
+    ASSERT_TRUE(serializeInto(up_weights, blobs.up));
+    ASSERT_TRUE(serializeInto(down_weights, blobs.down));
 
     ASSERT_FALSE(blobs.empty());
     EXPECT_GT(blobs.gate.size(), 96u);  // at least header + section table
@@ -341,22 +370,167 @@ TEST(Test__ExpertWeightTransfer, RoundTrip_SerializeTransferDeserialize)
     }
 }
 
-TEST(Test__ExpertWeightTransfer, TransferAllLayers_EmptyManifest)
+TEST(Test__ExpertWeightTransfer, DirectSections_ReconstructFinalPackedStorageByteExactly)
 {
-    // Empty manifest should return empty map without touching MPI
-    auto result = ExpertWeightTransfer::transferAllLayers(
-        {}, 40,
-        [](int, int) -> ExpertWeightBlobs { ADD_FAILURE() << "Should not be called"; return {}; },
-        0, MPI_COMM_NULL);
-    EXPECT_TRUE(result.empty());
+    auto source_packed = buildTestPacked(
+        /*N=*/128, /*K=*/256, /*codebook_id=*/0,
+        /*blocks_per_row=*/8, /*payload_bytes=*/16,
+        /*is_nibble_lut=*/true, /*is_asymmetric=*/false,
+        /*is_superblock=*/false, /*data_stride=*/1024,
+        /*interleaved_block_stride=*/1280,
+        /*interleaved_sz=*/2 * 8 * 1280,
+        /*payload_sz=*/2 * 8 * 64 * 16,
+        /*int8_flat_sz=*/0);
+    CPUPackedWeights source(std::move(source_packed));
+
+    PackedWeightsTransferDescriptor descriptor;
+    PackedWeightsConstSectionViews source_views;
+    ASSERT_TRUE(describeTransfer(source, descriptor, source_views));
+    ASSERT_EQ(descriptor.header.has_native_blocks, 0);
+
+    auto destination = allocateTransferTarget(descriptor);
+    ASSERT_NE(destination.weights, nullptr);
+    for (size_t section = 0;
+         section < PACKED_WEIGHT_SECTION_COUNT;
+         ++section)
+    {
+        ASSERT_EQ(destination.sizes[section], source_views.sizes[section]);
+        if (source_views.sizes[section] == 0)
+            continue;
+        ASSERT_NE(destination.data[section], nullptr);
+        ASSERT_NE(source_views.data[section], nullptr);
+        EXPECT_NE(destination.data[section], source_views.data[section]);
+        std::memcpy(
+            destination.data[section],
+            source_views.data[section],
+            source_views.sizes[section]);
+    }
+
+    const auto *received =
+        dynamic_cast<const CPUPackedWeights *>(destination.weights.get());
+    ASSERT_NE(received, nullptr);
+    const auto &actual = received->packed();
+    const auto &expected = source.packed();
+    EXPECT_EQ(actual.N, expected.N);
+    EXPECT_EQ(actual.K, expected.K);
+    EXPECT_EQ(actual.N_padded, expected.N_padded);
+    EXPECT_EQ(actual.blocks_per_row, expected.blocks_per_row);
+    EXPECT_EQ(actual.codebook_id, expected.codebook_id);
+    EXPECT_EQ(actual.payload_bytes, expected.payload_bytes);
+    EXPECT_EQ(actual.encoding, expected.encoding);
+    ASSERT_EQ(
+        actual.native_interleaved.size(),
+        expected.native_interleaved.size());
+    ASSERT_EQ(actual.payload.size(), expected.payload.size());
+    EXPECT_EQ(
+        std::memcmp(
+            actual.native_interleaved.data(),
+            expected.native_interleaved.data(),
+            actual.native_interleaved.size()),
+        0);
+    EXPECT_EQ(
+        std::memcmp(
+            actual.payload.data(),
+            expected.payload.data(),
+            actual.payload.size()),
+        0);
 }
 
-TEST(Test__ExpertWeightTransfer, TransferAllLayers_ZeroLayers)
+TEST(Test__ExpertWeightTransfer, DirectSections_InvalidGeometryFailsBeforeAllocation)
 {
-    std::vector<ExpertMigration> manifest = {{0, 0, 1}};
-    auto result = ExpertWeightTransfer::transferAllLayers(
-        manifest, 0,
+    auto source_packed = buildTestPacked(
+        /*N=*/64, /*K=*/64, /*codebook_id=*/0,
+        /*blocks_per_row=*/2, /*payload_bytes=*/16,
+        /*is_nibble_lut=*/true, /*is_asymmetric=*/false,
+        /*is_superblock=*/false, /*data_stride=*/1024,
+        /*interleaved_block_stride=*/1280,
+        /*interleaved_sz=*/2 * 1280,
+        /*payload_sz=*/2 * 64 * 16,
+        /*int8_flat_sz=*/0);
+    CPUPackedWeights source(std::move(source_packed));
+    PackedWeightsTransferDescriptor descriptor;
+    PackedWeightsConstSectionViews views;
+    ASSERT_TRUE(describeTransfer(source, descriptor, views));
+    descriptor.header.N = 0;
+    EXPECT_THROW(allocateTransferTarget(descriptor), std::invalid_argument);
+}
+
+TEST(Test__ExpertWeightTransfer, TransferLayered_EmptyManifest)
+{
+    // Empty manifest should return empty map without touching MPI
+    ExpertTransferEvidence evidence;
+    evidence.manifest_entries = 99;
+    evidence.outgoing_bytes = 99;
+    auto result = ExpertWeightTransfer::transferLayered(
+        {},
         [](int, int) -> ExpertWeightBlobs { ADD_FAILURE() << "Should not be called"; return {}; },
-        0, MPI_COMM_NULL);
+        0, MPI_COMM_NULL, &evidence);
     EXPECT_TRUE(result.empty());
+    EXPECT_EQ(evidence.manifest_entries, 0u);
+    EXPECT_EQ(evidence.outgoing_bytes, 0u);
+    EXPECT_EQ(evidence.total_ns, 0u);
+}
+
+TEST(Test__ExpertWeightTransfer, TransferLayeredPreparedCPU_EmptyManifest)
+{
+    ExpertTransferEvidence evidence;
+    evidence.manifest_entries = 99;
+    evidence.outgoing_bytes = 99;
+    auto result = ExpertWeightTransfer::transferLayeredPreparedCPU(
+        {},
+        [](int, int) -> ExpertPackedWeights
+        {
+            ADD_FAILURE() << "Empty direct manifest must not request weights";
+            return {};
+        },
+        [](std::unique_ptr<IPackedWeights>) -> std::shared_ptr<ITensorGemm>
+        {
+            ADD_FAILURE() << "Empty direct manifest must not construct engines";
+            return {};
+        },
+        0,
+        -1,
+        MPI_COMM_NULL,
+        &evidence);
+    EXPECT_TRUE(result.empty());
+    EXPECT_EQ(evidence.manifest_entries, 0u);
+    EXPECT_EQ(evidence.outgoing_bytes, 0u);
+    EXPECT_EQ(evidence.total_ns, 0u);
+}
+
+TEST(Test__ExpertWeightTransfer, TransferLayeredPreparedCPU_RequiresExactNUMANode)
+{
+    const std::vector<ExpertMigration> manifest = {{0, 7, 0, 1}};
+    EXPECT_THROW(
+        ExpertWeightTransfer::transferLayeredPreparedCPU(
+            manifest,
+            [](int, int) -> ExpertPackedWeights
+            {
+                ADD_FAILURE() << "NUMA policy must fail before source detachment";
+                return {};
+            },
+            [](std::unique_ptr<IPackedWeights>) -> std::shared_ptr<ITensorGemm>
+            {
+                ADD_FAILURE() << "NUMA policy must fail before engine construction";
+                return {};
+            },
+            0,
+            -1,
+            MPI_COMM_NULL),
+        std::invalid_argument);
+}
+
+TEST(Test__ExpertWeightTransfer, TransferLayered_InvalidManifestFailsBeforeMPI)
+{
+    const std::vector<ExpertMigration> manifest = {{-1, 0, 0, 1}};
+    EXPECT_THROW(
+        ExpertWeightTransfer::transferLayered(
+            manifest,
+            [](int, int) -> ExpertWeightBlobs {
+                ADD_FAILURE() << "Invalid manifest must fail before payload lookup";
+                return {};
+            },
+            0,
+            MPI_COMM_NULL),
+        std::invalid_argument);
 }

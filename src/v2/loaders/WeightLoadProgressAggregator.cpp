@@ -1,9 +1,19 @@
+/**
+ * @file WeightLoadProgressAggregator.cpp
+ * @brief Implements publication and explicit collective teardown for model-load progress.
+ *
+ * Rank zero polls remote passive-target windows while model weights load. The
+ * polling thread is always joined before the final collective barrier and
+ * window release, including when graph initialization throws.
+ */
+
 #include "WeightLoadProgressAggregator.h"
 #include "WeightLoadProgress.h"
 #include "../utils/Logger.h"
 
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -32,9 +42,9 @@ namespace llaminar2
 
         if (rc != MPI_SUCCESS || win == MPI_WIN_NULL)
         {
-            LOG_WARN("[ProgressAggregator] MPI_Win_allocate failed (rc=" << rc << "); "
-                                                                                  "falling back to rank-0-only progress display");
-            return nullptr;
+            throw std::runtime_error(
+                "[ProgressAggregator] MPI_Win_allocate failed with rc=" +
+                std::to_string(rc));
         }
 
         // Zero-initialize local window
@@ -81,6 +91,9 @@ namespace llaminar2
 
     void WeightLoadProgressAggregator::freeWindow()
     {
+        if (polling_.load(std::memory_order_acquire) || poll_thread_.joinable())
+            throw std::logic_error("[ProgressAggregator] Polling must stop before window release");
+
         if (win_ != MPI_WIN_NULL)
         {
             MPI_Win_unlock_all(win_);
@@ -149,6 +162,8 @@ namespace llaminar2
     {
         if (rank_ != 0 || !renderer)
             return;
+        if (polling_.load(std::memory_order_acquire) || poll_thread_.joinable())
+            throw std::logic_error("[ProgressAggregator] Polling was started more than once");
 
         renderer_ = std::move(renderer);
         polling_.store(true, std::memory_order_release);
@@ -157,20 +172,18 @@ namespace llaminar2
 
     void WeightLoadProgressAggregator::stopPolling()
     {
-        if (!polling_.load(std::memory_order_acquire))
-            return;
-
         polling_.store(false, std::memory_order_release);
         if (poll_thread_.joinable())
             poll_thread_.join();
-
-        // One final poll to capture any remaining updates
-        if (rank_ == 0 && renderer_)
-            pollOnce();
     }
 
     void WeightLoadProgressAggregator::barrier()
     {
+        if (polling_.load(std::memory_order_acquire) || poll_thread_.joinable())
+            throw std::logic_error("[ProgressAggregator] Polling must stop before barrier");
+        if (win_ == MPI_WIN_NULL)
+            throw std::logic_error("[ProgressAggregator] Cannot barrier after window release");
+
         MPI_Barrier(comm_);
 
         // After barrier, all ranks are done — do final poll

@@ -50,6 +50,34 @@ namespace llaminar2
         resetSessionStatePreservingCapturedReplay();
     }
 
+    bool FusedGateUpGEMMStage::prepareGraphLaunch(
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        (void)ctx;
+        if (!stream)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Graph launch preparation requires "
+                      "the exact non-null producer stream");
+            return false;
+        }
+        setGPUStream(stream);
+
+        ITensorFusedGateUpGemm *kernel = resolvePreparedKernel(
+            "FusedGateUpGEMMStage::prepareGraphLaunch");
+        if (!kernel)
+            return false;
+        bindStageStream(kernel);
+        if (!kernel->prepareFusedProjectionGraphCapture(2))
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Failed to provision persistent "
+                      "gate/up projection resources before graph capture"
+                      << " device=" << params_.device_id.toString());
+            return false;
+        }
+        return true;
+    }
+
     bool FusedGateUpGEMMStage::validatePreparedWeights(std::string *error) const
     {
         if (!params_.w_gate && !params_.w_up)

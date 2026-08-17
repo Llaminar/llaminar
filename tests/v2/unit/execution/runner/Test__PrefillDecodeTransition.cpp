@@ -200,6 +200,8 @@ namespace
 
             if (all_position_logits_enabled_)
             {
+                if (force_all_position_forward_failure_)
+                    return false;
                 setupAllPositionLogits(seq_len);
                 if (greedy_outcome_graph_armed_)
                 {
@@ -967,7 +969,7 @@ namespace
             return supports_device_resident_mtp_spec_state_publication_;
         }
 
-        bool usesMirroredLocalTPMTPHeadForVerifier() const override
+        bool usesMirroredMTPHeadForVerifier() const override
         {
             return mirrors_localtp_mtp_head_for_verifier_;
         }
@@ -1929,15 +1931,22 @@ namespace
         }
 
         /**
-         * @brief Report that this mock owns a device-side MoE maintenance controller.
+         * @brief Report the mock's frozen ExpertOverlay authority executor.
          *
-         * Production Dynamic-maintenance runners publish placement-bank updates
-         * on a GPU stream at each committed decode boundary. Tests opt into that
-         * contract explicitly so ordinary MTP publication tests retain their
-         * smaller event trace while ordering regressions can observe the
-         * maintenance handoff.
+         * Tests opt into the homogeneous device executor explicitly so
+         * ordinary MTP publication tests retain their smaller event trace
+         * while ordering regressions can observe the maintenance handoff.
          */
-        bool usesDeviceSideMoERebalanceController() const override
+        MoEOverlayAuthorityExecutionKind
+        moeOverlayAuthorityExecution() const override
+        {
+            return uses_device_side_moe_rebalance_controller_
+                       ? MoEOverlayAuthorityExecutionKind::
+                             HomogeneousDeviceResident
+                       : MoEOverlayAuthorityExecutionKind::Unresolved;
+        }
+
+        bool deviceResidentMoEOverlayMaintenanceReady() const override
         {
             return uses_device_side_moe_rebalance_controller_;
         }
@@ -4775,6 +4784,18 @@ namespace
             DeviceGenerationSamplingMode sampling_mode) override
         {
             ++device_generation_materialization_count_;
+            if (uses_device_side_moe_rebalance_controller_)
+            {
+                /*
+                 * Production participant runners launch transaction zero's
+                 * maintenance tail here before cloning it into the resident
+                 * parent. Model that device-owned edge inside the runner—not
+                 * as a separate OrchestrationRunner scheduling call.
+                 */
+                ++device_moe_maintenance_count_;
+                publication_events_.push_back(
+                    "device_moe_maintenance");
+            }
             last_device_generation_draft_depth_ = draft_depth;
             last_device_generation_topology_ = topology;
             last_device_generation_sampling_mode_ = sampling_mode;
@@ -5402,6 +5423,10 @@ namespace
         int allPositionVerifierSyncDeferralEnableCount() const { return all_position_verifier_sync_deferral_enable_count_; }
         int allPositionVerifierSyncDeferralDisableCount() const { return all_position_verifier_sync_deferral_disable_count_; }
         bool allPositionVerifierSyncDeferralEnabled() const { return all_position_verifier_sync_deferral_enabled_; }
+        int restoreWhileVerifierSyncDeferredCount() const
+        {
+            return restore_while_verifier_sync_deferred_count_;
+        }
         int lastSampleAllPositionStartRow() const { return last_sample_all_position_start_row_; }
         int lastSampleAllPositionRowCount() const { return last_sample_all_position_row_count_; }
         const PrefixStateSnapshot &lastRestoredSnapshot() const { return last_restored_snapshot_; }
@@ -5540,6 +5565,17 @@ namespace
             force_mtp_device_greedy_sample_failure_ = true;
         }
         /**
+         * @brief Fail a grouped all-position verifier after its transaction opens.
+         *
+         * This models a captured verifier launch failure while synchronization
+         * deferral is active, allowing rollback-order tests to prove that the
+         * reader transaction retires before prefix restoration begins.
+         */
+        void forceAllPositionForwardFailure()
+        {
+            force_all_position_forward_failure_ = true;
+        }
+        /**
          * @brief Force one request-batched stochastic verifier lane to reject.
          *
          * Production GPU verification can naturally produce a mixed request
@@ -5666,6 +5702,8 @@ namespace
             (void)seq_idx;
             if (!snapshot.valid)
                 return false;
+            if (all_position_verifier_sync_deferral_enabled_)
+                ++restore_while_verifier_sync_deferred_count_;
             restore_count_++;
             last_restored_snapshot_ = snapshot;
             position_ = snapshot.cached_tokens;
@@ -6656,6 +6694,8 @@ namespace
         int sample_mtp_logits_to_device_draft_slot_count_{0};
         bool force_main_device_greedy_sample_failure_{false};
         bool force_mtp_device_greedy_sample_failure_{false};
+        bool force_all_position_forward_failure_{false};
+        int restore_while_verifier_sync_deferred_count_{0};
         int sample_all_position_logits_count_{0};
         int sample_all_position_logits_batched_count_{0};
         int verify_greedy_all_position_batch_outcome_count_{0};
@@ -7289,42 +7329,6 @@ namespace
     // =========================================================================
     // Core Regression Tests
     // =========================================================================
-
-    TEST_F(Test__PrefillDecodeTransition, DirectMoERebalanceApplySyncsRuntimeHistogramCallbacks)
-    {
-        auto mock = std::make_unique<MockInferenceRunner>();
-        auto *mock_ptr = mock.get();
-
-        MoERebalanceController::Config controller_config;
-        controller_config.domain_id = "local_tp_cuda_0_cuda_1";
-        controller_config.mode = MoERebalanceMode::DYNAMIC;
-        controller_config.num_layers = 1;
-        controller_config.num_experts = 4;
-        controller_config.top_k = 2;
-        controller_config.window_size = 64;
-        controller_config.sockets = {DeviceId::cuda(0), DeviceId::cuda(1)};
-        controller_config.initial_expert_to_socket = {0, 0, 1, 1};
-
-        auto controller =
-            std::make_unique<MoERebalanceController>(std::move(controller_config));
-        auto *histogram = controller->histogram();
-        ASSERT_NE(histogram, nullptr);
-
-        int sync_calls = 0;
-        histogram->registerRuntimeHistogramSync([&sync_calls]()
-                                                {
-                                                    ++sync_calls;
-                                                    return true;
-                                                });
-        mock_ptr->setMoERebalanceController(std::move(controller));
-
-        OrchestrationConfig config;
-        config.device_for_this_rank = GlobalDeviceAddress::cuda(0);
-        OrchestrationRunner runner(std::move(config), plan_, std::move(mock));
-
-        ASSERT_TRUE(runner.applyMoERebalanceWithReplicas());
-        EXPECT_EQ(sync_calls, 1);
-    }
 
     /**
      * @brief Verify that prefill calls forward with full prompt tokens
@@ -9198,6 +9202,7 @@ namespace
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
         EXPECT_EQ(probe.mtp_verifier_runs, 1u);
         EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+        EXPECT_EQ(probe.mtp_last_transaction_draft_depth, 1);
         EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
         EXPECT_EQ(probe.mtp_rollbacks, 0u);
@@ -10210,6 +10215,93 @@ namespace
         EXPECT_EQ(mock->allPositionVerifierSyncDeferralDisableCount(), 1);
         EXPECT_EQ(mock->allPositionVerifierSyncDeferralSetCount(), 2);
         EXPECT_FALSE(mock->allPositionVerifierSyncDeferralEnabled());
+    }
+
+    /**
+     * @brief A failed greedy verifier retires its reader before rollback writes.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           GreedyGPUVerifierFailureClosesSyncDeferralBeforeRollback)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0),
+            /*mtp_draft_tokens=*/2,
+            /*chained_mtp_support=*/true);
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->requireMTPDecodeEquivalentReplay();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->forceAllPositionForwardFailure();
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const GenerationResult step = decodeWithBudget(runner, 3);
+
+        ASSERT_FALSE(step.success());
+        EXPECT_THAT(step.error,
+                    HasSubstr("Grouped-outcome greedy MTP verifier forward failed"));
+        EXPECT_EQ(mock->allPositionVerifierSyncDeferralEnableCount(), 1);
+        EXPECT_EQ(mock->allPositionVerifierSyncDeferralDisableCount(), 1);
+        EXPECT_FALSE(mock->allPositionVerifierSyncDeferralEnabled());
+        EXPECT_EQ(mock->restoreCount(), 2)
+            << "one verifier-base restore and one failure rollback must run";
+        EXPECT_EQ(mock->restoreWhileVerifierSyncDeferredCount(), 0)
+            << "exclusive prefix rollback must begin only after the deferred "
+               "verifier reader has retired";
+    }
+
+    /**
+     * @brief A failed stochastic verifier obeys the same reader/writer order.
+     */
+    TEST_F(Test__PrefillDecodeTransition,
+           StochasticGPUVerifierFailureClosesSyncDeferralBeforeRollback)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false,
+            {},
+            MTPVerifyMode::SpeculativeSampling);
+        mock->enableStochasticDeviceSampling();
+        mock->enableMTPSidecarLogitsStreamHandoff();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->requireMTPDecodeEquivalentReplay();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->enableDeviceGenerationControllerOwnedOutcomes();
+        mock->forceAllPositionForwardFailure();
+
+        SamplingParams sampling;
+        sampling.temperature = 0.8f;
+        sampling.top_k = 1;
+        sampling.top_p = 0.95f;
+        sampling.seed = 123;
+        runner->setSamplingParams(sampling);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const GenerationResult step = decodeWithBudget(runner, 2);
+
+        ASSERT_FALSE(step.success());
+        EXPECT_THAT(step.error,
+                    HasSubstr("Grouped-outcome MTP verifier forward failed"));
+        EXPECT_EQ(mock->allPositionVerifierSyncDeferralEnableCount(), 1);
+        EXPECT_EQ(mock->allPositionVerifierSyncDeferralDisableCount(), 1);
+        EXPECT_FALSE(mock->allPositionVerifierSyncDeferralEnabled());
+        EXPECT_EQ(mock->restoreCount(), 2)
+            << "one verifier-base restore and one failure rollback must run";
+        EXPECT_EQ(mock->restoreWhileVerifierSyncDeferredCount(), 0)
+            << "exclusive prefix rollback must begin only after the deferred "
+               "verifier reader has retired";
     }
 
     TEST_F(Test__PrefillDecodeTransition, GreedyGPUGroupedWithoutResidentPublicationFailsBeforeHostPublish)
@@ -12760,10 +12852,10 @@ namespace
             << "placement maintenance must publish before the retained generation parent is launched";
         EXPECT_EQ(mock->deviceMoEMaintenanceCount(), 1);
         ASSERT_TRUE(runner->maybeApplyMoERebalance())
-            << "The outer decode boundary must acknowledge maintenance that "
-               "was already published for the resident MTP consumer.";
+            << "The outer decode boundary must acknowledge maintenance embedded "
+               "in the resident graph family.";
         EXPECT_EQ(mock->deviceMoEMaintenanceCount(), 1)
-            << "Outer-loop acknowledgement must not replay device maintenance.";
+            << "Outer-loop acknowledgement must not submit a second maintenance graph.";
         const int32_t boundary_ready_token =
             mock->residentNextConditionToken(0);
         EXPECT_GE(boundary_ready_token, 0);
@@ -12786,18 +12878,18 @@ namespace
         EXPECT_DOUBLE_EQ(rejected_tokens->value, 0.0)
             << "A maintenance boundary is not a verifier rejection.";
         const auto maintenance_records =
-            PerfStatsCollector::snapshot({"moe_rebalance"});
+            PerfStatsCollector::snapshot({"moe_overlay_residency"});
         EXPECT_NE(findPerfRecord(
                       maintenance_records,
                       PerfStatRecord::Kind::Counter,
-                      "device_maintenance_published_before_mtp_consumers",
-                      "moe_rebalance"),
+                      "device_generation_embedded_maintenance_boundaries",
+                      "moe_overlay_residency"),
                   nullptr);
         EXPECT_NE(findPerfRecord(
                       maintenance_records,
                       PerfStatRecord::Kind::Counter,
-                      "decode_boundary_device_maintenance_early_publication_acknowledgements",
-                      "moe_rebalance"),
+                      "device_generation_embedded_maintenance_acknowledgements",
+                      "moe_overlay_residency"),
                   nullptr);
         EXPECT_THAT(mock->deviceGenerationLifecycleEvents(),
                     ElementsAre("admission",
@@ -15573,6 +15665,7 @@ namespace
         EXPECT_EQ(probe.mtp_draft_steps, 3u);
         EXPECT_GE(probe.mtp_verifier_runs, 1u);
         EXPECT_GE(probe.mtp_verifier_token_count, 4u);
+        EXPECT_EQ(probe.mtp_last_transaction_draft_depth, 3);
     }
 
     TEST_F(Test__PrefillDecodeTransition, GlobalTPMTPFencesEverySidecarBoundaryBeforeVerifier)
@@ -16057,7 +16150,7 @@ namespace
         ASSERT_TRUE(step1.success()) << step1.error;
 
         /*
-         * Dynamic MPI/NodeLocalTP execution must coordinate the scalar draft
+         * Dynamic MPI/NodeTP execution must coordinate the scalar draft
          * depth before launching sidecars.  The mock broadcast is intentionally
          * no-op for data, so this test verifies the structural contract: MTP no
          * longer hard-fails under MPI and the broadcast hook is exercised.

@@ -4,7 +4,7 @@
  *
  * A grouped verifier forward does not end when the LM head writes logits.  The
  * complete GPU transaction also selects verifier tokens and reduces the
- * accepted prefix into a compact outcome.  In mirrored LocalTP execution every
+ * accepted prefix into a compact outcome. In mirrored TP execution at any scope every
  * participant performs that same terminal transaction against its own
  * byte-identical full-vocabulary logits.  This header describes both the
  * operation and its ownership without depending on a particular model graph.
@@ -103,10 +103,11 @@ namespace llaminar2
         /**
          * Every graph participant owns and publishes its local compact result.
          *
-         * SingleDevice naturally has one owner.  Mirrored LocalTP requires a
-         * full-vocabulary, byte-identical head on every participant; each child
-         * runs identical reduction math and publishes readiness on its exact
-         * graph stream.  No rank outcome broadcast is part of this policy.
+         * SingleDevice naturally has one owner. Mirrored TP requires a
+         * full-vocabulary, byte-identical head on every participant; each
+         * participant runs identical reduction math and publishes readiness on
+         * its exact graph stream. No rank outcome broadcast is part of this
+         * policy, irrespective of local, node-local, or global rank scope.
          */
         ParticipantLocal = 1,
     };

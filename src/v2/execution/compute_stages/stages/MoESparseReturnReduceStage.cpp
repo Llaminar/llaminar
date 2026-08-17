@@ -9,6 +9,7 @@
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <chrono>
@@ -43,6 +44,11 @@ namespace llaminar2
             if (rows.live_row_count > rows.row_capacity)
             {
                 LOG_ERROR("[MoESparseReturnReduceStage] Return rows live count exceeds capacity");
+                return false;
+            }
+            if (rows.live_row_count != 0 && rows.residency_epoch == 0)
+            {
+                LOG_ERROR("[MoESparseReturnReduceStage] Non-empty return rows are missing their residency epoch");
                 return false;
             }
             return true;
@@ -81,9 +87,25 @@ namespace llaminar2
             params_.inbound_rows = params_.inbound_rows_lifetime.get();
     }
 
+    /**
+     * @brief Receive the request/chunk identity selected by the overlay runner.
+     *
+     * The paired dispatch and return boundaries are updated before one graph
+     * execution, guaranteeing that a returned row cannot be confused with a
+     * prior captured graph invocation.
+     */
+    void MoESparseReturnReduceStage::updateMoEOverlayCollectiveRuntimeParams(
+        const MoEOverlayCollectiveRuntimeParams &params)
+    {
+        runtime_params_ = params;
+    }
+
     bool MoESparseReturnReduceStage::execute(IDeviceContext *ctx)
     {
         last_collective_result_ = {};
+        const bool protocol_participant =
+            params_.inbound_consumer_role ==
+            InboundConsumerRole::ProtocolParticipant;
 
         if (!validateHostStagedStage(ctx, params_.device_id, "MoESparseReturnReduceStage"))
             return false;
@@ -99,7 +121,94 @@ namespace llaminar2
             return false;
         }
         MoEOverlayCollectiveKey runtime_key = params_.key;
-        runtime_key.step_id = execution_count_++;
+        if (params_.require_explicit_transaction_identity)
+        {
+            if (!runtime_params_.valid())
+            {
+                LOG_ERROR("[MoESparseReturnReduceStage] Distributed graph-native return "
+                          "started without a runner-stamped transaction identity");
+                return false;
+            }
+            runtime_key.generation_id = runtime_params_.generation_id;
+            runtime_key.step_id = runtime_params_.step_id;
+        }
+        else
+        {
+            /* Local isolated collectives intentionally retain their own counter. */
+            runtime_key.step_id = execution_count_++;
+        }
+        if (params_.require_explicit_execution_semantics)
+        {
+            if (!runtime_params_.valid() ||
+                !runtime_params_.hasExecutionSemantics())
+            {
+                LOG_ERROR("[MoESparseReturnReduceStage] Production sparse "
+                          "return started without typed execution semantics");
+                return false;
+            }
+            using Semantics =
+                MoEOverlayCollectiveRuntimeParams::ExecutionSemantics;
+            const auto semantics = runtime_params_.execution_semantics;
+            if (semantics == Semantics::Decode ||
+                semantics == Semantics::Prefill)
+            {
+                if (runtime_key.key_namespace !=
+                        MoEOverlayCollectiveNamespace::Main ||
+                    runtime_params_.mtp_depth != -1)
+                {
+                    LOG_ERROR("[MoESparseReturnReduceStage] Main execution semantics require the Main namespace and mtp_depth=-1");
+                    return false;
+                }
+                runtime_key.histogram_source =
+                    semantics == Semantics::Prefill
+                        ? ExpertHistogramSource::PrefillChunk
+                        : ExpertHistogramSource::DecodeToken;
+            }
+            else if (semantics == Semantics::MTPDraft)
+            {
+                if (runtime_key.key_namespace !=
+                        MoEOverlayCollectiveNamespace::MTP ||
+                    runtime_params_.mtp_depth < 0 ||
+                    runtime_key.mtp_depth != runtime_params_.mtp_depth)
+                {
+                    LOG_ERROR("[MoESparseReturnReduceStage] MTP draft semantics require the matching retained sidecar namespace depth");
+                    return false;
+                }
+                runtime_key = makeMTPMoEOverlayCollectiveKey(
+                    runtime_key.generation_id,
+                    runtime_key.step_id,
+                    runtime_params_.mtp_depth,
+                    runtime_key.layer_idx,
+                    runtime_key.tier_idx,
+                    runtime_key.domain_id,
+                    runtime_key.participant_id,
+                    runtime_key.direction);
+            }
+            else if (semantics == Semantics::GroupedVerifier)
+            {
+                if (runtime_key.key_namespace !=
+                        MoEOverlayCollectiveNamespace::Main ||
+                    runtime_params_.mtp_depth <= 0)
+                {
+                    LOG_ERROR("[MoESparseReturnReduceStage] Grouped verifier semantics require a Main graph and positive admitted draft depth");
+                    return false;
+                }
+                runtime_key = makeMTPMoEOverlayCollectiveKey(
+                    runtime_key.generation_id,
+                    runtime_key.step_id,
+                    runtime_params_.mtp_depth,
+                    runtime_key.layer_idx,
+                    runtime_key.tier_idx,
+                    runtime_key.domain_id,
+                    runtime_key.participant_id,
+                    runtime_key.direction);
+            }
+            else
+            {
+                LOG_ERROR("[MoESparseReturnReduceStage] Unsupported execution semantics");
+                return false;
+            }
+        }
 
         if (runtime_key.direction != MoEOverlayCollectiveDirection::ReturnReduce || !runtime_key.isValid())
         {
@@ -112,8 +221,41 @@ namespace llaminar2
                                                                                      << " target=" << params_.target_participant);
             return false;
         }
-        if (!validateReturnRows(*params_.outbound_rows, params_.d_model) ||
-            !validateDenseOutput(params_.dense_output, params_.seq_len, params_.d_model))
+        if (!validateReturnRows(*params_.outbound_rows, params_.d_model))
+        {
+            return false;
+        }
+        MoEOverlayDispatchTicket *ticket = nullptr;
+        if (protocol_participant &&
+            (params_.dense_output || params_.ticket_storage ||
+             params_.dense_output_buffer_id ||
+             params_.clear_output_before_scatter ||
+             params_.broadcast_after_scatter ||
+             params_.publish_ticket_completion ||
+             params_.release_residency_lease_on_completion))
+        {
+            LOG_ERROR("[MoESparseReturnReduceStage] Protocol-only participant "
+                      "cannot own dense output, a captured ticket, broadcast, "
+                      "or residency-lease retirement");
+            return false;
+        }
+        if (params_.ticket_storage)
+        {
+            ticket = &params_.ticket_storage->ticket();
+            if (!params_.ticket_storage->hasValidBoundIdentity() ||
+                !ticket->isValid() ||
+                ticket->header->bucket_row_capacity != params_.seq_len ||
+                ticket->header->d_model != params_.d_model ||
+                params_.dense_output || params_.broadcast_after_scatter)
+            {
+                LOG_ERROR("[MoESparseReturnReduceStage] Invalid or ambiguous fixed-capacity return ticket contract");
+                return false;
+            }
+        }
+        else if (!protocol_participant && !validateDenseOutput(
+                     params_.dense_output,
+                     params_.seq_len,
+                     params_.d_model))
         {
             return false;
         }
@@ -144,22 +286,62 @@ namespace llaminar2
         if (!validateReturnRows(*params_.inbound_rows, params_.d_model))
             return false;
 
-        float *dense = params_.dense_output->mutable_data();
-        const size_t dense_count = static_cast<size_t>(params_.seq_len) * static_cast<size_t>(params_.d_model);
-        if (params_.clear_output_before_scatter)
+        /*
+         * MPI ranks enter every return key, but only the rank that owns the
+         * continuation participant receives rows. Treating an unexpected
+         * local payload as discardable would hide a topology error, so the
+         * protocol-only role is valid only when the addressed receive is empty.
+         */
+        if (protocol_participant && params_.inbound_rows->live_row_count != 0)
+        {
+            LOG_ERROR("[MoESparseReturnReduceStage] Protocol-only participant "
+                      "received continuation-owned return rows");
+            return false;
+        }
+
+        if (params_.dispatch_output_lifetime)
+        {
+            const uint64_t expected_epoch =
+                params_.dispatch_output_lifetime->residency_epoch;
+            if (expected_epoch == 0 ||
+                params_.inbound_rows->residency_epoch != expected_epoch)
+            {
+                LOG_ERROR("[MoESparseReturnReduceStage] Return residency epoch mismatch: expected="
+                          << expected_epoch << " received="
+                          << params_.inbound_rows->residency_epoch);
+                return false;
+            }
+        }
+
+        const int logical_seq_len = ticket
+                                        ? ticket->header->logical_row_count
+                                        : params_.seq_len;
+        float *dense = protocol_participant
+                           ? nullptr
+                           : (ticket
+                                  ? ticket->return_rows_fp32
+                                  : params_.dense_output->mutable_data());
+        const size_t dense_count = protocol_participant
+                                       ? 0u
+                                       : static_cast<size_t>(params_.seq_len) *
+                                             static_cast<size_t>(params_.d_model);
+        if (!protocol_participant && params_.clear_output_before_scatter)
             std::fill_n(dense, dense_count, 0.0f);
 
         std::chrono::steady_clock::time_point t_scatter_start;
         if (MoEExpertOverlayProfiler::isEnabled())
             t_scatter_start = std::chrono::steady_clock::now();
 
-        for (size_t compact_row = 0; compact_row < params_.inbound_rows->live_row_count; ++compact_row)
+        for (size_t compact_row = 0;
+             !protocol_participant &&
+             compact_row < params_.inbound_rows->live_row_count;
+             ++compact_row)
         {
             const int row_id = params_.inbound_rows->row_ids_host[compact_row];
-            if (row_id < 0 || row_id >= params_.seq_len)
+            if (row_id < 0 || row_id >= logical_seq_len)
             {
                 LOG_ERROR("[MoESparseReturnReduceStage] Returned row id " << row_id
-                                                                          << " outside seq_len=" << params_.seq_len);
+                                                                          << " outside logical_seq_len=" << logical_seq_len);
                 return false;
             }
             const float *src = params_.inbound_rows->output_rows_fp32 + compact_row * static_cast<size_t>(params_.d_model);
@@ -209,10 +391,25 @@ namespace llaminar2
             }
         }
 
+        if (params_.publish_ticket_completion && !ticket)
+        {
+            LOG_ERROR("[MoESparseReturnReduceStage] Ticket completion was requested without ticket storage");
+            return false;
+        }
+        if (ticket && params_.publish_ticket_completion &&
+            last_collective_result_.collective_complete)
+        {
+            ticket->header->return_logical_row_count = logical_seq_len;
+        }
+
         if (MoEExpertOverlayProfiler::isEnabled())
         {
             const size_t compact_bytes = compactMoEOverlayReturnBytes(*params_.outbound_rows);
-            const size_t dense_bytes = denseMoEOverlayReturnBytes(params_.seq_len, params_.d_model);
+            const size_t dense_bytes =
+                protocol_participant
+                    ? 0u
+                    : denseMoEOverlayReturnBytes(
+                          params_.seq_len, params_.d_model);
             MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
                 params_.key.layer_idx,
                 runtime_key.tier_idx,
@@ -226,6 +423,32 @@ namespace llaminar2
                 prof_return_wait_ms,
                 prof_scatter_ms,
                 prof_broadcast_ms);
+        }
+
+        if (params_.release_residency_lease_on_completion)
+        {
+            if (!last_collective_result_.collective_complete ||
+                !params_.dispatch_output_lifetime ||
+                !params_.dispatch_output_lifetime->residency_lease ||
+                params_.dispatch_output_lifetime->residency_epoch == 0)
+            {
+                LOG_ERROR("[MoESparseReturnReduceStage] Final return cannot release a missing or incomplete residency lease");
+                return false;
+            }
+
+            const uint64_t released_epoch =
+                params_.dispatch_output_lifetime->residency_epoch;
+            params_.dispatch_output_lifetime->residency_lease.reset();
+            PerfStatsCollector::addCounter(
+                "moe_overlay_residency",
+                "dispatch_epoch_releases",
+                1.0,
+                params_.seq_len == 1 ? "decode" : "prefill",
+                params_.device_id.toString(),
+                {
+                    {"epoch", std::to_string(released_epoch)},
+                    {"layer", std::to_string(params_.key.layer_idx)},
+                });
         }
 
         return true;
@@ -247,7 +470,7 @@ namespace llaminar2
     StageBufferContract MoESparseReturnReduceStage::bufferContract() const
     {
         auto contract = StageBufferContract::build();
-        if (!params_.dense_output_buffer_id)
+        if (params_.ticket_storage || !params_.dense_output_buffer_id)
             return contract;
 
         if (params_.clear_output_before_scatter)
@@ -268,6 +491,15 @@ namespace llaminar2
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarBool("clear_output_before_scatter", params_.clear_output_before_scatter);
         info.addScalarBool("broadcast_after_scatter", params_.broadcast_after_scatter);
+        info.addScalarBool(
+            "protocol_participant",
+            params_.inbound_consumer_role ==
+                InboundConsumerRole::ProtocolParticipant);
+        info.addScalarBool("captured_return_ticket", params_.ticket_storage != nullptr);
+        info.addScalarBool("publish_ticket_completion",
+                           params_.publish_ticket_completion);
+        info.addScalarBool("release_residency_lease_on_completion",
+                           params_.release_residency_lease_on_completion);
         info.addScalarInt("continuation_root_tp_index", params_.continuation_root_tp_index);
         if (params_.continuation_tp_context)
         {

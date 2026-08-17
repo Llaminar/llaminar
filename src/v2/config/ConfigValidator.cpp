@@ -563,7 +563,7 @@ namespace llaminar2
             .description = "--tp-scope global with --tp-devices is contradictory",
             .fix_hint = "--tp-scope global distributes TP across MPI ranks (one device per rank). "
                         "--tp-devices specifies local devices within a rank. "
-                        "Use --tp-scope local with --tp-devices, or --tp-scope global without --tp-devices",
+                        "Use --tp-scope rank_local with --tp-devices, or --tp-scope global without --tp-devices",
             .applies = [](const OrchestrationConfig &c)
             { return c.tp_scope == TPScope::GLOBAL && hasTPDevices(c); },
             .check = [](const OrchestrationConfig &) -> std::optional<std::string>

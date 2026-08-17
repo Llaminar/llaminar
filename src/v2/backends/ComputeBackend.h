@@ -95,6 +95,7 @@ namespace llaminar2
         std::string name;          // Human-readable name
         size_t total_memory_bytes; // Total device memory
         size_t free_memory_bytes;  // Free device memory (approximate)
+        int compute_units = 0;     // CUDA SMs, ROCm CUs, or backend-equivalent units
         int compute_capability;    // Backend-specific capability (e.g., CUDA compute 8.6 → 86)
         bool supports_fp16;        // Hardware FP16 support
         bool supports_bf16;        // Hardware BF16 support

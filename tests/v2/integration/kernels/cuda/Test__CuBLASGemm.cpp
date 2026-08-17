@@ -16,6 +16,11 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <stdexcept>
+#include <thread>
+
 // Include project headers BEFORE CUDATestUtils.h (provides include paths)
 #include "backends/ComputeBackend.h" // DeviceManager
 #include "execution/local_execution/device/DeviceContext.h"
@@ -30,6 +35,89 @@
 
 using namespace llaminar2;
 using namespace llaminar2::test::cuda;
+
+#ifdef HAVE_CUDA
+namespace
+{
+    /** @brief Test-only nonblocking CUDA stream parked behind a host gate. */
+    class HostBlockedCudaStream final
+    {
+    public:
+        /** @brief Create the stream and wait until its gate is actively blocking. */
+        HostBlockedCudaStream()
+        {
+            if (cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) !=
+                cudaSuccess)
+            {
+                throw std::runtime_error(
+                    "Could not create adversarial CUDA stream");
+            }
+            if (cudaLaunchHostFunc(
+                    stream_,
+                    [](void *opaque)
+                    {
+                        auto *self = static_cast<HostBlockedCudaStream *>(opaque);
+                        self->entered_.store(true, std::memory_order_release);
+                        while (!self->release_.load(std::memory_order_acquire))
+                            std::this_thread::yield();
+                    },
+                    this) != cudaSuccess)
+            {
+                (void)cudaStreamDestroy(stream_);
+                stream_ = nullptr;
+                throw std::runtime_error(
+                    "Could not enqueue adversarial CUDA host gate");
+            }
+
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(5);
+            while (!entered_.load(std::memory_order_acquire) &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::yield();
+            }
+            if (!entered_.load(std::memory_order_acquire))
+            {
+                release_.store(true, std::memory_order_release);
+                (void)cudaStreamSynchronize(stream_);
+                (void)cudaStreamDestroy(stream_);
+                stream_ = nullptr;
+                throw std::runtime_error(
+                    "Adversarial CUDA host gate did not start");
+            }
+        }
+
+        /** @brief Release pending work before destroying the owned stream. */
+        ~HostBlockedCudaStream()
+        {
+            release();
+            if (stream_)
+            {
+                (void)cudaStreamDestroy(stream_);
+            }
+        }
+
+        HostBlockedCudaStream(const HostBlockedCudaStream &) = delete;
+        HostBlockedCudaStream &operator=(const HostBlockedCudaStream &) = delete;
+
+        /** @return Exact non-default stream parked behind the host gate. */
+        [[nodiscard]] cudaStream_t get() const noexcept { return stream_; }
+
+        /** @brief Release the gate and wait for its test-only host work to exit. */
+        void release() noexcept
+        {
+            release_.store(true, std::memory_order_release);
+            if (stream_)
+                (void)cudaStreamSynchronize(stream_);
+        }
+
+    private:
+        cudaStream_t stream_ = nullptr;
+        std::atomic<bool> entered_{false};
+        std::atomic<bool> release_{false};
+    };
+} // namespace
+#endif
 
 // ============================================================================
 // Test Fixture
@@ -50,16 +138,30 @@ protected:
         if (gpu_idx_ >= 0)
         {
             kernel_ = std::make_unique<cuda::CuBLASGemmKernel>(0);
+            ASSERT_EQ(
+                cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking),
+                cudaSuccess);
+            kernel_->bindStream(ExplicitGPUStream{stream_});
         }
     }
 
     void TearDown() override
     {
+        if (stream_)
+        {
+            (void)cudaStreamSynchronize(stream_);
+        }
         kernel_.reset();
+        if (stream_)
+        {
+            (void)cudaStreamDestroy(stream_);
+            stream_ = nullptr;
+        }
         CUDATestBase::TearDown();
     }
 
     std::unique_ptr<cuda::CuBLASGemmKernel> kernel_;
+    cudaStream_t stream_ = nullptr;
 #endif
 };
 
@@ -99,6 +201,7 @@ TEST_F(Test__CuBLASGemm, SmallMatrix_NN)
                                  /*transA=*/false, /*transB=*/false));
 
     // Download result
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
     ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
 
     // Compare
@@ -139,6 +242,7 @@ TEST_F(Test__CuBLASGemm, SmallMatrix_NT)
     ASSERT_TRUE(kernel_->execute(d_A, d_B, d_C, M, N, K,
                                  /*transA=*/false, /*transB=*/true));
 
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
     ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost));
 
     auto result = compareArrays(C_cuda.data(), C_cpu.data(), M * N, GEMM_ABS_TOL, GEMM_REL_TOL);
@@ -148,6 +252,116 @@ TEST_F(Test__CuBLASGemm, SmallMatrix_NT)
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
+}
+
+/**
+ * @brief Prove independent CUDA projections cannot inherit another stream.
+ *
+ * CUDA floating projections own separate cuBLAS handles.  The second handle is
+ * deliberately bound to a blocked stream after the first handle is bound.  The
+ * first projection must still complete on its own stream, and clearing its
+ * binding must make the next launch fail instead of reusing stale library state.
+ */
+TEST_F(Test__CuBLASGemm, IndependentHandlesKeepEachProjectionOnItsExactStream)
+{
+    constexpr int M = 8;
+    constexpr int N = 64;
+    constexpr int K = 128;
+
+    auto A = generateRandomFP32(M * K, -0.2f, 0.2f, 0x51de);
+    auto B = generateRandomFP32(K * N, -0.2f, 0.2f, 0x71de);
+    std::vector<float> expected(M * N, 0.0f);
+    std::vector<float> actual(M * N, 0.0f);
+    cpuGemmNN(A.data(), B.data(), expected.data(), M, N, K);
+
+    float *d_A = nullptr;
+    float *d_B = nullptr;
+    float *d_C = nullptr;
+    float *d_observed = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, A.size() * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_B, B.size() * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, actual.size() * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_observed, actual.size() * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(
+        d_A, A.data(), A.size() * sizeof(float), cudaMemcpyHostToDevice));
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(
+        d_B, B.data(), B.size() * sizeof(float), cudaMemcpyHostToDevice));
+    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, actual.size() * sizeof(float)));
+    ASSERT_EQ(cudaSuccess, cudaMemset(d_observed, 0, actual.size() * sizeof(float)));
+
+    cuda::CuBLASGemmKernel projection_a(0);
+    cuda::CuBLASGemmKernel projection_b(0);
+    projection_a.bindStream(ExplicitGPUStream{stream_});
+
+    // Pay cuBLAS's one-time algorithm/module initialization before parking an
+    // unrelated stream.  The adversarial interval below is intended to test
+    // stream ownership, not CUDA's process-wide lazy loader.
+    ASSERT_TRUE(projection_a.execute(
+        d_A, d_B, d_C, M, N, K, false, false));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
+    ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, actual.size() * sizeof(float)));
+
+    HostBlockedCudaStream blocked;
+    projection_b.bindStream(ExplicitGPUStream{blocked.get()});
+
+    ASSERT_TRUE(projection_a.execute(
+        d_A, d_B, d_C, M, N, K, false, false));
+
+    // Snapshot the result on A's stream before releasing B.  A device-to-device
+    // copy stays asynchronous even though the eventual host vector is pageable,
+    // so it cannot introduce a hidden device-wide wait on the blocked stream.
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpyAsync(
+            d_observed,
+            d_C,
+            actual.size() * sizeof(float),
+            cudaMemcpyDeviceToDevice,
+            stream_));
+
+    cudaEvent_t projection_done = nullptr;
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaEventCreateWithFlags(&projection_done, cudaEventDisableTiming));
+    ASSERT_EQ(cudaSuccess, cudaEventRecord(projection_done, stream_));
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(5);
+    cudaError_t completion = cudaErrorNotReady;
+    while (completion == cudaErrorNotReady &&
+           std::chrono::steady_clock::now() < deadline)
+    {
+        completion = cudaEventQuery(projection_done);
+        std::this_thread::yield();
+    }
+
+    // Release the adversarial stream before any potentially global runtime
+    // cleanup, even when the bounded completion check is about to fail.
+    blocked.release();
+    ASSERT_EQ(completion, cudaSuccess)
+        << "Projection A did not complete independently of projection B";
+    ASSERT_EQ(cudaSuccess, cudaEventDestroy(projection_done));
+    ASSERT_EQ(
+        cudaSuccess,
+        cudaMemcpy(
+            actual.data(),
+            d_observed,
+            actual.size() * sizeof(float),
+            cudaMemcpyDeviceToHost));
+
+    const auto result = compareArrays(
+        actual.data(), expected.data(), actual.size(),
+        GEMM_ABS_TOL, GEMM_REL_TOL);
+    EXPECT_TRUE(result.passed);
+
+    projection_a.clearStreamBinding();
+    EXPECT_FALSE(projection_a.execute(
+        d_A, d_B, d_C, M, N, K, false, false))
+        << "Clearing a CUDA binding must not leave the cuBLAS handle usable";
+
+    (void)cudaFree(d_A);
+    (void)cudaFree(d_B);
+    (void)cudaFree(d_C);
+    (void)cudaFree(d_observed);
 }
 
 TEST_F(Test__CuBLASGemm, SquareMatrix_256)
@@ -171,6 +385,7 @@ TEST_F(Test__CuBLASGemm, SquareMatrix_256)
 
     ASSERT_TRUE(kernel_->execute(d_A, d_B, d_C, M, N, K, false, false));
 
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
     cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
     auto result = compareArrays(C_cuda.data(), C_cpu.data(), M * N, GEMM_ABS_TOL, GEMM_REL_TOL);
@@ -209,6 +424,7 @@ TEST_F(Test__CuBLASGemm, DecodeSize_SingleToken)
 
     ASSERT_TRUE(kernel_->execute(d_A, d_B, d_C, M, N, K, false, false));
 
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
     cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
     auto result = compareArrays(C_cuda.data(), C_cpu.data(), M * N, GEMM_ABS_TOL, GEMM_REL_TOL);
@@ -243,6 +459,7 @@ TEST_F(Test__CuBLASGemm, PrefillSize_MediumBatch)
 
     ASSERT_TRUE(kernel_->execute(d_A, d_B, d_C, M, N, K, false, false));
 
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
     cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
     auto result = compareArrays(C_cuda.data(), C_cpu.data(), M * N, GEMM_ABS_TOL, GEMM_REL_TOL);
@@ -278,6 +495,7 @@ TEST_F(Test__CuBLASGemm, LMHeadSize)
 
     ASSERT_TRUE(kernel_->execute(d_A, d_B, d_C, M, N, K, false, false));
 
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
     cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
     auto result = compareArrays(C_cuda.data(), C_cpu.data(), M * N, GEMM_ABS_TOL, GEMM_REL_TOL);
@@ -330,6 +548,7 @@ TEST_F(Test__CuBLASGemm, AlphaBetaScaling)
 
     ASSERT_TRUE(kernel_->execute(d_A, d_B, d_C, M, N, K, false, false, alpha, beta));
 
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
     cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
     auto result = compareArrays(C_cuda.data(), C_cpu.data(), M * N, GEMM_ABS_TOL, GEMM_REL_TOL);
@@ -366,6 +585,7 @@ TEST_F(Test__CuBLASGemm, TinyMatrix_4x4)
 
     ASSERT_TRUE(kernel_->execute(d_A, d_B, d_C, M, N, K, false, false));
 
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
     cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
     auto result = compareArrays(C_cuda.data(), C_cpu.data(), M * N, GEMM_ABS_TOL, GEMM_REL_TOL);
@@ -413,6 +633,7 @@ TEST_F(Test__CuBLASGemm, NonSquareAspectRatios)
         ASSERT_TRUE(kernel_->execute(d_A, d_B, d_C, tc.M, tc.N, tc.K, false, false))
             << "Failed for case: " << tc.name;
 
+        ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream_));
         cudaMemcpy(C_cuda.data(), d_C, tc.M * tc.N * sizeof(float), cudaMemcpyDeviceToHost);
 
         auto result = compareArrays(C_cuda.data(), C_cpu.data(), tc.M * tc.N, GEMM_ABS_TOL, GEMM_REL_TOL);

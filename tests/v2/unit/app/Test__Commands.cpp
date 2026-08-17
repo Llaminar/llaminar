@@ -106,7 +106,8 @@ TEST(Test__Commands, BenchmarkPrefillBucketsStayEnabledForDenseDefaultMoEConfig)
 {
     const auto reason = benchmarkPrefillBucketDisableReason(
         /*uses_collectives=*/false,
-        /*dynamic_moe_rebalance_active=*/false);
+        /*dynamic_moe_rebalance_active=*/false,
+        /*segmented_collective_capture_authority=*/false);
     EXPECT_EQ(reason, BenchmarkPrefillBucketDisableReason::None);
 }
 
@@ -114,7 +115,8 @@ TEST(Test__Commands, BenchmarkPrefillBucketsStillDisableForActualMoERebalance)
 {
     const auto reason = benchmarkPrefillBucketDisableReason(
         /*uses_collectives=*/false,
-        /*dynamic_moe_rebalance_active=*/true);
+        /*dynamic_moe_rebalance_active=*/true,
+        /*segmented_collective_capture_authority=*/false);
     EXPECT_EQ(reason, BenchmarkPrefillBucketDisableReason::DynamicMoERebalance);
 }
 
@@ -122,8 +124,18 @@ TEST(Test__Commands, BenchmarkPrefillBucketsStillDisableForCollectives)
 {
     const auto reason = benchmarkPrefillBucketDisableReason(
         /*uses_collectives=*/true,
-        /*dynamic_moe_rebalance_active=*/false);
+        /*dynamic_moe_rebalance_active=*/false,
+        /*segmented_collective_capture_authority=*/false);
     EXPECT_EQ(reason, BenchmarkPrefillBucketDisableReason::Collectives);
+}
+
+TEST(Test__Commands, BenchmarkPrefillBucketsStayEnabledForExpertOverlaySegments)
+{
+    const auto reason = benchmarkPrefillBucketDisableReason(
+        /*uses_collectives=*/true,
+        /*dynamic_moe_rebalance_active=*/false,
+        /*segmented_collective_capture_authority=*/true);
+    EXPECT_EQ(reason, BenchmarkPrefillBucketDisableReason::None);
 }
 
 // ============================================================================

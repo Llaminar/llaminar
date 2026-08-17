@@ -413,6 +413,69 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             ("device_generation_dispatch_ticket_d2h_submissions",),
         )
 
+    def test_gpu_host_transfer_policy_accepts_authenticated_rocm_moe_ticket(
+        self,
+    ) -> None:
+        """HIP MoE cadence dispatch may expose only its 60-byte decision."""
+
+        result = validate_gpu_host_transfer_policy(
+            [
+                counter(
+                    "device_moe_rebalance_dispatch_ticket_d2h_submissions",
+                    domain="moe_rebalance",
+                    device="ROCm:1",
+                    tags={
+                        "bytes": "60",
+                        "authority": "immutable_scheduler_snapshot",
+                        "state_payload": "false",
+                    },
+                )
+            ]
+        )
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            result.scheduler_dispatch_operations,
+            ("device_moe_rebalance_dispatch_ticket_d2h_submissions",),
+        )
+
+    def test_gpu_host_transfer_policy_rejects_malformed_rocm_moe_ticket(
+        self,
+    ) -> None:
+        """MoE tickets remain fail-closed over backend, domain, and ABI size."""
+
+        canonical_tags = {
+            "bytes": "60",
+            "authority": "immutable_scheduler_snapshot",
+            "state_payload": "false",
+        }
+        invalid_records = {
+            "cuda": counter(
+                "device_moe_rebalance_dispatch_ticket_d2h_submissions",
+                domain="moe_rebalance",
+                device="CUDA:0",
+                tags=canonical_tags,
+            ),
+            "wrong_domain": counter(
+                "device_moe_rebalance_dispatch_ticket_d2h_submissions",
+                domain="mtp",
+                device="ROCm:0",
+                tags=canonical_tags,
+            ),
+            "expanded_payload": counter(
+                "device_moe_rebalance_dispatch_ticket_d2h_submissions",
+                domain="moe_rebalance",
+                device="ROCm:0",
+                tags=canonical_tags | {"bytes": "64"},
+            ),
+        }
+        for case, record in invalid_records.items():
+            with self.subTest(case=case):
+                result = validate_gpu_host_transfer_policy([record])
+                self.assertIn(
+                    "device_moe_rebalance_dispatch_ticket_d2h_submissions",
+                    result.error or "",
+                )
+
     def test_gpu_host_transfer_policy_rejects_noncanonical_dispatch_ticket(
         self,
     ) -> None:
@@ -1788,9 +1851,9 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 "decode_capture_policy",
                 tags={
                     "has_collectives": "true",
-                    "collective_segmented": "true",
+                    "heterogeneous_segmented": "true",
                     "replay_plan_policy": (
-                        "allow_heterogeneous_collective_segmentation"
+                        "allow_heterogeneous_boundary_segmentation"
                     ),
                 },
             ),
@@ -1809,7 +1872,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
                 "decode_capture_policy",
                 tags={
                     "has_collectives": "true",
-                    "collective_segmented": "false",
+                    "heterogeneous_segmented": "false",
                     "replay_plan_policy": "require_full_graph",
                 },
             ),
@@ -1869,7 +1932,7 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
             "tp",
             (
                 "--moe-routed-expert-domain "
-                "hot=cuda:0,cuda:1;scope=local "
+                "hot=cuda:0,cuda:1;scope=rank_local "
                 "--moe-routed-expert-domain "
                 "cold=0:cpu:0,1:cpu:0;scope=node_local"
             ),

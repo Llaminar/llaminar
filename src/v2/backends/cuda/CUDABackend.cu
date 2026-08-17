@@ -9,13 +9,16 @@
  */
 
 #include "CUDABackend.h"
+#include "CUDAGraphCapture.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 #include "../../utils/VramBillOfMaterials.h"
+#include "../../execution/moe/DeviceMoERebalanceABI.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDARowSelectKernels.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <memory>
 #include <stdexcept>
@@ -131,70 +134,49 @@ namespace llaminar2
 
     bool CUDABackend::deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
-        if (device_id >= device_count_ || device_id < 0)
-        {
+        if (!deviceToHostOnStream(dst, src, bytes, device_id, stream))
             return false;
-        }
 
-        // Use setDevice() to establish the CUDA runtime context for this thread.
-        if (!setDevice(device_id))
-        {
+        /*
+         * This compatibility API promises completed host bytes. Fence only the
+         * submitted copy frontier; synchronizing the stream would also drain
+         * unrelated work queued after it by another producer.
+         */
+        void *const completion = createEvent(device_id);
+        if (!completion)
             return false;
-        }
-
-        cudaStream_t s = requireExplicitStream(stream, "CUDABackend::deviceToHost");
-        cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, s);
-        if (err != cudaSuccess)
-            return false;
-        err = cudaStreamSynchronize(s);
-        return (err == cudaSuccess);
+        const bool recorded = recordEvent(completion, device_id, stream);
+        const bool completed = recorded && waitForEvent(completion, device_id);
+        destroyEvent(completion, device_id);
+        return completed;
     }
 
     bool CUDABackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
-        if (device_id >= device_count_ || device_id < 0)
-        {
+        if (!hostToDeviceOnStream(dst, src, bytes, device_id, stream))
             return false;
-        }
 
-        // Use setDevice() which handles both runtime and driver API context
-        if (!setDevice(device_id))
-        {
+        void *const completion = createEvent(device_id);
+        if (!completion)
             return false;
-        }
-
-        cudaStream_t s = requireExplicitStream(stream, "CUDABackend::hostToDevice");
-        cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, s);
-        if (err != cudaSuccess)
-            return false;
-        err = cudaStreamSynchronize(s);
-        return (err == cudaSuccess);
+        const bool recorded = recordEvent(completion, device_id, stream);
+        const bool completed = recorded && waitForEvent(completion, device_id);
+        destroyEvent(completion, device_id);
+        return completed;
     }
 
     bool CUDABackend::deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
     {
-        if (device_id >= device_count_ || device_id < 0)
-        {
+        if (!deviceCopyAsync(dst, src, bytes, device_id, stream))
             return false;
-        }
 
-        // Use setDevice() which handles both runtime and driver API context
-        if (!setDevice(device_id))
-        {
+        void *const completion = createEvent(device_id);
+        if (!completion)
             return false;
-        }
-
-        // Same-GPU VRAM copy: both src and dst are device pointers on device_id.
-        cudaStream_t s = requireExplicitStream(stream, "CUDABackend::deviceToDevice");
-        cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s);
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[CUDABackend::deviceToDevice] cudaMemcpyAsync failed: "
-                      << cudaGetErrorString(err));
-            return false;
-        }
-        err = cudaStreamSynchronize(s);
-        return (err == cudaSuccess);
+        const bool recorded = recordEvent(completion, device_id, stream);
+        const bool completed = recorded && waitForEvent(completion, device_id);
+        destroyEvent(completion, device_id);
+        return completed;
     }
 
     bool CUDABackend::synchronize(int device_id)
@@ -404,6 +386,35 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    bool CUDABackend::queryEvent(void *event, int device_id, bool *ready)
+    {
+        if (ready)
+            *ready = false;
+        if (!event || !ready || device_id < 0 || device_id >= device_count_)
+            return false;
+        if (!setDevice(device_id))
+        {
+            LOG_ERROR("[CUDABackend::queryEvent] setDevice(" << device_id
+                                                              << ") failed");
+            return false;
+        }
+
+        const cudaError_t err = cudaEventQuery(
+            reinterpret_cast<cudaEvent_t>(event));
+        if (err == cudaSuccess)
+        {
+            *ready = true;
+            return true;
+        }
+        if (err == cudaErrorNotReady)
+            return true;
+
+        LOG_ERROR("[CUDABackend::queryEvent] cudaEventQuery failed: "
+                  << cudaGetErrorString(err)
+                  << " (device=" << device_id << ", event=" << event << ")");
+        return false;
     }
 
     bool CUDABackend::setDevice(int device_id)
@@ -895,6 +906,81 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDABackend::registerExternalMappedHostMemory(
+        void *ptr,
+        size_t bytes,
+        int registration_device_id)
+    {
+        if (!ptr || bytes == 0u || registration_device_id < 0 ||
+            registration_device_id >= device_count_ ||
+            cudaSetDevice(registration_device_id) != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::registerExternalMappedHostMemory] invalid region or registration device="
+                      << registration_device_id);
+            return false;
+        }
+        const cudaError_t error = cudaHostRegister(
+            ptr,
+            bytes,
+            cudaHostRegisterMapped | cudaHostRegisterPortable);
+        if (error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::registerExternalMappedHostMemory] cudaHostRegister(mapped|portable) failed for "
+                      << bytes << " bytes: " << cudaGetErrorString(error));
+            (void)cudaGetLastError();
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::externalMappedHostDevicePointer(
+        void *host_ptr,
+        int device_id,
+        void **device_ptr)
+    {
+        if (device_ptr)
+            *device_ptr = nullptr;
+        if (!host_ptr || !device_ptr || device_id < 0 ||
+            device_id >= device_count_ || cudaSetDevice(device_id) != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::externalMappedHostDevicePointer] invalid mapped region or device="
+                      << device_id);
+            return false;
+        }
+        const cudaError_t error = cudaHostGetDevicePointer(
+            device_ptr, host_ptr, 0u);
+        if (error != cudaSuccess || !*device_ptr)
+        {
+            LOG_ERROR("[CUDABackend::externalMappedHostDevicePointer] cudaHostGetDevicePointer failed for device="
+                      << device_id << ": " << cudaGetErrorString(error));
+            (void)cudaGetLastError();
+            *device_ptr = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::unregisterExternalMappedHostMemory(
+        void *ptr,
+        int registration_device_id)
+    {
+        if (!ptr || registration_device_id < 0 ||
+            registration_device_id >= device_count_ ||
+            cudaSetDevice(registration_device_id) != cudaSuccess)
+        {
+            return false;
+        }
+        const cudaError_t error = cudaHostUnregister(ptr);
+        if (error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::unregisterExternalMappedHostMemory] cudaHostUnregister failed: "
+                      << cudaGetErrorString(error));
+            (void)cudaGetLastError();
+            return false;
+        }
+        return true;
+    }
+
     // Forward declarations for CUDA sampling kernels (CUDASamplingKernels.cu)
     extern "C" bool cudaOps_argmax_f32(
         const float *data, int n, float *out_value, int *out_index,
@@ -1314,6 +1400,38 @@ namespace llaminar2
         uint32_t *decode_rounds_until_maintenance,
         uint32_t *maintenance_due,
         uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_publish_serial_decode_commit_boundary(
+        uint32_t *decode_rounds_committed,
+        uint32_t *decode_rounds_until_maintenance,
+        uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_acknowledge_decode_commit_boundary(
+        uint32_t *decode_rounds_until_maintenance,
+        uint32_t *maintenance_due,
+        uint32_t *decode_boundary_advanced,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_initialize_device_moe_rebalance_dispatch_ticket(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        uint32_t participant_id,
+        uint32_t participant_count,
+        DeviceMoERebalanceDispatchTicket *ticket,
+        int device_idx,
+        void *stream);
+    extern "C" bool cudaOps_publish_device_moe_rebalance_dispatch_ticket(
+        const uint32_t *controller_magic,
+        const uint32_t *controller_version,
+        const uint32_t *controller_error,
+        const uint32_t *decode_rounds_committed,
+        const uint32_t *decode_rounds_until_maintenance,
+        const uint32_t *maintenance_due,
+        const uint32_t *decode_boundary_advanced,
+        DeviceMoERebalanceDispatchTicket *ticket,
         int device_idx,
         void *stream);
     extern "C" bool cudaOps_initialize_device_generation(
@@ -3331,6 +3449,122 @@ namespace llaminar2
             stream);
     }
 
+    bool CUDABackend::enqueuePublishSerialDecodeCommitBoundary(
+        void *decode_rounds_committed_device,
+        void *decode_rounds_until_maintenance_device,
+        void *maintenance_due_device,
+        void *decode_boundary_advanced_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !decode_rounds_committed_device ||
+            !decode_rounds_until_maintenance_device ||
+            !maintenance_due_device ||
+            !decode_boundary_advanced_device || !stream)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_publish_serial_decode_commit_boundary(
+            static_cast<uint32_t *>(decode_rounds_committed_device),
+            static_cast<uint32_t *>(decode_rounds_until_maintenance_device),
+            static_cast<uint32_t *>(maintenance_due_device),
+            static_cast<uint32_t *>(decode_boundary_advanced_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueAcknowledgeDecodeCommitBoundary(
+        void *decode_rounds_until_maintenance_device,
+        void *maintenance_due_device,
+        void *decode_boundary_advanced_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !decode_rounds_until_maintenance_device ||
+            !maintenance_due_device ||
+            !decode_boundary_advanced_device || !stream)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_acknowledge_decode_commit_boundary(
+            static_cast<uint32_t *>(decode_rounds_until_maintenance_device),
+            static_cast<uint32_t *>(maintenance_due_device),
+            static_cast<uint32_t *>(decode_boundary_advanced_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueInitializeDeviceMoERebalanceDispatchTicket(
+        uint64_t session_epoch,
+        uint64_t workspace_generation,
+        uint32_t participant_id,
+        uint32_t participant_count,
+        void *ticket_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            session_epoch == 0u || workspace_generation == 0u ||
+            participant_count == 0u || participant_id >= participant_count ||
+            !ticket_device || !stream)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_initialize_device_moe_rebalance_dispatch_ticket(
+            session_epoch,
+            workspace_generation,
+            participant_id,
+            participant_count,
+            static_cast<DeviceMoERebalanceDispatchTicket *>(ticket_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueuePublishDeviceMoERebalanceDispatchTicket(
+        const void *controller_magic_device,
+        const void *controller_version_device,
+        const void *controller_error_device,
+        const void *decode_rounds_committed_device,
+        const void *decode_rounds_until_maintenance_device,
+        const void *maintenance_due_device,
+        const void *decode_boundary_advanced_device,
+        void *ticket_device,
+        int device_id,
+        void *stream)
+    {
+        if (device_id < 0 || device_id >= device_count_ ||
+            !controller_magic_device || !controller_version_device ||
+            !controller_error_device || !decode_rounds_committed_device ||
+            !decode_rounds_until_maintenance_device ||
+            !maintenance_due_device || !decode_boundary_advanced_device ||
+            !ticket_device || !stream)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_publish_device_moe_rebalance_dispatch_ticket(
+            static_cast<const uint32_t *>(controller_magic_device),
+            static_cast<const uint32_t *>(controller_version_device),
+            static_cast<const uint32_t *>(controller_error_device),
+            static_cast<const uint32_t *>(decode_rounds_committed_device),
+            static_cast<const uint32_t *>(
+                decode_rounds_until_maintenance_device),
+            static_cast<const uint32_t *>(maintenance_due_device),
+            static_cast<const uint32_t *>(decode_boundary_advanced_device),
+            static_cast<DeviceMoERebalanceDispatchTicket *>(ticket_device),
+            device_id,
+            stream);
+    }
+
     bool CUDABackend::enqueueInitializeDeviceGeneration(
         int request_count,
         int max_new_tokens,
@@ -4162,6 +4396,272 @@ namespace llaminar2
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend::streamWaitEvent] failed: " << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::supportsStreamTimelineSignal32(int device_id) const
+    {
+        if (device_id < 0 || device_id >= device_count_)
+            return false;
+
+        /*
+         * CUDA's current 32-bit cuStreamWaitValue32/cuStreamWriteValue32
+         * contract has no corresponding current capability attribute.  The
+         * similarly named CAN_USE_STREAM_MEM_OPS_V1 attribute describes the
+         * deprecated v1 batch-mem-op ABI and returns zero on current drivers;
+         * using it would incorrectly reject devices which implement the
+         * current pair (including Ampere).  Prove that the exact ordinal is
+         * addressable here, then let allocation plus the real queued
+         * wait/write calls fail closed if a driver cannot execute them.
+         */
+        CUdevice device = 0;
+        return cuInit(0) == CUDA_SUCCESS &&
+               cuDeviceGet(&device, device_id) == CUDA_SUCCESS;
+    }
+
+    void *CUDABackend::allocateStreamTimelineSignal32(int device_id)
+    {
+        if (!supportsStreamTimelineSignal32(device_id) ||
+            cudaSetDevice(device_id) != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::allocateStreamTimelineSignal32] unsupported or invalid device="
+                      << device_id);
+            return nullptr;
+        }
+
+        void *signal = nullptr;
+        const cudaError_t error = cudaMalloc(&signal, sizeof(uint32_t));
+        if (error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::allocateStreamTimelineSignal32] cudaMalloc failed: "
+                      << cudaGetErrorString(error));
+            return nullptr;
+        }
+        return signal;
+    }
+
+    void CUDABackend::freeStreamTimelineSignal32(void *signal, int device_id)
+    {
+        if (!signal)
+            return;
+        CUDA_WARN_IF_FAIL(cudaSetDevice(device_id));
+        CUDA_WARN_IF_FAIL(cudaFree(signal));
+    }
+
+    bool CUDABackend::streamWaitTimelineSignal32(
+        void *stream,
+        void *signal,
+        uint32_t value,
+        int device_id)
+    {
+        const cudaStream_t cuda_stream =
+            requireExplicitStream(stream, "CUDABackend::streamWaitTimelineSignal32");
+        if (!signal || device_id < 0 || device_id >= device_count_ ||
+            cudaSetDevice(device_id) != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::streamWaitTimelineSignal32] invalid ownership"
+                      << " device=" << device_id << " signal=" << signal);
+            return false;
+        }
+
+        const CUresult result = cuStreamWaitValue32(
+            reinterpret_cast<CUstream>(cuda_stream),
+            static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(signal)),
+            value,
+            CU_STREAM_WAIT_VALUE_GEQ);
+        if (result != CUDA_SUCCESS)
+        {
+            const char *name = nullptr;
+            const char *description = nullptr;
+            (void)cuGetErrorName(result, &name);
+            (void)cuGetErrorString(result, &description);
+            LOG_ERROR("[CUDABackend::streamWaitTimelineSignal32] cuStreamWaitValue32 failed: "
+                      << (name ? name : "unknown") << " ("
+                      << (description ? description : "no description") << ")");
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::streamPublishTimelineSignal32(
+        void *stream,
+        void *signal,
+        uint32_t value,
+        int device_id)
+    {
+        const cudaStream_t cuda_stream =
+            requireExplicitStream(stream, "CUDABackend::streamPublishTimelineSignal32");
+        if (!signal || device_id < 0 || device_id >= device_count_ ||
+            cudaSetDevice(device_id) != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::streamPublishTimelineSignal32] invalid ownership"
+                      << " device=" << device_id << " signal=" << signal);
+            return false;
+        }
+
+        // The default write mode includes the device memory fence that makes
+        // every earlier H2D publication visible before consumers are released.
+        const CUresult result = cuStreamWriteValue32(
+            reinterpret_cast<CUstream>(cuda_stream),
+            static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(signal)),
+            value,
+            CU_STREAM_WRITE_VALUE_DEFAULT);
+        if (result != CUDA_SUCCESS)
+        {
+            const char *name = nullptr;
+            const char *description = nullptr;
+            (void)cuGetErrorName(result, &name);
+            (void)cuGetErrorString(result, &description);
+            LOG_ERROR("[CUDABackend::streamPublishTimelineSignal32] cuStreamWriteValue32 failed: "
+                      << (name ? name : "unknown") << " ("
+                      << (description ? description : "no description") << ")");
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::supportsStreamTimelineSignal64(int device_id) const
+    {
+        if (device_id < 0 || device_id >= device_count_)
+            return false;
+        CUdevice device = 0;
+        return cuInit(0) == CUDA_SUCCESS &&
+               cuDeviceGet(&device, device_id) == CUDA_SUCCESS;
+    }
+
+    void *CUDABackend::allocateStreamTimelineSignal64(int device_id)
+    {
+        if (!supportsStreamTimelineSignal64(device_id) ||
+            cudaSetDevice(device_id) != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::allocateStreamTimelineSignal64] unsupported or invalid device="
+                      << device_id);
+            return nullptr;
+        }
+        void *signal = nullptr;
+        const cudaError_t error = cudaMalloc(&signal, sizeof(uint64_t));
+        if (error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::allocateStreamTimelineSignal64] cudaMalloc failed: "
+                      << cudaGetErrorString(error));
+            return nullptr;
+        }
+        return signal;
+    }
+
+    void CUDABackend::freeStreamTimelineSignal64(
+        void *signal,
+        int device_id)
+    {
+        if (!signal)
+            return;
+        CUDA_WARN_IF_FAIL(cudaSetDevice(device_id));
+        CUDA_WARN_IF_FAIL(cudaFree(signal));
+    }
+
+    bool CUDABackend::streamWaitTimelineSignal64(
+        void *stream,
+        void *signal,
+        uint64_t value,
+        int device_id)
+    {
+        const cudaStream_t cuda_stream = requireExplicitStream(
+            stream, "CUDABackend::streamWaitTimelineSignal64");
+        if (!signal || device_id < 0 || device_id >= device_count_ ||
+            cudaSetDevice(device_id) != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::streamWaitTimelineSignal64] invalid ownership device="
+                      << device_id << " signal=" << signal);
+            return false;
+        }
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        const cudaError_t capture_query =
+            cudaStreamIsCapturing(cuda_stream, &capture_status);
+        if (capture_query != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::streamWaitTimelineSignal64] cudaStreamIsCapturing failed: "
+                      << cudaGetErrorString(capture_query));
+            return false;
+        }
+        if (capture_status == cudaStreamCaptureStatusActive)
+        {
+            return appendCUDAActiveCaptureTimelineWait64(
+                cuda_stream, signal, value);
+        }
+        if (capture_status == cudaStreamCaptureStatusInvalidated)
+        {
+            LOG_ERROR("[CUDABackend::streamWaitTimelineSignal64] capture stream is invalidated");
+            return false;
+        }
+        const CUresult result = cuStreamWaitValue64(
+            reinterpret_cast<CUstream>(cuda_stream),
+            static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(signal)),
+            value,
+            CU_STREAM_WAIT_VALUE_GEQ);
+        if (result != CUDA_SUCCESS)
+        {
+            const char *name = nullptr;
+            const char *description = nullptr;
+            (void)cuGetErrorName(result, &name);
+            (void)cuGetErrorString(result, &description);
+            LOG_ERROR("[CUDABackend::streamWaitTimelineSignal64] cuStreamWaitValue64 failed: "
+                      << (name ? name : "unknown") << " ("
+                      << (description ? description : "no description") << ")");
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::streamPublishTimelineSignal64(
+        void *stream,
+        void *signal,
+        uint64_t value,
+        int device_id)
+    {
+        const cudaStream_t cuda_stream = requireExplicitStream(
+            stream, "CUDABackend::streamPublishTimelineSignal64");
+        if (!signal || device_id < 0 || device_id >= device_count_ ||
+            cudaSetDevice(device_id) != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::streamPublishTimelineSignal64] invalid ownership device="
+                      << device_id << " signal=" << signal);
+            return false;
+        }
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        const cudaError_t capture_query =
+            cudaStreamIsCapturing(cuda_stream, &capture_status);
+        if (capture_query != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::streamPublishTimelineSignal64] cudaStreamIsCapturing failed: "
+                      << cudaGetErrorString(capture_query));
+            return false;
+        }
+        if (capture_status == cudaStreamCaptureStatusActive)
+        {
+            return appendCUDAActiveCaptureTimelinePublish64(
+                cuda_stream, signal, value);
+        }
+        if (capture_status == cudaStreamCaptureStatusInvalidated)
+        {
+            LOG_ERROR("[CUDABackend::streamPublishTimelineSignal64] capture stream is invalidated");
+            return false;
+        }
+        const CUresult result = cuStreamWriteValue64(
+            reinterpret_cast<CUstream>(cuda_stream),
+            static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(signal)),
+            value,
+            CU_STREAM_WRITE_VALUE_DEFAULT);
+        if (result != CUDA_SUCCESS)
+        {
+            const char *name = nullptr;
+            const char *description = nullptr;
+            (void)cuGetErrorName(result, &name);
+            (void)cuGetErrorString(result, &description);
+            LOG_ERROR("[CUDABackend::streamPublishTimelineSignal64] cuStreamWriteValue64 failed: "
+                      << (name ? name : "unknown") << " ("
+                      << (description ? description : "no description") << ")");
             return false;
         }
         return true;

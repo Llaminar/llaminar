@@ -325,11 +325,25 @@ namespace llaminar2
         MOE_CANONICAL_ROUTE_REDUCE, ///< Router-ordered LocalTP contribution reduction
         MOE_SHARED_RANK_BANK_PUBLISH, ///< Publish one shared partial into its canonical participant bank
         MOE_CANONICAL_PUBLICATION_FINALIZE, ///< Root-only fixed-order routed/shared finalizer
+        MOE_OVERLAY_TICKET_PUBLISH,  ///< Captured fixed-capacity heterogeneous dispatch ticket
+        MOE_OVERLAY_TICKET_CONSUME,  ///< Captured fixed-capacity heterogeneous return ingress
+        MOE_OVERLAY_ACTIVATION_DISPATCH_PACK, ///< Device pack into a mapped node-local activation lane
+        MOE_OVERLAY_ACTIVATION_DISPATCH_CONSUME, ///< Device consume from a mapped node-local activation lane
+        MOE_OVERLAY_ACTIVATION_RETURN_PACK, ///< Device pack of follower output into a mapped lane
+        MOE_OVERLAY_ACTIVATION_RETURN_CONSUME, ///< Device deterministic fold of one mapped return lane
         MOE_EXPERT_DISPATCH,        ///< Routed-row dispatch descriptor builder
         MOE_SPARSE_DISPATCH,        ///< Graph-native sparse MoE payload dispatch
+        MOE_RANK_BATCH_DISPATCH,   ///< One sparse dispatch envelope for all participants on a remote rank
         MOE_LOCAL_EXPERT,           ///< Participant-local sparse MoE expert compute
+        MOE_LOCAL_EXPERT_INPUT_PUBLISH, ///< Captured pinned-host packet publication into participant tensors
+        MOE_LOCAL_EXPERT_OUTPUT_PUBLISH, ///< Captured participant output publication into pinned host storage
+        MOE_LOCAL_EXPERT_COMPLETION, ///< Explicit completion of one submitted remote GPU expert packet
         MOE_SPARSE_RETURN_REDUCE,   ///< Graph-native sparse MoE return reduce
+        MOE_RANK_BATCH_RETURN_REDUCE, ///< One sparse return envelope for all participants on a remote rank
         MOE_DEVICE_REBALANCE,       ///< Graph-captured device-side MoE rebalance publish/apply
+        MOE_GPU_CURRENT_BATCH_LLEP, ///< Explicit GPU LLEP plan/sideband/apply transaction phase
+        MOE_DEVICE_DECODE_COMMIT_BOUNDARY, ///< Captured HIP serial-decode cadence publish/ack
+        MOE_CPU_CURRENT_BATCH_LLEP, ///< CPU transient LLEP plan/transfer/restore transaction
 
         // Collective
         ALLREDUCE,
@@ -393,6 +407,7 @@ namespace llaminar2
          * penalties followed by deterministic device-slot argmax publication.
          */
         MTP_DRAFT_TOKEN_PUBLICATION,
+        MOE_OVERLAY_EPOCH_BOUNDARY,
 
         /**
          * Captured verifier prelude: resident token composition, device geometry,
@@ -619,6 +634,21 @@ namespace llaminar2
     };
 
     /**
+     * @brief Lifetime over which one successful prepared-weight proof remains valid.
+     *
+     * PerExecution is the conservative default for stages whose engine bindings
+     * can change without another typed authority validating the replacement.
+     * StageLifetime may be selected only when construction/publication owns an
+     * immutable prepared representation and every mutable runtime bank performs
+     * its own generation/epoch proof before use.
+     */
+    enum class PreparedWeightValidationLifetime : uint8_t
+    {
+        PerExecution = 0, ///< Revalidate prepared bindings before every stage invocation.
+        StageLifetime,   ///< One successful setup proof covers this stage object's lifetime.
+    };
+
+    /**
      * @brief Return whether @p policy requires work at @p phase.
      */
     [[nodiscard]] constexpr bool requiresGraphLaunchPreparation(
@@ -629,6 +659,48 @@ namespace llaminar2
                (policy == GraphLaunchPreparationPolicy::CaptureOnly &&
                 phase == GraphLaunchPreparationPhase::Capture);
     }
+
+    /**
+     * @brief Outcome of planning one CPU verifier-state snapshot commit.
+     *
+     * CPU MTP publication validates every recurrent-state copy before any live
+     * state changes.  The publisher can then execute all independent layer
+     * copies in one OpenMP team instead of serializing one `memcpy` per stage.
+     * A typed status keeps an unsupported stage distinct from a valid no-op
+     * request whose accepted row is negative.
+     */
+    enum class CPUVerifierStateRestorePlanStatus : uint8_t
+    {
+        Unsupported,
+        NoOp,
+        Ready,
+        Invalid,
+    };
+
+    /**
+     * @brief Immutable byte-copy plan for one CPU-owned verifier-state stage.
+     *
+     * `source` points at the selected post-verifier snapshot and `destination`
+     * points at that stage's live CPU state. Both allocations remain owned by
+     * the stage/workspace that produced the plan and must stay valid until the
+     * enclosing publication transaction finishes. Publication copies these
+     * bytes verbatim; it never replays recurrence math.
+     */
+    struct CPUVerifierStateRestorePlan
+    {
+        CPUVerifierStateRestorePlanStatus status =
+            CPUVerifierStateRestorePlanStatus::Unsupported;
+        void *destination = nullptr;
+        const void *source = nullptr;
+        size_t bytes = 0;
+
+        /** @brief Return true when this plan describes a concrete byte copy. */
+        [[nodiscard]] bool ready() const noexcept
+        {
+            return status == CPUVerifierStateRestorePlanStatus::Ready &&
+                   destination != nullptr && source != nullptr && bytes > 0;
+        }
+    };
 
     class IComputeStage
     {
@@ -658,6 +730,59 @@ namespace llaminar2
             int real_seq_len = 0;   ///< Real, non-padding token count in this replay.
             int bucket_seq_len = 0; ///< Fixed graph execution length for this replay.
             int token_offset = 0;   ///< Absolute offset of the first real replay token.
+        };
+
+        /**
+         * @brief Root-authoritative identity for one graph-native MoE collective transaction.
+         *
+         * Graph capture can materialize the continuation and expert-only
+         * participant graphs at different times.  A stage-local execution
+         * counter therefore cannot name a distributed transaction: capture,
+         * recapture, and graph-cache eviction would make independently built
+         * stages disagree even though they are servicing the same request
+         * chunk.  The runner stamps this immutable pair before graph
+         * execution, and every sparse dispatch/return stage uses it to derive
+         * its wire key.
+         *
+         * The values are host-side control metadata for explicit manual
+         * sparse-collective boundaries. They do not create a host mirror of a
+         * device tensor and they do not change captured GPU topology.
+         */
+        struct MoEOverlayCollectiveRuntimeParams
+        {
+            /** Mathematical phase carried across an explicit sparse boundary. */
+            enum class ExecutionSemantics : uint8_t
+            {
+                Unspecified,
+                Decode,
+                Prefill,
+                MTPDraft,
+                GroupedVerifier,
+            };
+
+            uint64_t generation_id = 0; ///< Monotonic request-generation authority; zero is invalid.
+            uint64_t step_id = 0;       ///< Absolute logical operation offset within that generation.
+            /** Typed phase; a one-row prefill remains Prefill. */
+            ExecutionSemantics execution_semantics =
+                ExecutionSemantics::Unspecified;
+            /**
+             * MTP graph namespace depth selected by the controller.
+             *
+             * Main decode/prefill use -1. A NextN sidecar uses its declared
+             * sidecar graph depth (currently zero), while a grouped verifier
+             * uses the admitted speculative draft depth. This value is never
+             * inferred from a physical graph bucket.
+             */
+            int mtp_depth = -1;
+
+            /** @brief Return true when the runner supplied a usable protocol identity. */
+            [[nodiscard]] bool valid() const noexcept { return generation_id != 0; }
+            /** @return Whether the mathematical phase was supplied explicitly. */
+            [[nodiscard]] bool hasExecutionSemantics() const noexcept
+            {
+                return execution_semantics !=
+                       ExecutionSemantics::Unspecified;
+            }
         };
 
         /**
@@ -914,6 +1039,21 @@ namespace llaminar2
         virtual bool isGraphCapturable() const { return true; }
 
         /**
+         * @brief Whether this immutable graph role performs no execution work.
+         *
+         * Returning true permits a graph-capture wave contract to mark this
+         * node as a passive participant. The stage must then be a complete
+         * no-op for its graph-bound role: execute() may not enqueue device
+         * work, mutate host state, publish coherence, or allocate storage.
+         * Generic orchestration uses this opt-in to omit the node from the
+         * local executable while still joining a sibling's begin/end capture
+         * rendezvous. Shape-dependent or runtime-dependent no-op decisions
+         * must return false because capture topology cannot depend on live
+         * tensor values.
+         */
+        virtual bool isPassiveGraphCaptureNoOp() const { return false; }
+
+        /**
          * @brief Variant signature for graph-captured launch topology.
          *
          * Most stages have a single stable graph-capture topology and return 0.
@@ -927,6 +1067,19 @@ namespace llaminar2
          * change this signature unless they also alter grid/block/smem shape.
          */
         virtual uint64_t graphCaptureVariantSignature() const { return 0; }
+
+        /**
+         * @brief Declare how long validatePreparedWeights() remains authoritative.
+         *
+         * The default deliberately repeats validation. A stage opting into
+         * StageLifetime must document the immutable owner that prevents its
+         * prepared bindings from changing behind a retained execution plan.
+         */
+        virtual PreparedWeightValidationLifetime
+        preparedWeightValidationLifetime() const noexcept
+        {
+            return PreparedWeightValidationLifetime::PerExecution;
+        }
 
         /**
          * @brief Whether explicit launch preparation can make this stage capture-ready.
@@ -981,6 +1134,19 @@ namespace llaminar2
          * collective key.
          */
         virtual bool isManualGraphBoundary() const { return false; }
+
+        /**
+         * @brief Whether host execution must observe the preceding captured ticket.
+         *
+         * A heterogeneous graph may end a captured device segment with an
+         * asynchronous D2H copy into fixed pinned storage.  The first manual
+         * consumer of that storage declares this contract so the replay
+         * controller records and waits for one preallocated completion event
+         * at the explicit device/host boundary.  This is not a general manual
+         * stage synchronization switch and is invalid unless
+         * @ref isManualGraphBoundary also returns true.
+         */
+        virtual bool requiresHostGraphTicketFence() const { return false; }
 
         /**
          * @brief True when the last manual boundary execution completed globally.
@@ -1046,6 +1212,31 @@ namespace llaminar2
             (void)request_count;
             (void)stream;
             return false;
+        }
+
+        /**
+         * @brief Plan a byte-exact single-request CPU state publication.
+         *
+         * The method validates @p row and exposes the already-computed snapshot
+         * span without mutating live state. The MTP publisher first gathers and
+         * validates plans from every captured stage, then copies all `Ready`
+         * spans in one persistent OpenMP region. This two-phase contract makes
+         * malformed publication atomic and removes serial per-layer memory
+         * bandwidth from the decode hot path.
+         *
+         * A negative row is a valid `NoOp`: that request accepted no verifier
+         * row and retains its pre-transaction live state. GPU stages and CPU
+         * stages without native snapshot spans return `Unsupported`; a required
+         * captured CPU stage returning that status is a fatal publication
+         * contract violation, not permission to call a slower path.
+         *
+         * @param row Flat verifier snapshot row selected for the request.
+         * @return Typed immutable restore plan whose storage remains stage-owned.
+         */
+        virtual CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row)
+        {
+            (void)row;
+            return {};
         }
 
         /**
@@ -1273,6 +1464,22 @@ namespace llaminar2
          * @return true when an explicit stream is currently bound.
          */
         bool hasGPUStream() const noexcept { return gpu_stream_ != nullptr; }
+
+        /**
+         * @brief Test whether two GPU stages share one exact execution stream.
+         *
+         * Paired producer/completion nodes use this typed relation instead of
+         * retrieving two opaque pointers and accidentally treating null as a
+         * valid shared stream. CPU stages and either unbound GPU stage always
+         * return false.
+         */
+        bool sharesExactGPUStreamWith(
+            const IComputeStage &other) const noexcept
+        {
+            return device_id_.is_gpu() && other.device_id_.is_gpu() &&
+                   gpu_stream_ && other.gpu_stream_ &&
+                   gpu_stream_ == other.gpu_stream_;
+        }
 
         /**
          * @brief Get the stream used by this stage's current execution.
@@ -1522,6 +1729,31 @@ namespace llaminar2
          * avoid scanning every graph node before each cached prefill launch.
          */
         virtual bool hasPrefillReplayParams() const { return false; }
+
+        /**
+         * @brief Stamp the next graph-native MoE sparse-collective transaction.
+         *
+         * The forward engine invokes this before either a cold graph execution
+         * or a cached graph replay. Implementations must retain only this
+         * scalar protocol identity; they must not allocate, synchronize, or
+         * upload request state from this hook.
+         *
+         * @param params Root-authoritative generation and logical step.
+         */
+        virtual void updateMoEOverlayCollectiveRuntimeParams(
+            const MoEOverlayCollectiveRuntimeParams &params)
+        {
+            (void)params;
+        }
+
+        /**
+         * @brief Return true when this stage requires explicit MoE protocol identity.
+         *
+         * The forward graph cache uses this opt-in query to update only sparse
+         * collective stages rather than scanning unrelated model operations on
+         * every execution.
+         */
+        virtual bool hasMoEOverlayCollectiveRuntimeParams() const { return false; }
 
         /**
          * @brief Whether this stage can safely execute padded prefill buckets.

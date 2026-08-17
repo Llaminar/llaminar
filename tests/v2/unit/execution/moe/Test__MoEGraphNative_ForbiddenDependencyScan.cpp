@@ -1792,6 +1792,8 @@ namespace llaminar2::test
 
         const fs::path stage_path =
             root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        const fs::path router_stage_path =
+            root / "src/v2/execution/compute_stages/stages/MoERoutingStage.cpp";
         ASSERT_TRUE(fs::exists(stage_path)) << stage_path;
         const std::string stage = readFile(stage_path);
         ASSERT_FALSE(stage.empty()) << stage_path;
@@ -1996,10 +1998,13 @@ namespace llaminar2::test
 
         EXPECT_NE(local_contents.find("constexpr int kCompactTopK = 1;"),
                   std::string::npos);
-        EXPECT_NE(local_contents.find("std::fill_n(routing_indices, active_routes.size() * static_cast<size_t>(kCompactTopK), -1.0f)"),
+        EXPECT_NE(local_contents.find("std::fill_n(routing_indices, compact_routing_elements, -1.0f)"),
                   std::string::npos);
-        EXPECT_NE(local_contents.find("compute_params.top_k = kCompactTopK;"),
+        EXPECT_NE(local_contents.find("compute_params.top_k = 1;"),
                   std::string::npos);
+        EXPECT_NE(local_contents.find(".live_rows = static_cast<int>(compact_capacity_)"),
+                  std::string::npos)
+            << "Retained graphs must execute their immutable padded family, not recapture per live route count";
         EXPECT_EQ(local_contents.find("compact_output_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE"),
                   std::string::npos);
         EXPECT_NE(compute_contents.find("expert_id < 0 || expert_id >= num_experts"),
@@ -2035,11 +2040,13 @@ namespace llaminar2::test
                   std::string::npos);
         EXPECT_NE(impl_contents.find("contract.addInOut(*params_.dense_output_buffer_id);"),
                   std::string::npos);
-        EXPECT_NE(graph_contents.find("return_params.dense_output_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);"),
-                  std::string::npos);
+        EXPECT_TRUE(std::regex_search(
+            graph_contents,
+            std::regex(
+                R"(return_params\.dense_output_buffer_id\s*=\s*buffers\.idFor\(\s*BufferId::MOE_COMBINED_OUTPUT\s*\);)")));
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, LocalExpertPropagatesGpuStreamToNestedExpertCompute)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, LocalExpertCapturesExactPinnedTransfersOnParticipantStream)
     {
         const fs::path root = findRepoRoot();
         const fs::path path = root / "src/v2/execution/compute_stages/stages/MoELocalExpertStage.cpp";
@@ -2047,13 +2054,161 @@ namespace llaminar2::test
         const std::string contents = readFile(path);
         ASSERT_FALSE(contents.empty()) << path;
 
-        const size_t construct_stage = contents.find("MoEExpertComputeStage compute_stage(std::move(compute_params));");
-        ASSERT_NE(construct_stage, std::string::npos);
-        const size_t stream_bind = contents.find("compute_stage.setGPUStream(gpuStream());", construct_stage);
-        const size_t execute_stage = contents.find("compute_stage.execute(ctx)", construct_stage);
-        ASSERT_NE(stream_bind, std::string::npos);
-        ASSERT_NE(execute_stage, std::string::npos);
-        EXPECT_LT(stream_bind, execute_stage);
+        const size_t input_publisher = contents.find(
+            "class MoELocalExpertInputPublishStage final");
+        const size_t captured_h2d = contents.find(
+            "transfers.enqueuePinnedHostToDevice(", input_publisher);
+        const size_t output_publisher = contents.find(
+            "class MoELocalExpertOutputPublishStage final", captured_h2d);
+        const size_t captured_d2h = contents.find(
+            "enqueueDeviceToPinnedHost(", output_publisher);
+        const size_t input_graph_node = contents.find(
+            "\"moe_overlay_local_expert_input_publish\"", captured_d2h);
+        const size_t compute_graph_node = contents.find(
+            "\"moe_overlay_local_expert\"", input_graph_node + 1);
+        const size_t output_graph_node = contents.find(
+            "\"moe_overlay_local_expert_output_publish\"", compute_graph_node);
+        const size_t input_dependency = contents.find(
+            "replay->graph.addDependency(\n                \"moe_overlay_local_expert\",\n                \"moe_overlay_local_expert_input_publish\")",
+            output_graph_node);
+        const size_t output_dependency = contents.find(
+            "replay->graph.addDependency(\n                \"moe_overlay_local_expert_output_publish\",\n                \"moe_overlay_local_expert\")",
+            input_dependency);
+        const size_t exact_producer = contents.find(
+            "void *const producer_stream = requireGPUStream()", output_dependency);
+        const size_t retained_execute = contents.find(
+            "executeWithCachedGraphReplay(", exact_producer);
+        const size_t retained_family_publication =
+            contents.find(
+                "pending_deferred_replay_ = deferred_replay;",
+                retained_execute);
+        const size_t completion_wait =
+            contents.find(
+                "pending_deferred_replay_->cache.waitForCaptureStreamFence(",
+                retained_family_publication);
+        const size_t active_completion_policy = contents.find(
+            "HostFenceWaitPolicy::\n                    ActiveProgress",
+            completion_wait);
+        ASSERT_NE(input_publisher, std::string::npos);
+        ASSERT_NE(captured_h2d, std::string::npos);
+        ASSERT_NE(output_publisher, std::string::npos);
+        ASSERT_NE(captured_d2h, std::string::npos);
+        ASSERT_NE(input_graph_node, std::string::npos);
+        ASSERT_NE(compute_graph_node, std::string::npos);
+        ASSERT_NE(output_graph_node, std::string::npos);
+        ASSERT_NE(input_dependency, std::string::npos);
+        ASSERT_NE(output_dependency, std::string::npos);
+        ASSERT_NE(exact_producer, std::string::npos);
+        ASSERT_NE(retained_execute, std::string::npos);
+        ASSERT_NE(retained_family_publication, std::string::npos);
+        ASSERT_NE(completion_wait, std::string::npos);
+        ASSERT_NE(active_completion_policy, std::string::npos);
+        EXPECT_LT(input_publisher, captured_h2d);
+        EXPECT_LT(captured_h2d, output_publisher);
+        EXPECT_LT(output_publisher, captured_d2h);
+        EXPECT_LT(captured_d2h, input_graph_node);
+        EXPECT_LT(input_graph_node, compute_graph_node);
+        EXPECT_LT(compute_graph_node, output_graph_node);
+        EXPECT_LT(output_graph_node, input_dependency);
+        EXPECT_LT(input_dependency, output_dependency);
+        EXPECT_LT(output_dependency, exact_producer);
+        EXPECT_LT(exact_producer, retained_execute);
+        EXPECT_LT(retained_execute, retained_family_publication);
+        EXPECT_LT(retained_family_publication, completion_wait)
+            << "The retained graph must retain its exact family before the explicit host completion waits on that graph";
+        EXPECT_LT(completion_wait, active_completion_policy)
+            << "Latency-critical transaction followers must actively progress the exact completion event";
+        EXPECT_EQ(
+            contents.find("orderCaptureStreamAfter(", exact_producer),
+            std::string::npos)
+            << "the exact borrowed stream plus captured H2D nodes need no host-side replay dependency hook";
+        EXPECT_EQ(
+            contents.find("backend->deviceToHostOnStream("),
+            std::string::npos)
+            << "the stage must not bypass the canonical transfer authority";
+
+        const size_t inline_bind =
+            contents.find("compute_stage->setGPUStream(gpuStream());");
+        const size_t inline_execute =
+            contents.find("compute_stage->execute(ctx)", inline_bind);
+        ASSERT_NE(inline_bind, std::string::npos);
+        ASSERT_NE(inline_execute, std::string::npos);
+        EXPECT_LT(inline_bind, inline_execute);
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         EconomyServiceTimingCoversCompleteSparseEndpoint)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path path =
+            root / "src/v2/execution/compute_stages/stages/MoELocalExpertStage.cpp";
+        ASSERT_TRUE(fs::exists(path)) << path;
+        const std::string contents = readFile(path);
+        ASSERT_FALSE(contents.empty()) << path;
+
+        const size_t execute_begin =
+            contents.find("bool MoELocalExpertStage::execute(");
+        const size_t execute_end = contents.find(
+            "bool MoELocalExpertStage::validatePreparedWeights(",
+            execute_begin);
+        ASSERT_NE(execute_begin, std::string::npos);
+        ASSERT_NE(execute_end, std::string::npos);
+        const std::string execute_body =
+            contents.substr(execute_begin, execute_end - execute_begin);
+
+        const size_t service_start =
+            execute_body.find("const auto service_start =");
+        const size_t compact_capacity = execute_body.find(
+            "ensureCompactCapacity(active_routes_.size(), kCompactTopK)",
+            service_start);
+        const size_t pinned_input = execute_body.find(
+            "compact_family->pinned_transfer->mutableData(", service_start);
+        const size_t output_materialization = execute_body.find(
+            "pending_deferred_replay_->cache.waitForCaptureStreamFence(",
+            service_start);
+        const size_t pinned_output_read = execute_body.find(
+            "compact_result = static_cast<const float *>(\n                family->pinned_transfer->data(",
+            output_materialization);
+        const size_t aggregation_complete = execute_body.find(
+            "output.live_row_count = output_input_rows_.size()",
+            pinned_output_read);
+        const size_t elapsed_service = execute_body.find(
+            "service_completed_at - service_start",
+            aggregation_complete);
+        const size_t publish = execute_body.find(
+            "!publishServiceMeasurement(", elapsed_service);
+        const size_t diagnostic_publish = execute_body.find(
+            "record(\"packet_service\"", publish);
+
+        ASSERT_NE(service_start, std::string::npos);
+        ASSERT_NE(compact_capacity, std::string::npos);
+        ASSERT_NE(pinned_input, std::string::npos);
+        ASSERT_NE(output_materialization, std::string::npos);
+        ASSERT_NE(pinned_output_read, std::string::npos);
+        ASSERT_NE(aggregation_complete, std::string::npos);
+        ASSERT_NE(elapsed_service, std::string::npos);
+        ASSERT_NE(publish, std::string::npos);
+        ASSERT_NE(diagnostic_publish, std::string::npos);
+        EXPECT_LT(service_start, compact_capacity)
+            << "Economy timing must include host packet compaction";
+        EXPECT_LT(compact_capacity, pinned_input)
+            << "Economy timing must include compact packet publication into the captured-transfer source";
+        EXPECT_LT(pinned_input, output_materialization)
+            << "Economy timing must span device execution and output download";
+        EXPECT_LT(output_materialization, pinned_output_read);
+        EXPECT_LT(pinned_output_read, aggregation_complete)
+            << "Economy timing must include host-visible return aggregation";
+        EXPECT_LT(aggregation_complete, elapsed_service);
+        EXPECT_LT(elapsed_service, publish);
+        EXPECT_LT(publish, diagnostic_publish)
+            << "Optional PerfStats detail must not contaminate the economy "
+               "measurement used by placement";
+
+        EXPECT_EQ(execute_body.find("createTimingEvent("), std::string::npos);
+        EXPECT_EQ(execute_body.find("recordEvent("), std::string::npos);
+        EXPECT_EQ(execute_body.find("eventElapsedTimeMs("), std::string::npos)
+            << "Kernel-only GPU event timing cannot certify heterogeneous "
+               "endpoint economy";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, WeightManagerUnpinsMmapWeightsBeforeMadvise)
@@ -2092,13 +2247,17 @@ namespace llaminar2::test
         const fs::path root = findRepoRoot();
         const fs::path dgo_path = root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
         const fs::path rank_path = root / "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp";
+        const fs::path manager_path = root / "src/v2/loaders/WeightManager.cpp";
         ASSERT_TRUE(fs::exists(dgo_path)) << dgo_path;
         ASSERT_TRUE(fs::exists(rank_path)) << rank_path;
+        ASSERT_TRUE(fs::exists(manager_path)) << manager_path;
 
         const std::string dgo_contents = readFile(dgo_path);
         const std::string rank_contents = readFile(rank_path);
+        const std::string manager_contents = readFile(manager_path);
         ASSERT_FALSE(dgo_contents.empty()) << dgo_path;
         ASSERT_FALSE(rank_contents.empty()) << rank_path;
+        ASSERT_FALSE(manager_contents.empty()) << manager_path;
 
         const size_t graph_ready_start = dgo_contents.find("void DeviceGraphOrchestrator::onFirstGraphReady()");
         ASSERT_NE(graph_ready_start, std::string::npos);
@@ -2128,6 +2287,24 @@ namespace llaminar2::test
         EXPECT_EQ(rank_release_body.find("synchronizeStream("), std::string::npos);
         EXPECT_EQ(rank_release_body.find("synchronizeDevice("), std::string::npos)
             << "Rank mmap reclamation must rely on completed load pipelines, not a rank-wide GPU drain.";
+
+        /*
+         * Releasing host-resident tensors and advising the shared mmap are two
+         * ordered operations. The broad release skips TensorSlice views, so it
+         * must not issue MADV_DONTNEED before WeightManager::adviseMmapDontneed
+         * has unregistered those remaining CUDA/HIP host mappings.
+         */
+        const size_t manager_release =
+            manager_contents.find("size_t WeightManager::releaseHostResidentWeightData()");
+        const size_t manager_advise =
+            manager_contents.find("size_t WeightManager::adviseMmapDontneed()", manager_release);
+        ASSERT_NE(manager_release, std::string::npos);
+        ASSERT_NE(manager_advise, std::string::npos);
+        const std::string manager_release_body =
+            manager_contents.substr(manager_release, manager_advise - manager_release);
+        EXPECT_EQ(manager_release_body.find("loader_.adviseMmapDontneed();"), std::string::npos)
+            << "Host-resident release must not advise mmap pages before the explicit "
+               "registration-release phase.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DGOHostReleaseFollowsIntegratedMTPPrefillProducer)
@@ -2199,8 +2376,83 @@ namespace llaminar2::test
                   std::string::npos);
         EXPECT_NE(ffn_body.find("register_runtime_histogram = !use_mtp_runtime_table"),
                   std::string::npos);
-        EXPECT_NE(ffn_body.find("route_params.decode_histogram = mtp_sidecar_context ? nullptr : config_.moe.decode_histogram"),
+        const size_t histogram_binding =
+            ffn_body.find("route_params.decode_histogram =");
+        ASSERT_NE(histogram_binding, std::string::npos);
+        const std::string histogram_binding_body =
+            ffn_body.substr(histogram_binding, 220);
+        EXPECT_NE(histogram_binding_body.find("mtp_sidecar_context ||"),
                   std::string::npos);
+        EXPECT_NE(
+            histogram_binding_body.find(
+                "device_side_graph_rebalance_candidate"),
+            std::string::npos)
+            << "MTP sidecars and the captured device authority must both keep "
+               "host histogram mutation outside graph execution.";
+        EXPECT_NE(histogram_binding_body.find("? nullptr"),
+                  std::string::npos);
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         ExpertOverlayRCUIsTheOnlyTypedDurableAuthority)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path types_path = root / "src/v2/models/GraphTypes.h";
+        const fs::path factory_path =
+            root / "src/v2/execution/factory/InferenceRunnerFactory.cpp";
+        const fs::path graph_path =
+            root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
+        ASSERT_TRUE(fs::exists(types_path)) << types_path;
+        ASSERT_TRUE(fs::exists(factory_path)) << factory_path;
+        ASSERT_TRUE(fs::exists(graph_path)) << graph_path;
+
+        const std::string types = readFile(types_path);
+        const std::string factory = readFile(factory_path);
+        const std::string graph = readFile(graph_path);
+        ASSERT_FALSE(types.empty());
+        ASSERT_FALSE(factory.empty());
+        ASSERT_FALSE(graph.empty());
+
+        EXPECT_NE(
+            types.find("enum class MoEDurableResidencyAuthorityKind"),
+            std::string::npos)
+            << "Durable placement ownership must be typed rather than inferred "
+               "from a generic Dynamic mode.";
+        EXPECT_EQ(types.find("LegacyDomainController"), std::string::npos)
+            << "the replaced per-domain writer must not remain representable";
+        EXPECT_NE(types.find("ExpertOverlayRCU"), std::string::npos);
+        EXPECT_NE(
+            factory.find(
+                "MoEDurableResidencyAuthorityKind::ExpertOverlayRCU"),
+            std::string::npos)
+            << "The runner factory must bind the arbitrary-tier RCU authority.";
+        EXPECT_EQ(types.find("MoERebalanceMode rebalance_mode"),
+                  std::string::npos)
+            << "Graph configuration must not represent a second durable writer.";
+        EXPECT_NE(
+            factory.find(
+                "validateMoEDurableResidencyAuthorityForGraph("),
+            std::string::npos)
+            << "Factory construction must enforce universal RCU ownership.";
+        EXPECT_EQ(factory.find("LegacyDomainController"), std::string::npos);
+        EXPECT_EQ(graph.find("usesLegacyDurableResidencyAuthority"),
+                  std::string::npos);
+        EXPECT_NE(
+            factory.find(
+                "Multi-participant MoE reached graph construction without"),
+            std::string::npos)
+            << "unnormalized multi-device entry must fail before graph lowering";
+        EXPECT_NE(
+            graph.find("overlay_placement_source = main_it->second.get();"),
+            std::string::npos)
+            << "Current-batch LLEP must use private child banks whose canonical "
+               "placement source is the durable main-decode table.";
+        EXPECT_NE(
+            graph.find(
+                "does not share the canonical ExpertOverlay request ticket"),
+            std::string::npos)
+            << "Every request-local LLEP child must fail closed unless it shares "
+               "the parent ExpertOverlay epoch ticket.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DeviceRebalanceMaintenanceIsOneAtomicGraph)
@@ -2228,8 +2480,17 @@ namespace llaminar2::test
         EXPECT_NE(ffn_body.find("config_.compute_all_position_logits"), std::string::npos)
             << "Grouped all-position MTP rows must create the production decode-maintenance binding.";
         EXPECT_NE(ffn_body.find("device_side_graph_rebalance_candidate ="), std::string::npos);
-        EXPECT_NE(ffn_body.find("device_rebalance_decode_layer &&"), std::string::npos)
-            << "Device-side graph rebalance must own both serial and grouped decode layers so MTP does not depend on constructing an M=1 graph.";
+        EXPECT_EQ(ffn_body.find("device_side_graph_rebalance_candidate =\n            false"),
+                  std::string::npos)
+            << "the topology-selected homogeneous device authority must not be forced off";
+        EXPECT_NE(
+            ffn_body.find("homogeneous_device_resident_authority"),
+            std::string::npos);
+        EXPECT_NE(
+            ffn_body.find(
+                "MoEOverlayAuthorityExecutionKind::\n                    HomogeneousDeviceResident"),
+            std::string::npos)
+            << "graph lowering must consume the frozen typed authority backend";
         EXPECT_EQ(ffn_body.find("device_rebalance_graph_controller"),
                   std::string::npos)
             << "Homogeneous graph-stable GPU rebalance must not expose a host-controller selection toggle.";
@@ -2247,7 +2508,10 @@ namespace llaminar2::test
         EXPECT_NE(ffn_body.find("register_runtime_histogram_for_decode"), std::string::npos)
             << "Device-side graph rebalance must not register host decode-histogram sync callbacks.";
         EXPECT_NE(ffn_body.find("!device_side_graph_rebalance_candidate"), std::string::npos);
-        EXPECT_NE(ffn_body.find("config_.moe.rebalance_mode == MoERebalanceMode::DYNAMIC"), std::string::npos);
+        EXPECT_EQ(ffn_body.find("usesLegacyDurableResidencyAuthority"),
+                  std::string::npos);
+        EXPECT_EQ(ffn_body.find("config_.moe.rebalance_mode == MoERebalanceMode::DYNAMIC"),
+                  std::string::npos);
         EXPECT_EQ(ffn_body.find("hot_replica_cap > 0"), std::string::npos)
             << "Homogeneous GPU dynamic rebalance must not fall back to host publish/apply just because hot cache is off.";
         EXPECT_EQ(ffn_body.find("env.moe_rebalance.gpu_cache_experts_per_layer <= 0"), std::string::npos)
@@ -2257,7 +2521,12 @@ namespace llaminar2::test
                   std::string::npos);
         EXPECT_NE(contents.find("selectGraphRebalanceTransferMode("), std::string::npos);
         EXPECT_NE(contents.find("max_hot_replicas_per_participant == 0"), std::string::npos)
-            << "No-hot device-side dynamic mode must be resident-only and avoid transfer-slot allocation.";
+            << "A truly resident-only wave may avoid transfer slots when neither ownership nor replicas move.";
+        EXPECT_NE(
+            contents.find(
+                "dynamic_ownership_transfers =\n                    device_side_graph_rebalance_candidate"),
+            std::string::npos)
+            << "same-tier skew correction must move complete expert payloads even when hot-replica capacity is zero";
         EXPECT_NE(contents.find("DeviceMoERebalanceTransferMode::ResidentOnly"), std::string::npos);
         EXPECT_EQ(contents.find("GPUExpertTransfer::canAccessPeer(destination_device, source_device)"),
                   std::string::npos)
@@ -2333,21 +2602,29 @@ namespace llaminar2::test
         EXPECT_NE(ffn_body.find("\"LocalTP expert-ID-apportioned masked GPU decode graph build\""),
                   std::string::npos)
             << "The standard LocalTP path must initialize the same masked runtime-table contract as overlay.";
-        EXPECT_NE(contents.find("contiguousApportionedExpertOwners"),
+        EXPECT_NE(contents.find("ownerParticipantByExpert"),
                   std::string::npos)
-            << "Plain LocalTP masked runtime tables must publish owner/resident metadata for every expert.";
+            << "Plain LocalTP masked runtime tables must derive owner/resident metadata from the shared static assignment authority.";
         EXPECT_NE(contents.find("ownerParticipantsFromMap"),
                   std::string::npos)
             << "Overlay masked runtime tables must publish owner/resident metadata from the graph-native owner map.";
-        EXPECT_NE(ffn_body.find("expert_params.my_socket_id = std::max(0, config_.tp_device_idx)"),
+        EXPECT_NE(
+            ffn_body.find(
+                "expert_params.my_socket_id =\n"
+                "                    std::max(0, config_.tp_device_idx)"),
+            std::string::npos)
+            << "Standard LocalTP expert stages must use the participant-local "
+               "graph identity instead of shared mutable TP-context state.";
+        EXPECT_NE(
+            ffn_body.find(
+                "expert_params.participant_count =\n"
+                "                    config_.tp_ctx && config_.tp_ctx->degree() > 0"),
+            std::string::npos)
+            << "Expert stages must carry the typed TP context's full domain size "
+               "for variable 2+ card domains.";
+        EXPECT_NE(ffn_body.find("const auto owner_participants =\n                            routed_expert_ownership::ownerParticipantByExpert"),
                   std::string::npos)
-            << "Standard LocalTP expert stages must not default every participant to id 0.";
-        EXPECT_NE(ffn_body.find("expert_params.participant_count =\n                    local_tp_ctx && local_tp_ctx->degree() > 0"),
-                  std::string::npos)
-            << "Expert stages must carry the full LocalTP domain size for variable 2+ card domains.";
-        EXPECT_NE(ffn_body.find("const auto owner_participants =\n                            contiguousApportionedExpertOwners"),
-                  std::string::npos)
-            << "Standard LocalTP graph-side rebalance must know remote source owners for missing-arrival planning.";
+            << "Standard LocalTP graph-side rebalance must know policy-exact remote source owners for missing-arrival planning.";
         EXPECT_NE(contents.find("update.resident_participant_mask.assign"),
                   std::string::npos)
             << "Masked runtime tables must set resident masks for non-local owner experts, not only local payloads.";
@@ -3188,7 +3465,275 @@ namespace llaminar2::test
             << "ROCm C ABI ready apply must allow resident-only command buffers.";
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DeviceSideRebalanceRunsAtCommittedDecodeBoundary)
+    /**
+     * @test Per-device graph construction never reads LocalTP's mutable current
+     *       participant state.
+     *
+     * RankOrchestrator builds sibling participant graphs concurrently against
+     * one LocalTPContext.  GraphConfig::tp_device_idx is the immutable identity
+     * bound to each graph; calling the polymorphic context's myIndex() here
+     * either races or fails before any participant has selected a device.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         GraphConstructionUsesParticipantLocalTPIdentity)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path qwen35_path =
+            root / "src/v2/models/qwen35/Qwen35Graph.cpp";
+        const fs::path qwen35_moe_path =
+            root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
+        ASSERT_TRUE(fs::exists(qwen35_path)) << qwen35_path;
+        ASSERT_TRUE(fs::exists(qwen35_moe_path)) << qwen35_moe_path;
+
+        const std::string qwen35 = readFile(qwen35_path);
+        const std::string qwen35_moe = readFile(qwen35_moe_path);
+        ASSERT_FALSE(qwen35.empty()) << qwen35_path;
+        ASSERT_FALSE(qwen35_moe.empty()) << qwen35_moe_path;
+
+        EXPECT_EQ(qwen35.find("config.tp_ctx->myIndex()"), std::string::npos)
+            << "GDN graph geometry must use the identity bound to this graph.";
+        EXPECT_NE(qwen35.find("return config.tp_device_idx * n_v_heads;"),
+                  std::string::npos);
+        EXPECT_EQ(qwen35_moe.find("config_.tp_ctx->myIndex()"),
+                  std::string::npos)
+            << "MoE graph construction must not query shared LocalTP current-device state.";
+        EXPECT_NE(qwen35_moe.find("std::max(0, config_.tp_device_idx)"),
+                  std::string::npos);
+        EXPECT_NE(qwen35_moe.find(
+                      "config_.tp_device_idx ==\n"
+                      "                                    canonical_route_root_participant"),
+                  std::string::npos)
+            << "Canonical route ownership must be selected from the participant-local graph identity.";
+    }
+
+    /**
+     * @test ExpertOverlay parity has one production-shaped campaign authority.
+     *
+     * Plan-only topology smokes and backend-pair fixture copies can pass while
+     * the serving graph is broken. Keep topology coverage in the consolidated
+     * real-weight fixture, where every cell also proves compact transport and
+     * emits the normal Hugging Face comparison CSV artifacts.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         ExpertOverlayParityRetiresTopologySmokesAndDuplicateFixtures)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path parity_dir =
+            root / "tests/v2/integration/parity/qwen35moe";
+        const fs::path canonical_path =
+            parity_dir /
+            "Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp";
+        const fs::path cmake_path = root / "tests/v2/CMakeLists.txt";
+        ASSERT_TRUE(fs::exists(canonical_path)) << canonical_path;
+        ASSERT_TRUE(fs::exists(cmake_path)) << cmake_path;
+
+        for (const char *obsolete : {
+                 "Test__Qwen35MoE_ExpertOverlay_Parity.cpp",
+                 "Test__Qwen35MoE_GraphNative_RocmHotCpuCold_Parity.cpp",
+                 "Test__Qwen35MoE_GraphNative_CudaHotRocmWarm_Parity.cpp",
+             })
+        {
+            EXPECT_FALSE(fs::exists(parity_dir / obsolete))
+                << "Superseded ExpertOverlay parity fixture returned: " << obsolete;
+        }
+
+        const std::string canonical = readFile(canonical_path);
+        const std::string cmake = readFile(cmake_path);
+        ASSERT_FALSE(canonical.empty()) << canonical_path;
+        ASSERT_FALSE(cmake.empty()) << cmake_path;
+        EXPECT_EQ(canonical.find("TopologySmoke"), std::string::npos)
+            << "Production ExpertOverlay parity must not admit plan-only topology tests";
+        EXPECT_EQ(canonical.find("ProfilerCpuFallbackRows"), std::string::npos)
+            << "Sparse transport evidence belongs in the real parity forward";
+        EXPECT_NE(
+            canonical.find("assertSparseTransportPerfStatsEvidence();"),
+            std::string::npos)
+            << "Every production cell must prove compact tier traffic through PerfStats";
+        EXPECT_NE(
+            canonical.find("ProductionParity_CUDA_ROCm_CPU"),
+            std::string::npos);
+        EXPECT_NE(canonical.find("ProductionParity_CUDA_CPU"), std::string::npos);
+        EXPECT_NE(canonical.find("ProductionParity_ROCm_CPU"), std::string::npos);
+        EXPECT_NE(canonical.find("ProductionParity_CUDA_ROCm"), std::string::npos);
+
+        for (const char *obsolete_target : {
+                 "v2_integration_parity_qwen35moe_expert_overlay",
+                 "v2_integration_parity_qwen35moe_graphnative_rocm_hot_cpu_cold",
+                 "v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm\n",
+             })
+        {
+            EXPECT_EQ(cmake.find(obsolete_target), std::string::npos)
+                << "Superseded ExpertOverlay CMake target returned: "
+                << obsolete_target;
+        }
+        EXPECT_NE(
+            cmake.find(
+                "PRODUCTION_PERF_STATS_FILTER \"forward_graph,moe_overlay,"),
+            std::string::npos)
+            << "The real campaign must retain sparse transport PerfStats evidence";
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ParityCellsRequireExplicitDynamicMode)
+    {
+        const fs::path parity_path =
+            findRepoRoot() / "tests/v2/integration/parity/ParityTestBase.h";
+        ASSERT_TRUE(fs::exists(parity_path)) << parity_path;
+
+        const std::string parity = readFile(parity_path);
+        ASSERT_FALSE(parity.empty()) << parity_path;
+
+        const size_t declaration =
+            parity.find("MoERebalanceRuntimeConfig moe_rebalance{");
+        ASSERT_NE(declaration, std::string::npos);
+        const size_t declaration_end = parity.find(";", declaration);
+        ASSERT_NE(declaration_end, std::string::npos);
+        const std::string initializer =
+            parity.substr(declaration, declaration_end - declaration);
+        EXPECT_NE(
+            initializer.find(".mode = MoERebalanceRuntimeMode::Off"),
+            std::string::npos)
+            << "Dense and static parity cells must not inherit the production "
+               "Dynamic-MoE default; a cell may exercise maintenance only by "
+               "declaring Dynamic mode explicitly.";
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         ProductionParityUsesAuthenticatedExactPrefillGraphBucket)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path parity_path =
+            root / "tests/v2/integration/parity/ParityTestBase.h";
+        const fs::path qwen_base_path =
+            root / "tests/v2/integration/parity/qwen2/Qwen2ParityTestBase.h";
+        ASSERT_TRUE(fs::exists(parity_path)) << parity_path;
+        ASSERT_TRUE(fs::exists(qwen_base_path)) << qwen_base_path;
+
+        const std::string parity = readFile(parity_path);
+        const std::string qwen_base = readFile(qwen_base_path);
+        EXPECT_NE(
+            parity.find("configureExactProductionParityPrefillGraphBucket()"),
+            std::string::npos);
+        EXPECT_NE(
+            parity.find("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES"),
+            std::string::npos)
+            << "The bounded campaign must capture the authenticated prompt geometry instead of exporting padded rows";
+        EXPECT_NE(
+            qwen_base.find(
+                "configureExactProductionParityPrefillGraphBucket();"),
+            std::string::npos)
+            << "Every Qwen-family production parity fixture must install the exact bucket after authenticating token_ids";
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ParityMovementProofRequiresPayloadCopyBytesAndApply)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path parity_base_path =
+            root / "tests/v2/integration/parity/qwen36/Qwen36MoEParityTestBase.h";
+        const fs::path overlay_path =
+            root / "tests/v2/integration/parity/qwen36/"
+                   "Test__Qwen36MoE_ExpertOverlay_MathParity.cpp";
+        const fs::path cpu_path =
+            root / "tests/v2/integration/parity/qwen35moe/"
+                   "Test__Qwen35MoE_NodeTP_Parity.cpp";
+        ASSERT_TRUE(fs::exists(parity_base_path)) << parity_base_path;
+        ASSERT_TRUE(fs::exists(overlay_path)) << overlay_path;
+        ASSERT_TRUE(fs::exists(cpu_path)) << cpu_path;
+
+        const std::string parity_base = readFile(parity_base_path);
+        const std::string overlay = readFile(overlay_path);
+        const std::string cpu = readFile(cpu_path);
+
+        const size_t movement_start =
+            parity_base.find("inline void expectMoEExpertMovementPositive(");
+        const size_t movement_end =
+            parity_base.find("inline void expectMoEPrefixCachePerfPath(", movement_start);
+        ASSERT_NE(movement_start, std::string::npos);
+        ASSERT_NE(movement_end, std::string::npos);
+        const std::string movement =
+            parity_base.substr(movement_start, movement_end - movement_start);
+        for (const char *counter : {
+                 "weight_transfer_outgoing_entries",
+                 "weight_transfer_incoming_entries",
+                 "mask_apply_received_entries",
+                 "device_rebalance_copy_copied_arrivals",
+                 "device_rebalance_transfer_useful_payload_bytes",
+                 "device_rebalance_apply_applied_arrivals",
+                 "device_rebalance_request_copied_payload_lower_bound",
+                 "device_rebalance_request_applied_payload_lower_bound",
+                 "device_rebalance_request_useful_payload_bytes_lower_bound"})
+        {
+            EXPECT_NE(movement.find(counter), std::string::npos)
+                << "Physical movement proof must consume " << counter;
+        }
+        EXPECT_NE(movement.find("EXPECT_GT(copied_payloads, 0.0)"),
+                  std::string::npos);
+        EXPECT_NE(movement.find("EXPECT_GT(payload_bytes, 0.0)"),
+                  std::string::npos);
+        EXPECT_NE(movement.find("EXPECT_GT(applied_payloads, 0.0)"),
+                  std::string::npos);
+
+        const size_t rebalance_start =
+            parity_base.find("inline void expectMoERebalancePerfPath(");
+        ASSERT_NE(rebalance_start, std::string::npos);
+        const std::string rebalance = parity_base.substr(rebalance_start, 3200);
+        EXPECT_NE(rebalance.find("expectNoMoEExpertMovement(records, context);"),
+                  std::string::npos)
+            << "StaticOwner parity must reject every request-time movement counter";
+        EXPECT_GE(
+            countOccurrences(
+                rebalance,
+                "expectMoEExpertMovementPositive(records, context);"),
+            2u)
+            << "Both LLEP and Dynamic parity must require physical payload movement";
+
+        EXPECT_NE(
+            overlay.find(
+                "expectLLEPExpertPayloadMovementPositive(records, context);"),
+            std::string::npos)
+            << "LLEP campaign parity must require mode-specific payload movement";
+        EXPECT_GE(
+            countOccurrences(
+                overlay,
+                "expectMoEExpertMovementPositive(records, context);"),
+            2u)
+            << "LLEP and Dynamic campaign parity must both require copy/byte/apply evidence";
+        EXPECT_NE(
+            overlay.find("config.moe_rebalance.window_size = 1;"),
+            std::string::npos)
+            << "The bounded campaign must trigger Dynamic maintenance in its authenticated short decode";
+        EXPECT_NE(
+            overlay.find(".llep_enable_balanced_skip = false"),
+            std::string::npos)
+            << "The bounded campaign must force a real LLEP decision instead of relying on a long prompt";
+        EXPECT_NE(
+            overlay.find("expectNoMoEExpertMovement("),
+            std::string::npos)
+            << "Static expert-overlay parity must prove zero movement";
+        EXPECT_NE(
+            cpu.find("cpu_llep_weight_transfer_outgoing_bytes"),
+            std::string::npos);
+        EXPECT_NE(
+            cpu.find("cpu_llep_weight_transfer_incoming_bytes"),
+            std::string::npos)
+            << "CPU LLEP parity must prove real packed expert bytes moved";
+        EXPECT_NE(cpu.find("cpu_native_copy_bytes"), std::string::npos)
+            << "CPU parity must consume the local ExpertOverlay transport byte authority";
+        EXPECT_NE(
+            cpu.find("remote_projection_payload_bytes_completed"),
+            std::string::npos)
+            << "CPU parity must consume the cross-participant ExpertOverlay transport byte authority";
+        EXPECT_NE(cpu.find("EXPECT_EQ(copied_bytes, 0.0)"), std::string::npos)
+            << "Static CPU parity must reject every local and remote migration byte";
+        EXPECT_NE(cpu.find("EXPECT_GT(copied_bytes, 0.0)"), std::string::npos)
+            << "Dynamic CPU parity must prove a committed migration copied real expert bytes";
+        EXPECT_NE(
+            cpu.find("EXPECT_GT(committed_migrations, 0.0)"),
+            std::string::npos)
+            << "Dynamic CPU parity must prove the destination authority committed the move";
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         ExpertOverlayMaintenanceRunsAtCommittedDecodeBoundary)
     {
         const fs::path root = findRepoRoot();
         const fs::path runner_path = root / "src/v2/execution/runner/OrchestrationRunner.cpp";
@@ -3206,6 +3751,9 @@ namespace llaminar2::test
             root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
         const fs::path device_rebalance_stage_path =
             root / "src/v2/execution/compute_stages/stages/MoEDeviceRebalanceStage.cpp";
+        const fs::path decode_commit_stage_path =
+            root / "src/v2/execution/compute_stages/stages/"
+                   "MoEDeviceDecodeCommitBoundaryStage.cpp";
         const fs::path debug_env_path = root / "src/v2/utils/DebugEnv.h";
         const fs::path iface_path = root / "src/v2/execution/local_execution/orchestrators/IInferenceRunner.h";
         const fs::path chat_path = root / "src/v2/app/modes/ChatCompletionHandler.cpp";
@@ -3232,6 +3780,7 @@ namespace llaminar2::test
         ASSERT_TRUE(fs::exists(graph_builder_path)) << graph_builder_path;
         ASSERT_TRUE(fs::exists(qwen_moe_graph_path)) << qwen_moe_graph_path;
         ASSERT_TRUE(fs::exists(device_rebalance_stage_path)) << device_rebalance_stage_path;
+        ASSERT_TRUE(fs::exists(decode_commit_stage_path)) << decode_commit_stage_path;
         ASSERT_TRUE(fs::exists(debug_env_path)) << debug_env_path;
         ASSERT_TRUE(fs::exists(iface_path)) << iface_path;
         ASSERT_TRUE(fs::exists(chat_path)) << chat_path;
@@ -3254,6 +3803,7 @@ namespace llaminar2::test
         const std::string graph_builder = readFile(graph_builder_path);
         const std::string qwen_moe_graph = readFile(qwen_moe_graph_path);
         const std::string device_rebalance_stage = readFile(device_rebalance_stage_path);
+        const std::string decode_commit_stage = readFile(decode_commit_stage_path);
         const std::string debug_env = readFile(debug_env_path);
         const std::string iface = readFile(iface_path);
         const std::string chat = readFile(chat_path);
@@ -3269,6 +3819,7 @@ namespace llaminar2::test
         const std::string server_e2e = readFile(server_e2e_path);
         ASSERT_FALSE(runner.empty()) << runner_path;
         ASSERT_FALSE(dgo.empty()) << dgo_path;
+        ASSERT_FALSE(decode_commit_stage.empty()) << decode_commit_stage_path;
         ASSERT_FALSE(dgo_header.empty()) << dgo_header_path;
         ASSERT_FALSE(rank.empty()) << rank_path;
         ASSERT_FALSE(rank_header.empty()) << rank_header_path;
@@ -3289,7 +3840,6 @@ namespace llaminar2::test
             << expert_overlay_prefix_mtp_path;
         ASSERT_FALSE(server_e2e.empty()) << server_e2e_path;
 
-        EXPECT_NE(iface.find("usesDeviceSideMoERebalanceController() const"), std::string::npos);
         EXPECT_NE(iface.find("drainCompletedDecodeBoundaryMaintenanceDiagnostics()"),
                   std::string::npos)
             << "IInferenceRunner should expose a non-reset epilogue hook for completed async maintenance diagnostics.";
@@ -3300,30 +3850,38 @@ namespace llaminar2::test
         ASSERT_NE(maybe_end, std::string::npos);
         const std::string maybe_body = runner.substr(maybe_start, maybe_end - maybe_start);
 
-        const size_t device_side_gate = maybe_body.find("usesDeviceSideMoERebalanceController()");
-        const size_t host_controller_lookup = maybe_body.find("auto *controller = moeRebalanceController()");
-        const size_t pending_host_publish = maybe_body.find("publishPendingMoERebalanceUpdate()");
-        const size_t host_histogram_sync = maybe_body.find("histogram->syncRuntimeHistograms()");
-        const size_t host_apply = maybe_body.find("applyMoERebalanceWithReplicas()");
-        ASSERT_NE(device_side_gate, std::string::npos);
-        ASSERT_NE(host_controller_lookup, std::string::npos);
-        ASSERT_NE(pending_host_publish, std::string::npos);
-        ASSERT_NE(host_histogram_sync, std::string::npos);
-        ASSERT_NE(host_apply, std::string::npos);
-        EXPECT_LT(device_side_gate, host_controller_lookup)
-            << "The device-side controller path must return before consulting the host controller.";
-        EXPECT_LT(device_side_gate, pending_host_publish)
-            << "The device-side controller must bypass host pending-publish drain.";
-        EXPECT_LT(device_side_gate, host_histogram_sync)
-            << "The device-side controller must bypass host histogram sync.";
-        EXPECT_LT(device_side_gate, host_apply)
-            << "The device-side controller must bypass host publish/apply.";
-        EXPECT_NE(maybe_body.find("pending_moe_rebalance_prepare_.has_value()"), std::string::npos)
-            << "A leftover host-prepared publish in device-side mode is a state-machine bug.";
-        EXPECT_NE(maybe_body.find("pending host-prepared publish while the device-side controller is active"),
-                  std::string::npos);
-        EXPECT_EQ(maybe_body.find("device_side_host_maintenance_skips"), std::string::npos)
-            << "Device-side mode should not pay host-controller/stat bookkeeping overhead.";
+        EXPECT_NE(
+            maybe_body.find("moe_expert_overlay_maintenance_service_"),
+            std::string::npos)
+            << "Every dynamic placement boundary must address the one ExpertOverlay authority service.";
+        EXPECT_NE(
+            maybe_body.find("notifyMaintenanceProgress()"),
+            std::string::npos)
+            << "Host-coordinated inference may only wake its non-blocking background worker.";
+        EXPECT_NE(
+            maybe_body.find(
+                "runner_->maybeApplyDecodeBoundaryMaintenance()"),
+            std::string::npos)
+            << "The homogeneous device executor must enqueue its captured transaction at the same committed boundary.";
+        EXPECT_NE(
+            maybe_body.find(
+                "MoEOverlayAuthorityExecutionKind::\n                        HomogeneousDeviceResident"),
+            std::string::npos);
+        EXPECT_NE(maybe_body.find("{\"blocking\", \"false\"}"),
+                  std::string::npos)
+            << "PerfStats must identify the boundary as wake-only.";
+        for (const char *retired_entry : {
+                 "usesDeviceSideMoERebalanceController()",
+                 "moeRebalanceController()",
+                 "publishPendingMoERebalanceUpdate()",
+                 "histogram->syncRuntimeHistograms()",
+                 "applyMoERebalanceWithReplicas()",
+             })
+        {
+            EXPECT_EQ(maybe_body.find(retired_entry), std::string::npos)
+                << "Committed inference boundaries must not enter retired writer "
+                << retired_entry;
+        }
         EXPECT_NE(dgo.find("ensureGraphStableMoERebalanceTransferOrThrow"), std::string::npos);
         EXPECT_EQ(dgo.find("GPUExpertTransfer::canAccessPeer(primary_device, source_device)"),
                   std::string::npos)
@@ -3624,18 +4182,21 @@ namespace llaminar2::test
             generic_parity.substr(
                 generic_due_helper,
                 generic_drive_helper - generic_due_helper);
-        EXPECT_NE(
+        EXPECT_EQ(
             generic_due_body.find(
                 "activeUsesDeviceSideMoERebalanceController()"),
+            std::string::npos);
+        EXPECT_NE(
+            generic_due_body.find("request_every_decode_steps"),
             std::string::npos)
-            << "A device-owned scheduler needs one committed-boundary tick per decode transaction.";
+            << "Parity maintenance cadence must remain an explicit bounded campaign policy.";
         const size_t long_context_config_start =
             expert_overlay_parity.find(
-                "ExpertOverlayParityConfig longContextConfig(");
+                "ExpertOverlayParityConfig baseConfig(");
         ASSERT_NE(long_context_config_start, std::string::npos);
         const size_t long_context_config_end =
             expert_overlay_parity.find(
-                "const std::vector<ExpertOverlayParityConfig>",
+                "std::vector<ExpertOverlayParityConfig> makeExpertOverlayConfigs()",
                 long_context_config_start);
         ASSERT_NE(long_context_config_end, std::string::npos);
         const std::string long_context_config_body =
@@ -3660,15 +4221,15 @@ namespace llaminar2::test
                "not the historical composite DynamicOwnership mode.";
         EXPECT_NE(
             long_context_config_body.find(
-                "config.moe_rebalance_exercise.enabled = true;"),
+                ".enabled = true,"),
             std::string::npos);
         const size_t long_context_perf_start =
             expert_overlay_parity.find(
-                "void expectLongContextExpertOverlayPerfPath(");
+                "void expectMovementPositiveExpertOverlayPerfPath(");
         ASSERT_NE(long_context_perf_start, std::string::npos);
         const size_t long_context_perf_end =
             expert_overlay_parity.find(
-                "ExpertOverlayParityConfig baseConfig(",
+                "void expectRoutedExpertOwnerSelectionPerfPath(",
                 long_context_perf_start);
         ASSERT_NE(long_context_perf_end, std::string::npos);
         const std::string long_context_perf_body =
@@ -3739,7 +4300,7 @@ namespace llaminar2::test
                "tokenization instead of regenerating unused PyTorch decode evidence.";
         EXPECT_NE(
             qwen36_parity.find(
-                ".target_is_gpu = true"),
+                "ModelPayloadAccessPattern::DeviceStaging"),
             std::string::npos)
             << "Metadata-only GGUF tokenization must remain demand-paged for "
                "large GPU fixtures.";
@@ -3748,40 +4309,40 @@ namespace llaminar2::test
                 "expected_tokens->clear();"),
             std::string::npos)
             << "Model-tokenizer fixtures must not fabricate PyTorch oracle tokens.";
-        const size_t overlay_model_context_start =
+        EXPECT_EQ(
+            expert_overlay_parity.find("getOrCreateOverlayModelContext"),
+            std::string::npos)
+            << "ExpertOverlay parity must not retain a test-owned model-loader cache.";
+        const size_t overlay_runner_start =
             expert_overlay_parity.find(
-                "std::shared_ptr<ModelContext> getOrCreateOverlayModelContext(");
-        ASSERT_NE(overlay_model_context_start, std::string::npos);
-        const size_t overlay_model_context_end =
+                "bool setupProductionOverlayRunner()");
+        ASSERT_NE(overlay_runner_start, std::string::npos);
+        const size_t overlay_runner_end =
             expert_overlay_parity.find(
-                "void evictOverlayPipelineCacheIfNeeded(",
-                overlay_model_context_start);
-        ASSERT_NE(overlay_model_context_end, std::string::npos);
-        const std::string overlay_model_context_body =
+                "bool decodeWorkAvailable()",
+                overlay_runner_start);
+        ASSERT_NE(overlay_runner_end, std::string::npos);
+        const std::string overlay_runner_body =
             expert_overlay_parity.substr(
-                overlay_model_context_start,
-                overlay_model_context_end - overlay_model_context_start);
+                overlay_runner_start,
+                overlay_runner_end - overlay_runner_start);
         EXPECT_NE(
-            overlay_model_context_body.find(
-                ".target_is_gpu = true"),
+            overlay_runner_body.find(
+                "createOrchestrationRunnerFactory()"),
             std::string::npos)
-            << "GPU-only expert-overlay parity must select demand-paged model mmap "
-               "instead of whole-file CPU NUMA first-touch.";
+            << "ExpertOverlay parity must enter the production orchestration factory.";
         EXPECT_NE(
-            overlay_model_context_body.find(
-                ".mpi_ctx = mpi_ctx"),
+            overlay_runner_body.find(
+                "createFromOrchestrationConfig("),
             std::string::npos)
-            << "The GPU model loader should use the active MPI topology rather "
-               "than constructing a test-only single-rank TensorFactory.";
+            << "The production runner must resolve model loading and active MPI topology.";
         EXPECT_NE(
-            overlay_model_context_body.find(
-                "ModelContext::create(config.model_path, model_config)"),
+            overlay_runner_body.find("model_ctx_.reset();"),
             std::string::npos);
         EXPECT_EQ(
-            overlay_model_context_body.find(
-                "ModelContext::create(\n            config.model_path,\n            nullptr"),
+            overlay_runner_body.find("ModelContext::create("),
             std::string::npos)
-            << "The legacy ModelContext factory silently selects CPU first-touch.";
+            << "The parity fixture must not bypass production model loading.";
         const size_t generic_assert_helper =
             generic_parity.find(
                 "void assertParityMoERebalanceExercise(",
@@ -3791,11 +4352,11 @@ namespace llaminar2::test
             generic_parity.substr(
                 generic_drive_helper,
                 generic_assert_helper - generic_drive_helper);
-        EXPECT_NE(
+        EXPECT_EQ(
             generic_drive_body.find(
                 "runner->maybeApplyDecodeBoundaryMaintenance()"),
             std::string::npos)
-            << "Direct parity runners must invoke the same post-commit device maintenance hook as serving.";
+            << "Direct test runners must not revive the retired per-device writer.";
         EXPECT_NE(
             generic_drive_body.find(
                 "orch_runner_->maybeApplyMoERebalance()"),
@@ -3857,7 +4418,7 @@ namespace llaminar2::test
                   std::string::npos)
             << "The committed boundary must tick the device-resident maintenance scheduler without host token metadata.";
         const size_t stable_predicate_start =
-            dgo.find("bool DeviceGraphOrchestrator::usesGraphStableGpuMoERebalance() const");
+            dgo.find("bool DeviceGraphOrchestrator::usesGraphStableMoEOverlayResidency() const");
         ASSERT_NE(stable_predicate_start, std::string::npos);
         const size_t stable_predicate_end =
             dgo.find("uint64_t DeviceGraphOrchestrator::moePlacementEpoch() const",
@@ -3865,41 +4426,37 @@ namespace llaminar2::test
         ASSERT_NE(stable_predicate_end, std::string::npos);
         const std::string stable_predicate =
             dgo.substr(stable_predicate_start, stable_predicate_end - stable_predicate_start);
-        EXPECT_NE(stable_predicate.find("config.moe.rebalance_mode != MoERebalanceMode::DYNAMIC"),
+        EXPECT_NE(stable_predicate.find("usesExpertOverlayDurableResidencyAuthority"),
+                  std::string::npos);
+        EXPECT_NE(stable_predicate.find("MoEOverlayAuthorityExecutionKind::Unresolved"),
                   std::string::npos)
-            << "Graph-stable GPU MoE rebalance must be disabled when durable residency maintenance is off.";
-        EXPECT_NE(stable_predicate.find("domain.usesParticipantAssignedPrefill()"),
-                  std::string::npos)
-            << "Prefill graph admission must consume the routed domain's typed phase policy instead of reinterpreting raw compute-policy enums.";
+            << "graph stability must come from the frozen epoch-address contract";
+        EXPECT_EQ(stable_predicate.find("usesLegacyDurableResidencyAuthority"),
+                  std::string::npos);
 
-        const size_t device_controller_start =
-            dgo.find("bool DeviceGraphOrchestrator::usesDeviceSideMoERebalanceController() const");
+        const size_t device_controller_start = dgo.find(
+            "DeviceGraphOrchestrator::moeOverlayAuthorityExecution() const");
         ASSERT_NE(device_controller_start, std::string::npos);
-        const size_t device_controller_end =
-            dgo.find("uint64_t DeviceGraphOrchestrator::moePlacementEpoch() const",
-                     device_controller_start);
+        const size_t device_controller_end = dgo.find(
+            "DeviceGraphOrchestrator::\n        usesHomogeneousDeviceResidentMoEOverlayAuthority() const",
+            device_controller_start);
         ASSERT_NE(device_controller_end, std::string::npos);
-        const std::string device_controller_predicate =
-            dgo.substr(device_controller_start, device_controller_end - device_controller_start);
-        EXPECT_NE(device_controller_predicate.find("config.moe.rebalance_mode != MoERebalanceMode::DYNAMIC"),
-                  std::string::npos)
-            << "Static/off rebalance must never enter the device-side dynamic controller.";
-        const size_t graph_stable_gate =
-            device_controller_predicate.find("usesGraphStableGpuMoERebalance()");
-        const size_t graph_stable_gate_end =
-            device_controller_predicate.find("const DeviceId primary_device", graph_stable_gate);
-        ASSERT_NE(graph_stable_gate, std::string::npos);
-        ASSERT_NE(graph_stable_gate_end, std::string::npos);
-        const std::string recognized_graph_stable_body =
-            device_controller_predicate.substr(graph_stable_gate_end);
-        EXPECT_EQ(recognized_graph_stable_body.find("return false;"), std::string::npos)
-            << "Once a homogeneous graph-stable GPU domain is recognized, every invalid binding must fail hard instead of selecting host maintenance.";
-        EXPECT_GE(
-            countOccurrences(
-                recognized_graph_stable_body,
-                "host publish/apply fallback is refused"),
-            6u)
-            << "Every post-recognition topology/capability rejection must name the forbidden fallback.";
+        const std::string device_controller_predicate = dgo.substr(
+            device_controller_start,
+            device_controller_end - device_controller_start);
+        EXPECT_NE(
+            device_controller_predicate.find(
+                "usesExpertOverlayDurableResidencyAuthority()"),
+            std::string::npos);
+        EXPECT_NE(
+            device_controller_predicate.find(
+                "moe.authority_execution"),
+            std::string::npos)
+            << "the runner must report the topology-frozen sole authority executor";
+        EXPECT_EQ(
+            device_controller_predicate.find(
+                "usesLegacyDurableResidencyAuthority"),
+            std::string::npos);
         EXPECT_EQ(device_controller_predicate.find("hot_replica_cap <= 0"),
                   std::string::npos)
             << "Homogeneous GPU dynamic rebalance must stay device-owned when --moe-hot-expert-cache is off.";
@@ -3926,7 +4483,7 @@ namespace llaminar2::test
         const size_t maintenance_device_gate =
             maintenance_body.find("!state_.device_id.is_gpu()");
         const size_t maintenance_controller_gate =
-            maintenance_body.find("usesDeviceSideMoERebalanceController()");
+            maintenance_body.find("usesHomogeneousDeviceResidentMoEOverlayAuthority()");
         const size_t maintenance_boundary_timer =
             maintenance_body.find("\"device_maintenance_graph_boundary_enqueue\"");
         ASSERT_NE(maintenance_env_gate, std::string::npos);
@@ -3938,8 +4495,8 @@ namespace llaminar2::test
         EXPECT_LT(maintenance_env_gate, maintenance_dynamic_gate);
         EXPECT_LT(maintenance_dynamic_gate, maintenance_device_gate)
             << "Static/off rebalance must not pay GPU-state or position checks when maintenance env is set.";
-        EXPECT_LT(maintenance_dynamic_gate, maintenance_controller_gate)
-            << "Static/off rebalance must not walk controller/overlay state when maintenance env is set.";
+        EXPECT_LT(maintenance_dynamic_gate, maintenance_boundary_timer)
+            << "Static/off placement must return before any maintenance timing or enqueue work.";
         EXPECT_EQ(debug_env.find("device_rebalance_graph_controller"),
                   std::string::npos)
             << "The retired host-controller selection knob must not return.";
@@ -3967,7 +4524,8 @@ namespace llaminar2::test
         EXPECT_NE(debug_env.find("LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS"),
                   std::string::npos)
             << "The explicit env knob for projected load-spread diagnostics should stay documented.";
-        EXPECT_NE(debug_env.find("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER"),
+        EXPECT_NE(debug_env.find(
+                      "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT"),
                   std::string::npos)
             << "The LLEP useful-work transfer gate should stay documented.";
         EXPECT_NE(debug_env.find("bool allow_legacy_collective_rebalance_transfer = false"),
@@ -3992,8 +4550,52 @@ namespace llaminar2::test
             << "The compact outcome must advance maintenance from committed device metadata.";
         EXPECT_NE(dgo.find("active_cache.segment_cache.ensureCaptureStream"), std::string::npos)
             << "Maintenance must use an explicit graph-capture stream.";
+        for (const char *hosted_fragment : {
+                 "publication->instantiate()",
+                 "acknowledgement->instantiate()",
+             })
+        {
+            EXPECT_NE(dgo.find(hosted_fragment), std::string::npos)
+                << "HIP must instantiate every standalone ticket-scheduler fragment during setup: "
+                << hosted_fragment;
+        }
+        EXPECT_NE(
+            dgo.find(
+                "submitHostScheduledDeviceMoERebalanceKnownNonDueBoundary"),
+            std::string::npos)
+            << "Impossible-due HIP boundaries must remain graph-embedded and D2H-free";
+        EXPECT_EQ(dgo.find("known_non_due->instantiate()"), std::string::npos)
+            << "HIP must not retain a second per-token cadence graph after the complete decode graph owns the edge";
+        const size_t embedded_cadence_append = dgo.find(
+            "appendHostedDeviceMoEDecodeCommitBoundary(");
+        ASSERT_NE(embedded_cadence_append, std::string::npos);
+        EXPECT_NE(
+            dgo.find(
+                "ForwardExecutionRole::MainInference",
+                embedded_cadence_append),
+            std::string::npos)
+            << "Only the ordinary main decode graph may acquire serial cadence ownership";
+        EXPECT_NE(
+            dgo.find(
+                "ForwardExecutionPhase::Decode",
+                embedded_cadence_append),
+            std::string::npos);
+        EXPECT_NE(
+            dgo.find(
+                "createMoEDeviceDecodeCommitBoundary",
+                embedded_cadence_append),
+            std::string::npos)
+            << "The HIP cadence kernels must be a typed production graph stage";
+        const size_t embedded_publish = decode_commit_stage.find(
+            "enqueuePublishSerialDecodeCommitBoundary(");
+        const size_t embedded_ack = decode_commit_stage.find(
+            "enqueueAcknowledgeDecodeCommitBoundary(");
+        ASSERT_NE(embedded_publish, std::string::npos);
+        ASSERT_NE(embedded_ack, std::string::npos);
+        EXPECT_LT(embedded_publish, embedded_ack)
+            << "The complete HIP decode graph must publish before acknowledging a non-due edge";
         const size_t maintenance_scheduler_begin =
-            dgo.find("bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph()");
+            dgo.find("bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph(");
         const size_t maintenance_scheduler_end =
             dgo.find("// =====================================================================\n"
                      "    // IForwardExecutionHost interface implementations",
@@ -4010,24 +4612,27 @@ namespace llaminar2::test
         ASSERT_NE(launch_dependency_declaration, std::string::npos)
             << "Maintenance must express live-state ordering as a typed "
                "captured-executable launch dependency.";
-        EXPECT_NE(maintenance_scheduler.find(
-                      "waitForLiveInferenceStateReadyForObservation(\n"
-                      "                    execution_stream,\n"
-                      "                    \"moe_device_rebalance_maintenance_before_executable_launch\",\n"
-                      "                    DeviceTimelineRole::MoERebalanceMaintenance)"),
-                  std::string::npos)
+        const size_t live_state_wait =
+            maintenance_scheduler.find(
+                "waitForLiveInferenceStateReadyForObservation(");
+        ASSERT_NE(live_state_wait, std::string::npos)
             << "Maintenance must observe every committed device-state producer, including "
                "an all-position MTP verifier whose one-shot logits handoff was already consumed.";
+        const size_t live_state_reason = maintenance_scheduler.find(
+            "\"moe_device_rebalance_maintenance_before_executable_launch\"",
+            live_state_wait);
+        const size_t live_state_role = maintenance_scheduler.find(
+            "DeviceTimelineRole::MoERebalanceMaintenance",
+            live_state_wait);
+        ASSERT_NE(live_state_reason, std::string::npos);
+        ASSERT_NE(live_state_role, std::string::npos);
+        EXPECT_LT(live_state_wait, live_state_reason);
+        EXPECT_LT(live_state_reason, live_state_role)
+            << "The captured launch dependency must retain the typed MoE timeline role";
         EXPECT_EQ(maintenance_scheduler.find(
                       "peekPendingLogitsStream(PendingLogitsStreamRole::MainDecode)"),
                   std::string::npos)
             << "A MainDecode-only dependency recreates the grouped-verifier histogram race.";
-        const size_t live_state_wait =
-            maintenance_scheduler.find(
-                "waitForLiveInferenceStateReadyForObservation(\n"
-                "                    execution_stream,\n"
-                "                    \"moe_device_rebalance_maintenance_before_executable_launch\",\n"
-                "                    DeviceTimelineRole::MoERebalanceMaintenance)");
         const size_t launch_dependency_install =
             maintenance_scheduler.find(
                 "policy.launch_dependency = maintenance_launch_dependency;");
@@ -4042,6 +4647,67 @@ namespace llaminar2::test
             << "The complete live-state join must belong to the installed typed launch hook.";
         EXPECT_LT(launch_dependency_install, maintenance_replay)
             << "The launch hook must be installed before direct replay or first capture can submit work.";
+        const size_t hosted_observer =
+            dgo.find("bool DeviceGraphOrchestrator::observeDeviceMoERebalanceDispatchTicket(");
+        const size_t hosted_observer_wait = dgo.find(
+            "waitForLiveInferenceStateReadyForObservation(",
+            hosted_observer);
+        const size_t hosted_ticket_launch = dgo.find(
+            "cadence_boundary_publication_capture->launchOnStream(",
+            hosted_observer);
+        ASSERT_NE(hosted_observer, std::string::npos);
+        ASSERT_NE(hosted_observer_wait, std::string::npos);
+        ASSERT_NE(hosted_ticket_launch, std::string::npos);
+        EXPECT_LT(hosted_observer_wait, hosted_ticket_launch)
+            << "The authenticated HIP ticket publisher must join committed inference state before sampling cadence";
+        const size_t fast_boundary_begin = dgo.find(
+            "submitHostScheduledDeviceMoERebalanceKnownNonDueBoundary()");
+        const size_t fast_boundary_end = dgo.find(
+            "bool DeviceGraphOrchestrator::observeDeviceMoERebalanceDispatchTicket(",
+            fast_boundary_begin);
+        ASSERT_NE(fast_boundary_begin, std::string::npos);
+        ASSERT_NE(fast_boundary_end, std::string::npos);
+        const std::string fast_boundary = dgo.substr(
+            fast_boundary_begin,
+            fast_boundary_end - fast_boundary_begin);
+        EXPECT_NE(
+            fast_boundary.find(
+                "hosted_decode_commit_boundary_embedded"),
+            std::string::npos)
+            << "The host no-op requires immutable proof that the decode graph owns cadence";
+        for (const char *forbidden_fast_boundary_work : {
+                 "launchOnStream(",
+                 "recordEvent(",
+                 "waitForLiveInferenceStateReadyForObservation(",
+                 "deviceToHostOnStream(",
+             })
+        {
+            EXPECT_EQ(
+                fast_boundary.find(forbidden_fast_boundary_work),
+                std::string::npos)
+                << "A proven non-due HIP boundary must do no standalone work: "
+                << forbidden_fast_boundary_work;
+        }
+        EXPECT_EQ(
+            fast_boundary.find(
+                "releaseMoEOverlayEpochForExternalTransaction"),
+            std::string::npos)
+            << "A cadence-only HIP boundary does not write placement and must keep the RCU reader acquired";
+        EXPECT_NE(
+            dgo.find("\"hosted_device_moe_rebalance_due_ticket\""),
+            std::string::npos)
+            << "Only an authenticated due ticket may publish the overlay release edge";
+        EXPECT_NE(dgo.find("ticket.dispatchAction()"), std::string::npos)
+            << "HIP cadence bytes must decode through the shared typed ABI truth table";
+        EXPECT_NE(
+            dgo.find("DeviceMoERebalanceDispatchAction::None"),
+            std::string::npos)
+            << "An already-acknowledged serial boundary must be a typed no-op";
+        EXPECT_NE(
+            dgo.find(
+                "device_moe_rebalance_idle_ticket_acknowledgements_elided"),
+            std::string::npos)
+            << "PerfStats must prove that idle ticket observations launch no acknowledgement graph";
         const std::string steady_dependency_region =
             maintenance_scheduler.substr(
                 launch_dependency_declaration,
@@ -4340,26 +5006,21 @@ namespace llaminar2::test
 
         const size_t generate_start = runner.find("GenerationResult OrchestrationRunner::generate(");
         ASSERT_NE(generate_start, std::string::npos);
-        const size_t generate_end = runner.find("bool OrchestrationRunner::maybeApplyMoERebalance()",
-                                                generate_start);
+        const size_t generate_end = runner.find(
+            "bool OrchestrationRunner::maybeApplyMoERebalance()",
+            generate_start);
         ASSERT_NE(generate_end, std::string::npos);
         const std::string generate_body = runner.substr(generate_start, generate_end - generate_start);
 
         const size_t maintenance_call =
             generate_body.find("if (!maybeApplyMoERebalance())");
-        const size_t epilogue_device_side_gate =
-            generate_body.rfind("if (usesDeviceSideMoERebalanceController())");
-        const size_t epilogue_host_publish =
-            generate_body.rfind("publishPendingMoERebalanceUpdate()");
         ASSERT_NE(maintenance_call, std::string::npos)
             << "Every completed serial or MTP transaction must enter the shared decode-boundary maintenance hook.";
-        EXPECT_EQ(generate_body.find("!device_side_moe_rebalance && !maybeApplyMoERebalance()"),
+        EXPECT_EQ(generate_body.find("usesDeviceSideMoERebalanceController"),
+                  std::string::npos);
+        EXPECT_EQ(generate_body.find("publishPendingMoERebalanceUpdate"),
                   std::string::npos)
-            << "MTP must not skip captured device maintenance merely because the controller is device-owned.";
-        ASSERT_NE(epilogue_device_side_gate, std::string::npos);
-        ASSERT_NE(epilogue_host_publish, std::string::npos);
-        EXPECT_LT(epilogue_device_side_gate, epilogue_host_publish)
-            << "The decode epilogue must not drain host pending publishes in device-side mode.";
+            << "Generation epilogues must not publish a second placement authority.";
 
         const size_t chat_rebalance_helper =
             chat.find("bool runChatMoERebalanceMaintenance(");
@@ -4382,9 +5043,34 @@ namespace llaminar2::test
         EXPECT_NE(chat.find("runChatMoERebalanceMaintenance(runner_)"),
                   std::string::npos)
             << "Chat decode loops and epilogues must use the shared committed-boundary hook.";
-        EXPECT_NE(runner.find("runner_->maybeApplyDecodeBoundaryMaintenance()"),
-                  std::string::npos)
-            << "Device-owned rebalance must schedule its captured maintenance graph instead of becoming a no-op.";
+        const size_t maintenance_boundary_start = runner.find(
+            "bool OrchestrationRunner::maybeApplyMoERebalance()",
+            generate_end);
+        ASSERT_NE(maintenance_boundary_start, std::string::npos);
+        const size_t maintenance_boundary_end = runner.find(
+            "const RankExecutionPlan &OrchestrationRunner::executionPlan()",
+            maintenance_boundary_start);
+        ASSERT_NE(maintenance_boundary_end, std::string::npos);
+        const std::string maintenance_boundary_body = runner.substr(
+            maintenance_boundary_start,
+            maintenance_boundary_end - maintenance_boundary_start);
+        const size_t device_authority_selection =
+            maintenance_boundary_body.find(
+                "usesHomogeneousGpuDeviceResidentMoEOverlayAuthority()");
+        const size_t device_maintenance_launch =
+            maintenance_boundary_body.find(
+                "runner_->maybeApplyDecodeBoundaryMaintenance()");
+        ASSERT_NE(device_authority_selection, std::string::npos);
+        ASSERT_NE(device_maintenance_launch, std::string::npos)
+            << "The topology-selected captured authority must own the ordinary "
+               "committed-boundary launch.";
+        EXPECT_LT(device_authority_selection, device_maintenance_launch);
+        EXPECT_NE(
+            maintenance_boundary_body.find(
+                "device_generation_embedded_moe_maintenance_pending_ack_"),
+            std::string::npos)
+            << "A resident MTP parent must acknowledge its embedded maintenance "
+               "without replaying an outer graph.";
         EXPECT_NE(dgo.find("DeviceGraphOrchestrator::maybeApplyDecodeBoundaryMaintenance()"),
                   std::string::npos)
             << "A device runner must launch maintenance only after the verifier transaction closes.";
@@ -4393,23 +5079,23 @@ namespace llaminar2::test
             << "LocalTP needs a rank-level maintenance fanout.";
         EXPECT_NE(rank.find("tp_worker_pool_->dispatch("), std::string::npos)
             << "LocalTP maintenance participants must enter NCCL/RCCL and host rendezvous concurrently.";
-        const size_t benchmark_post_warmup =
-            benchmark.find("benchmark.setPostWarmupCallback");
-        ASSERT_NE(benchmark_post_warmup, std::string::npos);
-        const size_t benchmark_device_side_gate =
-            benchmark.find("orch_runner->usesDeviceSideMoERebalanceController()", benchmark_post_warmup);
-        const size_t benchmark_host_apply =
-            benchmark.find("orch_runner->applyMoERebalanceWithReplicas", benchmark_post_warmup);
-        ASSERT_NE(benchmark_device_side_gate, std::string::npos);
-        ASSERT_NE(benchmark_host_apply, std::string::npos);
-        EXPECT_LT(benchmark_device_side_gate, benchmark_host_apply)
-            << "Benchmark post-warmup setup must not call host publish/apply when the graph controller owns rebalance.";
-        EXPECT_NE(benchmark.find("device-side graph controller owns publish/apply"), std::string::npos);
-        EXPECT_NE(runner.find("drainPendingMoERebalanceBeforeCacheClear()"), std::string::npos)
-            << "clearCache() must drain prepared MoE publishes before request/session reset.";
-        EXPECT_NE(qwen36_parity.find("applyHostMoERebalanceIfNeeded"), std::string::npos);
-        EXPECT_NE(qwen36_parity.find("runner.usesDeviceSideMoERebalanceController()"), std::string::npos)
-            << "Parity direct decode loops must skip host rebalance maintenance in device-side mode.";
+        EXPECT_EQ(benchmark.find("benchmark.setPostWarmupCallback"),
+                  std::string::npos)
+            << "Benchmarks must exercise the same live background authority as serving.";
+        EXPECT_EQ(benchmark.find("applyMoERebalanceWithReplicas"),
+                  std::string::npos);
+        EXPECT_NE(benchmark.find("persistent ticketed"), std::string::npos)
+            << "Bucket policy must document why dynamic placement no longer invalidates capture.";
+        EXPECT_EQ(runner.find("drainPendingMoERebalanceBeforeCacheClear"), std::string::npos)
+            << "Request reset cannot own a second durable placement publisher.";
+        EXPECT_NE(runner.find("resetUnderlyingRunnerRequestState"), std::string::npos)
+            << "Request-owned data still needs an explicit non-placement reset contract.";
+        EXPECT_NE(
+            qwen36_parity.find("applyMoEOverlayMaintenanceIfNeeded"),
+            std::string::npos)
+            << "Production parity loops must invoke the universal authority boundary.";
+        EXPECT_EQ(qwen36_parity.find("applyHostMoERebalanceIfNeeded"),
+                  std::string::npos);
         EXPECT_EQ(qwen36_parity.find("runner->maybeApplyMoERebalance()"), std::string::npos)
             << "Qwen3.6 parity loops should not bypass the device-side maintenance gate.";
         EXPECT_NE(server_e2e.find("prefix-cache-rebalance-clear-probe"), std::string::npos)
@@ -4694,7 +5380,8 @@ namespace llaminar2::test
         EXPECT_LT(publish, return_true);
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, Qwen35MoEResetRestoresInitialRuntimePlacementBanks)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         Qwen35MoEResetPreservesDurableAndRestoresTransientPlacementBanks)
     {
         const fs::path root = findRepoRoot();
         const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
@@ -4726,15 +5413,26 @@ namespace llaminar2::test
         ASSERT_NE(reset_end, std::string::npos);
         const std::string reset_body = contents.substr(reset_start, reset_end - reset_start);
 
-        EXPECT_NE(reset_body.find("restoreInitialRuntimeState(execution_stream)"), std::string::npos)
-            << "Request-boundary reset must restore canonical MoE placement so "
-               "portable prefix blocks replay suffix prefill under the same "
-               "logical expert ownership used by an uncached full prefill.";
+        EXPECT_NE(reset_body.find("!table->usesOverlayEpochTicket()"),
+                  std::string::npos)
+            << "Request-boundary reset must distinguish request-transient "
+               "placement from model-lifetime ExpertOverlay RCU state.";
+        EXPECT_NE(
+            reset_body.find(
+                "table->overlayPlacementSource() != nullptr"),
+            std::string::npos)
+            << "A ticket-pinned CurrentBatchLLEP child remains request-local "
+               "even though its durable parent survives reset.";
+        EXPECT_NE(reset_body.find("restoreInitialRuntimeState(execution_stream)"),
+                  std::string::npos)
+            << "Request-boundary reset must restore the immutable baseline for "
+               "request-transient CurrentBatchLLEP placement.";
         EXPECT_EQ(reset_body.find("restoreInitialRuntimeState()"), std::string::npos)
             << "GPU model reset must never select an implicit stream.";
-        EXPECT_NE(reset_body.find("resetRequestPublications(execution_stream)"), std::string::npos)
-            << "Runtime placement and transfer-directory occupancy are one "
-               "stream-ordered reset transaction.";
+        EXPECT_EQ(reset_body.find("resetRequestPublications(execution_stream)"),
+                  std::string::npos)
+            << "A request reset must not erase a transfer-directory descriptor "
+               "that is still selected by the durable placement epoch.";
         EXPECT_EQ(reset_body.find("resetDecodeRuntimeState("), std::string::npos)
             << "Clearing runtime placement banks during session reset makes "
                "the next GPU decode route fall back to host/top-k state or fail "
@@ -5156,7 +5854,7 @@ namespace llaminar2::test
             moe_cpp.find("const bool use_fixed_topology_grouped_prefill");
         ASSERT_NE(fixed_prefill_start, std::string::npos);
         const size_t fixed_prefill_end =
-            moe_cpp.find("// Zero the output buffer via tensor-aware kernel",
+            moe_cpp.find("const bool forced_verifier_decode_replay =",
                          fixed_prefill_start);
         ASSERT_NE(fixed_prefill_end, std::string::npos);
         const std::string fixed_prefill_body =
@@ -5717,9 +6415,9 @@ namespace llaminar2::test
         EXPECT_NE(graph.find("for (int scan_layer = 0;"),
                   std::string::npos)
             << "Decode-maintenance allocation capacity must be derived from every model layer";
-        EXPECT_NE(graph.find("scan_layer < runtime_table_layers"),
+        EXPECT_NE(graph.find("scan_layer < bound_runtime_table_layers"),
                   std::string::npos)
-            << "The model format preflight must cover the full runtime-table layer domain";
+            << "The model format preflight must cover the complete materialized runtime-table domain, including MTP layers";
         EXPECT_NE(graph.find("DeviceMoETransferSlotDirectory::profileForLayerFormats"),
                   std::string::npos)
             << "Qwen MoE graph construction must merge exact layer formats into one explicit profile";
@@ -6128,40 +6826,55 @@ namespace llaminar2::test
                   std::string::npos)
             << "A failed capture must stop inference rather than selectively replaying stages";
 
-        const size_t single_capture_start =
+        const size_t capture_recorder_start =
             executor.find(
-                "bool DeviceGraphExecutor::executeWithGraphCapture(");
-        const size_t decode_policy_start =
+                "bool DeviceGraphExecutor::recordGraphCaptureBody(");
+        const size_t retained_capture_start =
             executor.find(
-                "bool DeviceGraphExecutor::executeDecodeWithCapturePolicy(",
-                single_capture_start);
-        ASSERT_NE(single_capture_start, std::string::npos);
-        ASSERT_NE(decode_policy_start, std::string::npos);
-        const std::string single_capture =
+                "bool DeviceGraphExecutor::captureRetainedGraphFragment(",
+                capture_recorder_start);
+        ASSERT_NE(capture_recorder_start, std::string::npos);
+        ASSERT_NE(retained_capture_start, std::string::npos);
+        const std::string capture_recorder =
             executor.substr(
-                single_capture_start,
-                decode_policy_start - single_capture_start);
+                capture_recorder_start,
+                retained_capture_start - capture_recorder_start);
         const size_t finish =
-            single_capture.find("capture_transaction.finish();");
+            capture_recorder.find("capture_transaction.finish();");
         const size_t execution_failure =
-            single_capture.find("if (!exec_success)", finish);
+            capture_recorder.find("if (!exec_success)", finish);
         ASSERT_NE(finish, std::string::npos);
         ASSERT_NE(execution_failure, std::string::npos);
         EXPECT_LT(finish, execution_failure)
             << "The native stream must leave capture mode before stage failure propagates";
-        EXPECT_EQ(single_capture.find(
+        EXPECT_EQ(capture_recorder.find(
                       "if (!exec_success || !capture->endCapture())"),
                   std::string::npos)
             << "Short-circuit evaluation must never skip endCapture after a stage failure";
-        EXPECT_NE(single_capture.find("if (capture->nodeCount() == 0)"),
+        EXPECT_NE(capture_recorder.find("if (capture->nodeCount() == 0u)"),
                   std::string::npos);
-        EXPECT_NE(single_capture.find(
-                      "zero nodes; refusing capture-time eager execution"),
+        EXPECT_NE(capture_recorder.find(
+                      "produced zero nodes; refusing capture-time eager execution"),
                   std::string::npos)
             << "A selected graph path must reject zero-node capture instead of accepting capture-time eager work";
-        EXPECT_EQ(single_capture.find("Skipping graph replay"),
+        EXPECT_EQ(capture_recorder.find("Skipping graph replay"),
                   std::string::npos)
             << "Zero-node capture must never be treated as successful execution";
+
+        const size_t immediate_capture_start = executor.find(
+            "bool DeviceGraphExecutor::executeWithGraphCapture(",
+            retained_capture_start);
+        const size_t decode_policy_start = executor.find(
+            "bool DeviceGraphExecutor::executeDecodeWithCapturePolicy(",
+            immediate_capture_start);
+        ASSERT_NE(immediate_capture_start, std::string::npos);
+        ASSERT_NE(decode_policy_start, std::string::npos);
+        const std::string immediate_capture = executor.substr(
+            immediate_capture_start,
+            decode_policy_start - immediate_capture_start);
+        EXPECT_NE(immediate_capture.find("recordGraphCaptureBody("),
+                  std::string::npos)
+            << "Immediate replay must use the same structural recorder as retained child composition";
 
         EXPECT_NE(
             controller.find(
@@ -6562,6 +7275,8 @@ namespace llaminar2::test
             root / "src/v2/execution/moe/MoERuntimeTable.h";
         const fs::path expert_stage_path =
             root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        const fs::path current_batch_stage_path =
+            root / "src/v2/execution/compute_stages/stages/MoEGPUCurrentBatchLLEPStage.cpp";
         const fs::path orchestrator_path =
             root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
         const fs::path graph_interface_path =
@@ -6583,6 +7298,8 @@ namespace llaminar2::test
         ASSERT_TRUE(fs::exists(controller_path)) << controller_path;
         ASSERT_TRUE(fs::exists(runtime_path)) << runtime_path;
         ASSERT_TRUE(fs::exists(expert_stage_path)) << expert_stage_path;
+        ASSERT_TRUE(fs::exists(current_batch_stage_path))
+            << current_batch_stage_path;
         ASSERT_TRUE(fs::exists(orchestrator_path)) << orchestrator_path;
         ASSERT_TRUE(fs::exists(graph_interface_path)) << graph_interface_path;
         ASSERT_TRUE(fs::exists(qwen_graph_path)) << qwen_graph_path;
@@ -6597,6 +7314,8 @@ namespace llaminar2::test
         const std::string controller = readFile(controller_path);
         const std::string runtime = readFile(runtime_path);
         const std::string expert_stage = readFile(expert_stage_path);
+        const std::string current_batch_stage =
+            readFile(current_batch_stage_path);
         const std::string orchestrator = readFile(orchestrator_path);
         const std::string graph_interface = readFile(graph_interface_path);
         const std::string qwen_graph = readFile(qwen_graph_path);
@@ -6634,11 +7353,32 @@ namespace llaminar2::test
                       "\"device_rebalance_prefill_current_batch_non_owner_assignment_layers\""),
                   std::string::npos)
             << "Resident row evidence must reach request-final PerfStats";
+        EXPECT_NE(orchestrator.find(
+                      "\"device_rebalance_request_copied_payload_lower_bound\""),
+                  std::string::npos)
+            << "Request-final PerfStats must retain copied payload evidence after rolling wave reuse";
+        EXPECT_NE(orchestrator.find(
+                      "\"device_rebalance_request_applied_payload_lower_bound\""),
+                  std::string::npos)
+            << "Request-final PerfStats must independently retain apply evidence";
+        EXPECT_NE(orchestrator.find(
+                      "\"device_rebalance_request_useful_payload_bytes_lower_bound\""),
+                  std::string::npos)
+            << "Request-final PerfStats must prove nonzero whole-expert payload bytes";
         EXPECT_NE(
             graph_interface.find(
                 "DeviceMoECurrentBatchLLEPEvidenceSource"),
             std::string::npos)
             << "Model graphs must expose one typed device-owned evidence source";
+        EXPECT_NE(
+            graph_interface.find("uint64_t expert_payload_slot_bytes = 0;"),
+            std::string::npos)
+            << "The typed LLEP evidence source must carry an immutable whole-expert byte extent";
+        EXPECT_NE(
+            orchestrator.find(
+                "llep_evidence_source.expert_payload_slot_bytes"),
+            std::string::npos)
+            << "Terminal LLEP evidence must convert applied layer markers into physical-byte lower bounds";
         EXPECT_NE(
             qwen_graph.find(
                 "GraphSideRebalanceBindingRole::CurrentBatchLLEPTransfer"),
@@ -6672,7 +7412,8 @@ namespace llaminar2::test
             std::string::npos)
             << "Ambiguous current-batch evidence sources must be diagnosed";
         EXPECT_NE(
-            qwen_graph.find("canonical runtime table for "),
+            qwen_graph.find(
+                "canonical runtime table or expert payload extent for "),
             std::string::npos)
             << "Unordered or ambiguous runtime-table selection must fail hard";
         EXPECT_NE(
@@ -6708,12 +7449,11 @@ namespace llaminar2::test
                       "\"device_rebalance_prefill_current_batch_non_owner_assignment_layers\""),
                   std::string::npos)
             << "Parity must accept applied resident-row work without inventing a payload transfer";
-        EXPECT_NE(expert_stage.find(
-                      "params_.prefill_llep_rebalance_config\n"
-                      "                            .min_wave_spread_improvement_per_payload_slot"),
+        EXPECT_NE(current_batch_stage.find(
+                      "params_.config.min_wave_spread_improvement_per_payload_slot"),
                   std::string::npos)
-            << "Current-batch planning must use the graph-owned typed economy policy";
-        EXPECT_EQ(expert_stage.find(
+            << "The explicit current-batch planner must use graph-owned economy policy";
+        EXPECT_EQ(current_batch_stage.find(
                       "moe_env\n"
                       "                                    .device_rebalance_min_wave_spread_improvement_per_payload_slot"),
                   std::string::npos)
@@ -6815,7 +7555,7 @@ namespace llaminar2::test
             << "LLEP observability must reuse the exact terminal-result event";
 
         const size_t diagnostic_start = orchestrator.find(
-            "publishSnapshotCurrentBatchLLEPEvidenceDiagnostics()");
+            "publishTerminalCurrentBatchLLEPEvidenceDiagnostics()");
         ASSERT_NE(diagnostic_start, std::string::npos);
         const size_t diagnostic_end = orchestrator.find(
             "drainCompletedDecodeBoundaryMaintenanceDiagnostics()",
@@ -6826,13 +7566,15 @@ namespace llaminar2::test
             diagnostic_end - diagnostic_start);
         EXPECT_NE(
             diagnostic.find(
-                "!snapshot_enabled_ || !PerfStatsCollector::isEnabled()"),
+                "!PerfStatsCollector::isEnabled()"),
             std::string::npos)
-            << "The extra diagnostic readback must be impossible in production";
+            << "The terminal diagnostic readback must require explicit PerfStats";
+        EXPECT_EQ(diagnostic.find("snapshot_enabled_"), std::string::npos)
+            << "Release PerfStats must prove LLEP movement without a snapshot build";
         EXPECT_NE(
             diagnostic.find("DeviceTimelineRole::Diagnostics"),
             std::string::npos)
-            << "Snapshot evidence must consume the explicit forward-output event";
+            << "Terminal evidence must consume the explicit forward-output event";
     }
 
     /**
@@ -7002,7 +7744,7 @@ namespace llaminar2::test
             << "Each path uses total slots for both config addressability and directory allocation";
 
         EXPECT_NE(
-            abi.find("kVersion = 10u"),
+            abi.find("kVersion = 11u"),
             std::string::npos);
         EXPECT_NE(
             abi.find("kConfigBytes = 140u"),
@@ -7175,10 +7917,23 @@ namespace llaminar2::test
                 << backend
                 << " each physical-slot lease must carry a compare-and-replace generation";
             EXPECT_NE(source->find(
+                          "build_transfer_slot_claim_index_kernel("),
+                      std::string::npos)
+                << backend
+                << " projection must build one fresh reverse index over every "
+                   "active runtime claim";
+            EXPECT_NE(source->find(
+                          "rebalance_transfer_slot_claim_index_ok("),
+                      std::string::npos)
+                << backend
+                << " projection must reject incomplete, malformed, or duplicate "
+                   "transfer-slot claims before leasing storage";
+            EXPECT_EQ(source->find(
                           "rebalance_any_active_runtime_claims_slot("),
                       std::string::npos)
                 << backend
-                << " physical storage must remain protected while any active bank references it";
+                << " slot leasing must not rescan every layer and expert for "
+                   "each candidate slot";
             EXPECT_NE(source->find(
                           "rebalance_transfer_slot_copy_complete_for_plan("),
                       std::string::npos)
@@ -7481,13 +8236,20 @@ namespace llaminar2::test
         const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
         const fs::path stage_path =
             root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        const fs::path current_batch_stage_path =
+            root / "src/v2/execution/compute_stages/stages/MoEGPUCurrentBatchLLEPStage.cpp";
         ASSERT_TRUE(fs::exists(graph_path)) << graph_path;
         ASSERT_TRUE(fs::exists(stage_path)) << stage_path;
+        ASSERT_TRUE(fs::exists(current_batch_stage_path))
+            << current_batch_stage_path;
 
         const std::string graph = readFile(graph_path);
         const std::string stage = readFile(stage_path);
+        const std::string current_batch_stage =
+            readFile(current_batch_stage_path);
         ASSERT_FALSE(graph.empty()) << graph_path;
         ASSERT_FALSE(stage.empty()) << stage_path;
+        ASSERT_FALSE(current_batch_stage.empty()) << current_batch_stage_path;
 
         EXPECT_EQ(graph.find("LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE"),
                   std::string::npos)
@@ -7502,9 +8264,18 @@ namespace llaminar2::test
             << "Graph lowering must consume the typed prefill economy boundary.";
         EXPECT_NE(
             graph.find(
-                "if (llep_prefill_enabled && !llep_prefill_transport_supported)"),
+                "if (gpu_llep_prefill_candidate &&\n"
+                "            !llep_prefill_transport_supported)"),
             std::string::npos)
-            << "Requested LLEP must fail hard when full graph transport is unavailable.";
+            << "Requested GPU LLEP must fail hard when full graph transport is unavailable.";
+        EXPECT_NE(
+            graph.find(
+                "if (llep_prefill_requested &&\n"
+                "            llep_prefill_cost_gate_passed &&\n"
+                "            !llep_prefill_enabled)"),
+            std::string::npos)
+            << "Requested CPU or GPU LLEP must fail hard when no production "
+               "transaction authority exists.";
         EXPECT_NE(graph.find("kPrefillLLEPTransferWorkspaceLanes"),
                   std::string::npos)
             << "Current-batch LLEP needs a bounded persistent workspace ring.";
@@ -7564,13 +8335,54 @@ namespace llaminar2::test
         EXPECT_EQ(stage.find("assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers"),
                   std::string::npos)
             << "Resident decode assignment must not create a foreign transfer plan.";
-        EXPECT_NE(stage.find("assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers"),
+        EXPECT_EQ(stage.find("assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers"),
                   std::string::npos)
-            << "Full transfer-backed prefill LLEP must use the after-transfer apply kernel.";
-        EXPECT_NE(stage.find("requestsTransferBackedCurrentBatchPrefillLLEP"),
+            << "The expert stage must not retain a hidden current-batch transport path.";
+        EXPECT_NE(stage.find("usesGraphPhasedCurrentBatchPrefillLLEP"),
                   std::string::npos)
-            << "Current-batch migration must be selected by an explicit typed "
-               "graph-build policy, not inferred from nullable transport pointers.";
+            << "Expert compute must consume, but never produce, graph-phased assignment.";
+        const size_t movement_begin = stage.find(
+            "executePrefixRuntimeRehydrationPayloadMovement(");
+        const size_t movement_end = stage.find(
+            "bool MoEExpertComputeStage::executeFixedTopologyGroupedPrefill(",
+            movement_begin);
+        ASSERT_NE(movement_begin, std::string::npos);
+        ASSERT_NE(movement_end, std::string::npos);
+        const std::string movement_body =
+            stage.substr(movement_begin, movement_end - movement_begin);
+        EXPECT_EQ(
+            movement_body.find(
+                "materializePrefillLeastLoadedMirroredDomainCommands("),
+            std::string::npos)
+            << "The prefix-only composite must not retain ordinary current-batch planning.";
+        EXPECT_EQ(
+            countOccurrences(movement_body, "allgatherRawOnStream("),
+            3u)
+            << "Prefix rehydration owns its two metadata gathers and one payload gather.";
+
+        EXPECT_NE(
+            current_batch_stage.find(
+                "materializePrefillLeastLoadedMirroredDomainCommands("),
+            std::string::npos)
+            << "Symmetric current-batch plans must materialize the complete "
+               "participant-major command envelope locally.";
+        EXPECT_NE(
+            current_batch_stage.find(
+                "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers("),
+            std::string::npos)
+            << "The explicit apply phase must publish assignment after arrivals.";
+        EXPECT_EQ(
+            current_batch_stage.find("allgatherRawOnStream("),
+            std::string::npos)
+            << "Current-batch plan/apply phases must never launch a hidden collective.";
+        EXPECT_NE(
+            graph.find("moe_current_batch_llep_payload"),
+            std::string::npos)
+            << "The graph must carry current-batch payloads through a named TP sideband.";
+        EXPECT_NE(
+            graph.find("takeCurrentBatchLLEPPayloadSideband()"),
+            std::string::npos)
+            << "The sideband must attach to the production shared-expert allreduce.";
         EXPECT_NE(graph.find("const bool current_batch_llep_transfer_candidate"),
                   std::string::npos)
             << "The graph must name current-batch migration independently from "
@@ -7590,6 +8402,8 @@ namespace llaminar2::test
         const fs::path rocm_path = root / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp";
         const fs::path expert_stage_path =
             root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        const fs::path current_batch_stage_path =
+            root / "src/v2/execution/compute_stages/stages/MoEGPUCurrentBatchLLEPStage.cpp";
         const fs::path maintenance_stage_path =
             root / "src/v2/execution/compute_stages/stages/MoEDeviceRebalanceStage.cpp";
         const fs::path graph_path =
@@ -7600,6 +8414,7 @@ namespace llaminar2::test
                  cuda_path,
                  rocm_path,
                  expert_stage_path,
+                 current_batch_stage_path,
                  maintenance_stage_path,
                  graph_path})
         {
@@ -7610,12 +8425,15 @@ namespace llaminar2::test
         const std::string cuda_source = readFile(cuda_path);
         const std::string rocm_source = readFile(rocm_path);
         const std::string expert_stage_source = readFile(expert_stage_path);
+        const std::string current_batch_stage_source =
+            readFile(current_batch_stage_path);
         const std::string maintenance_stage_source = readFile(maintenance_stage_path);
         const std::string graph_source = readFile(graph_path);
         ASSERT_FALSE(interface_source.empty());
         ASSERT_FALSE(cuda_source.empty());
         ASSERT_FALSE(rocm_source.empty());
         ASSERT_FALSE(expert_stage_source.empty());
+        ASSERT_FALSE(current_batch_stage_source.empty());
         ASSERT_FALSE(maintenance_stage_source.empty());
         ASSERT_FALSE(graph_source.empty());
 
@@ -7641,7 +8459,7 @@ namespace llaminar2::test
         }
 
         const size_t llep_begin = expert_stage_source.find(
-            "bool MoEExpertComputeStage::executeTransferBackedPrefillLLEPMovement");
+            "executePrefixRuntimeRehydrationPayloadMovement(");
         const size_t llep_end = expert_stage_source.find(
             "bool MoEExpertComputeStage::executeFixedTopologyGroupedPrefill",
             llep_begin);
@@ -7666,6 +8484,29 @@ namespace llaminar2::test
             << "Prefill LLEP must not introduce a full-device synchronization.";
         EXPECT_EQ(llep_body.find("StreamSynchronize"), std::string::npos)
             << "Prefill LLEP must not introduce a host stream synchronization.";
+
+        EXPECT_NE(
+            current_batch_stage_source.find(
+                "const MoEKernelLaunchContext launch"),
+            std::string::npos)
+            << "Both explicit current-batch phases must launch on their exact graph stream.";
+        EXPECT_EQ(
+            current_batch_stage_source.find("allgatherRawOnStream("),
+            std::string::npos)
+            << "The model TP stage, not either local phase, owns the sideband collective.";
+        EXPECT_EQ(
+            current_batch_stage_source.find("recordEventChecked"),
+            std::string::npos)
+            << "Graph dependencies already provide plan/collective/apply ordering.";
+        EXPECT_EQ(
+            current_batch_stage_source.find("synchronizeStream"),
+            std::string::npos);
+        EXPECT_EQ(
+            current_batch_stage_source.find("DeviceSynchronize"),
+            std::string::npos);
+        EXPECT_EQ(
+            current_batch_stage_source.find("StreamSynchronize"),
+            std::string::npos);
 
         const size_t trace_begin = expert_stage_source.find(
             "bool tracePrefillLLEPStatus(");
@@ -7742,9 +8583,15 @@ namespace llaminar2::test
             expert_stage_source.substr(
                 llep_prepare_begin,
                 llep_prepare_end - llep_prepare_begin);
-        EXPECT_NE(llep_prepare_body.find("prefill_llep_transfer_state->isMaterializedFor("),
-                  std::string::npos)
-            << "Prefill LLEP graph preparation must validate its persistent transfer resources.";
+        EXPECT_NE(
+            llep_prepare_body.find(
+                "prefix_runtime_rehydration_transfer_state"),
+            std::string::npos)
+            << "Prefix rehydration must name its distinct transfer-resource authority.";
+        EXPECT_NE(
+            llep_prepare_body.find("isMaterializedFor("),
+            std::string::npos)
+            << "Prefix rehydration graph preparation must validate persistent resources.";
         EXPECT_NE(
             llep_prepare_body.find(
                 "device_rebalance_llep_prefill_capture_resources_validated"),
@@ -7944,6 +8791,8 @@ namespace llaminar2::test
         const fs::path interface_path = root / "src/v2/kernels/IMoEKernel.h";
         const fs::path stage_path =
             root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        const fs::path router_stage_path =
+            root / "src/v2/execution/compute_stages/stages/MoERoutingStage.cpp";
         const fs::path publication_stage_path =
             root / "src/v2/execution/compute_stages/stages/MTPSpeculativeStatePublicationStage.cpp";
         const fs::path orchestrator_path =
@@ -7955,6 +8804,7 @@ namespace llaminar2::test
         for (const auto &path :
              {interface_path,
               stage_path,
+              router_stage_path,
               publication_stage_path,
               orchestrator_path,
               cuda_path,
@@ -7965,6 +8815,7 @@ namespace llaminar2::test
 
         const std::string interface_source = readFile(interface_path);
         const std::string stage_source = readFile(stage_path);
+        const std::string router_stage_source = readFile(router_stage_path);
         const std::string publication_stage_source =
             readFile(publication_stage_path);
         const std::string orchestrator_source =
@@ -7989,6 +8840,21 @@ namespace llaminar2::test
         EXPECT_EQ(
             stage_source.find("kernel->snapshotGroupedVerifierRoutes("),
             std::string::npos);
+        EXPECT_EQ(
+            router_stage_source.find("snapshotGroupedVerifierRoutes("),
+            std::string::npos);
+        EXPECT_NE(
+            interface_source.find("deferred_selected_route_ledger"),
+            std::string::npos)
+            << "The explicit heterogeneous ticket boundary must fuse selected "
+               "route retention into decode-equivalent top-k publication.";
+        EXPECT_NE(
+            router_stage_source.find(
+                "params_.defer_overlay_grouped_verifier_histogram_publication\n"
+                "                        ? moe_runtime_layer_"),
+            std::string::npos)
+            << "Only an explicitly typed overlay router may publish its "
+               "selected-route ledger.";
         EXPECT_NE(
             stage_source.find("retain_routes_during_initial_grouping"),
             std::string::npos);
@@ -8078,13 +8944,41 @@ namespace llaminar2::test
                 backend == std::string("CUDA")
                     ? "commit_grouped_verifier_histograms_runtime_kernel("
                     : "rocm_moe_commit_grouped_verifier_histograms_kernel(";
+            const std::string verifier_topk_kernel =
+                backend == std::string("CUDA")
+                    ? "softmax_topk_kernel("
+                    : "rocm_moe_softmax_topk_decode_equivalent_rows_kernel(";
+            const size_t verifier_topk_begin =
+                source->find(verifier_topk_kernel);
             const size_t grouping_begin =
                 source->find(grouping_kernel);
             const size_t commit_begin =
                 source->find(commit_kernel);
+            ASSERT_NE(verifier_topk_begin, std::string::npos) << backend;
             ASSERT_NE(grouping_begin, std::string::npos) << backend;
             ASSERT_NE(commit_begin, std::string::npos) << backend;
+            ASSERT_LT(verifier_topk_begin, grouping_begin) << backend;
             ASSERT_LT(grouping_begin, commit_begin) << backend;
+            const std::string verifier_topk =
+                source->substr(
+                    verifier_topk_begin,
+                    grouping_begin - verifier_topk_begin);
+            EXPECT_NE(
+                verifier_topk.find("deferred_selected_route_ledger"),
+                std::string::npos)
+                << backend;
+            EXPECT_NE(
+                verifier_topk.find(
+                    "->deferred_verifier_route_expert_ids["),
+                std::string::npos)
+                << backend
+                << " decode-equivalent top-k must retain overlay selections "
+                   "without a second launch.";
+            EXPECT_NE(
+                verifier_topk.find(
+                    "->deferred_verifier_route_participant_ids["),
+                std::string::npos)
+                << backend;
             const std::string speculative_grouping =
                 source->substr(
                     grouping_begin,
@@ -8099,6 +8993,18 @@ namespace llaminar2::test
                 std::string::npos)
                 << backend
                 << " speculative grouping mutated local-route history.";
+            EXPECT_EQ(
+                speculative_grouping.find(
+                    "runtime_selected_histogram(*runtime, 2u)"),
+                std::string::npos)
+                << backend
+                << " speculative grouping mutated external grouped-verifier history.";
+            EXPECT_EQ(
+                speculative_grouping.find(
+                    "runtime_local_histogram(*runtime, 2u)"),
+                std::string::npos)
+                << backend
+                << " speculative grouping mutated external grouped-verifier local history.";
             EXPECT_NE(
                 speculative_grouping.find(
                     "deferred_verifier_route_expert_ids[slot] ="),
@@ -8133,14 +9039,16 @@ namespace llaminar2::test
                 << " commit must consume device-owned accepted prefixes.";
             EXPECT_NE(
                 committed_publication.find(
-                    "decode_histogram[expert_id]"),
+                    "runtime_selected_histogram(*runtime, 2u)[expert_id]"),
                 std::string::npos)
-                << backend;
+                << backend
+                << " must publish accepted routes through the active persistent bank.";
             EXPECT_NE(
                 committed_publication.find(
-                    "decode_local_histogram[expert_id]"),
+                    "runtime_local_histogram(*runtime, 2u)[expert_id]"),
                 std::string::npos)
-                << backend;
+                << backend
+                << " must publish accepted local routes through the active persistent bank.";
         }
     }
 
@@ -8246,10 +9154,23 @@ namespace llaminar2::test
                   std::string::npos)
             << "Portable restore must not resurrect rolling transfer-slot "
                "payloads through a resolver after those bytes may be reused.";
-        EXPECT_NE(graph.find("Portable version 4 contains pointer-free, role-scoped logical"),
+        EXPECT_NE(graph.find("constexpr uint32_t kMoEPrefixRuntimeVersion = 5;"),
                   std::string::npos)
-            << "The graph must document the durable placement boundary enforced "
-               "by portable runtime version 4.";
+            << "Changing the prefix ownership boundary requires an explicit "
+               "portable schema version.";
+        EXPECT_NE(capture_body.find("if (table->usesOverlayEpochTicket())"),
+                  std::string::npos)
+            << "Prefix capture must exclude model-lifetime ExpertOverlay RCU "
+               "placement instead of serializing a stale residency epoch.";
+        EXPECT_NE(capture_body.find(
+                      "moe_durable_runtime_state_excluded_from_prefix"),
+                  std::string::npos)
+            << "PerfStats must prove that durable placement was deliberately "
+               "excluded from the prefix payload.";
+        EXPECT_NE(graph.find(
+                      "Prefix-cache MoE runtime state attempted to replace model-lifetime ExpertOverlay placement"),
+                  std::string::npos)
+            << "Restore must reject a payload that names an epoch-ticketed table.";
         EXPECT_NE(graph.find("resetPrefixCacheRuntimeStateWithoutSnapshot"),
                   std::string::npos)
             << "MoE prefix restore without a runtime payload must have its own "
@@ -8267,10 +9188,21 @@ namespace llaminar2::test
         ASSERT_NE(prefix_reset_end, std::string::npos);
         const std::string prefix_reset_body =
             graph.substr(prefix_reset_start, prefix_reset_end - prefix_reset_start);
+        EXPECT_NE(
+            prefix_reset_body.find("!table->usesOverlayEpochTicket()"),
+            std::string::npos)
+            << "No-payload prefix restore must reset only request-transient "
+               "placement and preserve the live model-lifetime RCU family.";
+        EXPECT_NE(
+            prefix_reset_body.find(
+                "table->overlayPlacementSource() != nullptr"),
+            std::string::npos)
+            << "Prefix reset must also restore a request-local LLEP child that "
+               "pins, but does not own, its durable ExpertOverlay parent.";
         EXPECT_NE(prefix_reset_body.find("restoreInitialRuntimeState(execution_stream)"),
                   std::string::npos)
-            << "No-payload prefix restore must republish the immutable "
-               "model-lifetime MoE state on the reset transaction stream.";
+            << "No-payload prefix restore must republish the immutable baseline "
+               "for request-transient placement on the transaction stream.";
         EXPECT_EQ(prefix_reset_body.find("resetDecodeRuntimeState();"),
                   std::string::npos)
             << "GPU prefix reset must never select an implicit stream.";
@@ -8278,10 +9210,10 @@ namespace llaminar2::test
                   std::string::npos)
             << "An empty runtime table is not a valid prefix-restored model "
                "state and must not replace the immutable initial placement.";
-        EXPECT_NE(prefix_reset_body.find("resetRequestPublications(execution_stream)"),
+        EXPECT_EQ(prefix_reset_body.find("resetRequestPublications(execution_stream)"),
                   std::string::npos)
-            << "Prefix reset must retire every transient transfer-slot "
-               "publication on the same transaction stream.";
+            << "The transfer directory may back a live durable bank; prefix "
+               "reset must not invalidate descriptors selected by the RCU ticket.";
         EXPECT_EQ(prefix_reset_body.find("moe_graph_rebalance_bindings_.clear()"),
                   std::string::npos)
             << "Graph stages retain binding pointers across replay-executable "
@@ -9058,6 +9990,60 @@ namespace llaminar2::test
                 "params_.comparison_rows_per_request + 1"),
             std::string::npos)
             << "Stage validation must include the first condition row in captured verifier capacity.";
+    }
+
+    /**
+     * @brief Keep aggregate parity cells isolated to their claimed GPU runtime.
+     *
+     * The aggregate scheduler intentionally overlaps CPU, CUDA, and ROCm cells
+     * only when their typed resource signatures are disjoint. Merely asking an
+     * unclaimed backend for its device count initializes that runtime and its
+     * pinned-host allocator, which makes otherwise independent CUDA and ROCm
+     * processes interfere. Hardware admission must therefore calculate the
+     * required device families first and probe only the families the cell owns.
+     */
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         ProductionParityProbesOnlyClaimedGpuRuntimes)
+    {
+        const fs::path parity_path =
+            findRepoRoot() / "tests/v2/integration/parity/ParityTestBase.h";
+        ASSERT_TRUE(fs::exists(parity_path)) << parity_path;
+
+        const std::string parity = readFile(parity_path);
+        ASSERT_FALSE(parity.empty()) << parity_path;
+
+        const size_t admission_start = parity.find(
+            "inline std::optional<std::string> checkHardwareAvailability(");
+        const size_t next_declaration = parity.find(
+            "// Metric Computation Functions",
+            admission_start);
+        ASSERT_NE(admission_start, std::string::npos);
+        ASSERT_NE(next_declaration, std::string::npos);
+        const std::string admission = parity.substr(
+            admission_start, next_declaration - admission_start);
+
+        EXPECT_NE(
+            admission.find(
+                "required_cuda > 0 ? getCudaDeviceCount() : 0"),
+            std::string::npos)
+            << "A non-CUDA parity cell must not initialize the CUDA runtime.";
+        EXPECT_NE(
+            admission.find(
+                "required_rocm > 0 ? getRocmDeviceCount() : 0"),
+            std::string::npos)
+            << "A non-ROCm parity cell must not initialize the ROCm runtime.";
+
+        const size_t requirement_scan = admission.find(
+            "for (auto dt : cfg.devices)");
+        const size_t cuda_probe = admission.find("getCudaDeviceCount()");
+        const size_t rocm_probe = admission.find("getRocmDeviceCount()");
+        ASSERT_NE(requirement_scan, std::string::npos);
+        ASSERT_NE(cuda_probe, std::string::npos);
+        ASSERT_NE(rocm_probe, std::string::npos);
+        EXPECT_LT(requirement_scan, cuda_probe)
+            << "CUDA admission must derive the claimed resource count before probing.";
+        EXPECT_LT(requirement_scan, rocm_probe)
+            << "ROCm admission must derive the claimed resource count before probing.";
     }
 
 } // namespace llaminar2::test

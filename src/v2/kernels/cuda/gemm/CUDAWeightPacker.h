@@ -5,6 +5,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include "tensors/NativeVnniFormatInfo.h"
 
 // Forward-declare opaque handle for row-major weight transpose
 typedef struct CUDARowMajorWeights_ CUDARowMajorWeights;
@@ -40,6 +41,7 @@ namespace llaminar2
             std::vector<uint32_t> native_emins;
             uint8_t native_codebook_id = 0;
             uint32_t native_blocks_per_row = 0;
+            NativeVnniSourceIdentity native_source_identity;
 
             int K = 0;
             int N = 0;
@@ -78,6 +80,7 @@ namespace llaminar2
                     native_emins = std::move(other.native_emins);
                     native_codebook_id = other.native_codebook_id;
                     native_blocks_per_row = other.native_blocks_per_row;
+                    native_source_identity = other.native_source_identity;
                     K = other.K;
                     N = other.N;
                     device_uploads = std::move(other.device_uploads);
@@ -98,6 +101,7 @@ namespace llaminar2
                     other.N = 0;
                     other.native_codebook_id = 0;
                     other.native_blocks_per_row = 0;
+                    other.native_source_identity = {};
                     other.source_tensor_ = nullptr;
                 }
                 return *this;

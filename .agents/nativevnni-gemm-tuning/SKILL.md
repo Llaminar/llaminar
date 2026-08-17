@@ -704,6 +704,14 @@ candidate. Admit grouped timings only after the production route counter and
 complete `M*N` byte comparison against production serial M=1 pass. Never
 substitute the historical static CPU sealed-shape CSVs for this transaction.
 
+CPU paired timing must alternate and record selected-first and exact-first
+invocation order. Estimate candidate regret by taking the median log ratio in
+each order stratum and weighting the two strata equally; never pool raw ratios
+across opposite orders. Bootstrap each stratum independently, and reject a
+cell that lacks complete order identity or either crossover direction. This
+removes stable first/second invocation effects without weakening the paired
+confidence bound.
+
 Do not defer sealed-capacity planning until installation. Before final
 development refinement, authenticated preflight must report the provisional
 leaf count, untouched-reserve reachability, projected witness geometry,

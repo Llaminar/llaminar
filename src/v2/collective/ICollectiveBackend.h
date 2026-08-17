@@ -27,13 +27,18 @@
 #include "../config/OrchestrationConfig.h" // For CollectiveBackendType (canonical definition)
 #include "DeviceGroup.h"
 #include "IBufferRegistration.h"
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace llaminar2
 {
+
+    class ICollectiveBackend;
 
     // CollectiveBackendType is now defined in OrchestrationConfig.h
     // to avoid duplicate definitions. See config/OrchestrationConfig.h.
@@ -146,6 +151,100 @@ namespace llaminar2
         {
             return {Kind::DeviceStream, stream};
         }
+    };
+
+    /**
+     * @brief Opaque authority for one host-observed background collective.
+     *
+     * A heterogeneous CUDA/ROCm collective cannot safely put a future memory
+     * wait on each compute stream: HIP streams from independent pools may share
+     * an HSA hardware queue, allowing the wait to block the transfer stream that
+     * must satisfy it.  This ticket instead names one preallocated background
+     * transaction.  The explicit segmented-graph boundary authenticates the
+     * ticket and waits for terminal H2D events before launching its consumer.
+     *
+     * Tickets are bound to one backend instance and lifecycle epoch.  A ticket
+     * from a shut-down or reinitialized backend therefore cannot accidentally
+     * authorize a reused descriptor with the same ring index.
+     */
+    class CollectiveCompletionTicket final
+    {
+    public:
+        /** @brief Completion authority encoded by this ticket. */
+        enum class Authority : uint8_t
+        {
+            HostObservedBackgroundTransfer, ///< Host proves all terminal DMA events.
+        };
+
+        /**
+         * @brief Construct a ticket for a host-observed background transfer.
+         * @param owner Backend instance that owns the descriptor ring.
+         * @param lifecycle_epoch Backend resource lifecycle that issued it.
+         * @param generation Monotonic transaction generation in that lifecycle.
+         * @param descriptor_index Preallocated descriptor-ring index.
+         * @return Authenticated opaque ticket for the matching backend.
+         */
+        [[nodiscard]] static CollectiveCompletionTicket hostObservedBackgroundTransfer(
+            const ICollectiveBackend *owner,
+            uint64_t lifecycle_epoch,
+            uint64_t generation,
+            size_t descriptor_index) noexcept
+        {
+            return CollectiveCompletionTicket(
+                owner,
+                lifecycle_epoch,
+                generation,
+                descriptor_index);
+        }
+
+        /** @brief Return the completion authority represented by this ticket. */
+        [[nodiscard]] constexpr Authority authority() const noexcept
+        {
+            return Authority::HostObservedBackgroundTransfer;
+        }
+
+        /** @brief Return the backend instance that issued the ticket. */
+        [[nodiscard]] constexpr const ICollectiveBackend *owner() const noexcept
+        {
+            return owner_;
+        }
+
+        /** @brief Return the issuing resource-lifecycle epoch. */
+        [[nodiscard]] constexpr uint64_t lifecycleEpoch() const noexcept
+        {
+            return lifecycle_epoch_;
+        }
+
+        /** @brief Return the monotonic transaction generation. */
+        [[nodiscard]] constexpr uint64_t generation() const noexcept
+        {
+            return generation_;
+        }
+
+        /** @brief Return the preallocated transaction-descriptor index. */
+        [[nodiscard]] constexpr size_t descriptorIndex() const noexcept
+        {
+            return descriptor_index_;
+        }
+
+    private:
+        /** @brief Build one fully specified, non-default-constructible ticket. */
+        constexpr CollectiveCompletionTicket(
+            const ICollectiveBackend *owner,
+            uint64_t lifecycle_epoch,
+            uint64_t generation,
+            size_t descriptor_index) noexcept
+            : owner_(owner),
+              lifecycle_epoch_(lifecycle_epoch),
+              generation_(generation),
+              descriptor_index_(descriptor_index)
+        {
+        }
+
+        const ICollectiveBackend *owner_; ///< Issuing backend identity.
+        uint64_t lifecycle_epoch_;        ///< Issuing resource lifecycle.
+        uint64_t generation_;             ///< Transaction generation.
+        size_t descriptor_index_;         ///< Descriptor ring location.
     };
 
     /**
@@ -829,6 +928,72 @@ namespace llaminar2
         virtual bool supportsAllreduceMultiOnStreams() const { return false; }
 
         /**
+         * @brief Submit a grouped allreduce completed by a host-observed ticket.
+         *
+         * This contract is reserved for explicit heterogeneous graph boundaries
+         * whose background transfer cannot safely publish a future wait onto a
+         * GPU compute stream. Implementations record the exact producer streams,
+         * enqueue allocation-free background progress, and return immediately
+         * with a ticket. The caller must pass that ticket to
+         * awaitHostCompletionTicket() before any consumer is submitted.
+         *
+         * The default is deliberately unsupported. A backend must never map this
+         * operation to a synchronous collective or an ordinary stream-ordered
+         * receipt because those completion authorities are not equivalent.
+         *
+         * @param buffers One in-place device buffer per participant.
+         * @param count Logical element count in each buffer.
+         * @param dtype Shared element representation.
+         * @param op Reduction operation.
+         * @param streams Exact non-null producer stream per participant.
+         * @return A backend-bound ticket on successful asynchronous submission;
+         *         std::nullopt when unsupported or rejected.
+         */
+        virtual std::optional<CollectiveCompletionTicket>
+        allreduceMultiOnStreamsWithHostCompletionTicket(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<void *> &streams)
+        {
+            (void)buffers;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)streams;
+            return std::nullopt;
+        }
+
+        /**
+         * @brief Whether host-ticket grouped allreduce submission is available.
+         */
+        virtual bool supportsAllreduceMultiOnStreamsWithHostCompletionTicket() const
+        {
+            return false;
+        }
+
+        /**
+         * @brief Observe terminal completion for a background collective ticket.
+         *
+         * Success means every output byte has reached its destination device and
+         * the caller may publish a completed device write without recording an
+         * event on an unrelated compute stream.
+         *
+         * @param ticket Ticket returned by this backend instance.
+         * @param timeout_ms Positive bounded observation timeout in milliseconds.
+         * @return true only when the authenticated transaction completed.
+         */
+        virtual bool awaitHostCompletionTicket(
+            const CollectiveCompletionTicket &ticket,
+            int timeout_ms)
+        {
+            (void)ticket;
+            (void)timeout_ms;
+            return false;
+        }
+
+        /**
          * @brief Group one anchor allreduce and compact sideband collectives.
          *
          * Implementations must enqueue the anchor allreduce and every sideband
@@ -955,6 +1120,62 @@ namespace llaminar2
          * @brief Whether participant-local on-stream allreduce is available.
          */
         virtual bool supportsAllreduceSingleDeviceOnStream() const { return false; }
+
+        /**
+         * @brief Whether this backend can publish bounded host-observed stream tickets.
+         *
+         * The capability exists for heterogeneous graph lifecycle boundaries,
+         * where CUDA and ROCm cannot participate in one native device
+         * collective.  It is deliberately not a collective-data fallback and
+         * must never be used during ordinary captured replay.
+         *
+         * @return true only when one persistent ticket exists per participant.
+         */
+        virtual bool supportsGraphCaptureLifecycleTickets() const { return false; }
+
+        /**
+         * @brief Record one persistent graph-lifecycle ticket on an exact stream.
+         *
+         * The successful call publishes an event after all work previously
+         * queued on @p stream.  No host wait, allocation, transfer, or default
+         * stream substitution is permitted.  LocalTP coordinates every
+         * participant into the same named generation before calling this
+         * method.
+         *
+         * @param device_idx Participant slot in the backend's DeviceGroup.
+         * @param stream Exact non-null CUDA/HIP stream approaching capture.
+         * @return true when event publication was accepted by the device runtime.
+         */
+        virtual bool recordGraphCaptureLifecycleTicket(
+            int device_idx,
+            void *stream)
+        {
+            (void)device_idx;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Observe one graph-lifecycle ticket with a bounded nonblocking poll.
+         *
+         * Implementations repeatedly query only the participant's persistent
+         * event.  They must not synchronize a stream/device or stage device
+         * state through host memory.  This host ownership transition is legal
+         * only while materializing a heterogeneous captured segment; steady
+         * state graph replay never invokes it.
+         *
+         * @param device_idx Participant slot whose event was recorded.
+         * @param timeout_ms Maximum observation interval; zero means unbounded.
+         * @return true only after the exact recorded stream point completed.
+         */
+        virtual bool awaitGraphCaptureLifecycleTicket(
+            int device_idx,
+            int timeout_ms)
+        {
+            (void)device_idx;
+            (void)timeout_ms;
+            return false;
+        }
 
         /**
          * @brief Per-device rooted reduction on a caller-provided stream.

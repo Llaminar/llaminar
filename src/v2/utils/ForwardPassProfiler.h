@@ -71,6 +71,10 @@ namespace llaminar2
             uint64_t graph_launch_ns = 0; ///< hipGraphLaunch / cudaGraphLaunch
             uint64_t post_launch_ns = 0;  ///< Output-coherence publication.
             uint64_t stream_sync_ns = 0;  ///< synchronizeStream() at end of replay phase
+            uint64_t manual_host_ticket_wait_ns = 0; ///< Explicit captured-ticket readiness wait at a heterogeneous boundary.
+            uint64_t manual_dispatch_ns = 0;         ///< CPU route descriptor/materialization work after ticket readiness.
+            uint64_t manual_sparse_protocol_ns = 0;  ///< Cross-rank sparse dispatch, remote execution completion, and return reduction.
+            uint64_t manual_other_ns = 0;            ///< Any remaining manual segment wall time; expected to stay zero in production overlay decode.
         };
 
         /**
@@ -95,6 +99,10 @@ namespace llaminar2
             uint64_t graph_launch_ns = 0;
             uint64_t post_launch_ns = 0;
             uint64_t stream_sync_ns = 0;
+            uint64_t manual_host_ticket_wait_ns = 0;
+            uint64_t manual_dispatch_ns = 0;
+            uint64_t manual_sparse_protocol_ns = 0;
+            uint64_t manual_other_ns = 0;
         };
 
         /// @brief Reset thread-local replay timings (call before replay phase)
@@ -104,6 +112,10 @@ namespace llaminar2
             t.graph_launch_ns = 0;
             t.post_launch_ns = 0;
             t.stream_sync_ns = 0;
+            t.manual_host_ticket_wait_ns = 0;
+            t.manual_dispatch_ns = 0;
+            t.manual_sparse_protocol_ns = 0;
+            t.manual_other_ns = 0;
         }
 
         /// @brief Add graph launch time (call in replay segment execution)
@@ -114,6 +126,30 @@ namespace llaminar2
 
         /// @brief Add stream sync time
         static void addReplayStreamSyncNs(uint64_t ns) { tls_replay_timings().stream_sync_ns += ns; }
+
+        /// @brief Add wall time spent waiting for a captured host ticket to become readable.
+        static void addReplayManualHostTicketWaitNs(uint64_t ns)
+        {
+            tls_replay_timings().manual_host_ticket_wait_ns += ns;
+        }
+
+        /// @brief Add CPU dispatch descriptor construction/materialization time.
+        static void addReplayManualDispatchNs(uint64_t ns)
+        {
+            tls_replay_timings().manual_dispatch_ns += ns;
+        }
+
+        /// @brief Add cross-rank sparse transport and remote completion time.
+        static void addReplayManualSparseProtocolNs(uint64_t ns)
+        {
+            tls_replay_timings().manual_sparse_protocol_ns += ns;
+        }
+
+        /// @brief Add manual replay work outside the typed dispatch/protocol families.
+        static void addReplayManualOtherNs(uint64_t ns)
+        {
+            tls_replay_timings().manual_other_ns += ns;
+        }
 
         /// @brief Consume and return the accumulated replay timings (resets them)
         static ReplayPhaseTimings consumeReplayTimings()
@@ -134,7 +170,9 @@ namespace llaminar2
          * Called at the end of executeCacheHit() when profiling is enabled.
          * Thread-safety: NOT thread-safe — called from a single orchestrator thread.
          */
-        void recordDecodeIteration(const PhaseTimings &timings)
+        void recordDecodeIteration(
+            const PhaseTimings &timings,
+            const std::string &device_name = {})
         {
             decode_setup_ns_ += timings.setup_ns;
             decode_execute_ns_ += timings.execute_ns;
@@ -148,13 +186,15 @@ namespace llaminar2
             decode_setup_dynamic_params_ns_ += timings.setup_dynamic_params_ns;
             decode_setup_graph_reset_ns_ += timings.setup_graph_reset_ns;
             decode_iterations_++;
-            recordUnified("decode", timings);
+            recordUnified("decode", timings, device_name);
         }
 
         /**
          * @brief Record one prefill iteration's timing breakdown
          */
-        void recordPrefillIteration(const PhaseTimings &timings)
+        void recordPrefillIteration(
+            const PhaseTimings &timings,
+            const std::string &device_name = {})
         {
             prefill_setup_ns_ += timings.setup_ns;
             prefill_execute_ns_ += timings.execute_ns;
@@ -168,7 +208,7 @@ namespace llaminar2
             prefill_setup_dynamic_params_ns_ += timings.setup_dynamic_params_ns;
             prefill_setup_graph_reset_ns_ += timings.setup_graph_reset_ns;
             prefill_iterations_++;
-            recordUnified("prefill", timings);
+            recordUnified("prefill", timings, device_name);
         }
 
         // ----- Reporting -----
@@ -249,28 +289,53 @@ namespace llaminar2
         }
 
     private:
-        static void recordIfNonZero(const char *name, const char *phase, uint64_t ns)
+        static void recordIfNonZero(
+            const char *name,
+            const char *phase,
+            uint64_t ns,
+            const std::string &device_name)
         {
             if (ns == 0)
                 return;
-            PerfStatsCollector::recordTimingNs("forward_pass", name, ns, phase);
+            PerfStatsCollector::recordTimingNs(
+                "forward_pass", name, ns, phase, device_name);
         }
 
-        static void recordUnified(const char *phase, const PhaseTimings &timings)
+        static void recordUnified(
+            const char *phase,
+            const PhaseTimings &timings,
+            const std::string &device_name)
         {
-            if (!PerfStatsCollector::isEnabled())
+            if (!PerfStatsCollector::isDomainEnabled("forward_pass"))
                 return;
-            recordIfNonZero("setup", phase, timings.setup_ns);
-            recordIfNonZero("execute", phase, timings.execute_ns);
-            recordIfNonZero("sync", phase, timings.sync_ns);
-            recordIfNonZero("setup_workspace", phase, timings.setup_workspace_ns);
-            recordIfNonZero("setup_token_copy", phase, timings.setup_token_copy_ns);
-            recordIfNonZero("setup_stream", phase, timings.setup_stream_ns);
-            recordIfNonZero("setup_dynamic_params", phase, timings.setup_dynamic_params_ns);
-            recordIfNonZero("setup_graph_reset", phase, timings.setup_graph_reset_ns);
-            recordIfNonZero("graph_launch", phase, timings.graph_launch_ns);
-            recordIfNonZero("post_launch", phase, timings.post_launch_ns);
-            recordIfNonZero("stream_sync", phase, timings.stream_sync_ns);
+            recordIfNonZero("setup", phase, timings.setup_ns, device_name);
+            recordIfNonZero("execute", phase, timings.execute_ns, device_name);
+            recordIfNonZero("sync", phase, timings.sync_ns, device_name);
+            recordIfNonZero("setup_workspace", phase, timings.setup_workspace_ns, device_name);
+            recordIfNonZero("setup_token_copy", phase, timings.setup_token_copy_ns, device_name);
+            recordIfNonZero("setup_stream", phase, timings.setup_stream_ns, device_name);
+            recordIfNonZero("setup_dynamic_params", phase, timings.setup_dynamic_params_ns, device_name);
+            recordIfNonZero("setup_graph_reset", phase, timings.setup_graph_reset_ns, device_name);
+            recordIfNonZero("graph_launch", phase, timings.graph_launch_ns, device_name);
+            recordIfNonZero("post_launch", phase, timings.post_launch_ns, device_name);
+            recordIfNonZero("stream_sync", phase, timings.stream_sync_ns, device_name);
+            recordIfNonZero(
+                "manual_host_ticket_wait",
+                phase,
+                timings.manual_host_ticket_wait_ns,
+                device_name);
+            recordIfNonZero(
+                "manual_dispatch",
+                phase,
+                timings.manual_dispatch_ns,
+                device_name);
+            recordIfNonZero(
+                "manual_sparse_protocol",
+                phase,
+                timings.manual_sparse_protocol_ns,
+                device_name);
+            recordIfNonZero(
+                "manual_other", phase, timings.manual_other_ns, device_name);
         }
 
         /**

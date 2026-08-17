@@ -87,7 +87,7 @@ namespace llaminar2::test
         {
             RoutedExpertDomain domain;
             domain.name = name;
-            domain.scope = ExecutionDomainScope::LOCAL;
+            domain.scope = ExecutionDomainScope::RANK_LOCAL;
             domain.backend = backend;
             domain.participants = {GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(1, 0)};
             domain.owner_rank = owner_rank;

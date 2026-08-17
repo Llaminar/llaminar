@@ -1,3 +1,8 @@
+/**
+ * @file Test__PreparedWeightStore.cpp
+ * @brief Prepared-weight identity, lifetime, adoption, and backend isolation tests.
+ */
+
 #include <gtest/gtest.h>
 
 #include "loaders/PreparedWeightStore.h"
@@ -246,6 +251,39 @@ TEST(Test__PreparedWeightStore, AdoptsPreparedGemmByCanonicalNameAfterHostPayloa
     EXPECT_TRUE(later_tensor->hasPreparedDeviceState());
 }
 
+TEST(Test__PreparedWeightStore, ExactBindingReuseRestoresStoreOwnedTensorAuthority)
+{
+    PreparedWeightStore store(ModelContextId{99});
+    auto authoritative_tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto authoritative_binding = makeStoreBinding(
+        33, "blk.0.ssm_alpha.weight", DeviceId::cpu());
+    authoritative_binding.tensor_owner = authoritative_tensor;
+    authoritative_binding.tensor = authoritative_tensor.get();
+
+    store.registerPreparedForTest(
+        authoritative_binding,
+        PreparedWeightKind::CpuPackedGemm,
+        DeviceId::cpu());
+
+    auto rematerialized_tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto rematerialized_binding = makeStoreBinding(
+        33, "blk.0.ssm_alpha.weight", DeviceId::cpu());
+    rematerialized_binding.tensor_owner = rematerialized_tensor;
+    rematerialized_binding.tensor = rematerialized_tensor.get();
+    rematerialized_binding.prepared = PreparedWeightRef{
+        ModelContextId{99},
+        rematerialized_binding.binding_id,
+        PreparedWeightKind::CpuPackedGemm,
+        DeviceId::cpu()};
+
+    ASSERT_TRUE(store.adoptPreparedGemmForBinding(
+        rematerialized_binding,
+        DeviceId::cpu()));
+    EXPECT_EQ(rematerialized_binding.tensor, authoritative_tensor.get());
+    EXPECT_EQ(rematerialized_binding.tensor_owner, authoritative_tensor);
+    EXPECT_TRUE(authoritative_tensor->hasPreparedDeviceState());
+}
+
 TEST(Test__PreparedWeightStore, DoesNotAdoptPreparedGemmAcrossDifferentSlicesWithSameCanonicalName)
 {
     PreparedWeightStore store(ModelContextId{99});
@@ -390,6 +428,73 @@ TEST(Test__PreparedWeightStore, ResolvesPreparedEmbeddingRefsByBinding)
     auto stored = store.binding(ref);
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ(stored->identity.role, WeightRole::Embedding);
+}
+
+TEST(Test__PreparedWeightStore, TypedEmbeddingAdoptionSurvivesGemmBindingIdCollision)
+{
+    PreparedWeightStore store(ModelContextId{99});
+
+    auto gemm_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{64, 96});
+    auto gemm_binding = makeStoreBinding(
+        27,
+        "blk.0.ffn_gate.weight",
+        DeviceId::cuda(0));
+    gemm_binding.tensor = gemm_tensor.get();
+    store.registerPreparedForTest(
+        gemm_binding,
+        PreparedWeightKind::CudaInt8PackedGemm,
+        DeviceId::cuda(0));
+
+    auto embedding_tensor = makeQ8_0Tensor(64, 96);
+    auto original_embedding = makeStoreBinding(
+        91,
+        "token_embd.weight",
+        DeviceId::cuda(0));
+    original_embedding.identity.role = WeightRole::Embedding;
+    original_embedding.tensor = embedding_tensor.get();
+    auto handle = makeEmbeddingHandle(
+        embedding_tensor.get(),
+        DeviceId::cuda(0));
+    store.registerPreparedEmbeddingFromPipeline(
+        original_embedding,
+        DeviceId::cuda(0),
+        &handle);
+
+    auto rematerialized_embedding = makeStoreBinding(
+        27,
+        "token_embd.weight",
+        DeviceId::cuda(0));
+    rematerialized_embedding.identity.role = WeightRole::Embedding;
+    rematerialized_embedding.tensor = embedding_tensor.get();
+    rematerialized_embedding.prepared = PreparedWeightRef{
+        ModelContextId{99},
+        rematerialized_embedding.binding_id,
+        PreparedWeightKind::PreparedEmbedding,
+        DeviceId::cuda(0)};
+
+    EXPECT_TRUE(store.adoptPreparedForBinding(
+        rematerialized_embedding,
+        DeviceId::cuda(0)));
+    EXPECT_FALSE(store.preparedRefForBinding(
+        rematerialized_embedding.binding_id,
+        DeviceId::cuda(0)).has_value())
+        << "Untyped lookup must reject a cross-kind binding-id collision";
+
+    const auto embedding_ref = store.preparedRefForBinding(
+        rematerialized_embedding.binding_id,
+        DeviceId::cuda(0),
+        PreparedWeightKind::PreparedEmbedding);
+    ASSERT_TRUE(embedding_ref.has_value());
+    EXPECT_EQ(embedding_ref->kind, PreparedWeightKind::PreparedEmbedding);
+    EXPECT_NE(store.embeddingHandle(*embedding_ref), nullptr);
+
+    const auto gemm_ref = store.preparedRefForBinding(
+        rematerialized_embedding.binding_id,
+        DeviceId::cuda(0),
+        PreparedWeightKind::CudaInt8PackedGemm);
+    ASSERT_TRUE(gemm_ref.has_value());
+    EXPECT_EQ(gemm_ref->kind, PreparedWeightKind::CudaInt8PackedGemm);
 }
 
 TEST(Test__PreparedWeightStore, SameBindingIdRetainsDistinctEmbeddingEntriesPerDevice)

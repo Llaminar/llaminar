@@ -35,6 +35,7 @@
 #include "execution/parallelism_tree/ParallelismTree.h"
 #include <string>
 #include <vector>
+#include <cstdint>
 #include <optional>
 #include <utility>
 #include <memory>
@@ -52,7 +53,7 @@ namespace llaminar2
     enum class TPScope
     {
         AUTO,       ///< Automatically determine based on topology
-        LOCAL,      ///< TP within single MPI rank (intra-rank: NVLink, HOST, NCCL)
+        RANK_LOCAL, ///< TP within one MPI rank (intra-rank: NVLink, HOST, NCCL)
         NODE_LOCAL, ///< TP across MPI ranks on same physical node (UPI, shmem, cross-process NCCL)
         GLOBAL,     ///< TP across all nodes (MPI over InfiniBand/Ethernet)
         HYBRID      ///< Hierarchical: local TP + global PP
@@ -117,14 +118,14 @@ namespace llaminar2
      * through toExecutionDomainDefinition() and keep PP layer ownership in
      * PPStageDefinition rather than extending this legacy wrapper.
      *
-     * Format: "name=device1,device2,...[;weights=w1,w2,...][;backend=type][;scope=local|node_local|global][;owner=N][;ranks=0,1,...]"
+     * Format: "name=device1,device2,...[;weights=w1,w2,...][;backend=type][;scope=rank_local|node_local|global][;owner=N][;ranks=0,1,...]"
      *
      * Examples:
      *   "gpu_tp=cuda:0,cuda:1" -> Equal split across 2 CUDA GPUs
      *   "mixed=cuda:0,rocm:0;weights=0.73,0.27" -> Proportional split
      *   "fast=cuda:0,cuda:1;backend=nccl" -> Force NCCL backend
-     *   "rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0" -> Local TP, rank 0
-     *   "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1" -> Node-local TP
+     *   "rocm_socket0=0:rocm:0,0:rocm:1;scope=rank_local;backend=rccl;owner=0" -> rank-local TP, rank 0
+     *   "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1" -> NodeTP
      */
     struct DomainDefinition
     {
@@ -142,7 +143,7 @@ namespace llaminar2
             RoutedExpertAssignmentPolicy::Unspecified;
 
         // Phase 5: domain scope and rank ownership
-        TPScope scope = TPScope::AUTO;   ///< Domain scope (local=single-rank, node_local/global=multi-rank)
+        TPScope scope = TPScope::AUTO;   ///< Domain scope (rank_local=single-rank, node_local/global=multi-rank)
         std::optional<int> owner_rank;   ///< Explicit owner MPI rank for local domains (;owner=N)
         std::vector<int> explicit_ranks; ///< Explicit participating ranks for node_local/global (;ranks=0,1,...)
 
@@ -444,6 +445,10 @@ namespace llaminar2
         /// Physical routed-expert compute distribution for the standard path.
         RoutedExpertComputePolicy routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
 
+        /// Static whole-expert ownership ordering for apportioned domains.
+        RoutedExpertOwnerOrder routed_expert_owner_order =
+            RoutedExpertOwnerOrder::Ordinal;
+
         /// Bounded hot remote-expert cache for dynamic routed-row assignment.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
 
@@ -551,5 +556,43 @@ namespace llaminar2
      */
     std::vector<std::string> normalizeMoERoutedExpertPlacementDomains(
         OrchestrationConfig &config);
+
+    /**
+     * @brief Provenance of a hardware-resolved ExpertOverlay installation.
+     *
+     * A user-declared domain remains the public topology authority. An
+     * implicit plan is different: it is the canonical replacement for simple
+     * `--tp-devices`/`--tp` selectors after model metadata identifies routed
+     * experts. Keeping both representations live would create two authorities
+     * and trigger valid mutual-exclusion rules during the second validation.
+     */
+    enum class MoEExpertOverlayPlanInstallOrigin : std::uint8_t
+    {
+        UserDeclaredDomains,
+        SynthesizedSimpleTP,
+    };
+
+    /**
+     * @brief Atomically install a hardware-resolved ExpertOverlay plan.
+     *
+     * Startup first parses rank-agnostic hardware selectors, then resolves
+     * them against the gathered cluster inventory. This lifecycle boundary
+     * updates both the routed placement plan and the canonical named-domain
+     * inventory together. It rejects any change to user intent other than
+     * specializing wildcard host/NUMA selectors and filling rank ownership.
+     * Rank-local domains install one `owner_rank` with no explicit rank list;
+     * cross-rank domains install one rank binding per participant.
+     *
+     * @param config Configuration whose requested overlay is being resolved.
+     * @param resolved_plan Immutable-copy result of inventory binding.
+     * @param origin Whether domains came from user intent or replaced simple
+     *        TP selectors during implicit single-tier normalization. The latter
+     *        atomically retires those selectors after successful installation.
+     * @return Empty on success; otherwise validation errors and no mutation.
+     */
+    std::vector<std::string> installResolvedMoEExpertOverlayPlan(
+        OrchestrationConfig &config,
+        std::shared_ptr<MoERoutedExpertPlacementPlan> resolved_plan,
+        MoEExpertOverlayPlanInstallOrigin origin);
 
 } // namespace llaminar2

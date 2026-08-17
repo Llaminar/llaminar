@@ -49,7 +49,7 @@ namespace llaminar2
             if (!config.tp_config)
                 return 0;
 
-            // NodeLocalTP uses one MPI rank per CPU socket, but DeviceId::cpu()
+            // NodeTP uses one MPI rank per CPU socket, but DeviceId::cpu()
             // is a singleton.  Matching by device would always find rank 0's
             // assignment, so prefer the current rank's assignment when it owns
             // the requested device.
@@ -455,7 +455,7 @@ namespace llaminar2
                decode_replicated_dense_weight_bindings_.lm_head != nullptr;
     }
 
-    bool QwenGraphBase::localTPMirroredMTPHeadConfigured() const
+    bool QwenGraphBase::mirroredMTPHeadConfigured() const
     {
         /*
          * Terminal-head ownership is a graph-layout policy, not a switch that
@@ -466,10 +466,7 @@ namespace llaminar2
          * mirrored, leaving stochastic parity dependent on two different
          * reduction and sampling implementations.
          */
-        return mtpTerminalHeadIsMirrored(config_.mtp.terminal_head_policy) &&
-               config_.lm_head_column_parallel &&
-               config_.tp_ctx != nullptr &&
-               config_.tp_ctx->isLocal();
+        return config_.mtpUsesMirroredTerminalHeadBinding();
     }
 
     bool QwenGraphBase::mirroredMTPHeadActiveForProjectedRows(int total_tokens) const
@@ -491,7 +488,7 @@ namespace llaminar2
                    config_.live_mtp_request_batch_condition)
                       ? total_tokens
                       : 1;
-        return localTPMirroredMTPHeadConfigured() &&
+        return mirroredMTPHeadConfigured() &&
                projected_rows > 0;
     }
 
@@ -577,7 +574,7 @@ namespace llaminar2
         }
         else if (useMirroredMTPHeadWeights())
         {
-            policy.head_policy = FinalHeadPolicy::MirroredLocalTPMTPFullVocabulary;
+            policy.head_policy = FinalHeadPolicy::MirroredMTPFullVocabulary;
         }
         else if (useDecodeReplicatedDenseWeights())
         {
@@ -604,7 +601,7 @@ namespace llaminar2
             (config_.vocab_size % config_.vocab_local) != 0)
         {
             throw std::logic_error(
-                "[QwenGraphBase] Mirrored LocalTP LM head requires an equal, positive serial vocabulary partition");
+                "[QwenGraphBase] Mirrored MTP LM head requires an equal, positive serial vocabulary partition");
         }
 
         return config_.vocab_local == config_.vocab_size
@@ -693,7 +690,7 @@ namespace llaminar2
             return false;
 
         /*
-         * LocalTP MTP can explicitly mirror the terminal LM head on every
+         * MTP can explicitly mirror the terminal LM head on every TP
          * participant.  In that mode MTP verifier/sidecar graphs produce the
          * same full-vocab rows as serial decode, and advertising a local shard
          * would reintroduce the tiny verifier logits collective this mode is
@@ -952,7 +949,7 @@ namespace llaminar2
         if (useDecodeReplicatedDenseWeights() || useMirroredMTPHeadWeights())
         {
             /*
-             * A mirrored LocalTP MTP verifier head must consume the same final
+             * A mirrored MTP verifier head must consume the same final
              * normalization vector on every participant before the replicated
              * full-vocabulary projection.  Pairing a replicated LM head with a
              * TP-local final_norm lets otherwise identical mirrored children
@@ -963,7 +960,7 @@ namespace llaminar2
             {
                 throw std::runtime_error(
                     useMirroredMTPHeadWeights()
-                        ? "[QwenGraphBase] Mirrored LocalTP MTP head was requested but no replicated final_norm binding is available"
+                        ? "[QwenGraphBase] Mirrored MTP head was requested but no replicated final_norm binding is available"
                         : "[QwenGraphBase] Replicated dense decode was requested but no replicated final_norm binding is available");
             }
             TensorBase *decode_bound =
@@ -972,7 +969,7 @@ namespace llaminar2
                 return decode_bound;
             throw std::runtime_error(
                 useMirroredMTPHeadWeights()
-                    ? "[QwenGraphBase] Mirrored LocalTP MTP head final_norm binding has no tensor"
+                    ? "[QwenGraphBase] Mirrored MTP head final_norm binding has no tensor"
                     : "[QwenGraphBase] Replicated dense decode final_norm binding has no tensor");
         }
         TensorBase *bound = legacyTensor(weight_bindings_.final_norm);
@@ -986,7 +983,7 @@ namespace llaminar2
             if (useMirroredMTPHeadWeights() && !hasMirroredMTPHeadWeightSource())
             {
                 throw std::runtime_error(
-                    "[QwenGraphBase] Mirrored LocalTP MTP head was requested but replicated final_norm/lm_head bindings are missing: " +
+                    "[QwenGraphBase] Mirrored MTP head was requested but replicated final_norm/lm_head bindings are missing: " +
                     describeDecodeReplicatedDenseBindingState());
             }
             TensorBase *decode_bound = legacyTensor(decode_replicated_dense_weight_bindings_.lm_head);
@@ -1030,7 +1027,7 @@ namespace llaminar2
             if (!decode_replicated_dense_weight_bindings_.final_norm)
                 throw std::runtime_error(
                     useMirroredMTPHeadWeights()
-                        ? "[QwenGraphBase] Mirrored LocalTP MTP head was requested but no replicated final_norm binding is available"
+                        ? "[QwenGraphBase] Mirrored MTP head was requested but no replicated final_norm binding is available"
                         : "[QwenGraphBase] Replicated dense decode was requested but no replicated final_norm binding is available");
             return decode_replicated_dense_weight_bindings_.final_norm;
         }
@@ -1044,7 +1041,7 @@ namespace llaminar2
             if (!decode_replicated_dense_weight_bindings_.lm_head)
                 throw std::runtime_error(
                     useMirroredMTPHeadWeights()
-                        ? "[QwenGraphBase] Mirrored LocalTP MTP head was requested but no replicated LM head binding is available"
+                        ? "[QwenGraphBase] Mirrored MTP head was requested but no replicated LM head binding is available"
                         : "[QwenGraphBase] Replicated dense decode was requested but no replicated LM head binding is available");
             return decode_replicated_dense_weight_bindings_.lm_head;
         }
@@ -1072,7 +1069,28 @@ namespace llaminar2
         // the sole source of truth for graph-executable prepared weights.
         if (binding && prepared_weight_store_)
         {
-            auto ref = prepared_weight_store_->preparedRefForBinding(binding->binding_id, device);
+            PreparedWeightKind expected_kind = PreparedWeightKind::None;
+            if (binding->identity.role == WeightRole::Embedding)
+            {
+                expected_kind = PreparedWeightKind::PreparedEmbedding;
+            }
+            else if (device.is_cuda())
+            {
+                expected_kind = PreparedWeightKind::CudaInt8PackedGemm;
+            }
+            else if (device.is_rocm())
+            {
+                expected_kind = PreparedWeightKind::RocmInt8PackedGemm;
+            }
+            else if (device.is_cpu())
+            {
+                expected_kind = PreparedWeightKind::CpuPackedGemm;
+            }
+
+            auto ref = prepared_weight_store_->preparedRefForBinding(
+                binding->binding_id,
+                device,
+                expected_kind);
             if (ref.has_value())
                 return ref;
         }
@@ -1375,15 +1393,17 @@ namespace llaminar2
     // GraphConfig Helper Methods
     // =============================================================================
 
-    bool GraphConfig::requiresEagerGPUWorkspaceFamilyManifest() const noexcept
+    bool GraphConfig::requiresEagerWorkspaceFamilyManifest() const noexcept
     {
         const bool phase_split_dense_graphs =
             dense_tp_enabled &&
             (dense_tp_decode_replicated ||
              dense_tp_decode_mirrored_embedding);
-        const bool dynamic_moe_graphs =
-            moe.rebalance_mode == MoERebalanceMode::DYNAMIC;
-        return mtp.enabled || phase_split_dense_graphs || dynamic_moe_graphs;
+        const bool tiered_overlay_graphs =
+            moe.routed_expert_plan &&
+            moe.routed_expert_plan->usesExpertOverlayAuthority();
+        return mtp.enabled || phase_split_dense_graphs ||
+               tiered_overlay_graphs;
     }
 
     bool GraphConfig::hasUnifiedPP() const
@@ -1555,23 +1575,15 @@ namespace llaminar2
                 "participant-local ownership policy");
         }
 
-        const bool mirrored_local_tp =
-            config_.tp_ctx &&
-            config_.tp_ctx->isLocal() &&
-            config_.tp_ctx->degree() > 1;
-        if (mirrored_local_tp &&
-            !mtpTerminalHeadIsMirrored(config_.mtp.terminal_head_policy))
+        const bool multi_participant_tp =
+            config_.tp_ctx && config_.tp_ctx->degree() > 1;
+        const bool participant_full_vocabulary =
+            config_.mtpParticipantOwnsFullVocabulary();
+        if (multi_participant_tp && !participant_full_vocabulary)
         {
             throw std::runtime_error(
-                "Participant-local LocalTP MTP outcomes require a mirrored "
-                "full verifier head on every participant");
-        }
-        if (config_.tp_ctx && !config_.tp_ctx->isLocal() &&
-            config_.tp_ctx->degree() > 1)
-        {
-            throw std::runtime_error(
-                "Participant-local compact MTP outcomes require a complete "
-                "local verifier head and cannot be lowered onto sharded GlobalTP");
+                "Participant-local MTP outcomes require a complete verifier "
+                "head on every TP participant");
         }
 
         MTPVerifierOutcomeStage::Params params{
@@ -1582,7 +1594,8 @@ namespace llaminar2
             .verifier_row_count = verifier_row_count,
             .vocab_size = config_.vocab_size,
             .ownership_policy = config_.mtp_verifier_outcome_ownership,
-            .mirrored_local_tp = mirrored_local_tp,
+            .participant_full_vocabulary =
+                participant_full_vocabulary,
             .stage_name = "mtp_verifier_outcome",
         };
         graph.addNode(
@@ -3165,7 +3178,7 @@ namespace llaminar2
         (void)sequence_lengths_device;
         (void)absolute_position_ids_device;
         ComputeGraph graph;
-        std::string prefix = "layer" + std::to_string(layer_idx) + "_";
+        const std::string prefix = ffnGraphStagePrefix(layer_idx);
         std::string ffn_terminal; // Track the last node for terminalNode()
 
         // Compute total tokens for GEMM m parameter
@@ -3357,6 +3370,11 @@ namespace llaminar2
 
         graph.setTerminalNode(ffn_terminal);
         return graph;
+    }
+
+    std::string QwenGraphBase::ffnGraphStagePrefix(int layer_idx) const
+    {
+        return "layer" + std::to_string(layer_idx) + "_";
     }
 
     // =============================================================================
@@ -3589,7 +3607,7 @@ namespace llaminar2
         // Use local head counts when QKV is column-parallel
         const bool reserve_full_dense_decode_buffers = config_.dense_tp_decode_replicated;
         const bool reserve_full_mtp_head_buffers =
-            localTPMirroredMTPHeadConfigured();
+            mirroredMTPHeadConfigured();
 
         config.local_n_heads = config_.qkv_column_parallel && !reserve_full_dense_decode_buffers
                                    ? config_.local_n_heads
@@ -3635,20 +3653,26 @@ namespace llaminar2
                                     ? config_.vocab_size
                                     : config.local_vocab);
         /*
-         * CPU GlobalTP computes the MTP LM head column-sharded, then allgathers
-         * only its compact sidecar rows for stochastic sampling.  Other
-         * topologies use either a single full head or mirrored LocalTP heads and
-         * reserve a 1x1 placeholder instead of wasting a full-vocabulary arena.
+         * An explicitly vocabulary-sharded MTP head needs compact gathered
+         * rows for stochastic sampling. Mirrored ownership writes the complete
+         * vocabulary on every TP participant and therefore reserves only the
+         * schema's 1x1 gathered-logits placeholder, irrespective of TP scope.
          */
+        const bool spans_multiple_global_ranks =
+            (config_.tp_ctx != nullptr &&
+             !config_.tp_ctx->isLocal() &&
+             config_.tp_ctx->degree() > 1) ||
+            (config_.tp_ctx == nullptr &&
+             mpi_ctx_ != nullptr &&
+             mpi_ctx_->world_size() > 1);
         const bool reserve_global_mtp_gather =
-            config_.mtp.enabled &&
-            config_.lm_head_column_parallel &&
-            ((config_.tp_ctx != nullptr &&
-              !config_.tp_ctx->isLocal() &&
-              config_.tp_ctx->degree() > 1) ||
-             (config_.tp_ctx == nullptr &&
-              mpi_ctx_ != nullptr &&
-              mpi_ctx_->world_size() > 1));
+            resolveMTPTerminalLogitsCollective({
+                .layout = config_.mtpTerminalLogitsLayout(),
+                .sidecar_produces_logits = config_.mtp.enabled,
+                .spans_multiple_global_ranks =
+                    spans_multiple_global_ranks,
+            }) ==
+            MTPTerminalLogitsCollective::GlobalVocabularyAllGather;
         config.custom_formulas["mtp_global_gather_rows"] =
             reserve_global_mtp_gather
                 ? static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp))

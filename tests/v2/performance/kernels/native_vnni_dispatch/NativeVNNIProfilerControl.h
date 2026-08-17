@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <linux/perf_event.h>
+#include <omp.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <stdexcept>
@@ -516,4 +517,79 @@ namespace llaminar2::test::native_vnni_dispatch
         uint64_t wall_clock_ns_ = 0;
         bool enabled_ = false;
     };
+
+    /**
+     * @brief Capture the exact persistent OpenMP team used by a CPU kernel.
+     *
+     * Performance events are attached to concrete Linux thread IDs, not to a
+     * process-wide inheritance tree. The returned vector is indexed by OpenMP
+     * thread number so element zero is the calling thread and every later
+     * profiler control operation addresses the same stable worker.
+     *
+     * @return Linux TIDs ordered by OpenMP thread number.
+     * @throws std::runtime_error If the runtime creates fewer workers than its
+     *         advertised maximum or maps two slots to the same thread.
+     */
+    inline std::vector<pid_t> capturePersistentOpenMPThreadIds()
+    {
+        std::vector<pid_t> thread_ids(
+            static_cast<size_t>(omp_get_max_threads()),
+            static_cast<pid_t>(-1));
+#pragma omp parallel shared(thread_ids)
+        {
+            const int thread_number = omp_get_thread_num();
+            thread_ids[static_cast<size_t>(thread_number)] =
+                static_cast<pid_t>(::syscall(SYS_gettid));
+        }
+        if (std::find(thread_ids.begin(), thread_ids.end(), -1) !=
+            thread_ids.end())
+        {
+            throw std::runtime_error(
+                "OpenMP profiler failed to capture every advertised worker TID");
+        }
+        std::vector<pid_t> unique = thread_ids;
+        std::sort(unique.begin(), unique.end());
+        if (std::adjacent_find(unique.begin(), unique.end()) != unique.end())
+        {
+            throw std::runtime_error(
+                "OpenMP profiler captured a duplicate persistent worker TID");
+        }
+        return thread_ids;
+    }
+
+    /**
+     * @brief Profile exactly one launch on a warmed persistent OpenMP team.
+     *
+     * Fixture construction, route publication, correctness checks, warmup, and
+     * canonical timing must occur before this function. Counter reset/enable
+     * and disable/read happen on the same workers immediately around `launch`,
+     * yielding one uncontaminated candidate record.
+     *
+     * @tparam Launch Nullary callable that enters one production kernel route.
+     * @param control Reusable process-owned event groups.
+     * @param request_id Immutable corpus/profiler launch identity.
+     * @param output_path Atomic output path for this exact request.
+     * @param launch One production kernel invocation.
+     */
+    template <typename Launch>
+    inline void profileExactOpenMPRegion(
+        LinuxPerfControl &control,
+        const std::string &request_id,
+        const std::string &output_path,
+        Launch &&launch)
+    {
+        control.rebind(request_id, output_path);
+        if (!control.prepared())
+            control.prepare(capturePersistentOpenMPThreadIds());
+        const auto parallel_perf_control = [](auto &&action)
+        {
+#pragma omp parallel
+            {
+                action(static_cast<size_t>(omp_get_thread_num()));
+            }
+        };
+        control.begin(parallel_perf_control);
+        std::forward<Launch>(launch)();
+        control.end(parallel_perf_control);
+    }
 } // namespace llaminar2::test::native_vnni_dispatch

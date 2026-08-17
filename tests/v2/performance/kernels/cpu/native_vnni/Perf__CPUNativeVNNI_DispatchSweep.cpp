@@ -23,15 +23,20 @@
 #include <mpi.h>
 #include <omp.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <random>
+#include <set>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -43,6 +48,7 @@
 #include "utils/Logger.h"
 #include "fort.hpp"
 
+#include "../../native_vnni_dispatch/NativeVNNIProfilerControl.h"
 #include "utils/TestTensorFactory.h"
 
 using namespace llaminar2;
@@ -184,6 +190,14 @@ namespace
             return TestTensorFactory::createQ8_0Random({N, K});
         if (fmt == "Q4_0")
             return TestTensorFactory::createQ4_0Random({N, K});
+        if (fmt == "Q4_1")
+            return TestTensorFactory::createQ4_1Random({N, K});
+        if (fmt == "Q5_0")
+            return TestTensorFactory::createQ5_0Random({N, K});
+        if (fmt == "Q5_1")
+            return TestTensorFactory::createQ5_1Random({N, K});
+        if (fmt == "Q6_K")
+            return TestTensorFactory::createQ6_KRandom({N, K});
         return nullptr;
     }
 
@@ -351,10 +365,12 @@ namespace
         const auto &packed = kernel.packedWeights();
         int N_chunks = (shape.N + 63) / 64;
         int bpr = packed.blocks_per_row;
-        double weight_bytes = (double)N_chunks * bpr * packed.interleaved_block_stride +
-                              (double)N_chunks * bpr * 64 * (4 + 4); // scales + comp
-        if (packed.is_asymmetric)
-            weight_bytes += (double)N_chunks * bpr * 64 * 4; // mins
+        // `interleaved_block_stride` already contains values and all inline
+        // metadata. Adding scales/compensation/minima again overstates both
+        // bandwidth and roofline efficiency for every prepared encoding.
+        const double weight_bytes =
+            static_cast<double>(N_chunks) * bpr *
+            packed.interleaved_block_stride;
         // For M>1, activation bytes matter too
         double activation_bytes = (double)M * shape.K * sizeof(float);
         double total_bytes = weight_bytes + activation_bytes;
@@ -382,7 +398,11 @@ namespace
 
             // Query the actual tile config that was used
             NativeVNNITileConfig cfg = computeTileConfig(
-                shape.N, shape.K, M, packed.payload_bytes, omp_get_max_threads());
+                shape.N,
+                shape.K,
+                M,
+                packed.preparedFootprint(),
+                omp_get_max_threads());
 
             SweepResult r;
             r.format = fmt.name;
@@ -583,6 +603,320 @@ namespace
         const ModelDims future_qwen_9b = {
             "9B", 90, 4096, 32, 8, 128, 14336};
         EXPECT_EQ(prefillMValues(future_qwen_9b), through_16384);
+    }
+
+    /**
+     * @test Measure topology-derived K tiles against neighboring exact tiles.
+     *
+     * The five formats represent every distinct prepared-memory footprint:
+     * symmetric/asymmetric native nibble, native dual-scale Q6, and
+     * symmetric/asymmetric expanded INT8. The Qwen-32B FFN-down geometry makes
+     * each prepared panel larger than one private L2, so every format genuinely
+     * exercises cache tiling rather than normalizing to full K.
+     *
+     * Candidate launches are interleaved in a deterministic rotating order.
+     * This avoids granting the first or last candidate a systematic thermal or
+     * cache-state advantage. Environment publication and tile-policy reloads
+     * occur outside each timed interval. Before timing, every candidate is
+     * required to produce the same bytes as the full-K grouped execution.
+     *
+     * This is a performance diagnostic rather than a fixed winner assertion:
+     * cache topology and CPU generation legitimately change the winner. The
+     * emitted table supplies the empirical evidence used to revise the generic
+     * topology policy and its tolerable regret threshold.
+     *
+     * `LLAMINAR_CPU_NVNNI_CACHE_TILE_M`, `_N`, and `_K` may select another
+     * positive, block-aligned geometry without recompiling the harness. This
+     * makes grouped-depth and model-shape comparisons repeatable while keeping
+     * the production candidate implementation identical. `_FORMAT` and
+     * `_CANDIDATE` narrow execution to one prepared format/tile. When the
+     * standard NativeVNNI profiler request/output variables are also present,
+     * one additional isolated launch is enclosed by process-owned per-worker
+     * Linux performance events after setup and warmup.
+     */
+    TEST_F(
+        CPUNativeVNNIDispatchSweepTest,
+        CacheKTilesCoverAllPreparedFootprints)
+    {
+        auto selected_dimension = [](const char *name, int fallback)
+        {
+            const char *raw = std::getenv(name);
+            return raw == nullptr ? fallback : std::stoi(raw);
+        };
+        const int M = selected_dimension(
+            "LLAMINAR_CPU_NVNNI_CACHE_TILE_M", 8);
+        const int N = selected_dimension(
+            "LLAMINAR_CPU_NVNNI_CACHE_TILE_N", 5120);
+        const int K = selected_dimension(
+            "LLAMINAR_CPU_NVNNI_CACHE_TILE_K", 27648);
+        ASSERT_GT(M, 1);
+        ASSERT_GT(N, 0);
+        ASSERT_GT(K, 0);
+        ASSERT_EQ(K % Q8_1Block::BLOCK_SIZE, 0);
+        const int K_BLOCKS = K / Q8_1Block::BLOCK_SIZE;
+        const char *selected_format_raw =
+            std::getenv("LLAMINAR_CPU_NVNNI_CACHE_TILE_FORMAT");
+        const std::string selected_format =
+            selected_format_raw == nullptr ? "" : selected_format_raw;
+        const char *selected_candidate_raw =
+            std::getenv("LLAMINAR_CPU_NVNNI_CACHE_TILE_CANDIDATE");
+        const std::optional<int> selected_candidate =
+            selected_candidate_raw == nullptr
+                ? std::nullopt
+                : std::optional<int>(std::stoi(selected_candidate_raw));
+        if (selected_candidate.has_value())
+            ASSERT_GT(*selected_candidate, 0);
+
+        const std::string profiler_request_id =
+            native_vnni_dispatch::profilerRequestId();
+        const std::string profiler_output_path =
+            native_vnni_dispatch::profilerEnvironment(
+                native_vnni_dispatch::kPerfStatsPathEnvironment);
+        std::optional<native_vnni_dispatch::LinuxPerfControl> perf_control;
+        if (!profiler_request_id.empty())
+        {
+            ASSERT_FALSE(selected_format.empty())
+                << "isolated cache-tile profiling requires one format";
+            ASSERT_TRUE(selected_candidate.has_value())
+                << "isolated cache-tile profiling requires one K tile";
+            perf_control.emplace(
+                profiler_request_id, profiler_output_path);
+        }
+        constexpr int WARMUPS_PER_CANDIDATE = 2;
+        constexpr int TIMED_ROUNDS = 9;
+        constexpr std::array<const char *, 5> formats = {
+            "Q4_0", "Q4_1", "Q6_K", "Q5_0", "Q5_1",
+        };
+
+        std::mt19937 activation_rng(0xCA6E71E5u);
+        std::uniform_real_distribution<float> activation_distribution(
+            -1.0f, 1.0f);
+        std::vector<float> activations(static_cast<size_t>(M) * K);
+        for (float &value : activations)
+            value = activation_distribution(activation_rng);
+        std::vector<Q8_1Block> quantized(
+            static_cast<size_t>(M) * K_BLOCKS);
+        quantize_activations_to_q8_1(
+            activations.data(), quantized.data(), M, K, K_BLOCKS);
+
+        std::cout
+            << "format,m,n,k,prepared_stride,auto_k_tile,candidate_k_tile,"
+               "median_us,p10_us,gflops,regret_pct\n";
+
+        bool selected_format_executed = false;
+        for (const char *format : formats)
+        {
+            if (!selected_format.empty() && selected_format != format)
+                continue;
+            selected_format_executed = true;
+            SCOPED_TRACE(format);
+            auto weights = createWeights(format, N, K);
+            ASSERT_NE(weights, nullptr);
+            CPUNativeVNNIGemmKernel kernel(weights.get());
+            ASSERT_TRUE(kernel.isValid());
+            const auto &packed = kernel.packedWeights();
+
+            clearOverrides();
+            const NativeVNNITileConfig automatic = computeTileConfig(
+                N,
+                K,
+                M,
+                packed.preparedFootprint(),
+                omp_get_max_threads());
+            ASSERT_GT(automatic.k_tile_blocks, 0)
+                << format << " did not exercise cache tiling";
+            ASSERT_LT(automatic.k_tile_blocks, K_BLOCKS)
+                << format << " normalized to a full-K tile";
+            const int auto_tile = automatic.k_tile_blocks;
+
+            const auto scaled_auto_tile =
+                [auto_tile, K_BLOCKS](int numerator, int denominator)
+            {
+                const std::int64_t scaled =
+                    static_cast<std::int64_t>(auto_tile) * numerator /
+                    denominator;
+                return static_cast<int>(std::clamp<std::int64_t>(
+                    scaled, 1, K_BLOCKS));
+            };
+            std::set<int> unique_tiles = {
+                scaled_auto_tile(1, 8),
+                scaled_auto_tile(1, 4),
+                scaled_auto_tile(3, 8),
+                scaled_auto_tile(1, 2),
+                scaled_auto_tile(3, 4),
+                std::max(1, auto_tile - 1),
+                auto_tile,
+                std::min(K_BLOCKS, auto_tile + 1),
+                scaled_auto_tile(5, 4),
+                scaled_auto_tile(3, 2),
+                scaled_auto_tile(2, 1),
+                scaled_auto_tile(3, 1),
+                scaled_auto_tile(4, 1),
+                K_BLOCKS,
+            };
+            if (selected_candidate.has_value())
+            {
+                ASSERT_LE(*selected_candidate, K_BLOCKS)
+                    << "selected K tile exceeds the logical K extent";
+                unique_tiles.insert(*selected_candidate);
+            }
+
+            struct Candidate
+            {
+                int k_tile_blocks = 0;
+                std::vector<double> samples_us;
+            };
+            std::vector<Candidate> candidates;
+            candidates.reserve(unique_tiles.size());
+            for (const int tile : unique_tiles)
+            {
+                if (!selected_candidate.has_value() ||
+                    *selected_candidate == tile)
+                {
+                    candidates.push_back({.k_tile_blocks = tile});
+                }
+            }
+            ASSERT_FALSE(candidates.empty())
+                << format << " did not generate the selected K tile";
+            if (perf_control.has_value())
+                ASSERT_EQ(candidates.size(), 1u);
+
+            std::vector<float> reference(static_cast<size_t>(M) * N);
+            std::vector<float> output(static_cast<size_t>(M) * N);
+            applyOverrides(1, K_BLOCKS, 0, 0);
+            gemm_native_vnni_preq(
+                packed,
+                quantized.data(),
+                reference.data(),
+                M,
+                N,
+                ISAPath::AUTO,
+                VerifierRowsPolicy::Pairwise,
+                PrefillSchedulePolicy::TwoRowNMajor,
+                1);
+
+            auto launch = [&](Candidate &candidate)
+            {
+                applyOverrides(1, candidate.k_tile_blocks, 0, 0);
+                gemm_native_vnni_preq(
+                    packed,
+                    quantized.data(),
+                    output.data(),
+                    M,
+                    N,
+                    ISAPath::AUTO,
+                    VerifierRowsPolicy::Pairwise,
+                    PrefillSchedulePolicy::TwoRowNMajor,
+                    1);
+            };
+
+            for (Candidate &candidate : candidates)
+            {
+                launch(candidate);
+                ASSERT_EQ(
+                    std::memcmp(
+                        output.data(),
+                        reference.data(),
+                        output.size() * sizeof(float)),
+                    0)
+                    << format << " K-tile=" << candidate.k_tile_blocks;
+                for (int warmup = 0;
+                     warmup < WARMUPS_PER_CANDIDATE;
+                     ++warmup)
+                    launch(candidate);
+                candidate.samples_us.reserve(TIMED_ROUNDS);
+            }
+
+            if (perf_control.has_value())
+            {
+                Candidate &profiled = candidates.front();
+                applyOverrides(1, profiled.k_tile_blocks, 0, 0);
+                native_vnni_dispatch::profileExactOpenMPRegion(
+                    *perf_control,
+                    profiler_request_id,
+                    profiler_output_path,
+                    [&]()
+                    {
+                        gemm_native_vnni_preq(
+                            packed,
+                            quantized.data(),
+                            output.data(),
+                            M,
+                            N,
+                            ISAPath::AUTO,
+                            VerifierRowsPolicy::Pairwise,
+                            PrefillSchedulePolicy::TwoRowNMajor,
+                            1);
+                    });
+            }
+
+            for (int round = 0; round < TIMED_ROUNDS; ++round)
+            {
+                for (size_t offset = 0; offset < candidates.size(); ++offset)
+                {
+                    Candidate &candidate = candidates[
+                        (offset + static_cast<size_t>(round)) %
+                        candidates.size()];
+                    applyOverrides(1, candidate.k_tile_blocks, 0, 0);
+                    const auto begin =
+                        std::chrono::steady_clock::now();
+                    gemm_native_vnni_preq(
+                        packed,
+                        quantized.data(),
+                        output.data(),
+                        M,
+                        N,
+                        ISAPath::AUTO,
+                        VerifierRowsPolicy::Pairwise,
+                        PrefillSchedulePolicy::TwoRowNMajor,
+                        1);
+                    const auto end = std::chrono::steady_clock::now();
+                    candidate.samples_us.push_back(
+                        std::chrono::duration<double, std::micro>(
+                            end - begin)
+                            .count());
+                }
+            }
+
+            double best_median_us =
+                std::numeric_limits<double>::infinity();
+            for (Candidate &candidate : candidates)
+            {
+                std::sort(
+                    candidate.samples_us.begin(),
+                    candidate.samples_us.end());
+                best_median_us = std::min(
+                    best_median_us,
+                    candidate.samples_us[candidate.samples_us.size() / 2]);
+            }
+            for (const Candidate &candidate : candidates)
+            {
+                const double median_us =
+                    candidate.samples_us[candidate.samples_us.size() / 2];
+                const double p10_us = candidate.samples_us[0];
+                const double gflops =
+                    (2.0 * M * N * K) / (median_us * 1.0e3);
+                const double regret_pct =
+                    (median_us / best_median_us - 1.0) * 100.0;
+                std::cout
+                    << format << ","
+                    << M << ","
+                    << N << ","
+                    << K << ","
+                    << packed.interleaved_block_stride << ","
+                    << auto_tile << ","
+                    << candidate.k_tile_blocks << ","
+                    << std::fixed << std::setprecision(2)
+                    << median_us << ","
+                    << p10_us << ","
+                    << gflops << ","
+                    << regret_pct << "\n";
+            }
+        }
+
+        ASSERT_TRUE(selected_format_executed)
+            << "unknown cache-tile format filter: " << selected_format;
+        clearOverrides();
     }
 
     // -----------------------------------------------------------------------

@@ -115,6 +115,9 @@ TEST(Test__SnapshotCapture_KeyConversion, MoEStages)
               "layer0_MOE_EXPERT_OUTPUT_ALLREDUCED");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_overlay_fast_allreduce"),
               "layer0_MOE_EXPERT_OUTPUT_ALLREDUCED");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey(
+                  "layer0_moe_overlay_continuation_broadcast"),
+              "layer0_MOE_EXPERT_OUTPUT_ALLREDUCED");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_routed_expert_partial_reduce"), "layer0_MOE_EXPERT_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_sparse_return_reduce_tier0_hot_p0_allreduce"),
               "layer0_MOE_EXPERT_OUTPUT_ALLREDUCED");
@@ -124,8 +127,43 @@ TEST(Test__SnapshotCapture_KeyConversion, MoEStages)
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert_gate"), "layer0_MOE_SHARED_GATE_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_add"), "layer0_MOE_COMBINED_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_combine"), "layer0_MOE_COMBINED_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey(
+                  "layer0_moe_overlay_ticket_consume_tier2_cold_p3"),
+              "layer0_MOE_EXPERT_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer39_moe_ffn"), "layer39_MOE_EXPERT_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer39_moe_add"), "layer39_MOE_COMBINED_OUTPUT");
+}
+
+/**
+ * @brief Overlay ticket captures retain each target's cumulative routed sum.
+ *
+ * The ordinary expert-output key remains the final semantic model checkpoint;
+ * the extra key is evidence for diagnosis of a heterogeneous sparse return.
+ */
+TEST(Test__SnapshotCapture_Capture,
+     OverlayTicketConsumePublishesParticipantCumulativeCheckpoint)
+{
+    const std::vector<float> cumulative = {1.0f, -2.0f, 3.0f, -4.0f};
+    StageDumpInfo dump;
+    dump.outputs.push_back(
+        makeFP32Output("output", cumulative.data(), 1, cumulative.size()));
+
+    SnapshotCapture capture;
+    capture.captureStage(
+        "layer7_moe_overlay_ticket_consume_tier2_cold_p3", dump);
+
+    const std::string semantic_key = "layer7_MOE_EXPERT_OUTPUT";
+    const std::string cumulative_key =
+        "layer7_MOE_OVERLAY_CUMULATIVE_TIER2_COLD_P3";
+    ASSERT_NE(capture.get(semantic_key), nullptr);
+    ASSERT_NE(capture.get(cumulative_key), nullptr);
+    EXPECT_EQ(capture.get(semantic_key)->data, cumulative);
+    EXPECT_EQ(capture.get(cumulative_key)->data, cumulative);
+
+    const auto keys = SnapshotCapture::possibleKeysForStageName(
+        "layer7_moe_overlay_ticket_consume_tier2_cold_p3");
+    EXPECT_NE(std::find(keys.begin(), keys.end(), semantic_key), keys.end());
+    EXPECT_NE(std::find(keys.begin(), keys.end(), cumulative_key), keys.end());
 }
 
 TEST(Test__SnapshotCapture_KeyConversion, PossibleKeysIncludeFusedMoECombinedOutput)
@@ -245,6 +283,16 @@ TEST(Test__SnapshotCapture_KeyConversion, PossibleKeysIncludePostCollectiveOutpu
                         routed_keys.end(),
                         "layer14_MOE_EXPERT_OUTPUT_ALLREDUCED"),
               routed_keys.end());
+
+    const auto overlay_publication_keys =
+        SnapshotCapture::possibleKeysForStageName(
+            "layer14_moe_overlay_continuation_broadcast");
+    EXPECT_NE(
+        std::find(
+            overlay_publication_keys.begin(),
+            overlay_publication_keys.end(),
+            "layer14_MOE_EXPERT_OUTPUT_ALLREDUCED"),
+        overlay_publication_keys.end());
 }
 
 TEST(Test__SnapshotCapture_KeyConversion, MTPSidecarStages)
@@ -321,6 +369,43 @@ TEST(Test__SnapshotCapture_Capture, ConcurrentStageCallbacksDoNotRaceSnapshotSto
         ASSERT_NE(snapshot, nullptr) << key;
         EXPECT_EQ(snapshot->data, payloads[t]);
     }
+}
+
+/**
+ * @brief A handle acquired by parity must outlive later callback publication.
+ *
+ * Captured graphs can publish a later decode/pre-fill value or clear the
+ * diagnostic bank while an outer rank/global router is still copying an older
+ * checkpoint.  This regression locks down the ownership contract used by
+ * SnapshotInfo: a reader sees one complete immutable publication, never a
+ * map entry or vector invalidated by the next callback.
+ */
+TEST(Test__SnapshotCapture_Capture,
+     SharedHandleSurvivesReplacementAndClear)
+{
+    const std::vector<float> first = {1.0f, 2.0f, 3.0f, 4.0f};
+    const std::vector<float> second = {9.0f, 8.0f, 7.0f, 6.0f};
+
+    SnapshotCapture capture;
+    capture.captureStage(
+        "embedding",
+        makeSingleOutputDump("output", first.data(), /*rows=*/1, /*cols=*/4));
+
+    const StoredSnapshotHandle held = capture.getShared("EMBEDDING");
+    ASSERT_TRUE(held);
+    EXPECT_EQ(held->data, first);
+
+    // A later graph publication replaces the semantic key, not the immutable
+    // object retained by the outer parity comparison.
+    capture.captureStage(
+        "embedding",
+        makeSingleOutputDump("output", second.data(), /*rows=*/1, /*cols=*/4));
+    capture.clear();
+
+    EXPECT_EQ(held->rows, 1u);
+    EXPECT_EQ(held->cols, 4u);
+    EXPECT_EQ(held->data, first);
+    EXPECT_FALSE(capture.getShared("EMBEDDING"));
 }
 
 TEST(Test__SnapshotCapture_KeyConversion, FallbackUpperCase)
@@ -508,6 +593,60 @@ TEST(Test__SnapshotCapture_Capture, MTPSidecarFusedQKVUsesMTPKeys)
     EXPECT_EQ(v_snapshot->data, v);
 }
 
+/**
+ * @brief K/V-only catch-up graphs preserve both semantic projection outputs.
+ */
+TEST(Test__SnapshotCapture_Capture, MTPSidecarFusedKVUsesCanonicalKAndVKeys)
+{
+    std::vector<float> k = {3.0f, 4.0f};
+    std::vector<float> v = {5.0f, 6.0f};
+
+    StageDumpInfo dump;
+    dump.outputs.push_back(makeFP32Output("output_k", k.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("output_v", v.data(), 1, 2));
+
+    SnapshotCapture capture;
+    capture.captureStage("MTP0_kv_proj", dump);
+
+    ASSERT_NE(capture.get("MTP0_K_PROJECTION"), nullptr);
+    ASSERT_NE(capture.get("MTP0_V_PROJECTION"), nullptr);
+    EXPECT_EQ(capture.get("MTP0_K_PROJECTION")->data, k);
+    EXPECT_EQ(capture.get("MTP0_V_PROJECTION")->data, v);
+    EXPECT_EQ(capture.get("MTP0_KV_PROJ"), nullptr)
+        << "A fused implementation is not a semantic numerical checkpoint";
+
+    EXPECT_EQ(
+        SnapshotCapture::possibleKeysForStageName("MTP0_kv_proj"),
+        (std::vector<std::string>{
+            "MTP0_K_PROJECTION", "MTP0_V_PROJECTION"}));
+}
+
+/**
+ * @brief Scoped MTP embedding collectives use the canonical reduced key.
+ */
+TEST(Test__SnapshotCapture_Capture, MTPEmbeddingAllreduceUsesReducedSemanticName)
+{
+    const std::vector<float> embedding = {1.0f, 2.0f};
+    SnapshotCapture capture;
+    capture.captureStage(
+        "MTP0_embedding_allreduce",
+        makeSingleOutputDump("output", embedding.data(), 1, 2));
+
+    ASSERT_NE(capture.get("MTP0_EMBEDDING_ALLREDUCED"), nullptr);
+    EXPECT_EQ(capture.get("MTP0_EMBEDDING_ALLREDUCED")->data, embedding);
+    EXPECT_EQ(capture.get("MTP0_EMBEDDING_ALLREDUCE"), nullptr);
+    EXPECT_EQ(
+        SnapshotCapture::convertStageNameToSnapshotKey(
+            "MTP0_embedding_allreduce"),
+        "MTP0_EMBEDDING_ALLREDUCED");
+    EXPECT_EQ(
+        SnapshotCapture::convertStageNameToSnapshotKey(
+            "mtp0_embedding_allreduce"),
+        "MTP0_EMBEDDING_ALLREDUCED")
+        << "Production MTP graph node spelling must not leak into the "
+           "schema-facing snapshot key";
+}
+
 TEST(Test__SnapshotCapture_Capture, GDNProjectionSplitsAlphaAndBeta)
 {
     std::vector<float> qkv = {1.0f, 2.0f};
@@ -608,6 +747,95 @@ TEST(Test__SnapshotCapture_Capture, ContextQualifiedMTPKeysRemainDisambiguated)
     ASSERT_NE(catchup_snapshot, nullptr);
     EXPECT_EQ(decode_snapshot->data, decode_embedding);
     EXPECT_EQ(catchup_snapshot->data, catchup_embedding);
+}
+
+/**
+ * @brief Segmented prefill restores ordinary parity keys to the full prompt.
+ *
+ * The graph callback records a scoped copy for each fixed bucket and also
+ * writes the historical bare key. Aggregation must replace that bare final
+ * chunk with the real-row concatenation while retaining every scoped value for
+ * CSV-guided diagnosis. Terminal values remain the final chunk rather than
+ * being fabricated into sequence tensors.
+ */
+TEST(Test__SnapshotCapture_Capture,
+     SegmentedPrefillAggregationJoinsLiveRowsAndRetainsChunkEvidence)
+{
+    const std::vector<float> first_embedding = {1.0f, 2.0f, 3.0f, 4.0f};
+    const std::vector<float> second_embedding = {5.0f, 6.0f};
+    const std::vector<float> first_logits = {10.0f, 11.0f};
+    const std::vector<float> second_logits = {12.0f, 13.0f};
+
+    SnapshotCapture capture;
+    capture.captureStage(
+        "prefill_chunk_0::embedding",
+        makeSingleOutputDump(
+            "output", first_embedding.data(), /*rows=*/2, /*cols=*/2));
+    capture.captureStage(
+        "prefill_chunk_1::embedding",
+        makeSingleOutputDump(
+            "output", second_embedding.data(), /*rows=*/1, /*cols=*/2));
+    // LM-head snapshots are intentionally last-token values: one row even
+    // though the first graph chunk contains two real token rows.
+    capture.captureStage(
+        "prefill_chunk_0::lm_head",
+        makeSingleOutputDump(
+            "output", first_logits.data(), /*rows=*/1, /*cols=*/2));
+    capture.captureStage(
+        "prefill_chunk_1::lm_head",
+        makeSingleOutputDump(
+            "output", second_logits.data(), /*rows=*/1, /*cols=*/2));
+
+    const auto aggregation = capture.aggregateSequentialChunkSnapshots({
+        {.context = "prefill_chunk_0", .logical_rows = 2},
+        {.context = "prefill_chunk_1", .logical_rows = 1},
+    });
+    ASSERT_TRUE(aggregation) << aggregation.error;
+    EXPECT_EQ(aggregation.aggregated_sequence_keys, 1u);
+    EXPECT_EQ(aggregation.terminal_or_nonsequence_keys, 1u);
+
+    const auto *embedding = capture.get("EMBEDDING");
+    ASSERT_NE(embedding, nullptr);
+    EXPECT_EQ(embedding->rows, 3u);
+    EXPECT_EQ(embedding->cols, 2u);
+    EXPECT_EQ(
+        embedding->data,
+        (std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f}));
+
+    // The final bare LM_HEAD remains the terminal chunk. It must not claim to
+    // contain three prompt rows merely because the embedding is sequence-shaped.
+    const auto *lm_head = capture.get("LM_HEAD");
+    ASSERT_NE(lm_head, nullptr);
+    EXPECT_EQ(lm_head->rows, 1u);
+    EXPECT_EQ(lm_head->data, second_logits);
+
+    const auto *first_scoped = capture.get("PREFILL_CHUNK_0_EMBEDDING");
+    const auto *second_scoped = capture.get("PREFILL_CHUNK_1_EMBEDDING");
+    ASSERT_NE(first_scoped, nullptr);
+    ASSERT_NE(second_scoped, nullptr);
+    EXPECT_EQ(first_scoped->data, first_embedding);
+    EXPECT_EQ(second_scoped->data, second_embedding);
+}
+
+/**
+ * @brief An incomplete chunk checkpoint must fail rather than compare a tail.
+ */
+TEST(Test__SnapshotCapture_Capture,
+     SegmentedPrefillAggregationRejectsMissingSequenceChunk)
+{
+    const std::vector<float> first_embedding = {1.0f, 2.0f, 3.0f, 4.0f};
+    SnapshotCapture capture;
+    capture.captureStage(
+        "prefill_chunk_0::embedding",
+        makeSingleOutputDump(
+            "output", first_embedding.data(), /*rows=*/2, /*cols=*/2));
+
+    const auto aggregation = capture.aggregateSequentialChunkSnapshots({
+        {.context = "prefill_chunk_0", .logical_rows = 2},
+        {.context = "prefill_chunk_1", .logical_rows = 1},
+    });
+    EXPECT_FALSE(aggregation);
+    EXPECT_NE(aggregation.error.find("missing chunk 1"), std::string::npos);
 }
 
 // =========================================================================

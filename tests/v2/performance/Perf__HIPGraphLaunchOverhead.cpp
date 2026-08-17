@@ -33,10 +33,13 @@
 #endif
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <numeric>
 #include <algorithm>
@@ -127,7 +130,221 @@ constexpr int VECTOR_N = 1024;  // Small vector — kernel ~5μs, dominated by l
 constexpr int BLOCK_SIZE = 256;
 
 // Node counts to test: covers small graphs up to Qwen2.5-7B decode graph (732 nodes)
-const std::vector<int> NODE_COUNTS = {1, 5, 10, 28, 50, 100, 200, 338, 500, 732};
+const std::vector<int> NODE_COUNTS = {1, 5, 10, 19, 28, 50, 100, 200, 338, 500, 732};
+
+/**
+ * @brief One setup-owned retained graph used by the multi-device launch test.
+ *
+ * The production heterogeneous MoE endpoint retains one graph per participant
+ * device.  Keeping every stream, graph executable, and completion event alive
+ * here makes the timed loop measure only replay submission and publication.
+ */
+struct RetainedDeviceGraph
+{
+    int device = -1;                 ///< HIP ordinal owned by this endpoint.
+    hipStream_t stream = nullptr;    ///< Exact non-default replay stream.
+    hipGraph_t graph = nullptr;      ///< Captured 19-node graph definition.
+    hipGraphExec_t executable = nullptr; ///< Instantiated replay authority.
+    hipEvent_t completion = nullptr; ///< Exact event published after replay.
+    hipError_t worker_error = hipSuccess; ///< First asynchronous worker error.
+};
+
+/**
+ * @brief Destroy a retained endpoint on the device that owns its resources.
+ * @param endpoint Endpoint whose setup-owned resources are released.
+ */
+void destroyRetainedDeviceGraph(RetainedDeviceGraph &endpoint) noexcept
+{
+    if (endpoint.device >= 0)
+        (void)hipSetDevice(endpoint.device);
+    if (endpoint.completion)
+        (void)hipEventDestroy(endpoint.completion);
+    if (endpoint.executable)
+        (void)hipGraphExecDestroy(endpoint.executable);
+    if (endpoint.graph)
+        (void)hipGraphDestroy(endpoint.graph);
+    if (endpoint.stream)
+        (void)hipStreamDestroy(endpoint.stream);
+    endpoint = {};
+}
+
+/**
+ * @brief Capture and instantiate one fixed-size no-op endpoint graph.
+ * @param endpoint Destination owner populated on success.
+ * @param device HIP device ordinal assigned to the endpoint.
+ * @param node_count Number of kernel nodes captured in the retained graph.
+ * @return First HIP status that fails, or `hipSuccess`.
+ */
+hipError_t initializeRetainedDeviceGraph(
+    RetainedDeviceGraph &endpoint,
+    int device,
+    int node_count)
+{
+    endpoint.device = device;
+    hipError_t status = hipSetDevice(device);
+    if (status != hipSuccess)
+        return status;
+    status = hipStreamCreateWithFlags(&endpoint.stream, hipStreamNonBlocking);
+    if (status != hipSuccess)
+        return status;
+    status = hipEventCreateWithFlags(
+        &endpoint.completion,
+        hipEventDisableTiming);
+    if (status != hipSuccess)
+        return status;
+
+    status = hipStreamBeginCapture(
+        endpoint.stream,
+        hipStreamCaptureModeRelaxed);
+    if (status != hipSuccess)
+        return status;
+    for (int node = 0; node < node_count; ++node)
+        nop_kernel<<<1, 1, 0, endpoint.stream>>>();
+    status = hipStreamEndCapture(endpoint.stream, &endpoint.graph);
+    if (status != hipSuccess)
+        return status;
+    return hipGraphInstantiate(
+        &endpoint.executable,
+        endpoint.graph,
+        nullptr,
+        nullptr,
+        0);
+}
+
+/**
+ * @brief Allocation-free persistent fan-out for retained HIP graph submission.
+ *
+ * Each worker binds one HIP device exactly once, then waits for a monotonically
+ * increasing generation.  A generation only launches its endpoint graph and
+ * records the exact completion event; the coordinator performs the later host
+ * fence after every sibling has been submitted.  This is the same two-wave
+ * ordering required by the ExpertOverlay participant graph, without allocating
+ * futures, callables, or threads inside the measured path.
+ */
+class PersistentHIPGraphLaunchWave final
+{
+public:
+    /** @brief Start one permanent worker for every retained endpoint. */
+    explicit PersistentHIPGraphLaunchWave(
+        std::vector<RetainedDeviceGraph> &endpoints)
+        : endpoints_(endpoints)
+    {
+        workers_.reserve(endpoints_.size());
+        for (size_t index = 0; index < endpoints_.size(); ++index)
+        {
+            workers_.emplace_back(
+                [this, index]()
+                {
+                    workerLoop(index);
+                });
+        }
+
+        // Construction does not return until every worker has installed its
+        // immutable device context. No timed generation pays this setup cost.
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_cv_.wait(
+            lock,
+            [this]()
+            {
+                return ready_count_ == endpoints_.size();
+            });
+    }
+
+    /** @brief Stop and join every permanent worker. */
+    ~PersistentHIPGraphLaunchWave()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            shutdown_ = true;
+        }
+        dispatch_cv_.notify_all();
+        for (auto &worker : workers_)
+        {
+            if (worker.joinable())
+                worker.join();
+        }
+    }
+
+    PersistentHIPGraphLaunchWave(const PersistentHIPGraphLaunchWave &) = delete;
+    PersistentHIPGraphLaunchWave &operator=(const PersistentHIPGraphLaunchWave &) = delete;
+
+    /**
+     * @brief Submit one graph on every device and wait until all events exist.
+     *
+     * Device execution remains asynchronous when this method returns. The
+     * caller next waits on the endpoint events, preserving the production
+     * all-submit-before-any-completion contract.
+     */
+    void submitAll()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        completed_count_ = 0;
+        ++generation_;
+        dispatch_cv_.notify_all();
+        completion_cv_.wait(
+            lock,
+            [this]()
+            {
+                return completed_count_ == endpoints_.size();
+            });
+    }
+
+private:
+    /** @brief Own one HIP context and service every published launch generation. */
+    void workerLoop(size_t index)
+    {
+        auto &endpoint = endpoints_[index];
+        endpoint.worker_error = hipSetDevice(endpoint.device);
+        uint64_t observed_generation = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++ready_count_;
+        }
+        ready_cv_.notify_one();
+
+        while (true)
+        {
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                dispatch_cv_.wait(
+                    lock,
+                    [this, observed_generation]()
+                    {
+                        return shutdown_ || generation_ > observed_generation;
+                    });
+                if (shutdown_)
+                    return;
+                observed_generation = generation_;
+            }
+
+            if (endpoint.worker_error == hipSuccess)
+                endpoint.worker_error = hipGraphLaunch(
+                    endpoint.executable,
+                    endpoint.stream);
+            if (endpoint.worker_error == hipSuccess)
+                endpoint.worker_error = hipEventRecord(
+                    endpoint.completion,
+                    endpoint.stream);
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ++completed_count_;
+            }
+            completion_cv_.notify_one();
+        }
+    }
+
+    std::vector<RetainedDeviceGraph> &endpoints_;
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable ready_cv_;
+    std::condition_variable dispatch_cv_;
+    std::condition_variable completion_cv_;
+    size_t ready_count_ = 0;
+    size_t completed_count_ = 0;
+    uint64_t generation_ = 0;
+    bool shutdown_ = false;
+};
 
 // ============================================================================
 // Test Fixture
@@ -710,6 +927,197 @@ TEST_F(Perf__HIPGraphLaunchOverhead, DecodeBudgetAnalysis)
     printf("║  Throughput loss:                    %+7.1f%%                           ║\n", -throughput_loss_pct);
     printf("║                                                                        ║\n");
     printf("╚══════════════════════════════════════════════════════════════════════════╝\n\n");
+}
+
+// ============================================================================
+// TEST 6: Four-device retained endpoint graph submission topology
+// ============================================================================
+
+TEST(Perf__HIPGraphLaunchWave, FourDeviceSerialVsPersistentFanout)
+{
+    constexpr int kRequiredDevices = 4;
+    constexpr int kEndpointGraphNodes = 19;
+    constexpr int kWarmupIterations = 30;
+    constexpr int kBenchmarkIterations = 1000;
+
+    int available_devices = 0;
+    ASSERT_EQ(hipGetDeviceCount(&available_devices), hipSuccess);
+    if (available_devices < kRequiredDevices)
+    {
+        GTEST_SKIP() << "Four-device endpoint launch proof requires four visible ROCm devices; found "
+                     << available_devices;
+    }
+
+    std::vector<RetainedDeviceGraph> endpoints(kRequiredDevices);
+    const auto destroyEndpoints = [&]()
+    {
+        for (auto &endpoint : endpoints)
+            destroyRetainedDeviceGraph(endpoint);
+    };
+    for (int device = 0; device < kRequiredDevices; ++device)
+    {
+        const hipError_t status = initializeRetainedDeviceGraph(
+            endpoints[static_cast<size_t>(device)],
+            device,
+            kEndpointGraphNodes);
+        if (status != hipSuccess)
+        {
+            destroyEndpoints();
+            FAIL() << "Could not prepare retained endpoint graph on ROCm device "
+                   << device << ": " << hipGetErrorString(status);
+            return;
+        }
+    }
+
+    const auto waitForAllEvents = [&]() -> hipError_t
+    {
+        for (auto &endpoint : endpoints)
+        {
+            hipError_t status = hipSetDevice(endpoint.device);
+            if (status != hipSuccess)
+                return status;
+            status = hipEventSynchronize(endpoint.completion);
+            if (status != hipSuccess)
+                return status;
+        }
+        return hipSuccess;
+    };
+
+    const auto submitSerial = [&]() -> hipError_t
+    {
+        for (auto &endpoint : endpoints)
+        {
+            hipError_t status = hipSetDevice(endpoint.device);
+            if (status != hipSuccess)
+                return status;
+            status = hipGraphLaunch(endpoint.executable, endpoint.stream);
+            if (status != hipSuccess)
+                return status;
+            status = hipEventRecord(endpoint.completion, endpoint.stream);
+            if (status != hipSuccess)
+                return status;
+        }
+        return hipSuccess;
+    };
+
+    std::vector<double> serial_submission_samples;
+    std::vector<double> serial_service_samples;
+    std::vector<double> fanout_submission_samples;
+    std::vector<double> fanout_service_samples;
+    serial_submission_samples.reserve(kBenchmarkIterations);
+    serial_service_samples.reserve(kBenchmarkIterations);
+    fanout_submission_samples.reserve(kBenchmarkIterations);
+    fanout_service_samples.reserve(kBenchmarkIterations);
+
+    hipError_t benchmark_error = hipSuccess;
+    {
+        PersistentHIPGraphLaunchWave fanout(endpoints);
+
+        // Warm both paths before timing so graph instantiation, worker startup,
+        // and initial HIP context work cannot bias either implementation.
+        for (int iteration = 0; iteration < kWarmupIterations; ++iteration)
+        {
+            benchmark_error = submitSerial();
+            if (benchmark_error != hipSuccess)
+                break;
+            benchmark_error = waitForAllEvents();
+            if (benchmark_error != hipSuccess)
+                break;
+            fanout.submitAll();
+            benchmark_error = waitForAllEvents();
+            if (benchmark_error != hipSuccess)
+                break;
+        }
+
+        for (int iteration = 0;
+             benchmark_error == hipSuccess &&
+             iteration < kBenchmarkIterations;
+             ++iteration)
+        {
+            const auto serial_start = std::chrono::steady_clock::now();
+            benchmark_error = submitSerial();
+            const auto serial_submitted = std::chrono::steady_clock::now();
+            if (benchmark_error != hipSuccess)
+                break;
+            benchmark_error = waitForAllEvents();
+            const auto serial_completed = std::chrono::steady_clock::now();
+            if (benchmark_error != hipSuccess)
+                break;
+            serial_submission_samples.push_back(
+                std::chrono::duration<double, std::micro>(
+                    serial_submitted - serial_start)
+                    .count());
+            serial_service_samples.push_back(
+                std::chrono::duration<double, std::micro>(
+                    serial_completed - serial_start)
+                    .count());
+
+            const auto fanout_start = std::chrono::steady_clock::now();
+            fanout.submitAll();
+            const auto fanout_submitted = std::chrono::steady_clock::now();
+            benchmark_error = waitForAllEvents();
+            const auto fanout_completed = std::chrono::steady_clock::now();
+            if (benchmark_error != hipSuccess)
+                break;
+            fanout_submission_samples.push_back(
+                std::chrono::duration<double, std::micro>(
+                    fanout_submitted - fanout_start)
+                    .count());
+            fanout_service_samples.push_back(
+                std::chrono::duration<double, std::micro>(
+                    fanout_completed - fanout_start)
+                    .count());
+        }
+
+        for (const auto &endpoint : endpoints)
+        {
+            if (benchmark_error == hipSuccess &&
+                endpoint.worker_error != hipSuccess)
+            {
+                benchmark_error = endpoint.worker_error;
+            }
+        }
+    }
+
+    if (benchmark_error != hipSuccess)
+    {
+        const std::string error = hipGetErrorString(benchmark_error);
+        destroyEndpoints();
+        FAIL() << "Four-device endpoint launch benchmark failed: " << error;
+        return;
+    }
+
+    auto serial_submission = computeStats(
+        serial_submission_samples,
+        kRequiredDevices);
+    auto serial_service = computeStats(
+        serial_service_samples,
+        kRequiredDevices);
+    auto fanout_submission = computeStats(
+        fanout_submission_samples,
+        kRequiredDevices);
+    auto fanout_service = computeStats(
+        fanout_service_samples,
+        kRequiredDevices);
+
+    printf("\n");
+    printf("Four-device retained HIP endpoint graph (%d nodes/device, median of %d):\n",
+           kEndpointGraphNodes,
+           kBenchmarkIterations);
+    printf("  serial coordinator: submission=%7.1f us, all-complete=%7.1f us\n",
+           serial_submission.median_us,
+           serial_service.median_us);
+    printf("  persistent fan-out: submission=%7.1f us, all-complete=%7.1f us\n",
+           fanout_submission.median_us,
+           fanout_service.median_us);
+    printf("  service speedup:    %7.2fx\n",
+           serial_service.median_us / fanout_service.median_us);
+
+    EXPECT_EQ(serial_service.iterations, kBenchmarkIterations);
+    EXPECT_EQ(fanout_service.iterations, kBenchmarkIterations);
+    EXPECT_GT(serial_service.median_us, 0.0);
+    EXPECT_GT(fanout_service.median_us, 0.0);
+    destroyEndpoints();
 }
 
 } // anonymous namespace

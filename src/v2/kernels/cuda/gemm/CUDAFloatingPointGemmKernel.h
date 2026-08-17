@@ -245,6 +245,10 @@ namespace llaminar2
 
             KernelSnapshotInfo getKernelSnapshotInfo() const override;
 
+            /** @brief Export the exact live row-major GPU floating weights. */
+            bool exportContiguousFloatingPointWeights(
+                ContiguousFloatingPointWeightDescriptor &out) const override;
+
             // =========================================================================
             // Accessors
             // =========================================================================

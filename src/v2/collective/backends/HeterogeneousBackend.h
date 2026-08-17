@@ -1,19 +1,23 @@
 /**
  * @file HeterogeneousBackend.h
- * @brief Heterogeneous multi-GPU collective backend orchestrating NCCL, RCCL, and HOST
+ * @brief Mixed CUDA/ROCm collectives with an event-driven host bridge.
  *
- * The HeterogeneousBackend enables collective operations across mixed NVIDIA (CUDA)
- * and AMD (ROCm) GPU configurations. It orchestrates sub-backends:
+ * The HeterogeneousBackend enables collective operations across mixed NVIDIA
+ * (CUDA) and AMD (ROCm) GPU configurations. It orchestrates sub-backends:
  * - NCCL for intra-NVIDIA communication (when >1 CUDA GPU)
  * - RCCL for intra-AMD communication (when >1 ROCm GPU)
  * - HostBackend for cross-vendor bridge transfers (host-staged)
  *
  * Example configuration: RTX 3090 (cuda:0) + 2x MI50 (rocm:0, rocm:1)
  *
- * AllReduce algorithm (3 GPUs: 1 CUDA + 2 ROCm):
- * 1. RCCL: AllReduce within ROCm domain → rocm:0 has ROCm partial
- * 2. HOST: Transfer cuda:0 ↔ rocm:0 partials via host-staged allreduce
- * 3. RCCL: Broadcast from rocm:0 to rocm:1
+ * The production explicit-stream path records each participant's exact
+ * producer event, publishes one preallocated descriptor to a background
+ * worker, performs bounded D2H/fixed-order reduction/H2D chunks on persistent
+ * transfer streams, and returns a typed completion ticket. The segmented graph
+ * boundary observes that ticket before any consumer graph is submitted. It
+ * deliberately does not install unresolved future waits on compute streams:
+ * CUDA/HIP stream pools can alias hardware queues, which would let such a wait
+ * block the transfer stream that must satisfy it.
  *
  * Requirements:
  * - HAVE_CUDA and HAVE_ROCM both defined
@@ -27,7 +31,12 @@
 
 #include "../ICollectiveBackend.h"
 #include "../DeviceGroup.h"
+#include <array>
+#include <condition_variable>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace llaminar2
@@ -37,6 +46,7 @@ namespace llaminar2
     class NCCLBackend;
     class RCCLBackend;
     class HostBackend;
+    class IBackend;
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 
@@ -49,7 +59,9 @@ namespace llaminar2
      * 2. Cross-vendor reduction via host-staged bridge
      * 3. Broadcast back within each domain
      *
-     * Thread Safety: Not thread-safe. Use one instance per device/stream.
+     * The explicit-stream allreduce path is thread-safe. LocalTP participant
+     * workers rendezvous before one submission owner publishes a transaction to
+     * the backend's persistent background bridge.
      */
     class HeterogeneousBackend : public ICollectiveBackend
     {
@@ -107,7 +119,7 @@ namespace llaminar2
         bool reserveTempBufferBytes(size_t bytes) override;
 
         // =====================================================================
-        // Collective Operations (Stubs - Phase 1)
+        // Collective operations and explicit completion authorities
         // =====================================================================
 
         /**
@@ -115,6 +127,23 @@ namespace llaminar2
          * @return true (HeterogeneousBackend manages multiple GPUs via sub-backends)
          */
         bool isMultiGpuSingleProcess() const override { return true; }
+
+        /** @copydoc ICollectiveBackend::supportsGraphCaptureLifecycleTickets */
+        bool supportsGraphCaptureLifecycleTickets() const override
+        {
+            return initialized_ &&
+                   graph_capture_lifecycle_tickets_.size() == device_group_.size();
+        }
+
+        /** @copydoc ICollectiveBackend::recordGraphCaptureLifecycleTicket */
+        bool recordGraphCaptureLifecycleTicket(
+            int device_idx,
+            void *stream) override;
+
+        /** @copydoc ICollectiveBackend::awaitGraphCaptureLifecycleTicket */
+        bool awaitGraphCaptureLifecycleTicket(
+            int device_idx,
+            int timeout_ms) override;
 
         bool allreduce(
             void *buffer,
@@ -144,6 +173,63 @@ namespace llaminar2
             size_t count,
             CollectiveDataType dtype,
             CollectiveOp op) override;
+
+        /**
+         * @brief Reject the unsafe stream-ordered mixed-vendor contract.
+         *
+         * CUDA and ROCm stream pools do not guarantee that a future memory wait
+         * and the transfer that satisfies it occupy independent hardware queues.
+         * Production callers must use the host-completion-ticket API below.
+         *
+         * @return Always false with a precise lastError() diagnostic.
+         */
+        bool allreduceMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<void *> &streams) override;
+
+        /** @copydoc ICollectiveBackend::supportsAllreduceMultiOnStreams */
+        bool supportsAllreduceMultiOnStreams() const override
+        {
+            return false;
+        }
+
+        /**
+         * @brief Queue an allocation-free mixed-vendor allreduce on exact streams.
+         *
+         * Producer events are recorded on every caller stream and a background
+         * worker performs chunked D2H/reduce/H2D work on persistent transfer
+         * streams. The call returns once the descriptor is published; it never
+         * performs payload work inline. The returned ticket is the sole authority
+         * for admitting the next heterogeneous captured segment.
+         *
+         * @param buffers One in-place device buffer per DeviceGroup participant.
+         * @param count Logical element count in every buffer.
+         * @param dtype Shared element representation.
+         * @param op Fixed-order host reduction operation.
+         * @param streams Exact non-null producer stream per participant.
+         * @return Backend-bound completion ticket on successful submission.
+         */
+        std::optional<CollectiveCompletionTicket>
+        allreduceMultiOnStreamsWithHostCompletionTicket(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<void *> &streams) override;
+
+        /** @copydoc ICollectiveBackend::supportsAllreduceMultiOnStreamsWithHostCompletionTicket */
+        bool supportsAllreduceMultiOnStreamsWithHostCompletionTicket() const override
+        {
+            return initialized_ && async_bridge_ready_;
+        }
+
+        /** @copydoc ICollectiveBackend::awaitHostCompletionTicket */
+        bool awaitHostCompletionTicket(
+            const CollectiveCompletionTicket &ticket,
+            int timeout_ms) override;
 
         bool allgather(
             const void *send_buf,
@@ -863,6 +949,125 @@ namespace llaminar2
         /// Create HOST backend for cross-vendor bridge
         bool createBridgeBackend();
 
+        /**
+         * @brief Allocate one persistent event ticket per mixed-vendor participant.
+         * @return true only when every CUDA/ROCm participant owns an event.
+         */
+        bool initializeGraphCaptureLifecycleTickets();
+
+        /**
+         * @brief Destroy all persistent lifecycle ticket events.
+         *
+         * Destruction occurs only after graph owners have stopped submitting
+         * lifecycle boundaries, and before the device group is cleared.
+         */
+        void releaseGraphCaptureLifecycleTickets() noexcept;
+
+        // =====================================================================
+        // Asynchronous exact-stream bridge
+        // =====================================================================
+
+        static constexpr size_t ASYNC_BRIDGE_CHUNK_BYTES = 8U * 1024U * 1024U;
+        static constexpr size_t ASYNC_BRIDGE_HOST_BUFFER_SLOTS = 2;
+        static constexpr size_t ASYNC_BRIDGE_TRANSACTION_DEPTH = 4;
+
+        /** @brief Lifecycle state for one preallocated transaction descriptor. */
+        enum class AsyncTransactionState
+        {
+            Free,       ///< Descriptor may be filled by the submission thread.
+            Filling,    ///< Submission owns metadata and producer-event publication.
+            Pending,    ///< Descriptor is visible in the worker's FIFO.
+            Processing, ///< Background worker owns the descriptor.
+            Completed,  ///< Terminal H2D events passed; ticket observation owns release.
+        };
+
+        /**
+         * @brief Persistent resources belonging to one mixed-vendor participant.
+         *
+         * Host buffers are allocated by that participant's own runtime, so CUDA
+         * and ROCm never rely on cross-registering the same pages. Two slots let
+         * D2H/reduction of chunk N+1 overlap H2D consumption of chunk N.
+         */
+        struct AsyncBridgeParticipant
+        {
+            DeviceId device = DeviceId::invalid(); ///< Exact participant identity.
+            IBackend *backend = nullptr;            ///< Borrowed process backend.
+            void *transfer_stream = nullptr;        ///< Owned non-default DMA stream.
+            std::array<void *, ASYNC_BRIDGE_HOST_BUFFER_SLOTS> host_buffers{};
+            std::array<void *, ASYNC_BRIDGE_HOST_BUFFER_SLOTS> input_ready_events{};
+            std::array<void *, ASYNC_BRIDGE_HOST_BUFFER_SLOTS> output_consumed_events{};
+            std::array<bool, ASYNC_BRIDGE_HOST_BUFFER_SLOTS> output_pending{};
+        };
+
+        /**
+         * @brief One allocation-free asynchronous allreduce transaction.
+         *
+         * Vectors are sized once during resource reservation. Submission only
+         * replaces pointer values, so the inference hot path never grows storage.
+         */
+        struct AsyncBridgeTransaction
+        {
+            AsyncTransactionState state = AsyncTransactionState::Free;
+            std::vector<void *> buffers;          ///< Borrowed device payloads.
+            std::vector<void *> producer_streams; ///< Borrowed exact compute streams.
+            std::vector<void *> producer_events;  ///< Owned event per participant.
+            size_t count = 0;                     ///< Logical element count.
+            CollectiveDataType dtype = CollectiveDataType::FLOAT32;
+            CollectiveOp op = CollectiveOp::ALLREDUCE_SUM;
+            uint64_t generation = 0; ///< Monotonic ticket generation.
+        };
+
+        /**
+         * @brief Allocate streams, events, and pinned chunk buffers.
+         * @param maximum_payload_bytes Largest legal transaction payload.
+         * @return true only when every participant owns the complete resource set.
+         */
+        bool initializeAsyncBridgeResources(size_t maximum_payload_bytes);
+
+        /**
+         * @brief Drain and destroy every asynchronous bridge resource.
+         *
+         * The worker is stopped before device resources are released. This method
+         * is used both for normal shutdown and setup rollback.
+         */
+        void releaseAsyncBridgeResources() noexcept;
+
+        /** @brief Background FIFO loop that owns payload movement and reduction. */
+        void asyncBridgeWorkerMain();
+
+        /**
+         * @brief Process one transaction descriptor completely.
+         * @param transaction_index Index in async_transactions_.
+         */
+        void processAsyncBridgeTransaction(size_t transaction_index);
+
+        /**
+         * @brief Poll one exact backend event without calling a blocking sync API.
+         * @param participant Participant that owns @p event.
+         * @param event Event to observe.
+         * @param operation Diagnostic operation name.
+         * @return true when the event completed within the collective timeout.
+         */
+        bool awaitAsyncBridgeEvent(
+            const AsyncBridgeParticipant &participant,
+            void *event,
+            const char *operation) const;
+
+        /**
+         * @brief Record asynchronous bridge PerfStats for one completed transaction.
+         * @param transaction Completed transaction descriptor.
+         * @param chunks Number of streamed chunks.
+         */
+        void recordAsyncBridgePerfStats(
+            const AsyncBridgeTransaction &transaction,
+            size_t chunks) const;
+
+        /**
+         * @brief Terminate after an unrecoverable background protocol failure.
+         * @param message Precise ownership/operation diagnostic.
+         */
+        [[noreturn]] static void failAsyncBridge(const std::string &message);
+
         // =====================================================================
         // Member Variables
         // =====================================================================
@@ -886,6 +1091,46 @@ namespace llaminar2
         std::unique_ptr<RCCLBackend> rccl_backend_;   ///< For ROCm domain (only if >1 ROCm)
         std::unique_ptr<HostBackend> bridge_backend_; ///< For cross-domain (host-staged)
 
+        /**
+         * @brief Backend event and device provenance for one participant ticket.
+         *
+         * The compute backend owns the event API while this collective backend
+         * owns event lifetime.  Events are recorded only outside native stream
+         * capture and queried by the matching participant worker.
+         */
+        struct GraphCaptureLifecycleTicket
+        {
+            DeviceId device = DeviceId::invalid(); ///< Exact ticket owner.
+            IBackend *backend = nullptr;            ///< Borrowed process backend.
+            void *event = nullptr;                  ///< Owned persistent event.
+        };
+
+        /// Tickets indexed exactly like device_group_.devices.
+        std::vector<GraphCaptureLifecycleTicket> graph_capture_lifecycle_tickets_;
+
+        /// Participant resources indexed exactly like device_group_.devices.
+        std::vector<AsyncBridgeParticipant> async_participants_;
+
+        /// Fixed descriptor ring; no transaction metadata is allocated in inference.
+        std::vector<AsyncBridgeTransaction> async_transactions_;
+
+        /// Fixed FIFO containing indices into async_transactions_.
+        std::array<size_t, ASYNC_BRIDGE_TRANSACTION_DEPTH> async_pending_fifo_{};
+        size_t async_pending_head_ = 0;  ///< Worker pop position.
+        size_t async_pending_tail_ = 0;  ///< Submission push position.
+        size_t async_pending_count_ = 0; ///< Published descriptor count.
+        size_t async_submission_cursor_ = 0; ///< Next preferred descriptor.
+
+        mutable std::mutex async_mutex_; ///< Protects FIFO and descriptor states.
+        std::condition_variable async_cv_; ///< Signals work and descriptor release.
+        std::mutex async_submission_mutex_; ///< Serializes generation publication.
+        std::thread async_worker_;          ///< Persistent bridge progress thread.
+        bool async_stop_requested_ = false; ///< Worker drains then exits.
+        bool async_bridge_ready_ = false;   ///< Complete resource contract installed.
+        size_t async_max_payload_bytes_ = 0; ///< Setup-owned payload capacity.
+        uint64_t async_lifecycle_epoch_ = 0; ///< Invalidates tickets across resource setup.
+        uint64_t async_next_generation_ = 1; ///< Zero remains outside issued tickets.
+
         /// Last error message
         std::string last_error_;
     };
@@ -908,6 +1153,9 @@ namespace llaminar2
         void shutdown() override {}
 
         bool isMultiGpuSingleProcess() const override { return false; }
+        bool supportsGraphCaptureLifecycleTickets() const override { return false; }
+        bool recordGraphCaptureLifecycleTicket(int, void *) override { return false; }
+        bool awaitGraphCaptureLifecycleTicket(int, int) override { return false; }
         bool allreduce(void *, size_t, CollectiveDataType, CollectiveOp) override { return false; }
         bool allreduceMulti(const std::vector<void *> &, size_t, CollectiveDataType, CollectiveOp) override
         {

@@ -13,6 +13,8 @@
 #include "execution/mtp/MTPSpecStatePublisher.h"
 #include "execution/mtp/MTPSpecTransactionDriver.h"
 
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -173,6 +175,128 @@ namespace
         bool post_restore_ok_ = true;
         std::vector<std::string> *operation_log_ = nullptr;
         std::string label_;
+    };
+
+    /**
+     * @brief CPU capture stage exposing immutable row-copy plans to the publisher.
+     *
+     * The fake deliberately rejects the older grouped callback so the focused
+     * tests prove that a single-request transaction uses the validated parallel
+     * restore contract and not a hidden serial publication path.
+     */
+    class FakePlannedCPUVerifierStateStage final : public IComputeStage
+    {
+    public:
+        FakePlannedCPUVerifierStateStage(
+            size_t bytes_per_row,
+            uint8_t seed,
+            CPUVerifierStateRestorePlanStatus plan_status =
+                CPUVerifierStateRestorePlanStatus::Ready)
+            : IComputeStage(DeviceId::cpu()),
+              bytes_per_row_(bytes_per_row),
+              snapshots_(bytes_per_row * 3),
+              live_(bytes_per_row, 0),
+              plan_status_(plan_status)
+        {
+            for (size_t row = 0; row < 3; ++row)
+            {
+                for (size_t byte = 0; byte < bytes_per_row_; ++byte)
+                {
+                    snapshots_[row * bytes_per_row_ + byte] =
+                        static_cast<uint8_t>(seed + row * 17 + byte);
+                }
+            }
+        }
+
+        bool execute(IDeviceContext *ctx) override
+        {
+            (void)ctx;
+            return true;
+        }
+
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+
+        bool supportsBackend(ComputeBackendType backend) const override
+        {
+            (void)backend;
+            return true;
+        }
+
+        bool hasVerifierStateCapture() const override { return true; }
+
+        bool requiresVerifierStateCaptureForPublication() const override
+        {
+            return true;
+        }
+
+        CPUVerifierStateRestorePlan planCPUVerifierStateRestoreRow(int row) override
+        {
+            planned_rows.push_back(row);
+            if (plan_status_ != CPUVerifierStateRestorePlanStatus::Ready)
+            {
+                return {
+                    .status = plan_status_,
+                };
+            }
+            if (row < 0)
+            {
+                return {
+                    .status = CPUVerifierStateRestorePlanStatus::NoOp,
+                };
+            }
+            if (row >= 3 || bytes_per_row_ == 0)
+            {
+                return {
+                    .status = CPUVerifierStateRestorePlanStatus::Invalid,
+                };
+            }
+            return {
+                .status = CPUVerifierStateRestorePlanStatus::Ready,
+                .destination = live_.data(),
+                .source = snapshots_.data() +
+                          static_cast<size_t>(row) * bytes_per_row_,
+                .bytes = bytes_per_row_,
+            };
+        }
+
+        bool restoreVerifierStateCaptureRows(
+            const int *host_row_indices,
+            int request_count,
+            void *stream) override
+        {
+            (void)host_row_indices;
+            (void)request_count;
+            (void)stream;
+            ++legacy_restore_calls;
+            return false;
+        }
+
+        void clearVerifierStateCaptureBindingAfterPublication() override
+        {
+            ++capture_binding_clear_calls;
+        }
+
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+        [[nodiscard]] std::vector<uint8_t> expectedRow(int row) const
+        {
+            return std::vector<uint8_t>(
+                snapshots_.begin() + static_cast<size_t>(row) * bytes_per_row_,
+                snapshots_.begin() + static_cast<size_t>(row + 1) * bytes_per_row_);
+        }
+
+        [[nodiscard]] const std::vector<uint8_t> &live() const { return live_; }
+
+        std::vector<int> planned_rows;
+        int legacy_restore_calls = 0;
+        int capture_binding_clear_calls = 0;
+
+    private:
+        size_t bytes_per_row_ = 0;
+        std::vector<uint8_t> snapshots_;
+        std::vector<uint8_t> live_;
+        CPUVerifierStateRestorePlanStatus plan_status_ =
+            CPUVerifierStateRestorePlanStatus::Unsupported;
     };
 
     MTPSpecDecodeMetadataShape shapeFor(int requests = 1, int draft_tokens = 3)
@@ -1136,6 +1260,78 @@ TEST(Test__MTPSpecStateContract, BatchedHostPublisherUsesOneGroupedRestorePerSta
     EXPECT_TRUE(skipped.batch_host_restored_rows.empty());
 }
 
+/**
+ * @brief Single-request CPU publication commits every independent stage in one plan.
+ *
+ * Different span sizes exercise the OpenMP worksharing loop while byte equality
+ * proves that parallel publication selects the exact accepted verifier row.
+ */
+TEST(Test__MTPSpecStateContract, SingleRequestCPUStatePublicationUsesByteExactParallelPlans)
+{
+    FakePlannedCPUVerifierStateStage recurrence(
+        /*bytes_per_row=*/256 * 1024,
+        /*seed=*/11);
+    FakePlannedCPUVerifierStateStage short_conv(
+        /*bytes_per_row=*/4093,
+        /*seed=*/73);
+    FakeVerifierStateStage skipped(/*captures=*/false);
+    const int restore_rows[1] = {1};
+    MTPSpecStepPlanBatch batch = planBatch(
+        {participantPlan(/*participant_id=*/0, /*accepted_count=*/2)});
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromVerifierRows(
+            batch,
+            restore_rows,
+            {&recurrence, &skipped, &short_conv},
+            DeviceId::cpu(),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.restored_stage_count, 2);
+    EXPECT_EQ(result.skipped_stage_count, 1);
+    EXPECT_EQ(recurrence.live(), recurrence.expectedRow(1));
+    EXPECT_EQ(short_conv.live(), short_conv.expectedRow(1));
+    EXPECT_THAT(recurrence.planned_rows, ElementsAre(1));
+    EXPECT_THAT(short_conv.planned_rows, ElementsAre(1));
+    EXPECT_EQ(recurrence.legacy_restore_calls, 0);
+    EXPECT_EQ(short_conv.legacy_restore_calls, 0);
+    EXPECT_EQ(recurrence.capture_binding_clear_calls, 1);
+    EXPECT_EQ(short_conv.capture_binding_clear_calls, 1);
+}
+
+TEST(Test__MTPSpecStateContract, SingleRequestCPUStatePublicationValidatesAllPlansBeforeCopy)
+{
+    FakePlannedCPUVerifierStateStage valid(
+        /*bytes_per_row=*/4096,
+        /*seed=*/19);
+    FakePlannedCPUVerifierStateStage invalid(
+        /*bytes_per_row=*/4096,
+        /*seed=*/37,
+        CPUVerifierStateRestorePlanStatus::Invalid);
+    const std::vector<uint8_t> original_live = valid.live();
+    const int restore_rows[1] = {1};
+    MTPSpecStepPlanBatch batch = planBatch(
+        {participantPlan(/*participant_id=*/0, /*accepted_count=*/2)});
+
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromVerifierRows(
+            batch,
+            restore_rows,
+            {&valid, &invalid},
+            DeviceId::cpu(),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("could not plan a native restore"));
+    EXPECT_EQ(valid.live(), original_live)
+        << "A later invalid stage must fail before any earlier live state changes.";
+    EXPECT_EQ(valid.capture_binding_clear_calls, 0);
+    EXPECT_EQ(invalid.capture_binding_clear_calls, 0);
+}
+
 TEST(Test__MTPSpecStateContract, PublisherRejectsGpuNullStream)
 {
     FakeVerifierStateStage captured(/*captures=*/true);
@@ -1700,5 +1896,5 @@ TEST(Test__MTPSpecStateContract, GraphPublisherRejectsMissingStage)
             /*require_captured_stage=*/true);
 
     EXPECT_FALSE(result.ok);
-    EXPECT_THAT(result.error, HasSubstr("without a stage"));
+    EXPECT_THAT(result.error, HasSubstr("null stage at index"));
 }

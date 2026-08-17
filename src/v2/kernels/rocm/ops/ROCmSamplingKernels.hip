@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdio>
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../execution/moe/DeviceMoERebalanceABI.h"
 #include "../../../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../common/SamplingMath.h"
@@ -4285,6 +4286,167 @@ __global__ void rocm_advance_speculative_commit_boundary_kernel(
 }
 
 /**
+ * @brief Publish one ordinary serial decode boundary into the shared clock.
+ *
+ * A pre-existing marker means grouped MTP already published this exact edge;
+ * the kernel then validates the pair and returns without advancing again.
+ */
+__global__ void rocm_publish_serial_decode_commit_boundary_kernel(
+    uint32_t *__restrict__ decode_rounds_committed,
+    uint32_t *__restrict__ decode_rounds_until_maintenance,
+    uint32_t *__restrict__ maintenance_due,
+    uint32_t *__restrict__ decode_boundary_advanced)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    if (!decode_rounds_committed ||
+        !decode_rounds_until_maintenance || !maintenance_due ||
+        !decode_boundary_advanced)
+    {
+        if (maintenance_due)
+            *maintenance_due = 2u;
+        return;
+    }
+
+    const uint32_t due = *maintenance_due;
+    const uint32_t advanced = *decode_boundary_advanced;
+    const uint32_t remaining = *decode_rounds_until_maintenance;
+    if (advanced > 1u || due > 1u)
+    {
+        *maintenance_due = 2u;
+        return;
+    }
+    if (advanced == 1u)
+    {
+        const bool valid_existing_edge =
+            (due == 0u && remaining > 0u) ||
+            (due == 1u && remaining == 0u);
+        if (!valid_existing_edge)
+            *maintenance_due = 2u;
+        return;
+    }
+    if (due != 0u || remaining == 0u ||
+        *decode_rounds_committed == 0xffffffffu)
+    {
+        *maintenance_due = 2u;
+        return;
+    }
+
+    ++(*decode_rounds_committed);
+    *decode_rounds_until_maintenance = remaining - 1u;
+    if (remaining == 1u)
+        *maintenance_due = 1u;
+    *decode_boundary_advanced = 1u;
+}
+
+/** Retire only a non-due published edge after the conditional child. */
+__global__ void rocm_acknowledge_decode_commit_boundary_kernel(
+    uint32_t *__restrict__ decode_rounds_until_maintenance,
+    uint32_t *__restrict__ maintenance_due,
+    uint32_t *__restrict__ decode_boundary_advanced)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    if (!decode_rounds_until_maintenance || !maintenance_due ||
+        !decode_boundary_advanced)
+    {
+        if (maintenance_due)
+            *maintenance_due = 2u;
+        return;
+    }
+    const uint32_t due = *maintenance_due;
+    const uint32_t advanced = *decode_boundary_advanced;
+    const uint32_t remaining = *decode_rounds_until_maintenance;
+    if (due == 0u && remaining > 0u && advanced <= 1u)
+    {
+        *decode_boundary_advanced = 0u;
+        return;
+    }
+    if (due == 1u && remaining == 0u && advanced == 1u)
+        return;
+    *maintenance_due = 2u;
+}
+
+/** Bind one persistent MoE scheduler ticket to the active request lifecycle. */
+__global__ void rocm_initialize_device_moe_rebalance_dispatch_ticket_kernel(
+    uint64_t session_epoch,
+    uint64_t workspace_generation,
+    uint32_t participant_id,
+    uint32_t participant_count,
+    llaminar2::DeviceMoERebalanceDispatchTicket *__restrict__ ticket)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0 || !ticket)
+        return;
+
+    llaminar2::DeviceMoERebalanceDispatchTicket initialized{};
+    initialized.magic =
+        llaminar2::DeviceMoERebalanceDispatchTicket::kMagic;
+    initialized.abi_version =
+        llaminar2::DeviceMoERebalanceDispatchTicket::kABIVersion;
+    initialized.session_epoch_low = static_cast<uint32_t>(session_epoch);
+    initialized.session_epoch_high =
+        static_cast<uint32_t>(session_epoch >> 32u);
+    initialized.workspace_generation_low =
+        static_cast<uint32_t>(workspace_generation);
+    initialized.workspace_generation_high =
+        static_cast<uint32_t>(workspace_generation >> 32u);
+    initialized.participant_id = participant_id;
+    initialized.participant_count = participant_count;
+    *ticket = initialized;
+}
+
+/** Pack only the cadence decision consumed by HIP's rank scheduler. */
+__global__ void rocm_publish_device_moe_rebalance_dispatch_ticket_kernel(
+    const uint32_t *__restrict__ controller_magic,
+    const uint32_t *__restrict__ controller_version,
+    const uint32_t *__restrict__ controller_error,
+    const uint32_t *__restrict__ decode_rounds_committed,
+    const uint32_t *__restrict__ decode_rounds_until_maintenance,
+    const uint32_t *__restrict__ maintenance_due,
+    const uint32_t *__restrict__ decode_boundary_advanced,
+    llaminar2::DeviceMoERebalanceDispatchTicket *__restrict__ ticket)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0 || !ticket)
+        return;
+
+    const bool pointers_valid = controller_magic && controller_version &&
+                                controller_error && decode_rounds_committed &&
+                                decode_rounds_until_maintenance &&
+                                maintenance_due && decode_boundary_advanced;
+    const uint32_t version =
+        pointers_valid ? *controller_version : 0u;
+    const uint32_t error = pointers_valid ? *controller_error : 0xffffffffu;
+    const uint32_t committed =
+        pointers_valid ? *decode_rounds_committed : 0u;
+    const uint32_t remaining =
+        pointers_valid ? *decode_rounds_until_maintenance : 0u;
+    const uint32_t due = pointers_valid ? *maintenance_due : 2u;
+    const uint32_t advanced =
+        pointers_valid ? *decode_boundary_advanced : 2u;
+    /* A conservative hosted observation can land after serial decode's
+     * captured acknowledgement has cleared `advanced`.  That is an
+     * authenticated idle snapshot, not a corrupt boundary.  Only a due state
+     * requires an outstanding advanced marker; non-due state is valid both
+     * before and after acknowledgement. */
+    const bool boundary_valid =
+        pointers_valid &&
+        *controller_magic == 0x4d4f4552u &&
+        version == llaminar2::moe_rebalance_abi::kVersion && error == 0u &&
+        due <= 1u && advanced <= 1u &&
+        ((due != 0u && advanced == 1u && remaining == 0u) ||
+         (due == 0u && remaining > 0u));
+
+    ticket->healthy = boundary_valid ? 1u : 0u;
+    ticket->controller_version = version;
+    ticket->decode_rounds_committed = committed;
+    ticket->decode_rounds_until_maintenance = remaining;
+    ticket->maintenance_due = due <= 1u ? due : 0u;
+    ticket->decode_boundary_advanced = advanced <= 1u ? advanced : 0u;
+    ticket->error_code = error;
+    __threadfence_system();
+}
+
+/**
  * @brief Initialize one persistent device-generation controller per request.
  *
  * The response payload is intentionally not cleared.  Its authoritative count
@@ -6991,6 +7153,159 @@ bool rocmOps_advance_speculative_commit_boundary(
         fprintf(
             stderr,
             "ROCm speculative commit-boundary advance launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_publish_serial_decode_commit_boundary(
+    uint32_t *decode_rounds_committed,
+    uint32_t *decode_rounds_until_maintenance,
+    uint32_t *maintenance_due,
+    uint32_t *decode_boundary_advanced,
+    int device_idx,
+    void *stream)
+{
+    if (!decode_rounds_committed ||
+        !decode_rounds_until_maintenance || !maintenance_due ||
+        !decode_boundary_advanced || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_publish_serial_decode_commit_boundary_kernel,
+        dim3(1),
+        dim3(1),
+        0,
+        static_cast<hipStream_t>(stream),
+        decode_rounds_committed,
+        decode_rounds_until_maintenance,
+        maintenance_due,
+        decode_boundary_advanced);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm serial decode commit-boundary publication failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_acknowledge_decode_commit_boundary(
+    uint32_t *decode_rounds_until_maintenance,
+    uint32_t *maintenance_due,
+    uint32_t *decode_boundary_advanced,
+    int device_idx,
+    void *stream)
+{
+    if (!decode_rounds_until_maintenance || !maintenance_due ||
+        !decode_boundary_advanced || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_acknowledge_decode_commit_boundary_kernel,
+        dim3(1),
+        dim3(1),
+        0,
+        static_cast<hipStream_t>(stream),
+        decode_rounds_until_maintenance,
+        maintenance_due,
+        decode_boundary_advanced);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm decode commit-boundary acknowledgement failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_initialize_device_moe_rebalance_dispatch_ticket(
+    uint64_t session_epoch,
+    uint64_t workspace_generation,
+    uint32_t participant_id,
+    uint32_t participant_count,
+    llaminar2::DeviceMoERebalanceDispatchTicket *ticket,
+    int device_idx,
+    void *stream)
+{
+    if (session_epoch == 0u || workspace_generation == 0u ||
+        participant_count == 0u || participant_id >= participant_count ||
+        !ticket || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_initialize_device_moe_rebalance_dispatch_ticket_kernel,
+        dim3(1), dim3(1), 0, static_cast<hipStream_t>(stream),
+        session_epoch,
+        workspace_generation,
+        participant_id,
+        participant_count,
+        ticket);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm MoE dispatch-ticket initialization failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_publish_device_moe_rebalance_dispatch_ticket(
+    const uint32_t *controller_magic,
+    const uint32_t *controller_version,
+    const uint32_t *controller_error,
+    const uint32_t *decode_rounds_committed,
+    const uint32_t *decode_rounds_until_maintenance,
+    const uint32_t *maintenance_due,
+    const uint32_t *decode_boundary_advanced,
+    llaminar2::DeviceMoERebalanceDispatchTicket *ticket,
+    int device_idx,
+    void *stream)
+{
+    if (!controller_magic || !controller_version || !controller_error ||
+        !decode_rounds_committed || !decode_rounds_until_maintenance ||
+        !maintenance_due || !decode_boundary_advanced || !ticket || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(
+        rocm_publish_device_moe_rebalance_dispatch_ticket_kernel,
+        dim3(1), dim3(1), 0, static_cast<hipStream_t>(stream),
+        controller_magic,
+        controller_version,
+        controller_error,
+        decode_rounds_committed,
+        decode_rounds_until_maintenance,
+        maintenance_due,
+        decode_boundary_advanced,
+        ticket);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(
+            stderr,
+            "ROCm MoE dispatch-ticket publication failed: %s\n",
             hipGetErrorString(err));
         return false;
     }

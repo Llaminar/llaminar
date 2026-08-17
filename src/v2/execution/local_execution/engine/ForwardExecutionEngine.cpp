@@ -15,6 +15,7 @@
 #include "ForwardExecutionEngine.h"
 #include "PrefillBucketUtils.h"
 #include "../../compute_stages/ComputeStageFactory.h"
+#include "../../moe/MoEOverlayRetainedParentComposer.h"
 #include "../../../transfer/TransferEngine.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
@@ -25,7 +26,6 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
-#include <mutex>
 #include <unordered_set>
 
 namespace llaminar2
@@ -33,13 +33,16 @@ namespace llaminar2
     namespace
     {
         /// @brief Build a prefill graph-cache config from the cached debug environment.
-        PrefillGraphConfig makePrefillGraphConfigFromEnv()
+        PrefillGraphConfig makePrefillGraphConfigFromEnv(
+            int resident_graph_rows)
         {
             const auto &env = debugEnv();
             PrefillGraphConfig config;
             config.enabled = env.execution.gpu_graphs;
             config.minimum_padded_bucket_seq_len =
-                std::max(1, env.execution.prefill_graph_min_seq);
+                effectivePrefillGraphMinimumPaddedBucketSeqLen(
+                    env.execution.prefill_graph_min_seq,
+                    resident_graph_rows);
             config.trace = env.execution.prefill_graph_trace;
             config.buckets_enabled = env.execution.prefill_graph_buckets;
             config.bucket_sizes = env.execution.prefill_graph_bucket_sizes;
@@ -66,6 +69,185 @@ namespace llaminar2
             const int bucket_seq_len = effectiveBucketSeqLen(input);
             return real_seq_len > 0 && bucket_seq_len > 0 && real_seq_len < bucket_seq_len;
         }
+
+        /**
+         * @brief Restore the host's diagnostic namespace after one chunk attempt.
+         *
+         * Graph snapshot callbacks execute synchronously at their explicit
+         * post-launch diagnostic boundary, but the namespace must still be
+         * restored on every early return and exception. This small RAII owner
+         * keeps that diagnostic concern separate from the graph's live-state
+         * lifecycle and makes an incomplete schedule unable to contaminate the
+         * next request's artifacts.
+         */
+        class ScopedPrefillChunkSnapshotDiagnostics
+        {
+        public:
+            /**
+             * @brief Enter the host namespace for @p chunk.
+             * @param host Graph-execution host that owns optional snapshots.
+             * @param chunk Scheduler-owned chunk geometry.
+             */
+            ScopedPrefillChunkSnapshotDiagnostics(
+                IForwardExecutionHost &host,
+                const PrefillChunkPlan &chunk) noexcept
+                : host_(host), chunk_(chunk)
+            {
+                host_.beginPrefillChunkSnapshotDiagnostics(chunk_);
+            }
+
+            /** @brief Restore the prior diagnostic namespace. */
+            ~ScopedPrefillChunkSnapshotDiagnostics()
+            {
+                host_.endPrefillChunkSnapshotDiagnostics(chunk_);
+            }
+
+            ScopedPrefillChunkSnapshotDiagnostics(
+                const ScopedPrefillChunkSnapshotDiagnostics &) = delete;
+            ScopedPrefillChunkSnapshotDiagnostics &operator=(
+                const ScopedPrefillChunkSnapshotDiagnostics &) = delete;
+
+        private:
+            IForwardExecutionHost &host_;
+            const PrefillChunkPlan &chunk_;
+        };
+
+        /**
+         * @brief Own one forward graph's admitted live-state mailbox read.
+         *
+         * `prepareLiveStateForForwardGraphExecution()` can retain a shared
+         * mailbox-admission lease inside the host until the engine publishes a
+         * completion event. Every return after that prelude must therefore
+         * retire the read, including failures while preparing token rows,
+         * verifier metadata, dynamic parameters, or the execution rendezvous.
+         * Keeping that obligation in a lexical owner prevents prefix rollback
+         * from requesting the exclusive mailbox lease while the same thread
+         * still owns an abandoned reader lease.
+         *
+         * The normal post-launch path supplies the actual producer stream so
+         * the transaction also verifies that graph execution did not migrate
+         * away from the stream admitted by the prelude. Before-launch failure
+         * cleanup uses the admitted stream itself; recording an event there is
+         * conservative and preserves all prelude work already enqueued on it.
+         */
+        class ScopedForwardLiveStateRead final
+        {
+        public:
+            /**
+             * @brief Arm completion ownership after a successful host prelude.
+             * @param host Host that owns the pending mailbox admission.
+             * @param input Forward invocation associated with the admission.
+             * @param admission_stream Exact stream admitted by the prelude.
+             * @param device Device that owns @p admission_stream.
+             */
+            ScopedForwardLiveStateRead(
+                IForwardExecutionHost &host,
+                const ForwardInput &input,
+                void *admission_stream,
+                DeviceId device) noexcept
+                : host_(host),
+                  input_(input),
+                  admission_stream_(admission_stream),
+                  device_(device)
+            {
+            }
+
+            /**
+             * @brief Retire a prelude whose caller left before explicit completion.
+             *
+             * A failed completion would leave an exclusive rollback or reset
+             * permanently blocked, so it is a fatal lifecycle violation rather
+             * than a recoverable inference error.
+             */
+            ~ScopedForwardLiveStateRead() noexcept
+            {
+                if (active_)
+                    completeOrTerminate(admission_stream_, "scope_exit");
+            }
+
+            ScopedForwardLiveStateRead(
+                const ScopedForwardLiveStateRead &) = delete;
+            ScopedForwardLiveStateRead &operator=(
+                const ScopedForwardLiveStateRead &) = delete;
+
+            /**
+             * @brief Publish the graph's mailbox-read completion explicitly.
+             * @param producer_stream Exact stream which consumed live state.
+             *
+             * This must be called immediately after graph execution, whether
+             * the executor reported success or failure. Stream identity is
+             * checked before the host records its event because substituting a
+             * different stream would publish readiness ahead of real readers.
+             */
+            void complete(void *producer_stream) noexcept
+            {
+                completeOrTerminate(producer_stream, "post_launch");
+            }
+
+        private:
+            /**
+             * @brief Complete once or terminate on a broken ownership edge.
+             * @param producer_stream Stream on which the completion event belongs.
+             * @param boundary Diagnostic lifecycle boundary requesting completion.
+             */
+            void completeOrTerminate(
+                void *producer_stream,
+                const char *boundary) noexcept
+            {
+                if (!active_)
+                    return;
+                if (producer_stream != admission_stream_)
+                {
+                    LOG_ERROR(
+                        "[ForwardExecutionEngine] Live-state read changed streams between admission and completion"
+                        << " admitted_stream=" << admission_stream_
+                        << " producer_stream=" << producer_stream
+                        << " device=" << device_.toString()
+                        << " boundary=" << boundary);
+                    std::terminate();
+                }
+
+                try
+                {
+                    if (!host_.completeLiveStateForForwardGraphExecution(
+                            input_, producer_stream, device_))
+                    {
+                        LOG_ERROR(
+                            "[ForwardExecutionEngine] Failed to publish forward graph live-state read completion"
+                            << " device=" << device_.toString()
+                            << " stream=" << producer_stream
+                            << " boundary=" << boundary);
+                        std::terminate();
+                    }
+                }
+                catch (const std::exception &e)
+                {
+                    LOG_ERROR(
+                        "[ForwardExecutionEngine] Exception while publishing forward graph live-state read completion"
+                        << " device=" << device_.toString()
+                        << " stream=" << producer_stream
+                        << " boundary=" << boundary
+                        << " error=" << e.what());
+                    std::terminate();
+                }
+                catch (...)
+                {
+                    LOG_ERROR(
+                        "[ForwardExecutionEngine] Unknown exception while publishing forward graph live-state read completion"
+                        << " device=" << device_.toString()
+                        << " stream=" << producer_stream
+                        << " boundary=" << boundary);
+                    std::terminate();
+                }
+                active_ = false;
+            }
+
+            IForwardExecutionHost &host_;
+            const ForwardInput &input_;
+            void *admission_stream_ = nullptr;
+            DeviceId device_;
+            bool active_ = true;
+        };
 
         /**
          * @brief Map a typed forward invocation onto workspace graph semantics.
@@ -182,12 +364,6 @@ namespace llaminar2
             return home.is_gpu() ? home : execution_device;
         }
 
-        std::mutex &gpuCacheMissGraphMaterializationMutex()
-        {
-            static std::mutex mutex;
-            return mutex;
-        }
-
         /**
          * @brief Install a host-owned worker resolver for one engine call.
          *
@@ -299,6 +475,14 @@ namespace llaminar2
             chunk_input.token_offset = plan.chunk.token_offset;
             chunk_input.position_offset = plan.chunk.token_offset;
             chunk_input.prefill_chunk_index = plan.chunk_index;
+            /*
+             * Sparse MoE packets carry only live rows, but the matching root
+             * and participant graphs must still name this padded bucket by its
+             * shared logical start. Graph-capture history is never part of the
+             * transaction key.
+             */
+            chunk_input.moe_overlay_collective_step_id =
+                static_cast<uint64_t>(plan.chunk.token_offset);
             return chunk_input;
         }
 
@@ -349,6 +533,108 @@ namespace llaminar2
                 if (stage)
                     stage->updatePrefillReplayParams(replay_params);
             }
+        }
+
+        /** @brief Build the explicit wire identity for one MoE overlay graph execution. */
+        IComputeStage::MoEOverlayCollectiveRuntimeParams
+        makeMoEOverlayCollectiveRuntimeParams(const ForwardInput &input)
+        {
+            return IComputeStage::MoEOverlayCollectiveRuntimeParams{
+                .generation_id =
+                    input.moe_overlay_collective_generation_id,
+                .step_id = input.moe_overlay_collective_step_id,
+                .execution_semantics =
+                    input.execution_role ==
+                            ForwardExecutionRole::GroupedMTPVerifier
+                        ? IComputeStage::MoEOverlayCollectiveRuntimeParams::
+                              ExecutionSemantics::GroupedVerifier
+                        : (input.execution_phase ==
+                                   ForwardExecutionPhase::Prefill
+                               ? IComputeStage::
+                                     MoEOverlayCollectiveRuntimeParams::
+                                         ExecutionSemantics::Prefill
+                               : IComputeStage::
+                                     MoEOverlayCollectiveRuntimeParams::
+                                         ExecutionSemantics::Decode),
+                .mtp_depth = input.moe_overlay_mtp_depth,
+            };
+        }
+
+        /** @brief Collect only sparse stages that require distributed wire identity. */
+        std::vector<IComputeStage *> collectMoEOverlayCollectiveRuntimeStages(
+            ComputeGraph &graph)
+        {
+            std::vector<IComputeStage *> stages;
+            for (const auto &node_name : graph.getExecutionOrder())
+            {
+                ComputeNode *node = graph.getNode(node_name);
+                if (node && node->stage &&
+                    node->stage->hasMoEOverlayCollectiveRuntimeParams())
+                {
+                    stages.push_back(node->stage.get());
+                }
+            }
+            return stages;
+        }
+
+        /** @brief Stamp sparse graph boundaries before cold execution or cached replay. */
+        void updateMoEOverlayCollectiveRuntimeStages(
+            const ForwardInput &input,
+            const std::vector<IComputeStage *> &stages)
+        {
+            const auto runtime_params =
+                makeMoEOverlayCollectiveRuntimeParams(input);
+            for (auto *stage : stages)
+            {
+                if (stage)
+                    stage->updateMoEOverlayCollectiveRuntimeParams(
+                        runtime_params);
+            }
+        }
+
+        /**
+         * @brief Emit one production-evidence record for a completed sparse graph execution.
+         *
+         * The counter is intentionally outside the stage loop: one graph
+         * invocation can contain many layer-local dispatch/return boundaries,
+         * but they must all carry the same request generation and logical
+         * chunk start.  Tests can therefore prove the continuation and remote
+         * expert graph used the same protocol sequence without turning
+         * layer-count into an observability artefact.  Callers invoke this
+         * only after the graph result and its live-state handoff have both
+         * succeeded: cache lookup is not execution evidence, because the
+         * first use of an atomic GPU graph deliberately transitions from a
+         * cache miss into the cache-hit execution path.
+         */
+        void recordMoEOverlayCollectiveTransaction(
+            const ForwardInput &input,
+            const std::vector<IComputeStage *> &stages,
+            const char *graph_path)
+        {
+            if (stages.empty())
+                return;
+
+            const auto runtime_params =
+                makeMoEOverlayCollectiveRuntimeParams(input);
+            if (!runtime_params.valid())
+                return;
+
+            const char *phase =
+                input.execution_phase == ForwardExecutionPhase::Decode
+                    ? "decode"
+                    : "prefill";
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "moe_overlay_collective_transaction",
+                1.0,
+                phase,
+                input.device.to_string(),
+                {{"role", "continuation_graph"},
+                 {"identity_source", "orchestration_request_and_chunk"},
+                 {"generation", std::to_string(runtime_params.generation_id)},
+                 {"logical_step", std::to_string(runtime_params.step_id)},
+                 {"graph_path", graph_path ? graph_path : "unknown"},
+                 {"sparse_stage_count", std::to_string(stages.size())}});
         }
 
         std::string boolTag(bool value)
@@ -516,6 +802,7 @@ namespace llaminar2
             bool moe_rebalancing_active,
             PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default,
             bool collectives_graph_capturable = false,
+            bool heterogeneous_segmentation_admitted = false,
             bool moe_rebalancing_graph_stable = false,
             bool host_policy_disabled = false,
             std::string *reject_stage_name = nullptr,
@@ -537,13 +824,14 @@ namespace llaminar2
                 effectiveBucketSeqLen(input),
                 mode,
                 collectives_graph_capturable,
+                heterogeneous_segmentation_admitted,
                 moe_rebalancing_graph_stable,
                 reject_stage_name,
                 reject_stage_type);
         }
 
-        /// @brief Deterministic tie-breaker for bucketed forward-cache LRU victims.
-        bool bucketedSignatureLessForEviction(
+        /// @brief Deterministic tie-breaker for exact and bucketed prefill LRU victims.
+        bool prefillSignatureLessForEviction(
             const ForwardGraphSignature &lhs,
             const ForwardGraphSignature &rhs)
         {
@@ -820,34 +1108,72 @@ namespace llaminar2
             return false;
         }
 
+        // The runtime input owns padded token/position buffers, whereas the
+        // host-facing hooks deliberately consume the stable scheduler contract.
+        // Materialize that contract once so snapshots and chunk maintenance
+        // observe identical real-row and bucket geometry.
+        const PrefillChunkPlan scheduled_chunk = makeMaintenanceChunkPlan(plan);
+        ScopedPrefillChunkSnapshotDiagnostics snapshot_scope(host, scheduled_chunk);
+
         // Preserve the caller's execution context and swap in the prepared
         // chunk buffers plus fixed-bucket metadata for the delegated launch.
         ForwardInput chunk_input = makeBucketedPrefillInput(base_input, plan);
 
-        if (!execute(chunk_input, output, host))
+        std::unique_ptr<IPrefillChunkGraphSubmissionLease> submission_lease;
+        std::string submission_error;
+        if (!host.beginPrefillChunkGraphSubmission(
+                chunk_input,
+                scheduled_chunk,
+                &submission_lease,
+                &submission_error))
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Prefill chunk graph submission "
+                "admission failed for chunk "
+                << scheduled_chunk.chunk_index << ": "
+                << (submission_error.empty()
+                        ? "external graph authority rejected the chunk"
+                        : submission_error));
+            return false;
+        }
+
+        const bool execution_succeeded = execute(chunk_input, output, host);
+        if (submission_lease &&
+            !submission_lease->finish(
+                execution_succeeded, &submission_error))
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Prefill chunk graph submission "
+                "could not publish its terminal state for chunk "
+                << scheduled_chunk.chunk_index << ": "
+                << (submission_error.empty()
+                        ? "external graph authority rejected the terminal state"
+                        : submission_error));
+            return false;
+        }
+        if (!execution_succeeded)
             return false;
 
-        const PrefillChunkPlan maintenance_chunk = makeMaintenanceChunkPlan(plan);
         const PrefillChunkMaintenanceState maintenance_state =
-            host.prefillChunkMaintenanceState(maintenance_chunk);
+            host.prefillChunkMaintenanceState(scheduled_chunk);
         const PrefillChunkMaintenanceDecision maintenance_decision =
-            evaluatePrefillChunkMaintenance(maintenance_chunk, maintenance_state);
+            evaluatePrefillChunkMaintenance(scheduled_chunk, maintenance_state);
 
         const bool maintenance_was_requested =
             maintenance_state.rebalance_requested ||
-            maintenance_chunk.rebalance_required_after;
+            scheduled_chunk.rebalance_required_after;
         if (maintenance_was_requested && !maintenance_decision)
         {
             LOG_ERROR("[ForwardExecutionEngine] Prefill chunk maintenance blocked after chunk "
-                      << maintenance_chunk.chunk_index << ": "
+                      << scheduled_chunk.chunk_index << ": "
                       << maintenance_decision.reason);
             return false;
         }
         if (maintenance_decision.can_run &&
-            !host.onPrefillChunkMaintenance(maintenance_chunk, maintenance_decision))
+            !host.onPrefillChunkMaintenance(scheduled_chunk, maintenance_decision))
         {
             LOG_ERROR("[ForwardExecutionEngine] Prefill chunk maintenance failed after chunk "
-                      << maintenance_chunk.chunk_index << ": "
+                      << scheduled_chunk.chunk_index << ": "
                       << maintenance_decision.reason);
             return false;
         }
@@ -877,10 +1203,19 @@ namespace llaminar2
         {
             if (!runPrefillChunk(base_input, chunk_plan, output, host))
             {
+                host.cancelPrefillChunkSnapshotDiagnostics();
                 LOG_ERROR("[ForwardExecutionEngine] Prefill chunk schedule failed at chunk "
                           << chunk_plan.chunk_index);
                 return false;
             }
+        }
+
+        if (!host.finalizePrefillChunkSnapshotDiagnostics(schedule.schedule))
+        {
+            host.cancelPrefillChunkSnapshotDiagnostics();
+            LOG_ERROR("[ForwardExecutionEngine] Prefill chunk schedule produced "
+                      "incomplete snapshot diagnostics");
+            return false;
         }
 
         return true;
@@ -1097,27 +1432,27 @@ namespace llaminar2
         return summary;
     }
 
-    void ForwardExecutionEngine::touchBucketedPrefillForwardCache(
+    void ForwardExecutionEngine::touchPrefillForwardCache(
         const ForwardGraphSignature &signature,
         ForwardGraphCache &cache)
     {
-        if (!signature.is_bucketed_prefill || !cache.valid)
+        if (signature.decode || !cache.valid)
             return;
-        cache.bucketed_prefill_last_access_tick = ++bucketed_prefill_forward_access_counter_;
+        cache.prefill_last_access_tick = ++prefill_forward_access_counter_;
     }
 
-    size_t ForwardExecutionEngine::bucketedPrefillForwardCacheSize() const
+    size_t ForwardExecutionEngine::prefillForwardCacheSize() const
     {
         size_t count = 0;
         for (const auto &[signature, cache] : cache_)
         {
-            if (signature.is_bucketed_prefill && cache.valid)
+            if (!signature.decode && cache.valid)
                 ++count;
         }
         return count;
     }
 
-    void ForwardExecutionEngine::enforceBucketedPrefillForwardCapacity(
+    void ForwardExecutionEngine::enforcePrefillForwardCapacity(
         const ForwardGraphSignature *active_signature)
     {
         const int configured_cap = debugEnv().execution.prefill_graph_max_cached_buckets;
@@ -1125,26 +1460,27 @@ namespace llaminar2
             return;
 
         const size_t cap = static_cast<size_t>(configured_cap);
-        while (bucketedPrefillForwardCacheSize() > cap)
+        while (prefillForwardCacheSize() > cap)
         {
             auto victim = cache_.end();
             uint64_t oldest_tick = std::numeric_limits<uint64_t>::max();
 
-            // The cap only applies to reusable bucketed prefill graphs. Decode
-            // and non-bucketed prefill retain their existing cache lifetime.
+            // Exact CPU prefill and bucketed GPU prefill both retain complete
+            // graph topology and stage-owned persistent buffers. Bound them as
+            // one cache class; decode has its independent stable-shape lifetime.
             for (auto it = cache_.begin(); it != cache_.end(); ++it)
             {
                 const auto &signature = it->first;
                 const auto &cache = it->second;
-                if (!signature.is_bucketed_prefill || !cache.valid)
+                if (signature.decode || !cache.valid)
                     continue;
                 if (active_signature && signature == *active_signature)
                     continue;
 
-                const uint64_t tick = cache.bucketed_prefill_last_access_tick;
+                const uint64_t tick = cache.prefill_last_access_tick;
                 if (victim == cache_.end() ||
                     tick < oldest_tick ||
-                    (tick == oldest_tick && bucketedSignatureLessForEviction(signature, victim->first)))
+                    (tick == oldest_tick && prefillSignatureLessForEviction(signature, victim->first)))
                 {
                     oldest_tick = tick;
                     victim = it;
@@ -1157,10 +1493,13 @@ namespace llaminar2
             const auto evicted_signature = victim->first;
             victim->second.invalidate();
             cache_.erase(victim);
-            ++bucketed_prefill_forward_eviction_count_;
+            ++prefill_forward_eviction_count_;
 
-            LOG_INFO("[ForwardExecutionEngine] Evicted bucketed prefill forward graph bucket_seq_len="
-                     << evicted_signature.bucket_seq_len
+            LOG_INFO("[ForwardExecutionEngine] Evicted prefill forward topology rows="
+                     << (evicted_signature.is_bucketed_prefill
+                             ? evicted_signature.bucket_seq_len
+                             : evicted_signature.seq_len)
+                     << " bucketed=" << evicted_signature.is_bucketed_prefill
                      << " device=" << evicted_signature.device.toString()
                      << " due to cache cap=" << configured_cap);
         }
@@ -1180,6 +1519,37 @@ namespace llaminar2
             host,
             input.device);
         last_executed_forward_graph_ = {};
+        const bool setup_materialization =
+            input.graph_submission_intent ==
+            ForwardGraphSubmissionIntent::
+                MaterializeExecutableWithoutLaunch;
+        if (setup_materialization &&
+            (!input.device.is_gpu() ||
+             input.moe_overlay_graph_launch_dependency))
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Setup-only forward graph "
+                "materialization requires a GPU input with no request-scoped "
+                "launch dependency");
+            return false;
+        }
+
+        /*
+         * Workspace-family discovery builds the exact production topology with
+         * permanent arena/KV addresses before a workspace generation exists.
+         * That typed declaration is never executable: only the runtime binding
+         * whose capture identity includes the finalized generation may cross
+         * this boundary.
+         */
+        if (input.shifted_mtp_prefill &&
+            !input.shifted_mtp_prefill->executableForRequestCount(
+                input.batch_size))
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Refusing a declaration-only or "
+                "incomplete shifted-MTP prefill binding");
+            return false;
+        }
 
         auto start = std::chrono::high_resolution_clock::now();
 
@@ -1210,8 +1580,28 @@ namespace llaminar2
             host.mtpSpecVerifierInputPlanActive() &&
             input.seq_len > 0 &&
             input.seq_len <= decode_max_seq_len;
-        const bool is_single_token_decode = (input.seq_len == 1 && input.batch_size <= 1);
+        /*
+         * A scheduled prefill chunk carries a typed fixed-bucket contract.
+         * Its physical width may look like a short continuation after the
+         * first chunk advances the request cursor, but it still owns prompt
+         * ingestion semantics: padded rows must not become decode rows, and
+         * the prefill graph must retain its row-selection/snapshot contract.
+         *
+         * Do not infer the phase from `position_offset` once this contract is
+         * present.  MTP verifier buckets deliberately retain
+         * ForwardExecutionPhase::Decode and therefore remain decode paths.
+         */
+        const bool typed_bucketed_prefill =
+            input.execution_phase == ForwardExecutionPhase::Prefill &&
+            input.bucket_seq_len > 0 &&
+            input.seq_len == effectiveBucketSeqLen(input) &&
+            effectiveRealSeqLen(input) > 0 &&
+            effectiveRealSeqLen(input) <= effectiveBucketSeqLen(input);
+        const bool is_single_token_decode =
+            !typed_bucketed_prefill &&
+            input.seq_len == 1 && input.batch_size <= 1;
         const bool is_short_continuation_decode =
+            !typed_bucketed_prefill &&
             input.batch_size <= 1 &&
             input.seq_len > 1 &&
             input.seq_len <= decode_max_seq_len &&
@@ -1277,28 +1667,32 @@ namespace llaminar2
             prefillGraphBucketsAtOrBelowCapacity(
                 env.execution.prefill_graph_bucket_sizes,
                 resident_graph_rows);
-        std::vector<int> raw_prefill_buckets = resident_prefill_buckets;
         const int raw_prefill_bucket_floor =
-            std::max(1, env.execution.prefill_graph_min_seq);
-        raw_prefill_buckets.erase(
-            raw_prefill_buckets.begin(),
-            std::lower_bound(
-                raw_prefill_buckets.begin(),
-                raw_prefill_buckets.end(),
-                raw_prefill_bucket_floor));
+            effectivePrefillGraphMinimumPaddedBucketSeqLen(
+                env.execution.prefill_graph_min_seq,
+                resident_graph_rows);
+        const std::vector<int> raw_prefill_buckets =
+            rawPrefillGraphBucketsForResidentCapacity(
+                env.execution.prefill_graph_bucket_sizes,
+                resident_graph_rows,
+                env.execution.prefill_graph_min_seq);
         /*
-         * Every homogeneous GPU prefill is graph-cache eligible. The configured
-         * minimum is a physical-bucket coalescing policy, not permission to run
-         * short prompts eagerly: a 35-row prompt with a 256-row floor captures
-         * the 256-row graph. Explicit chunk schedules retain their already-
-         * admitted bucket, including a short terminal tail.
+         * Forward topology reuse and native GPU graph capture are separate
+         * policies. Exact-shape CPU prefill keeps its ComputeGraph, prepared
+         * kernels, and stage-owned persistent workspace warm, then executes it
+         * through the ordinary CPU executor. Homogeneous GPU prefill additionally
+         * enters the bucketed capture/replay state machine below.
          */
-        const bool prefill_cache_eligible =
+        const bool prefill_topology_cache_eligible =
             config_.cache_config.enabled &&
             !is_decode &&
             !has_unified_pp &&
             has_stable_forward_inputs &&
-            (is_standard_path || is_partial_pp_path) &&
+            (is_standard_path || is_partial_pp_path);
+        const bool cpu_exact_prefill_cache_eligible =
+            prefill_topology_cache_eligible && input.device.is_cpu();
+        const bool prefill_cache_eligible =
+            prefill_topology_cache_eligible &&
             input.device.is_gpu() &&
             env.execution.gpu_graphs;
 
@@ -1391,6 +1785,7 @@ namespace llaminar2
              !has_unified_pp &&
              has_stable_forward_inputs &&
              (is_standard_path || is_partial_pp_path)) ||
+            cpu_exact_prefill_cache_eligible ||
             prefill_cache_eligible;
 
         ForwardGraphSignature forward_signature;
@@ -1497,9 +1892,15 @@ namespace llaminar2
                 forward_signature.decode ? "decode" : "prefill",
                 forward_signature.device.toString(),
                 forwardCacheLookupTags(forward_signature, "hit"));
-            touchBucketedPrefillForwardCache(forward_signature, *active_forward_cache);
+            touchPrefillForwardCache(forward_signature, *active_forward_cache);
             const bool success = executeCacheHit(effective_input, output, *active_forward_cache, host,
                                                  is_decode, start);
+            if (setup_materialization)
+            {
+                if (success && !forward_signature.decode)
+                    enforcePrefillForwardCapacity(&forward_signature);
+                return success;
+            }
             if (live_mtp_request_batch_condition &&
                 debugEnv().runtime_debug.mtp_condition_graph_contract_trace)
             {
@@ -1513,8 +1914,8 @@ namespace llaminar2
             {
                 recordLastExecutedForwardGraph(forward_signature, /*cache_hit=*/true);
             }
-            if (success && forward_signature.is_bucketed_prefill)
-                enforceBucketedPrefillForwardCapacity(&forward_signature);
+            if (success && !forward_signature.decode)
+                enforcePrefillForwardCapacity(&forward_signature);
             if (success)
                 host.commitSuccessfulForwardOutput(output);
             return success;
@@ -1574,6 +1975,12 @@ namespace llaminar2
         }
         if (success && build_cache && build_cache->valid)
             recordLastExecutedForwardGraph(forward_signature, /*cache_hit=*/false);
+        if (setup_materialization)
+        {
+            if (success && !forward_signature.decode)
+                enforcePrefillForwardCapacity(&forward_signature);
+            return success;
+        }
         if (success && !output.execution.valid)
         {
             LOG_ERROR("[ForwardExecutionEngine] Successful forward did not publish execution provenance for "
@@ -1687,6 +2094,236 @@ namespace llaminar2
         return view;
     }
 
+    std::optional<ForwardExecutionEngine::RetainedDecodeGraphView>
+    ForwardExecutionEngine::retainedDecodeGraph(
+        const ForwardGraphSignature &signature,
+        std::string *error) const
+    {
+        auto reject = [&](const std::string &reason)
+            -> std::optional<RetainedDecodeGraphView>
+        {
+            if (error)
+                *error = reason;
+            return std::nullopt;
+        };
+        if (error)
+            error->clear();
+
+        const auto cache_it = cache_.find(signature);
+        if (cache_it == cache_.end())
+            return reject("no cached forward graph matches the exact signature");
+
+        const ForwardGraphCache &cache = cache_it->second;
+        if (!cache.valid || !cache.graph)
+            return reject("the exact forward graph cache entry is not valid");
+        if (!signature.device.is_gpu() || !signature.decode)
+            return reject("retained replay requires a GPU decode graph");
+        if (!signature.uses_device_token_ids ||
+            !signature.uses_device_position_ids)
+        {
+            return reject(
+                "retained replay requires device-owned token and position rows");
+        }
+        if (!cache.phase3_active || !cache.segment_cache.initialized ||
+            cache.segment_cache.needs_capture)
+        {
+            return reject(
+                "forward graph has not reached steady retained replay state");
+        }
+        if (!cache.segment_cache.capture_stream || !cache.gpu_ctx ||
+            cache.segment_cache.segments.empty())
+        {
+            return reject(
+                "retained forward replay has incomplete stream, context, or segment ownership");
+        }
+
+        RetainedDecodeGraphView view;
+        view.signature = signature;
+        view.device = signature.device;
+        view.stream = cache.segment_cache.capture_stream;
+        const auto &parent_plan =
+            cache.segment_cache.retained_composed_parent_replay;
+        if (parent_plan.valid())
+        {
+            if (cache.segment_cache.graph_replay_plan_policy !=
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::
+                        RequireRetainedParentComposition ||
+                !cache.segment_cache.retained_parent_capture ||
+                !cache.segment_cache.retained_parent_capture->hasExecutable())
+            {
+                return reject(
+                    "retained parent identity is incomplete or disagrees with replay policy");
+            }
+            view.replay_unit_count = 1u;
+            view.source_capture_unit_count = parent_plan.child_unit_count;
+            view.composed_parent = true;
+            view.segmented = false;
+        }
+        else
+        {
+            view.replay_unit_count = cache.segment_cache.segments.size();
+            view.source_capture_unit_count = view.replay_unit_count;
+            view.segmented = view.replay_unit_count > 1;
+        }
+        return view;
+    }
+
+    std::optional<std::vector<
+        DeviceGraphExecutor::GraphSegmentCache::
+            RetainedCaptureUnitTemplateView>>
+    ForwardExecutionEngine::retainedDecodeCaptureUnitTemplates(
+        const ForwardGraphSignature &signature,
+        std::string *error) const
+    {
+        using UnitView = DeviceGraphExecutor::GraphSegmentCache::
+            RetainedCaptureUnitTemplateView;
+        auto reject = [&](const std::string &reason)
+            -> std::optional<std::vector<UnitView>>
+        {
+            if (error)
+                *error = reason;
+            return std::nullopt;
+        };
+        if (error)
+            error->clear();
+
+        std::string retained_error;
+        if (!retainedDecodeGraph(signature, &retained_error))
+            return reject(retained_error);
+
+        const auto cache_it = cache_.find(signature);
+        if (cache_it == cache_.end() || !cache_it->second.graph)
+        {
+            return reject(
+                "retained decode capture-unit cache identity disappeared");
+        }
+        return cache_it->second.segment_cache.retainedCaptureUnitTemplates(
+            *cache_it->second.graph, error);
+    }
+
+    bool ForwardExecutionEngine::replayRetainedDecodeGraph(
+        const ForwardGraphSignature &signature,
+        IDeviceContext *ctx,
+        const IComputeStage::MoEOverlayCollectiveRuntimeParams &sparse_params,
+        const DeviceGraphExecutor::GraphLaunchDependencyHook
+            &launch_dependency,
+        void **out_producer_stream,
+        std::string *error)
+    {
+        auto fail = [&](const std::string &reason) -> bool
+        {
+            if (error)
+                *error = reason;
+            return false;
+        };
+        if (error)
+            error->clear();
+        if (out_producer_stream)
+            *out_producer_stream = nullptr;
+
+        std::string retained_error;
+        const auto retained = retainedDecodeGraph(signature, &retained_error);
+        if (!retained)
+            return fail(retained_error);
+        if (!ctx || ctx->deviceId() != signature.device)
+            return fail("retained replay received the wrong device context");
+
+        auto cache_it = cache_.find(signature);
+        if (cache_it == cache_.end())
+            return fail("retained replay cache identity disappeared");
+        ForwardGraphCache &cache = cache_it->second;
+
+        if (!cache.moe_overlay_collective_runtime_stages.empty() &&
+            !sparse_params.valid())
+        {
+            return fail(
+                "retained sparse replay requires a root-authoritative wire identity");
+        }
+        for (IComputeStage *stage :
+             cache.moe_overlay_collective_runtime_stages)
+        {
+            if (!stage)
+                return fail("retained sparse replay contains a null runtime stage");
+            stage->updateMoEOverlayCollectiveRuntimeParams(sparse_params);
+        }
+
+        const auto plan_policy =
+            cache.segment_cache.graph_replay_plan_policy;
+        DeviceGraphExecutor::RetainedParentCompositionHook parent_composer;
+        if (retained->composed_parent)
+        {
+            if (plan_policy !=
+                DeviceGraphExecutor::GraphReplayPlanPolicy::
+                    RequireRetainedParentComposition)
+            {
+                return fail(
+                    "retained parent view disagrees with cache replay policy");
+            }
+            try
+            {
+                auto composer = makeMoEOverlayRetainedParentComposer(*cache.graph);
+                if (!composer)
+                {
+                    return fail(
+                        "retained parent graph no longer declares typed packet frontiers");
+                }
+                parent_composer = std::move(*composer);
+            }
+            catch (const std::exception &ex)
+            {
+                return fail(
+                    std::string(
+                        "retained parent topology validation failed: ") +
+                    ex.what());
+            }
+        }
+
+        /*
+         * Phase-3 graph units do not call markCompleted(), while manual sparse
+         * boundaries retain ordinary ComputeGraph stage flags. Resetting the
+         * declarative graph here clears only host lifecycle flags; the retained
+         * executables, streams, workspaces, and device state remain untouched.
+         */
+        cache.graph->reset();
+        if (!executor_.executeWithCachedGraphReplay(
+                *cache.graph,
+                ctx,
+                cache.segment_cache,
+                retained->stream,
+                cache.gpu_ctx,
+                &cache.collective_nodes,
+                /*collectives_graph_capturable=*/
+                    !cache.collective_nodes.empty(),
+                /*force_recapture=*/false,
+                /*defer_final_sync=*/true,
+                {},
+                plan_policy,
+                launch_dependency,
+                std::span<const BufferId>{},
+                std::move(parent_composer)))
+        {
+            return fail("retained decode graph replay submission failed");
+        }
+
+        if (out_producer_stream)
+            *out_producer_stream = retained->stream;
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "hosted_retained_decode_replays",
+            1.0,
+            "decode",
+            signature.device.toString(),
+            {{"replay_units", std::to_string(retained->replay_unit_count)},
+             {"source_capture_units",
+              std::to_string(retained->source_capture_unit_count)},
+             {"segmented", retained->segmented ? "true" : "false"},
+             {"composed_parent",
+              retained->composed_parent ? "true" : "false"},
+             {"role", std::to_string(static_cast<int>(
+                          signature.execution_role))}});
+        return true;
+    }
+
     void ForwardExecutionEngine::clearLastAllPositionVerifierForwardGraph()
     {
         last_all_position_verifier_graph_ = {};
@@ -1785,7 +2422,7 @@ namespace llaminar2
 
             PrefillGraphCacheSnapshot snapshot;
             snapshot.forward_cache_valid = cache.valid;
-            snapshot.eviction_count = bucketed_prefill_forward_eviction_count_;
+            snapshot.eviction_count = prefill_forward_eviction_count_;
             snapshot.bucket_seq_len = signature.is_bucketed_prefill
                                           ? signature.bucket_seq_len
                                           : signature.seq_len;
@@ -1842,6 +2479,175 @@ namespace llaminar2
         return snapshots;
     }
 
+    bool ForwardExecutionEngine::materializeCachedExecutableWithoutLaunch(
+        const ForwardInput &input,
+        ForwardGraphCache &forward_cache,
+        IForwardExecutionHost &host,
+        bool is_decode)
+    {
+        if (input.graph_submission_intent !=
+                ForwardGraphSubmissionIntent::
+                    MaterializeExecutableWithoutLaunch ||
+            !input.device.is_gpu() || !forward_cache.graph ||
+            input.moe_overlay_graph_launch_dependency)
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Setup graph materialization requires "
+                "one cached GPU graph and forbids request-scoped launch "
+                "dependencies");
+            return false;
+        }
+        if (forward_cache.segment_cache.initialized &&
+            !forward_cache.segment_cache.needs_capture &&
+            forward_cache.segment_cache.executable_submission_state !=
+                DeviceGraphExecutor::GraphSegmentCache::
+                    ExecutableSubmissionState::Empty)
+        {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "setup_materialized_graph_reuses",
+                1.0,
+                "setup",
+                input.device.toString(),
+                {{"context", is_decode ? "main_decode" : "prefill"}});
+            return true;
+        }
+
+        IDeviceContext *const ctx = host.getDeviceContext(input.device);
+        IWorkerGPUContext *const gpu_ctx =
+            ctx ? host.getWorkerGPUContext(ctx->deviceId()) : nullptr;
+        if (!ctx || !gpu_ctx ||
+            !forward_cache.segment_cache.ensureCaptureStream(
+                gpu_ctx, ctx->deviceId()) ||
+            !forward_cache.segment_cache.capture_stream)
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Setup graph materialization could "
+                "not establish its exact device context and capture stream on "
+                << input.device.toString());
+            return false;
+        }
+        forward_cache.gpu_ctx = gpu_ctx;
+        forward_cache.gpu_stream = gpu_ctx->defaultStream();
+        if (!forward_cache.gpu_stream)
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Setup graph materialization resolved "
+                "a null worker stream on "
+                << input.device.toString());
+            return false;
+        }
+
+        /*
+         * Setup capture intentionally skips the ordinary live-state prelude: it
+         * has no admitted request and launches no model work. Graph construction
+         * can nevertheless publish immutable device descriptors. Join that one
+         * producer on the exact capture stream now, before recording the native
+         * executable, so the publication event can be reused by the next bucket
+         * without a host or device synchronization.
+         */
+        if (!host.prepareGraphBuildStateForMaterialization(
+                input,
+                forward_cache.segment_cache.capture_stream,
+                ctx->deviceId()))
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Setup graph materialization could not "
+                "consume graph-build device-state readiness on "
+                << input.device.toString());
+            return false;
+        }
+
+        constexpr auto kMaterialize =
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+                MaterializeWithoutLaunch;
+        if (!is_decode)
+        {
+            bool used_graph_replay = false;
+            return executePrefillWithGraphCache(
+                input,
+                forward_cache,
+                ctx,
+                host,
+                &used_graph_replay,
+                kMaterialize);
+        }
+
+        DeviceGraphExecutor::DecodeCapturePolicy capture_policy =
+            host.buildDecodeCapturePolicy(
+                !forward_cache.collective_nodes.empty(), ctx);
+        if (!capture_policy.allow_cached_graph_replay)
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Setup decode materialization requires "
+                "the production cached-graph policy on "
+                << input.device.toString());
+            return false;
+        }
+        try
+        {
+            const bool device_timeline_transaction =
+                forward_cache.graph->nativeCaptureEnvelope() ==
+                GraphNativeCaptureEnvelope::
+                    DeviceOwnedTimelineTransaction;
+            if (device_timeline_transaction)
+            {
+                capture_policy.graph_replay_plan_policy =
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::
+                        RequireFullGraph;
+                capture_policy.retained_parent_composer = {};
+                capture_policy.defer_final_sync = true;
+            }
+            else if (auto sparse_parent_composer =
+                         makeMoEOverlayRetainedParentComposer(
+                             *forward_cache.graph))
+            {
+                capture_policy.graph_replay_plan_policy =
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::
+                        RequireRetainedParentComposition;
+                capture_policy.retained_parent_composer =
+                    std::move(*sparse_parent_composer);
+                capture_policy.defer_final_sync = true;
+            }
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Setup decode materialization could "
+                "not derive its retained ExpertOverlay topology: "
+                << error.what());
+            return false;
+        }
+
+        const DeviceId capture_device = ctx->deviceId();
+        capture_policy.capture_boundary =
+            [&host, &input, capture_device](
+                const std::string &boundary_name,
+                void *capture_stream)
+        {
+            return host.waitAtDecodeGraphCaptureBoundary(
+                input,
+                capture_device,
+                boundary_name,
+                capture_stream);
+        };
+        capture_policy.launch_dependency = {};
+        capture_policy.force_recapture = false;
+        forward_cache.segment_cache.perf_context = "main_decode";
+
+        bool used_graph_replay = false;
+        return executor_.executeDecodeWithCapturePolicy(
+            *forward_cache.graph,
+            ctx,
+            &forward_cache.segment_cache,
+            forward_cache.gpu_stream,
+            forward_cache.gpu_ctx,
+            &forward_cache.collective_nodes,
+            capture_policy,
+            &used_graph_replay,
+            kMaterialize);
+    }
+
     // =========================================================================
     // executeCacheHit() — Reuse Cached Forward Graph
     // =========================================================================
@@ -1857,7 +2663,16 @@ namespace llaminar2
         // ===== CACHE HIT: Reuse cached decode graph =====
 
         // Setup sub-phase timing (only when profiling is active)
-        const bool profiling_setup = KernelProfiler::isEnabled();
+        /*
+         * The coarse forward-pass decomposition is intentionally available
+         * without per-kernel or per-stage GPU events.  It adds only host clock
+         * reads and thread-local accumulation, which lets a focused PerfStats
+         * campaign attribute orchestration latency without changing the GPU
+         * execution DAG it is trying to measure.
+         */
+        const bool profiling_setup =
+            KernelProfiler::isEnabled() ||
+            PerfStatsCollector::isDomainEnabled("forward_pass");
         using Clock = std::chrono::high_resolution_clock;
         Clock::time_point setup_workspace_t0, setup_workspace_t1;
         Clock::time_point setup_token_copy_t0, setup_token_copy_t1;
@@ -2098,13 +2913,20 @@ namespace llaminar2
             }
         }
 
-        if (decode_capture_allowed && stream_ctx && stream_ctx->deviceId().is_gpu() && stream_gpu_ctx)
+        bool heterogeneous_prefill_segmented = false;
+        if ((decode_capture_allowed || !is_decode) &&
+            stream_ctx && stream_ctx->deviceId().is_gpu() && stream_gpu_ctx)
         {
             const auto early_capture_policy = host.buildDecodeCapturePolicy(
                 !forward_cache.collective_nodes.empty(),
                 stream_ctx);
 
-            if (early_capture_policy.allow_cached_graph_replay)
+            const bool use_segment_cache_stream =
+                decode_capture_allowed ||
+                (!is_decode &&
+                 early_capture_policy.heterogeneous_segmented_enabled);
+            if (early_capture_policy.allow_cached_graph_replay &&
+                use_segment_cache_stream)
             {
                 if (forward_cache.segment_cache.ensureCaptureStream(
                         stream_gpu_ctx,
@@ -2112,6 +2934,9 @@ namespace llaminar2
                 {
                     replay_stream = forward_cache.segment_cache.capture_stream;
                     dynamic_param_stream = replay_stream;
+                    heterogeneous_prefill_segmented =
+                        !is_decode &&
+                        early_capture_policy.heterogeneous_segmented_enabled;
                 }
                 else
                 {
@@ -2122,7 +2947,7 @@ namespace llaminar2
             }
         }
 
-        if (!is_decode && stream_gpu_ctx)
+        if (!is_decode && stream_gpu_ctx && !heterogeneous_prefill_segmented)
         {
             if (forward_cache.prefill_capture_stream.ensure(stream_gpu_ctx))
             {
@@ -2157,6 +2982,17 @@ namespace llaminar2
                       << " applied_stream=" << forward_cache.applied_stream);
         }
 
+        if (input.graph_submission_intent ==
+            ForwardGraphSubmissionIntent::
+                MaterializeExecutableWithoutLaunch)
+        {
+            return materializeCachedExecutableWithoutLaunch(
+                input,
+                forward_cache,
+                host,
+                is_decode);
+        }
+
         if (profiling_setup)
         {
             setup_stream_t1 = Clock::now();
@@ -2171,6 +3007,11 @@ namespace llaminar2
             LOG_ERROR("[ForwardExecutionEngine] Failed to prepare live state for cached forward graph execution");
             return false;
         }
+        ScopedForwardLiveStateRead live_state_read(
+            host,
+            input,
+            dynamic_param_stream,
+            stream_device);
 
         if (!host.prepareDeviceTokenInputsForForwardGraphExecution(
                 input,
@@ -2226,6 +3067,15 @@ namespace llaminar2
         {
             updatePrefillReplayParamStages(input, forward_cache.prefill_replay_param_stages);
         }
+        if (!forward_cache.moe_overlay_collective_runtime_stages_cached)
+        {
+            forward_cache.moe_overlay_collective_runtime_stages =
+                collectMoEOverlayCollectiveRuntimeStages(*forward_cache.graph);
+            forward_cache.moe_overlay_collective_runtime_stages_cached = true;
+        }
+        updateMoEOverlayCollectiveRuntimeStages(
+            input,
+            forward_cache.moe_overlay_collective_runtime_stages);
         const int *replay_position_ids =
             selectForwardReplayHostPositionIds(forward_cache, input);
         const int position_row_count = forwardPositionRowCount(input);
@@ -2332,10 +3182,33 @@ namespace llaminar2
 
         if (!is_decode)
         {
-            // Prefill with graph capture/replay state machine. Snapshot capture
-            // is handled as a post-graph drain inside executePrefillWithGraphCache()
-            // so parity diagnostics do not force eager stage execution.
-            success = executePrefillWithGraphCache(input, forward_cache, ctx, host);
+            if (input.device.is_gpu())
+            {
+                // GPU prefill uses the native capture/replay state machine.
+                // Snapshot capture is a post-graph drain so parity diagnostics
+                // never force eager stage execution.
+                success = executePrefillWithGraphCache(
+                    input,
+                    forward_cache,
+                    ctx,
+                    host,
+                    &used_graph_replay);
+            }
+            else
+            {
+                /*
+                 * CPU exact prefill reuses the complete graph topology without
+                 * pretending that CPU execution is a GPU graph replay. The
+                 * graph owns its prepared kernels and persistent stage state;
+                 * reset/update above refreshes request data before each eager
+                 * traversal. Keep snapshots bound to this exact graph just as
+                 * on first materialization.
+                 */
+                success = executor_.executeWithSnapshotManifest(
+                    *forward_cache.graph,
+                    ctx,
+                    forward_cache.snapshot_manifest);
+            }
         }
         else
         {
@@ -2345,6 +3218,86 @@ namespace llaminar2
                 capture_policy = host.buildDecodeCapturePolicy(
                     has_collective_nodes,
                     ctx);
+            }
+            if (input.moe_overlay_graph_launch_dependency)
+            {
+                if (capture_policy.launch_dependency)
+                {
+                    const auto existing =
+                        std::move(capture_policy.launch_dependency);
+                    const auto overlay =
+                        input.moe_overlay_graph_launch_dependency;
+                    capture_policy.launch_dependency =
+                        [existing, overlay](
+                            DeviceGraphExecutor::GraphExecutableLaunchPhase phase,
+                            void *stream)
+                    {
+                        return existing(phase, stream) &&
+                               overlay(phase, stream);
+                    };
+                }
+                else
+                {
+                    capture_policy.launch_dependency =
+                        input.moe_overlay_graph_launch_dependency;
+                }
+                if (!capture_policy.allow_cached_graph_replay)
+                {
+                    LOG_ERROR(
+                        "[ForwardExecutionEngine] GPU ExpertOverlay decode "
+                        "requires retained graph execution so its remote "
+                        "ticket can be armed at the exact executable launch "
+                        "edge");
+                    return false;
+                }
+            }
+            const bool uses_device_timeline_transaction =
+                forward_cache.graph->nativeCaptureEnvelope() ==
+                GraphNativeCaptureEnvelope::
+                    DeviceOwnedTimelineTransaction;
+            bool uses_retained_sparse_parent = false;
+            try
+            {
+                if (uses_device_timeline_transaction)
+                {
+                    if (!decode_capture_allowed ||
+                        !capture_policy.allow_cached_graph_replay)
+                    {
+                        LOG_ERROR(
+                            "[ForwardExecutionEngine] Device-owned ExpertOverlay timeline requires mandatory full-graph capture/replay");
+                        return false;
+                    }
+                    capture_policy.graph_replay_plan_policy =
+                        DeviceGraphExecutor::GraphReplayPlanPolicy::
+                            RequireFullGraph;
+                    capture_policy.retained_parent_composer = {};
+                    capture_policy.defer_final_sync = true;
+                }
+                else if (auto sparse_parent_composer =
+                             makeMoEOverlayRetainedParentComposer(
+                                 *forward_cache.graph))
+                {
+                    if (!decode_capture_allowed ||
+                        !capture_policy.allow_cached_graph_replay)
+                    {
+                        LOG_ERROR(
+                            "[ForwardExecutionEngine] Typed ExpertOverlay packet graph requires mandatory retained-parent capture/replay");
+                        return false;
+                    }
+                    capture_policy.graph_replay_plan_policy =
+                        DeviceGraphExecutor::GraphReplayPlanPolicy::
+                            RequireRetainedParentComposition;
+                    capture_policy.retained_parent_composer =
+                        std::move(*sparse_parent_composer);
+                    uses_retained_sparse_parent = true;
+                }
+            }
+            catch (const std::exception &ex)
+            {
+                LOG_ERROR(
+                    "[ForwardExecutionEngine] Could not derive retained ExpertOverlay endpoint authority: "
+                    << ex.what());
+                return false;
             }
             if (typed_mtp_decode_role &&
                 input.device.is_gpu() &&
@@ -2359,7 +3312,7 @@ namespace llaminar2
                     << " device=" << input.device.toString());
                 return false;
             }
-            if (capture_policy.collective_segmented_enabled)
+            if (capture_policy.heterogeneous_segmented_enabled)
             {
                 LOG_DEBUG(
                     "[ForwardExecutionEngine] Heterogeneous collective-only "
@@ -2430,7 +3383,9 @@ namespace llaminar2
                 host.shouldDeferAllPositionVerifierFinalSync();
             const bool wants_main_decode_sync_defer =
                 !all_position_verifier &&
-                host.shouldDeferMainDecodeFinalSync();
+                (host.shouldDeferMainDecodeFinalSync() ||
+                 uses_retained_sparse_parent ||
+                 uses_device_timeline_transaction);
             const bool wants_captured_collective_sync_defer =
                 !all_position_verifier &&
                 has_collective_nodes &&
@@ -2447,6 +3402,13 @@ namespace llaminar2
                      (wants_main_decode_sync_defer ||
                       wants_captured_collective_sync_defer))
             {
+                capture_policy.defer_final_sync = true;
+            }
+            if (uses_retained_sparse_parent ||
+                uses_device_timeline_transaction)
+            {
+                // The endpoint executable publishes an asynchronous device
+                // timeline transaction; its consumer owns completion.
                 capture_policy.defer_final_sync = true;
             }
             requested_deferred_all_position_sync =
@@ -2469,14 +3431,20 @@ namespace llaminar2
                  {"allow_graph_replay", boolTag(capture_policy.allow_cached_graph_replay)},
                  {"defer_final_sync", boolTag(capture_policy.defer_final_sync)},
                  {"has_collectives", boolTag(has_collective_nodes)},
-                 {"collective_segmented", boolTag(capture_policy.collective_segmented_enabled)},
+                 {"heterogeneous_segmented", boolTag(capture_policy.heterogeneous_segmented_enabled)},
+                 {"retained_sparse_parent", boolTag(uses_retained_sparse_parent)},
+                 {"device_timeline_transaction", boolTag(uses_device_timeline_transaction)},
                  {"collectives_graph_capturable", boolTag(capture_policy.collectives_graph_capturable)},
                  {"replay_plan_policy",
                   capture_policy.graph_replay_plan_policy ==
                           DeviceGraphExecutor::GraphReplayPlanPolicy::
                               RequireFullGraph
                       ? "require_full_graph"
-                      : "allow_heterogeneous_collective_segmentation"}});
+                      : (capture_policy.graph_replay_plan_policy ==
+                                 DeviceGraphExecutor::GraphReplayPlanPolicy::
+                                     RequireRetainedParentComposition
+                             ? "require_retained_parent_composition"
+                             : "allow_heterogeneous_boundary_segmentation")}});
 
             if (capture_policy.allow_cached_graph_replay && !forward_cache.gpu_stream)
             {
@@ -2550,13 +3518,25 @@ namespace llaminar2
                       is_decode,
                       used_graph_replay)
                 : dynamic_param_stream;
-        if (!host.completeLiveStateForForwardGraphExecution(
-                input,
-                live_state_completion_stream,
-                stream_device))
+        live_state_read.complete(live_state_completion_stream);
+
+        if (success && !is_decode && !input.device.is_gpu() &&
+            effectiveRealSeqLen(input) > 0)
         {
-            LOG_ERROR("[ForwardExecutionEngine] Failed to publish cached forward graph live-state read completion");
-            return false;
+            const int terminal_row = effectiveRealSeqLen(input) - 1;
+            if (!executor_.publishCapturedTerminalStateAfterGraphExecution(
+                    *forward_cache.graph,
+                    terminal_row,
+                    nullptr,
+                    "cpu_exact_prefill_cache_hit",
+                    input.sequence_lengths_device,
+                    input.batch_size,
+                    input.seq_len,
+                    input.sequence_lengths))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Failed to publish terminal CPU prefill state after exact topology replay");
+                return false;
+            }
         }
 
         auto exec_t1 = std::chrono::high_resolution_clock::now();
@@ -2686,12 +3666,11 @@ namespace llaminar2
                  * instead inherit the producer stream through the deferred path
                  * above, so neither route needs a host or stream synchronization.
                  */
-                if (!host.publishLogitsAtBoundary(
-                        output.logits,
-                        ctx,
-                        output.execution.stream))
+                if (!host.publishForwardResultAtBoundary(
+                        output,
+                        ctx))
                 {
-                    LOG_ERROR("[ForwardExecutionEngine] Failed to publish cached forward logits at the device boundary");
+                    LOG_ERROR("[ForwardExecutionEngine] Failed to publish cached forward result at the device boundary");
                     return false;
                 }
             }
@@ -2705,8 +3684,39 @@ namespace llaminar2
             collectTimeline(host, ctx, is_decode, input, start, stage_context);
         }
 
+        if (success)
+        {
+            recordMoEOverlayCollectiveTransaction(
+                input,
+                forward_cache.moe_overlay_collective_runtime_stages,
+                "cache_hit");
+        }
+
         auto end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
+
+        /*
+         * Keep one low-overhead end-to-end cache-hit timing in the same CSV as
+         * the heterogeneous transport evidence.  The timer already brackets
+         * every cache hit for the DEBUG summary below; exporting it therefore
+         * adds no clock reads and lets Release campaigns distinguish capture
+         * setup from steady graph replay without enabling log-heavy DEBUG.
+         */
+        if (PerfStatsCollector::isDomainEnabled("forward_graph"))
+        {
+            PerfStatsCollector::recordTimingNs(
+                "forward_graph",
+                "forward_cache_hit_total",
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        end - start)
+                        .count()),
+                is_decode ? "decode" : "prefill",
+                input.device.toString(),
+                {{"phase3_active", forward_cache.phase3_active ? "true" : "false"},
+                 {"sequence_rows", std::to_string(input.seq_len)},
+                 {"used_graph_replay", used_graph_replay ? "true" : "false"}});
+        }
 
         // Decode step timing breakdown (enabled via TP_TIMING)
         if (is_decode && debugEnv().tp_timing)
@@ -2762,11 +3772,20 @@ namespace llaminar2
             timings.graph_launch_ns = replay_timings.graph_launch_ns;
             timings.post_launch_ns = replay_timings.post_launch_ns;
             timings.stream_sync_ns = replay_timings.stream_sync_ns;
+            timings.manual_host_ticket_wait_ns =
+                replay_timings.manual_host_ticket_wait_ns;
+            timings.manual_dispatch_ns =
+                replay_timings.manual_dispatch_ns;
+            timings.manual_sparse_protocol_ns =
+                replay_timings.manual_sparse_protocol_ns;
+            timings.manual_other_ns = replay_timings.manual_other_ns;
 
             if (is_decode)
-                forward_pass_profiler_.recordDecodeIteration(timings);
+                forward_pass_profiler_.recordDecodeIteration(
+                    timings, input.device.toString());
             else
-                forward_pass_profiler_.recordPrefillIteration(timings);
+                forward_pass_profiler_.recordPrefillIteration(
+                    timings, input.device.toString());
         }
 
         LOG_DEBUG("[ForwardExecutionEngine] Forward (cached) completed in "
@@ -2783,12 +3802,19 @@ namespace llaminar2
         const ForwardInput &input,
         ForwardGraphCache &forward_cache,
         IDeviceContext *ctx,
-        IForwardExecutionHost &host)
+        IForwardExecutionHost &host,
+        bool *used_graph_replay,
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy
+            initial_submission)
     {
+        if (used_graph_replay)
+            *used_graph_replay = false;
         // Initialize prefill graph cache on first use
         if (!forward_cache.prefill_graph_cache)
         {
-            forward_cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(makePrefillGraphConfigFromEnv());
+            forward_cache.prefill_graph_cache =
+                std::make_unique<PrefillGraphCache>(
+                    makePrefillGraphConfigFromEnv(host.residentGraphRows()));
         }
 
         auto &cache = *forward_cache.prefill_graph_cache;
@@ -2825,16 +3851,181 @@ namespace llaminar2
         const int bucket_seq_len = effectiveBucketSeqLen(input);
         const bool padded_bucket = isPaddedBucketExecution(input);
         const bool snapshots_active = (executor_.config().snapshot_callback != nullptr);
+        DeviceGraphExecutor::GraphSnapshotLogicalRows snapshot_logical_rows;
+        if (padded_bucket && snapshots_active)
+        {
+            if (input.batch_size <= 0 || bucket_seq_len <= 0 ||
+                real_seq_len <= 0 || real_seq_len > bucket_seq_len)
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Padded prefill snapshot publication has invalid row geometry: batch_size="
+                          << input.batch_size
+                          << " real_seq_len=" << real_seq_len
+                          << " bucket_seq_len=" << bucket_seq_len);
+                return false;
+            }
+
+            snapshot_logical_rows.physical_rows_per_sequence =
+                static_cast<size_t>(bucket_seq_len);
+            snapshot_logical_rows.logical_rows_per_sequence.reserve(
+                static_cast<size_t>(input.batch_size));
+            for (int batch = 0; batch < input.batch_size; ++batch)
+            {
+                const int logical_rows =
+                    input.sequence_lengths &&
+                            static_cast<size_t>(batch) <
+                                input.sequence_lengths->size()
+                        ? (*input.sequence_lengths)[static_cast<size_t>(batch)]
+                        : real_seq_len;
+                if (logical_rows <= 0 || logical_rows > bucket_seq_len)
+                {
+                    LOG_ERROR("[ForwardExecutionEngine] Padded prefill snapshot publication has an invalid logical row count for batch "
+                              << batch << ": logical_rows=" << logical_rows
+                              << " bucket_seq_len=" << bucket_seq_len);
+                    return false;
+                }
+                snapshot_logical_rows.logical_rows_per_sequence.push_back(
+                    static_cast<size_t>(logical_rows));
+            }
+        }
+        const auto *snapshot_logical_rows_ptr =
+            snapshot_logical_rows.active() ? &snapshot_logical_rows : nullptr;
+        if (snapshots_active)
+        {
+            /*
+             * This log is deliberately confined to snapshot-enabled runs.
+             * Fixed-width graph execution is allowed to retain padded device
+             * storage, whereas the diagnostic callback must publish only the
+             * request-owned prefix.  Reporting both descriptors here makes a
+             * malformed handoff distinguishable from a later publisher bug
+             * without adding work to ordinary inference.
+             */
+            LOG_DEBUG(
+                "[ForwardExecutionEngine] Prefill snapshot row contract"
+                << " chunk=" << input.prefill_chunk_index
+                << " real_seq_len=" << real_seq_len
+                << " bucket_seq_len=" << bucket_seq_len
+                << " padded=" << padded_bucket
+                << " batch_size=" << input.batch_size
+                << " projection_active="
+                << (snapshot_logical_rows_ptr != nullptr)
+                << " logical_rows="
+                << (snapshot_logical_rows_ptr &&
+                            !snapshot_logical_rows.logical_rows_per_sequence.empty()
+                        ? std::to_string(
+                              snapshot_logical_rows
+                                  .logical_rows_per_sequence.front())
+                        : std::string("none")));
+        }
         const bool moe_rebalancing_active = host.isMoeRebalancingActive();
         const bool moe_rebalancing_graph_stable =
             host.isMoeRebalancingGraphStableForPrefillCapture();
         const bool host_prefill_graph_disabled = host.prefillGraphCaptureDisabledByHost();
+        auto prefill_capture_policy =
+            host.buildDecodeCapturePolicy(
+                !forward_cache.collective_nodes.empty(),
+                ctx);
+        if (input.moe_overlay_graph_launch_dependency)
+        {
+            if (prefill_capture_policy.launch_dependency)
+            {
+                const auto existing =
+                    std::move(prefill_capture_policy.launch_dependency);
+                const auto overlay =
+                    input.moe_overlay_graph_launch_dependency;
+                prefill_capture_policy.launch_dependency =
+                    [existing, overlay](
+                        DeviceGraphExecutor::GraphExecutableLaunchPhase phase,
+                        void *stream)
+                {
+                    return existing(phase, stream) &&
+                           overlay(phase, stream);
+                };
+            }
+            else
+            {
+                prefill_capture_policy.launch_dependency =
+                    input.moe_overlay_graph_launch_dependency;
+            }
+            if (!prefill_capture_policy.allow_cached_graph_replay)
+            {
+                LOG_ERROR(
+                    "[ForwardExecutionEngine] GPU ExpertOverlay prefill "
+                    "requires retained graph execution so its remote ticket "
+                    "can be armed at the exact executable launch edge");
+                return false;
+            }
+        }
+        const bool uses_device_timeline_transaction =
+            forward_cache.graph->nativeCaptureEnvelope() ==
+            GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction;
+        bool uses_retained_sparse_parent = false;
+        try
+        {
+            if (uses_device_timeline_transaction)
+            {
+                if (!prefill_capture_policy.allow_cached_graph_replay)
+                {
+                    LOG_ERROR(
+                        "[ForwardExecutionEngine] Device-owned ExpertOverlay prefill timeline requires mandatory full-graph capture/replay");
+                    return false;
+                }
+                prefill_capture_policy.graph_replay_plan_policy =
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::
+                        RequireFullGraph;
+                prefill_capture_policy.retained_parent_composer = {};
+                prefill_capture_policy.defer_final_sync = true;
+            }
+            else if (auto sparse_parent_composer =
+                         makeMoEOverlayRetainedParentComposer(
+                             *forward_cache.graph))
+            {
+                if (!prefill_capture_policy.allow_cached_graph_replay)
+                {
+                    LOG_ERROR(
+                        "[ForwardExecutionEngine] Typed ExpertOverlay prefill packet graph requires mandatory retained-parent capture/replay");
+                    return false;
+                }
+                prefill_capture_policy.graph_replay_plan_policy =
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::
+                        RequireRetainedParentComposition;
+                prefill_capture_policy.retained_parent_composer =
+                    std::move(*sparse_parent_composer);
+                /*
+                 * The retained parent is a single asynchronous device
+                 * transaction. Terminal-state and snapshot publication are
+                 * enqueued on its exact producer stream below; no host fence is
+                 * needed between the sparse parent and those consumers.
+                 */
+                prefill_capture_policy.defer_final_sync = true;
+                uses_retained_sparse_parent = true;
+            }
+        }
+        catch (const std::exception &ex)
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Could not derive retained ExpertOverlay prefill endpoint authority: "
+                << ex.what());
+            return false;
+        }
         const bool prefill_collectives_graph_capturable =
             !forward_cache.collective_nodes.empty() &&
-            host.buildDecodeCapturePolicy(
-                    /*has_collective_nodes=*/true,
-                    ctx)
-                .collectives_graph_capturable;
+            prefill_capture_policy.collectives_graph_capturable;
+        const bool prefill_heterogeneous_segmentation_admitted =
+            prefill_capture_policy.heterogeneous_segmented_enabled ||
+            uses_retained_sparse_parent ||
+            uses_device_timeline_transaction;
+        if (initial_submission ==
+                DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+                    MaterializeWithoutLaunch &&
+            !prefill_heterogeneous_segmentation_admitted)
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Setup-only prefill materialization "
+                "currently requires the explicit heterogeneous/retained sparse "
+                "graph path; monolithic PrefillGraphCache has an independent "
+                "lifecycle");
+            return false;
+        }
         bool padded_preflight_checked = false;
         PrefillGraphRejectReason padded_preflight_reason = PrefillGraphRejectReason::None;
         std::string padded_reject_stage_name;
@@ -2956,6 +4147,7 @@ namespace llaminar2
                 moe_rebalancing_active,
                 PrefillGraphPreflightMode::ColdPaddedSupport,
                 prefill_collectives_graph_capturable,
+                prefill_heterogeneous_segmentation_admitted,
                 moe_rebalancing_graph_stable,
                 host_prefill_graph_disabled,
                 &padded_reject_stage_name,
@@ -3061,6 +4253,181 @@ namespace llaminar2
             return {gpu_ctx, forward_cache.prefill_capture_stream.stream};
         };
 
+        if (prefill_heterogeneous_segmentation_admitted)
+        {
+            /*
+             * A heterogeneous prefill graph is never routed through the
+             * monolithic PrefillGraphCache. Its explicit CPU/cross-device
+             * boundaries are stable members of the replay topology, so the
+             * generic segment cache captures every GPU region and executes each
+             * declared manual boundary in the same order on transaction zero
+             * and every replay. Only exact row geometry is admitted here.
+             */
+            std::string reject_stage_name;
+            std::string reject_stage_type;
+            const auto segmented_preflight = preflightPrefillGraph(
+                cache,
+                *forward_cache.graph,
+                key,
+                forward_cache.collective_nodes,
+                input,
+                snapshots_active,
+                moe_rebalancing_active,
+                PrefillGraphPreflightMode::Default,
+                prefill_collectives_graph_capturable,
+                /*heterogeneous_segmentation_admitted=*/true,
+                moe_rebalancing_graph_stable,
+                host_prefill_graph_disabled,
+                &reject_stage_name,
+                &reject_stage_type);
+            if (segmented_preflight != PrefillGraphRejectReason::None)
+            {
+                LOG_ERROR(
+                    "[ForwardExecutionEngine] Heterogeneous segmented prefill "
+                    "rejected by typed preflight: "
+                    << toString(segmented_preflight)
+                    << (reject_stage_name.empty() ? "" : " stage=")
+                    << reject_stage_name
+                    << (reject_stage_type.empty() ? "" : " type=")
+                    << reject_stage_type
+                    << " real_seq_len=" << real_seq_len
+                    << " bucket_seq_len=" << bucket_seq_len);
+                return false;
+            }
+
+            IWorkerGPUContext *gpu_ctx = gpuContextForPrefill();
+            if (!gpu_ctx ||
+                !forward_cache.segment_cache.ensureCaptureStream(
+                    gpu_ctx,
+                    ctx->deviceId()) ||
+                !forward_cache.segment_cache.capture_stream)
+            {
+                LOG_ERROR(
+                    "[ForwardExecutionEngine] Heterogeneous segmented prefill "
+                    "could not establish its explicit capture stream");
+                return false;
+            }
+
+            void *const stream = forward_cache.segment_cache.capture_stream;
+            bindPrefillStreamToStages(stream);
+            forward_cache.segment_cache.perf_context =
+                input.bucket_seq_len > 0 ? "prefill_bucket" : "prefill";
+            const bool was_initialized =
+                forward_cache.segment_cache.initialized &&
+                !forward_cache.segment_cache.needs_capture;
+
+            auto capture_boundary =
+                [&host, &input](
+                    const std::string &boundary_name,
+                    void *capture_stream) -> bool
+            {
+                return host.waitAtPrefillGraphCaptureBoundary(
+                    input,
+                    input.device,
+                    boundary_name,
+                    capture_stream);
+            };
+
+            const bool replay_ok = executor_.executeWithCachedGraphReplay(
+                *forward_cache.graph,
+                ctx,
+                forward_cache.segment_cache,
+                stream,
+                gpu_ctx,
+                &forward_cache.collective_nodes,
+                prefill_capture_policy.collectives_graph_capturable,
+                /*force_recapture=*/false,
+                prefill_capture_policy.defer_final_sync,
+                std::move(capture_boundary),
+                prefill_capture_policy.graph_replay_plan_policy,
+                prefill_capture_policy.launch_dependency,
+                std::span<const BufferId>{},
+                prefill_capture_policy.retained_parent_composer,
+                initial_submission);
+            if (!replay_ok)
+            {
+                LOG_ERROR(
+                    "[ForwardExecutionEngine] Mandatory heterogeneous segmented "
+                    "prefill capture/replay failed");
+                return false;
+            }
+
+            if (initial_submission ==
+                DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+                    MaterializeWithoutLaunch)
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "prefill_graph_materialized_without_launch",
+                    1.0,
+                    "setup",
+                    input.device.toString(),
+                    {{"bucket_seq_len", std::to_string(bucket_seq_len)},
+                     {"replay_plan",
+                      uses_device_timeline_transaction
+                          ? "device_timeline_full_graph"
+                          : uses_retained_sparse_parent
+                          ? "retained_sparse_parent"
+                          : "heterogeneous_segments"}});
+                publishPrefillGraphObservation(
+                    forward_cache,
+                    input,
+                    key,
+                    PrefillGraphPhase::Ready,
+                    "materialized_without_launch",
+                    uses_retained_sparse_parent
+                        ? "retained_sparse_parent"
+                        : "heterogeneous_boundary_segmentation");
+                return true;
+            }
+
+            if (!publishPrefillCapturedTerminalState(
+                    stream,
+                    was_initialized
+                        ? "heterogeneous_prefill_segmented_replay"
+                        : "heterogeneous_prefill_segmented_capture"))
+            {
+                return false;
+            }
+            if (!executor_.publishSnapshotsAfterGraphExecution(
+                    *forward_cache.graph,
+                    stream,
+                    was_initialized
+                        ? "heterogeneous_prefill_segmented_replay"
+                        : "heterogeneous_prefill_segmented_capture",
+                    &forward_cache.segment_cache.snapshot_manifest,
+                    snapshot_logical_rows_ptr))
+            {
+                return false;
+            }
+
+            if (used_graph_replay)
+                *used_graph_replay = true;
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "prefill_heterogeneous_segmented_graph",
+                1.0,
+                "prefill",
+                input.device.toString(),
+                {{"transaction", was_initialized ? "replay" : "capture"},
+                 {"real_seq_len", std::to_string(real_seq_len)},
+                     {"bucket_seq_len", std::to_string(bucket_seq_len)},
+                     {"replay_plan",
+                      uses_retained_sparse_parent
+                          ? "retained_sparse_parent"
+                          : "heterogeneous_segments"}});
+            publishPrefillGraphObservation(
+                forward_cache,
+                input,
+                key,
+                PrefillGraphPhase::Ready,
+                was_initialized ? "replay" : "capture",
+                uses_retained_sparse_parent
+                    ? "retained_sparse_parent"
+                    : "heterogeneous_boundary_segmentation");
+            return true;
+        }
+
         if (phase == PrefillGraphPhase::Ready && !host_prefill_graph_disabled)
         {
             // === REPLAY PATH ===
@@ -3096,7 +4463,8 @@ namespace llaminar2
                     *forward_cache.graph,
                     stream,
                     "prefill_graph_replay",
-                    &forward_cache.snapshot_manifest))
+                    &forward_cache.snapshot_manifest,
+                    snapshot_logical_rows_ptr))
             {
                 return false;
             }
@@ -3132,6 +4500,7 @@ namespace llaminar2
                 moe_rebalancing_active,
                 PrefillGraphPreflightMode::CaptureReady,
                 prefill_collectives_graph_capturable,
+                prefill_heterogeneous_segmentation_admitted,
                 moe_rebalancing_graph_stable,
                 host_prefill_graph_disabled,
                 &capture_ready_reject_stage_name,
@@ -3157,6 +4526,15 @@ namespace llaminar2
              * Warmup -> Capture transition.
              */
             bindPrefillStreamToStages(stream);
+            if (!executor_.allocateGraphStorageForCapture(
+                    *forward_cache.graph,
+                    ctx,
+                    "prefill_graph_capture_prebind"))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph storage prebind failed for seq_len="
+                          << input.seq_len);
+                return false;
+            }
             if (!preparePrefillGraphLaunchMetadata(
                     stream,
                     GraphLaunchPreparationPhase::Capture,
@@ -3292,7 +4670,8 @@ namespace llaminar2
                     *forward_cache.graph,
                     stream,
                     "prefill_graph_capture_launch",
-                    &forward_cache.snapshot_manifest))
+                    &forward_cache.snapshot_manifest,
+                    snapshot_logical_rows_ptr))
             {
                 return false;
             }
@@ -3363,6 +4742,7 @@ namespace llaminar2
                         ? PrefillGraphPreflightMode::ColdPaddedSupport
                         : PrefillGraphPreflightMode::Default,
                     prefill_collectives_graph_capturable,
+                    prefill_heterogeneous_segmentation_admitted,
                     moe_rebalancing_graph_stable,
                     host_prefill_graph_disabled,
                     &cold_reject_stage_name,
@@ -3433,7 +4813,8 @@ namespace llaminar2
                 *forward_cache.graph,
                 nullptr,
                 "prefill_graph_warmup",
-                &forward_cache.snapshot_manifest))
+                &forward_cache.snapshot_manifest,
+                snapshot_logical_rows_ptr))
         {
             return false;
         }
@@ -3472,13 +4853,6 @@ namespace llaminar2
         std::chrono::high_resolution_clock::time_point start)
     {
         // ===== CACHE MISS: Build new graph =====
-
-        std::unique_lock<std::mutex> materialization_lock;
-        if (input_in.device.is_gpu())
-        {
-            materialization_lock = std::unique_lock<std::mutex>(
-                gpuCacheMissGraphMaterializationMutex());
-        }
 
         // Unified PP path currently executes multi-device graphs and does not use
         // this forward cache; clear entries to avoid stale memory growth.
@@ -3643,25 +5017,25 @@ namespace llaminar2
         const bool bucketed_prefill_miss =
             should_cache && build_cache && signature.is_bucketed_prefill && !is_decode;
         bool bucketed_prefill_capture_candidate = false;
+        bool bucketed_prefill_heterogeneous_segmented_candidate = false;
         PrefillGraphRejectReason bucketed_prefill_reject_reason = PrefillGraphRejectReason::None;
         std::string bucketed_prefill_reject_stage_name;
         std::string bucketed_prefill_reject_stage_type;
 
         if (bucketed_prefill_miss)
         {
-            PrefillGraphCache preflight_cache(makePrefillGraphConfigFromEnv());
+            PrefillGraphCache preflight_cache(
+                makePrefillGraphConfigFromEnv(host.residentGraphRows()));
             PrefillGraphCacheKey key = makePrefillGraphKey(effective_input, host);
-            bool prefill_collectives_graph_capturable = false;
-            if (!collective_nodes.empty())
-            {
-                IDeviceContext *prefill_preflight_ctx = host.getDeviceContext(effective_input.device);
-                prefill_collectives_graph_capturable =
-                    host.buildDecodeCapturePolicy(
-                        /*has_collective_nodes=*/true,
-                        prefill_preflight_ctx)
-                        .collectives_graph_capturable;
-            }
-
+            /*
+             * Reject graph-intrinsic violations before asking the host for a
+             * launch context.  The optimistic policy flags make this first
+             * pass ignore only the two capabilities that genuinely depend on
+             * that context; recurrent padded stages, invalid geometry, and
+             * host/rebalancing policy remain fatal here.  Besides preserving
+             * fail-fast behavior, this keeps rejected graphs from touching a
+             * backend whose stream/context lifecycle they can never use.
+             */
             bucketed_prefill_reject_reason = preflightPrefillGraph(
                 preflight_cache,
                 graph,
@@ -3671,11 +5045,48 @@ namespace llaminar2
                 executor_.config().snapshot_callback != nullptr,
                 host.isMoeRebalancingActive(),
                 PrefillGraphPreflightMode::Default,
-                prefill_collectives_graph_capturable,
+                /*collectives_graph_capturable=*/true,
+                /*heterogeneous_segmentation_admitted=*/true,
                 host.isMoeRebalancingGraphStableForPrefillCapture(),
                 host.prefillGraphCaptureDisabledByHost(),
                 &bucketed_prefill_reject_stage_name,
                 &bucketed_prefill_reject_stage_type);
+
+            if (bucketed_prefill_reject_reason ==
+                PrefillGraphRejectReason::None)
+            {
+                IDeviceContext *prefill_preflight_ctx =
+                    host.getDeviceContext(effective_input.device);
+                const auto prefill_capture_policy =
+                    host.buildDecodeCapturePolicy(
+                        !collective_nodes.empty(),
+                        prefill_preflight_ctx);
+                const bool prefill_collectives_graph_capturable =
+                    !collective_nodes.empty() &&
+                    prefill_capture_policy.collectives_graph_capturable;
+                const bool prefill_heterogeneous_segmentation_admitted =
+                    prefill_capture_policy.heterogeneous_segmented_enabled;
+
+                bucketed_prefill_reject_reason = preflightPrefillGraph(
+                    preflight_cache,
+                    graph,
+                    key,
+                    collective_nodes,
+                    effective_input,
+                    executor_.config().snapshot_callback != nullptr,
+                    host.isMoeRebalancingActive(),
+                    PrefillGraphPreflightMode::Default,
+                    prefill_collectives_graph_capturable,
+                    prefill_heterogeneous_segmentation_admitted,
+                    host.isMoeRebalancingGraphStableForPrefillCapture(),
+                    host.prefillGraphCaptureDisabledByHost(),
+                    &bucketed_prefill_reject_stage_name,
+                    &bucketed_prefill_reject_stage_type);
+                bucketed_prefill_heterogeneous_segmented_candidate =
+                    bucketed_prefill_reject_reason ==
+                        PrefillGraphRejectReason::None &&
+                    prefill_heterogeneous_segmentation_admitted;
+            }
             bucketed_prefill_capture_candidate =
                 (bucketed_prefill_reject_reason == PrefillGraphRejectReason::None);
 
@@ -3684,7 +5095,9 @@ namespace llaminar2
                 if (build_cache && !build_cache->prefill_graph_cache)
                 {
                     build_cache->prefill_graph_cache =
-                        std::make_unique<PrefillGraphCache>(makePrefillGraphConfigFromEnv());
+                        std::make_unique<PrefillGraphCache>(
+                            makePrefillGraphConfigFromEnv(
+                                host.residentGraphRows()));
                 }
                 if (build_cache && build_cache->prefill_graph_cache)
                 {
@@ -3722,6 +5135,16 @@ namespace llaminar2
             updatePrefillReplayParamStages(effective_input, prefill_replay_param_stages);
         }
 
+        // Sparse manual boundaries must receive the same root-published
+        // identity before the very first graph execution and all later cache
+        // replays. A local stage-object execution count is not stable across
+        // independent rank graph construction or capture lifecycle changes.
+        std::vector<IComputeStage *> moe_overlay_collective_runtime_stages =
+            collectMoEOverlayCollectiveRuntimeStages(graph);
+        updateMoEOverlayCollectiveRuntimeStages(
+            effective_input,
+            moe_overlay_collective_runtime_stages);
+
         // Ensure declared CPU/GPU workspace is allocated for this graph. Cache
         // hits repeat this step because another bucket can grow the shared
         // per-device workspace and leave cached stages bound to old pointers.
@@ -3741,11 +5164,6 @@ namespace llaminar2
         }
         const uint64_t workspace_generation = host.workspaceGeneration(effective_input.device);
 
-        if (materialization_lock.owns_lock())
-        {
-            materialization_lock.unlock();
-        }
-
         // Notify host that graph is ready — allows releasing transient resources
         // (e.g., mmap pages) before execution allocates large activation buffers.
         if (!first_graph_ready_fired_)
@@ -3755,11 +5173,12 @@ namespace llaminar2
         }
 
         /*
-         * A cacheable GPU decode graph has one lifecycle, including its first
+         * A cacheable GPU decode graph and an exact heterogeneous segmented
+         * prefill graph each have one lifecycle, including their first
          * invocation. Install the fully built graph into its stable cache
          * before submitting any kernels, then enter executeCacheHit(), whose
-         * Warmup -> Materialize transaction executes the logical payload once
-         * and returns with a complete native graph executable.
+         * capture transaction executes the logical payload once and returns
+         * with complete native graph executable units.
          *
          * Keeping a separate eager cache-miss execution here used to expose a
          * valid ComputeGraph with no replay-ready GraphSegmentCache. The MTP
@@ -3769,7 +5188,10 @@ namespace llaminar2
          * also guarantees that cache misses and hits share identical stream,
          * dynamic-parameter, collective, snapshot, and publication ordering.
          */
-        if (should_cache && build_cache && is_decode &&
+        const bool atomic_gpu_graph_first_use =
+            is_decode ||
+            bucketed_prefill_heterogeneous_segmented_candidate;
+        if (should_cache && build_cache && atomic_gpu_graph_first_use &&
             effective_input.device.is_gpu())
         {
             build_cache->graph =
@@ -3779,6 +5201,12 @@ namespace llaminar2
             build_cache->snapshot_configuration_epoch =
                 executor_.snapshotConfigurationEpoch();
             build_cache->collective_nodes = std::move(collective_nodes);
+            build_cache->prefill_replay_param_stages =
+                std::move(prefill_replay_param_stages);
+            build_cache->prefill_replay_param_stages_cached = !is_decode;
+            build_cache->moe_overlay_collective_runtime_stages =
+                std::move(moe_overlay_collective_runtime_stages);
+            build_cache->moe_overlay_collective_runtime_stages_cached = true;
             build_cache->valid = true;
 
             /*
@@ -3813,7 +5241,9 @@ namespace llaminar2
             build_cache->pp_needs_copy = initial_pp_copy.needs_copy;
             LOG_DEBUG(
                 "[ForwardExecutionEngine] Atomically materialized first-use "
-                "GPU decode graph [seq_len="
+                "GPU graph [kind="
+                << (is_decode ? "decode" : "heterogeneous_prefill")
+                << ", seq_len="
                 << signature.seq_len
                 << ", batch_size=" << signature.batch_size
                 << ", device=" << signature.device.to_string()
@@ -3962,6 +5392,11 @@ namespace llaminar2
                 LOG_ERROR("[ForwardExecutionEngine] Failed to prepare live state for forward graph execution");
                 return false;
             }
+            ScopedForwardLiveStateRead live_state_read(
+                host,
+                effective_input,
+                execution_stream,
+                ctx->deviceId());
 
             if (!host.prepareDeviceTokenInputsForForwardGraphExecution(
                     effective_input,
@@ -4062,14 +5497,7 @@ namespace llaminar2
              * Even a failed executor may have queued kernels, so skipping this
              * event edge would let the next mailbox writer race partial work.
              */
-            if (!host.completeLiveStateForForwardGraphExecution(
-                    effective_input,
-                    execution_stream,
-                    ctx->deviceId()))
-            {
-                LOG_ERROR("[ForwardExecutionEngine] Failed to publish cache-miss forward graph live-state read completion");
-                return false;
-            }
+            live_state_read.complete(execution_stream);
         }
 
         DeviceId producer_device = effective_input.device;
@@ -4183,12 +5611,11 @@ namespace llaminar2
                 host.getDeviceContext(producer_device);
             if (sync_ctx && !device_consumer_owns_logits)
             {
-                if (!host.publishLogitsAtBoundary(
-                        output.logits,
-                        sync_ctx,
-                        execution_stream_used))
+                if (!host.publishForwardResultAtBoundary(
+                        output,
+                        sync_ctx))
                 {
-                    LOG_ERROR("[ForwardExecutionEngine] Failed to publish cache-miss forward logits at the device boundary");
+                    LOG_ERROR("[ForwardExecutionEngine] Failed to publish cache-miss forward result at the device boundary");
                     return false;
                 }
             }
@@ -4201,6 +5628,14 @@ namespace llaminar2
                 host,
                 host.getDeviceContext(effective_input.device),
                 is_decode, effective_input, start, stage_context);
+        }
+
+        if (success)
+        {
+            recordMoEOverlayCollectiveTransaction(
+                effective_input,
+                moe_overlay_collective_runtime_stages,
+                "cache_miss");
         }
 
         // Cache the graph for future matching forward signatures
@@ -4218,9 +5653,12 @@ namespace llaminar2
 
             build_cache->prefill_replay_param_stages = std::move(prefill_replay_param_stages);
             build_cache->prefill_replay_param_stages_cached = !is_decode;
+            build_cache->moe_overlay_collective_runtime_stages =
+                std::move(moe_overlay_collective_runtime_stages);
+            build_cache->moe_overlay_collective_runtime_stages_cached = true;
 
             build_cache->valid = true;
-            touchBucketedPrefillForwardCache(signature, *build_cache);
+            touchPrefillForwardCache(signature, *build_cache);
 
             // Store PP hidden state copy info for cache HIT replay
             if (initial_pp_copy.needs_copy)
@@ -4251,7 +5689,9 @@ namespace llaminar2
                 if (!build_cache->prefill_graph_cache)
                 {
                     build_cache->prefill_graph_cache =
-                        std::make_unique<PrefillGraphCache>(makePrefillGraphConfigFromEnv());
+                        std::make_unique<PrefillGraphCache>(
+                            makePrefillGraphConfigFromEnv(
+                                host.residentGraphRows()));
                 }
 
                 PrefillGraphCacheKey key = makePrefillGraphKey(effective_input, host);
@@ -4283,8 +5723,9 @@ namespace llaminar2
                         bucketed_prefill_reject_stage_name,
                         bucketed_prefill_reject_stage_type);
                 }
-                enforceBucketedPrefillForwardCapacity(&signature);
             }
+            if (!signature.decode)
+                enforcePrefillForwardCapacity(&signature);
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -4417,7 +5858,7 @@ namespace llaminar2
         PrefillGraphCacheSnapshot snapshot;
         const ForwardGraphCache &forward_cache = it->second;
         snapshot.forward_cache_valid = forward_cache.valid;
-        snapshot.eviction_count = bucketed_prefill_forward_eviction_count_;
+        snapshot.eviction_count = prefill_forward_eviction_count_;
         snapshot.bucket_seq_len = key.seq_len;
         snapshot.domain_id = key.domain_id;
         snapshot.participant_id = key.participant_id;

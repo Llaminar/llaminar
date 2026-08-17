@@ -84,6 +84,16 @@ CUDA_NATIVE_VNNI_GEMV_FORBIDDEN_REDUCTIONS = (
 CPU_NATIVE_VNNI_GROUPED_FALLBACK = re.compile(
     r"\bverifier_policy\s*=\s*VerifierRowsPolicy::Pairwise\s*;"
 )
+CPU_NATIVE_VNNI_FORBIDDEN_LAUNCHER_TOKENS = (
+    "deferred_packing_",
+    "native_blocks_",
+    "thread_local std::vector",
+)
+GENERIC_FUSED_PROJECTION_REPLAY = re.compile(
+    r"virtual\s+bool\s+multiply_fused_tensor\s*\(.*?"
+    r"virtual\s+bool\s+multiply_fused_verifier_rows_decode_equivalent",
+    re.DOTALL,
+)
 
 
 def find_violations(repo_root: pathlib.Path) -> list[str]:
@@ -149,6 +159,15 @@ def find_violations(repo_root: pathlib.Path) -> list[str]:
                     "policy substitution is forbidden; reject an invalid "
                     "physical policy before launch"
                 )
+            if path.name == "CPUNativeVNNIGemmKernel.h":
+                for token in CPU_NATIVE_VNNI_FORBIDDEN_LAUNCHER_TOKENS:
+                    if token in source:
+                        violations.append(
+                            f"{path.relative_to(repo_root)}: CPU NativeVNNI "
+                            f"production launcher token {token!r} is forbidden; "
+                            "prepare weights eagerly and use persistent aligned "
+                            "scratch rather than deferred or vector-backed work"
+                        )
             if not GEMM_OWNED_NAME.search(path.name):
                 continue
             if canonical_root not in path.parents:
@@ -157,6 +176,29 @@ def find_violations(repo_root: pathlib.Path) -> list[str]:
                     "packed-weight files must live below "
                     f"src/v2/kernels/{backend}/gemm/"
                 )
+
+    tensor_kernels = repo_root / "src/v2/tensors/TensorKernels.h"
+    if tensor_kernels.is_file():
+        source = tensor_kernels.read_text(encoding="utf-8", errors="replace")
+        match = GENERIC_FUSED_PROJECTION_REPLAY.search(source)
+        if match and re.search(r"->\s*multiply_tensor\s*\(", match.group(0)):
+            violations.append(
+                "src/v2/tensors/TensorKernels.h: the generic fused-projection "
+                "contract must not replay individual multiply_tensor() calls"
+            )
+
+    gemm_stage = (
+        repo_root
+        / "src/v2/execution/compute_stages/stages/GEMMStage.cpp"
+    )
+    if gemm_stage.is_file():
+        source = gemm_stage.read_text(encoding="utf-8", errors="replace")
+        if re.search(r"->\s*createSwiGLU\s*\(", source):
+            violations.append(
+                "src/v2/execution/compute_stages/stages/GEMMStage.cpp: "
+                "GEMMStage must not reconstruct failed fused SwiGLU as separate "
+                "activation and GEMM operations"
+            )
 
     return sorted(violations)
 
@@ -236,10 +278,43 @@ def run_self_test() -> int:
             encoding="utf-8",
         )
 
+        unsafe_cpu_launcher = (
+            root / "src/v2/kernels/cpu/gemm/CPUNativeVNNIGemmKernel.h"
+        )
+        unsafe_cpu_launcher.write_text(
+            "bool deferred_packing_;\n"
+            "void *native_blocks_;\n"
+            "thread_local std::vector<float> scratch;\n",
+            encoding="utf-8",
+        )
+
+        unsafe_interface = root / "src/v2/tensors/TensorKernels.h"
+        unsafe_interface.parent.mkdir(parents=True, exist_ok=True)
+        unsafe_interface.write_text(
+            "virtual bool multiply_fused_tensor() {\n"
+            "  projection.kernel->multiply_tensor();\n"
+            "  return true;\n"
+            "}\n"
+            "virtual bool multiply_fused_verifier_rows_decode_equivalent();\n",
+            encoding="utf-8",
+        )
+
+        unsafe_stage = (
+            root
+            / "src/v2/execution/compute_stages/stages/GEMMStage.cpp"
+        )
+        unsafe_stage.parent.mkdir(parents=True, exist_ok=True)
+        unsafe_stage.write_text(
+            "void replay(IActivationTensor *activation) {\n"
+            "  activation->createSwiGLU();\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
         violations = find_violations(root)
-        if len(violations) != 9:
+        if len(violations) != 14:
             print(
-                f"expected nine ownership violations, found {len(violations)}",
+                f"expected fourteen ownership violations, found {len(violations)}",
                 file=sys.stderr,
             )
             for violation in violations:

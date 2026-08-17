@@ -44,6 +44,7 @@
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../../../tensors/NativeVnniFormatInfo.h"
 #include "../../../utils/DebugEnv.h"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
 #include "ROCmNativeVNNIGemmShard.h"
@@ -62,8 +63,8 @@
 #define LLAMINAR_ROCM_NVNNI_SHARD_SYMBOL(PREFIX) \
     LLAMINAR_ROCM_NVNNI_CONCAT(PREFIX, LLAMINAR_ROCM_NATIVE_VNNI_SHARD)
 
-extern "C" bool rocmGemv_native_vnni_query_serial_m1_config(
-    uint8_t codebook_id,
+extern "C" bool rocmGemv_native_vnni_query_serial_m1_config_with_policy(
+    uint8_t arithmetic_policy_codebook_id,
     int N,
     int K,
     int* kb,
@@ -92,6 +93,8 @@ enum NativeVNNIGemmFormat : uint8_t {
     NVNNI_GEMM_IQ1_S   = 16,  // IQ1 grid, 11-bit index, asymmetric, embedded scales
     NVNNI_GEMM_IQ1_M   = 17,  // IQ1 grid, 11-bit index, dual-scale + embedded mins
     NVNNI_GEMM_Q8_0    = 19,  // 8-bit symmetric, direct INT8 payload (32 bytes)
+    NVNNI_GEMM_EXPANDED_INT8_MIN =
+        llaminar2::kNativeVnniExpandedInt8MinCodebook,
 };
 
 // ============================================================================
@@ -100,7 +103,9 @@ enum NativeVNNIGemmFormat : uint8_t {
 
 template <NativeVNNIGemmFormat FMT>
 struct NVNNIGemmTraits {
-    static constexpr bool is_asymmetric = (FMT == NVNNI_GEMM_Q4_1 || FMT == NVNNI_GEMM_Q5_1 || FMT == NVNNI_GEMM_IQ1_S);
+    static constexpr bool is_asymmetric =
+        FMT == NVNNI_GEMM_Q4_1 || FMT == NVNNI_GEMM_Q5_1 ||
+        FMT == NVNNI_GEMM_IQ1_S || FMT == NVNNI_GEMM_EXPANDED_INT8_MIN;
     static constexpr bool is_iq3_grid = (FMT == NVNNI_GEMM_IQ3_S || FMT == NVNNI_GEMM_IQ3_XXS);
     static constexpr bool is_iq2_grid = (FMT == NVNNI_GEMM_IQ2_S || FMT == NVNNI_GEMM_IQ2_XS || FMT == NVNNI_GEMM_IQ2_XXS);
     static constexpr bool is_iq1_grid = (FMT == NVNNI_GEMM_IQ1_S || FMT == NVNNI_GEMM_IQ1_M);
@@ -123,7 +128,8 @@ struct NVNNIGemmTraits {
     static constexpr bool is_6bit   = (FMT == NVNNI_GEMM_Q6_K);
     static constexpr bool is_3bit   = (FMT == NVNNI_GEMM_Q3_K);
     static constexpr bool is_2bit   = (FMT == NVNNI_GEMM_Q2_K);
-    static constexpr bool is_8bit   = (FMT == NVNNI_GEMM_Q8_0);
+    static constexpr bool is_8bit =
+        FMT == NVNNI_GEMM_Q8_0 || FMT == NVNNI_GEMM_EXPANDED_INT8_MIN;
     static constexpr bool uses_lut  = (FMT == NVNNI_GEMM_IQ4_NL);
     static constexpr int  payload_bytes =
         is_8bit ? 32 :                              // Q8_0: 32 raw INT8 values
@@ -2447,7 +2453,8 @@ static bool launch_native_vnni_gemm(
     const float* d_scales_A,
     const float* d_scales_A_blockwise,
     int M, int N, int K,
-    int device_id, void* stream)
+    int device_id, void* stream,
+    uint8_t arithmetic_policy_codebook_id)
 {
     constexpr int BPT = 2;
     constexpr int BLOCK_SIZE = 256;
@@ -2474,8 +2481,8 @@ static bool launch_native_vnni_gemm(
     if (serial_m1_kblocks <= 0)
     {
         int ignored_target_waves = 0;
-        if (!rocmGemv_native_vnni_query_serial_m1_config(
-                static_cast<uint8_t>(FMT),
+        if (!rocmGemv_native_vnni_query_serial_m1_config_with_policy(
+                arithmetic_policy_codebook_id,
                 N,
                 K,
                 &serial_m1_kblocks,
@@ -2484,11 +2491,13 @@ static bool launch_native_vnni_gemm(
             fprintf(
                 stderr,
                 "[rocmGemm_native_vnni_fp32] no serial M=1 split-K policy "
-                "for batch-invariant prefill (M=%d N=%d K=%d codebook=%u)\n",
+                "for batch-invariant prefill (M=%d N=%d K=%d "
+                "codebook=%u arithmetic_policy_codebook=%u)\n",
                 M,
                 N,
                 K,
-                static_cast<unsigned>(FMT));
+                static_cast<unsigned>(FMT),
+                static_cast<unsigned>(arithmetic_policy_codebook_id));
             return false;
         }
     }
@@ -3136,6 +3145,7 @@ bool LLAMINAR_ROCM_NVNNI_SHARD_SYMBOL(
     const float*   d_scales_A_blockwise, // [M × blocks_per_row] per-block activation scales
     int M, int N, int K,
     uint8_t codebook_id,
+    uint8_t arithmetic_policy_codebook_id,
     int device_id, void* stream)
 {
     if (M <= 0 || N <= 0 || K <= 0 || K % 32 != 0)
@@ -3150,7 +3160,8 @@ bool LLAMINAR_ROCM_NVNNI_SHARD_SYMBOL(
     #define LAUNCH_GEMM(FMT) \
         return launch_native_vnni_gemm<FMT>( \
             d_A_int8, d_payload, scales, mins, emins, d_output, d_scales_A, \
-            d_scales_A_blockwise, M, N, K, device_id, stream)
+            d_scales_A_blockwise, M, N, K, device_id, stream, \
+            arithmetic_policy_codebook_id)
 
     switch (codebook_id)
     {
@@ -3178,6 +3189,8 @@ bool LLAMINAR_ROCM_NVNNI_SHARD_SYMBOL(
 #elif LLAMINAR_ROCM_NATIVE_VNNI_SHARD == 7
     case NVNNI_GEMM_IQ1_M:    LAUNCH_GEMM(NVNNI_GEMM_IQ1_M);
     case NVNNI_GEMM_Q8_0:     LAUNCH_GEMM(NVNNI_GEMM_Q8_0);
+    case NVNNI_GEMM_EXPANDED_INT8_MIN:
+        LAUNCH_GEMM(NVNNI_GEMM_EXPANDED_INT8_MIN);
 #endif
     default:
         fprintf(

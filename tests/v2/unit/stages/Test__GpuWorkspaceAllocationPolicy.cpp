@@ -605,9 +605,46 @@ TEST(
         repoRoot() /
         "src/v2/execution/compute_stages/stages/MoELocalExpertStage.h");
     const auto executable = stripCommentsAndStringLiterals(source);
+    const auto setup_boundary = sliceBetween(
+        executable,
+        "bool MoELocalExpertStage::preparePersistentBuffers()",
+        "bool MoELocalExpertStage::prepareExpertGemmEngines(");
+    const auto execution_boundary = sliceBetween(
+        executable,
+        "bool MoELocalExpertStage::execute(",
+        "bool MoELocalExpertStage::validatePreparedWeights(");
 
-    EXPECT_EQ(countOccurrences(executable, ".prepareInput("), 3u);
-    EXPECT_EQ(countOccurrences(executable, ".prepareOutput("), 1u);
+    EXPECT_EQ(countOccurrences(setup_boundary, ".prepareInput("), 3u)
+        << "setup must preallocate the three immutable sparse-packet inputs";
+    EXPECT_EQ(countOccurrences(setup_boundary, ".prepareOutput("), 1u)
+        << "setup must preallocate the immutable sparse-packet output";
+    EXPECT_EQ(countOccurrences(execution_boundary, ".prepareInput("), 3u)
+        << "the explicit heterogeneous boundary owns exactly three H2D inputs";
+    EXPECT_EQ(countOccurrences(execution_boundary, ".prepareOutput("), 1u)
+        << "the explicit heterogeneous boundary owns exactly one GPU output";
+    EXPECT_EQ(countOccurrences(executable, ".prepareInput("), 6u)
+        << "no other MoE local-expert path may own device input preparation";
+    EXPECT_EQ(countOccurrences(executable, ".prepareOutput("), 2u)
+        << "no other MoE local-expert path may own device output preparation";
+    EXPECT_NE(
+        setup_boundary.find("bindPinnedHostBuffer("),
+        std::string::npos)
+        << "model setup must bind the immutable backend-pinned bidirectional transfer family";
+    EXPECT_EQ(execution_boundary.find("allocatePinned("), std::string::npos)
+        << "local expert inference must never allocate pinned host memory";
+    EXPECT_EQ(
+        executable.find("backend->deviceToHostOnStream("),
+        std::string::npos)
+        << "stages must submit captured transfers through TransferEngine";
+    EXPECT_EQ(
+        countOccurrences(executable, "enqueuePinnedHostToDevice("), 3u)
+        << "the retained participant graph must capture exactly three H2D inputs";
+    EXPECT_EQ(
+        countOccurrences(executable, "enqueueDeviceToPinnedHost("), 1u)
+        << "the retained participant graph must capture exactly one D2H output";
+    EXPECT_EQ(execution_boundary.find("orderCaptureStreamAfter("),
+              std::string::npos)
+        << "captured H2D nodes on the exact participant stream require no external replay handoff";
     EXPECT_NE(
         header.find("bool isGraphCapturable() const override { return false; }"),
         std::string::npos)
@@ -1152,10 +1189,18 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         "void DeviceMoERuntimeTable::ensurePrefillRouteScratchCapacity(",
         "bool DeviceMoERuntimeTable::prepareInactiveBank(");
 
+    const auto compact_factory = removeAsciiWhitespace(factory);
+    const auto compact_graph_source = removeAsciiWhitespace(graph_source);
     EXPECT_NE(
-        factory.find("resolveActivationBufferSeqLen(config_.max_seq_len, device)"),
+        compact_factory.find(
+            "graphStableActivationRowCapacity(config_,device)"),
         std::string::npos)
-        << "ordinary prefill must contribute its largest graph bucket";
+        << "ordinary prefill must contribute the admitted graph-stable row envelope";
+    EXPECT_NE(
+        compact_graph_source.find(
+            "resolveActivationBufferSeqLen(config.max_seq_len,device)"),
+        std::string::npos)
+        << "direct graph builders must retain the conservative largest-bucket fallback";
     EXPECT_NE(
         factory.find("resolveMTPMaxTargetQueryRows(config_.mtp)"),
         std::string::npos)
@@ -1798,7 +1843,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoERebalanceMaintenanceAlwaysPublishesD
         "bool DeviceGraphOrchestrator::\n"
         "        materializeDeviceMoERebalanceMaintenanceGraphForFamily()",
         "DeviceMoERebalanceGraphControllerState *\n"
-        "    DeviceGraphOrchestrator::deviceMoERebalanceControllerStateDevice()");
+        "    DeviceGraphOrchestrator::deviceMoERebalanceControllerStateDevice(");
     const auto executable_materialize_fn =
         stripCommentsAndStringLiterals(materialize_fn);
 
@@ -1854,6 +1899,57 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoERebalanceMaintenanceAlwaysPublishesD
         "gpu_ctx->recordEventChecked(active_cache.completion_event.get(), maintenance_stream)",
         "active_cache.completion_event_in_flight = true;",
         "The completion event must be recorded before it is published to graph consumers.");
+}
+
+/**
+ * @brief Keep Static ExpertOverlay independent from Dynamic maintenance state.
+ *
+ * The device generation controller is authoritative in both policies, while
+ * the MoE maintenance controller exists only when Dynamic movement is active.
+ * Requiring a retained maintenance graph in Static mode both breaks MTP and
+ * fabricates movement machinery that its no-movement contract forbids.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     StaticExpertOverlayMTPDoesNotRequireMaintenanceController)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const std::array<std::string, 3> controller_consumers = {
+        sliceBetween(
+            source,
+            "bool DeviceGraphOrchestrator::materializeMTPStochasticSerialOutcomeGraph(",
+            "bool DeviceGraphOrchestrator::executeMTPStochasticSerialOutcomeCaptured("),
+        sliceBetween(
+            source,
+            "bool DeviceGraphOrchestrator::prepareAllPositionVerifierGraphMetadata(",
+            "bool DeviceGraphOrchestrator::prepareLiveStateForForwardGraphExecution("),
+        sliceBetween(
+            source,
+            "bool DeviceGraphOrchestrator::verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(",
+            "bool DeviceGraphOrchestrator::copyDeviceSpeculativeOutcomesToHostForDiagnostics("),
+    };
+
+    for (const auto &consumer : controller_consumers)
+    {
+        const auto compact = removeAsciiWhitespace(
+            stripCommentsAndStringLiterals(consumer));
+        const size_t dynamic_policy = compact.find(
+            "isMoeRebalancingActive()&&"
+            "usesHomogeneousDeviceResidentMoEOverlayAuthority()");
+        const size_t controller_resolution = compact.find(
+            "?deviceMoERebalanceControllerStateDevice(");
+        ASSERT_NE(dynamic_policy, std::string::npos);
+        ASSERT_NE(controller_resolution, std::string::npos);
+        EXPECT_LT(dynamic_policy, controller_resolution)
+            << "Each MTP consumer must prove Dynamic maintenance is active "
+               "before resolving its optional controller.";
+        EXPECT_NE(
+            compact.find(
+                "if(requires_rebalance_controller&&!rebalance_controller)"),
+            std::string::npos)
+            << "A missing controller is fatal only for a policy that requires movement.";
+    }
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPPendingLogitsStreamsUseOwnershipHelpers)
@@ -2091,10 +2187,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPFirstUseCaptureAndParentPublicationA
 /**
  * @brief Keep collectives embedded in composite stages visible to graph policy.
  *
- * Most collectives have a dedicated stage type, but full LLEP prefill and MoE
- * maintenance intentionally compose several kernels and collectives inside one
- * stage. Their instance-level predicates are required so whole-graph capture
- * does not depend on another incomplete orchestration-side type list.
+ * Most collectives have a dedicated stage type. Prefix-cache payload
+ * rehydration and MoE maintenance still compose local work with a collective,
+ * so their instance predicates remain explicit. Ordinary current-batch LLEP
+ * is different: its local plan/apply phases report non-collective and the
+ * intervening TP allreduce owns the payload allgather as a typed sideband.
  */
 TEST(Test__GpuWorkspaceAllocationPolicy, CompositeMoEStagesPublishConditionalCollectiveContracts)
 {
@@ -2103,6 +2200,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CompositeMoEStagesPublishConditionalCol
         root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.h");
     const auto expert_source = readFile(
         root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp");
+    const auto current_batch_header = readFile(
+        root / "src/v2/execution/compute_stages/stages/MoEGPUCurrentBatchLLEPStage.h");
+    const auto qwen_graph = readFile(
+        root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp");
     const auto rebalance_header = readFile(
         root / "src/v2/execution/compute_stages/stages/MoEDeviceRebalanceStage.h");
     const auto rebalance_source = readFile(
@@ -2116,11 +2217,22 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CompositeMoEStagesPublishConditionalCol
         "bool MoEExpertComputeStage::isCollectiveStage() const",
         "bool MoEExpertComputeStage::isGraphCapturable() const");
     EXPECT_NE(
-        expert_contract.find(
-            "requestsTransferBackedCurrentBatchPrefillLLEP()"),
+        expert_contract.find("params_.prefix_runtime_device_rehydration"),
         std::string::npos)
-        << "The typed graph-build request must classify transfer-backed LLEP "
-           "as collective before runtime binding validation.";
+        << "Only typed prefix-runtime rehydration remains a composite collective.";
+    EXPECT_EQ(
+        expert_contract.find("GraphPhasedCurrentBatch"),
+        std::string::npos)
+        << "Current-batch LLEP is lowered through an explicit TP sideband.";
+    EXPECT_NE(
+        current_batch_header.find(
+            "bool isCollectiveStage() const override { return false; }"),
+        std::string::npos)
+        << "Local plan/apply phases must not hide collective ownership.";
+    EXPECT_NE(
+        qwen_graph.find("moe_current_batch_llep_payload"),
+        std::string::npos)
+        << "The production graph must attach current-batch payload bytes to a TP collective.";
 
     EXPECT_NE(
         rebalance_header.find("bool isCollectiveStage() const override;"),
@@ -2194,7 +2306,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMaintenanceCaptureUsesGraphOwnedColl
         orchestrator_source,
         "bool DeviceGraphOrchestrator::\n"
         "        materializeDeviceMoERebalanceMaintenanceGraphForFamily()",
-        "bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph()");
+        "bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph(");
     EXPECT_NE(
         maintenance_materialization.find(
             "cache.graph->collectiveNodeNames()"),
@@ -2204,7 +2316,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMaintenanceCaptureUsesGraphOwnedColl
 
     const auto maintenance_launch = sliceBetween(
         orchestrator_source,
-        "bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph()",
+        "bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph(",
         "// =====================================================================\n"
         "    // IForwardExecutionHost interface implementations");
     EXPECT_EQ(
@@ -3636,11 +3748,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCaptu
         "bool CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv(",
         "bool CUDAQuantisedGemmKernel::multiply_quantized_m1_decode_gemv(");
     const auto small_m_body = stripCommentsAndStringLiterals(small_m_raw);
+    const auto small_m_compact = removeAsciiWhitespace(small_m_body);
     EXPECT_NE(small_m_body.find("void *stream_handle = execution_stream ? execution_stream : gpu_stream_;"),
               std::string::npos);
     EXPECT_NE(small_m_raw.find("NativeVNNI small-M GEMV requires an explicit CUDA stream"),
               std::string::npos)
         << "Small-M GEMV helpers must reject null streams instead of using stream 0.";
+    EXPECT_NE(small_m_body.find("impl_->native_source_identity.codebook_id"),
+              std::string::npos)
+        << "A normalized ExpertOverlay projection must retain its source-format "
+           "arithmetic policy for grouped verifier rows.";
+    EXPECT_NE(small_m_compact.find(
+                  "cudaNativeVNNIGemvTuned_small_m_fp32_withPolicy("),
+              std::string::npos)
+        << "Grouped decode must route physical bytes and source arithmetic policy "
+           "through the policy-aware CUDA entry point.";
 
     const auto m1_raw = sliceBetween(
         kernel_source,
@@ -3652,13 +3774,19 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIFusedVerifierRowsPinCaptu
               std::string::npos);
     EXPECT_NE(m1_raw.find("Canonical M=1 decode GEMV requires an explicit CUDA stream"),
               std::string::npos);
-    EXPECT_NE(m1_compact.find("cudaNativeVNNIGemvTuned_fp32("
+    EXPECT_NE(m1_body.find("impl_->native_source_identity.codebook_id"),
+              std::string::npos)
+        << "Canonical decode must derive its reduction schedule from the source "
+           "codebook, not the normalized physical decoder.";
+    EXPECT_NE(m1_compact.find("cudaNativeVNNIGemvTuned_fp32_withPolicy("
                               "d_A_int8,impl_->d_weights_native_vnni,impl_->d_weights_native_scales,"
                               "impl_->d_weights_native_mins,impl_->d_weights_native_emins,d_C,"
                               "d_scales_A_blockwise,n,k,alpha,beta,nullptr,d_bias,"
-                              "impl_->native_codebook_id,cuda_device_id_,stream_handle,impl_->gemv_ctx,nullptr)"),
+                              "impl_->native_codebook_id,arithmetic_policy_codebook_id,"
+                              "cuda_device_id_,stream_handle,impl_->gemv_ctx,nullptr)"),
               std::string::npos)
-        << "The M=1 canonical path must launch the serial decode GEMV on the captured stream without lazy ROWPAR state.";
+        << "The M=1 canonical path must launch the source-policy serial decode "
+           "GEMV on the captured stream without lazy ROWPAR state.";
     EXPECT_EQ(m1_compact.find("cudaMemsetAsync("), std::string::npos)
         << "Canonical M=1 decode must not pad into a synthetic small-M transaction.";
     EXPECT_EQ(m1_compact.find("cudaMemcpyAsync("), std::string::npos)
@@ -3862,8 +3990,35 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUDecodeSamplingCannotFallbackToFullLo
         << "GPU logits sampling failures must return before full logits D2H fallback.";
     EXPECT_NE(sampler_body.find("gpu_ptr_for_guard!=nullptr"),
               std::string::npos)
-        << "The guard must trigger for tensors with a GPU pointer even if the "
+              << "The guard must trigger for tensors with a GPU pointer even if the "
            "coherence device metadata is stale.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     ReplicatedCPUGreedyLogitsNeverEnterASecondGlobalTPCollective)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto sampler_body = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "int DeviceGraphOrchestrator::sampleGreedyOnDevice()",
+            "int DeviceGraphOrchestrator::sampleOnDevice(")));
+
+    ASSERT_NE(sampler_body.find("if(column_parallel)"), std::string::npos);
+    EXPECT_EQ(
+        countOccurrences(sampler_body, "coordinateGreedyCandidate("),
+        1u)
+        << "Only shard-local logits may coordinate candidates. A complete CPU "
+           "GlobalTP row was already gathered by the graph; a second collective "
+           "deadlocks against worker ranks waiting at the sampling fence.";
+    EXPECT_NE(
+        sampler_body.find(
+            "returnreplicated_candidate.valid?replicated_candidate.token:-1;"),
+        std::string::npos)
+        << "Replicated full-vocabulary logits must be sampled locally by the "
+           "coordinated root.";
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, DeferredSampleReadinessPreservesVerifierOwnedSlots)
@@ -5020,6 +5175,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, LivePrefixRestoreAndTruncatePublishEven
         compact_published_join.find(
             "if(consumes_publications){"),
         std::string::npos);
+    EXPECT_NE(
+        compact_published_join.find(
+            "caseDeviceTimelineRole::DeviceGenerationController:"),
+        std::string::npos)
+        << "The captured generation parent takes authority from the externally "
+           "scheduled transaction and must retire its one-shot publications.";
     EXPECT_NE(
         compact_published_join.find(
             "caseDeviceTimelineRole::TargetSampler:"),
@@ -8485,6 +8646,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             orchestrator_source,
             "bool DeviceGraphOrchestrator::completeLiveStateForForwardGraphExecution(",
             "const float *DeviceGraphOrchestrator::getAllPositionLogits() const")));
+    const auto compact_forward_read_scope =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            engine_source,
+            "class ScopedForwardLiveStateRead final",
+            "WorkspaceGraphParticipantRole workspaceParticipantRole(")));
     const auto compact_cache_hit =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
             engine_source,
@@ -8603,20 +8769,60 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "execution_stream,"),
         std::string::npos);
 
+    EXPECT_NE(
+        compact_forward_read_scope.find(
+            "~ScopedForwardLiveStateRead()noexcept"),
+        std::string::npos)
+        << "Forward admission needs lexical cleanup on every early return.";
+    EXPECT_NE(
+        compact_forward_read_scope.find(
+            "completeOrTerminate(admission_stream_,"),
+        std::string::npos)
+        << "Before-launch failure cleanup must publish on the admitted stream.";
+    EXPECT_NE(
+        compact_forward_read_scope.find(
+            "producer_stream!=admission_stream_"),
+        std::string::npos)
+        << "Post-launch completion must reject a substituted stream.";
+    EXPECT_NE(
+        compact_forward_read_scope.find(
+            "host_.completeLiveStateForForwardGraphExecution("),
+        std::string::npos);
+    EXPECT_NE(compact_forward_read_scope.find("std::terminate()"),
+              std::string::npos)
+        << "A completion failure must be fatal instead of abandoning the shared lease.";
+
+    const size_t cached_prepare = compact_cache_hit.find(
+        "host.prepareLiveStateForForwardGraphExecution(");
+    const size_t cached_scope = compact_cache_hit.find(
+        "ScopedForwardLiveStateReadlive_state_read(", cached_prepare);
     const size_t cached_launch = compact_cache_hit.find(
         "executor_.executeDecodeWithCapturePolicy(");
     const size_t cached_complete = compact_cache_hit.find(
-        "host.completeLiveStateForForwardGraphExecution(");
+        "live_state_read.complete(live_state_completion_stream)",
+        cached_launch);
+    ASSERT_NE(cached_prepare, std::string::npos);
+    ASSERT_NE(cached_scope, std::string::npos);
     ASSERT_NE(cached_launch, std::string::npos);
     ASSERT_NE(cached_complete, std::string::npos);
+    EXPECT_LT(cached_prepare, cached_scope);
+    EXPECT_LT(cached_scope, cached_launch);
     EXPECT_LT(cached_launch, cached_complete);
 
+    const size_t miss_prepare = compact_cache_miss.find(
+        "host.prepareLiveStateForForwardGraphExecution(");
+    const size_t miss_scope = compact_cache_miss.find(
+        "ScopedForwardLiveStateReadlive_state_read(", miss_prepare);
     const size_t miss_launch = compact_cache_miss.find(
         "executor_.executeWithSnapshotManifest(");
     const size_t miss_complete = compact_cache_miss.find(
-        "host.completeLiveStateForForwardGraphExecution(");
+        "live_state_read.complete(execution_stream)", miss_launch);
+    ASSERT_NE(miss_prepare, std::string::npos);
+    ASSERT_NE(miss_scope, std::string::npos);
     ASSERT_NE(miss_launch, std::string::npos);
     ASSERT_NE(miss_complete, std::string::npos);
+    EXPECT_LT(miss_prepare, miss_scope);
+    EXPECT_LT(miss_scope, miss_launch);
     EXPECT_LT(miss_launch, miss_complete);
 
     EXPECT_EQ(
@@ -8650,7 +8856,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
 
     const std::string ownership_protocol =
         compact_reader_wait + compact_reader_completion + compact_writer_wait +
-        compact_forward_prepare + compact_forward_complete;
+        compact_forward_prepare + compact_forward_complete +
+        compact_forward_read_scope;
     EXPECT_EQ(ownership_protocol.find("synchronize"), std::string::npos);
     EXPECT_EQ(ownership_protocol.find("deviceToHost"), std::string::npos);
     EXPECT_EQ(ownership_protocol.find("hostToDevice"), std::string::npos);
@@ -10335,9 +10542,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy, AttentionDeviceParamsCanDeriveFromDevic
     EXPECT_EQ(update_dynamic_body.find("kv_len>logical_seq_len"),
               std::string::npos)
         << "Reusable prefill graphs must record device-count derivation even when captured with no prefix history.";
-    EXPECT_NE(execute_device_params_body.find("has_current_dynamic_sequence_state||effective_kv_len>logical_seq_len"),
+    EXPECT_NE(execute_device_params_body.find("has_current_dynamic_sequence_state||effective_kv_len>logical_seq_len||isGraphCaptureActive()"),
               std::string::npos)
-        << "Eager execution may still ignore hostile device counts unless the forward engine established a dynamic boundary.";
+        << "Every captured prefill must record the canonical device-count "
+           "parameter producer, including setup materialization with no host "
+           "dynamic-sequence mirror; eager execution may still require an "
+           "established dynamic boundary.";
     EXPECT_EQ(stage_compact.find("!tq_cache"), std::string::npos)
         << "TQ attention must derive dynamic parameters from the same canonical device count as standard caches.";
 
@@ -10918,9 +11128,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEDeviceRoutedDecodeTableGuardsO
         << "The one-token device-routed MoE runtime table is a full local "
            "expert ownership contract. LocalTP sharded experts must not receive "
            "that table until a sharded runtime table/reducer is implemented.";
-    EXPECT_NE(compact.find("local_count!=config_.moe.num_experts"),
+    EXPECT_NE(compact.find("config_.moe.owner_participant_count>1"),
               std::string::npos)
-        << "Partial expert-ID ownership ranges must use the mask/range + allreduce "
+        << "Multi-participant expert ownership must use the shared owner-map mask + allreduce "
            "path instead of the single-device full-owner runtime table.";
     EXPECT_NE(compact.find("debugEnv().moe_rebalance.gpu_cache_experts_per_layer>0"),
               std::string::npos)
@@ -12444,6 +12654,54 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefillCapturePreparesArenaStorageBefor
         "beginCapture().");
 }
 
+/**
+ * @brief Require stable arena pointers before launch descriptors are built.
+ *
+ * Cold first-use capture cannot rely on an eager warmup to allocate scratch.
+ * Allocation is a separate, authority-neutral pass; exact-stream coherence
+ * remains after launch preparation so metadata producer events are also joined.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     EveryNativeCapturePathPrebindsArenaStorageBeforeLaunchPreparation)
+{
+    const auto controller_source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp");
+    const auto executor_source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp");
+    const auto forward_source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/engine/ForwardExecutionEngine.cpp");
+
+    const auto phase_two_capture = sliceBetween(
+        controller_source,
+        "DeviceGraphCaptureController::CapturePhaseResult DeviceGraphCaptureController::executeCapturePhase(",
+        "DeviceGraphCaptureController::ReplayPhaseResult DeviceGraphCaptureController::executeReplayPhase(");
+    const auto direct_capture_recorder = sliceBetween(
+        executor_source,
+        "bool DeviceGraphExecutor::recordGraphCaptureBody(",
+        "bool DeviceGraphExecutor::captureRetainedGraphFragment(");
+    const auto prefill_capture = sliceBetween(
+        forward_source,
+        "if (can_attempt_capture && capture_ready_reason == PrefillGraphRejectReason::None)",
+        "const std::string capture_launch_boundary");
+
+    expectNeedleBefore(
+        phase_two_capture,
+        "hooks.prebind_storage(seg)",
+        "prepareGraphLaunchMetadata(",
+        "Segmented capture must allocate every arena address before launch "
+        "metadata embeds pointers.");
+    expectNeedleBefore(
+        direct_capture_recorder,
+        "allocateGraphStorageForCapture(",
+        "node->stage->prepareGraphLaunch(ctx, gpu_stream)",
+        "Direct native capture must prebind arena addresses before cold launch preparation.");
+    expectNeedleBefore(
+        prefill_capture,
+        "executor_.allocateGraphStorageForCapture(",
+        "preparePrefillGraphLaunchMetadata(",
+        "Bucketed prefill capture must prebind arena addresses before cold launch preparation.");
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, EveryNativeCapturePathPreparesStorageBeforeBeginCapture)
 {
     const auto controller_source =
@@ -12458,10 +12716,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, EveryNativeCapturePathPreparesStorageBe
         controller_source,
         "bool DeviceGraphCaptureController::executeCapturedReplaySegmentRecapture(",
         "DeviceGraphCaptureController::VerifyReplayResult DeviceGraphCaptureController::executeCapturedReplaySegmentVerify(");
-    const auto direct_capture = sliceBetween(
+    const auto direct_capture_recorder = sliceBetween(
         executor_source,
-        "bool DeviceGraphExecutor::executeWithGraphCapture(",
-        "bool DeviceGraphExecutor::executeWithCachedGraphReplay(");
+        "bool DeviceGraphExecutor::recordGraphCaptureBody(",
+        "bool DeviceGraphExecutor::captureRetainedGraphFragment(");
 
     expectNeedleBefore(
         phase_two_capture,
@@ -12482,11 +12740,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, EveryNativeCapturePathPreparesStorageBe
         "Diagnostic recapture is not allowed to bypass exact-stream input "
         "preparation.");
     expectNeedleBefore(
-        direct_capture,
+        direct_capture_recorder,
         "prepareGraphStorageForCapture(",
         "ScopedBackendGraphCapture capture_transaction(",
-        "The direct single-graph API must enforce the same pre-capture event "
-        "contract as cached decode capture.");
+        "Immediate replay and retained child composition must enforce the same "
+        "pre-capture event contract as cached decode capture.");
 }
 
 /**
@@ -12577,18 +12835,18 @@ TEST(Test__GpuWorkspaceAllocationPolicy, NativeCaptureUsesFrozenDependencyTransa
               std::string::npos)
         << "Transfer publication must be able to query the exact active ledger.";
 
-    const auto direct_capture = sliceBetween(
+    const auto direct_capture_recorder = sliceBetween(
         executor_source,
-        "bool DeviceGraphExecutor::executeWithGraphCapture(",
-        "bool DeviceGraphExecutor::executeWithCachedGraphReplay(");
+        "bool DeviceGraphExecutor::recordGraphCaptureBody(",
+        "bool DeviceGraphExecutor::captureRetainedGraphFragment(");
     expectNeedleBefore(
-        direct_capture,
+        direct_capture_recorder,
         "planGraphCaptureDependencies(",
         "ScopedBackendGraphCapture capture_transaction(",
-        "Direct capture must freeze dependency topology before beginCapture().");
-    EXPECT_NE(direct_capture.find("runStage("), std::string::npos)
-        << "Direct capture must advance the ledger through the canonical runner.";
-    EXPECT_EQ(direct_capture.find("node->stage->execute(ctx)"),
+        "Direct capture recording must freeze dependency topology before beginCapture().");
+    EXPECT_NE(direct_capture_recorder.find("runStage("), std::string::npos)
+        << "Direct capture recording must advance the ledger through the canonical runner.";
+    EXPECT_EQ(direct_capture_recorder.find("node->stage->execute(ctx)"),
               std::string::npos)
         << "Direct stage execution bypasses capture dependency publication.";
 
@@ -12739,7 +12997,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto grouped_prefill = sliceBetween(
         source,
         "if (use_fixed_topology_grouped_prefill)",
-        "// Zero the output buffer via tensor-aware kernel");
+        "const bool forced_verifier_decode_replay =");
     EXPECT_NE(
         grouped_prefill.find("publishPublicationTarget();"),
         std::string::npos);
@@ -12752,7 +13010,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto single_token = sliceBetween(
         source,
         "bool MoEExpertComputeStage::executeSingleToken(IDeviceContext *ctx)",
-        "bool MoEExpertComputeStage::executeCPUGroupedDecodeEquivalentVerifierPrefill(");
+        "bool MoEExpertComputeStage::executeCPUGroupedDecodeEquivalentRows(");
     const auto runtime_route = sliceBetween(
         single_token,
         "if (can_try_device_routed_decode)",
@@ -12788,7 +13046,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoERuntimeDecodeUsesFusedWorkspaceBefor
     const auto single_token = sliceBetween(
         source,
         "bool MoEExpertComputeStage::executeSingleToken(IDeviceContext *ctx)",
-        "bool MoEExpertComputeStage::executeCPUGroupedDecodeEquivalentVerifierPrefill(");
+        "bool MoEExpertComputeStage::executeCPUGroupedDecodeEquivalentRows(");
 
     expectNeedleBefore(
         single_token,
@@ -12937,7 +13195,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
     const auto combined_shared_section = sliceBetween(
         graph_source,
         "const bool can_combine_shared_verifier =",
-        "if (overlay_requested && !use_expert_overlay)");
+        "const RoutedExpertTier *local_tp_fast_tier =");
     const std::string compact_combined_shared =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(combined_shared_section));
     EXPECT_NE(compact_combined_shared.find("false"),
@@ -13033,7 +13291,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
 
     const auto canonical_rank_bank_section = sliceBetween(
         graph_source,
-        "if (canonical_publication_lowering.usesRankBanks())",
+        "if (canonical_publication_lowering.usesRankBanks())\n"
+        "            {\n"
+        "                if (!canonical_route_contributions",
         "/*\n             * Input-parallel prefill shared-expert down rows");
     const std::string compact_canonical_rank_bank =
         removeAsciiWhitespace(
@@ -13903,7 +14163,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto materialization_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::materializeForwardGraphForShape(",
-        "ReceivedWeightsMap DeviceGraphOrchestrator::transferExpertWeights(");
+        "ExpertTransferResult DeviceGraphOrchestrator::transferExpertWeights(");
     const auto compact =
         removeAsciiWhitespace(materialization_body);
 
@@ -13942,7 +14202,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto materialization_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::materializeForwardGraphForShape(",
-        "ReceivedWeightsMap DeviceGraphOrchestrator::transferExpertWeights(");
+        "ExpertTransferResult DeviceGraphOrchestrator::transferExpertWeights(");
     const auto compact =
         removeAsciiWhitespace(
             stripCommentsAndStringLiterals(materialization_body));
@@ -13989,7 +14249,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto materialization_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::materializeForwardGraphForShape(",
-        "ReceivedWeightsMap DeviceGraphOrchestrator::transferExpertWeights(");
+        "ExpertTransferResult DeviceGraphOrchestrator::transferExpertWeights(");
     const auto bucket_participant = sliceBetween(
         materialization_body,
         "ForwardInput bucket_input = input;",
@@ -14030,7 +14290,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto materialization_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::materializeForwardGraphForShape(",
-        "ReceivedWeightsMap DeviceGraphOrchestrator::transferExpertWeights(");
+        "ExpertTransferResult DeviceGraphOrchestrator::transferExpertWeights(");
     const auto maximum_prefill_participant = sliceBetween(
         materialization_body,
         "ForwardInput maximum_prefill_input = input;",
@@ -14040,14 +14300,35 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
 
     EXPECT_NE(
         compact.find(
-            "if(!request_sequence_lengths_dev_||"
+            "if(!request_token_ids_dev_||"
+            "!request_position_ids_dev_||"
+            "!request_sequence_lengths_dev_||"
             "request_sequence_lengths_capacity_<batch_size)"),
+        std::string::npos);
+    EXPECT_NE(
+        compact.find(
+            "maximum_prefill_input.token_ids_device="
+            "request_token_ids_dev_;"),
+        std::string::npos);
+    EXPECT_NE(
+        compact.find(
+            "maximum_prefill_input.position_ids_device="
+            "request_position_ids_dev_;"),
         std::string::npos);
     EXPECT_NE(
         compact.find(
             "maximum_prefill_input.sequence_lengths_device="
             "static_cast<constint32_t*>(request_sequence_lengths_dev_);"),
         std::string::npos);
+    EXPECT_NE(
+        compact.find(
+            "bindShiftedMTPPrefillTransaction("
+            "maximum_prefill_input,batch_size,"
+            "ShiftedMTPPrefillGraphBinding::Purpose::"
+            "WorkspaceFamilyDeclaration)"),
+        std::string::npos)
+        << "The maximum prefill participant must include the same integrated "
+           "MTP subgraph whose workspace will be used by live prefill.";
     EXPECT_EQ(compact.find("request_sequence_lengths_active_count_"),
               std::string::npos)
         << "The manifest owns a stable address before any request publishes "
@@ -14072,7 +14353,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto materialization_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::materializeForwardGraphForShape(",
-        "ReceivedWeightsMap DeviceGraphOrchestrator::transferExpertWeights(");
+        "ExpertTransferResult DeviceGraphOrchestrator::transferExpertWeights(");
     const auto grouped_participant = sliceBetween(
         materialization_body,
         "ForwardInput grouped_input = input;",
@@ -15066,19 +15347,28 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         std::string::npos)
         << "The terminal bridge must consume one event published after the complete parent launch.";
 
-    const size_t first_maintenance = resident_generation_runner.find(
-        "publishDeviceMoEMaintenanceBeforeMTPConsumer(");
     const size_t parent_prepare = resident_generation_runner.find(
         "runner_->materializeDeviceResidentGeneration(");
     const size_t parent_launch = resident_generation_runner.find(
         "runner_->launchDeviceResidentGeneration()");
-    ASSERT_NE(first_maintenance, std::string::npos);
+    const size_t parent_finish = resident_generation_runner.find(
+        "runner_->finishDeviceResidentGeneration(&terminal)");
+    const size_t maintenance_ack = resident_generation_runner.find(
+        "noteEmbeddedDeviceMoEOverlayMaintenance(");
     ASSERT_NE(parent_prepare, std::string::npos);
     ASSERT_NE(parent_launch, std::string::npos);
-    EXPECT_LT(first_maintenance, parent_prepare)
-        << "First-transaction maintenance must make its child replay-ready before parent composition.";
+    ASSERT_NE(parent_finish, std::string::npos);
+    ASSERT_NE(maintenance_ack, std::string::npos);
     EXPECT_LT(parent_prepare, parent_launch)
         << "Every participant must finish parent composition before any parent launch.";
+    EXPECT_LT(parent_launch, parent_finish);
+    EXPECT_LT(parent_finish, maintenance_ack)
+        << "The host may acknowledge device-owned maintenance only after the complete captured parent retires.";
+    EXPECT_EQ(
+        resident_generation_runner.find(
+            "publishDeviceMoEMaintenanceBeforeMTPConsumer("),
+        std::string::npos)
+        << "Device-resident maintenance is the final conditional child of the captured parent, not a host-published prelaunch transaction.";
     EXPECT_NE(
         resident_generation_runner.find(
             "runner_->finishDeviceResidentGeneration(&terminal)"),

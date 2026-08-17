@@ -98,7 +98,7 @@ namespace llaminar2
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT",
-                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE",
             };
@@ -122,6 +122,7 @@ namespace llaminar2
         bool benchmark_memory_log = false;    ///< Emit benchmark GPU memory snapshots when LLAMINAR_BENCH_MEM_LOG is present.
         int benchmark_iterations = 3;         ///< Measured benchmark iterations (LLAMINAR_BENCHMARK_ITERATIONS, default 3).
         int benchmark_warmup_iterations = 1;  ///< Benchmark warmup iterations (LLAMINAR_BENCHMARK_WARMUP_ITERATIONS, default 1).
+        bool profiler_normal_exit = false;    ///< Permit profiler finalizers instead of `_exit(0)` when LLAMINAR_PROFILER_NORMAL_EXIT is truthy.
         bool rope_on_read = true;             ///< Enable RoPE-on-read unless LLAMINAR_ROPE_ON_READ parses to 0.
         bool sync_after_stage = false;        ///< Synchronize GPU after every stage when LLAMINAR_SYNC_AFTER_STAGE is present.
         bool serialize_tp_forward = false;    ///< Serialize local TP forwards when LLAMINAR_SERIALIZE_TP_FORWARD is present.
@@ -153,6 +154,7 @@ namespace llaminar2
             benchmark_memory_log = isPresent("LLAMINAR_BENCH_MEM_LOG");
             benchmark_iterations = readIntClamped("LLAMINAR_BENCHMARK_ITERATIONS", 3, 1, 100);
             benchmark_warmup_iterations = readIntClamped("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", 1, 0, 100);
+            profiler_normal_exit = readTruthy("LLAMINAR_PROFILER_NORMAL_EXIT");
             rope_on_read = readBoolDefaultTrue("LLAMINAR_ROPE_ON_READ");
             sync_after_stage = isPresent("LLAMINAR_SYNC_AFTER_STAGE");
             serialize_tp_forward = isPresent("LLAMINAR_SERIALIZE_TP_FORWARD");
@@ -1020,7 +1022,7 @@ namespace llaminar2
         bool prefill_graph_buckets = true;                                                                                                                             ///< Enable bucketed prefill graph capture by default (env: LLAMINAR_PREFILL_GRAPH_BUCKETS=0 to opt out)
         bool prefill_graph_required = false;                                                                                                                           ///< Fail benchmark/runtime probes if eligible prefill does not capture/replay (env: LLAMINAR_PREFILL_GRAPH_REQUIRED)
         std::vector<int> prefill_graph_bucket_sizes = defaultPrefillGraphBucketSizes(); ///< Bucket lengths for bucketed prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES)
-        int prefill_graph_max_cached_buckets = 10;                                                                                                                     ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
+        int prefill_graph_max_cached_buckets = static_cast<int>(kDefaultPrefillGraphMaxCachedEntries);                                                                 ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
         int prefill_graph_pad_token_id = 0;                                                                                                                            ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
 
         // =================================================================
@@ -1303,7 +1305,8 @@ namespace llaminar2
                     prefill_graph_bucket_sizes.end());
             }
 
-            prefill_graph_max_cached_buckets = 10;
+            prefill_graph_max_cached_buckets =
+                static_cast<int>(kDefaultPrefillGraphMaxCachedEntries);
             const char *prefill_graph_max_buckets_env = std::getenv("LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS");
             if (prefill_graph_max_buckets_env)
             {
@@ -3551,10 +3554,13 @@ namespace llaminar2
             int device_rebalance_min_wave_spread_improvement_per_payload_slot = 256;
             /// Optional LLEP useful-work gate. When nonzero, the shared
             /// least-loaded assignment planner requires at least this many
-            /// foreign routed rows per planned expert transfer. This helps
-            /// avoid paying an expert payload move for tiny dispatch wins.
-            /// (env: LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER)
-            int device_rebalance_min_foreign_rows_per_transfer = 0;
+            /// foreign routed rows per serialized critical-path payload slot.
+            /// Reciprocal and independent lanes overlap; multiple payloads on
+            /// one participant lane remain additive. This avoids paying an
+            /// expert payload move for tiny dispatch wins without double
+            /// charging concurrent edges. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT)
+            int device_rebalance_min_foreign_rows_per_critical_path_payload_slot = 0;
             /// Realized router-benefit gate. When nonzero and the
             /// current wave already has active local hot-cache replicas, the
             /// previous router window must have produced at least this much
@@ -3886,8 +3892,9 @@ namespace llaminar2
                 moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot =
                     std::max(0, std::atoi(moe_min_wave_improvement));
             if (const char *moe_min_foreign_rows =
-                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER"))
-                moe_rebalance.device_rebalance_min_foreign_rows_per_transfer =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT"))
+                moe_rebalance
+                    .device_rebalance_min_foreign_rows_per_critical_path_payload_slot =
                     std::max(0, std::atoi(moe_min_foreign_rows));
             if (const char *moe_min_router_improvement =
                     std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
@@ -4083,10 +4090,12 @@ namespace llaminar2
                     std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
                 moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot =
                     std::max(0, std::atoi(moe_min_wave_improvement));
-            moe_rebalance.device_rebalance_min_foreign_rows_per_transfer = 0;
+            moe_rebalance
+                .device_rebalance_min_foreign_rows_per_critical_path_payload_slot = 0;
             if (const char *moe_min_foreign_rows =
-                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER"))
-                moe_rebalance.device_rebalance_min_foreign_rows_per_transfer =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_CRITICAL_PATH_PAYLOAD_SLOT"))
+                moe_rebalance
+                    .device_rebalance_min_foreign_rows_per_critical_path_payload_slot =
                     std::max(0, std::atoi(moe_min_foreign_rows));
             moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot = 128;
             if (const char *moe_min_router_improvement =

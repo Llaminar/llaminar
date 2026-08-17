@@ -40,6 +40,22 @@ from .pipeline_stages import PipelineStage
 from .registry import ModelRegistry
 
 
+def production_router_distribution(router_output) -> torch.Tensor:
+    """Return the full post-softmax distribution published by production.
+
+    Hugging Face names the first tuple member ``router_logits`` even though the
+    module has already applied softmax. Keeping this validation in one helper
+    prevents main-model and recursive-MTP hooks from drifting back to a
+    reconstructed raw projection that no captured backend publishes.
+    """
+
+    if not isinstance(router_output, tuple) or len(router_output) < 3:
+        raise RuntimeError(
+            "Qwen3.5 MoE router did not return probabilities, weights, and indices"
+        )
+    return router_output[0]
+
+
 class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
     """
     PyTorch reference implementation for Qwen 3.5 MoE models.
@@ -279,13 +295,22 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
         prompt: str,
         decode_steps: int,
         output_dir,
+        max_draft_depth: int = 3,
         verbose: bool = False,
     ) -> int:
-        """Generate decode_stepN_MTP0_* snapshots for the Qwen3.6 nextn sidecar."""
+        """Generate recursive MTP0..MTPN checkpoints for the Qwen3.6 sidecar.
+
+        Each repeated predictor call consumes the previous call's shared-head-
+        normalized hidden state.  That tensor is both the LM-head input and the
+        hidden-state result published by the reference Qwen3.5 MTP module; the
+        pre-normalized decoder residual is an intermediate checkpoint only.
+        """
         if not getattr(self, "_mtp_sidecar_state", None):
             return 0
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not loaded")
+        if max_draft_depth < 1 or max_draft_depth > 3:
+            raise ValueError("max_draft_depth must be in [1, 3]")
 
         from pathlib import Path
         from transformers.cache_utils import DynamicCache
@@ -318,7 +343,12 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
         if last_hidden.dim() == 2:
             last_hidden = last_hidden.unsqueeze(0)
 
-        def project_sidecar_hidden(terminal_hidden: torch.Tensor, token_id: int) -> dict:
+        def project_sidecar_hidden(
+            terminal_hidden: torch.Tensor,
+            token_id: int,
+            depth_index: int,
+        ) -> dict:
+            prefix = f"MTP{depth_index}_"
             token = torch.tensor([[token_id]], device=self.device, dtype=torch.long)
             embedding = self.hf_model.model.embed_tokens(token)
             norm_hidden = self._rms_norm(
@@ -330,12 +360,12 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             concat = torch.cat([norm_embedding, norm_hidden], dim=-1)
             projected = F.linear(concat, eh_proj)
             return {
-                "MTP_TERMINAL_HIDDEN_ROW_SELECT": terminal_hidden,
-                "MTP0_EMBEDDING": embedding,
-                "MTP0_NORM_HIDDEN": norm_hidden,
-                "MTP0_NORM_EMBEDDING": norm_embedding,
-                "MTP0_CONCAT": concat,
-                "MTP0_FC": projected,
+                f"{prefix}TERMINAL_HIDDEN_ROW_SELECT": terminal_hidden,
+                f"{prefix}EMBEDDING": embedding,
+                f"{prefix}NORM_HIDDEN": norm_hidden,
+                f"{prefix}NORM_EMBEDDING": norm_embedding,
+                f"{prefix}CONCAT": concat,
+                f"{prefix}FC": projected,
             }
 
         def _capture_mtp(captures: dict, key: str, tensor: torch.Tensor) -> None:
@@ -351,78 +381,82 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
                 return tensor.contiguous().reshape(tensor.shape[0], tensor.shape[1], -1)
             return tensor
 
-        def _install_sidecar_capture_hooks(captures: dict) -> list:
+        def _install_sidecar_capture_hooks(
+            captures: dict,
+            depth_index: int,
+        ) -> list:
             handles = []
             runtime = {}
+            prefix = f"MTP{depth_index}_"
+            key = lambda suffix: f"{prefix}{suffix}"
 
             handles.append(sidecar_layer.input_layernorm.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_ATTENTION_NORM", out)))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("ATTENTION_NORM"), out)))
 
             fa = sidecar_layer.self_attn
 
             def _q_proj(_mod, _inp, out):
-                _capture_mtp(captures, "MTP0_Q_PROJECTION", out)
+                _capture_mtp(captures, key("Q_PROJECTION"), out)
                 head_dim = getattr(fa, "head_dim", self.hf_config.head_dim)
                 q_gate = out.view(*out.shape[:-1], -1, head_dim * 2)
                 _, gate = torch.chunk(q_gate, 2, dim=-1)
                 runtime["fa_gate"] = gate.reshape(*out.shape[:-1], -1).detach()
-                _capture_mtp(captures, "MTP0_FA_GATE", runtime["fa_gate"])
+                _capture_mtp(captures, key("FA_GATE"), runtime["fa_gate"])
 
             handles.append(fa.q_proj.register_forward_hook(_q_proj))
             handles.append(fa.k_proj.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_K_PROJECTION", out)))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("K_PROJECTION"), out)))
             handles.append(fa.v_proj.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_V_PROJECTION", out)))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("V_PROJECTION"), out)))
             handles.append(fa.q_norm.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_Q_NORM", _flatten_seq_head_tensor(out))))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("Q_NORM"), _flatten_seq_head_tensor(out))))
             handles.append(fa.k_norm.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_K_NORM", _flatten_seq_head_tensor(out))))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("K_NORM"), _flatten_seq_head_tensor(out))))
 
             def _attention_context(_mod, inp):
                 h = inp[0] if isinstance(inp, tuple) else inp
-                _capture_mtp(captures, "MTP0_ATTENTION_CONTEXT_GATED", h)
+                _capture_mtp(captures, key("ATTENTION_CONTEXT_GATED"), h)
                 gate = runtime.get("fa_gate")
                 if gate is not None:
                     raw_context = h / torch.sigmoid(gate.to(device=h.device, dtype=h.dtype)).clamp_min(1e-12)
-                    _capture_mtp(captures, "MTP0_ATTENTION_CONTEXT", raw_context)
+                    _capture_mtp(captures, key("ATTENTION_CONTEXT"), raw_context)
 
             handles.append(fa.o_proj.register_forward_pre_hook(_attention_context))
 
             def _attention_output(_mod, _inp, out):
                 h = out[0] if isinstance(out, tuple) else out
-                _capture_mtp(captures, "MTP0_ATTENTION_OUTPUT", h)
+                _capture_mtp(captures, key("ATTENTION_OUTPUT"), h)
 
             handles.append(fa.register_forward_hook(_attention_output))
 
             handles.append(sidecar_layer.post_attention_layernorm.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_FFN_NORM", out)))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("FFN_NORM"), out)))
 
             moe_block = sidecar_layer.mlp
 
             def _router(_mod, _inp, out):
-                # Qwen3_5MoeTopKRouter returns softmax probabilities as
-                # out[0], despite naming that value `router_logits` in
-                # Transformers.  Llaminar's MOE_ROUTER_OUTPUT contract is the
-                # actual linear projection before softmax, so reconstruct that
-                # exact semantic boundary from the hook input and gate weight.
-                hidden = _inp[0] if isinstance(_inp, tuple) else _inp
-                raw_router_logits = F.linear(
-                    hidden.reshape(-1, _mod.hidden_dim), _mod.weight
-                )
+                # Qwen3_5MoeTopKRouter calls its first result `router_logits`,
+                # but the value is the full post-softmax expert distribution.
+                # Llaminar intentionally publishes that same live routing
+                # workspace under the historical MOE_ROUTER_OUTPUT key.  Keep
+                # the reference at the production boundary instead of
+                # reconstructing a pre-softmax tensor that the captured graph
+                # does not expose after routing has completed.
                 _capture_mtp(
-                    captures, "MTP0_MOE_ROUTER_OUTPUT", raw_router_logits
+                    captures,
+                    key("MOE_ROUTER_OUTPUT"),
+                    production_router_distribution(out),
                 )
-                if isinstance(out, tuple) and len(out) >= 3:
-                    _capture_mtp(captures, "MTP0_MOE_ROUTING_WEIGHTS", out[1])
-                    _capture_mtp(captures, "MTP0_MOE_ROUTING_INDICES", out[2].float())
+                _capture_mtp(captures, key("MOE_ROUTING_WEIGHTS"), out[1])
+                _capture_mtp(captures, key("MOE_ROUTING_INDICES"), out[2].float())
 
             handles.append(moe_block.gate.register_forward_hook(_router))
             handles.append(moe_block.experts.register_forward_hook(
-                lambda _mod, _inp, out: _capture_mtp(captures, "MTP0_MOE_EXPERT_OUTPUT", out)))
+                lambda _mod, _inp, out: _capture_mtp(captures, key("MOE_EXPERT_OUTPUT"), out)))
 
             def _shared_expert(_mod, _inp, out):
                 runtime["shared_expert_output"] = out.detach()
-                _capture_mtp(captures, "MTP0_MOE_SHARED_EXPERT_OUTPUT", out)
+                _capture_mtp(captures, key("MOE_SHARED_EXPERT_OUTPUT"), out)
 
             handles.append(moe_block.shared_expert.register_forward_hook(_shared_expert))
 
@@ -430,21 +464,21 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
                 shared = runtime.get("shared_expert_output")
                 if shared is not None:
                     gated = shared.to(device=out.device, dtype=out.dtype) * torch.sigmoid(out)
-                    _capture_mtp(captures, "MTP0_MOE_SHARED_GATE_OUTPUT", gated)
+                    _capture_mtp(captures, key("MOE_SHARED_GATE_OUTPUT"), gated)
                 else:
-                    _capture_mtp(captures, "MTP0_MOE_SHARED_GATE_OUTPUT", out)
+                    _capture_mtp(captures, key("MOE_SHARED_GATE_OUTPUT"), out)
 
             handles.append(moe_block.shared_expert_gate.register_forward_hook(_shared_gate))
 
             def _moe_combined(_mod, _inp, out):
                 h = out[0] if isinstance(out, tuple) else out
-                _capture_mtp(captures, "MTP0_MOE_COMBINED_OUTPUT", h)
+                _capture_mtp(captures, key("MOE_COMBINED_OUTPUT"), h)
 
             handles.append(moe_block.register_forward_hook(_moe_combined))
 
             def _ffn_residual(_mod, _inp, out):
                 h = out[0] if isinstance(out, tuple) else out
-                _capture_mtp(captures, "MTP0_FFN_RESIDUAL", h)
+                _capture_mtp(captures, key("FFN_RESIDUAL"), h)
 
             handles.append(sidecar_layer.register_forward_hook(_ffn_residual))
             return handles
@@ -453,12 +487,17 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             projected: torch.Tensor,
             position: int,
             cache,
+            depth_index: int = 0,
             captures: Optional[dict] = None,
         ) -> tuple[torch.Tensor, object]:
             text_position_ids = torch.tensor([[position]], device=self.device, dtype=torch.long)
             rope_position_ids = text_position_ids[None, ...].expand(3, 1, 1)
             position_embeddings = self.hf_model.model.rotary_emb(projected, rope_position_ids)
-            handles = _install_sidecar_capture_hooks(captures) if captures is not None else []
+            handles = (
+                _install_sidecar_capture_hooks(captures, depth_index)
+                if captures is not None
+                else []
+            )
             try:
                 hidden = sidecar_layer(
                     projected,
@@ -477,7 +516,8 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             for row in range(len(token_ids) - 1):
                 pieces = project_sidecar_hidden(
                     last_hidden[:, row:row + 1, :],
-                    token_ids[row + 1])
+                    token_ids[row + 1],
+                    0)
                 _, sidecar_cache = sidecar_forward(
                     pieces["MTP0_FC"],
                     row + 1,
@@ -486,37 +526,69 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             next_token = int(result["logits"][0, -1, :].argmax())
             total = 0
             for step in range(decode_steps):
-                pieces = project_sidecar_hidden(last_hidden[:, -1:, :], next_token)
-                sidecar_captures = {}
-                hidden, sidecar_cache = sidecar_forward(
-                    pieces["MTP0_FC"],
-                    len(token_ids) + step,
-                    sidecar_cache,
-                    sidecar_captures)
-                final_hidden = self._rms_norm(
-                    hidden,
-                    shared_head_norm,
-                    self.hf_config.rms_norm_eps,
-                    pre_rmsnorm_1p=True)
-                logits = self.hf_model.lm_head(final_hidden)
+                committed_cache_length = sidecar_cache.get_seq_length()
+                draft_hidden = last_hidden[:, -1:, :]
+                draft_condition_token = next_token
+                for depth_index in range(max_draft_depth):
+                    prefix = f"MTP{depth_index}_"
+                    pieces = project_sidecar_hidden(
+                        draft_hidden,
+                        draft_condition_token,
+                        depth_index)
+                    sidecar_captures = {}
+                    hidden, sidecar_cache = sidecar_forward(
+                        pieces[f"{prefix}FC"],
+                        len(token_ids) + step + depth_index,
+                        sidecar_cache,
+                        depth_index,
+                        sidecar_captures)
+                    final_hidden = self._rms_norm(
+                        hidden,
+                        shared_head_norm,
+                        self.hf_config.rms_norm_eps,
+                        pre_rmsnorm_1p=True)
+                    logits = self.hf_model.lm_head(final_hidden)
 
-                snapshots = {
-                    "MTP_TERMINAL_HIDDEN_ROW_SELECT": self._flatten_for_snapshot(pieces["MTP_TERMINAL_HIDDEN_ROW_SELECT"]),
-                    "MTP0_EMBEDDING": self._flatten_for_snapshot(pieces["MTP0_EMBEDDING"]),
-                    "MTP0_NORM_HIDDEN": self._flatten_for_snapshot(pieces["MTP0_NORM_HIDDEN"]),
-                    "MTP0_NORM_EMBEDDING": self._flatten_for_snapshot(pieces["MTP0_NORM_EMBEDDING"]),
-                    "MTP0_CONCAT": self._flatten_for_snapshot(pieces["MTP0_CONCAT"]),
-                    "MTP0_FC": self._flatten_for_snapshot(pieces["MTP0_FC"]),
-                    "MTP0_FFN_RESIDUAL": self._flatten_for_snapshot(hidden),
-                    "MTP0_FINAL_NORM": self._flatten_for_snapshot(final_hidden),
-                    "MTP0_LM_HEAD": self._flatten_for_snapshot(logits),
-                }
-                snapshots.update(sidecar_captures)
-                for key, payload in snapshots.items():
-                    np.save(output_dir / f"decode_step{step}_{key}.npy", payload)
-                    total += 1
-                    if verbose:
-                        print(f"  Saved decode_step{step}_{key}: shape={list(payload.shape)}")
+                    snapshots = {
+                        f"{prefix}TERMINAL_HIDDEN_ROW_SELECT": self._flatten_for_snapshot(
+                            pieces[f"{prefix}TERMINAL_HIDDEN_ROW_SELECT"]),
+                        f"{prefix}EMBEDDING": self._flatten_for_snapshot(
+                            pieces[f"{prefix}EMBEDDING"]),
+                        f"{prefix}NORM_HIDDEN": self._flatten_for_snapshot(
+                            pieces[f"{prefix}NORM_HIDDEN"]),
+                        f"{prefix}NORM_EMBEDDING": self._flatten_for_snapshot(
+                            pieces[f"{prefix}NORM_EMBEDDING"]),
+                        f"{prefix}CONCAT": self._flatten_for_snapshot(
+                            pieces[f"{prefix}CONCAT"]),
+                        f"{prefix}FC": self._flatten_for_snapshot(
+                            pieces[f"{prefix}FC"]),
+                        f"{prefix}FFN_RESIDUAL": self._flatten_for_snapshot(hidden),
+                        f"{prefix}FINAL_NORM": self._flatten_for_snapshot(final_hidden),
+                        f"{prefix}LM_HEAD": self._flatten_for_snapshot(logits),
+                    }
+                    if depth_index == 0:
+                        snapshots["MTP_TERMINAL_HIDDEN_ROW_SELECT"] = snapshots[
+                            "MTP0_TERMINAL_HIDDEN_ROW_SELECT"
+                        ]
+                    snapshots.update(sidecar_captures)
+                    for snapshot_key, payload in snapshots.items():
+                        np.save(
+                            output_dir / f"decode_step{step}_{snapshot_key}.npy",
+                            payload)
+                        total += 1
+                        if verbose:
+                            print(
+                                f"  Saved decode_step{step}_{snapshot_key}: "
+                                f"shape={list(payload.shape)}"
+                            )
+
+                    draft_condition_token = int(logits[0, -1, :].argmax())
+                    draft_hidden = final_hidden
+
+                # Only the first sidecar row belongs to the next committed main
+                # position.  Deeper rows are speculative and must not leak into
+                # the reference cache used by the following main decode step.
+                sidecar_cache.crop(committed_cache_length + 1)
 
                 result = self.forward(
                     [next_token],
@@ -832,28 +904,22 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
 
             # Router output (gate) + routing indices and weights
             def _router(mod, inp, out, i=idx):
-                # The module's first returned value has already passed through
-                # softmax.  Capture the pre-softmax linear projection so this
-                # snapshot has the same meaning as Llaminar's router-logit
-                # workspace and PipelineStage.MOE_ROUTER_OUTPUT documentation.
-                hidden = inp[0] if isinstance(inp, tuple) else inp
-                raw_router_logits = F.linear(
-                    hidden.reshape(-1, mod.hidden_dim), mod.weight
-                )
+                # The first result is the complete post-softmax distribution.
+                # CUDA and ROCm retain that same full routing workspace through
+                # captured replay, so this is the only live cross-backend
+                # checkpoint boundary. Top-k weights and indices remain the
+                # second and third results respectively.
                 if self._should_capture(PipelineStage.MOE_ROUTER_OUTPUT):
                     self.capture_stage(
                         PipelineStage.MOE_ROUTER_OUTPUT,
-                        raw_router_logits,
+                        production_router_distribution(out),
                         i,
                     )
-                if isinstance(out, tuple) and len(out) >= 3:
-                    # gate returns (softmax probabilities, normalized top-k
-                    # weights, selected experts).
-                    if self._should_capture(PipelineStage.MOE_ROUTING_WEIGHTS):
-                        self.capture_stage(PipelineStage.MOE_ROUTING_WEIGHTS, out[1], i)
-                    if self._should_capture(PipelineStage.MOE_ROUTING_INDICES):
-                        # selected_experts is int64 — store as float for snapshot compat
-                        self.capture_stage(PipelineStage.MOE_ROUTING_INDICES, out[2].float(), i)
+                if self._should_capture(PipelineStage.MOE_ROUTING_WEIGHTS):
+                    self.capture_stage(PipelineStage.MOE_ROUTING_WEIGHTS, out[1], i)
+                if self._should_capture(PipelineStage.MOE_ROUTING_INDICES):
+                    # selected_experts is int64 — store as float for snapshot compat
+                    self.capture_stage(PipelineStage.MOE_ROUTING_INDICES, out[2].float(), i)
             self._hook_handles.append(
                 moe_block.gate.register_forward_hook(_router)
             )

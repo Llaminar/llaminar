@@ -6,6 +6,7 @@ Walks tests/v2/integration/parity/results/<git-hash>/ for per-test directories.
 Each directory typically contains:
   - prefill_summary.csv  : LM_HEAD aggregate (cosine, KL, top-1, top-5, passed)
   - decode_steps.csv     : per-decode-step LM_HEAD metrics (averaged)
+  - production_path.csv  : graph-path, segmentation, reuse, and budget proof
 
 Writes a Markdown table to:
   - stdout (always), and
@@ -101,6 +102,116 @@ def summarize(results_root: Path, artifact_name: str) -> tuple[str, int, int]:
 
         out.append(f"### Commit `{commit_dir.name}`\n")
         out.append("")
+
+        # Live production-path and economy evidence.
+        production_rows: list[str] = []
+        for tdir in test_dirs:
+            evidence = read_csv(tdir / "production_path.csv")
+            if not evidence:
+                continue
+            row = evidence[0]
+            homogeneous_gpu = passed_bool(row.get("homogeneous_gpu")) is True
+            graph_ok = row.get("execution_path") == "graph"
+            within_budget = passed_bool(row.get("within_budget")) is True
+            full_graph = (
+                passed_bool(row.get("full_graph_capture")) is True
+                or passed_bool(row.get("full_graph_replay")) is True
+            )
+            decode_graph = (
+                passed_bool(row.get("decode_graph_capture")) is True
+                or passed_bool(row.get("decode_graph_replay")) is True
+            )
+            generation_controller = (
+                passed_bool(row.get("device_generation_controller")) is True
+            )
+            generation_policy = row.get(
+                "generation_execution_policy", "not_observed"
+            )
+            native_generation_parent = (
+                passed_bool(row.get("native_generation_parent")) is True
+            )
+            hosted_ticket_boundary = (
+                passed_bool(row.get("hosted_ticket_boundary_certified")) is True
+            )
+            generation_loop_certified = (
+                passed_bool(row.get("generation_loop_certified")) is True
+            )
+            native_policy_ok = (
+                generation_policy == "native_conditional_parent"
+                and native_generation_parent
+                and not hosted_ticket_boundary
+            )
+            hosted_policy_ok = (
+                generation_policy == "host_scheduled_captured_transactions"
+                and not native_generation_parent
+                and hosted_ticket_boundary
+            )
+            generation_ok = (
+                generation_policy == "not_observed"
+                and not native_generation_parent
+                and not hosted_ticket_boundary
+                and not generation_loop_certified
+                if not generation_controller
+                else generation_loop_certified
+                and (native_policy_ok or hosted_policy_ok)
+            )
+            forward_graph = (
+                passed_bool(row.get("forward_full_graph_capture")) is True
+                or passed_bool(row.get("forward_full_graph_replay")) is True
+            )
+            captured_generation = (
+                forward_graph if hosted_policy_ok else full_graph
+            )
+            segmented = any(
+                passed_bool(row.get(key)) is True
+                for key in (
+                    "segmented_plan",
+                    "segmented_capture",
+                    "segmented_replay",
+                )
+            )
+            path_passed = graph_ok and within_budget and (
+                not homogeneous_gpu
+                or (
+                    captured_generation
+                    and decode_graph
+                    and generation_ok
+                    and not segmented
+                )
+            )
+            status = "✅" if path_passed else "❌"
+            total += 1
+            if not path_passed:
+                failed += 1
+            csv_rel = (tdir / "production_path.csv").relative_to(
+                results_root.parent
+            )
+            production_rows.append(
+                f"| `{tdir.name}` "
+                f"| {row.get('backend', '-')} "
+                f"| {row.get('execution_path', '-')} "
+                f"| {'yes' if captured_generation else 'no'} "
+                f"| {'yes' if decode_graph else 'no'} "
+                f"| {generation_policy if generation_controller else '-'} "
+                f"| {'yes' if segmented else 'no'} "
+                f"| {'yes' if passed_bool(row.get('model_context_reused')) is True else 'no'} "
+                f"| {fmt_float(row.get('elapsed_seconds'), 2)} / "
+                f"{fmt_float(row.get('budget_seconds'), 0)} "
+                f"| {status} "
+                f"| `{csv_rel}` |"
+            )
+
+        if production_rows:
+            out.append("#### Production path and economy")
+            out.append("")
+            out.append(
+                "| Test | Backend | Path | Captured generation | Decode graph | Generation policy | Segmented | Context reused | Seconds / budget | Status | CSV |"
+            )
+            out.append(
+                "|------|---------|------|:----------:|:------------:|:-----------------:|:---------:|:--------------:|-----------------:|:------:|-----|"
+            )
+            out.extend(production_rows)
+            out.append("")
 
         # Prefill table
         prefill_rows: list[str] = []

@@ -47,7 +47,11 @@ from .corpus import (
     runtime_key,
 )
 from .exact_oracle import candidate_is_eligible
-from .paired_confirmation import PairedCellKey, PairedTimingComparison
+from .paired_confirmation import (
+    PairedCellKey,
+    PairedTimingComparison,
+    prefer_promotion_eligible_comparisons,
+)
 from .policy_accelerator import (
     TREE_MAXIMUM_FEATURE_AXES,
     UINT32_MAX,
@@ -2980,7 +2984,11 @@ def _paired_effective_latencies(
     component keeps separate confirmation sessions off the absolute clock axis.
     """
 
-    edges = tuple(comparisons)
+    # A CPU edge collected in an isolated one-rank timing process supersedes
+    # historical evidence whose co-run environment was not recorded. Retaining
+    # the legacy edge as an equal-weight observation would make a corrected cell
+    # depend on the very socket interference this protocol revision removes.
+    edges = prefer_promotion_eligible_comparisons(comparisons)
     adjacency: dict[str, set[str]] = defaultdict(set)
     for comparison in edges:
         selected = comparison.selected_effective_candidate_id
@@ -3145,6 +3153,8 @@ def _paired_domain_digest(
                 item.exact_effective_candidate_id,
                 item.selected_to_exact_median_ratio,
                 item.pair_count,
+                item.timing_scope,
+                item.mpi_world_size,
             ),
         ):
             payload.append({
@@ -3173,6 +3183,8 @@ def _paired_domain_digest(
                     comparison.selected_to_exact_median_ratio.hex()
                 ),
                 "pair_count": comparison.pair_count,
+                "timing_scope": comparison.timing_scope,
+                "mpi_world_size": comparison.mpi_world_size,
             })
     return "sha256:" + _content_key({"comparisons": payload})
 

@@ -20,11 +20,15 @@
 #include "stages/HiddenStateRowSelectStage.h"
 #include "stages/HiddenStateRowsSelectStage.h"
 #include "stages/LMHeadStage.h"
+#include "stages/MoEOverlayTicketPublishStage.h"
+#include "stages/MoEOverlayTicketConsumeStage.h"
 #include "stages/MoEExpertDispatchStage.h"
 #include "stages/MoELocalExpertStage.h"
 #include "stages/MoESparseDispatchStage.h"
 #include "stages/MoESparseReturnReduceStage.h"
 #include "stages/MoEDeviceRebalanceStage.h"
+#include "stages/MoEGPUCurrentBatchLLEPStage.h"
+#include "stages/MoEDeviceDecodeCommitBoundaryStage.h"
 #include "stages/MoERoutingStage.h"
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/ResidualAddStage.h"
@@ -154,6 +158,64 @@ namespace llaminar2
         return std::make_unique<MoERoutingStage>(params);
     }
 
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoEOverlayTicketPublish(
+        const MoEOverlayTicketPublishStage::Params &params)
+    {
+        return std::make_unique<MoEOverlayTicketPublishStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoEOverlayTicketConsume(
+        const MoEOverlayTicketConsumeStage::Params &params)
+    {
+        return std::make_unique<MoEOverlayTicketConsumeStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoEOverlayActivationDispatchPack(
+        const MoEOverlayActivationDispatchPackStage::Params &params)
+    {
+        return std::make_unique<MoEOverlayActivationDispatchPackStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoEOverlayActivationDispatchPackBatch(
+        const MoEOverlayActivationDispatchPackBatchStage::Params &params)
+    {
+        return std::make_unique<
+            MoEOverlayActivationDispatchPackBatchStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoEOverlayActivationDispatchConsume(
+        const MoEOverlayActivationDispatchConsumeStage::Params &params)
+    {
+        return std::make_unique<MoEOverlayActivationDispatchConsumeStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoEOverlayActivationReturnPack(
+        const MoEOverlayActivationReturnPackStage::Params &params)
+    {
+        return std::make_unique<MoEOverlayActivationReturnPackStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoEOverlayActivationReturnConsume(
+        const MoEOverlayActivationReturnConsumeStage::Params &params)
+    {
+        return std::make_unique<MoEOverlayActivationReturnConsumeStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoEOverlayActivationReturnConsumeBatch(
+        const MoEOverlayActivationReturnConsumeBatchStage::Params &params)
+    {
+        return std::make_unique<
+            MoEOverlayActivationReturnConsumeBatchStage>(params);
+    }
+
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertDispatch(
         const MoEExpertDispatchStage::Params &params)
     {
@@ -166,10 +228,24 @@ namespace llaminar2
         return std::make_unique<MoESparseDispatchStage>(params);
     }
 
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoERankBatchDispatch(
+        const MoERankBatchDispatchStage::Params &params)
+    {
+        return std::make_unique<MoERankBatchDispatchStage>(params);
+    }
+
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoELocalExpert(
         const MoELocalExpertStage::Params &params)
     {
         return std::make_unique<MoELocalExpertStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoELocalExpertCompletion(
+        const MoELocalExpertCompletionStage::Params &params)
+    {
+        return std::make_unique<MoELocalExpertCompletionStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoESparseReturnReduce(
@@ -178,10 +254,38 @@ namespace llaminar2
         return std::make_unique<MoESparseReturnReduceStage>(params);
     }
 
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoERankBatchReturnReduce(
+        const MoERankBatchReturnReduceStage::Params &params)
+    {
+        return std::make_unique<MoERankBatchReturnReduceStage>(params);
+    }
+
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEDeviceRebalance(
         const MoEDeviceRebalanceStage::Params &params)
     {
         return std::make_unique<MoEDeviceRebalanceStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoEGPUCurrentBatchLLEP(
+        const MoEGPUCurrentBatchLLEPStage::Params &params)
+    {
+        return std::make_unique<MoEGPUCurrentBatchLLEPStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoEDeviceDecodeCommitBoundary(
+        const MoEDeviceDecodeCommitBoundaryStage::Params &params)
+    {
+        return std::make_unique<MoEDeviceDecodeCommitBoundaryStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoECPUCurrentBatchLLEP(
+        const MoECPUCurrentBatchLLEPStage::Params &params)
+    {
+        return std::make_unique<MoECPUCurrentBatchLLEPStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createSharedExpertFFN(
@@ -200,6 +304,20 @@ namespace llaminar2
         const MoECanonicalRouteReduceStage::Params &params)
     {
         return std::make_unique<MoECanonicalRouteReduceStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoECanonicalRouteGather(
+        const MoECanonicalRouteGatherStage::Params &params)
+    {
+        return std::make_unique<MoECanonicalRouteGatherStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoECanonicalOutputBroadcast(
+        const MoECanonicalOutputBroadcastStage::Params &params)
+    {
+        return std::make_unique<MoECanonicalOutputBroadcastStage>(params);
     }
 
     std::unique_ptr<IComputeStage>

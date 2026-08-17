@@ -1,18 +1,27 @@
 /**
  * @file Test__GPUExpertTransfer_CUDA.cpp
- * @brief CUDA D2D coverage for GPU expert packed transfer.
+ * @brief CUDA D2D coverage for packed and floating expert transfers.
+ *
+ * In addition to the separated NativeVNNI layout, this suite moves raw FP16,
+ * BF16, and FP32 projection payloads through the persistent production peer
+ * lane. Every case joins an exact producer event, observes completion only by
+ * polling the destination event, and compares every bit at the destination.
  */
 
 #include <gtest/gtest.h>
 
 #include "backends/DeviceId.h"
+#include "execution/moe/ExpertTierGpuPeerTransferLane.h"
 #include "execution/moe/GPUExpertTransfer.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 #include <cstring>
+#include <chrono>
 #include <random>
+#include <string>
+#include <thread>
 #include <vector>
 
 using namespace llaminar2;
@@ -363,6 +372,321 @@ namespace
         freeCuda(d_active2_mins, dst_dev);
         freeCuda(d_active2_emins, dst_dev);
     }
+
+    /**
+     * @brief Exercise the persistent peer lane with a cross-device event edge.
+     *
+     * The maintenance thread starts from the source device deliberately. The
+     * lane must submit on its destination-owned auxiliary stream, restore the
+     * caller context, and reach readiness solely through event queries.
+     */
+    void runCudaPeerLaneTransfer()
+    {
+        requireTwoCudaDevices();
+        constexpr int src_dev = 0;
+        constexpr int dst_dev = 1;
+        constexpr int n = 2048;
+        constexpr int k = 256;
+        constexpr uint8_t payload_bytes_per_block = 16;
+        constexpr size_t block_count =
+            static_cast<size_t>(n) * static_cast<size_t>(k / 32);
+        constexpr size_t vnni_bytes =
+            block_count * payload_bytes_per_block;
+
+        std::mt19937 rng(0xC0FFEEu);
+        std::vector<uint8_t> expected_vnni(vnni_bytes);
+        std::vector<uint16_t> expected_scales(block_count);
+        std::vector<uint16_t> expected_mins(block_count);
+        std::vector<uint32_t> expected_emins(block_count);
+        for (auto &value : expected_vnni)
+            value = static_cast<uint8_t>(rng());
+        for (auto &value : expected_scales)
+            value = static_cast<uint16_t>(rng());
+        for (auto &value : expected_mins)
+            value = static_cast<uint16_t>(rng());
+        for (auto &value : expected_emins)
+            value = rng();
+
+        auto *src_vnni = allocCuda<uint8_t>(src_dev, vnni_bytes);
+        auto *src_scales = allocCuda<uint16_t>(src_dev, block_count);
+        auto *src_mins = allocCuda<uint16_t>(src_dev, block_count);
+        auto *src_emins = allocCuda<uint32_t>(src_dev, block_count);
+        auto *dst_vnni = allocCuda<uint8_t>(dst_dev, vnni_bytes);
+        auto *dst_scales = allocCuda<uint16_t>(dst_dev, block_count);
+        auto *dst_mins = allocCuda<uint16_t>(dst_dev, block_count);
+        auto *dst_emins = allocCuda<uint32_t>(dst_dev, block_count);
+        ASSERT_NE(src_vnni, nullptr);
+        ASSERT_NE(src_scales, nullptr);
+        ASSERT_NE(src_mins, nullptr);
+        ASSERT_NE(src_emins, nullptr);
+        ASSERT_NE(dst_vnni, nullptr);
+        ASSERT_NE(dst_scales, nullptr);
+        ASSERT_NE(dst_mins, nullptr);
+        ASSERT_NE(dst_emins, nullptr);
+
+        ASSERT_TRUE(uploadCuda(
+            src_vnni, expected_vnni.data(), vnni_bytes, src_dev));
+        ASSERT_TRUE(uploadCuda(
+            src_scales, expected_scales.data(), block_count, src_dev));
+        ASSERT_TRUE(uploadCuda(
+            src_mins, expected_mins.data(), block_count, src_dev));
+        ASSERT_TRUE(uploadCuda(
+            src_emins, expected_emins.data(), block_count, src_dev));
+
+        const auto source = makeCudaDescriptor(
+            src_vnni, src_scales, src_mins, src_emins,
+            n, k, payload_bytes_per_block);
+        const auto destination = makeCudaDescriptor(
+            dst_vnni, dst_scales, dst_mins, dst_emins,
+            n, k, payload_bytes_per_block);
+
+        (void)cudaSetDevice(src_dev);
+        cudaStream_t producer_stream = nullptr;
+        cudaEvent_t source_ready = nullptr;
+        ASSERT_EQ(
+            cudaStreamCreateWithFlags(
+                &producer_stream, cudaStreamNonBlocking),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaEventCreateWithFlags(
+                &source_ready, cudaEventDisableTiming),
+            cudaSuccess);
+        ASSERT_EQ(cudaEventRecord(source_ready, producer_stream), cudaSuccess);
+
+        {
+            ExpertTierGpuPeerTransferLane lane({
+                .source_device = DeviceId::cuda(src_dev),
+                .destination_device = DeviceId::cuda(dst_dev),
+                .lane_name = "cuda_peer_event_polled",
+                .perf_device = "cuda-peer",
+                .collect_timing_measurements = true,
+            });
+            std::string error;
+            ASSERT_TRUE(lane.materialize(&error)) << error;
+            ASSERT_EQ(cudaSetDevice(src_dev), cudaSuccess);
+            ASSERT_TRUE(lane.start(
+                source,
+                destination,
+                ExpertTierSourceReadiness::producerEvent(source_ready),
+                &error)) << error;
+
+            int current_device = -1;
+            ASSERT_EQ(cudaGetDevice(&current_device), cudaSuccess);
+            EXPECT_EQ(current_device, src_dev);
+
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10);
+            while (lane.progress() ==
+                       ExpertTierGpuPeerTransferProgress::Pending &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                ASSERT_NE(
+                    lane.poll(&error),
+                    ExpertTierGpuPeerTransferProgress::Failed)
+                    << error;
+                std::this_thread::yield();
+            }
+            ASSERT_EQ(
+                lane.progress(),
+                ExpertTierGpuPeerTransferProgress::Ready)
+                << error;
+
+            /*
+             * Reuse the persistent lane from an installed RCU bank.  This path
+             * must not fabricate or wait on a producer event: the retained
+             * epoch is the source-byte readiness and lifetime authority.
+             */
+            ASSERT_EQ(cudaSetDevice(src_dev), cudaSuccess);
+            ASSERT_TRUE(lane.start(
+                source,
+                destination,
+                ExpertTierSourceReadiness::publishedResidencyBank(17),
+                &error)) << error;
+            while (lane.progress() ==
+                       ExpertTierGpuPeerTransferProgress::Pending &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                ASSERT_NE(
+                    lane.poll(&error),
+                    ExpertTierGpuPeerTransferProgress::Failed)
+                    << error;
+                std::this_thread::yield();
+            }
+            ASSERT_EQ(
+                lane.progress(),
+                ExpertTierGpuPeerTransferProgress::Ready)
+                << error;
+            ASSERT_EQ(cudaGetDevice(&current_device), cudaSuccess);
+            EXPECT_EQ(current_device, src_dev);
+
+            const auto stats = lane.stats();
+            EXPECT_EQ(stats.transfers_started, 2u);
+            EXPECT_EQ(stats.transfers_completed, 2u);
+            EXPECT_EQ(stats.bytes_submitted, source.totalBytes() * 2u);
+            EXPECT_EQ(stats.producer_event_waits, 1u);
+            EXPECT_EQ(stats.published_bank_sources, 1u);
+            EXPECT_EQ(stats.timing_measurement_failures, 0u);
+            EXPECT_TRUE(stats.last_measurement.valid());
+            EXPECT_EQ(stats.last_measurement.bytes, source.totalBytes());
+            EXPECT_GT(stats.last_measurement.device_nanoseconds, 0u);
+            EXPECT_EQ(stats.inference_stream_waits, 0u);
+            EXPECT_EQ(stats.blocking_synchronizations, 0u);
+        }
+
+        std::vector<uint8_t> actual_vnni(vnni_bytes);
+        std::vector<uint16_t> actual_scales(block_count);
+        std::vector<uint16_t> actual_mins(block_count);
+        std::vector<uint32_t> actual_emins(block_count);
+        ASSERT_TRUE(downloadCuda(
+            actual_vnni.data(), dst_vnni, vnni_bytes, dst_dev));
+        ASSERT_TRUE(downloadCuda(
+            actual_scales.data(), dst_scales, block_count, dst_dev));
+        ASSERT_TRUE(downloadCuda(
+            actual_mins.data(), dst_mins, block_count, dst_dev));
+        ASSERT_TRUE(downloadCuda(
+            actual_emins.data(), dst_emins, block_count, dst_dev));
+        EXPECT_EQ(actual_vnni, expected_vnni);
+        EXPECT_EQ(actual_scales, expected_scales);
+        EXPECT_EQ(actual_mins, expected_mins);
+        EXPECT_EQ(actual_emins, expected_emins);
+
+        (void)cudaSetDevice(src_dev);
+        ASSERT_EQ(cudaEventDestroy(source_ready), cudaSuccess);
+        ASSERT_EQ(cudaStreamDestroy(producer_stream), cudaSuccess);
+        freeCuda(src_vnni, src_dev);
+        freeCuda(src_scales, src_dev);
+        freeCuda(src_mins, src_dev);
+        freeCuda(src_emins, src_dev);
+        freeCuda(dst_vnni, dst_dev);
+        freeCuda(dst_scales, dst_dev);
+        freeCuda(dst_mins, dst_dev);
+        freeCuda(dst_emins, dst_dev);
+    }
+
+    /**
+     * @brief Prove one contiguous floating projection uses peer DMA unchanged.
+     *
+     * Floating formats are intentionally treated as opaque bytes by tier
+     * movement. The element width controls the production-shaped allocation;
+     * arbitrary bit patterns (including values that would decode as NaN) prove
+     * the lane never interprets or converts a same-backend payload.
+     *
+     * @param precision_name Stable test/evidence identity (fp16, bf16, fp32).
+     * @param element_bytes Bytes per scalar in the floating representation.
+     * @param seed Deterministic source-pattern seed.
+     */
+    void runCudaContiguousPeerLaneTransfer(
+        const char *precision_name,
+        std::size_t element_bytes,
+        std::uint32_t seed)
+    {
+        requireTwoCudaDevices();
+        ASSERT_TRUE(element_bytes == 2 || element_bytes == 4);
+        constexpr int src_dev = 0;
+        constexpr int dst_dev = 1;
+        constexpr std::size_t element_count = 32771;
+        const std::size_t bytes = element_count * element_bytes;
+
+        std::vector<std::uint8_t> expected(bytes);
+        for (std::size_t index = 0; index < expected.size(); ++index)
+        {
+            expected[index] = static_cast<std::uint8_t>(
+                (index * 43u + seed * 17u + (index >> 3u)) & 0xffu);
+        }
+
+        auto *source = allocCuda<std::uint8_t>(src_dev, bytes);
+        auto *destination = allocCuda<std::uint8_t>(dst_dev, bytes);
+        ASSERT_NE(source, nullptr);
+        ASSERT_NE(destination, nullptr);
+
+        ASSERT_EQ(cudaSetDevice(src_dev), cudaSuccess);
+        cudaStream_t producer_stream = nullptr;
+        cudaEvent_t source_ready = nullptr;
+        ASSERT_EQ(
+            cudaStreamCreateWithFlags(
+                &producer_stream, cudaStreamNonBlocking),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaEventCreateWithFlags(&source_ready, cudaEventDisableTiming),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                source,
+                expected.data(),
+                bytes,
+                cudaMemcpyHostToDevice,
+                producer_stream),
+            cudaSuccess);
+        ASSERT_EQ(cudaEventRecord(source_ready, producer_stream), cudaSuccess);
+
+        {
+            ExpertTierGpuPeerTransferLane lane({
+                .source_device = DeviceId::cuda(src_dev),
+                .destination_device = DeviceId::cuda(dst_dev),
+                .lane_name = std::string("cuda_peer_contiguous_") +
+                             precision_name,
+                .perf_device = "cuda-peer-floating",
+                .collect_timing_measurements = true,
+            });
+            std::string error;
+            ASSERT_TRUE(lane.materialize(&error)) << error;
+
+            /* Start from the source device to catch ambient-device coupling. */
+            ASSERT_EQ(cudaSetDevice(src_dev), cudaSuccess);
+            ASSERT_TRUE(lane.startContiguous(
+                source,
+                destination,
+                bytes,
+                ExpertTierSourceReadiness::producerEvent(source_ready),
+                &error))
+                << error;
+
+            int current_device = -1;
+            ASSERT_EQ(cudaGetDevice(&current_device), cudaSuccess);
+            EXPECT_EQ(current_device, src_dev);
+
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::seconds(10);
+            while (lane.progress() ==
+                       ExpertTierGpuPeerTransferProgress::Pending &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                ASSERT_NE(
+                    lane.poll(&error),
+                    ExpertTierGpuPeerTransferProgress::Failed)
+                    << error;
+                std::this_thread::yield();
+            }
+            ASSERT_EQ(
+                lane.progress(), ExpertTierGpuPeerTransferProgress::Ready)
+                << error;
+
+            const auto stats = lane.stats();
+            EXPECT_EQ(stats.transfers_started, 1u);
+            EXPECT_EQ(stats.transfers_completed, 1u);
+            EXPECT_EQ(stats.bytes_submitted, bytes);
+            EXPECT_EQ(stats.producer_event_waits, 1u);
+            EXPECT_EQ(stats.published_bank_sources, 0u);
+            EXPECT_EQ(stats.failed_transfers, 0u);
+            EXPECT_EQ(stats.timing_measurement_failures, 0u);
+            EXPECT_TRUE(stats.last_measurement.valid());
+            EXPECT_EQ(stats.last_measurement.bytes, bytes);
+            EXPECT_GT(stats.last_measurement.device_nanoseconds, 0u);
+            EXPECT_EQ(stats.inference_stream_waits, 0u);
+            EXPECT_EQ(stats.blocking_synchronizations, 0u);
+        }
+
+        std::vector<std::uint8_t> actual(bytes);
+        ASSERT_TRUE(downloadCuda(
+            actual.data(), destination, bytes, dst_dev));
+        EXPECT_EQ(actual, expected);
+
+        ASSERT_EQ(cudaSetDevice(src_dev), cudaSuccess);
+        ASSERT_EQ(cudaEventDestroy(source_ready), cudaSuccess);
+        ASSERT_EQ(cudaStreamDestroy(producer_stream), cudaSuccess);
+        freeCuda(source, src_dev);
+        freeCuda(destination, dst_dev);
+    }
 }
 
 TEST(Test__GPUExpertTransferCUDA, D2DTransfer)
@@ -383,4 +707,24 @@ TEST(Test__GPUExpertTransferCUDA, RepeatedD2DTransfer)
 TEST(Test__GPUExpertTransferCUDA, StagedActivationCopiesTransferSlotIntoActiveSlot)
 {
     runCudaStagedActivation();
+}
+
+TEST(Test__ExpertTierGpuPeerTransferCUDA, EventPolledTransferIsByteExact)
+{
+    runCudaPeerLaneTransfer();
+}
+
+TEST(Test__ExpertTierGpuPeerTransferCUDA, FP16ContiguousTransferIsByteExact)
+{
+    runCudaContiguousPeerLaneTransfer("fp16", 2, 0xF016u);
+}
+
+TEST(Test__ExpertTierGpuPeerTransferCUDA, BF16ContiguousTransferIsByteExact)
+{
+    runCudaContiguousPeerLaneTransfer("bf16", 2, 0xBF16u);
+}
+
+TEST(Test__ExpertTierGpuPeerTransferCUDA, FP32ContiguousTransferIsByteExact)
+{
+    runCudaContiguousPeerLaneTransfer("fp32", 4, 0xF032u);
 }

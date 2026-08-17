@@ -2,7 +2,9 @@
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
 #include "utils/KVCacheProfiler.h"
+#include "utils/Logger.h"
 #include "utils/WeightLoadingProfiler.h"
+#include "utils/ProductionParityEvidence.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -16,6 +18,7 @@
 #include <string>
 
 using namespace llaminar2;
+using namespace llaminar2::test::parity;
 
 namespace
 {
@@ -53,6 +56,27 @@ namespace
         std::string old_value_;
     };
 
+    class ScopedLoggerRank
+    {
+    public:
+        explicit ScopedLoggerRank(int rank)
+            : previous_rank_(Logger::getInstance().getRank())
+        {
+            Logger::getInstance().setRank(rank);
+        }
+
+        ~ScopedLoggerRank()
+        {
+            Logger::getInstance().setRank(previous_rank_);
+        }
+
+        ScopedLoggerRank(const ScopedLoggerRank &) = delete;
+        ScopedLoggerRank &operator=(const ScopedLoggerRank &) = delete;
+
+    private:
+        int previous_rank_ = -1;
+    };
+
     std::filesystem::path uniqueTempPath(const std::string &suffix)
     {
         const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -66,6 +90,135 @@ namespace
         std::stringstream buffer;
         buffer << in.rdbuf();
         return buffer.str();
+    }
+
+    /**
+     * @brief Append one complete participant ledger for HIP ticket dispatch.
+     *
+     * The fixture intentionally uses three controller transactions: two
+     * ticket-selected captured continuations followed by one terminal
+     * submission. That mirrors the equality the production gate proves.
+     */
+    void appendCertifiedHostedTicketParticipant(
+        std::vector<PerfStatRecord> &records,
+        const std::string &device)
+    {
+        records.push_back(PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_loop_graph_materializations",
+            .device = device,
+            .tags = {
+                {"backend", "HIP"},
+                {"execution",
+                 "hosted_captured_transactions_with_ticket_only_dispatch"},
+                {"fragments", "5"}},
+            .value = 1.0,
+        });
+        records.push_back(PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_loop_graph_launches",
+            .device = device,
+            .tags = {
+                {"backend", "HIP"},
+                {"execution",
+                 "hosted_ticket_selected_captured_transactions"},
+                {"fragments", "5"}},
+            .value = 1.0,
+        });
+        records.push_back(PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_dispatch_ticket_d2h_submissions",
+            .device = device,
+            .tags = {
+                {"bytes", "48"},
+                {"authority", "immutable_scheduler_snapshot"},
+                {"state_payload", "false"}},
+            .value = 3.0,
+        });
+        for (int transaction = 1; transaction <= 3; ++transaction)
+        {
+            records.push_back(PerfStatRecord{
+                .kind = PerfStatRecord::Kind::Counter,
+                .domain = "mtp",
+                .name = "device_generation_dispatch_tickets_observed",
+                .device = device,
+                .tags = {
+                    {"transaction", std::to_string(transaction)},
+                    {"next_depth", "2"},
+                    {"complete", transaction == 3 ? "true" : "false"},
+                    {"maintenance_due", "false"}},
+                .value = 1.0,
+            });
+        }
+        records.push_back(PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "hosted_device_generation_transaction_submissions",
+            .device = device,
+            .tags = {
+                {"depth", "2"},
+                {"fragments", "5"},
+                {"dynamic_depth_source", "device_controller_ticket"}},
+            .value = 2.0,
+        });
+        records.push_back(PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "hosted_device_generation_terminal_submissions",
+            .device = device,
+            .tags = {{"transactions", "3"}},
+            .value = 1.0,
+        });
+        records.push_back(PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_terminal_transactions",
+            .device = device,
+            .value = 3.0,
+        });
+        records.push_back(PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name =
+                "device_generation_terminal_compact_outcome_reductions",
+            .device = device,
+            .tags = {
+                {"authority", "device_generation_controller"},
+                {"accounting_role", "captured_graph_replay_multiplier"},
+                {"source", "captured_stochastic_compact_outcome"},
+                {"execution", "host_scheduled_captured_transactions"}},
+            .value = 3.0,
+        });
+        records.push_back(PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_terminal_response_bridges",
+            .device = device,
+            .value = 1.0,
+        });
+    }
+
+    /** @brief Build a complete mirrored two-participant HIP ticket fixture. */
+    std::vector<PerfStatRecord> certifiedHostedTicketRecords()
+    {
+        std::vector<PerfStatRecord> records{
+            PerfStatRecord{
+                .kind = PerfStatRecord::Kind::Counter,
+                .domain = "mtp",
+                .name = "device_generation_execution_policy_selections",
+                .device = "ROCm:0",
+                .tags = {
+                    {"policy", "host_scheduled_captured_transactions"},
+                    {"topology", "fixed_depth"},
+                    {"selection_boundary", "pre_first_draft"}},
+                .value = 1.0,
+            }};
+        appendCertifiedHostedTicketParticipant(records, "ROCm:0");
+        appendCertifiedHostedTicketParticipant(records, "ROCm:1");
+        return records;
     }
 }
 
@@ -104,6 +257,254 @@ TEST(Test__PerfStatsCollector, AggregatesCountersAndTimers)
     EXPECT_EQ(timer_it->min_ns, 1000u);
     EXPECT_EQ(timer_it->max_ns, 3000u);
     EXPECT_EQ(timer_it->device, "rocm:0");
+}
+
+TEST(Test__ProductionParityEvidence, RecognizesNativeConditionalGenerationParent)
+{
+    const std::vector<PerfStatRecord> records = {
+        PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_loop_graph_materializations",
+            .tags = {{"execution", "native_device_controlled_switch_while"}},
+            .value = 1.0,
+        },
+        PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_loop_graph_launches",
+            .tags = {{"execution", "single_async_native_switch_while_launch"}},
+            .value = 1.0,
+        },
+        PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_terminal_compact_outcome_reductions",
+            .tags = {{"execution", "native_conditional_graph"}},
+            .value = 4.0,
+        },
+    };
+
+    const auto evidence = collectProductionDeviceGenerationEvidence(records);
+    EXPECT_TRUE(evidence.controller_observed);
+    EXPECT_TRUE(evidence.hasNativeParent());
+    EXPECT_TRUE(evidence.hasCertifiedGenerationLoop());
+    EXPECT_FALSE(evidence.hosted_ticket_boundary_certified);
+    EXPECT_EQ(
+        evidence.policy,
+        ProductionDeviceGenerationPolicy::NativeConditionalParent);
+    EXPECT_STREQ(
+        productionDeviceGenerationPolicyName(evidence.policy),
+        "native_conditional_parent");
+}
+
+TEST(Test__ProductionParityEvidence, DistinguishesHostedCapturedTransactions)
+{
+    const std::vector<PerfStatRecord> records = {
+        PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_loop_graph_materializations",
+            .tags = {
+                {"execution",
+                 "hosted_captured_transactions_with_ticket_only_dispatch"}},
+            .value = 1.0,
+        },
+        PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_loop_graph_launches",
+            .tags = {
+                {"execution",
+                 "hosted_ticket_selected_captured_transactions"}},
+            .value = 1.0,
+        },
+        PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_terminal_compact_outcome_reductions",
+            .tags = {
+                {"execution", "host_scheduled_captured_transactions"}},
+            .value = 3.0,
+        },
+    };
+
+    const auto evidence = collectProductionDeviceGenerationEvidence(records);
+    EXPECT_TRUE(evidence.controller_observed);
+    EXPECT_FALSE(evidence.hasNativeParent());
+    EXPECT_FALSE(evidence.hosted_ticket_boundary_certified);
+    EXPECT_FALSE(evidence.hasCertifiedGenerationLoop());
+    EXPECT_EQ(
+        evidence.policy,
+        ProductionDeviceGenerationPolicy::HostScheduledCapturedTransactions);
+}
+
+TEST(Test__ProductionParityEvidence, CertifiesMirroredHostedTicketBoundary)
+{
+    const auto evidence = collectProductionDeviceGenerationEvidence(
+        certifiedHostedTicketRecords());
+    EXPECT_TRUE(evidence.controller_observed);
+    EXPECT_FALSE(evidence.hasNativeParent());
+    EXPECT_TRUE(evidence.hosted_ticket_boundary_certified);
+    EXPECT_TRUE(evidence.hasCertifiedGenerationLoop());
+    EXPECT_EQ(
+        evidence.policy,
+        ProductionDeviceGenerationPolicy::HostScheduledCapturedTransactions);
+}
+
+TEST(Test__ProductionParityEvidence, CertifiesRankCoordinatedHostedLaunch)
+{
+    auto records = certifiedHostedTicketRecords();
+    std::erase_if(
+        records,
+        [](const PerfStatRecord &record)
+        {
+            return record.name == "device_generation_loop_graph_launches";
+        });
+    records.push_back(PerfStatRecord{
+        .kind = PerfStatRecord::Kind::Counter,
+        .domain = "mtp",
+        .name = "rank_device_generation_parent_launches",
+        .device = "rank",
+        .tags = {
+            {"execution", "hosted_ticket_selected_captured_transactions"},
+            {"launch_order", "all_participants_before_ticket_wait"},
+            {"participants", "2"}},
+        .value = 1.0,
+    });
+
+    const auto evidence = collectProductionDeviceGenerationEvidence(records);
+    EXPECT_TRUE(evidence.hosted_ticket_boundary_certified)
+        << evidence.certification_detail;
+    EXPECT_TRUE(evidence.hasCertifiedGenerationLoop());
+
+    records.back().tags["participants"] = "3";
+    const auto malformed =
+        collectProductionDeviceGenerationEvidence(records);
+    EXPECT_FALSE(malformed.hosted_ticket_boundary_certified);
+    EXPECT_FALSE(malformed.hasCertifiedGenerationLoop());
+}
+
+TEST(Test__ProductionParityEvidence, CertifiesExactRetainedHostedGraphReuse)
+{
+    auto records = certifiedHostedTicketRecords();
+    for (PerfStatRecord &record : records)
+    {
+        if (record.name !=
+            "device_generation_loop_graph_materializations")
+        {
+            continue;
+        }
+
+        record.name = "device_generation_loop_graph_reuses";
+        record.tags.erase("execution");
+        record.tags.insert({
+            {"execution_policy", "host_scheduled_captured_transactions"},
+            {"requests", "1"},
+            {"draft_depth", "2"},
+            {"minimum_draft_depth", "2"},
+            {"maximum_draft_depth", "2"},
+            {"depth_policy", "fixed_width"},
+            {"sampling_mode", "stochastic"},
+            {"conditional_fragments", "0"},
+            {"workspace_generation", "7"},
+        });
+    }
+
+    const auto evidence = collectProductionDeviceGenerationEvidence(records);
+    EXPECT_TRUE(evidence.hosted_ticket_boundary_certified)
+        << evidence.certification_detail;
+    EXPECT_TRUE(evidence.hasCertifiedGenerationLoop());
+
+    auto malformed = records;
+    auto reuse = std::find_if(
+        malformed.begin(),
+        malformed.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.name == "device_generation_loop_graph_reuses" &&
+                   record.device == "ROCm:1";
+        });
+    ASSERT_NE(reuse, malformed.end());
+    reuse->tags["workspace_generation"] = "0";
+    const auto malformed_evidence =
+        collectProductionDeviceGenerationEvidence(malformed);
+    EXPECT_FALSE(malformed_evidence.hosted_ticket_boundary_certified);
+    EXPECT_FALSE(malformed_evidence.hasCertifiedGenerationLoop());
+}
+
+TEST(Test__ProductionParityEvidence, RejectsMalformedHostedTicketEvidence)
+{
+    auto malformed_ticket = certifiedHostedTicketRecords();
+    auto ticket = std::find_if(
+        malformed_ticket.begin(),
+        malformed_ticket.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.name ==
+                       "device_generation_dispatch_ticket_d2h_submissions" &&
+                   record.device == "ROCm:0";
+        });
+    ASSERT_NE(ticket, malformed_ticket.end());
+    ticket->tags["bytes"] = "64";
+    EXPECT_FALSE(collectProductionDeviceGenerationEvidence(malformed_ticket)
+                     .hosted_ticket_boundary_certified);
+
+    auto divergent_ledger = certifiedHostedTicketRecords();
+    auto transactions = std::find_if(
+        divergent_ledger.begin(),
+        divergent_ledger.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.name ==
+                       "device_generation_terminal_transactions" &&
+                   record.device == "ROCm:1";
+        });
+    ASSERT_NE(transactions, divergent_ledger.end());
+    transactions->value = 4.0;
+    EXPECT_FALSE(collectProductionDeviceGenerationEvidence(divergent_ledger)
+                     .hosted_ticket_boundary_certified);
+
+    auto mutable_host_read = certifiedHostedTicketRecords();
+    mutable_host_read.push_back(PerfStatRecord{
+        .kind = PerfStatRecord::Kind::Counter,
+        .domain = "mtp",
+        .name = "grouped_outcome_stochastic_device_outcome_host_bridge",
+        .device = "ROCm:0",
+        .value = 1.0,
+    });
+    EXPECT_FALSE(collectProductionDeviceGenerationEvidence(mutable_host_read)
+                     .hosted_ticket_boundary_certified);
+}
+
+TEST(Test__ProductionParityEvidence, RejectsMissingOrConflictingAuthorityTags)
+{
+    const PerfStatRecord unclassified{
+        .kind = PerfStatRecord::Kind::Counter,
+        .domain = "mtp",
+        .name = "device_generation_terminal_transactions",
+        .value = 2.0,
+    };
+    auto evidence =
+        collectProductionDeviceGenerationEvidence({unclassified});
+    EXPECT_TRUE(evidence.controller_observed);
+    EXPECT_FALSE(evidence.hasNativeParent());
+    EXPECT_EQ(
+        evidence.policy,
+        ProductionDeviceGenerationPolicy::Unclassified);
+
+    PerfStatRecord native = unclassified;
+    native.name = "device_generation_loop_graph_launches";
+    native.tags = {{"execution", "single_async_native_while_launch"}};
+    PerfStatRecord hosted = native;
+    hosted.tags = {
+        {"execution", "hosted_ticket_selected_captured_transactions"}};
+    evidence = collectProductionDeviceGenerationEvidence({native, hosted});
+    EXPECT_TRUE(evidence.controller_observed);
+    EXPECT_FALSE(evidence.hasNativeParent());
+    EXPECT_EQ(
+        evidence.policy,
+        ProductionDeviceGenerationPolicy::Inconsistent);
 }
 
 TEST(Test__PerfStatsCollector, ExportsFilteredJsonAndCsv)
@@ -246,6 +647,91 @@ TEST(Test__PerfStatsCollector, PerfStatsExportAloneDoesNotEnableGpuStageEventTim
     EXPECT_FALSE(PerfStatsCollector::gpuStageEventTimingEnabled());
 }
 
+TEST(Test__PerfStatsCollector, UnrelatedExportDoesNotEnableCpuStageTiming)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv cpu_stage_timing("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "moe_canonical_publication");
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    EXPECT_TRUE(PerfStatsCollector::isEnabled());
+    EXPECT_FALSE(PerfStatsCollector::cpuStageTimingEnabled());
+}
+
+TEST(Test__PerfStatsCollector, ExportFilterIsACollectionDomainGate)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "mtp");
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    EXPECT_TRUE(PerfStatsCollector::isDomainEnabled("mtp"));
+    EXPECT_FALSE(PerfStatsCollector::isDomainEnabled("kernel"));
+    EXPECT_FALSE(PerfStatsCollector::isDomainEnabled("stage_cpu_detail"));
+
+    PerfStatsCollector::addCounter("mtp", "kept", 1.0);
+    PerfStatsCollector::addCounter("kernel", "discarded", 1.0);
+    {
+        PerfStatsCollector::ScopedTimer discarded_timer(
+            "kernel", "discarded_timer");
+    }
+
+    const auto records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records.front().domain, "mtp");
+    EXPECT_EQ(records.front().name, "kept");
+}
+
+TEST(Test__PerfStatsCollector, QualifiedFilterEnablesItsOwningDomain)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv filter(
+        "LLAMINAR_PERF_STATS_FILTER",
+        "mtp.verifier_forward");
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    EXPECT_TRUE(PerfStatsCollector::isDomainEnabled("mtp"));
+    EXPECT_FALSE(PerfStatsCollector::isDomainEnabled("moe"));
+}
+
+TEST(Test__PerfStatsCollector, CpuStageFilterEnablesCpuStageTiming)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv cpu_stage_timing("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "stage_cpu_detail.verifier");
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    EXPECT_TRUE(PerfStatsCollector::isEnabled());
+    EXPECT_TRUE(PerfStatsCollector::cpuStageTimingEnabled());
+
+    PerfStatsCollector::addCounter("stage_cpu", "verifier", 1.0);
+    PerfStatsCollector::addCounter("stage_cpu_detail", "verifier", 1.0);
+    const auto records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records.front().domain, "stage_cpu_detail");
+}
+
+TEST(Test__PerfStatsCollector, ExplicitCpuStageTimingEnablesStructuredCollection)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", nullptr);
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", nullptr);
+    ScopedEnv csv("LLAMINAR_PERF_STATS_CSV", nullptr);
+    ScopedEnv cpu_stage_timing("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", "1");
+    PerfStatsCollector::reset();
+
+    EXPECT_TRUE(PerfStatsCollector::isEnabled());
+    EXPECT_TRUE(PerfStatsCollector::cpuStageTimingEnabled());
+}
+
 TEST(Test__PerfStatsCollector, GraphKernelInventoryIsExplicitAndReloadable)
 {
     ScopedEnv inventory("LLAMINAR_GPU_GRAPH_KERNEL_INVENTORY", nullptr);
@@ -264,12 +750,14 @@ TEST(Test__PerfStatsCollector, GpuStageTimingEnablesStructuredCollection)
     ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
     ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
     ScopedEnv perf_stage_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv cpu_stage_timing("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", nullptr);
     ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", nullptr);
     ScopedEnv json("LLAMINAR_PERF_STATS_JSON", nullptr);
     ScopedEnv csv("LLAMINAR_PERF_STATS_CSV", nullptr);
     PerfStatsCollector::reset();
 
     EXPECT_TRUE(PerfStatsCollector::isEnabled());
+    EXPECT_FALSE(PerfStatsCollector::cpuStageTimingEnabled());
     EXPECT_TRUE(PerfStatsCollector::gpuStageEventTimingEnabled());
 
     PerfStatsCollector::recordTimingNs(
@@ -315,10 +803,12 @@ TEST(Test__PerfStatsCollector, DeprecatedUnifiedProfilingAliasesGraphSafePerfSta
     ScopedEnv executor_profiling("LLAMINAR_EXECUTOR_PROFILING", nullptr);
     ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", nullptr);
     ScopedEnv perf_stage_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv cpu_stage_timing("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", nullptr);
     ScopedEnv summary("LLAMINAR_PERF_STATS_SUMMARY", nullptr);
     ScopedEnv profiling("LLAMINAR_PROFILING", "1");
 
     EXPECT_TRUE(PerfStatsCollector::isEnabled());
+    EXPECT_TRUE(PerfStatsCollector::cpuStageTimingEnabled());
     EXPECT_TRUE(PerfStatsCollector::gpuStageEventTimingEnabled());
     EXPECT_FALSE(debugEnv().profile.enabled);
     EXPECT_FALSE(debugEnv().execution.executor_profiling);
@@ -340,6 +830,37 @@ TEST(Test__PerfStatsCollector, DeprecatedUnifiedProfilingFlushesSummaryWithoutEx
 
     EXPECT_NE(output.find("UNIFIED PERF STATS"), std::string::npos);
     EXPECT_NE(output.find("profiling.summary_only_flush"), std::string::npos);
+}
+
+TEST(Test__PerfStatsCollector, RankQualifiedExportWritesParticipantLocalEvidence)
+{
+    ScopedLoggerRank rank(7);
+
+    const std::filesystem::path path_template =
+        uniqueTempPath(".rank-{rank}.json");
+    std::string expected_path_text = path_template.string();
+    const size_t token = expected_path_text.find("{rank}");
+    ASSERT_NE(token, std::string::npos);
+    expected_path_text.replace(token, std::string("{rank}").size(), "7");
+    const std::filesystem::path expected_path(expected_path_text);
+
+    {
+        ScopedEnv json("LLAMINAR_PERF_STATS_JSON", path_template.c_str());
+        ScopedEnv csv("LLAMINAR_PERF_STATS_CSV", nullptr);
+        ScopedEnv summary("LLAMINAR_PERF_STATS_SUMMARY", nullptr);
+        PerfStatsCollector::reset();
+        PerfStatsCollector::addCounter(
+            "stage_cpu", "rank_local_probe", 1.0, "prefill", "cpu");
+
+        ASSERT_TRUE(PerfStatsCollector::flushFromEnv());
+        ASSERT_TRUE(std::filesystem::exists(expected_path));
+        const auto document = nlohmann::json::parse(readFile(expected_path));
+        ASSERT_EQ(document.at("records").size(), 1u);
+        EXPECT_EQ(document.at("records")[0].at("name"), "rank_local_probe");
+    }
+
+    std::error_code error;
+    std::filesystem::remove(expected_path, error);
 }
 
 TEST(Test__PerfStatsCollector, ExistingProfilersPublishStructuredRecords)

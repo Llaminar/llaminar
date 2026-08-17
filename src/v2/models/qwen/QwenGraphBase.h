@@ -170,6 +170,12 @@ namespace llaminar2
             prepared_weight_store_ = store;
         }
 
+        void setCPUCurrentBatchLLEPPhysicalExecutor(
+            ICPUCurrentBatchLLEPPhysicalExecutor *executor) override
+        {
+            cpu_current_batch_llep_executor_ = executor;
+        }
+
         bool setComputeAllPositionLogits(bool enabled) override
         {
             config_.compute_all_position_logits = enabled;
@@ -347,6 +353,21 @@ namespace llaminar2
             const int32_t *absolute_position_ids_device = nullptr) override;
 
     protected:
+        /**
+         * @brief Resolve the semantic node prefix for one FFN subgraph.
+         *
+         * Ordinary transformer layers use their model-layer identity. Model
+         * families that reuse the FFN builder inside an independently
+         * executable graph, such as a recursive MTP sidecar, override this
+         * hook so graph identity, snapshots, and diagnostics all describe the
+         * actual execution owner rather than the source weight layer.
+         *
+         * @param layer_idx Source transformer layer supplying the weights.
+         * @return Stable node prefix including its trailing underscore.
+         */
+        [[nodiscard]] virtual std::string ffnGraphStagePrefix(
+            int layer_idx) const;
+
         // =====================================================================
         // Configuration (protected for subclass access)
         // =====================================================================
@@ -356,6 +377,8 @@ namespace llaminar2
         TensorFactory *tensor_factory_ = nullptr;
         BufferArena *arena_ = nullptr;
         PreparedWeightStore *prepared_weight_store_ = nullptr;
+        ICPUCurrentBatchLLEPPhysicalExecutor *
+            cpu_current_batch_llep_executor_ = nullptr;
         ModelWeights weights_;
         ModelWeightBindings weight_bindings_;
         ModelWeightBindings decode_replicated_dense_weight_bindings_;
@@ -421,12 +444,18 @@ namespace llaminar2
         bool hasDecodeMirroredEmbeddingWeightSource() const;
         bool useDecodeMirroredEmbeddingWeights() const;
         bool hasMirroredMTPHeadWeightSource() const;
-        bool localTPMirroredMTPHeadConfigured() const;
+        /**
+         * @brief Return whether MTP owns a full terminal head per TP participant.
+         *
+         * The result depends only on the typed MTP/head-layout policy. TP scope
+         * must not silently reinterpret mirrored ownership as sharded ownership.
+         */
+        bool mirroredMTPHeadConfigured() const;
         /**
          * @brief Decide whether a terminal projection uses the mirrored MTP head.
          *
-         * LocalTP MTP owns one replicated full-vocabulary terminal head per
-         * participant.  That head is required not only by the speculative
+         * Mirrored MTP owns one replicated full-vocabulary terminal head per
+         * participant at every TP scope. That head is required not only by the speculative
          * verifier and NextN sidecar, but also by the grouped main-model
          * condition forward that samples the first target token of a request
          * batch.  Keeping the decision in one projected-row policy prevents
@@ -480,7 +509,7 @@ namespace llaminar2
             PrimaryColumnParallel,
             PrimaryFullVocabulary,
             DecodeReplicatedFullVocabulary,
-            MirroredLocalTPMTPFullVocabulary,
+            MirroredMTPFullVocabulary,
         };
 
         /**

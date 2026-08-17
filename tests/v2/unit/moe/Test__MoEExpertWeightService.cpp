@@ -171,7 +171,8 @@ namespace
                 up_slab_ref,
                 down_slab_ref,
                 true,
-                &gpu_direct_slot_pool};
+                &gpu_direct_slot_pool,
+                CPUExpertNUMAPlacement::aggregateDomain()};
         }
     };
 
@@ -242,6 +243,11 @@ namespace
         projection.is_asymmetric = projection.staged.is_asymmetric;
         projection.has_emins = projection.staged.has_emins;
         projection.codebook_id = projection.staged.codebook_id;
+        projection.source_identity = NativeVnniSourceIdentity{
+            .codebook_id = native_vnni_formats::IQ4_NL.codebook_id,
+            .is_superblock = native_vnni_formats::IQ4_NL.is_superblock,
+            .present = true,
+        };
         projection.transfer_slot_lifetime = lifetime;
         return projection;
     }
@@ -419,6 +425,57 @@ TEST(Test__MoEExpertWeightService, ExtractExpertViews_WithMask_ExtractsAll)
     {
         EXPECT_NE(owner.expert_gate_views[e], nullptr) << "expert " << e;
     }
+}
+
+TEST(Test__MoEExpertWeightService, ExtractExpertViews_PackedNonContiguousMaskMapsGlobalIdsToPackedSlots)
+{
+    TestWeightContextOwner owner;
+    owner.gate_3d = createQ4_0_3D(kDModel, kExpertIntermediate, 2, 142);
+    owner.up_3d = createQ4_0_3D(kDModel, kExpertIntermediate, 2, 143);
+    owner.down_3d = createQ4_0_3D(kExpertIntermediate, kDModel, 2, 144);
+    owner.expert_mask = {true, false, true, false};
+
+    auto ctx = owner.buildContext();
+    ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+
+    ASSERT_NE(owner.expert_gate_views[0], nullptr);
+    EXPECT_EQ(owner.expert_gate_views[1], nullptr);
+    ASSERT_NE(owner.expert_gate_views[2], nullptr);
+    EXPECT_EQ(owner.expert_gate_views[3], nullptr);
+
+    const size_t gate_bytes_per_expert =
+        static_cast<size_t>(kExpertIntermediate) *
+        ((static_cast<size_t>(kDModel) + kBlockSize - 1u) / kBlockSize) *
+        sizeof(Q4_0Block);
+    const auto *gate_base = static_cast<const uint8_t *>(owner.gate_3d->raw_data());
+    EXPECT_EQ(owner.expert_gate_views[0]->raw_data(), gate_base);
+    EXPECT_EQ(
+        owner.expert_gate_views[2]->raw_data(),
+        gate_base + gate_bytes_per_expert);
+
+    const size_t down_bytes_per_expert =
+        static_cast<size_t>(kDModel) *
+        ((static_cast<size_t>(kExpertIntermediate) + kBlockSize - 1u) / kBlockSize) *
+        sizeof(Q4_0Block);
+    const auto *down_base = static_cast<const uint8_t *>(owner.down_3d->raw_data());
+    EXPECT_EQ(owner.expert_down_views[0]->raw_data(), down_base);
+    EXPECT_EQ(
+        owner.expert_down_views[2]->raw_data(),
+        down_base + down_bytes_per_expert);
+}
+
+TEST(Test__MoEExpertWeightService, ExtractExpertViews_PackedMaskCardinalityMismatchIsFatal)
+{
+    TestWeightContextOwner owner;
+    owner.gate_3d = createQ4_0_3D(kDModel, kExpertIntermediate, 2, 242);
+    owner.up_3d = createQ4_0_3D(kDModel, kExpertIntermediate, 2, 243);
+    owner.down_3d = createQ4_0_3D(kExpertIntermediate, kDModel, 2, 244);
+    owner.expert_mask = {true, false, false, false};
+
+    auto ctx = owner.buildContext();
+    EXPECT_THROW(
+        (void)MoEExpertWeightService::extractExpertViews(ctx),
+        std::runtime_error);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1063,6 +1120,8 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_ReusesReleasedPhysicalSlot)
     auto second = pool->acquire(12);
     ASSERT_TRUE(first.has_value());
     ASSERT_TRUE(second.has_value());
+    ASSERT_NE(first->lifetime, nullptr);
+    ASSERT_NE(second->lifetime, nullptr);
     EXPECT_EQ(pool->usedSlots(), 2u);
     EXPECT_FALSE(pool->acquire(13).has_value());
 
@@ -1077,6 +1136,54 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_ReusesReleasedPhysicalSlot)
     ASSERT_TRUE(reused.has_value());
     EXPECT_EQ(reused->slot_index, released_slot);
     EXPECT_EQ(pool->slotForExpert(13), released_slot);
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_RetainsSameExpertAcrossRcuEpochs)
+{
+    std::vector<GpuExpertSlotPool::ProjectionSpec> specs;
+    for (const char *label : {"gate", "up", "down"})
+    {
+        specs.push_back({
+            .label = label,
+            .N = 4,
+            .K = 32,
+            .payload_bytes_per_block = 16,
+            .is_asymmetric = true,
+            .has_emins = false,
+            .codebook_id = 7,
+        });
+    }
+
+    auto pool = GpuExpertSlotPool::create(
+        nullptr,
+        DeviceId::cuda(0),
+        /*device_ordinal=*/0,
+        /*layer_idx=*/3,
+        /*active_capacity=*/2,
+        std::move(specs),
+        /*vram_safety_margin_bytes=*/0);
+
+    auto old_epoch = pool->acquire(11, /*residency_epoch=*/40);
+    auto candidate_epoch = pool->acquire(11, /*residency_epoch=*/41);
+    ASSERT_TRUE(old_epoch.has_value());
+    ASSERT_TRUE(candidate_epoch.has_value());
+    EXPECT_NE(old_epoch->slot_index, candidate_epoch->slot_index);
+    EXPECT_EQ(old_epoch->residency_epoch, 40u);
+    EXPECT_EQ(candidate_epoch->residency_epoch, 41u);
+    EXPECT_EQ(pool->slotForExpert(11, 40), old_epoch->slot_index);
+    EXPECT_EQ(pool->slotForExpert(11, 41), candidate_epoch->slot_index);
+    EXPECT_FALSE(pool->slotForExpert(11).has_value());
+    EXPECT_FALSE(pool->acquire(11, 41).has_value());
+    EXPECT_FALSE(pool->acquire(12, 41).has_value());
+
+    const int retired_slot = old_epoch->slot_index;
+    old_epoch->lifetime.reset();
+    EXPECT_FALSE(pool->slotForExpert(11, 40).has_value());
+    EXPECT_EQ(pool->slotForExpert(11, 41), candidate_epoch->slot_index);
+
+    auto reused = pool->acquire(12, /*residency_epoch=*/41);
+    ASSERT_TRUE(reused.has_value());
+    EXPECT_EQ(reused->slot_index, retired_slot);
 }
 
 TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_TransferSlotsAreSurplusAndReleaseIndependently)
@@ -1115,6 +1222,8 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_TransferSlotsAreSurplusAndR
     auto transfer = pool->acquireTransferSlot(22);
     ASSERT_TRUE(active.has_value());
     ASSERT_TRUE(transfer.has_value());
+    ASSERT_NE(active->lifetime, nullptr);
+    ASSERT_NE(transfer->lifetime, nullptr);
     EXPECT_EQ(pool->usedSlots(), 1u);
     EXPECT_EQ(pool->usedTransferSlots(), 1u);
     EXPECT_EQ(pool->availableSlots(), 0u);
@@ -1728,8 +1837,68 @@ TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_StoreEngineReuse
     EXPECT_EQ(owner.prepared_down_gemm[1], store.expertGemmKernel(down_ref, 1));
 }
 
-TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_InvalidBlobDoesNotRepack)
+TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_DirectPreparedArrivalIsShared)
 {
+    TestWeightContextOwner source;
+    source.expert_mask = {true, true, true, true};
+    {
+        auto ctx = source.buildContext();
+        ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+        ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx));
+    }
+
+    ExpertPackedWeights packed;
+    {
+        auto ctx = source.buildContext();
+        packed = MoEExpertWeightService::clonePreparedExpert(ctx, 1);
+    }
+    ASSERT_TRUE(packed.complete());
+
+    PreparedExpertEngines arrival;
+    arrival.packed_bytes = packed.totalBytes();
+    arrival.gate = KernelFactory::createExpertGemmFromPackedWeights(
+        std::move(packed.gate));
+    arrival.up = KernelFactory::createExpertGemmFromPackedWeights(
+        std::move(packed.up));
+    arrival.down = KernelFactory::createExpertGemmFromPackedWeights(
+        std::move(packed.down));
+    ASSERT_TRUE(arrival.complete());
+    std::unordered_map<int, PreparedExpertEngines> received_prepared;
+    received_prepared.emplace(1, arrival);
+
+    TestWeightContextOwner destination;
+    destination.expert_mask = {true, false, true, false};
+    {
+        auto ctx = destination.buildContext();
+        ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+        ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx));
+    }
+
+    std::vector<bool> new_mask = {true, true, true, false};
+    {
+        auto ctx = destination.buildContext();
+        ASSERT_TRUE(MoEExpertWeightService::registerAndPrepareNewExperts(
+            ctx, new_mask, nullptr, &received_prepared));
+    }
+
+    EXPECT_EQ(destination.prepared_gate_gemm[1], arrival.gate.get());
+    EXPECT_EQ(destination.prepared_up_gemm[1], arrival.up.get());
+    EXPECT_EQ(destination.prepared_down_gemm[1], arrival.down.get());
+}
+
+TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_SerializedCPUArrivalIsAccepted)
+{
+    TestWeightContextOwner source;
+    source.expert_mask = {true, true, true, true};
+    ExpertWeightBlobs serialized;
+    {
+        auto ctx = source.buildContext();
+        ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+        ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx));
+        serialized = MoEExpertWeightService::serializeExpert(ctx, 1);
+    }
+    ASSERT_FALSE(serialized.empty());
+
     TestWeightContextOwner owner;
     owner.expert_mask = {true, false, true, false};
 
@@ -1743,19 +1912,18 @@ TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_InvalidBlobDoesN
     }
 
     std::unordered_map<int, ExpertWeightBlobs> received;
-    received[1].gate = {0x01, 0x02, 0x03};
-    received[1].up = {0x04, 0x05};
-    received[1].down = {0x06};
+    received.emplace(1, std::move(serialized));
 
     std::vector<bool> new_mask = {true, true, true, false};
     {
         auto ctx = owner.buildContext();
-        EXPECT_FALSE(MoEExpertWeightService::registerAndPrepareNewExperts(ctx, new_mask, &received));
+        EXPECT_TRUE(MoEExpertWeightService::registerAndPrepareNewExperts(
+            ctx, new_mask, &received, nullptr));
     }
 
-    EXPECT_EQ(owner.prepared_gate_gemm[1], nullptr);
-    EXPECT_EQ(owner.prepared_up_gemm[1], nullptr);
-    EXPECT_EQ(owner.prepared_down_gemm[1], nullptr);
+    EXPECT_NE(owner.prepared_gate_gemm[1], nullptr);
+    EXPECT_NE(owner.prepared_up_gemm[1], nullptr);
+    EXPECT_NE(owner.prepared_down_gemm[1], nullptr);
 }
 
 TEST(Test__MoEExpertWeightService, RegisterAndPrepareNewExperts_NoNewExperts)
@@ -1933,7 +2101,13 @@ TEST(Test__MoEExpertWeightService, GpuDirectTransferSlotStagingUsesSourceDescrip
     ASSERT_NE(allocation_ns, std::string::npos);
     const std::string spec_block =
         source.substr(make_specs, allocation_ns - make_specs);
-    EXPECT_NE(spec_block.find("source_descriptor_for(grp, sample_expert"), std::string::npos);
+    const size_t source_descriptor_call =
+        spec_block.find("source_descriptor_for(");
+    ASSERT_NE(source_descriptor_call, std::string::npos);
+    EXPECT_NE(
+        spec_block.find("sample_expert", source_descriptor_call),
+        std::string::npos)
+        << "slot specs must resolve the sample expert through the live source descriptor";
     EXPECT_NE(spec_block.find("deviceMoEProjectionFormat"), std::string::npos);
     EXPECT_EQ(spec_block.find("vnni_info_for(grp, sample_expert"), std::string::npos)
         << "slot pool specs must come from the source descriptor for inactive arrivals";

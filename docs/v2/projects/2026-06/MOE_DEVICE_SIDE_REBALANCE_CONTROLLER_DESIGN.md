@@ -6,10 +6,49 @@ For homogeneous GPU LocalTP MoE domains (`cuda+nccl` or `rocm+rccl`, degree
 2+), rebalance publish/apply must be graph-capturable and device-owned. The
 host may initialize topology, allocate persistent slots, and prewarm graphs,
 but it must not participate in histogram synchronization, policy decisions,
-transfer publication, runtime-table application, or request-time graph control.
+transfer publication, or runtime-table application. When a graph API has no
+conditional nodes, the host may submit the retained captured transaction named
+by an authenticated immutable device-controller ticket; that narrow scheduling
+action does not transfer controller authority or mutable inference state.
 
 This design is for same-backend domains only. Cross-vendor movement and mixed
 CUDA/ROCm expert domains remain out of scope for this controller.
+
+### Current execution-location status (2026-08-14 audit)
+
+The single authority does not imply one implementation location. Homogeneous
+single-tier CUDA and ROCm are required to keep histogram policy, epoch
+selection, and generation-loop control on device. Heterogeneous or multi-tier
+ExpertOverlay uses the host-authoritative RCU service described in the tier
+migration design because it composes backend conversion, rank consensus, and
+arbitrary transfer domains.
+
+CUDA now materializes and launches the fixed- or dynamic-depth MTP loop,
+including device-gated Dynamic maintenance, as one native conditional parent.
+The registered real-weight Qwen3.6 CUDA2 fresh/prefix-restore by fixed-depth-2,
+fixed-depth-3, and dynamic-depth matrix proved exact tokens, checkpoint parity,
+positive movement, reset/reuse, and the native parent in 332.09 seconds.
+
+The installed HIP graph API has no conditional graph node, so ROCm uses a
+first-class authenticated-ticket policy rather than imitating CUDA's parent.
+The device controller publishes a 60-byte immutable scheduler snapshot and
+retains all compact outcomes and mutable state; the host submits only the
+already-captured transaction named by that decision. For LocalTP, the rank
+coordinator submits every participant branch before observing the next ticket.
+Serial decode publishes and settles non-due cadence inside the complete decode
+graph. Consequently, the conservative host observation bound can authenticate
+an already-acknowledged idle ticket and perform no extra graph launch; grouped
+MTP still uses the retained acknowledgement graph when its accepted-row count
+leaves a non-due publication pending.
+Production certification requires exact ticket provenance, per-device
+ticket/observation/submission/terminal equality, captured graph-family evidence,
+controller-owned compact reductions, and no intermediate host-state bridge.
+`production_path.csv` truthfully keeps complete `full_graph_*` false, requires
+the captured `forward_full_graph_*` body, and records the ticket and generation
+certificates separately. Real-weight Qwen3.6 ROCm2 fixed-depth-2 is green under
+that contract. The registered fresh/prefix-restore by fixed-depth-2,
+fixed-depth-3, and dynamic-depth matrix is also green: all six cells completed
+in 365.53 seconds and emitted passing checkpoint plus production-path CSVs.
 
 ## Active Policy Taxonomy
 
@@ -258,7 +297,7 @@ Current conformance audit, 2026-07-01:
   `device_rebalance_llep_native_rows`,
   `device_rebalance_llep_spilled_rows`,
   `device_rebalance_llep_spilled_row_ratio`, and
-  `device_rebalance_llep_spilled_rows_per_transfer`. These tell us how large
+  `device_rebalance_llep_spilled_rows_per_critical_path_payload_slot`. These tell us how large
   the conceptual LLEP row-assignment opportunity was versus how much the
   current residency path actually moved.
 - CUDA and ROCm now also expose a graph-capturable current-batch prefill
@@ -513,8 +552,9 @@ Implemented or partially implemented:
   the policy comparator can use those fields directly for threshold searches.
 - The LLEP transfer planner now honors the shared relative spread-improvement
   floor (`min_spread_improvement_divisor`) in addition to the absolute and
-  per-transfer floors. CUDA and ROCm pass the same device rebalance config into
-  LLEP, so the existing cost-gate knob no longer silently misses the LLEP path.
+  per-critical-path-payload-slot floors. CUDA and ROCm pass the same device
+  rebalance config into LLEP, so the existing cost-gate knob no longer silently
+  misses the LLEP path.
 - Current-batch LLEP assignment now reuses grouped-prefill route metadata instead
   of scanning every route slot per expert. The planner publishes per-expert span
   bounds in runtime scratch, and CUDA/ROCm assignment kernels apply only the
@@ -618,8 +658,14 @@ Latest evidence:
 
 Still incomplete:
 
-- Device-side graph scheduling still needs a host bridge for launching prewarmed
-  bucket graphs on current CUDA/ROCm APIs.
+- CUDA's native conditional parent now schedules the installed device-gated
+  maintenance fragment without a request-time host decision. ROCm's installed
+  first-class policy is the authenticated 60-byte ticket dispatcher because
+  HIP provides no CUDA-style conditional graph node. It selects only prewarmed
+  captured transactions and transfers no mutable controller state. A future
+  native HIP conditional graph facility could replace this narrow dispatch
+  boundary, but a bespoke persistent executor is not a prerequisite for the
+  current production contract.
 - Dynamic, LLEP, and hot-cache admission are conceptually separated in code and
   tests. Dynamic now has an explicit sweep surface; LLEP and cache admission
   still need the same level of public config cleanup.
@@ -775,26 +821,29 @@ runner reconstruction when the full production graph is not required.
 
 ## Next Work
 
-1. Clean up the remaining public policy surface so `LLEP` and
+1. Keep the now-green CUDA native-parent and ROCm authenticated-ticket MTP
+   matrices together in the aggregate gate, including their backend-specific
+   capture/replay and request-reset evidence.
+2. Clean up the remaining public policy surface so `LLEP` and
    `HotExpertReplicaCache` are explicit and independent of `Dynamic`.
-2. Run transfer-backed LLEP through CUDA2 and ROCm2 parity, then clean repeated
+3. Run transfer-backed LLEP through CUDA2 and ROCm2 parity, then clean repeated
    benchmark matrices. Include both no-cache and hot-cache-admission variants so
    LLEP, Dynamic, and cache effects stay separable.
-3. Use the Dynamic CLI/DebugEnv knobs for bounded CUDA2/ROCm2 sweeps at 1024
+4. Use the Dynamic CLI/DebugEnv knobs for bounded CUDA2/ROCm2 sweeps at 1024
    and 2048 tokens, starting with the now-wired relative LLEP cost gate
    (`LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR`) to
    reject low-value whole-expert arrivals. Only revisit lower imbalance
    thresholds, larger per-layer swap counts, and larger per-wave command caps
    after the high-value-only gate recovers no-movement/static speed.
-4. Extend Dynamic, if needed, with an explicit hot-set variant
+5. Extend Dynamic, if needed, with an explicit hot-set variant
    (`hotset_expert_count=20`), configurable window schedule, variable domain
    size, and cost-gated non-empty moves while keeping the shared helper as the
    single policy implementation used by CPU, CUDA, and ROCm.
-5. Keep LLEP modular behind the shared routed-assignment surface so additional
+6. Keep LLEP modular behind the shared routed-assignment surface so additional
    algorithms can be added without backend drift.
-6. Wire production prefill and batched decode to run LLEP only when row count
+7. Wire production prefill and batched decode to run LLEP only when row count
    and cost gates make it worthwhile.
-7. Run parity, E2E prefix-cache/server tests, full unit tests, then clean
+8. Run parity, E2E prefix-cache/server tests, full unit tests, then clean
    CUDA2/ROCm2 benchmark matrices before making a policy the default.
 
 Historical checkpoint notes were intentionally removed from this file. Use the
