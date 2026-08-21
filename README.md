@@ -43,6 +43,11 @@ Llaminar uses a predefined devcontainer and the recommended development environm
 
 Open vscode in the devcontainer, and run the Build Integration / Build Release vscode tasks with `CTRL + Shift + P`.
 
+For terminal-only development over SSH, use `llaminar` to enter the same
+devcontainer with Codex CLI, `llaminar shell` for a persistent shell, or
+`llaminar rebuild` to recreate the environment without VS Code. See [the SSH
+and Codex workflow](.devcontainer/SSH_CODEX.md) for setup and recovery details.
+
 The image pins one Ninja release for both the system and workspace tools.
 Resolve the devcontainer's active executable while configuring and always
 build through CMake, so an existing tree keeps using that same tool. Mixing

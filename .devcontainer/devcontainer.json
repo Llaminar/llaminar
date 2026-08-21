@@ -86,7 +86,7 @@
         3000,
         5000
     ],
-    "postCreateCommand": "bash -c 'sudo chmod 666 /dev/dri/render* 2>/dev/null || true && sudo chown -R vscode:vscode /workspaces/llaminar || true && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-ccache.sh && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && gh auth login && GH_USER=$(gh api user --jq .login) && GH_NAME=$(gh api user --jq .name) && GH_ID=$(gh api user --jq .id) && git config --global user.name \"${GH_NAME:-$GH_USER}\" && git config --global user.email \"${GH_ID}+${GH_USER}@users.noreply.github.com\" && cmake --version && gcc --version'",
+    "postCreateCommand": "bash /workspaces/llaminar/.devcontainer/post-create.sh",
     "postStartCommand": "bash /workspaces/llaminar/.devcontainer/onstart.sh",
     "postAttachCommand": "bash /workspaces/llaminar/.devcontainer/onstart.sh",
     "remoteUser": "vscode",
@@ -109,6 +109,7 @@
         "HSA_OVERRIDE_GFX_VERSION": "9.0.6"
     },
     "mounts": [
-        "source=/opt/llaminar-models,target=/opt/llaminar-models,type=bind,consistency=cached"
+        "source=/opt/llaminar-models,target=/opt/llaminar-models,type=bind,consistency=cached",
+        "source=llaminar-codex-state,target=/home/vscode/.codex,type=volume"
     ]
 }

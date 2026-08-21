@@ -58,6 +58,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         procps \
         python3.12-venv \
         strace \
+        tmux \
         tree \
         unzip \
         util-linux \
@@ -125,6 +126,10 @@ RUN mkdir -p /workspaces/llaminar && chown -R vscode:vscode /workspaces
 
 USER vscode
 WORKDIR /workspaces/llaminar
+
+# Seed the runtime mount point with vscode ownership. Docker copies this
+# metadata into a newly created named volume before postCreateCommand runs.
+RUN mkdir -p /home/vscode/.codex && chmod 700 /home/vscode/.codex
 
 # MPI, CUDA, ROCm env for vscode shells.
 ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
