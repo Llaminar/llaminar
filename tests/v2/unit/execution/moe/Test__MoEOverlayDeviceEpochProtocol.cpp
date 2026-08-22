@@ -5,11 +5,15 @@
 
 #include "execution/moe/MoEOverlayDeviceEpochProtocol.h"
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
+#include "execution/moe/MoEOverlayDeviceControllerABI.h"
+#include "execution/moe/MoEOverlayDeviceControllerRuntimeBinding.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <stdexcept>
 #include <thread>
@@ -17,6 +21,68 @@
 
 namespace llaminar2::test
 {
+    TEST(Test__MoEOverlayDeviceEpochProtocol,
+         FollowerBoundaryReceiptNeverRetargetsACompletedBoundaryToNewWork)
+    {
+        MoEOverlayInferenceBoundaryReceipt receipt;
+
+        const auto pristine = receipt.consumeLatestCompleted();
+        EXPECT_FALSE(pristine.hasCompletedBoundary());
+        EXPECT_FALSE(pristine.newerSubmissionInFlight());
+
+        /* Admission precedes backend launch. A rejected launch removes only
+         * its newest receipt and restores the exact prior serial state. */
+        const std::uint64_t rejected = receipt.beginSubmission();
+        ASSERT_EQ(rejected, 1u);
+        EXPECT_TRUE(receipt.consumeLatestCompleted().newerSubmissionInFlight());
+        EXPECT_TRUE(receipt.cancelUnsubmitted(rejected));
+        EXPECT_EQ(receipt.submittedGeneration(), 0u);
+        EXPECT_EQ(receipt.completedGeneration(), 0u);
+        EXPECT_FALSE(receipt.cancelUnsubmitted(rejected));
+
+        const std::uint64_t first = receipt.beginSubmission();
+        ASSERT_EQ(first, 1u);
+        const auto first_in_flight = receipt.consumeLatestCompleted();
+        EXPECT_FALSE(first_in_flight.hasCompletedBoundary());
+        EXPECT_TRUE(first_in_flight.newerSubmissionInFlight());
+        EXPECT_FALSE(first_in_flight.fresh_completion);
+
+        ASSERT_TRUE(receipt.completeSubmission(first));
+        EXPECT_FALSE(receipt.cancelUnsubmitted(first));
+        const auto first_committed = receipt.consumeLatestCompleted();
+        EXPECT_TRUE(first_committed.hasCompletedBoundary());
+        EXPECT_EQ(first_committed.completed_generation, first);
+        EXPECT_TRUE(first_committed.fresh_completion);
+        EXPECT_FALSE(first_committed.newerSubmissionInFlight());
+
+        /*
+         * This is the deadlock-producing interleaving from production: the
+         * next sparse graph is submitted before background maintenance consumes
+         * the prior command boundary.  The receipt remains pinned to generation
+         * one and reports generation two as live.  A topology-wide maintenance
+         * submitter must defer this snapshot: beginning from the older terminal
+         * can deadlock against the newer transaction on another participant.
+         */
+        const std::uint64_t second = receipt.beginSubmission();
+        ASSERT_EQ(second, 2u);
+        const auto overlap = receipt.consumeLatestCompleted();
+        EXPECT_EQ(overlap.submitted_generation, second);
+        EXPECT_EQ(overlap.completed_generation, first);
+        EXPECT_FALSE(overlap.fresh_completion);
+        EXPECT_TRUE(overlap.newerSubmissionInFlight());
+
+        EXPECT_FALSE(receipt.completeSubmission(first));
+        EXPECT_FALSE(receipt.completeSubmission(second + 1u));
+        ASSERT_TRUE(receipt.completeSubmission(second));
+        const auto second_committed = receipt.consumeLatestCompleted();
+        EXPECT_EQ(second_committed.completed_generation, second);
+        EXPECT_TRUE(second_committed.fresh_completion);
+        EXPECT_FALSE(second_committed.newerSubmissionInFlight());
+        EXPECT_EQ(receipt.submittedGeneration(), second);
+        EXPECT_EQ(receipt.completedGeneration(), second);
+        EXPECT_EQ(receipt.consumedGeneration(), second);
+    }
+
     TEST(Test__MoEOverlayDeviceEpochProtocol,
          ArenaOwnsStableSlotsAndHonorsPreparedInitialBank)
     {
@@ -135,6 +201,241 @@ namespace llaminar2::test
 
         EXPECT_TRUE(protocol.release(*new_ticket));
         EXPECT_TRUE(protocol.tryRetire(2u));
+    }
+
+    TEST(Test__MoEOverlayDeviceEpochProtocol,
+         TopologyAdmissionPinsRetiringBankUntilGlobalEpochAdvances)
+    {
+        DeviceMoEOverlayEpochControl control;
+        MoEOverlayDeviceEpochProtocol::initialize(control, 17u);
+        MoEOverlayDeviceEpochProtocol protocol(control);
+
+        ASSERT_EQ(protocol.reserveCandidate(18u), 1u);
+        protocol.markCandidateReady(18u);
+        ASSERT_TRUE(protocol.publishReadyCandidate(18u).valid());
+        ASSERT_EQ(
+            protocol.bankState(0u),
+            DeviceMoEOverlayEpochBankState::Retiring);
+
+        // The participant has locally flipped, but the topology leader has
+        // not admitted the new epoch. A request must retain the old bank.
+        auto old_admission = protocol.tryAcquireAdmitted(17u);
+        ASSERT_TRUE(old_admission.has_value());
+        EXPECT_EQ(old_admission->epoch, 17u);
+        EXPECT_EQ(old_admission->bank(), 0u);
+        EXPECT_EQ(old_admission->generation(), 1u);
+        EXPECT_FALSE(protocol.tryRetire(17u));
+        EXPECT_TRUE(protocol.release(*old_admission));
+
+        // Once every participant has published, the same local control admits
+        // the new bank through the topology-wide epoch word.
+        auto new_admission = protocol.tryAcquireAdmitted(18u);
+        ASSERT_TRUE(new_admission.has_value());
+        EXPECT_EQ(new_admission->epoch, 18u);
+        EXPECT_EQ(new_admission->bank(), 1u);
+        EXPECT_EQ(new_admission->generation(), 2u);
+        EXPECT_TRUE(protocol.tryRetire(17u));
+        EXPECT_TRUE(protocol.release(*new_admission));
+        EXPECT_FALSE(protocol.tryAcquireAdmitted(17u).has_value())
+            << "A globally admitted epoch may not resolve after retirement";
+    }
+
+    TEST(Test__MoEOverlayDeviceEpochProtocol,
+         PublicCPUKernelConsumesExternalAdmissionEpoch)
+    {
+        DeviceMoEOverlayEpochControl control;
+        MoEOverlayDeviceEpochProtocol::initialize(control, 31u);
+        MoEOverlayDeviceEpochProtocol protocol(control);
+        ASSERT_EQ(protocol.reserveCandidate(32u), 1u);
+        protocol.markCandidateReady(32u);
+        ASSERT_TRUE(protocol.publishReadyCandidate(32u).valid());
+
+        std::uint64_t admission_epoch = 31u;
+        CPUMoEKernel kernel;
+        DeviceMoEOverlayEpochTicket ticket{};
+        DeviceMoEOverlayEpochStatus status{};
+        const MoEKernelLaunchContext launch{};
+        ASSERT_TRUE(kernel.acquireMoEOverlayEpoch(
+            launch,
+            &control,
+            &ticket,
+            &status,
+            &admission_epoch));
+        ASSERT_TRUE(status.succeeded());
+        EXPECT_EQ(ticket.epoch, 31u);
+        EXPECT_EQ(ticket.bank(), 0u);
+        ASSERT_TRUE(kernel.releaseMoEOverlayEpoch(
+            launch, &control, &ticket, &status));
+        ASSERT_TRUE(status.succeeded());
+
+        std::atomic_ref<std::uint64_t>(admission_epoch).store(
+            32u, std::memory_order_release);
+        ASSERT_TRUE(kernel.acquireMoEOverlayEpoch(
+            launch,
+            &control,
+            &ticket,
+            &status,
+            &admission_epoch));
+        ASSERT_TRUE(status.succeeded());
+        EXPECT_EQ(ticket.epoch, 32u);
+        EXPECT_EQ(ticket.bank(), 1u);
+        ASSERT_TRUE(kernel.releaseMoEOverlayEpoch(
+            launch, &control, &ticket, &status));
+    }
+
+    TEST(Test__MoEOverlayDeviceEpochProtocol,
+         SymmetricContinuationFreezesOneEpochAfterEveryLocalGuardArrives)
+    {
+        constexpr std::uint32_t kSiblingParticipant = 1u;
+        constexpr std::uint32_t kPublisherParticipant = 4u;
+        constexpr std::uint32_t kMask =
+            (1u << kSiblingParticipant) | (1u << kPublisherParticipant);
+
+        std::array<DeviceMoEOverlayEpochControl, 2> controls{};
+        for (auto &control : controls)
+        {
+            MoEOverlayDeviceEpochProtocol::initialize(control, 1u);
+            MoEOverlayDeviceEpochProtocol protocol(control);
+            ASSERT_EQ(protocol.reserveCandidate(2u), 1u);
+            protocol.markCandidateReady(2u);
+            ASSERT_TRUE(protocol.publishReadyCandidate(2u).valid());
+        }
+
+        MoEOverlayDeviceControllerInferenceEpochRecord barrier{};
+        barrier.participant_mask = kMask;
+        barrier.publisher_participant_id = kPublisherParticipant;
+        barrier.topology_fingerprint = 0xabc123u;
+        barrier.epoch = 1u;
+        std::uint64_t live_admission_epoch = 1u;
+
+        std::array<DeviceMoEOverlayEpochTicket, 2> tickets{};
+        std::array<DeviceMoEOverlayEpochStatus, 2> statuses{};
+        std::array<CPUMoEKernel, 2> kernels{};
+        const MoEKernelLaunchContext launch{};
+        std::array<bool, 2> submitted{};
+
+        /* The publisher reaches admission first while epoch one is live. It
+         * must not sample yet: the sibling has not raised its local retirement
+         * guard. Flip admission in exactly that vulnerable interval. */
+        std::thread publisher(
+            [&]
+            {
+                submitted[0] = kernels[0].acquireMoEOverlayEpoch(
+                    launch,
+                    &controls[0],
+                    &tickets[0],
+                    &statuses[0],
+                    &live_admission_epoch,
+                    {
+                        .record = &barrier,
+                        .participant_id = kPublisherParticipant,
+                    });
+            });
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(2);
+        bool publisher_arrived = false;
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            publisher_arrived =
+                std::atomic_ref<std::uint64_t>(
+                    barrier.arrival_sequence[kPublisherParticipant])
+                    .load(std::memory_order_acquire) == 1u;
+            if (publisher_arrived)
+                break;
+            std::this_thread::yield();
+        }
+        std::atomic_ref<std::uint64_t>(live_admission_epoch).store(
+            2u, std::memory_order_release);
+
+        std::thread sibling(
+            [&]
+            {
+                submitted[1] = kernels[1].acquireMoEOverlayEpoch(
+                    launch,
+                    &controls[1],
+                    &tickets[1],
+                    &statuses[1],
+                    &live_admission_epoch,
+                    {
+                        .record = &barrier,
+                        .participant_id = kSiblingParticipant,
+                    });
+            });
+        publisher.join();
+        sibling.join();
+
+        ASSERT_TRUE(publisher_arrived)
+            << "publisher did not hold its local RCU guard before the adversarial flip";
+        ASSERT_TRUE(submitted[0]);
+        ASSERT_TRUE(submitted[1]);
+        ASSERT_TRUE(statuses[0].succeeded());
+        ASSERT_TRUE(statuses[1].succeeded());
+        EXPECT_EQ(tickets[0].epoch, 2u);
+        EXPECT_EQ(tickets[1].epoch, 2u);
+        EXPECT_EQ(barrier.epoch, 2u);
+        EXPECT_EQ(barrier.publication_sequence, 1u);
+        EXPECT_EQ(
+            barrier.arrival_sequence[kPublisherParticipant], 1u);
+        EXPECT_EQ(barrier.arrival_sequence[kSiblingParticipant], 1u);
+        EXPECT_EQ(controls[0].acquisitions_in_flight, 0u);
+        EXPECT_EQ(controls[1].acquisitions_in_flight, 0u);
+
+        ASSERT_TRUE(kernels[0].releaseMoEOverlayEpoch(
+            launch, &controls[0], &tickets[0], &statuses[0]));
+        ASSERT_TRUE(kernels[1].releaseMoEOverlayEpoch(
+            launch, &controls[1], &tickets[1], &statuses[1]));
+        ASSERT_TRUE(statuses[0].succeeded());
+        ASSERT_TRUE(statuses[1].succeeded());
+
+        /* Replay with the non-publisher arriving first proves the monotonic
+         * record has no fixed device-order assumption and cannot reuse N. */
+        std::atomic_ref<std::uint64_t>(live_admission_epoch).store(
+            1u, std::memory_order_release);
+        std::thread sibling_first(
+            [&]
+            {
+                submitted[1] = kernels[1].acquireMoEOverlayEpoch(
+                    launch,
+                    &controls[1],
+                    &tickets[1],
+                    &statuses[1],
+                    &live_admission_epoch,
+                    {
+                        .record = &barrier,
+                        .participant_id = kSiblingParticipant,
+                    });
+            });
+        std::thread publisher_second(
+            [&]
+            {
+                submitted[0] = kernels[0].acquireMoEOverlayEpoch(
+                    launch,
+                    &controls[0],
+                    &tickets[0],
+                    &statuses[0],
+                    &live_admission_epoch,
+                    {
+                        .record = &barrier,
+                        .participant_id = kPublisherParticipant,
+                    });
+            });
+        sibling_first.join();
+        publisher_second.join();
+
+        ASSERT_TRUE(statuses[0].succeeded());
+        ASSERT_TRUE(statuses[1].succeeded());
+        EXPECT_EQ(tickets[0].epoch, 1u);
+        EXPECT_EQ(tickets[1].epoch, 1u);
+        EXPECT_EQ(barrier.epoch, 1u);
+        EXPECT_EQ(barrier.publication_sequence, 2u);
+        EXPECT_EQ(
+            barrier.arrival_sequence[kPublisherParticipant], 2u);
+        EXPECT_EQ(barrier.arrival_sequence[kSiblingParticipant], 2u);
+        ASSERT_TRUE(kernels[0].releaseMoEOverlayEpoch(
+            launch, &controls[0], &tickets[0], &statuses[0]));
+        ASSERT_TRUE(kernels[1].releaseMoEOverlayEpoch(
+            launch, &controls[1], &tickets[1], &statuses[1]));
     }
 
     TEST(Test__MoEOverlayDeviceEpochProtocol,

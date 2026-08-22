@@ -41,6 +41,106 @@ namespace llaminar2
             "rank-batch transport does not own node-local shared return rows");
     }
 
+    std::string makeMoEOverlayRankBatchChannelIdentity(
+        int tier_index,
+        int domain_ordinal,
+        int source_world_rank,
+        int target_world_rank,
+        std::span<const int> participant_ids)
+    {
+        if (tier_index < 0 || domain_ordinal < 0 ||
+            source_world_rank < 0 || target_world_rank < 0 ||
+            source_world_rank == target_world_rank || participant_ids.empty())
+        {
+            throw std::invalid_argument(
+                "MoE rank-batch channel identity requires complete remote-rank topology");
+        }
+        if (participant_ids.front() < 0 ||
+            !std::is_sorted(participant_ids.begin(), participant_ids.end()) ||
+            std::adjacent_find(
+                participant_ids.begin(), participant_ids.end()) !=
+                participant_ids.end())
+        {
+            throw std::invalid_argument(
+                "MoE rank-batch channel participant ids must be strictly increasing and non-negative");
+        }
+
+        std::ostringstream identity;
+        identity << "tier" << tier_index
+                 << "#domain" << domain_ordinal
+                 << "#rank" << source_world_rank << "to"
+                 << target_world_rank << "#p";
+        for (const int participant_id : participant_ids)
+            identity << participant_id << ',';
+        return identity.str();
+    }
+
+    void MoEOverlayRankBatchTransportRegistry::install(
+        std::string channel_identity,
+        std::shared_ptr<IMoEOverlayRankBatchTransport> transport)
+    {
+        if (channel_identity.empty() || !transport ||
+            transport->sourceWorldRank() < 0 ||
+            transport->targetWorldRank() < 0 ||
+            transport->sourceWorldRank() == transport->targetWorldRank() ||
+            transport->participantIds().empty())
+        {
+            throw std::invalid_argument(
+                "MoE rank-batch registry requires a named, complete transport");
+        }
+
+        /*
+         * Publication is one-way: a graph may retain the returned shared_ptr
+         * immediately after setup. Replacing an entry later would leave two
+         * live driver-registration authorities for the same shared mapping.
+         */
+        std::scoped_lock lock(mutex_);
+        const auto [_, inserted] = transports_.emplace(
+            std::move(channel_identity), std::move(transport));
+        if (!inserted)
+        {
+            throw std::logic_error(
+                "MoE rank-batch transport identity was installed more than once");
+        }
+    }
+
+    std::shared_ptr<IMoEOverlayRankBatchTransport>
+    MoEOverlayRankBatchTransportRegistry::require(
+        const std::string &channel_identity,
+        int source_world_rank,
+        int target_world_rank,
+        std::span<const int> participant_ids) const
+    {
+        std::scoped_lock lock(mutex_);
+        const auto found = transports_.find(channel_identity);
+        if (found == transports_.end() || !found->second)
+        {
+            throw std::logic_error(
+                "MoE rank-batch graph requested a channel that preflight did not create: " +
+                channel_identity);
+        }
+        const auto &transport = found->second;
+        if (transport->sourceWorldRank() != source_world_rank ||
+            transport->targetWorldRank() != target_world_rank ||
+            !std::equal(
+                participant_ids.begin(),
+                participant_ids.end(),
+                transport->participantIds().begin(),
+                transport->participantIds().end()))
+        {
+            throw std::logic_error(
+                "MoE rank-batch preflight channel topology diverged from graph construction: " +
+                channel_identity);
+        }
+        return transport;
+    }
+
+    std::size_t MoEOverlayRankBatchTransportRegistry::size() const
+    {
+        std::scoped_lock lock(mutex_);
+        return transports_.size();
+    }
+
     namespace
     {
         constexpr uint32_t kBatchMagic = 0x42454f4dU; // "MOEB" in little-endian memory.

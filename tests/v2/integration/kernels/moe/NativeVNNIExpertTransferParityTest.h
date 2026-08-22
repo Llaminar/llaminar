@@ -32,10 +32,14 @@
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/moe/DeviceMoERebalanceABI.h"
+#include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/moe/DeviceMoETransferSlotDirectory.h"
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "execution/moe/ExpertTierWeightTransferLane.h"
 #include "execution/moe/LeastLoadedExpertAssignment.h"
+#include "execution/moe/MoEOverlayHostAuthorityDeviceBankPublisher.h"
+#include "execution/moe/MoEOverlayParticipantResidency.h"
+#include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "interfaces/IWorkspaceConsumer.h"
@@ -184,7 +188,8 @@ namespace llaminar2::test
             const std::vector<uint32_t> &resident_participant_mask,
             int num_layers,
             int top_k,
-            int token_capacity)
+            int token_capacity,
+            std::shared_ptr<DeviceMoEOverlayEpochArena> overlay_epoch_arena = {})
         {
             if (descriptors.empty() ||
                 descriptors.size() != local_compute_mask.size() ||
@@ -203,6 +208,7 @@ namespace llaminar2::test
                 .top_k = top_k,
                 .mirror_to_device = true,
                 .prefill_token_capacity = token_capacity,
+                .overlay_epoch_arena = std::move(overlay_epoch_arena),
             };
             auto table = std::make_unique<DeviceMoERuntimeTable>(config);
 
@@ -1819,12 +1825,213 @@ namespace llaminar2::test
             };
             return result;
         }
+
+        /**
+         * @brief Minimal non-owning boundary required by host publication setup.
+         *
+         * The focused publisher regression has no concurrent inference graph
+         * while maintenance prepares the candidate. The publisher nevertheless
+         * requires the same typed model binding as production; this object makes
+         * that absence explicit without introducing a stream synchronization or
+         * pretending to own device execution state.
+         */
+        class QuiescentOverlayInferenceBoundary final
+            : public IMoEOverlayDeviceInferenceBoundary
+        {
+        public:
+            MoEOverlayInferenceBoundaryStatus
+            enqueueMoEOverlayDeviceInferenceBoundary(
+                void *maintenance_stream,
+                MoEOverlayInferenceBoundaryRequest) override
+            {
+                return maintenance_stream
+                           ? MoEOverlayInferenceBoundaryStatus::Submitted
+                           : MoEOverlayInferenceBoundaryStatus::Failed;
+            }
+
+            bool installMoEOverlayTransferProgressEpoch(
+                std::shared_ptr<MappedTransferProgressEpoch> epoch) override
+            {
+                return epoch != nullptr;
+            }
+        };
+
+        /** @brief Build one two-tier, one-participant-per-domain placement. */
+        inline MoERoutedExpertPlacementPlan hostPublicationPlan(
+            DeviceId device,
+            bool candidate)
+        {
+            RoutedExpertDomain priority_zero_domain;
+            priority_zero_domain.name = "priority_0_domain";
+            priority_zero_domain.scope = ExecutionDomainScope::SINGLE;
+            priority_zero_domain.backend = CollectiveBackendType::HOST;
+            priority_zero_domain.participants = {
+                device.is_cuda()
+                    ? GlobalDeviceAddress::cuda(device.cuda_ordinal(), 0)
+                    : GlobalDeviceAddress::rocm(device.rocm_ordinal(), 0)};
+            priority_zero_domain.world_ranks = {0};
+            priority_zero_domain.owner_rank = 0;
+            priority_zero_domain.routed_compute_policy =
+                RoutedExpertComputePolicy::Apportioned;
+
+            RoutedExpertDomain priority_one_domain;
+            priority_one_domain.name = "priority_1_domain";
+            priority_one_domain.scope = ExecutionDomainScope::SINGLE;
+            priority_one_domain.backend = CollectiveBackendType::HOST;
+            priority_one_domain.participants = {GlobalDeviceAddress::cpu(0)};
+            priority_one_domain.world_ranks = {0};
+            priority_one_domain.owner_rank = 0;
+            priority_one_domain.routed_compute_policy =
+                RoutedExpertComputePolicy::Apportioned;
+
+            RoutedExpertTier priority_zero;
+            priority_zero.name = "priority_0";
+            priority_zero.domain = priority_zero_domain.name;
+            priority_zero.priority = 0;
+            priority_zero.max_experts_per_layer = 1;
+
+            RoutedExpertTier priority_one;
+            priority_one.name = "priority_1";
+            priority_one.domain = priority_one_domain.name;
+            priority_one.priority = 1;
+            priority_one.max_experts_per_layer = 1;
+            priority_one.fallback = true;
+
+            MoERoutedExpertPlacementPlan plan;
+            plan.enabled = true;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+            plan.continuation_domain = priority_zero_domain.name;
+            plan.shared_expert_domain = priority_zero_domain.name;
+            plan.residency_policy =
+                RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+            plan.owner_order = RoutedExpertOwnerOrder::Ordinal;
+            plan.domains = {
+                std::move(priority_zero_domain),
+                std::move(priority_one_domain)};
+            plan.routed_tiers = {
+                std::move(priority_zero),
+                std::move(priority_one)};
+            plan.placements = {{
+                .layer = 0,
+                .routed_expert_tier = candidate
+                                          ? std::vector<int>{1, 0}
+                                          : std::vector<int>{0, 1},
+            }};
+            return plan;
+        }
+
+        /** @brief Materialize one immutable snapshot from its exact plan. */
+        inline std::shared_ptr<const MoEOverlayResidencySnapshot>
+        hostPublicationSnapshot(
+            std::uint64_t epoch,
+            MoERoutedExpertPlacementPlan plan)
+        {
+            auto retained_plan =
+                std::make_shared<MoERoutedExpertPlacementPlan>(
+                    std::move(plan));
+            MoEExpertOwnerMap owner_map = MoEExpertOwnerMap::build(
+                *retained_plan);
+            auto snapshot = std::make_shared<MoEOverlayResidencySnapshot>();
+            snapshot->epoch = epoch;
+            snapshot->placement_plan = std::move(retained_plan);
+            snapshot->owner_map = owner_map;
+            snapshot->layered_ownership = owner_map.layeredOwnership(1, 2);
+            if (!snapshot->valid())
+                throw std::runtime_error(
+                    "Host publication test produced an invalid snapshot");
+            return snapshot;
+        }
+
+        /** @brief Create a prepared engine alias over promoted GPU storage. */
+        inline std::shared_ptr<ITensorGemm> promotedEngine(
+            DeviceId device,
+            const DeviceNativeVNNIMatrixDesc &descriptor,
+            const std::shared_ptr<void> &lifetime)
+        {
+            const NativeVnniSourceIdentity source_identity{
+                .codebook_id = descriptor.source_codebook_id,
+                .is_superblock = descriptor.source_is_superblock != 0u,
+                .present = descriptor.source_identity_present != 0u,
+            };
+            const NativeVnniReusableDeviceAllocationFormat allocation{
+                .payload_bytes_per_block =
+                    descriptor.allocation_payload_bytes_per_block,
+                .has_mins = descriptor.allocation_has_mins != 0u,
+                .has_emins = descriptor.allocation_has_emins != 0u,
+            };
+#ifdef HAVE_CUDA
+            if (device.is_cuda())
+            {
+                // The direct GEMM constructors predate the immutable device
+                // descriptor ABI and still spell their borrowed weight views
+                // as mutable pointers. They never write through these aliases;
+                // retain constness everywhere except this legacy constructor
+                // boundary so the publisher regression consumes the exact ABI
+                // used by grouped execution.
+                return std::make_shared<cuda::CUDAQuantisedGemmKernel>(
+                    descriptor.n,
+                    descriptor.k,
+                    device.cuda_ordinal(),
+                    const_cast<std::uint8_t *>(descriptor.payload),
+                    const_cast<std::uint16_t *>(
+                        static_cast<const std::uint16_t *>(descriptor.scales)),
+                    const_cast<std::uint16_t *>(
+                        static_cast<const std::uint16_t *>(descriptor.mins)),
+                    const_cast<std::uint32_t *>(
+                        static_cast<const std::uint32_t *>(descriptor.emins)),
+                    descriptor.codebook_id,
+                    descriptor.blocks_per_row,
+                    lifetime,
+                    source_identity,
+                    allocation);
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (device.is_rocm())
+            {
+                return std::make_shared<rocm::ROCmQuantisedGemmKernel>(
+                    descriptor.n,
+                    descriptor.k,
+                    device.rocm_ordinal(),
+                    const_cast<std::uint8_t *>(descriptor.payload),
+                    const_cast<void *>(descriptor.scales),
+                    const_cast<void *>(descriptor.mins),
+                    const_cast<void *>(descriptor.emins),
+                    descriptor.codebook_id,
+                    descriptor.blocks_per_row,
+                    lifetime,
+                    source_identity,
+                    allocation);
+            }
+#endif
+            throw std::runtime_error(
+                "Host publication test backend was not built");
+        }
+
+        /** @brief Poll one typed inactive-bank phase to its terminal. */
+        template <typename Poll>
+        inline MoEOverlayResidencyWaveProgress awaitPublicationPhase(
+            Poll &&poll,
+            std::string *error)
+        {
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            auto progress = MoEOverlayResidencyWaveProgress::Pending;
+            while (progress == MoEOverlayResidencyWaveProgress::Pending &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                progress = poll(error);
+                if (progress == MoEOverlayResidencyWaveProgress::Pending)
+                    std::this_thread::yield();
+            }
+            return progress;
+        }
     } // namespace native_vnni_transfer_parity_detail
 
     /**
      * @brief Prove promoted codebook-23 weights through grouped MoE execution.
      *
-     * Three real Q5_1 projections are prepared twice: the ordinary compact GPU
+         * Three real Q5_K projections are prepared twice: the ordinary compact GPU
      * load path publishes codebook 7, while the CPU-cold promotion path streams
      * the same mathematical weights into codebook 23. Both descriptor triplets
      * then execute the production grouped route plan at verifier and long-prefill
@@ -1849,12 +2056,12 @@ namespace llaminar2::test
                 "Grouped asymmetric parity backend is unavailable");
 
         constexpr int kDModel = 2048;
-        constexpr int kIntermediate = 32;
+        constexpr int kIntermediate = 512;
         constexpr int kNumExperts = 2;
         constexpr int kTopK = 2;
         constexpr int kMaxRows = 65;
         constexpr int kLayer = 0;
-        const auto &format = quantizedVerifierFormat("Q5_1");
+        const auto &format = quantizedVerifierFormat("Q5_K");
 
         std::vector<std::unique_ptr<TensorBase>> weights;
         std::vector<GpuPreparedGemm> prepared;
@@ -2156,6 +2363,391 @@ namespace llaminar2::test
                 promoted_canonical,
                 compact_canonical,
                 kDModel);
+        }
+
+        /*
+         * Close the last production-only gap: a heterogeneous host authority
+         * does not call flipActiveBank() or upload a table assembled by this
+         * test. It installs a complete immutable participant bank, exports the
+         * retained engines into the canonical runtime table, DMA-publishes only
+         * the inactive placement bank plus its selector, advances the device RCU
+         * epoch, and lets inference acquire that epoch ticket. The descriptor
+         * tables start with expert one empty, exactly as a graph captured before
+         * promotion would. Runtime publication must therefore be the sole reason
+         * the promoted expert becomes executable.
+         */
+        {
+            constexpr int rows = 16;
+            auto previous_snapshot = hostPublicationSnapshot(
+                1u, hostPublicationPlan(device, /*candidate=*/false));
+            auto candidate_snapshot = hostPublicationSnapshot(
+                2u, hostPublicationPlan(device, /*candidate=*/true));
+            const auto *gpu_participant =
+                previous_snapshot->owner_map.participantForId(0);
+            ASSERT_NE(gpu_participant, nullptr);
+            ASSERT_EQ(gpu_participant->device, device);
+
+            auto registry = std::make_shared<
+                MoEOverlayParticipantResidencyRegistry>(
+                MoEOverlayParticipantResidencyRegistry::Config{
+                    .owner_map = previous_snapshot->owner_map,
+                    .local_participant_ids = {0},
+                    .num_layers = 1,
+                    .num_experts = kNumExperts,
+                    .initial_epoch = 1u,
+                    .retained_epoch_capacity = 2u,
+                });
+            const auto borrowed = [](ITensorGemm *engine)
+            {
+                return std::shared_ptr<ITensorGemm>(
+                    engine, [](ITensorGemm *) {});
+            };
+            MoEOverlayPreparedExpertTriplet compact_triplet{
+                .gate = borrowed(prepared[0].kernel),
+                .up = borrowed(prepared[1].kernel),
+                .down = borrowed(prepared[2].kernel),
+            };
+            std::vector<MoEOverlayPreparedExpertTriplet> initial_triplets(
+                kNumExperts);
+            initial_triplets[0] = compact_triplet;
+            std::string publication_error;
+            ASSERT_TRUE(registry->registerInitialLayer(
+                /*participant_id=*/0,
+                /*layer_idx=*/0,
+                std::vector<bool>{true, false},
+                initial_triplets,
+                &publication_error))
+                << publication_error;
+            ASSERT_TRUE(registry->allInitialBanksReady());
+
+            auto promoted_lifetime = std::make_shared<int>(7319);
+            MoEOverlayPreparedExpertTriplet promoted_triplet{
+                .gate = promotedEngine(
+                    device, promoted_gate.descriptor, promoted_lifetime),
+                .up = promotedEngine(
+                    device, promoted_up.descriptor, promoted_lifetime),
+                .down = promotedEngine(
+                    device, promoted_down.descriptor, promoted_lifetime),
+            };
+            auto endpoint = registry->endpoint(0);
+            ASSERT_NE(endpoint, nullptr);
+            auto candidate_bank = endpoint->cloneCandidate(1u, 2u);
+            candidate_bank.layers[0].clearExpert(0);
+            candidate_bank.layers[0].setResidentExpert(
+                1, promoted_triplet);
+            auto prepared_candidate = endpoint->prepareReadyBank(
+                std::move(candidate_bank), &publication_error);
+            ASSERT_TRUE(prepared_candidate.has_value()) << publication_error;
+            ASSERT_EQ(
+                endpoint->installReadyBank(
+                    std::move(*prepared_candidate), &publication_error),
+                MoEOverlayParticipantBankInstallStatus::Installed)
+                << publication_error;
+
+            auto epoch_arena = std::make_shared<DeviceMoEOverlayEpochArena>(
+                DeviceMoEOverlayEpochArena::Config{
+                    .device_id = device,
+                    .initial_epoch = 1u,
+                    // A freshly initialized runtime table prepares bank one.
+                    .initial_bank = 1u,
+                    .request_slot_capacity = 1u,
+                });
+            auto initial_runtime_descriptors = compact_experts;
+            initial_runtime_descriptors[0].owner_participant = 0;
+            initial_runtime_descriptors[1].owner_participant = 1;
+            auto published_runtime = makeRuntimeTable(
+                device,
+                stream,
+                initial_runtime_descriptors,
+                /*participant_id=*/0u,
+                std::vector<std::uint8_t>{1u, 0u},
+                std::vector<std::uint32_t>{0b01u, 0b10u},
+                /*num_layers=*/1,
+                kTopK,
+                kMaxRows,
+                epoch_arena);
+            ASSERT_EQ(
+                published_runtime->hostLayerState(0).active_bank,
+                1u);
+
+            QuiescentOverlayInferenceBoundary inference_boundary;
+            MoEOverlayDeviceControllerRuntimeBinding runtime_binding{
+                .device = device,
+                .runtime_layers_device =
+                    published_runtime->deviceLayerState(0),
+                .runtime_table_host = published_runtime.get(),
+                .overlay_participant_id = 0,
+                .domain_participant_id = 0u,
+                .domain_participant_count = 1u,
+                .layer_count = 1u,
+                .expert_count = kNumExperts,
+                .top_k = kTopK,
+                .epoch_control = epoch_arena->control(),
+                .maintenance_epoch = epoch_arena->maintenanceEpoch(),
+                .maintenance_status = epoch_arena->maintenanceStatus(),
+                .inference_boundary = &inference_boundary,
+            };
+            ASSERT_TRUE(runtime_binding.hostPublicationValid());
+            auto publisher = std::make_shared<
+                MoEOverlayHostAuthorityDeviceBankPublisher>(
+                MoEOverlayHostAuthorityDeviceBankPublisher::Config{
+                    .runtime_bindings = {runtime_binding},
+                    .registry = registry,
+                    .perf_device = device.to_string(),
+                });
+            auto transaction = publisher->createTransaction(
+                previous_snapshot,
+                candidate_snapshot,
+                &publication_error);
+            ASSERT_NE(transaction, nullptr) << publication_error;
+            ASSERT_TRUE(transaction->beginPrepare(&publication_error))
+                << publication_error;
+            ASSERT_EQ(
+                awaitPublicationPhase(
+                    [&](std::string *error)
+                    { return transaction->pollPrepare(error); },
+                    &publication_error),
+                MoEOverlayResidencyWaveProgress::Ready)
+                << publication_error;
+            ASSERT_TRUE(transaction->beginPublication(&publication_error))
+                << publication_error;
+            ASSERT_EQ(
+                awaitPublicationPhase(
+                    [&](std::string *error)
+                    { return transaction->pollPublication(error); },
+                    &publication_error),
+                MoEOverlayResidencyWaveProgress::Ready)
+                << publication_error;
+
+            const MoEKernelLaunchContext launch{.stream = stream};
+            ASSERT_TRUE(kernel.acquireMoEOverlayEpoch(
+                launch,
+                epoch_arena->control(),
+                epoch_arena->requestTicket(0u),
+                epoch_arena->requestStatus(0u)));
+            ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+
+            /*
+             * Observe the publication certificate before routing. These are
+             * diagnostic-only D2H copies in an integration test; production
+             * inference consumes the same records in place on device. Keeping
+             * the assertions here makes the regression identify whether a
+             * future break is in epoch admission or descriptor execution.
+             */
+            DeviceMoELayerRuntime observed_runtime{};
+            DeviceMoEOverlayEpochTicket observed_ticket{};
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                &observed_runtime,
+                published_runtime->deviceLayerState(0),
+                sizeof(observed_runtime),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                &observed_ticket,
+                epoch_arena->requestTicket(0u),
+                sizeof(observed_ticket),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+            EXPECT_EQ(observed_runtime.active_bank, 0u);
+            EXPECT_EQ(observed_runtime.active_epoch, 2u);
+            EXPECT_EQ(observed_runtime.banks[0].epoch, 2u);
+            EXPECT_EQ(observed_runtime.banks[0].expert_count,
+                      static_cast<std::uint32_t>(kNumExperts));
+            EXPECT_EQ(observed_runtime.banks[0].local_compute_mask[1], 1u);
+            EXPECT_EQ(observed_runtime.banks[0].resident_participant_mask[1],
+                      0b01u);
+            EXPECT_TRUE(observed_runtime.banks[0].experts[1].weightsReady());
+            EXPECT_EQ(observed_runtime.banks[0].experts[1].gate.payload,
+                      promoted_gate.descriptor.payload);
+            EXPECT_EQ(observed_ticket.epoch, 2u);
+            EXPECT_EQ(observed_ticket.selector & 1u, 0u);
+            EXPECT_GT(observed_ticket.selector >> 1u, 0u);
+
+            std::array<DeviceNativeVNNIMatrixDesc, kNumExperts>
+                sparse_bootstrap_gates{compact_gate, {}};
+            std::array<DeviceNativeVNNIMatrixDesc, kNumExperts>
+                sparse_bootstrap_ups{compact_up, {}};
+            std::array<DeviceNativeVNNIMatrixDesc, kNumExperts>
+                sparse_bootstrap_downs{compact_down, {}};
+            const int published_gateup_table =
+                kernel.uploadGroupedExpertGateUpDescriptorTables(
+                    sparse_bootstrap_gates.data(),
+                    sparse_bootstrap_ups.data(),
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate,
+                    MoEDecodeDescriptorSource::RuntimePlacementTable);
+            const int published_down_table =
+                kernel.uploadGroupedExpertDownDescriptorTable(
+                    sparse_bootstrap_downs.data(),
+                    kNumExperts,
+                    kDModel,
+                    kIntermediate,
+                    MoEDecodeDescriptorSource::RuntimePlacementTable);
+            ASSERT_GE(published_gateup_table, 0);
+            ASSERT_GE(published_down_table, 0);
+
+            auto reference_descriptors = compact_experts;
+            reference_descriptors[0].owner_participant = -1;
+            reference_descriptors[1].owner_participant = 0;
+            auto reference_runtime = makeRuntimeTable(
+                device,
+                stream,
+                reference_descriptors,
+                /*participant_id=*/0u,
+                std::vector<std::uint8_t>{0u, 1u},
+                std::vector<std::uint32_t>{0u, 0b01u},
+                /*num_layers=*/1,
+                kTopK,
+                kMaxRows);
+
+            auto hidden = makeHidden(rows, kDModel, 93u);
+            auto routing_indices = TestTensorFactory::createFP32(
+                {static_cast<std::size_t>(rows), kTopK});
+            auto routing_weights = TestTensorFactory::createFP32(
+                {static_cast<std::size_t>(rows), kTopK});
+            for (int row = 0; row < rows; ++row)
+            {
+                routing_indices->mutable_data()[row * kTopK] = 1.0f;
+                routing_indices->mutable_data()[row * kTopK + 1] = 0.0f;
+                routing_weights->mutable_data()[row * kTopK] = 0.625f;
+                routing_weights->mutable_data()[row * kTopK + 1] = 0.375f;
+            }
+            ASSERT_TRUE(hidden->ensureOnDevice(device, stream));
+            ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
+            ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
+
+            ASSERT_TRUE(kernel.publishCompleteGroupedPrefillPlanFromRouter(
+                reference_runtime->deviceLayerState(0),
+                routing_indices.get(),
+                routing_weights.get(),
+                rows,
+                rows,
+                kNumExperts,
+                kTopK,
+                compact_gateup_table,
+                compact_down_table,
+                /*filter_to_local_runtime_experts=*/true));
+            std::vector<float> reference_canonical;
+            const auto reference_output = executePublishedPlan(
+                backend,
+                kernel,
+                *reference_runtime,
+                device,
+                stream,
+                hidden.get(),
+                compact_gateup_table,
+                compact_down_table,
+                rows,
+                kDModel,
+                kIntermediate,
+                kNumExperts,
+                kTopK,
+                /*layer_idx=*/0,
+                &reference_canonical);
+
+            ASSERT_TRUE(kernel.publishCompleteGroupedPrefillPlanFromRouter(
+                published_runtime->deviceLayerState(0),
+                routing_indices.get(),
+                routing_weights.get(),
+                rows,
+                rows,
+                kNumExperts,
+                kTopK,
+                published_gateup_table,
+                published_down_table,
+                /*filter_to_local_runtime_experts=*/true));
+
+            std::array<std::int32_t, kNumExperts> observed_counts{};
+            std::array<std::int32_t, rows * kTopK> observed_route_experts{};
+            std::array<std::int32_t, rows * kTopK>
+                observed_route_participants{};
+            std::array<float, rows * kTopK> observed_route_weights{};
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                observed_counts.data(),
+                observed_runtime.expert_counts,
+                sizeof(observed_counts),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                observed_route_experts.data(),
+                observed_runtime.route_expert_ids,
+                sizeof(observed_route_experts),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                observed_route_participants.data(),
+                observed_runtime.route_participant_ids,
+                sizeof(observed_route_participants),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->deviceToHostOnStream(
+                observed_route_weights.data(),
+                observed_runtime.route_weights,
+                sizeof(observed_route_weights),
+                device.ordinal,
+                stream));
+            EXPECT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+            EXPECT_EQ(observed_counts[0], 0);
+            EXPECT_EQ(observed_counts[1], rows);
+            for (int row = 0; row < rows; ++row)
+            {
+                const auto local_slot =
+                    static_cast<std::size_t>(row * kTopK);
+                const auto remote_slot = local_slot + 1u;
+                EXPECT_EQ(observed_route_experts[local_slot], 1);
+                EXPECT_EQ(observed_route_participants[local_slot], 0);
+                EXPECT_FLOAT_EQ(observed_route_weights[local_slot], 0.625f);
+                EXPECT_EQ(observed_route_experts[remote_slot], 0);
+                EXPECT_EQ(observed_route_participants[remote_slot], -1);
+                EXPECT_FLOAT_EQ(observed_route_weights[remote_slot], 0.0f);
+            }
+            std::vector<float> published_canonical;
+            const auto published_output = executePublishedPlan(
+                backend,
+                kernel,
+                *published_runtime,
+                device,
+                stream,
+                hidden.get(),
+                published_gateup_table,
+                published_down_table,
+                rows,
+                kDModel,
+                kIntermediate,
+                kNumExperts,
+                kTopK,
+                /*layer_idx=*/0,
+                &published_canonical);
+            expectByteEqual(
+                std::string(backend_label) +
+                    " host-published promoted output",
+                published_output,
+                reference_output,
+                kDModel);
+            expectByteEqual(
+                std::string(backend_label) +
+                    " host-published promoted canonical",
+                published_canonical,
+                reference_canonical,
+                kDModel);
+
+            ASSERT_TRUE(kernel.releaseMoEOverlayEpoch(
+                launch,
+                epoch_arena->control(),
+                epoch_arena->requestTicket(0u),
+                epoch_arena->requestStatus(0u)));
+            ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+            ASSERT_EQ(
+                awaitPublicationPhase(
+                    [&](std::string *error)
+                    { return transaction->pollRetirementFence(error); },
+                    &publication_error),
+                MoEOverlayResidencyWaveProgress::Ready)
+                << publication_error;
+            transaction->retirePrevious();
+            transaction.reset();
         }
 
         ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));

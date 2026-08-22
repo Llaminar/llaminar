@@ -82,9 +82,9 @@ namespace llaminar2
         std::uint64_t wave_wall_nanoseconds = 0;
         /** Independent complete-wave samples contributing to the median. */
         std::uint64_t wave_sample_count = 0;
-        /** Median added inference latency measured during concurrent movement. */
+        /** Reserved zero: runtime contention is governed by maintenance budgets. */
         std::uint64_t inference_interference_nanoseconds = 0;
-        /** Paired inference-only/inference-plus-movement samples. */
+        /** Reserved zero: startup performs no paired synthetic inference. */
         std::uint64_t interference_sample_count = 0;
     };
 

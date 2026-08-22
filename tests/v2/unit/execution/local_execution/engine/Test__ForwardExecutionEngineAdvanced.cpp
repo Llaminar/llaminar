@@ -226,6 +226,13 @@ namespace
             input.token_ids = tokens.data();
             input.position_ids = positions.data();
             input.position_offset = position_offset;
+            input.execution_phase = resolveForwardExecutionPhase({
+                .role = ForwardExecutionRole::MainInference,
+                .seq_len = seq_len,
+                .batch_size = batch_size,
+                .decode_max_seq_len = 4,
+                .logical_position = position_offset,
+            });
         }
     };
 
@@ -387,6 +394,42 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PrefillThenDecode_TwoSeparateBuilds
     EXPECT_EQ(host.build_calls, 2) << "Different seq_len should trigger a new build";
 }
 
+/**
+ * @brief Prove typed phase, rather than row count, selects graph topology.
+ *
+ * A one-token prompt has the same tensor geometry as serial decode. The
+ * request orchestrator has already resolved that ambiguity before invoking
+ * ForwardExecutionEngine, so the engine must retain a prefill graph for the
+ * former and a decode graph for the latter.
+ */
+TEST_F(
+    Test__ForwardExecutionEngineAdvanced,
+    OneTokenExplicitPrefillDoesNotEnterDecodeTopology)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+    ForwardOutput output{};
+
+    TestInput prefill(1);
+    prefill.input.execution_phase = ForwardExecutionPhase::Prefill;
+    ASSERT_TRUE(engine.execute(prefill.input, output, host));
+    const auto prefill_view = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(prefill_view.has_value());
+    EXPECT_FALSE(prefill_view->is_decode);
+    EXPECT_FALSE(prefill_view->signature.decode);
+
+    TestInput decode(1);
+    decode.input.execution_phase = ForwardExecutionPhase::Decode;
+    ASSERT_TRUE(engine.execute(decode.input, output, host));
+    const auto decode_view = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(decode_view.has_value());
+    EXPECT_TRUE(decode_view->is_decode);
+    EXPECT_TRUE(decode_view->signature.decode);
+    EXPECT_EQ(host.build_calls, 2)
+        << "Prefill and decode need distinct graph identities even at M=1.";
+}
+
 TEST_F(Test__ForwardExecutionEngineAdvanced, SameDecodeShape_CacheHitOnSecondCall)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
@@ -534,7 +577,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, ThreeTokenAllPositionVerifierUsesDe
         << "M=3 verifier continuations should be eligible for decode graph capture";
 }
 
-TEST_F(Test__ForwardExecutionEngineAdvanced, TwoTokenPromptWithoutHistoryDoesNotUseDecodeCache)
+TEST_F(Test__ForwardExecutionEngineAdvanced, TwoTokenPromptWithoutHistoryUsesPrefillTopology)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
     TrackingHost host(&mock_ctx_);
@@ -548,7 +591,11 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, TwoTokenPromptWithoutHistoryDoesNot
 
     TestInput prompt2(2);
     engine.execute(prompt2.input, output, host);
-    EXPECT_EQ(host.build_calls, 2)
+    EXPECT_EQ(host.build_calls, 1)
+        << "Exact CPU prefill topology should remain reusable across requests";
+    const auto view = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(view.has_value());
+    EXPECT_FALSE(view->is_decode)
         << "A two-token prompt at position zero is prefill, not verifier decode";
 }
 
@@ -868,10 +915,10 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, DiscardAllCachedGraphs_ForcesRebuil
 }
 
 // =========================================================================
-// Prefill is not cached; decode is cached
+// Exact CPU prefill and decode use distinct reusable topology entries
 // =========================================================================
 
-TEST_F(Test__ForwardExecutionEngineAdvanced, PrefillRebuilds_DecodeCaches)
+TEST_F(Test__ForwardExecutionEngineAdvanced, CPUExactPrefillAndDecodeCacheSeparately)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
     TrackingHost host(&mock_ctx_);
@@ -884,22 +931,20 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PrefillRebuilds_DecodeCaches)
     engine.execute(prefill.input, output, host);
     EXPECT_EQ(host.build_calls, 1);
 
-    // Same prefill shape should rebuild. Caching prefill graphs retains large
-    // per-prompt activation state and causes server memory growth across
-    // different chat requests.
+    // Exact CPU prefill reuses topology while refreshing request data.
     TestInput prefill2(100);
     engine.execute(prefill2.input, output, host);
-    EXPECT_EQ(host.build_calls, 2) << "Prefill graphs should not be cached";
+    EXPECT_EQ(host.build_calls, 1);
 
     // Decode with 1 token
     TestInput decode(1);
     engine.execute(decode.input, output, host);
-    EXPECT_EQ(host.build_calls, 3);
+    EXPECT_EQ(host.build_calls, 2);
 
     // Decode again — should hit cache
     TestInput decode2(1);
     engine.execute(decode2.input, output, host);
-    EXPECT_EQ(host.build_calls, 3) << "Same decode shape should hit cache";
+    EXPECT_EQ(host.build_calls, 2) << "Same decode shape should hit cache";
 }
 
 // =========================================================================

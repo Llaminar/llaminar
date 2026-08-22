@@ -25,6 +25,10 @@
 
 namespace llaminar2
 {
+    struct MappedTransferProgressClaim;
+    struct MappedTransferProgressCommand;
+    struct MappedTransferProgressCompletion;
+
     namespace sampling_math
     {
         struct DeviceGenerationDepthPolicy;
@@ -2795,7 +2799,10 @@ namespace llaminar2
             void *out_stopped_flags_device = nullptr,
             void *out_next_sidecar_condition_tokens_device = nullptr,
             void *out_next_sidecar_position_ids_device = nullptr,
-            void *out_next_verifier_condition_tokens_device = nullptr)
+            void *out_next_verifier_condition_tokens_device = nullptr,
+            const void *verifier_input_tokens_device = nullptr,
+            int verifier_input_token_stride = 0,
+            void *out_committed_verifier_identity_device = nullptr)
         {
             (void)output_tokens_device;
             (void)output_token_stride;
@@ -2820,6 +2827,9 @@ namespace llaminar2
             (void)out_next_sidecar_condition_tokens_device;
             (void)out_next_sidecar_position_ids_device;
             (void)out_next_verifier_condition_tokens_device;
+            (void)verifier_input_tokens_device;
+            (void)verifier_input_token_stride;
+            (void)out_committed_verifier_identity_device;
             return false;
         }
 
@@ -3688,6 +3698,104 @@ namespace llaminar2
         {
             // Default: fall back to synchronous deviceToHost.
             return deviceToHost(dst, src, bytes, device_id, stream);
+        }
+
+        /**
+         * @brief Launch a bounded device kernel that writes mapped host pages.
+         *
+         * This primitive exists for progress-sensitive transfers competing
+         * with a retained graph's own mapped system-memory traffic. @p dst is
+         * the exact device alias of a TransferEngine-owned mapped region, not a
+         * host pointer. Implementations enqueue a byte-exact kernel on @p stream
+         * and never allocate, wait, synchronize, or substitute a DMA copy.
+         * Ordinary callers use TransferEngine, which validates registration,
+         * bounds, endpoint identity, and the exact stream before reaching here.
+         *
+         * @param dst Device-visible alias of mapped host destination bytes.
+         * @param src Stable device source bytes on @p device_id.
+         * @param bytes Positive byte count to copy exactly.
+         * @param device_id Exact source GPU ordinal.
+         * @param stream Exact non-null latency-critical compute stream.
+         * @return True only when the kernel launch was accepted.
+         */
+        virtual bool deviceToMappedHostByKernelOnStream(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int device_id,
+            void *stream)
+        {
+            (void)dst;
+            (void)src;
+            (void)bytes;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Snapshot fixed mapped transfer commands on an exact stream.
+         *
+         * One capture-safe block owns each permanent slot and copies its
+         * host-published command into ordinary device memory.  This is the
+         * primary-stream half of a graph-owned parallel progress branch.  It
+         * performs no allocation, wait, callback, synchronization, or payload
+         * transfer. Production callers reach it only through TransferEngine.
+         *
+         * @param commands Device alias of the fixed mapped command array.
+         * @param claims Persistent device-resident immutable snapshots.
+         * @param slot_capacity Positive immutable command-array cardinality.
+         * @param device_id Exact local GPU ordinal.
+         * @param stream Exact non-null primary capture stream.
+         * @return True only when the claim kernel launch was accepted.
+         */
+        virtual bool enqueueMappedTransferProgressClaims(
+            const MappedTransferProgressCommand *commands,
+            MappedTransferProgressClaim *claims,
+            size_t slot_capacity,
+            int device_id,
+            void *stream)
+        {
+            (void)commands;
+            (void)claims;
+            (void)slot_capacity;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Copy every claimed mapped transfer on an exact branch stream.
+         *
+         * One block owns each slot, skips an idle or completed generation, and
+         * copies an active process-local source/destination pair before a
+         * system-scope release publication. Either endpoint may be VRAM or a
+         * TransferEngine-registered mapped host alias. The method is capture-
+         * safe and never allocates, waits, synchronizes, or invokes the host.
+         *
+         * @param claims Device-resident snapshots produced by the claim phase.
+         * @param completions Device alias of the fixed mapped result array.
+         * @param slot_capacity Positive immutable command-array cardinality.
+         * @param maximum_bytes Positive per-command byte bound.
+         * @param device_id Exact local GPU ordinal.
+         * @param stream Exact non-null auxiliary capture stream.
+         * @return True only when the payload kernel launch was accepted.
+         */
+        virtual bool enqueueMappedTransferProgressCopies(
+            const MappedTransferProgressClaim *claims,
+            MappedTransferProgressCompletion *completions,
+            size_t slot_capacity,
+            size_t maximum_bytes,
+            int device_id,
+            void *stream)
+        {
+            (void)claims;
+            (void)completions;
+            (void)slot_capacity;
+            (void)maximum_bytes;
+            (void)device_id;
+            (void)stream;
+            return false;
         }
 
         // ====================================================================

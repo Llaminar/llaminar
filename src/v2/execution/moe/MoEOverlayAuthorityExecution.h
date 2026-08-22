@@ -15,12 +15,21 @@
 
 namespace llaminar2
 {
-    /** @brief Physical execution backend for ExpertOverlay authority work. */
+    /**
+     * @brief Ownership locus for the sole live ExpertOverlay authority.
+     *
+     * This enum deliberately says nothing about tier count, vendor
+     * homogeneity, collective choice, or controller fan-out. Those are
+     * properties of the frozen controller topology. Authority ownership is
+     * determined only by the owners of live routed-expert state: an all-GPU
+     * overlay is device-resident, while any CPU participant makes the one
+     * authority host-resident.
+     */
     enum class MoEOverlayAuthorityExecutionKind : std::uint8_t
     {
         Unresolved = 0, ///< Declarative input not yet frozen against topology.
-        HostCoordinated, ///< Multiple tiers or heterogeneous tier participants.
-        HomogeneousDeviceResident, ///< One tier whose participants share one device type.
+        HostResident, ///< At least one live routed-expert participant is CPU-owned.
+        DeviceResident, ///< Every live routed-expert participant is GPU-owned.
     };
 
     /**
@@ -35,10 +44,10 @@ namespace llaminar2
         {
         case MoEOverlayAuthorityExecutionKind::Unresolved:
             return "unresolved";
-        case MoEOverlayAuthorityExecutionKind::HostCoordinated:
-            return "host-coordinated";
-        case MoEOverlayAuthorityExecutionKind::HomogeneousDeviceResident:
-            return "homogeneous-device-resident";
+        case MoEOverlayAuthorityExecutionKind::HostResident:
+            return "host-resident";
+        case MoEOverlayAuthorityExecutionKind::DeviceResident:
+            return "device-resident";
         }
         return "unknown";
     }

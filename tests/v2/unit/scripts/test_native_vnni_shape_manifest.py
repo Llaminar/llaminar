@@ -79,7 +79,7 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
         """Every spent prefill witness leaves a disjoint fresh holdout pool."""
 
         manifest = load_shape_manifest()
-        self.assertEqual(len(manifest.shapes), 594)
+        self.assertEqual(len(manifest.shapes), 600)
         fast_sealed = [
             shape
             for shape in manifest.shapes
@@ -706,8 +706,37 @@ class NativeVNNIShapeManifestTest(unittest.TestCase):
         production = [
             shape for shape in manifest.shapes if shape.role == ShapeRole.PRODUCTION
         ]
-        self.assertEqual(len(production), 86)
+        self.assertEqual(len(production), 92)
         self.assertTrue(all(shape.exact_overlay for shape in production))
+        tp_local = {
+            shape.name: (shape.n, shape.k)
+            for shape in production
+            if shape.model_family == "qwen35-moe-tp-local"
+        }
+        self.assertEqual(
+            tp_local,
+            {
+                "Qwen35MoE_122B_TP2_AttnKVProjection": (256, 3072),
+                "Qwen35MoE_122B_TP2_GDNZProjection": (4096, 3072),
+                "Qwen35MoE_122B_TP2_AttnGDNOutputProjection": (3072, 4096),
+                "Qwen35MoE_122B_TP4_AttnKVProjection": (128, 3072),
+                "Qwen35MoE_122B_TP4_GDNZProjection": (2048, 3072),
+                "Qwen35MoE_122B_TP4_AttnGDNOutputProjection": (3072, 2048),
+            },
+        )
+        exact_dimensions = {
+            (shape.n, shape.k)
+            for shape in production
+            if shape.exact_overlay
+        }
+        expected_by_degree = {
+            2: {(256, 3072), (4096, 3072), (3072, 4096)},
+            4: {(128, 3072), (2048, 3072), (3072, 2048)},
+            8: {(64, 3072), (1024, 3072), (3072, 1024)},
+        }
+        for degree, dimensions in expected_by_degree.items():
+            with self.subTest(tp_degree=degree):
+                self.assertTrue(dimensions.issubset(exact_dimensions))
 
     def test_manifest_digest_is_stable_and_content_addressed(self) -> None:
         """Generated policy provenance must bind the complete reviewed split."""

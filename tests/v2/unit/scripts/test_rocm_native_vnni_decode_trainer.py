@@ -381,8 +381,8 @@ class ROCmNativeVNNIDecodeTrainerTest(unittest.TestCase):
             source,
         )
         self.assertIn(
-            "return resolveNativeVNNIDecodeGeneratedRuntimeConfig(\n"
-            "        codebook_id, 1, N, K);",
+            "return resolveNativeVNNISerialM1RuntimeConfigForPolicy(\n"
+            "        defaultNativeVNNIArithmeticPolicyCodebook(codebook_id), N, K);",
             source,
         )
         self.assertIn("generated dispatch miss", source)

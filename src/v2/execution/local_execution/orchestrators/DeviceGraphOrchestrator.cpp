@@ -54,6 +54,7 @@
 #include "../../moe/GpuExpertTransferStagingPool.h"
 #include "../../moe/IMoEGroupedVerifierHistogramPublisher.h"
 #include "../../moe/MoEOverlayInferenceTransactionService.h"
+#include "../../moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../loaders/WeightPlan.h"
 #include "../../../backends/BackendManager.h"
@@ -72,6 +73,7 @@
 #include "execution/prefix_cache/PrefixStateCache.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
 #include "utils/Sha256.h"
+#include "transfer/MappedTransferProgressEpoch.h"
 #include "transfer/TransferEngine.h"
 #include <chrono>
 #include <algorithm>
@@ -91,6 +93,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -98,6 +101,160 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Persistent backend event closing one calibration sample.
+         *
+         * The object is allocated during graph setup and reused serially. The
+         * inference thread only records the event on the exact terminal stream;
+         * the maintenance thread only queries it. No stream synchronization,
+         * host callback, or per-transaction allocation is introduced.
+         */
+        class BackendMoEOverlayInferenceCompletionEvent final
+            : public IMoEOverlayInferenceCompletionEvent
+        {
+        public:
+            /**
+             * @brief Allocate the event once on its owning backend device.
+             * @param backend Stable model-lifetime backend authority.
+             * @param device Exact GPU event owner.
+             * @throws std::invalid_argument when ownership is invalid.
+             * @throws std::runtime_error when event allocation fails.
+             */
+            BackendMoEOverlayInferenceCompletionEvent(
+                IBackend *backend,
+                DeviceId device)
+                : backend_(backend),
+                  device_ordinal_(device.gpu_ordinal()),
+                  device_name_(device.toString())
+            {
+                if (!backend_ || !device.is_gpu() || device_ordinal_ < 0)
+                {
+                    throw std::invalid_argument(
+                        "ExpertOverlay calibration fence requires one GPU backend device");
+                }
+                void *const raw_event =
+                    backend_->createEvent(device_ordinal_);
+                if (!raw_event)
+                {
+                    throw std::runtime_error(
+                        "ExpertOverlay calibration could not allocate its persistent device event on " +
+                        device_name_);
+                }
+                event_.reset(
+                    raw_event,
+                    [backend = backend_, ordinal = device_ordinal_](
+                        void *event)
+                    {
+                        if (event)
+                            backend->destroyEvent(event, ordinal);
+                    });
+            }
+
+            /** @copydoc IMoEOverlayInferenceCompletionEvent::record */
+            bool record(
+                void *producer_stream,
+                std::string *error) noexcept override
+            {
+                if (error)
+                    error->clear();
+                EventState observed = state_.load(std::memory_order_acquire);
+                while (observed != EventState::InFlight &&
+                       !state_.compare_exchange_weak(
+                           observed,
+                           EventState::InFlight,
+                           std::memory_order_acq_rel,
+                           std::memory_order_acquire))
+                {
+                }
+                if (!producer_stream || !event_ ||
+                    observed == EventState::InFlight)
+                {
+                    if (observed != EventState::InFlight)
+                        state_.store(EventState::Idle, std::memory_order_release);
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay calibration event is null, missing its exact stream, or already in flight on " +
+                            device_name_;
+                    }
+                    return false;
+                }
+                if (!backend_->recordEvent(
+                        event_.get(), device_ordinal_, producer_stream))
+                {
+                    state_.store(EventState::Idle, std::memory_order_release);
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay calibration could not record its exact graph-terminal event on " +
+                            device_name_;
+                    }
+                    return false;
+                }
+                return true;
+            }
+
+            /** @copydoc IMoEOverlayInferenceCompletionFence::poll */
+            [[nodiscard]] MoEOverlayInferenceCompletionFenceProgress poll(
+                std::string *error) noexcept override
+            {
+                if (error)
+                    error->clear();
+                const EventState observed =
+                    state_.load(std::memory_order_acquire);
+                if (observed == EventState::Ready)
+                    return MoEOverlayInferenceCompletionFenceProgress::Ready;
+                if (observed != EventState::InFlight || !event_)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay calibration queried an unrecorded event on " +
+                            device_name_;
+                    }
+                    return MoEOverlayInferenceCompletionFenceProgress::Failed;
+                }
+
+                bool ready = false;
+                if (!backend_->queryEvent(
+                        event_.get(), device_ordinal_, &ready))
+                {
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay calibration backend event query failed on " +
+                            device_name_;
+                    }
+                    return MoEOverlayInferenceCompletionFenceProgress::Failed;
+                }
+                if (!ready)
+                {
+                    return MoEOverlayInferenceCompletionFenceProgress::Pending;
+                }
+                /*
+                 * Keep Ready idempotent: an aggregate may revisit this leaf
+                 * while a slower sibling event is still Pending.
+                 */
+                state_.store(EventState::Ready, std::memory_order_release);
+                return MoEOverlayInferenceCompletionFenceProgress::Ready;
+            }
+
+        private:
+            /** Reusable event lifecycle visible to inference and maintenance. */
+            enum class EventState : std::uint8_t
+            {
+                Idle,
+                InFlight,
+                Ready,
+            };
+
+            IBackend *backend_ = nullptr; ///< Stable backend event authority.
+            int device_ordinal_ = -1; ///< Backend-local event owner ordinal.
+            std::string device_name_; ///< Setup-cached failure diagnostic.
+            std::shared_ptr<void> event_; ///< Persistent backend event owner.
+            std::atomic<EventState> state_{EventState::Idle}; ///< Reuse guard.
+        };
+
         /**
          * @brief Report the exact device timeline dependency that could not be joined.
          *
@@ -142,123 +299,6 @@ namespace llaminar2
                 device_name.c_str());
             std::fflush(stderr);
             return false;
-        }
-
-        /**
-         * @brief Publish one captured transaction fragment's kernel inventory.
-         *
-         * Inventory is opt-in and runs only while a new parent graph is being
-         * materialized. The backend walk reads native graph metadata; it does not
-         * launch a second execution path, synchronize, allocate device memory, or
-         * transfer device data. Repeated nodes deliberately share the same
-         * PerfStats key, so the record value/count is the exact multiplicity of a
-         * kernel geometry in this semantic fragment and transaction-depth branch.
-         *
-         * @param capture Captured source graph to inspect.
-         * @param fragment_name Declarative producer role in the MTP transaction.
-         * @param transaction_depth Device-selected MTP branch owning the fragment.
-         * @param device Participant whose graph is being composed.
-         * @param error Receives a fatal, actionable inspection diagnostic.
-         * @return true when instrumentation is disabled or the complete inventory
-         *         was validated and published.
-         */
-        bool publishMTPGraphKernelInventory(
-            const IGPUGraphCapture &capture,
-            const char *fragment_name,
-            int transaction_depth,
-            DeviceId device,
-            std::string &error)
-        {
-            if (!debugEnv().runtime_debug.gpu_graph_kernel_inventory)
-                return true;
-
-            std::vector<GPUGraphKernelNodeInfo> kernel_nodes;
-            std::string inspection_error;
-            if (!capture.inspectKernelNodes(kernel_nodes, &inspection_error))
-            {
-                error = "kernel inventory failed for fragment '" +
-                        std::string(fragment_name ? fragment_name : "unknown") +
-                        "': " + inspection_error;
-                return false;
-            }
-
-            size_t unresolved_names = 0;
-            for (const GPUGraphKernelNodeInfo &node : kernel_nodes)
-            {
-                if (!node.valid())
-                {
-                    error = "kernel inventory returned invalid launch geometry for fragment '" +
-                            std::string(fragment_name ? fragment_name : "unknown") +
-                            "' at " + node.graph_path;
-                    return false;
-                }
-                unresolved_names += node.name_resolved ? 0u : 1u;
-
-                const std::string grid =
-                    std::to_string(node.grid_x) + "x" +
-                    std::to_string(node.grid_y) + "x" +
-                    std::to_string(node.grid_z);
-                const std::string block =
-                    std::to_string(node.block_x) + "x" +
-                    std::to_string(node.block_y) + "x" +
-                    std::to_string(node.block_z);
-                PerfStatsCollector::Tags tags{
-                    {"backend", capture.backendName()},
-                    {"fragment", fragment_name ? fragment_name : "unknown"},
-                    {"transaction_depth", std::to_string(transaction_depth)},
-                    {"kernel", node.name},
-                    {"grid", grid},
-                    {"block", block},
-                    {"dynamic_smem_bytes",
-                     std::to_string(node.dynamic_shared_memory_bytes)},
-                    {"static_smem_bytes",
-                     std::to_string(node.static_shared_memory_bytes)},
-                    {"local_bytes_per_thread",
-                     std::to_string(node.local_memory_bytes_per_thread)},
-                    {"registers_per_thread",
-                     std::to_string(node.registers_per_thread)},
-                    {"max_threads_per_block",
-                     std::to_string(node.max_threads_per_block)},
-                    {"max_active_blocks_per_sm",
-                     std::to_string(node.max_active_blocks_per_sm)},
-                    {"nesting_depth", std::to_string(node.nesting_depth)},
-                    {"name_resolved", node.name_resolved ? "true" : "false"},
-                };
-                if (!node.name_resolved)
-                {
-                    tags.emplace(
-                        "function_identity",
-                        std::to_string(node.function_identity));
-                }
-                PerfStatsCollector::addCounter(
-                    "gpu_graph_inventory",
-                    "kernel_nodes",
-                    1.0,
-                    "graph_setup",
-                    device.toString(),
-                    std::move(tags));
-            }
-
-            PerfStatsCollector::addCounter(
-                "gpu_graph_inventory",
-                "fragment_kernel_nodes",
-                static_cast<double>(kernel_nodes.size()),
-                "graph_setup",
-                device.toString(),
-                {{"backend", capture.backendName()},
-                 {"fragment", fragment_name ? fragment_name : "unknown"},
-                 {"transaction_depth", std::to_string(transaction_depth)},
-                 {"unresolved_names", std::to_string(unresolved_names)}});
-            PerfStatsCollector::addCounter(
-                "gpu_graph_inventory",
-                "fragment_native_nodes",
-                static_cast<double>(capture.nodeCount()),
-                "graph_setup",
-                device.toString(),
-                {{"backend", capture.backendName()},
-                 {"fragment", fragment_name ? fragment_name : "unknown"},
-                 {"transaction_depth", std::to_string(transaction_depth)}});
-            return true;
         }
 
         constexpr size_t kStochasticDistributionMaxK = 256;
@@ -306,7 +346,8 @@ namespace llaminar2
             case MTPDepthPolicyMode::Observe:
                 policy.mode = DeviceGenerationDepthPolicyMode::Observe;
                 policy.minimum_depth = mtp.depth_policy.min_depth;
-                policy.maximum_depth = resolveMTPMaximumDraftDepth(mtp);
+                policy.maximum_depth =
+                    resolveMTPMaximumExecutionDraftDepth(mtp);
                 policy.initial_depth = resolveMTPDepthPolicyInitialDepth(
                     mtp.depth_policy,
                     mtp.draft_tokens,
@@ -315,7 +356,8 @@ namespace llaminar2
             case MTPDepthPolicyMode::Dynamic:
                 policy.mode = DeviceGenerationDepthPolicyMode::Dynamic;
                 policy.minimum_depth = mtp.depth_policy.min_depth;
-                policy.maximum_depth = resolveMTPMaximumDraftDepth(mtp);
+                policy.maximum_depth =
+                    resolveMTPMaximumExecutionDraftDepth(mtp);
                 policy.initial_depth = resolveMTPDepthPolicyInitialDepth(
                     mtp.depth_policy,
                     mtp.draft_tokens,
@@ -3627,6 +3669,13 @@ namespace llaminar2
                     binding.request_generation;
                 input.moe_overlay_collective_step_id =
                     binding.descriptor.logical_step_id;
+                input.moe_overlay_sequence_id = binding.sequence_id;
+                input.moe_overlay_sequence_placement_epoch =
+                    binding.descriptor.placement_epoch;
+                input.moe_overlay_sequence_graph_ordinal =
+                    binding.sequence_graph_ordinal;
+                input.moe_overlay_sequence_graph_count =
+                    binding.sequence_graph_count;
 
                 if (!graph_scope_.ownsTicketAuthority())
                     return true;
@@ -4405,7 +4454,21 @@ namespace llaminar2
          */
         try
         {
-            if (moe_overlay_epoch_external_reader_active_)
+            const auto lease_state =
+                moe_overlay_epoch_lease_lifecycle_->load();
+            if (lease_state != MoEOverlayEpochLeaseState::Idle &&
+                lease_state != MoEOverlayEpochLeaseState::ExternalReader &&
+                lease_state !=
+                    MoEOverlayEpochLeaseState::ReleasePublished)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay teardown found an incomplete forward epoch submission on "
+                    << state_.device_id.toString()
+                    << " lease_state="
+                    << moeOverlayEpochLeaseStateName(lease_state));
+                std::terminate();
+            }
+            if (lease_state == MoEOverlayEpochLeaseState::ExternalReader)
             {
                 if (!moe_overlay_epoch_acquire_producer_stream_ ||
                     !releaseMoEOverlayEpochForExternalTransaction(
@@ -4417,6 +4480,16 @@ namespace llaminar2
                     std::terminate();
                 }
             }
+            if (moe_overlay_external_sequence_identity_.valid())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay teardown found "
+                    "an execution-sequence identity without its live sequence "
+                    "lease on "
+                    << state_.device_id.toString());
+                std::terminate();
+            }
+            moe_overlay_epoch_forward_submission_stream_ = nullptr;
         }
         catch (const std::exception &exception)
         {
@@ -4432,10 +4505,15 @@ namespace llaminar2
             std::terminate();
         }
 
-        if (moe_overlay_epoch_release_pending_)
+        if (moe_overlay_epoch_lease_lifecycle_->load() ==
+            MoEOverlayEpochLeaseState::ReleasePublished)
         {
+            auto submission =
+                moe_overlay_epoch_lease_lifecycle_->beginSubmission();
             if (!moe_overlay_epoch_released_event_ ||
-                !moe_overlay_epoch_release_producer_stream_ ||
+                !submission.publishedReleaseProducerStream() ||
+                submission.state() !=
+                    MoEOverlayEpochLeaseState::ReleasePublished ||
                 !backend->waitForEvent(
                     moe_overlay_epoch_released_event_.get(),
                     state_.device_id.gpu_ordinal()))
@@ -4444,8 +4522,15 @@ namespace llaminar2
                           << state_.device_id.toString());
                 std::terminate();
             }
-            moe_overlay_epoch_release_pending_ = false;
-            moe_overlay_epoch_release_producer_stream_ = nullptr;
+            if (!submission.commit(MoEOverlayEpochLeaseState::Idle))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay teardown lost release receipt ownership on "
+                          << state_.device_id.toString()
+                          << " lease_state="
+                          << moeOverlayEpochLeaseStateName(
+                                 submission.state()));
+                std::terminate();
+            }
         }
     }
 
@@ -4756,19 +4841,42 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::
-        usesHomogeneousDeviceResidentMoEOverlayAuthority() const
+        usesDeviceResidentMoEOverlayAuthority() const
     {
         return moeOverlayAuthorityExecution() ==
                MoEOverlayAuthorityExecutionKind::
-                   HomogeneousDeviceResident;
+                   DeviceResident;
+    }
+
+    bool DeviceGraphOrchestrator::
+        usesTopologyWideDeviceMoEOverlayController() const noexcept
+    {
+        if (!graph_builder_ || !state_.device_id.is_gpu())
+            return false;
+
+        const auto &moe = graph_builder_->config().moe;
+        return moe.device_controller_fabric != nullptr &&
+               moe.authority_execution ==
+                   MoEOverlayAuthorityExecutionKind::DeviceResident;
+    }
+
+    bool DeviceGraphOrchestrator::
+        usesParticipantLocalDeviceMoERebalanceController() const noexcept
+    {
+        const auto policy =
+            deviceMoERebalanceMaintenanceExecutionPolicy();
+        return policy ==
+                   DeviceMoERebalanceMaintenanceExecutionPolicy::
+                       NativeConditionalGraph ||
+               policy ==
+                   DeviceMoERebalanceMaintenanceExecutionPolicy::
+                       HostScheduledCapturedMaintenance;
     }
 
     bool DeviceGraphOrchestrator::
         deviceResidentMoEOverlayMaintenanceReady() const
     {
-        if (!usesHomogeneousDeviceResidentMoEOverlayAuthority())
-            return false;
-        if (!isMoeRebalancingActive())
+        if (!usesParticipantLocalDeviceMoERebalanceController())
             return false;
 
         const auto &cache = device_moe_rebalance_maintenance_graph_;
@@ -5665,10 +5773,7 @@ namespace llaminar2
         device_generation_storage_.clear();
         device_generation_state_ready_ = {};
         last_device_generation_dispatch_ticket_.reset();
-        device_generation_dispatch_ticket_copy_pending_ = false;
-        hosted_device_generation_scheduler_started_ = false;
-        hosted_device_generation_terminal_submitted_ = false;
-        hosted_device_generation_last_transaction_count_ = 0;
+        hosted_device_generation_cursor_.reset();
         request_token_ids_dev_ = nullptr;
         request_position_ids_dev_ = nullptr;
         prefill_chunk_token_ids_dev_ = nullptr;
@@ -6346,7 +6451,17 @@ namespace llaminar2
                     sizeof(sampling_math::MTPFirstTransactionDiagnosticRecord) /
                         sizeof(int32_t),
                     "INT32",
-                                        state_.device_id))
+                    state_.device_id) ||
+                !arena_->registerBuffer(
+                    BufferId::MTP_COMMITTED_VERIFIER_IDENTITY,
+                    static_cast<size_t>(
+                        stochastic_batch_output_request_capacity_),
+                    sizeof(
+                        sampling_math::
+                            MTPCommittedVerifierIdentityRecord) /
+                        sizeof(int32_t),
+                    "INT32",
+                    state_.device_id))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to register stochastic MTP sampling buffers");
                 return false;
@@ -6819,7 +6934,9 @@ namespace llaminar2
             arena_->isRegistered(BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS) &&
             arena_->isRegistered(BufferId::STOCHASTIC_BATCH_OUTPUT_META) &&
             arena_->isRegistered(
-                BufferId::MTP_FIRST_TRANSACTION_DIAGNOSTIC))
+                BufferId::MTP_FIRST_TRANSACTION_DIAGNOSTIC) &&
+            arena_->isRegistered(
+                BufferId::MTP_COMMITTED_VERIFIER_IDENTITY))
         {
             arena_->allocateDeviceStorage(BufferId::STOCHASTIC_TARGET_TOKEN_IDS, state_.device_id);
             arena_->allocateDeviceStorage(BufferId::STOCHASTIC_TARGET_PROBS, state_.device_id);
@@ -6856,6 +6973,9 @@ namespace llaminar2
             arena_->allocateDeviceStorage(BufferId::STOCHASTIC_BATCH_OUTPUT_META, state_.device_id);
             arena_->allocateDeviceStorage(
                 BufferId::MTP_FIRST_TRANSACTION_DIAGNOSTIC,
+                state_.device_id);
+            arena_->allocateDeviceStorage(
+                BufferId::MTP_COMMITTED_VERIFIER_IDENTITY,
                 state_.device_id);
 
             stochastic_target_token_ids_dev_ =
@@ -6939,6 +7059,12 @@ namespace llaminar2
                     arena_->getDevicePtr(
                         BufferId::MTP_FIRST_TRANSACTION_DIAGNOSTIC,
                         state_.device_id));
+            mtp_committed_verifier_identity_dev_ =
+                static_cast<
+                    sampling_math::MTPCommittedVerifierIdentityRecord *>(
+                    arena_->getDevicePtr(
+                        BufferId::MTP_COMMITTED_VERIFIER_IDENTITY,
+                        state_.device_id));
 
             MTPVerifierOutcomeGraphBinding outcome_binding;
             outcome_binding.verifier_input_tokens_device =
@@ -6987,6 +7113,12 @@ namespace llaminar2
                 stochastic_batch_output_token_stride_;
             outcome_binding.output_meta_capacity =
                 sampling_math::kSpeculativeBatchMetaCount;
+            if (!mtp_committed_verifier_identity_dev_)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to bind persistent committed MTP verifier identity storage on "
+                          << state_.device_id.toString());
+                return false;
+            }
             if (!outcome_binding.validForGreedy() ||
                 !graph_builder_ ||
                 !graph_builder_->setMTPVerifierOutcomeGraphBinding(
@@ -7124,35 +7256,6 @@ namespace llaminar2
                     if (stream)
                         backend->destroyStream(stream, loop_device_ordinal);
                 });
-            auto allocate_loop_handoff_event =
-                [backend, loop_device_ordinal](
-                    std::shared_ptr<void> *owner) -> bool
-            {
-                void *const event = backend->createEvent(loop_device_ordinal);
-                if (!event)
-                    return false;
-                owner->reset(
-                    event,
-                    [backend, loop_device_ordinal](void *value)
-                    {
-                        if (value)
-                            backend->destroyEvent(
-                                value, loop_device_ordinal);
-                    });
-                return true;
-            };
-            if (!allocate_loop_handoff_event(
-                    &mtp_device_generation_loop_graph_
-                         .handoff_to_fragment_event) ||
-                !allocate_loop_handoff_event(
-                    &mtp_device_generation_loop_graph_
-                         .handoff_from_fragment_event))
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] Failed to preallocate retained-fragment handoff events on "
-                          << state_.device_id.toString());
-                mtp_device_generation_loop_graph_.release();
-                return false;
-            }
             try
             {
                 auto &gpu_context =
@@ -7534,21 +7637,26 @@ namespace llaminar2
          * Retire the exact published events and close any static/prefill-only
          * epoch reader before invalidating its retained graphs or event owners.
          * This is intentionally event-scoped and never synchronizes the device.
-         */
+        */
         retirePublishedDeviceWorkBeforeArenaRelease();
-        if (moe_overlay_epoch_external_reader_active_ ||
-            moe_overlay_epoch_release_pending_)
+        const auto lease_state =
+            moe_overlay_epoch_lease_lifecycle_->load();
+        if (lease_state != MoEOverlayEpochLeaseState::Idle ||
+            moe_overlay_external_sequence_identity_.valid() ||
+            moe_overlay_epoch_forward_submission_stream_)
         {
             throw std::logic_error(
-                "DeviceGraphOrchestrator buffer retirement left an ExpertOverlay epoch transaction active");
+                std::string(
+                    "DeviceGraphOrchestrator buffer retirement left an ExpertOverlay epoch lease active: ") +
+                moeOverlayEpochLeaseStateName(lease_state));
         }
         moe_overlay_epoch_acquire_graph_.invalidate();
         moe_overlay_epoch_release_graph_.invalidate();
         moe_overlay_epoch_acquired_event_.reset();
         moe_overlay_epoch_released_event_.reset();
         moe_overlay_epoch_acquire_producer_stream_ = nullptr;
-        moe_overlay_epoch_release_producer_stream_ = nullptr;
-        moe_overlay_epoch_release_pending_ = false;
+        moe_overlay_external_sequence_identity_.reset();
+        moe_overlay_epoch_forward_submission_stream_ = nullptr;
         moe_overlay_epoch_execution_binding_ = {};
         if (arena_)
         {
@@ -7725,10 +7833,15 @@ namespace llaminar2
         }
     }
 
-    bool DeviceGraphOrchestrator::maybeApplyDecodeBoundaryMaintenance()
+    bool DeviceGraphOrchestrator::maybeApplyDecodeBoundaryMaintenance(
+        uint64_t committed_tokens)
     {
-        if (!isMoeRebalancingActive() ||
-            !usesHomogeneousDeviceResidentMoEOverlayAuthority())
+        if (committed_tokens == 0u)
+        {
+            throw std::invalid_argument(
+                "Device MoE maintenance cannot retire an empty decode transaction");
+        }
+        if (!usesParticipantLocalDeviceMoERebalanceController())
             return true;
 
         if (compute_all_position_logits_ ||
@@ -7748,10 +7861,16 @@ namespace llaminar2
          */
         PerfStatsCollector::addCounter(
             "moe_rebalance",
-            "device_maintenance_participant_boundary_calls",
-            1.0,
+            "device_maintenance_participant_committed_tokens",
+            static_cast<double>(committed_tokens),
             "decode",
             state_.device_id.toString());
+        /*
+         * The accepted-state/sampling graph has already advanced the canonical
+         * device controller by the exact grouped-MTP commit count. One enqueue
+         * observes that durable state; replaying once per token would count the
+         * transaction twice and serialize otherwise grouped work.
+         */
         return maybeRunDeviceMoERebalanceMaintenanceGraph();
     }
 
@@ -7760,10 +7879,20 @@ namespace llaminar2
         deviceMoERebalanceMaintenanceExecutionPolicy() const noexcept
     {
         if (!isMoeRebalancingActive() ||
-            !usesHomogeneousDeviceResidentMoEOverlayAuthority())
+            !usesDeviceResidentMoEOverlayAuthority())
         {
             return DeviceMoERebalanceMaintenanceExecutionPolicy::Inactive;
         }
+
+        /*
+         * The topology-wide service owns one controller graph spanning every
+         * mapped homogeneous group.  Advertising a participant-local policy
+         * here would attach the retired CUDA conditional or ROCm ticket
+         * authority to the same runtime table, producing two epoch writers.
+         */
+        if (usesTopologyWideDeviceMoEOverlayController())
+            return DeviceMoERebalanceMaintenanceExecutionPolicy::Inactive;
+
         if (state_.device_id.is_cuda())
         {
             return DeviceMoERebalanceMaintenanceExecutionPolicy::
@@ -7789,6 +7918,237 @@ namespace llaminar2
         }
         return device_moe_rebalance_maintenance_graph_
             .hosted_observation_schedule;
+    }
+
+    std::vector<MoEOverlayDeviceControllerRuntimeBinding>
+    DeviceGraphOrchestrator::moeOverlayDeviceControllerRuntimeBindings() const
+    {
+        if (!graph_builder_)
+            return {};
+        auto binding =
+            graph_builder_->deviceMoEOverlayControllerRuntimeBinding(
+                state_.device_id);
+        if (binding.publicationValid())
+        {
+            // The pointer is setup-stable for this orchestrator's lifetime.
+            // It carries no policy or epoch value; it only exposes the exact
+            // participant-local producer/release timeline to the controller.
+            binding.inference_boundary = const_cast<
+                DeviceGraphOrchestrator *>(this);
+        }
+        return binding.valid()
+                   ? std::vector<MoEOverlayDeviceControllerRuntimeBinding>{
+                         binding}
+                   : std::vector<MoEOverlayDeviceControllerRuntimeBinding>{};
+    }
+
+    bool DeviceGraphOrchestrator::installMoEOverlayTransferProgressEpoch(
+        std::shared_ptr<MappedTransferProgressEpoch> epoch)
+    {
+        if (!epoch || !state_.device_id.is_gpu() ||
+            epoch->device() != state_.device_id)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Rejected a retained transfer epoch with mismatched device ownership");
+            return false;
+        }
+        if (moe_overlay_transfer_progress_epoch_ &&
+            moe_overlay_transfer_progress_epoch_ != epoch)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Rejected replacement of an installed retained transfer epoch on "
+                << state_.device_id.toString());
+            return false;
+        }
+        moe_overlay_transfer_progress_epoch_ = std::move(epoch);
+        return true;
+    }
+
+    MoEOverlayInferenceBoundaryStatus DeviceGraphOrchestrator::
+        enqueueMoEOverlayDeviceInferenceBoundary(
+            void *maintenance_stream,
+            MoEOverlayInferenceBoundaryRequest request)
+    {
+        const auto *const moe = graph_builder_
+                                    ? &graph_builder_->config().moe
+                                    : nullptr;
+        const bool observational_boundary =
+            request.purpose == MoEOverlayInferenceBoundaryPurpose::
+                                   ServiceTelemetrySnapshot;
+        const bool overlay_authority_bound =
+            moe && moe->usesExpertOverlayDurableResidencyAuthority() &&
+            moe->routed_expert_plan &&
+            moe->authority_execution !=
+                MoEOverlayAuthorityExecutionKind::Unresolved;
+        const bool device_policy_boundary =
+            !observational_boundary && moe &&
+            moe->device_controller_fabric &&
+            usesDeviceResidentMoEOverlayAuthority();
+        if (!state_.device_id.is_gpu() || !maintenance_stream ||
+            (observational_boundary && !overlay_authority_bound) ||
+            (!observational_boundary && !device_policy_boundary))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Topology-wide ExpertOverlay "
+                "boundary has incomplete device, stream, authority, or purpose ownership");
+            return MoEOverlayInferenceBoundaryStatus::Failed;
+        }
+
+        const char *const name = request.name();
+        const auto defer_for_lease =
+            [&](MoEOverlayEpochLeaseState lease_state)
+            -> MoEOverlayInferenceBoundaryStatus
+        {
+            /*
+             * Inference and maintenance share this one atomic authority. Any
+             * pending/forward/hosted phase means inference owns the lease; the
+             * controller retries after its ordinary terminal publication. It
+             * never joins, clears, or releases a partially submitted forward.
+             */
+            PerfStatsCollector::addCounter(
+                "moe_overlay_controller",
+                "inference_boundary_deferrals",
+                1.0,
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"boundary", name},
+                 {"reason", moeOverlayEpochLeaseStateName(lease_state)},
+                 {"blocking", "false"}});
+            return MoEOverlayInferenceBoundaryStatus::Deferred;
+        };
+        const auto initial_lease_state =
+            moe_overlay_epoch_lease_lifecycle_->load();
+        if (moeOverlayEpochObservationAction(initial_lease_state) ==
+            MoEOverlayEpochObservationAction::DeferToInferenceOwner)
+        {
+            return defer_for_lease(initial_lease_state);
+        }
+        if (compute_all_position_logits_ ||
+            compute_row_indexed_all_position_logits_)
+        {
+            /*
+             * Grouped verification is one live inference transaction. The
+             * background controller is allowed to reach this boundary before
+             * acceptance/rollback closes its all-position logits view, but it
+             * must not turn that ordinary overlap into either a fatal error or
+             * a wait on the inference thread. Retry the complete topology
+             * preflight after the verifier publishes its normal closure edge.
+             */
+            PerfStatsCollector::addCounter(
+                "moe_overlay_controller",
+                "inference_boundary_deferrals",
+                1.0,
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"boundary",
+                  name},
+                 {"reason", "grouped_verifier_live"},
+                 {"blocking", "false"}});
+            return MoEOverlayInferenceBoundaryStatus::Deferred;
+        }
+        bool replacement_writer_pending = false;
+        if (!waitForDeviceResidentLogicalSequenceStateMailboxForObservation(
+                maintenance_stream,
+                name,
+                &replacement_writer_pending))
+        {
+            if (replacement_writer_pending)
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_controller",
+                    "inference_boundary_deferrals",
+                    1.0,
+                    perfPhaseName(),
+                    state_.device_id.toString(),
+                    {{"boundary", name},
+                     {"reason", "logical_state_replacement_writer"},
+                     {"blocking", "false"}});
+                return MoEOverlayInferenceBoundaryStatus::Deferred;
+            }
+            return MoEOverlayInferenceBoundaryStatus::Failed;
+        }
+        if (!waitForLiveInferenceStateReadyForObservation(
+                maintenance_stream,
+                name,
+                DeviceTimelineRole::MoERebalanceMaintenance,
+                /*logical_state_mailbox_already_joined=*/true))
+        {
+            return MoEOverlayInferenceBoundaryStatus::Failed;
+        }
+
+        /*
+         * Observation may consume an immutable terminal receipt, but it never
+         * closes a live reader. ExternalReader is the admitted next inference
+         * transaction and its forward must be the sole authority that promotes
+         * or releases the corresponding device ticket.
+         */
+        {
+            /*
+             * Re-open the lifecycle under its submission authority after all
+             * live-state joins.  The next inference acquire is allowed to
+             * consume this same immutable event, so a naked atomic state load
+             * is insufficient: it could observe `ReleasePublished` while that
+             * acquire was clearing the associated raw stream payload.  The
+             * typed submission pins the state and receipt as one pair while we
+             * enqueue this independent consumer wait.
+             */
+            auto joined_submission =
+                moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+            const auto joined_lease_state = joined_submission.state();
+            const auto observation_action =
+                moeOverlayEpochObservationAction(joined_lease_state);
+            if (observation_action ==
+                MoEOverlayEpochObservationAction::DeferToInferenceOwner)
+            {
+                return defer_for_lease(joined_lease_state);
+            }
+            if (observation_action ==
+                MoEOverlayEpochObservationAction::WaitForPublishedRelease)
+            {
+                /*
+                 * Ordinary topology-wide forward submissions append their
+                 * captured release before returning to the execution engine.
+                 * The release kernel may still be queued, so consume its
+                 * immutable event without recording a late fence on the
+                 * mutable inference stream. Event waits are multi-consumer and
+                 * do not transfer ownership.
+                 */
+                IBackend *const backend = getBackendFor(state_.device_id);
+                if (!backend || !moe_overlay_epoch_released_event_ ||
+                    !joined_submission
+                         .publishedReleaseProducerStream() ||
+                    !backend->streamWaitEvent(
+                        maintenance_stream,
+                        moe_overlay_epoch_released_event_.get(),
+                        state_.device_id.gpu_ordinal()))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Topology-wide ExpertOverlay maintenance could not consume the completed forward-reader release on "
+                        << state_.device_id.toString());
+                    return MoEOverlayInferenceBoundaryStatus::Failed;
+                }
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_controller",
+                    "inference_boundary_release_event_waits",
+                    1.0,
+                    perfPhaseName(),
+                    state_.device_id.toString(),
+                    {{"boundary", name},
+                     {"blocking", "false"},
+                     {"stream", "exact_participant_maintenance"}});
+            }
+        }
+
+        PerfStatsCollector::addCounter(
+            "moe_overlay_controller",
+            "inference_boundaries_enqueued",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"stream", "exact_participant_maintenance"},
+             {"blocking", "false"},
+             {"host_epoch_mirror", "false"}});
+        return MoEOverlayInferenceBoundaryStatus::Submitted;
     }
 
     bool DeviceGraphOrchestrator::
@@ -8089,16 +8449,17 @@ namespace llaminar2
             void *const stream = cache.segment_cache.capture_stream;
             if (!stream ||
                 (moe_overlay_epoch_execution_binding_ &&
-                 !releaseMoEOverlayEpochForExternalTransaction(
+                 !claimMoEOverlayEpochForPlacementMaintenance(
                      stream,
                      "hosted_device_moe_rebalance_due_ticket")))
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] HIP due MoE ticket could not publish its ExpertOverlay release edge on "
+                LOG_ERROR("[DeviceGraphOrchestrator] HIP due MoE ticket could not claim its ExpertOverlay inference boundary on "
                           << state_.device_id.toString());
                 return false;
             }
             submitted = maybeRunDeviceMoERebalanceMaintenanceGraph(
-                /*boundary_already_published=*/true);
+                MoEOverlayEpochMaintenanceBoundarySource::
+                    AuthenticatedDispatchTicket);
         }
         else if (dispatch_action ==
                  DeviceMoERebalanceDispatchAction::Acknowledge)
@@ -10056,12 +10417,133 @@ namespace llaminar2
         publishTerminalCurrentBatchLLEPEvidenceDiagnostics();
     }
 
+    const char *DeviceGraphOrchestrator::moeOverlayEpochLeaseStateName(
+        MoEOverlayEpochLeaseState state) noexcept
+    {
+        switch (state)
+        {
+        case MoEOverlayEpochLeaseState::Idle:
+            return "idle";
+        case MoEOverlayEpochLeaseState::ExternalReader:
+            return "external_reader";
+        case MoEOverlayEpochLeaseState::ExternalSequence:
+            return "external_sequence";
+        case MoEOverlayEpochLeaseState::HostedParent:
+            return "hosted_parent";
+        case MoEOverlayEpochLeaseState::CapturedMainForward:
+            return "captured_main_forward";
+        case MoEOverlayEpochLeaseState::ExternalForward:
+            return "external_forward";
+        case MoEOverlayEpochLeaseState::HostedChildForward:
+            return "hosted_child_forward";
+        case MoEOverlayEpochLeaseState::ReleasePublished:
+            return "release_published";
+        }
+        return "invalid";
+    }
+
+    DeviceGraphOrchestrator::MoEOverlayExternalSequenceGraphLease::
+        ~MoEOverlayExternalSequenceGraphLease() noexcept
+    {
+        if (!active())
+            return;
+        if (!finish(/*execution_succeeded=*/false))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Failed to abort an unfinished "
+                "ExpertOverlay execution-sequence graph at "
+                << (consumer_name_ ? consumer_name_ : "unnamed"));
+            std::terminate();
+        }
+    }
+
+    bool DeviceGraphOrchestrator::MoEOverlayExternalSequenceGraphLease::admit(
+        DeviceGraphOrchestrator &owner,
+        const MoEOverlayInferenceParticipantGraphBinding &binding,
+        void *execution_stream,
+        DeviceTimelineRole consumer_role,
+        const char *consumer_name)
+    {
+        if (active() || owner_ || binding_ || execution_stream_)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay sequence graph lease "
+                "cannot be admitted more than once");
+            return false;
+        }
+        if (!binding.active)
+        {
+            finished_ = true;
+            return true;
+        }
+        if (!owner.admitMoEOverlayExternalSequenceGraph(
+                binding,
+                execution_stream,
+                consumer_role,
+                consumer_name))
+        {
+            return false;
+        }
+        owner_ = &owner;
+        binding_ = &binding;
+        execution_stream_ = execution_stream;
+        consumer_name_ = consumer_name;
+        finished_ = false;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::MoEOverlayExternalSequenceGraphLease::finish(
+        bool execution_succeeded) noexcept
+    {
+        if (!active())
+            return true;
+
+        bool ok = false;
+        try
+        {
+            ok = owner_->finishMoEOverlayExternalSequenceGraph(
+                *binding_,
+                execution_stream_,
+                execution_succeeded,
+                consumer_name_);
+        }
+        catch (const std::exception &exception)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay execution-sequence "
+                "graph terminal threw at "
+                << (consumer_name_ ? consumer_name_ : "unnamed")
+                << ": " << exception.what());
+            return false;
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay execution-sequence "
+                "graph terminal threw an unknown exception at "
+                << (consumer_name_ ? consumer_name_ : "unnamed"));
+            return false;
+        }
+
+        if (ok)
+            finished_ = true;
+        return ok;
+    }
+
     bool DeviceGraphOrchestrator::
         initializeMoEOverlayEpochExecutionBinding()
     {
-        if (moe_overlay_epoch_external_reader_active_)
+        const auto initial_lease_state =
+            moe_overlay_epoch_lease_lifecycle_->load();
+        if ((initial_lease_state != MoEOverlayEpochLeaseState::Idle &&
+             initial_lease_state !=
+                 MoEOverlayEpochLeaseState::ReleasePublished) ||
+            moe_overlay_external_sequence_identity_.valid() ||
+            moe_overlay_epoch_forward_submission_stream_)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay epoch topology cannot change while a request reader is active");
+            LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay epoch topology cannot change while a request lease is active"
+                      << " lease_state="
+                      << moeOverlayEpochLeaseStateName(initial_lease_state));
             return false;
         }
 
@@ -10085,11 +10567,17 @@ namespace llaminar2
 
         const auto retire_pending_release_before_identity_change = [&]() -> bool
         {
-            if (!moe_overlay_epoch_release_pending_)
-                return true;
+            auto submission =
+                moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+            if (submission.state() !=
+                MoEOverlayEpochLeaseState::ReleasePublished)
+            {
+                return submission.state() ==
+                       MoEOverlayEpochLeaseState::Idle;
+            }
             IBackend *const backend = getBackendFor(state_.device_id);
             if (!backend || !moe_overlay_epoch_released_event_ ||
-                !moe_overlay_epoch_release_producer_stream_ ||
+                !submission.publishedReleaseProducerStream() ||
                 !backend->waitForEvent(
                     moe_overlay_epoch_released_event_.get(),
                     state_.device_id.gpu_ordinal()))
@@ -10098,8 +10586,14 @@ namespace llaminar2
                           << state_.device_id.toString());
                 return false;
             }
-            moe_overlay_epoch_release_pending_ = false;
-            moe_overlay_epoch_release_producer_stream_ = nullptr;
+            if (!submission.commit(MoEOverlayEpochLeaseState::Idle))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay epoch identity retirement lost release ownership"
+                          << " observed_state="
+                          << moeOverlayEpochLeaseStateName(
+                                 submission.state()));
+                return false;
+            }
             return true;
         };
 
@@ -10112,8 +10606,8 @@ namespace llaminar2
             moe_overlay_epoch_acquired_event_.reset();
             moe_overlay_epoch_released_event_.reset();
             moe_overlay_epoch_acquire_producer_stream_ = nullptr;
-            moe_overlay_epoch_release_producer_stream_ = nullptr;
-            moe_overlay_epoch_release_pending_ = false;
+            moe_overlay_external_sequence_identity_.reset();
+            moe_overlay_epoch_forward_submission_stream_ = nullptr;
             moe_overlay_epoch_execution_binding_ = {};
             return true;
         }
@@ -10140,8 +10634,8 @@ namespace llaminar2
             moe_overlay_epoch_acquired_event_.reset();
             moe_overlay_epoch_released_event_.reset();
             moe_overlay_epoch_acquire_producer_stream_ = nullptr;
-            moe_overlay_epoch_release_producer_stream_ = nullptr;
-            moe_overlay_epoch_release_pending_ = false;
+            moe_overlay_external_sequence_identity_.reset();
+            moe_overlay_epoch_forward_submission_stream_ = nullptr;
             moe_overlay_epoch_execution_binding_ = binding;
         }
 
@@ -10216,6 +10710,13 @@ namespace llaminar2
             params.request_slot =
                 moe_overlay_epoch_execution_binding_.request_slot;
             params.operation = operation;
+            if (operation ==
+                MoEOverlayEpochBoundaryStage::Operation::Release)
+            {
+                params.retirement_readiness_controller =
+                    moe_overlay_epoch_execution_binding_
+                        .retirement_readiness_controller;
+            }
             params.stage_name = node_name;
 
             if (cache.valid && cache.graph && cache.stage &&
@@ -10372,7 +10873,8 @@ namespace llaminar2
         acquireMoEOverlayEpochForExternalTransaction(
             void *consumer_stream,
             DeviceTimelineRole consumer_role,
-            const char *consumer_name)
+            const char *consumer_name,
+            MoEOverlayEpochLeaseState acquired_state)
     {
         if (!moe_overlay_epoch_execution_binding_)
             return true;
@@ -10382,17 +10884,34 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay epoch acquire has incomplete stream/event ownership");
             return false;
         }
-
         IBackend *const backend = getBackendFor(state_.device_id);
         if (!backend)
             return false;
+        if (acquired_state != MoEOverlayEpochLeaseState::ExternalReader &&
+            acquired_state != MoEOverlayEpochLeaseState::ExternalSequence &&
+            acquired_state != MoEOverlayEpochLeaseState::ExternalForward)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] External ExpertOverlay acquire "
+                "received an invalid terminal lease state="
+                << moeOverlayEpochLeaseStateName(acquired_state));
+            return false;
+        }
         const int ordinal = state_.device_id.gpu_ordinal();
-        if (moe_overlay_epoch_external_reader_active_)
+        auto submission =
+            moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+        const auto lease_state = submission.state();
+        if (lease_state == MoEOverlayEpochLeaseState::ExternalReader &&
+            (acquired_state == MoEOverlayEpochLeaseState::ExternalReader ||
+             acquired_state == MoEOverlayEpochLeaseState::ExternalForward))
         {
             /*
-             * A later child graph may use another stream. It waits on the one
-             * durable acquire publication instead of attempting to acquire the
-             * same ticket again.
+             * A later child graph may use another stream, and a complete forward
+             * may consume a reader acquired by its enclosing live-state prelude.
+             * Both wait on the one durable acquire publication instead of
+             * incrementing the device ticket twice. The forward-owner transition
+             * is committed under this same submission authority, so maintenance
+             * cannot release the reader between event wait and graph admission.
              */
             if (!moe_overlay_epoch_acquire_producer_stream_ ||
                 !backend->streamWaitEvent(
@@ -10403,6 +10922,15 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay child could not consume the acquired epoch event");
                 return false;
             }
+            if (acquired_state ==
+                    MoEOverlayEpochLeaseState::ExternalForward &&
+                !submission.commit(
+                    MoEOverlayEpochLeaseState::ExternalForward))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay forward could not publish ownership of its existing external reader");
+                std::terminate();
+            }
             PerfStatsCollector::addCounter(
                 "moe_overlay_epoch",
                 "external_transaction_reader_event_waits",
@@ -10411,13 +10939,27 @@ namespace llaminar2
                 state_.device_id.toString(),
                 {{"consumer", consumer_name ? consumer_name : "unnamed"},
                  {"consumer_role",
-                  std::string(deviceTimelineRoleName(consumer_role))}});
+                  std::string(deviceTimelineRoleName(consumer_role))},
+                 {"reader_use",
+                  acquired_state == MoEOverlayEpochLeaseState::ExternalForward
+                      ? "forward_owner"
+                      : "shared_child"}});
             return true;
         }
 
-        if (moe_overlay_epoch_release_pending_)
+        const auto predecessor_state = lease_state;
+        if (lease_state != MoEOverlayEpochLeaseState::Idle &&
+            lease_state != MoEOverlayEpochLeaseState::ReleasePublished)
         {
-            if (!moe_overlay_epoch_release_producer_stream_ ||
+            LOG_ERROR("[DeviceGraphOrchestrator] External ExpertOverlay acquire overlaps another lease phase"
+                      << " lease_state="
+                      << moeOverlayEpochLeaseStateName(lease_state));
+            return false;
+        }
+        if (predecessor_state ==
+            MoEOverlayEpochLeaseState::ReleasePublished)
+        {
+            if (!submission.publishedReleaseProducerStream() ||
                 !backend->streamWaitEvent(
                     consumer_stream,
                     moe_overlay_epoch_released_event_.get(),
@@ -10426,8 +10968,6 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay acquire could not join the prior release");
                 return false;
             }
-            moe_overlay_epoch_release_pending_ = false;
-            moe_overlay_epoch_release_producer_stream_ = nullptr;
         }
 
         if (!executeMoEOverlayEpochBoundaryCaptured(
@@ -10446,23 +10986,320 @@ namespace llaminar2
             std::terminate();
         }
         moe_overlay_epoch_acquire_producer_stream_ = consumer_stream;
-        moe_overlay_epoch_external_reader_active_ = true;
+        if (!submission.commit(acquired_state))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay acquire could not publish its complete semantic owner");
+            std::terminate();
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::admitMoEOverlayExternalSequenceGraph(
+        const MoEOverlayInferenceParticipantGraphBinding &binding,
+        void *execution_stream,
+        DeviceTimelineRole consumer_role,
+        const char *consumer_name)
+    {
+        if (!binding.active)
+            return true;
+        if (!state_.device_id.is_gpu() || !execution_stream ||
+            binding.request_generation == 0 || binding.sequence_id == 0 ||
+            binding.sequence_graph_count <= 1 ||
+            binding.sequence_graph_ordinal < 0 ||
+            binding.sequence_graph_ordinal >=
+                binding.sequence_graph_count - 1 ||
+            binding.descriptor.graph_role !=
+                MoEOverlayInferenceGraphRole::MTPDraft ||
+            binding.descriptor.placement_epoch == 0)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Direct ExpertOverlay MTP graph "
+                "received an invalid execution-sequence binding"
+                << " device=" << state_.device_id.toString()
+                << " request_generation=" << binding.request_generation
+                << " sequence_id=" << binding.sequence_id
+                << " ordinal=" << binding.sequence_graph_ordinal
+                << " graph_count=" << binding.sequence_graph_count
+                << " placement_epoch="
+                << binding.descriptor.placement_epoch);
+            return false;
+        }
+
+        /*
+         * Some GPU participants can be outside the topology-wide epoch arena.
+         * They still authenticate the rank-wide graph sequence, but have no
+         * local residency ticket to acquire or retain.
+         */
+        if (!moe_overlay_epoch_execution_binding_)
+            return true;
+
+        auto &identity = moe_overlay_external_sequence_identity_;
+        if (binding.beginsSequence())
+        {
+            if (identity.valid())
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay MTP sequence "
+                    "began while another sequence identity remained live"
+                    << " live_sequence=" << identity.sequence_id
+                    << " incoming_sequence=" << binding.sequence_id);
+                return false;
+            }
+            if (!acquireMoEOverlayEpochForExternalTransaction(
+                    execution_stream,
+                    consumer_role,
+                    consumer_name,
+                    MoEOverlayEpochLeaseState::ExternalSequence))
+            {
+                return false;
+            }
+            identity.request_generation = binding.request_generation;
+            identity.sequence_id = binding.sequence_id;
+            identity.placement_epoch =
+                binding.descriptor.placement_epoch;
+            identity.graph_count = binding.sequence_graph_count;
+            identity.last_graph_ordinal = binding.sequence_graph_ordinal;
+        }
+        else
+        {
+            const auto lease_state =
+                moe_overlay_epoch_lease_lifecycle_->load();
+            const bool identity_matches =
+                identity.valid() &&
+                identity.request_generation == binding.request_generation &&
+                identity.sequence_id == binding.sequence_id &&
+                identity.placement_epoch ==
+                    binding.descriptor.placement_epoch &&
+                identity.graph_count == binding.sequence_graph_count &&
+                binding.sequence_graph_ordinal ==
+                    identity.last_graph_ordinal + 1;
+            if (lease_state !=
+                    MoEOverlayEpochLeaseState::ExternalSequence ||
+                !identity_matches)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay MTP sequence "
+                    "graph is duplicated, skipped, crossed, or changed epoch"
+                    << " lease_state="
+                    << moeOverlayEpochLeaseStateName(lease_state)
+                    << " live_request=" << identity.request_generation
+                    << " incoming_request=" << binding.request_generation
+                    << " live_sequence=" << identity.sequence_id
+                    << " incoming_sequence=" << binding.sequence_id
+                    << " live_ordinal=" << identity.last_graph_ordinal
+                    << " incoming_ordinal="
+                    << binding.sequence_graph_ordinal
+                    << " live_count=" << identity.graph_count
+                    << " incoming_count=" << binding.sequence_graph_count
+                    << " live_epoch=" << identity.placement_epoch
+                    << " incoming_epoch="
+                    << binding.descriptor.placement_epoch);
+                return false;
+            }
+
+            IBackend *const backend = getBackendFor(state_.device_id);
+            if (!backend || !moe_overlay_epoch_acquired_event_ ||
+                !moe_overlay_epoch_acquire_producer_stream_ ||
+                !backend->streamWaitEvent(
+                    execution_stream,
+                    moe_overlay_epoch_acquired_event_.get(),
+                    state_.device_id.gpu_ordinal()))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay MTP sequence "
+                    "graph could not consume its immutable acquire edge");
+                return false;
+            }
+            identity.last_graph_ordinal =
+                binding.sequence_graph_ordinal;
+        }
+
+        PerfStatsCollector::addCounter(
+            "moe_overlay_epoch",
+            binding.beginsSequence()
+                ? "external_sequence_acquires"
+                : "external_sequence_graph_joins",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"sequence_id", std::to_string(binding.sequence_id)},
+             {"graph_ordinal",
+              std::to_string(binding.sequence_graph_ordinal)},
+             {"graph_count",
+              std::to_string(binding.sequence_graph_count)},
+             {"placement_epoch",
+              std::to_string(binding.descriptor.placement_epoch)},
+             {"blocking", "false"}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::finishMoEOverlayExternalSequenceGraph(
+        const MoEOverlayInferenceParticipantGraphBinding &binding,
+        void *execution_stream,
+        bool execution_succeeded,
+        const char *consumer_name)
+    {
+        if (!binding.active || !moe_overlay_epoch_execution_binding_)
+            return true;
+
+        const auto &identity = moe_overlay_external_sequence_identity_;
+        const auto lease_state =
+            moe_overlay_epoch_lease_lifecycle_->load();
+        const bool identity_matches =
+            identity.valid() &&
+            identity.request_generation == binding.request_generation &&
+            identity.sequence_id == binding.sequence_id &&
+            identity.placement_epoch == binding.descriptor.placement_epoch &&
+            identity.graph_count == binding.sequence_graph_count &&
+            identity.last_graph_ordinal ==
+                binding.sequence_graph_ordinal;
+        if (lease_state != MoEOverlayEpochLeaseState::ExternalSequence ||
+            !identity_matches || !execution_stream)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay MTP graph terminal "
+                "lost its exact sequence lease"
+                << " boundary="
+                << (consumer_name ? consumer_name : "unnamed")
+                << " lease_state="
+                << moeOverlayEpochLeaseStateName(lease_state)
+                << " live_sequence=" << identity.sequence_id
+                << " incoming_sequence=" << binding.sequence_id
+                << " live_ordinal=" << identity.last_graph_ordinal
+                << " incoming_ordinal="
+                << binding.sequence_graph_ordinal);
+            return false;
+        }
+
+        if (execution_succeeded)
+        {
+            /* The grouped verifier owns the only successful terminal release. */
+            return true;
+        }
+
+        if (!releaseMoEOverlayEpochForExternalTransaction(
+                execution_stream,
+                consumer_name,
+                MoEOverlayEpochLeaseState::ExternalSequence))
+        {
+            return false;
+        }
+        moe_overlay_external_sequence_identity_.reset();
+        PerfStatsCollector::addCounter(
+            "moe_overlay_epoch",
+            "external_sequence_aborts",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"sequence_id", std::to_string(binding.sequence_id)},
+             {"graph_ordinal",
+              std::to_string(binding.sequence_graph_ordinal)},
+             {"blocking", "false"}});
         return true;
     }
 
     bool DeviceGraphOrchestrator::
-        releaseMoEOverlayEpochForExternalTransaction(
-            void *release_stream,
+        claimMoEOverlayEpochForPlacementMaintenance(
+            void *maintenance_stream,
             const char *boundary_name)
     {
         if (!moe_overlay_epoch_execution_binding_)
             return true;
-        if (!moe_overlay_epoch_external_reader_active_ || !release_stream ||
+        if (!maintenance_stream ||
             !moe_overlay_epoch_acquired_event_ ||
             !moe_overlay_epoch_released_event_)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay release reached an incomplete or inactive transaction at "
+            LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay placement maintenance reached an incomplete boundary at "
                       << (boundary_name ? boundary_name : "unnamed"));
+            return false;
+        }
+
+        auto submission =
+            moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+        const auto lease_state = submission.state();
+        const auto action =
+            moeOverlayEpochPlacementMaintenanceAction(lease_state);
+        const char *action_name = "invalid";
+        switch (action)
+        {
+        case MoEOverlayEpochPlacementMaintenanceAction::CloseExternalReader:
+            action_name = "close_external_reader";
+            if (!submitMoEOverlayEpochExternalRelease(
+                    submission,
+                    maintenance_stream,
+                    boundary_name,
+                    MoEOverlayEpochLeaseState::ExternalReader))
+            {
+                return false;
+            }
+            break;
+        case MoEOverlayEpochPlacementMaintenanceAction::JoinPublishedRelease:
+        {
+            action_name = "join_published_release";
+            IBackend *const backend = getBackendFor(state_.device_id);
+            if (!backend ||
+                !submission.publishedReleaseProducerStream() ||
+                !backend->streamWaitEvent(
+                    maintenance_stream,
+                    moe_overlay_epoch_released_event_.get(),
+                    state_.device_id.gpu_ordinal()))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay placement maintenance could not join the published release at "
+                    << (boundary_name ? boundary_name : "unnamed"));
+                return false;
+            }
+            break;
+        }
+        case MoEOverlayEpochPlacementMaintenanceAction::
+            RejectMissingBoundary:
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay placement maintenance has no committed inference boundary at "
+                << (boundary_name ? boundary_name : "unnamed"));
+            return false;
+        case MoEOverlayEpochPlacementMaintenanceAction::
+            RejectLiveInferenceOwner:
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay placement maintenance overlaps a live inference owner"
+                << " boundary="
+                << (boundary_name ? boundary_name : "unnamed")
+                << " lease_state="
+                << moeOverlayEpochLeaseStateName(lease_state));
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "moe_overlay_epoch",
+            "placement_maintenance_boundary_claims",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"boundary", boundary_name ? boundary_name : "unnamed"},
+             {"action", action_name},
+             {"blocking", "false"}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::submitMoEOverlayEpochExternalRelease(
+        MoEOverlayEpochLeaseLifecycle::Submission &submission,
+        void *release_stream,
+        const char *boundary_name,
+        MoEOverlayEpochLeaseState expected_state)
+    {
+        if (!moe_overlay_epoch_execution_binding_ || !release_stream ||
+            !moe_overlay_epoch_acquired_event_ ||
+            !moe_overlay_epoch_released_event_ ||
+            submission.state() != expected_state)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay external release primitive received an incomplete or mismatched lease"
+                      << " boundary="
+                      << (boundary_name ? boundary_name : "unnamed")
+                      << " lease_state="
+                      << moeOverlayEpochLeaseStateName(submission.state())
+                      << " expected_state="
+                      << moeOverlayEpochLeaseStateName(expected_state));
             return false;
         }
 
@@ -10490,10 +11327,236 @@ namespace llaminar2
             std::terminate();
         }
 
-        moe_overlay_epoch_external_reader_active_ = false;
         moe_overlay_epoch_acquire_producer_stream_ = nullptr;
-        moe_overlay_epoch_release_producer_stream_ = release_stream;
-        moe_overlay_epoch_release_pending_ = true;
+        if (!submission.publishRelease(release_stream))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay release could not publish its durable semantic receipt");
+            std::terminate();
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::
+        releaseMoEOverlayEpochForExternalTransaction(
+            void *release_stream,
+            const char *boundary_name,
+            MoEOverlayEpochLeaseState expected_state)
+    {
+        if (!moe_overlay_epoch_execution_binding_)
+            return true;
+        if (!release_stream ||
+            !moe_overlay_epoch_acquired_event_ ||
+            !moe_overlay_epoch_released_event_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay release reached an incomplete or inactive transaction at "
+                      << (boundary_name ? boundary_name : "unnamed"));
+            return false;
+        }
+
+        if (expected_state != MoEOverlayEpochLeaseState::ExternalReader &&
+            expected_state != MoEOverlayEpochLeaseState::ExternalSequence &&
+            expected_state != MoEOverlayEpochLeaseState::ExternalForward)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay release received an invalid expected lease state"
+                      << " expected_state="
+                      << moeOverlayEpochLeaseStateName(expected_state));
+            return false;
+        }
+        auto submission =
+            moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+        const auto prior_state = submission.state();
+        if (prior_state != expected_state)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay release has no external lease"
+                      << " boundary="
+                      << (boundary_name ? boundary_name : "unnamed")
+                      << " lease_state="
+                      << moeOverlayEpochLeaseStateName(prior_state));
+            return false;
+        }
+        return submitMoEOverlayEpochExternalRelease(
+            submission,
+            release_stream,
+            boundary_name,
+            expected_state);
+    }
+
+    bool DeviceGraphOrchestrator::acquireMoEOverlayEpochForHostedParent(
+        void *acquire_stream,
+        const IGPUGraphCapture *acquire_capture,
+        const char *parent_name)
+    {
+        if (!moe_overlay_epoch_execution_binding_)
+            return true;
+        if (!acquire_stream || !acquire_capture ||
+            !moe_overlay_epoch_acquired_event_ ||
+            !moe_overlay_epoch_released_event_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted ExpertOverlay parent acquire has incomplete or overlapping ownership at "
+                      << (parent_name ? parent_name : "unnamed"));
+            return false;
+        }
+
+        IBackend *const backend = getBackendFor(state_.device_id);
+        const int ordinal = state_.device_id.gpu_ordinal();
+        if (!backend)
+            return false;
+        auto submission =
+            moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+        const auto lease_state = submission.state();
+        const auto predecessor_state = lease_state;
+        if (lease_state != MoEOverlayEpochLeaseState::Idle &&
+            lease_state != MoEOverlayEpochLeaseState::ReleasePublished)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted ExpertOverlay parent acquire overlaps another lease phase"
+                      << " lease_state="
+                      << moeOverlayEpochLeaseStateName(lease_state));
+            return false;
+        }
+        if (predecessor_state ==
+            MoEOverlayEpochLeaseState::ReleasePublished)
+        {
+            if (!submission.publishedReleaseProducerStream() ||
+                !backend->streamWaitEvent(
+                    acquire_stream,
+                    moe_overlay_epoch_released_event_.get(),
+                    ordinal))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Hosted ExpertOverlay parent acquire could not join the prior branch release at "
+                          << (parent_name ? parent_name : "unnamed"));
+                return false;
+            }
+        }
+
+        if (!acquire_capture->launchOnStream(acquire_stream) ||
+            !backend->recordEvent(
+                moe_overlay_epoch_acquired_event_.get(),
+                ordinal,
+                acquire_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted ExpertOverlay parent acquire could not publish its exact completion edge at "
+                      << (parent_name ? parent_name : "unnamed"));
+            return false;
+        }
+        moe_overlay_epoch_acquire_producer_stream_ = acquire_stream;
+        if (!submission.commit(MoEOverlayEpochLeaseState::HostedParent))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Hosted ExpertOverlay parent acquire could not publish its complete owner");
+            std::terminate();
+        }
+        PerfStatsCollector::addCounter(
+            "moe_overlay_epoch",
+            "hosted_parent_acquires",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"parent", parent_name ? parent_name : "unnamed"},
+             {"blocking", "false"}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::releaseMoEOverlayEpochForHostedParent(
+        void *release_stream,
+        const IGPUGraphCapture *release_capture,
+        const char *parent_name)
+    {
+        if (!moe_overlay_epoch_execution_binding_)
+            return true;
+        if (!release_stream || !release_capture ||
+            !moe_overlay_epoch_acquired_event_ ||
+            !moe_overlay_epoch_released_event_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted ExpertOverlay parent release has incomplete or contradictory ownership at "
+                      << (parent_name ? parent_name : "unnamed"));
+            return false;
+        }
+
+        auto submission =
+            moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+        const auto lease_state = submission.state();
+        if (lease_state != MoEOverlayEpochLeaseState::HostedParent)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted ExpertOverlay parent release lost its atomic lease claim"
+                      << " lease_state="
+                      << moeOverlayEpochLeaseStateName(lease_state));
+            return false;
+        }
+
+        IBackend *const backend = getBackendFor(state_.device_id);
+        const int ordinal = state_.device_id.gpu_ordinal();
+        if (!backend || !moe_overlay_epoch_acquire_producer_stream_ ||
+            !backend->streamWaitEvent(
+                release_stream,
+                moe_overlay_epoch_acquired_event_.get(),
+                ordinal) ||
+            !release_capture->launchOnStream(release_stream) ||
+            !backend->recordEvent(
+                moe_overlay_epoch_released_event_.get(),
+                ordinal,
+                release_stream))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted ExpertOverlay parent release could not close and publish its ticket at "
+                      << (parent_name ? parent_name : "unnamed"));
+            return false;
+        }
+
+        moe_overlay_epoch_acquire_producer_stream_ = nullptr;
+        if (!submission.publishRelease(release_stream))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Hosted ExpertOverlay parent release could not publish its durable receipt");
+            std::terminate();
+        }
+        PerfStatsCollector::addCounter(
+            "moe_overlay_epoch",
+            "hosted_parent_releases",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"parent", parent_name ? parent_name : "unnamed"},
+             {"blocking", "false"}});
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::consumeMoEOverlayEpochForHostedChild(
+        void *consumer_stream,
+        const char *child_name)
+    {
+        if (!moe_overlay_epoch_execution_binding_)
+            return true;
+        if (!consumer_stream ||
+            moe_overlay_epoch_lease_lifecycle_->load() !=
+                MoEOverlayEpochLeaseState::HostedParent ||
+            !moe_overlay_epoch_acquired_event_ ||
+            !moe_overlay_epoch_acquire_producer_stream_)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Hosted ExpertOverlay child has no complete parent acquire edge at "
+                << (child_name ? child_name : "unnamed"));
+            return false;
+        }
+
+        IBackend *const backend = getBackendFor(state_.device_id);
+        if (!backend || !backend->streamWaitEvent(
+                            consumer_stream,
+                            moe_overlay_epoch_acquired_event_.get(),
+                            state_.device_id.gpu_ordinal()))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Hosted ExpertOverlay child could not consume its parent acquire event at "
+                << (child_name ? child_name : "unnamed"));
+            return false;
+        }
+        PerfStatsCollector::addCounter(
+            "moe_overlay_epoch",
+            "hosted_child_acquire_event_consumptions",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"child", child_name ? child_name : "unnamed"},
+             {"blocking", "false"}});
         return true;
     }
 
@@ -10503,9 +11566,12 @@ namespace llaminar2
     {
         if (!moe_overlay_epoch_execution_binding_)
             return true;
-        if (!parent_stream)
+        const auto lease_state = moe_overlay_epoch_lease_lifecycle_->load();
+        if (!parent_stream ||
+            lease_state == MoEOverlayEpochLeaseState::HostedParent ||
+            lease_state == MoEOverlayEpochLeaseState::HostedChildForward)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay internal parent requires an exact launch stream at "
+            LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay internal parent requires an exact stream and no already-active hosted parent at "
                       << (parent_name ? parent_name : "unnamed"));
             return false;
         }
@@ -10516,7 +11582,7 @@ namespace llaminar2
          * all first-transaction state, so the parent's first captured acquire
          * sees an empty request ticket.
          */
-        if (moe_overlay_epoch_external_reader_active_)
+        if (lease_state == MoEOverlayEpochLeaseState::ExternalReader)
         {
             return releaseMoEOverlayEpochForExternalTransaction(
                 parent_stream,
@@ -10529,15 +11595,21 @@ namespace llaminar2
          * retaining the direct event dependency makes the parent contract valid
          * even when a future topology has no maintenance payload to execute.
          */
-        if (!moe_overlay_epoch_release_pending_)
+        auto release_submission =
+            moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+        if (release_submission.state() !=
+            MoEOverlayEpochLeaseState::ReleasePublished)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] ExpertOverlay internal parent has neither an active external reader nor a published release at "
-                      << (parent_name ? parent_name : "unnamed"));
+                      << (parent_name ? parent_name : "unnamed")
+                      << " lease_state="
+                      << moeOverlayEpochLeaseStateName(
+                             release_submission.state()));
             return false;
         }
         IBackend *const backend = getBackendFor(state_.device_id);
         if (!backend || !moe_overlay_epoch_released_event_ ||
-            !moe_overlay_epoch_release_producer_stream_ ||
+            !release_submission.publishedReleaseProducerStream() ||
             !backend->streamWaitEvent(
                 parent_stream,
                 moe_overlay_epoch_released_event_.get(),
@@ -10654,14 +11726,9 @@ namespace llaminar2
     {
         if (!state_.device_id.is_gpu() ||
             !isMoeRebalancingActive() ||
-            !usesHomogeneousDeviceResidentMoEOverlayAuthority())
+            !usesDeviceResidentMoEOverlayAuthority())
         {
             return true;
-        }
-        if (!debugEnv().moe_rebalance.device_rebalance_maintenance_graph)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Homogeneous device-resident ExpertOverlay was selected, but its captured maintenance graph is disabled");
-            return false;
         }
         if (!graph_builder_)
         {
@@ -10670,6 +11737,59 @@ namespace llaminar2
         }
 
         auto &cache = device_moe_rebalance_maintenance_graph_;
+        if (usesTopologyWideDeviceMoEOverlayController())
+        {
+            /*
+             * The main forward-family declaration has already materialized the
+             * model-lifetime runtime table and its epoch arena.  Certify that
+             * exact binding here; the orchestration layer will pass it unchanged
+             * to MoEOverlayDeviceControllerGraphService after all rank-local
+             * participants have completed construction.
+             *
+             * Do not build a local maintenance graph as a temporary bridge.
+             * Both graph types can publish the same bank selector, so even an
+             * apparently idle duplicate would violate the single-writer RCU
+             * contract as soon as its cadence became due.
+             */
+            if (cache.graph || !cache.collective_nodes.empty())
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Mapped topology-wide ExpertOverlay found a forbidden participant-local maintenance graph on "
+                          << state_.device_id.toString());
+                return false;
+            }
+
+            const auto bindings =
+                moeOverlayDeviceControllerRuntimeBindings();
+            if (bindings.size() != 1u ||
+                !bindings.front().backgroundPublicationValid() ||
+                bindings.front().device != state_.device_id ||
+                bindings.front().inference_boundary != this)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Mapped topology-wide ExpertOverlay has no unique production runtime/publication binding on "
+                          << state_.device_id.toString()
+                          << " bindings=" << bindings.size());
+                return false;
+            }
+
+            PerfStatsCollector::addCounter(
+                "moe_overlay_controller",
+                "mapped_runtime_bindings_certified",
+                1.0,
+                "graph_setup",
+                state_.device_id.toString(),
+                {{"authority", "topology_wide_device_controller"},
+                 {"participant_local_maintenance_graph", "false"},
+                 {"durable_writer_count", "1"},
+                 {"blocking", "false"}});
+            return true;
+        }
+
+        if (!debugEnv().moe_rebalance.device_rebalance_maintenance_graph)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Single-domain native device-resident ExpertOverlay was selected, but its captured maintenance graph is disabled");
+            return false;
+        }
+
         if (!cache.graph)
         {
             ComputeGraph graph =
@@ -10872,14 +11992,145 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::
+        appendCapturedMainForwardMoEOverlayEpochTransaction(
+            ComputeGraph &graph,
+            const ForwardInput &input,
+            std::string *error)
+    {
+        if (error)
+            error->clear();
+
+        const bool owns_topology_wide_main_transaction =
+            input.execution_role == ForwardExecutionRole::MainInference &&
+            usesTopologyWideDeviceMoEOverlayController();
+        if (!owns_topology_wide_main_transaction)
+            return true;
+
+        if (!state_.device_id.is_gpu() ||
+            input.device != state_.device_id ||
+            !moe_overlay_epoch_execution_binding_)
+        {
+            if (error)
+            {
+                *error =
+                    "topology-wide main graph has no matching GPU epoch binding";
+            }
+            return false;
+        }
+        if (graph.size() == 0u)
+        {
+            if (error)
+                *error = "cannot enclose an empty main graph in an epoch transaction";
+            return false;
+        }
+
+        constexpr const char *kAcquireNode =
+            "moe_overlay_main_forward_epoch_acquire";
+        constexpr const char *kReleaseNode =
+            "moe_overlay_main_forward_epoch_release";
+        if (graph.getNode(kAcquireNode) || graph.getNode(kReleaseNode))
+        {
+            if (error)
+                *error = "main graph already contains an epoch transaction boundary";
+            return false;
+        }
+
+        const std::vector<std::string> prior_roots = graph.getRootNodes();
+        const std::vector<std::string> prior_leaves = graph.getLeafNodes();
+        if (prior_roots.empty() || prior_leaves.empty())
+        {
+            if (error)
+                *error = "main graph has no complete root/leaf frontier";
+            return false;
+        }
+
+        /*
+         * The release is a control-only terminal. Preserve the model's logical
+         * output marker so tensor publication remains attached to the stage
+         * that actually produced the output, while the executor's terminal
+         * event is recorded after the RCU ticket has been released.
+         */
+        const std::string prior_terminal = graph.terminalNode();
+        if (ComputeNode *const output_node = graph.getNode(prior_terminal))
+            output_node->is_final_output = true;
+
+        const auto make_boundary =
+            [&](MoEOverlayEpochBoundaryStage::Operation operation,
+                const char *stage_name)
+        {
+            MoEOverlayEpochBoundaryStage::Params params;
+            params.device_id = state_.device_id;
+            params.arena = moe_overlay_epoch_execution_binding_.arena;
+            params.request_slot =
+                moe_overlay_epoch_execution_binding_.request_slot;
+            params.operation = operation;
+            if (operation ==
+                MoEOverlayEpochBoundaryStage::Operation::Release)
+            {
+                params.retirement_readiness_controller =
+                    moe_overlay_epoch_execution_binding_
+                        .retirement_readiness_controller;
+            }
+            params.stage_name = stage_name;
+            return std::make_unique<MoEOverlayEpochBoundaryStage>(
+                std::move(params));
+        };
+
+        try
+        {
+            graph.addNode(
+                kAcquireNode,
+                make_boundary(
+                    MoEOverlayEpochBoundaryStage::Operation::Acquire,
+                    kAcquireNode),
+                state_.device_id);
+            graph.addNode(
+                kReleaseNode,
+                make_boundary(
+                    MoEOverlayEpochBoundaryStage::Operation::Release,
+                    kReleaseNode),
+                state_.device_id);
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+                *error = exception.what();
+            return false;
+        }
+
+        /* Every original reader is downstream of the acquire. The release is
+         * downstream of every original leaf, including any HIP cadence stage,
+         * so no auxiliary MoE stream can outlive the request ticket. */
+        for (const std::string &root : prior_roots)
+            graph.addDependency(root, kAcquireNode);
+        for (const std::string &leaf : prior_leaves)
+            graph.addDependency(kReleaseNode, leaf);
+        graph.setTerminalNode(kReleaseNode);
+
+        PerfStatsCollector::addCounter(
+            "moe_overlay_epoch",
+            "captured_main_forward_transactions_declared",
+            1.0,
+            input.execution_phase == ForwardExecutionPhase::Decode
+                ? "decode"
+                : "prefill",
+            state_.device_id.toString(),
+            {{"ownership", "device_graph_root_terminal"},
+             {"request_slot",
+              std::to_string(
+                  moe_overlay_epoch_execution_binding_.request_slot)}});
+        return true;
+    }
+
     DeviceMoERebalanceGraphControllerState *
     DeviceGraphOrchestrator::deviceMoERebalanceControllerStateDevice(
         std::string *error)
     {
-        if (!usesHomogeneousDeviceResidentMoEOverlayAuthority())
+        if (!usesParticipantLocalDeviceMoERebalanceController())
         {
             if (error)
-                *error = "homogeneous device-resident authority is not selected";
+                *error = "participant-local device maintenance authority is not selected";
             return nullptr;
         }
         if (!device_moe_rebalance_maintenance_graph_.graph)
@@ -10956,8 +12207,7 @@ namespace llaminar2
             void *stream,
             uint64_t ticket_session_epoch)
     {
-        if (!isMoeRebalancingActive() ||
-            !usesHomogeneousDeviceResidentMoEOverlayAuthority())
+        if (!usesParticipantLocalDeviceMoERebalanceController())
         {
             return true;
         }
@@ -11429,21 +12679,26 @@ namespace llaminar2
     }
 
     bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph(
-        bool boundary_already_published)
+        MoEOverlayEpochMaintenanceBoundarySource boundary_source)
     {
         const auto &env = debugEnv();
         if (!env.moe_rebalance.device_rebalance_maintenance_graph)
         {
-            if (isMoeRebalancingActive() &&
-                state_.device_id.is_gpu() &&
-                usesHomogeneousDeviceResidentMoEOverlayAuthority())
+            if (state_.device_id.is_gpu() &&
+                usesParticipantLocalDeviceMoERebalanceController())
             {
                 throw std::runtime_error(
-                    "Homogeneous device-resident ExpertOverlay maintenance cannot run because its captured graph is disabled");
+                    "Single-domain native device-resident ExpertOverlay maintenance cannot run because its captured graph is disabled");
             }
             return true;
         }
 
+        /*
+         * Static placement has no maintenance transaction. Keep this typed
+         * policy check ahead of device/context inspection and timing so Static
+         * pays no per-token controller tax even when maintenance support is
+         * enabled globally.
+         */
         if (!isMoeRebalancingActive())
             return true;
 
@@ -11454,7 +12709,7 @@ namespace llaminar2
             return true;
         }
 
-        if (!usesHomogeneousDeviceResidentMoEOverlayAuthority())
+        if (!usesParticipantLocalDeviceMoERebalanceController())
             return true;
 
         const std::string device_key = state_.device_id.toString();
@@ -11475,8 +12730,9 @@ namespace llaminar2
         const PerfStatsCollector::Tags scheduler_tags = {
             {"scheduling_authority", "device_commit_boundary"},
             {"host_position_authority", "false"},
-            {"boundary_already_published",
-             boolTag(boundary_already_published)}};
+            {"boundary_source",
+             moeOverlayEpochMaintenanceBoundarySourceName(
+                 boundary_source)}};
         PerfStatsCollector::addCounter(
             "moe_rebalance",
             "device_maintenance_scheduler_ticks",
@@ -11628,8 +12884,21 @@ namespace llaminar2
                 "decode",
                 device_key,
                 dependency_tags);
-            if (!boundary_already_published)
+            if (boundary_source ==
+                MoEOverlayEpochMaintenanceBoundarySource::
+                    GraphLaunchDependency)
             {
+                if (moe_overlay_epoch_execution_binding_ &&
+                    moe_overlay_epoch_lease_lifecycle_->load() ==
+                        MoEOverlayEpochLeaseState::ExternalSequence)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Device MoE maintenance "
+                        "reached executable launch while a complete MTP "
+                        "execution sequence still owned the residency epoch on "
+                        << device_key);
+                    return false;
+                }
                 if (!waitForLiveInferenceStateReadyForObservation(
                         execution_stream,
                         "moe_device_rebalance_maintenance_before_executable_launch",
@@ -11644,6 +12913,8 @@ namespace llaminar2
                  * maintenance can reserve or publish its peer bank.
                  */
                 if (moe_overlay_epoch_execution_binding_ &&
+                    moe_overlay_epoch_lease_lifecycle_->load() ==
+                        MoEOverlayEpochLeaseState::ExternalReader &&
                     !releaseMoEOverlayEpochForExternalTransaction(
                         execution_stream,
                         "device_moe_maintenance_commit_boundary"))
@@ -11651,12 +12922,24 @@ namespace llaminar2
                     return false;
                 }
             }
-            else if (moe_overlay_epoch_execution_binding_ &&
-                     (moe_overlay_epoch_external_reader_active_ ||
-                      !moe_overlay_epoch_release_pending_))
+            else if (boundary_source ==
+                         MoEOverlayEpochMaintenanceBoundarySource::
+                             AuthenticatedDispatchTicket &&
+                     moe_overlay_epoch_execution_binding_ &&
+                     moe_overlay_epoch_lease_lifecycle_->load() !=
+                         MoEOverlayEpochLeaseState::ReleasePublished)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Authenticated HIP maintenance ticket did not publish the required ExpertOverlay release edge on "
                           << device_key);
+                return false;
+            }
+            else if (boundary_source !=
+                     MoEOverlayEpochMaintenanceBoundarySource::
+                         AuthenticatedDispatchTicket)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Device MoE maintenance received an invalid typed inference-boundary source on "
+                    << device_key);
                 return false;
             }
             if (device_resident_logical_sequence_state_mailbox_.valid() &&
@@ -11966,6 +13249,18 @@ namespace llaminar2
                     "Failed to append the HIP device MoE decode commit "
                     "boundary: " +
                     cadence_error);
+            }
+
+            std::string epoch_error;
+            if (!appendCapturedMainForwardMoEOverlayEpochTransaction(
+                    result.graph(),
+                    build_input,
+                    &epoch_error))
+            {
+                return GraphBuildResult(
+                    "Failed to enclose the topology-wide main forward in its "
+                    "captured ExpertOverlay epoch transaction: " +
+                    epoch_error);
             }
 
             applyCurrentExpertPlacementToGraph(
@@ -12411,6 +13706,31 @@ namespace llaminar2
 	                 {"heterogeneous_execution_domain", boolTag(heterogeneous_execution_domain)},
 	                 {"heterogeneous_segmentation_admitted", boolTag(policy.heterogeneous_segmented_enabled)},
 	                 {"reason", captured_collectives_reason}});
+        }
+        return policy;
+    }
+
+    std::optional<DeviceGraphExecutor::DecodeCapturePolicy>
+    DeviceGraphOrchestrator::buildDecodeCapturePolicyForGraph(
+        const ComputeGraph &graph,
+        bool has_collective_nodes,
+        IDeviceContext *ctx,
+        const char *consumer) const
+    {
+        auto policy = buildDecodeCapturePolicy(has_collective_nodes, ctx);
+        std::string policy_error;
+        if (!DeviceGraphCaptureController::
+                constrainReplayPolicyToNativeEnvelope(
+                    graph.nativeCaptureEnvelope(),
+                    policy,
+                    &policy_error))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] "
+                      << (consumer ? consumer : "device-owned graph")
+                      << " rejected graph-native capture envelope on "
+                      << state_.device_id.toString() << ": "
+                      << policy_error);
+            return std::nullopt;
         }
         return policy;
     }
@@ -14104,7 +15424,8 @@ namespace llaminar2
             return false;
         }
         if (moe_overlay_inference_transaction_coordinator_ ||
-            moe_overlay_inference_transaction_participant_index_ >= 0)
+            moe_overlay_inference_transaction_participant_index_ >= 0 ||
+            moe_overlay_inference_completion_fence_)
         {
             LOG_ERROR(
                 "[DeviceGraphOrchestrator] Serving graph setup must complete "
@@ -14219,6 +15540,84 @@ namespace llaminar2
                  {"capacity_authority", "orchestration_memory_plan"}});
         }
 
+        /*
+         * The first decode arrives only after prompt prefill, so its cache
+         * identity is the history-bearing serial variant. Use the same stable
+         * arena token and position rows as production forwardImpl(); the setup
+         * sentinel position is never executed, but makes decode_has_history
+         * true while native capture records the exact production pointers.
+         * Request state remains untouched because MaterializeWithoutLaunch
+         * captures and instantiates without running the live-state prelude or
+         * any model arithmetic.
+         */
+        if (plan.main_decode_graph !=
+                ServingMainDecodeGraphKind::HistoryBearingSerial ||
+            !request_token_ids_dev_ || !request_position_ids_dev_)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Serving graph setup is missing "
+                "its history-bearing serial decode inventory or persistent "
+                "request rows");
+            return false;
+        }
+
+        ForwardInput decode_input;
+        decode_input.token_ids = nullptr;
+        decode_input.token_ids_device = request_token_ids_dev_;
+        decode_input.position_ids = nullptr;
+        decode_input.position_ids_device = request_position_ids_dev_;
+        decode_input.materialize_serial_decode_position_from_device_kv = true;
+        decode_input.position_policy = ForwardPositionPolicy::ExplicitRows;
+        decode_input.execution_role = ForwardExecutionRole::MainInference;
+        decode_input.execution_phase = ForwardExecutionPhase::Decode;
+        decode_input.graph_submission_intent =
+            ForwardGraphSubmissionIntent::
+                MaterializeExecutableWithoutLaunch;
+        decode_input.batch_size = 1;
+        decode_input.seq_len = 1;
+        decode_input.real_seq_len = 1;
+        decode_input.bucket_seq_len = 0;
+        decode_input.position_offset = 1;
+        decode_input.token_offset = 1;
+        decode_input.moe_overlay_collective_generation_id = 1;
+        decode_input.moe_overlay_collective_step_id = 1;
+        decode_input.device_state_publication_stream = publication_stream;
+        decode_input.device = state_.device_id;
+        decode_input.kv_cache = state_.kv_cache.get();
+        decode_input.sequence_lengths = nullptr;
+        decode_input.sequence_lengths_device = nullptr;
+        decode_input.rehydrate_prefix_runtime_on_device = false;
+        if (!bindShiftedMTPPrefillTransaction(
+                decode_input, /*request_count=*/1))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Serving decode graph setup could "
+                "not bind its production MTP contract");
+            return false;
+        }
+
+        ForwardOutput decode_output;
+        decode_output.logits = state_.logits.get();
+        decode_output.hidden = state_.hidden.get();
+        if (!executeForward(decode_input, decode_output))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Failed to capture and instantiate "
+                "the history-bearing serial decode executable without launch");
+            return false;
+        }
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "serving_graph_family_materializations",
+            1.0,
+            "setup",
+            state_.device_id.toString(),
+            {{"role", "main_decode"},
+             {"physical_rows", "1"},
+             {"decode_history", "present"},
+             {"submission", "materialized_unlaunched"},
+             {"capacity_authority", "orchestration_memory_plan"}});
+
         PerfStatsCollector::addCounter(
             "forward_graph",
             "serving_graph_family_participant_completions",
@@ -14226,8 +15625,20 @@ namespace llaminar2
             "setup",
             state_.device_id.toString(),
             {{"prefill_buckets", std::to_string(normalized_buckets.size())},
+             {"main_decode_graphs", "1"},
              {"request_state_mutations", "0"},
              {"executable_launches", "0"}});
+
+        if (moe_overlay_transfer_progress_epoch_)
+        {
+            const auto progress_stats =
+                moe_overlay_transfer_progress_epoch_->stats();
+            LOG_DEBUG(
+                "[DeviceGraphOrchestrator] Serving graph family sealed without transfer-progress joins"
+                << " device=" << state_.device_id.toString()
+                << " background_dma_submissions="
+                << progress_stats.dma_submissions);
+        }
         return true;
     }
 
@@ -14263,20 +15674,38 @@ namespace llaminar2
                 coordinator,
             int continuation_participant_index)
     {
-        const auto plan = graph_builder_
-                              ? graph_builder_->config().moe.routed_expert_plan
-                              : nullptr;
+        const auto *const moe = graph_builder_
+                                    ? &graph_builder_->config().moe
+                                    : nullptr;
+        const auto plan = moe ? moe->routed_expert_plan : nullptr;
+        const auto authority = moeOverlayAuthorityExecution();
+
+        /*
+         * This object coordinates submission of independently retained rank
+         * graphs; it is not the residency-policy authority. A CPU-containing
+         * overlay naturally uses it beside the host-resident authority. An
+         * all-GPU heterogeneous overlay may also use it as the explicit graph
+         * API boundary, but only after a mapped device fabric proves that
+         * policy and durable epoch ownership remain on GPU. Static and Dynamic
+         * share this submission-only coordinator: Dynamic policy, physical
+         * movement, and runtime-bank publication are owned by the mapped
+         * device-controller fabric and its retained background graphs.
+         */
+        const bool valid_submission_locus =
+            authority == MoEOverlayAuthorityExecutionKind::HostResident ||
+            (authority ==
+                 MoEOverlayAuthorityExecutionKind::DeviceResident &&
+             moe && moe->device_controller_fabric);
         if (!coordinator ||
             continuation_participant_index < 0 ||
             continuation_participant_index >=
                 coordinator->continuationParticipantCount() ||
             !plan || !plan->usesExpertOverlayAuthority() ||
-            moeOverlayAuthorityExecution() !=
-                MoEOverlayAuthorityExecutionKind::HostCoordinated)
+            !valid_submission_locus)
         {
             LOG_ERROR(
                 "[DeviceGraphOrchestrator] Refusing an invalid "
-                "heterogeneous ExpertOverlay transaction binding");
+                "heterogeneous ExpertOverlay graph-submission binding");
             return false;
         }
         if (moe_overlay_inference_transaction_coordinator_ ||
@@ -14288,10 +15717,62 @@ namespace llaminar2
             return false;
         }
 
+        const auto completion_boundary =
+            coordinator->participantCompletionBoundary(
+                continuation_participant_index);
+        const bool valid_boundary =
+            (completion_boundary ==
+                 MoEOverlayInferenceCompletionBoundaryKind::DeviceEvent &&
+             state_.device_id.is_gpu()) ||
+            (completion_boundary ==
+                 MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous &&
+             state_.device_id.is_cpu());
+        if (!valid_boundary)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay completion policy disagrees with participant device "
+                << state_.device_id.toString()
+                << " participant=" << continuation_participant_index);
+            return false;
+        }
+        if (completion_boundary ==
+            MoEOverlayInferenceCompletionBoundaryKind::DeviceEvent)
+        {
+            IBackend *const backend = getBackendFor(state_.device_id);
+            try
+            {
+                moe_overlay_inference_completion_fence_ =
+                    std::make_shared<
+                        BackendMoEOverlayInferenceCompletionEvent>(
+                        backend,
+                        state_.device_id);
+            }
+            catch (const std::exception &exception)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Could not allocate the ExpertOverlay participant calibration event: "
+                    << exception.what());
+                return false;
+            }
+        }
+
         moe_overlay_inference_transaction_coordinator_ =
             std::move(coordinator);
         moe_overlay_inference_transaction_participant_index_ =
             continuation_participant_index;
+        PerfStatsCollector::addCounter(
+            "moe_overlay_transaction",
+            "graph_submission_bindings",
+            1.0,
+            "graph_setup",
+            state_.device_id.toString(),
+            {{"authority_execution", toString(authority)},
+             {"controller_fabric",
+              moe && moe->device_controller_fabric ? "mapped_device" :
+                                                      "host"},
+             {"host_policy_mirror", "false"},
+             {"participant_index",
+              std::to_string(continuation_participant_index)}});
         return true;
     }
 
@@ -14927,7 +16408,9 @@ namespace llaminar2
         bool force_decode_phase,
         const void *position_ids_device_override,
         const int32_t *sequence_lengths_device_override,
-        std::span<const int> request_real_lengths)
+        std::span<const int> request_real_lengths,
+        std::optional<RemotePrefillTransactionGeometry>
+            remote_prefill_geometry)
     {
         // Enable device-scoped logging for this execution
         // All LOG_* calls from this thread will include the device ID
@@ -15779,7 +17262,28 @@ namespace llaminar2
                        ? MoEOverlayInferenceGraphRole::MainPrefill
                        : MoEOverlayInferenceGraphRole::MainDecode);
         int overlay_physical_rows_per_request = seq_len;
-        if (moe_overlay_inference_transaction_coordinator_ &&
+        if (remote_prefill_geometry)
+        {
+            if (overlay_graph_role !=
+                    MoEOverlayInferenceGraphRole::MainPrefill ||
+                batch_size != 1 ||
+                remote_prefill_geometry->physical_rows_per_request <
+                    logical_rows_per_request)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Remote prefill transaction "
+                    "geometry is incompatible with the local exact-shape graph"
+                    << " logical_rows=" << logical_rows_per_request
+                    << " physical_rows="
+                    << remote_prefill_geometry
+                           ->physical_rows_per_request
+                    << " requests=" << batch_size);
+                return nullptr;
+            }
+            overlay_physical_rows_per_request =
+                remote_prefill_geometry->physical_rows_per_request;
+        }
+        else if (moe_overlay_inference_transaction_coordinator_ &&
             overlay_graph_role ==
                 MoEOverlayInferenceGraphRole::MainPrefill &&
             state_.device_id.is_gpu() && batch_size == 1 &&
@@ -15880,6 +17384,13 @@ namespace llaminar2
                 binding.request_generation;
             input.moe_overlay_collective_step_id =
                 binding.descriptor.logical_step_id;
+            input.moe_overlay_sequence_id = binding.sequence_id;
+            input.moe_overlay_sequence_placement_epoch =
+                binding.descriptor.placement_epoch;
+            input.moe_overlay_sequence_graph_ordinal =
+                binding.sequence_graph_ordinal;
+            input.moe_overlay_sequence_graph_count =
+                binding.sequence_graph_count;
             if (execution_role ==
                 ForwardExecutionRole::GroupedMTPVerifier)
             {
@@ -16114,13 +17625,28 @@ namespace llaminar2
         const auto &env = debugEnv().execution;
         if (seq_len <= 1 ||
             !state_.isInitialized() ||
-            !state_.device_id.is_gpu() ||
-            !cache_config_.enabled ||
-            !env.gpu_graphs ||
-            !env.prefill_graph_buckets ||
             pp_stage_config_.has_value() ||
             (pipeline_config_ && pipeline_config_->hasPP()) ||
             compute_all_position_logits_)
+        {
+            return false;
+        }
+
+        /*
+         * An eager CPU graph uses the same canonical segmentation boundaries
+         * as a captured GPU graph, but executes only the live rows in each
+         * segment.  The scheduler's bucket remains the authenticated remote
+         * transaction capacity; it is not a request to pad CPU arithmetic.
+         */
+        if (state_.device_id.is_cpu())
+        {
+            return seq_len <= state_.max_seq_len &&
+                   state_.activation_seq_len > 0;
+        }
+        if (!state_.device_id.is_gpu() ||
+            !cache_config_.enabled ||
+            !env.gpu_graphs ||
+            !env.prefill_graph_buckets)
         {
             return false;
         }
@@ -16281,6 +17807,130 @@ namespace llaminar2
                       << planned_chunks.error);
             return false;
         }
+
+        if (state_.device_id.is_cpu())
+        {
+            if (policy.real_token_start != state_.positions[0])
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] CPU prefill schedule starts "
+                    "outside the canonical request cursor"
+                    << " schedule_start=" << policy.real_token_start
+                    << " position=" << state_.positions[0]);
+                return false;
+            }
+
+            std::uint64_t executed_rows = 0u;
+            for (const PrefillChunkPlan &chunk : planned_chunks.chunks)
+            {
+                const int relative_offset =
+                    chunk.token_offset - policy.real_token_start;
+                if (chunk.real_count <= 0 || relative_offset < 0 ||
+                    relative_offset > seq_len ||
+                    chunk.real_count > seq_len - relative_offset ||
+                    chunk.bucket_seq_len < chunk.real_count ||
+                    chunk.bucket_seq_len > activation_seq_len)
+                {
+                    cancelPrefillChunkSnapshotDiagnostics();
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] CPU prefill chunk exceeds "
+                        "its admitted logical or transaction capacity"
+                        << " chunk=" << chunk.chunk_index
+                        << " real_rows=" << chunk.real_count
+                        << " transaction_rows=" << chunk.bucket_seq_len
+                        << " capacity=" << activation_seq_len);
+                    return false;
+                }
+
+                bool snapshot_scope_active = false;
+                const float *chunk_logits = nullptr;
+                try
+                {
+                    beginPrefillChunkSnapshotDiagnostics(chunk);
+                    snapshot_scope_active = true;
+                    chunk_logits = forwardImpl(
+                        tokens + relative_offset,
+                        /*token_ids_device=*/nullptr,
+                        chunk.real_count,
+                        /*batch_size=*/1,
+                        ForwardExecutionRole::MainInference,
+                        /*force_prefill_phase=*/true,
+                        /*force_decode_phase=*/false,
+                        /*position_ids_device_override=*/nullptr,
+                        /*sequence_lengths_device_override=*/nullptr,
+                        /*request_real_lengths=*/{},
+                        RemotePrefillTransactionGeometry{
+                            .physical_rows_per_request =
+                                chunk.bucket_seq_len,
+                        });
+                    endPrefillChunkSnapshotDiagnostics(chunk);
+                    snapshot_scope_active = false;
+                }
+                catch (...)
+                {
+                    if (snapshot_scope_active)
+                        endPrefillChunkSnapshotDiagnostics(chunk);
+                    cancelPrefillChunkSnapshotDiagnostics();
+                    throw;
+                }
+                if (!chunk_logits)
+                {
+                    cancelPrefillChunkSnapshotDiagnostics();
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] CPU exact-shape prefill "
+                        "chunk " << chunk.chunk_index << " failed");
+                    return false;
+                }
+
+                const PrefillChunkMaintenanceState maintenance_state =
+                    prefillChunkMaintenanceState(chunk);
+                const PrefillChunkMaintenanceDecision maintenance_decision =
+                    evaluatePrefillChunkMaintenance(
+                        chunk, maintenance_state);
+                const bool maintenance_requested =
+                    maintenance_state.rebalance_requested ||
+                    chunk.rebalance_required_after;
+                if ((maintenance_requested && !maintenance_decision) ||
+                    (maintenance_decision.can_run &&
+                     !onPrefillChunkMaintenance(
+                         chunk, maintenance_decision)))
+                {
+                    cancelPrefillChunkSnapshotDiagnostics();
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] CPU prefill chunk "
+                        "maintenance failed after chunk "
+                        << chunk.chunk_index << ": "
+                        << maintenance_decision.reason);
+                    return false;
+                }
+                executed_rows +=
+                    static_cast<std::uint64_t>(chunk.real_count);
+            }
+
+            if (executed_rows != static_cast<std::uint64_t>(seq_len) ||
+                !finalizePrefillChunkSnapshotDiagnostics(planned_chunks))
+            {
+                cancelPrefillChunkSnapshotDiagnostics();
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] CPU prefill schedule did not "
+                    "retire its complete logical row sequence");
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "host_eager_prefill_chunk_transactions",
+                static_cast<double>(planned_chunks.chunks.size()),
+                "prefill",
+                state_.device_id.toString(),
+                {{"logical_rows", std::to_string(seq_len)},
+                 {"local_padding_rows", "0"},
+                 {"transaction_capacity_rows",
+                  std::to_string(
+                      planned_chunks.chunks.front().bucket_seq_len)},
+                 {"position_authority", "forward_impl"}});
+            return true;
+        }
+
         const int captured_bucket_seq_len =
             planned_chunks.chunks.front().bucket_seq_len;
         const bool one_physical_bucket = std::all_of(
@@ -18907,54 +20557,6 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::beginHostedSemanticFragmentHandoff(
-        void *fragment_stream)
-    {
-        auto &loop = mtp_device_generation_loop_graph_;
-        IBackend *const backend = getBackendFor(state_.device_id);
-        const int ordinal = state_.device_id.gpu_ordinal();
-        if (!backend || !loop.stream || !fragment_stream ||
-            !loop.handoff_to_fragment_event ||
-            !backend->recordEvent(
-                loop.handoff_to_fragment_event.get(),
-                ordinal,
-                loop.stream.get()) ||
-            !backend->streamWaitEvent(
-                fragment_stream,
-                loop.handoff_to_fragment_event.get(),
-                ordinal))
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Hosted retained fragment could not consume the scheduler event on "
-                      << state_.device_id.toString());
-            return false;
-        }
-        return true;
-    }
-
-    bool DeviceGraphOrchestrator::finishHostedSemanticFragmentHandoff(
-        void *fragment_stream)
-    {
-        auto &loop = mtp_device_generation_loop_graph_;
-        IBackend *const backend = getBackendFor(state_.device_id);
-        const int ordinal = state_.device_id.gpu_ordinal();
-        if (!backend || !loop.stream || !fragment_stream ||
-            !loop.handoff_from_fragment_event ||
-            !backend->recordEvent(
-                loop.handoff_from_fragment_event.get(),
-                ordinal,
-                fragment_stream) ||
-            !backend->streamWaitEvent(
-                loop.stream.get(),
-                loop.handoff_from_fragment_event.get(),
-                ordinal))
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Hosted retained fragment could not publish completion to the scheduler stream on "
-                      << state_.device_id.toString());
-            return false;
-        }
-        return true;
-    }
-
     bool DeviceGraphOrchestrator::replayHostedMTPSidecar(
         MTPSidecarCaptureRole role,
         int draft_depth,
@@ -18992,8 +20594,20 @@ namespace llaminar2
         if (!cache || cache->graph.get() != validated_graph)
             return fail("hosted MTP sidecar cache identity changed after validation");
         void *const replay_stream = cache->segment_cache.capture_stream;
-        if (!beginHostedSemanticFragmentHandoff(replay_stream))
+        auto &loop = mtp_device_generation_loop_graph_;
+        IWorkerGPUContext *const replay_context =
+            cache->segment_cache.gpu_ctx_ref;
+        if (!loop.stream || !replay_context ||
+            !cache->segment_cache.orderCaptureStreamAfter(
+                replay_context, loop.stream.get()))
             return fail("hosted MTP sidecar scheduler handoff failed");
+        if (moe_overlay_epoch_execution_binding_ &&
+            moe_overlay_epoch_lease_lifecycle_->load() !=
+                MoEOverlayEpochLeaseState::HostedParent)
+        {
+            return fail(
+                "hosted MTP sidecar has no scheduler-owned ExpertOverlay reader");
+        }
 
         MoEOverlayInferenceExecutionDescriptor descriptor{
             .graph_role = MoEOverlayInferenceGraphRole::MTPDraft,
@@ -19045,14 +20659,22 @@ namespace llaminar2
         }
 
         IDeviceContext *const ctx = getDeviceContext(state_.device_id);
-        auto capture_policy = buildDecodeCapturePolicy(
-            !cache->collective_nodes.empty(), ctx);
-        if (graph_scope.ownsTicketAuthority())
+        auto capture_policy_result = buildDecodeCapturePolicyForGraph(
+            *cache->graph,
+            !cache->collective_nodes.empty(),
+            ctx,
+            "hosted MTP sidecar");
+        if (!capture_policy_result)
+            return fail("hosted MTP sidecar native capture policy is unavailable");
+        auto capture_policy = std::move(*capture_policy_result);
+        if (moe_overlay_epoch_execution_binding_ ||
+            graph_scope.ownsTicketAuthority())
         {
             const auto existing =
                 std::move(capture_policy.launch_dependency);
             capture_policy.launch_dependency =
-                [&graph_scope,
+                [this,
+                 &graph_scope,
                  existing,
                  device = state_.device_id](
                     DeviceGraphExecutor::GraphExecutableLaunchPhase phase,
@@ -19060,6 +20682,14 @@ namespace llaminar2
             {
                 if (existing && !existing(phase, execution_stream))
                     return false;
+                if (!consumeMoEOverlayEpochForHostedChild(
+                        execution_stream,
+                        "hosted_mtp_sidecar_executable"))
+                {
+                    return false;
+                }
+                if (!graph_scope.ownsTicketAuthority())
+                    return true;
                 std::string arm_error;
                 if (!graph_scope.armForExecutableLaunch(
                         execution_stream, &arm_error))
@@ -19099,13 +20729,29 @@ namespace llaminar2
             {},
             capture_policy.graph_replay_plan_policy,
             capture_policy.launch_dependency);
-        std::string finish_error;
-        if (!graph_scope.finish(submitted, &finish_error))
-            return fail(finish_error);
         if (!submitted)
+        {
+            std::string finish_error;
+            (void)graph_scope.finish(false, &finish_error);
             return fail("hosted MTP sidecar retained replay submission failed");
-        if (!finishHostedSemanticFragmentHandoff(replay_stream))
+        }
+        if (!cache->segment_cache.orderStreamAfterCapture(
+                replay_context, loop.stream.get()))
+        {
+            std::string finish_error;
+            (void)graph_scope.finish(false, &finish_error);
             return fail("hosted MTP sidecar completion handoff failed");
+        }
+
+        /*
+         * The scheduler-stream wait above is the participant terminal. Publish
+         * protocol completion only after that edge exists; finishing earlier
+         * lets another rank retire the graph group while this participant's
+         * retained executable is still using its immutable overlay ticket.
+         */
+        std::string finish_error;
+        if (!graph_scope.finish(true, &finish_error))
+            return fail(finish_error);
 
         if (out_producer_stream)
             *out_producer_stream = replay_stream;
@@ -19141,14 +20787,19 @@ namespace llaminar2
             *out_producer_stream = nullptr;
         if (!forward_engine_)
             return fail("hosted grouped verifier has no forward engine");
+        if (moe_overlay_epoch_execution_binding_ &&
+            moe_overlay_epoch_lease_lifecycle_->load() !=
+                MoEOverlayEpochLeaseState::HostedParent)
+        {
+            return fail(
+                "hosted grouped verifier has no active parent-owned ExpertOverlay reader");
+        }
 
         std::string retained_error;
         const auto retained = forward_engine_->retainedDecodeGraph(
             signature, &retained_error);
         if (!retained)
             return fail(retained_error);
-        if (!beginHostedSemanticFragmentHandoff(retained->stream))
-            return fail("hosted grouped verifier scheduler handoff failed");
 
         MoEOverlayInferenceExecutionDescriptor descriptor{
             .graph_role = MoEOverlayInferenceGraphRole::MTPGroupedVerifier,
@@ -19196,13 +20847,22 @@ namespace llaminar2
         void *producer_stream = nullptr;
         IDeviceContext *const ctx = getDeviceContext(state_.device_id);
         DeviceGraphExecutor::GraphLaunchDependencyHook launch_dependency;
-        if (graph_scope.ownsTicketAuthority())
+        if (moe_overlay_epoch_execution_binding_ ||
+            graph_scope.ownsTicketAuthority())
         {
             launch_dependency =
-                [&graph_scope, device = state_.device_id](
+                [this, &graph_scope, device = state_.device_id](
                     DeviceGraphExecutor::GraphExecutableLaunchPhase,
                     void *execution_stream) -> bool
             {
+                if (!consumeMoEOverlayEpochForHostedChild(
+                        execution_stream,
+                        "hosted_mtp_grouped_verifier_executable"))
+                {
+                    return false;
+                }
+                if (!graph_scope.ownsTicketAuthority())
+                    return true;
                 std::string arm_error;
                 if (!graph_scope.armForExecutableLaunch(
                         execution_stream, &arm_error))
@@ -19222,6 +20882,8 @@ namespace llaminar2
             ctx,
             params,
             launch_dependency,
+            GraphCaptureAuxiliaryBranchFactory{},
+            mtp_device_generation_loop_graph_.stream.get(),
             &producer_stream,
             &retained_error);
         std::string finish_error;
@@ -19229,8 +20891,7 @@ namespace llaminar2
             return fail(finish_error);
         if (!submitted)
             return fail(retained_error);
-        if (producer_stream != retained->stream ||
-            !finishHostedSemanticFragmentHandoff(producer_stream))
+        if (producer_stream != retained->stream)
         {
             return fail(
                 "hosted grouped verifier published an invalid completion stream");
@@ -20058,8 +21719,7 @@ namespace llaminar2
                       *width_policy)
                 : 0;
         const bool include_device_moe_maintenance =
-            isMoeRebalancingActive() &&
-            usesHomogeneousDeviceResidentMoEOverlayAuthority();
+            usesParticipantLocalDeviceMoERebalanceController();
         const bool include_overlay_epoch_boundaries =
             static_cast<bool>(moe_overlay_epoch_execution_binding_);
         const DeviceGenerationLoopTopology loop_topology =
@@ -20086,6 +21746,7 @@ namespace llaminar2
         const auto fragment_count_for_depth =
             [include_device_moe_maintenance,
              include_overlay_epoch_boundaries,
+             hosted_execution,
              sampling_mode](int depth) -> size_t
         {
             const size_t common_fragment_count =
@@ -20096,7 +21757,9 @@ namespace llaminar2
                     : 0u;
             return common_fragment_count + stochastic_fragment_count +
                    (include_device_moe_maintenance ? 1u : 0u) +
-                   (include_overlay_epoch_boundaries ? 2u : 0u);
+                   (include_overlay_epoch_boundaries
+                        ? 2u
+                        : 0u);
         };
         size_t expected_fragment_count = 0;
         for (int depth = minimum_draft_depth;
@@ -20125,13 +21788,6 @@ namespace llaminar2
         {
             return fail(
                 "device-generation parent graph has no exact preallocated stream/capture owner");
-        }
-        if (hosted_execution &&
-            (!loop.handoff_to_fragment_event ||
-             !loop.handoff_from_fragment_event))
-        {
-            return fail(
-                "hosted device-generation graph has no preallocated semantic-fragment event bridge");
         }
         if (execution_policy ==
                 DeviceGenerationExecutionPolicy::Unsupported ||
@@ -20199,7 +21855,10 @@ namespace llaminar2
                           const std::string &fragment_error,
                           DeviceControlledLoopFragmentExecution execution =
                               DeviceControlledLoopFragmentExecution::Always,
-                          const uint32_t *condition_word_device = nullptr) -> bool
+                          const uint32_t *condition_word_device = nullptr,
+                          HostedDeviceGenerationFragment::Kind hosted_kind =
+                              HostedDeviceGenerationFragment::Kind::
+                                  CapturedLocal) -> bool
         {
             if (!view || !view->capture)
             {
@@ -20213,11 +21872,21 @@ namespace llaminar2
             }
             if (hosted_execution)
             {
+                if (hosted_kind !=
+                        HostedDeviceGenerationFragment::Kind::CapturedLocal &&
+                    hosted_kind != HostedDeviceGenerationFragment::Kind::
+                                       MoEOverlayEpochAcquire &&
+                    hosted_kind != HostedDeviceGenerationFragment::Kind::
+                                       MoEOverlayEpochRelease)
+                {
+                    return fail(
+                        std::string("device-generation hosted capture has an invalid typed kind for ") +
+                        fragment_name);
+                }
                 mtp_device_generation_loop_hosted_fragment_scratch_.push_back(
                     HostedDeviceGenerationFragment{
                         .name = fragment_name,
-                        .kind = HostedDeviceGenerationFragment::Kind::
-                            CapturedLocal,
+                        .kind = hosted_kind,
                         .capture = view->capture,
                         .execution = execution,
                         .condition_word_device = condition_word_device,
@@ -20276,8 +21945,12 @@ namespace llaminar2
          * replay-ready. Every branch therefore owns one complete transaction in
          * producer order: epoch acquire, sidecars, verifier, compact outcome,
          * state publication, terminal-hidden selection, epoch release, then
-         * maintenance for the state it committed. Acquire/release are absent
-         * together for an explicit non-overlay topology.
+         * maintenance for the state it committed. Native and heterogeneous
+         * hosted parents both own acquire as their first typed fragment. Hosted
+         * sidecar streams borrow the resulting immutable event and return their
+         * terminal to the scheduler stream before its final release fragment.
+         * Acquire/release are absent together for an explicit non-overlay
+         * topology.
          *
          * The verifier/publication tail always uses the maximum captured width.
          * Its kernels consume ActiveVerifierRowCount from the same controller as
@@ -20301,7 +21974,14 @@ namespace llaminar2
                 if (!append(
                         "ExpertOverlay epoch acquire",
                         epoch_acquire,
-                        fragment_error))
+                        fragment_error,
+                        DeviceControlledLoopFragmentExecution::Always,
+                        nullptr,
+                        hosted_execution
+                            ? HostedDeviceGenerationFragment::Kind::
+                                  MoEOverlayEpochAcquire
+                            : HostedDeviceGenerationFragment::Kind::
+                                  CapturedLocal))
                 {
                     return false;
                 }
@@ -20510,7 +22190,7 @@ namespace llaminar2
             auto state_publication =
                 mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(
                     request_count,
-                    verifier_rows_per_request,
+                    physical_verifier_rows_per_request,
                     &fragment_error);
             if (!append(
                     "speculative state publication",
@@ -20543,7 +22223,14 @@ namespace llaminar2
                 if (!append(
                         "ExpertOverlay epoch release",
                         epoch_release,
-                        fragment_error))
+                        fragment_error,
+                        DeviceControlledLoopFragmentExecution::Always,
+                        nullptr,
+                        hosted_execution
+                            ? HostedDeviceGenerationFragment::Kind::
+                                  MoEOverlayEpochRelease
+                            : HostedDeviceGenerationFragment::Kind::
+                                  CapturedLocal))
                 {
                     return false;
                 }
@@ -20750,9 +22437,9 @@ namespace llaminar2
                             mtp_device_generation_loop_hosted_fragment_scratch_[
                                 branch_offset + fragment_index];
                         if (fragment.capture &&
-                            !publishMTPGraphKernelInventory(
+                            !DeviceGraphCaptureController::publishKernelInventory(
                                 *fragment.capture,
-                                fragment.name,
+                                fragment.name ? fragment.name : "unnamed",
                                 depth,
                                 state_.device_id,
                                 inventory_error))
@@ -20777,9 +22464,9 @@ namespace llaminar2
                         const DeviceControlledLoopFragment &fragment =
                             mtp_device_generation_loop_fragment_scratch_[
                                 branch_offset + fragment_index];
-                        if (!publishMTPGraphKernelInventory(
+                        if (!DeviceGraphCaptureController::publishKernelInventory(
                                 *fragment.capture,
-                                fragment.name,
+                                fragment.name ? fragment.name : "unnamed",
                                 depth,
                                 state_.device_id,
                                 inventory_error))
@@ -21656,6 +23343,10 @@ namespace llaminar2
         const bool try_gpu_graph_capture =
             state_.device_id.is_gpu() &&
             debugEnv().execution.gpu_graphs;
+        const bool participates_in_overlay_graph_group =
+            !kv_cache_only &&
+            static_cast<bool>(
+                moe_overlay_inference_transaction_coordinator_);
         if (state_.device_id.is_gpu() && !try_gpu_graph_capture)
         {
             LOG_ERROR(
@@ -21680,7 +23371,11 @@ namespace llaminar2
             if (sidecar_cache.segment_cache.ensureCaptureStream(
                     sidecar_gpu_ctx,
                     state_.device_id,
-                    /*context_from_process_pool=*/true))
+                    /*context_from_process_pool=*/true) &&
+                sidecar_cache.segment_cache.ensureCaptureInputEvent(
+                    sidecar_gpu_ctx) &&
+                sidecar_cache.segment_cache.ensureCaptureOutputEvent(
+                    sidecar_gpu_ctx))
             {
                 void *capture_stream = sidecar_cache.segment_cache.capture_stream;
                 sidecar_dynamic_stream = capture_stream;
@@ -21704,7 +23399,9 @@ namespace llaminar2
             !waitForPendingDeviceMoERebalanceMaintenance(
                 sidecar_dynamic_stream,
                 DeviceTimelineRole::MTPSidecarGraph,
-                "mtp_sidecar_graph"))
+                "mtp_sidecar_graph",
+                /*acquire_overlay_epoch=*/
+                    !participates_in_overlay_graph_group))
         {
             return false;
         }
@@ -22279,10 +23976,6 @@ namespace llaminar2
          */
         const bool has_moe_overlay_sparse_boundary =
             !sidecar_cache.moe_overlay_collective_runtime_stages.empty();
-        const bool participates_in_overlay_graph_group =
-            !kv_cache_only &&
-            static_cast<bool>(
-                moe_overlay_inference_transaction_coordinator_);
         MoEOverlayInferenceExecutionDescriptor overlay_descriptor{
             .graph_role = MoEOverlayInferenceGraphRole::MTPDraft,
             .logical_step_id = 0,
@@ -22314,6 +24007,46 @@ namespace llaminar2
                 << ": " << overlay_graph_scope.error());
             return false;
         }
+        MoEOverlayExternalSequenceGraphLease overlay_sequence_graph_lease;
+        if (state_.device_id.is_gpu() && overlay_graph_scope.active() &&
+            !overlay_sequence_graph_lease.admit(
+                *this,
+                overlay_graph_scope.binding(),
+                sidecar_dynamic_stream,
+                DeviceTimelineRole::MTPSidecarGraph,
+                sidecar_context.c_str()))
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] ExpertOverlay transaction "
+                "could not admit the MTP sidecar into its complete "
+                "execution-sequence residency lease"
+                << " participant="
+                << moe_overlay_inference_transaction_participant_index_
+                << " device=" << state_.device_id.toString());
+            return false;
+        }
+        const auto finish_overlay_graph =
+            [&](bool execution_succeeded) -> bool
+        {
+            std::string overlay_finish_error;
+            if (!overlay_graph_scope.finish(
+                    execution_succeeded, &overlay_finish_error))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay transaction "
+                    "authority could not finish the MTP sidecar graph: "
+                    << overlay_finish_error);
+                return false;
+            }
+            if (!overlay_sequence_graph_lease.finish(execution_succeeded))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay MTP sidecar "
+                    "could not finish its execution-sequence residency edge");
+                return false;
+            }
+            return true;
+        };
         if (overlay_graph_scope.active())
         {
             const auto &binding = overlay_graph_scope.binding();
@@ -22345,6 +24078,7 @@ namespace llaminar2
                 stage->updateMoEOverlayCollectiveRuntimeParams(params);
             }
         }
+
         sidecar_cache.graph->reset();
 
         const bool has_sidecar_collectives = !sidecar_cache.collective_nodes.empty();
@@ -22384,9 +24118,14 @@ namespace llaminar2
                 }
                 sidecar_cache.segment_cache.perf_context =
                     sidecar_cache.capture_perf_context;
-                auto capture_policy = buildDecodeCapturePolicy(
+                auto capture_policy_result = buildDecodeCapturePolicyForGraph(
+                    *sidecar_cache.graph,
                     has_sidecar_collectives,
-                    ctx);
+                    ctx,
+                    "ExpertOverlay MTP sidecar timeline");
+                if (!capture_policy_result)
+                    return false;
+                auto capture_policy = std::move(*capture_policy_result);
                 capture_policy.defer_final_sync = can_defer_sidecar_sync;
                 if (overlay_graph_scope.ownsTicketAuthority())
                 {
@@ -22777,17 +24516,8 @@ namespace llaminar2
                 if (suppress_timeline_ || !timeline.hasValidRecords())
                 {
                     timeline.resetTimings();
-                    std::string overlay_finish_error;
-                    if (!overlay_graph_scope.finish(
-                            ok, &overlay_finish_error))
-                    {
-                        LOG_ERROR(
-                            "[DeviceGraphOrchestrator] ExpertOverlay "
-                            "transaction authority could not finish the MTP "
-                            "sidecar graph: "
-                            << overlay_finish_error);
+                    if (!finish_overlay_graph(ok))
                         return false;
-                    }
                     return ok;
                 }
 
@@ -22804,15 +24534,8 @@ namespace llaminar2
                 timeline.resetTimings();
             }
         }
-        std::string overlay_finish_error;
-        if (!overlay_graph_scope.finish(ok, &overlay_finish_error))
-        {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] ExpertOverlay transaction "
-                "authority could not finish the MTP sidecar graph: "
-                << overlay_finish_error);
+        if (!finish_overlay_graph(ok))
             return false;
-        }
         return ok;
     }
 
@@ -25820,14 +27543,85 @@ namespace llaminar2
         }
 
         IBackend *backend = getBackendFor(state_.device_id);
-        if (!terminal_event || !*terminal_event || !backend ||
-            !backend->waitForEvent(
-                terminal_event->get(),
-                state_.device_id.gpu_ordinal()))
+        if (!terminal_event || !*terminal_event || !backend)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Benchmark failed to wait for the exact complete-forward event on "
+            LOG_ERROR("[DeviceGraphOrchestrator] Benchmark completion boundary has no queryable exact complete-forward event on "
                       << state_.device_id.toString()
                       << " ordering=" << ordering);
+            return false;
+        }
+
+        /*
+         * A host benchmark must observe the exact terminal event, but an
+         * unbounded cudaEventSynchronize()/hipEventSynchronize() turns a lost
+         * graph edge into a permanently occupied accelerator. Poll the event
+         * through the backend's non-blocking query contract and apply the same
+         * canonical 30-second failure bound as graph/collective rendezvous.
+         * This remains a benchmark result boundary only: production consumers
+         * continue to chain the event on-device and never enter this loop.
+         */
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(
+                collective_timeout_policy::kDefaultCollectiveTimeoutMs);
+        bool event_ready = false;
+        while (!event_ready && std::chrono::steady_clock::now() < deadline)
+        {
+            if (!backend->queryEvent(
+                    terminal_event->get(),
+                    state_.device_id.gpu_ordinal(),
+                    &event_ready))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Benchmark failed to query the exact complete-forward event on "
+                          << state_.device_id.toString()
+                          << " ordering=" << ordering);
+                return false;
+            }
+            if (!event_ready)
+                std::this_thread::yield();
+        }
+        if (!event_ready)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Benchmark exact complete-forward event timed out after "
+                      << collective_timeout_policy::kDefaultCollectiveTimeoutMs
+                      << "ms on " << state_.device_id.toString()
+                      << " ordering=" << ordering
+                      << " publication_sequence="
+                      << ready->publication_sequence
+                      << " graph_seq_len=" << ready->graph_seq_len
+                      << " graph_batch_size=" << ready->graph_batch_size
+                      << " execution_role="
+                      << static_cast<int>(ready->execution_role));
+            const auto *const moe = graph_builder_
+                                        ? &graph_builder_->config().moe
+                                        : nullptr;
+            if (moe && moe->device_controller_fabric)
+            {
+                try
+                {
+                    const auto barrier =
+                        moe_overlay_epoch_execution_binding_
+                            ? moe_overlay_epoch_execution_binding_.arena
+                                  ->admissionBarrier()
+                            : DeviceMoEOverlayEpochAdmissionBarrierBinding{};
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Fatal forward timeout epoch evidence device="
+                        << state_.device_id.toString()
+                        << " local_participant="
+                        << (barrier.valid()
+                                ? std::to_string(barrier.participant_id)
+                                : std::string("unbound"))
+                        << ' '
+                        << moe->device_controller_fabric
+                               ->describeInferenceEpochBarrier());
+                }
+                catch (const std::exception &exception)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Could not describe fatal forward epoch state: "
+                        << exception.what());
+                }
+            }
             return false;
         }
 
@@ -26522,9 +28316,7 @@ namespace llaminar2
 
         const auto &mtp = graph_builder_->config().mtp;
         const int requested_rows =
-            std::max(1, mtp.depth_policy.max_depth > 0
-                            ? mtp.depth_policy.max_depth
-                            : mtp.draft_tokens);
+            resolveMTPMaximumExecutionDraftDepth(mtp);
         const MTPVerifierRowCapability capability =
             mtpVerifierRowCapability();
         const auto &config = graph_builder_->config();
@@ -28148,7 +29940,18 @@ namespace llaminar2
         if (!state_.device_id.is_gpu())
             return true;
         if (!consumer_stream || publication_generation == 0)
+        {
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Resident logical-state reader completion has invalid publication identity"
+                << " consumer="
+                << (consumer_name && consumer_name[0] != '\0'
+                        ? consumer_name
+                        : "unknown")
+                << " stream=" << consumer_stream
+                << " publication_generation=" << publication_generation
+                << " device=" << state_.device_id.toString());
             return false;
+        }
 
         std::lock_guard<std::mutex> completion_lock(
             device_resident_logical_state_admission_sync_
@@ -28240,8 +30043,11 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::waitForDeviceResidentLogicalSequenceStateMailboxForObservation(
         void *consumer_stream,
-        const char *consumer_name) const
+        const char *consumer_name,
+        bool *replacement_writer_pending) const
     {
+        if (replacement_writer_pending)
+            *replacement_writer_pending = false;
         if (!state_.device_id.is_gpu())
             return true;
 
@@ -28249,13 +30055,24 @@ namespace llaminar2
             device_resident_logical_state_admission_sync_->admission_mutex);
         if (pending_device_resident_logical_state_writer_.valid())
         {
-            LOG_ERROR(
+            if (replacement_writer_pending)
+                *replacement_writer_pending = true;
+            LOG_DEBUG(
                 "[DeviceGraphOrchestrator] Resident logical-state observation "
-                "encountered an unfinished replacement writer"
+                "deferred behind an unfinished replacement writer"
                 << " consumer="
                 << (consumer_name && consumer_name[0] != '\0'
                         ? consumer_name
-                        : "unknown"));
+                        : "unknown")
+                << " writer="
+                << (pending_device_resident_logical_state_writer_.writer_name &&
+                            pending_device_resident_logical_state_writer_
+                                    .writer_name[0] != '\0'
+                        ? pending_device_resident_logical_state_writer_.writer_name
+                        : "unknown")
+                << " replaced_generation="
+                << pending_device_resident_logical_state_writer_
+                       .replaced_publication_generation);
             return false;
         }
 
@@ -29641,8 +31458,7 @@ namespace llaminar2
          * maintenance graph for Static would violate its no-movement contract.
          */
         const bool requires_rebalance_controller =
-            isMoeRebalancingActive() &&
-            usesHomogeneousDeviceResidentMoEOverlayAuthority();
+            usesParticipantLocalDeviceMoERebalanceController();
         std::string rebalance_controller_error;
         DeviceMoERebalanceGraphControllerState *rebalance_controller =
             requires_rebalance_controller
@@ -29994,7 +31810,9 @@ namespace llaminar2
             !stochastic_target_sample_tokens_dev_ ||
             request.requestCount() >
                 mtp_sidecar_condition_token_slot_width_ ||
-            request.requestCount() > stochastic_target_row_capacity_ ||
+            static_cast<size_t>(request.requestCount()) *
+                    static_cast<size_t>(verifier_rows_per_request) >
+                static_cast<size_t>(stochastic_target_row_capacity_) ||
             full_condition_offset < 0 ||
             full_condition_offset + request.requestCount() >
                 mtp_sidecar_condition_token_capacity_)
@@ -30053,6 +31871,13 @@ namespace llaminar2
             device_generation_storage_.control_device;
         params.generation_control_stride =
             device_generation_storage_.control_stride;
+        params.verifier_input_tokens_device =
+            static_cast<const int32_t *>(
+                mtp_verifier_input_tokens_dev_);
+        params.verifier_input_token_stride =
+            verifier_rows_per_request;
+        params.committed_verifier_identity_device =
+            mtp_committed_verifier_identity_dev_;
 
         params.request_count = request.requestCount();
         params.verifier_rows_per_request = verifier_rows_per_request;
@@ -30372,7 +32197,8 @@ namespace llaminar2
             !publishDeviceGenerationStateReady(
                 request.outcome.stream,
                 request.requestCount(),
-                "generation_response_and_state_commit"))
+                DeviceGenerationStatePublicationKind::
+                    CommittedTransaction))
         {
             return fail(
                 "MTP publication could not publish generation-controller readiness");
@@ -33187,12 +35013,23 @@ namespace llaminar2
         const size_t draft_probability_bytes =
             static_cast<size_t>(stochastic_draft_row_capacity_) *
             sizeof(float);
+        const size_t verifier_token_bytes =
+            static_cast<size_t>(stochastic_target_row_capacity_) *
+            sizeof(int32_t);
+        const size_t committed_verifier_identity_bytes =
+            static_cast<size_t>(
+                stochastic_batch_output_request_capacity_) *
+            sizeof(
+                sampling_math::MTPCommittedVerifierIdentityRecord);
 
         /*
          * -1 is an intentionally invalid token sentinel. Per-slot readiness,
-         * not these initial bytes, grants semantic read access. The fills also
-         * create each tensor's completion event during setup so re-publication
-         * after a sampler launch cannot allocate in the decode hot path.
+         * not these initial bytes, grants semantic read access to reusable
+         * proposal and verifier-input scratch. The committed identity is a
+         * separate persistent evidence record: zeroing it makes "no committed
+         * verifier transaction" explicit without pretending scratch is
+         * durable. These setup fills also create every arena completion event,
+         * so later sampler and commit publication cannot allocate in decode.
          */
         if (!state_.device_id.is_gpu() ||
             !producer_stream ||
@@ -33200,8 +35037,11 @@ namespace llaminar2
             !stochastic_target_sample_tokens_dev_ ||
             !stochastic_draft_sample_tokens_dev_ ||
             !stochastic_draft_sample_probs_dev_ ||
+            !mtp_verifier_input_tokens_dev_ ||
+            !mtp_committed_verifier_identity_dev_ ||
             stochastic_target_row_capacity_ <= 0 ||
             stochastic_draft_row_capacity_ <= 0 ||
+            stochastic_batch_output_request_capacity_ <= 0 ||
             !backend->memset(
                 stochastic_target_sample_tokens_dev_,
                 0xFF,
@@ -33218,6 +35058,18 @@ namespace llaminar2
                 stochastic_draft_sample_probs_dev_,
                 0,
                 draft_probability_bytes,
+                state_.device_id.gpu_ordinal(),
+                producer_stream) ||
+            !backend->memset(
+                mtp_verifier_input_tokens_dev_,
+                0xFF,
+                verifier_token_bytes,
+                state_.device_id.gpu_ordinal(),
+                producer_stream) ||
+            !backend->memset(
+                mtp_committed_verifier_identity_dev_,
+                0,
+                committed_verifier_identity_bytes,
                 state_.device_id.gpu_ordinal(),
                 producer_stream) ||
             !publishPreparedArenaGraphInput(
@@ -33237,7 +35089,19 @@ namespace llaminar2
                 stochastic_draft_sample_probs_dev_,
                 producer_stream,
                 state_.device_id,
-                "initialize_stochastic_draft_sample_probs"))
+                "initialize_stochastic_draft_sample_probs") ||
+            !publishPreparedArenaGraphInput(
+                BufferId::MTP_VERIFIER_INPUT_TOKENS,
+                mtp_verifier_input_tokens_dev_,
+                producer_stream,
+                state_.device_id,
+                "initialize_mtp_verifier_input_tokens") ||
+            !publishPreparedArenaGraphInput(
+                BufferId::MTP_COMMITTED_VERIFIER_IDENTITY,
+                mtp_committed_verifier_identity_dev_,
+                producer_stream,
+                state_.device_id,
+                "initialize_mtp_committed_verifier_identity"))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Could not initialize persistent MTP sample banks"
                       << " reason=" << (reason ? reason : "unknown")
@@ -35964,7 +37828,8 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::waitForLiveInferenceStateReadyForObservation(
         void *observation_stream,
         const char *observation_name,
-        DeviceTimelineRole observation_role) const
+        DeviceTimelineRole observation_role,
+        bool logical_state_mailbox_already_joined) const
     {
         if (!state_.device_id.is_gpu())
             return true;
@@ -36006,7 +37871,8 @@ namespace llaminar2
          * belongs here so every host-visible KV/GDN/MTP export observes the
          * same producer set.
          */
-        if (!waitForDeviceResidentLogicalSequenceStateMailboxForObservation(
+        if (!logical_state_mailbox_already_joined &&
+            !waitForDeviceResidentLogicalSequenceStateMailboxForObservation(
                 observation_stream,
                 consumer))
         {
@@ -36700,8 +38566,7 @@ namespace llaminar2
          */
         const bool requires_rebalance_controller =
             generation_controller_owned &&
-            isMoeRebalancingActive() &&
-            usesHomogeneousDeviceResidentMoEOverlayAuthority();
+            usesParticipantLocalDeviceMoERebalanceController();
         std::string rebalance_controller_error;
         DeviceMoERebalanceGraphControllerState *rebalance_controller =
             requires_rebalance_controller
@@ -36934,6 +38799,251 @@ namespace llaminar2
 
         const bool request_consumers_started_before_prelude =
             request_input_reuse_ready_.consumers_started;
+        const auto epoch_submission_policy =
+            moeOverlayForwardEpochSubmissionPolicy(
+                static_cast<bool>(moe_overlay_epoch_execution_binding_),
+                usesTopologyWideDeviceMoEOverlayController(),
+                input.execution_role == ForwardExecutionRole::MainInference);
+        const auto admit_forward_epoch = [&]() -> bool
+        {
+            using Policy = MoEOverlayForwardEpochSubmissionPolicy;
+            if (epoch_submission_policy == Policy::Unbound)
+                return true;
+            if (!execution_stream)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay forward admission has no exact execution stream on "
+                    << state_.device_id.toString());
+                return false;
+            }
+
+            if (epoch_submission_policy == Policy::CapturedMainTransaction)
+            {
+                auto submission =
+                    moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+                const auto lease_state = submission.state();
+                const auto predecessor_state = lease_state;
+                if (lease_state != MoEOverlayEpochLeaseState::Idle &&
+                    lease_state !=
+                        MoEOverlayEpochLeaseState::ReleasePublished)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Captured main ExpertOverlay graph overlaps another lease phase on "
+                        << state_.device_id.toString()
+                        << " lease_state="
+                        << moeOverlayEpochLeaseStateName(lease_state));
+                    return false;
+                }
+                if (predecessor_state ==
+                    MoEOverlayEpochLeaseState::ReleasePublished)
+                {
+                    IBackend *const backend =
+                        getBackendFor(state_.device_id);
+                    if (!backend || !moe_overlay_epoch_released_event_ ||
+                        !submission.publishedReleaseProducerStream() ||
+                        !backend->streamWaitEvent(
+                            execution_stream,
+                            moe_overlay_epoch_released_event_.get(),
+                            state_.device_id.gpu_ordinal()))
+                    {
+                        LOG_ERROR(
+                            "[DeviceGraphOrchestrator] Captured main ExpertOverlay graph could not join the prior terminal release on "
+                            << state_.device_id.toString());
+                        return false;
+                    }
+                }
+                if (!submission.commit(
+                        MoEOverlayEpochLeaseState::CapturedMainForward))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Captured main ExpertOverlay graph could not publish its complete submission owner on "
+                        << state_.device_id.toString());
+                    std::terminate();
+                }
+            }
+            else if (moe_overlay_epoch_lease_lifecycle_->load() ==
+                     MoEOverlayEpochLeaseState::ExternalSequence)
+            {
+                auto &identity = moe_overlay_external_sequence_identity_;
+                const bool final_verifier_matches =
+                    input.execution_role ==
+                        ForwardExecutionRole::GroupedMTPVerifier &&
+                    identity.valid() &&
+                    input.moe_overlay_collective_generation_id ==
+                        identity.request_generation &&
+                    input.moe_overlay_sequence_id == identity.sequence_id &&
+                    input.moe_overlay_sequence_placement_epoch ==
+                        identity.placement_epoch &&
+                    input.moe_overlay_sequence_graph_count ==
+                        identity.graph_count &&
+                    input.moe_overlay_sequence_graph_ordinal ==
+                        identity.graph_count - 1 &&
+                    identity.last_graph_ordinal ==
+                        input.moe_overlay_sequence_graph_ordinal - 1;
+                if (!final_verifier_matches)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Grouped verifier does not "
+                        "close the exact live ExpertOverlay MTP sequence"
+                        << " device=" << state_.device_id.toString()
+                        << " live_request=" << identity.request_generation
+                        << " incoming_request="
+                        << input.moe_overlay_collective_generation_id
+                        << " live_sequence=" << identity.sequence_id
+                        << " incoming_sequence="
+                        << input.moe_overlay_sequence_id
+                        << " live_ordinal="
+                        << identity.last_graph_ordinal
+                        << " incoming_ordinal="
+                        << input.moe_overlay_sequence_graph_ordinal
+                        << " live_count=" << identity.graph_count
+                        << " incoming_count="
+                        << input.moe_overlay_sequence_graph_count
+                        << " live_epoch=" << identity.placement_epoch
+                        << " incoming_epoch="
+                        << input.moe_overlay_sequence_placement_epoch);
+                    return false;
+                }
+
+                auto submission =
+                    moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+                const auto sequence_state = submission.state();
+                if (sequence_state !=
+                    MoEOverlayEpochLeaseState::ExternalSequence)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Grouped verifier lost its "
+                        "ExpertOverlay sequence lease claim"
+                        << " device=" << state_.device_id.toString()
+                        << " lease_state="
+                        << moeOverlayEpochLeaseStateName(sequence_state));
+                    return false;
+                }
+
+                IBackend *const backend = getBackendFor(state_.device_id);
+                if (!backend || !moe_overlay_epoch_acquired_event_ ||
+                    !moe_overlay_epoch_acquire_producer_stream_ ||
+                    !backend->streamWaitEvent(
+                        execution_stream,
+                        moe_overlay_epoch_acquired_event_.get(),
+                        state_.device_id.gpu_ordinal()))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Grouped verifier could not "
+                        "consume the MTP sequence acquire publication on "
+                        << state_.device_id.toString());
+                    return false;
+                }
+                identity.last_graph_ordinal =
+                    input.moe_overlay_sequence_graph_ordinal;
+                if (!submission.commit(
+                        MoEOverlayEpochLeaseState::ExternalForward))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Grouped verifier could not publish its complete sequence-forward owner on "
+                        << state_.device_id.toString());
+                    std::terminate();
+                }
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_epoch",
+                    "external_sequence_verifier_joins",
+                    1.0,
+                    perfPhaseName(),
+                    state_.device_id.toString(),
+                    {{"sequence_id", std::to_string(identity.sequence_id)},
+                     {"graph_ordinal",
+                      std::to_string(identity.last_graph_ordinal)},
+                     {"graph_count", std::to_string(identity.graph_count)},
+                     {"blocking", "false"}});
+            }
+            else if (moe_overlay_epoch_lease_lifecycle_->load() ==
+                     MoEOverlayEpochLeaseState::HostedParent)
+            {
+                auto submission =
+                    moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+                const auto hosted_state = submission.state();
+                if (hosted_state != MoEOverlayEpochLeaseState::HostedParent)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Hosted ExpertOverlay child lost its atomic parent lease claim on "
+                        << state_.device_id.toString()
+                        << " lease_state="
+                        << moeOverlayEpochLeaseStateName(hosted_state));
+                    return false;
+                }
+                IBackend *const backend = getBackendFor(state_.device_id);
+                if (!backend || !moe_overlay_epoch_acquired_event_ ||
+                    !moe_overlay_epoch_acquire_producer_stream_ ||
+                    !backend->streamWaitEvent(
+                        execution_stream,
+                        moe_overlay_epoch_acquired_event_.get(),
+                        state_.device_id.gpu_ordinal()))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Hosted ExpertOverlay child forward could not consume its parent reader publication on "
+                        << state_.device_id.toString());
+                    return false;
+                }
+                if (!submission.commit(
+                        MoEOverlayEpochLeaseState::HostedChildForward))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Hosted ExpertOverlay child could not publish its complete forward owner on "
+                        << state_.device_id.toString());
+                    std::terminate();
+                }
+            }
+            else
+            {
+                if (input.execution_role ==
+                        ForwardExecutionRole::GroupedMTPVerifier &&
+                    input.moe_overlay_sequence_id != 0)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Direct grouped verifier "
+                        "reached forward admission without its complete "
+                        "ExpertOverlay MTP sequence lease"
+                        << " device=" << state_.device_id.toString()
+                        << " sequence_id="
+                        << input.moe_overlay_sequence_id
+                        << " lease_state="
+                        << moeOverlayEpochLeaseStateName(
+                               moe_overlay_epoch_lease_lifecycle_->load()));
+                    return false;
+                }
+                if (!acquireMoEOverlayEpochForExternalTransaction(
+                        execution_stream,
+                        DeviceTimelineRole::MainForwardGraph,
+                        "forward_graph_exact_submission",
+                        MoEOverlayEpochLeaseState::ExternalForward))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Retained ExpertOverlay forward could not acquire its exact per-submission reader on "
+                        << state_.device_id.toString());
+                    return false;
+                }
+            }
+            moe_overlay_epoch_forward_submission_stream_ =
+                execution_stream;
+            const auto admitted_state =
+                moe_overlay_epoch_lease_lifecycle_->load();
+            PerfStatsCollector::addCounter(
+                "moe_overlay_epoch",
+                "forward_submission_admissions",
+                1.0,
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"lifetime", "one_forward_submission"},
+                 {"boundary_owner",
+                  epoch_submission_policy == Policy::CapturedMainTransaction
+                      ? "captured_main_graph"
+                      : admitted_state ==
+                                MoEOverlayEpochLeaseState::HostedChildForward
+                            ? "borrowed_hosted_parent"
+                            : "retained_external_graphs"},
+                 {"blocking", "false"}});
+            return true;
+        };
         auto materialize_serial_decode_position = [&]() -> bool
         {
             if (!input.materialize_serial_decode_position_from_device_kv)
@@ -37055,7 +39165,8 @@ namespace llaminar2
         if (!waitForPendingDeviceMoERebalanceMaintenance(
                 execution_stream,
                 DeviceTimelineRole::MainForwardGraph,
-                "forward_graph"))
+                "forward_graph",
+                /*acquire_overlay_epoch=*/false))
         {
             return false;
         }
@@ -37075,7 +39186,8 @@ namespace llaminar2
             !has_live_mutation &&
             !has_logical_mailbox)
         {
-            return materialize_serial_decode_position();
+            return materialize_serial_decode_position() &&
+                   admit_forward_epoch();
         }
         if (!execution_stream)
         {
@@ -37148,7 +39260,44 @@ namespace llaminar2
             pending_device_resident_logical_state_forward_read_
                 .admission_lock = std::move(admission_lock);
         }
-        return true;
+        return admit_forward_epoch();
+    }
+
+    GraphCaptureAuxiliaryBranchFactory
+    DeviceGraphOrchestrator::forwardGraphAuxiliaryBranchFactory(
+        const ForwardInput &input,
+        DeviceId execution_device)
+    {
+        if (!moe_overlay_transfer_progress_epoch_)
+            return {};
+        if (!state_.device_id.is_gpu() ||
+            execution_device != state_.device_id ||
+            moe_overlay_transfer_progress_epoch_->device() !=
+                state_.device_id)
+        {
+            throw std::logic_error(
+                "ExpertOverlay transfer-progress branch received mismatched forward/device ownership");
+        }
+
+        /*
+         * Movement is submitted as event-polled asynchronous DMA on dedicated
+         * background streams. Keep this graph hook empty: the maintenance
+         * service is the sole submission authority, and inference never joins
+         * movement events or inherits mapped-host transport state.
+         */
+        PerfStatsCollector::addCounter(
+            "moe_overlay_residency",
+            "mapped_transfer_progress_forward_branch_omissions",
+            1.0,
+            input.execution_phase == ForwardExecutionPhase::Prefill
+                ? "prefill"
+                : "decode",
+            state_.device_id.toString(),
+            {{"execution_role",
+              std::to_string(static_cast<int>(input.execution_role))},
+             {"authority", "maintenance_epoch"},
+             {"inference_join", "false"}});
+        return {};
     }
 
     bool DeviceGraphOrchestrator::prepareGraphBuildStateForMaterialization(
@@ -37186,33 +39335,277 @@ namespace llaminar2
         void *execution_stream,
         DeviceId execution_device)
     {
-        (void)input;
         if (!state_.device_id.is_gpu())
             return true;
 
         auto &pending =
             pending_device_resident_logical_state_forward_read_;
-        if (!pending.valid())
-            return true;
-        if (!execution_stream || execution_device != state_.device_id ||
-            execution_stream != pending.stream)
+        if (pending.valid())
         {
-            LOG_ERROR(
-                "[DeviceGraphOrchestrator] Forward graph mailbox read completion did not name its exact admitted stream"
-                << " expected_stream=" << pending.stream
-                << " actual_stream=" << execution_stream
-                << " expected_device=" << state_.device_id.toString()
-                << " actual_device=" << execution_device.toString());
-            return false;
+            if (!execution_stream || execution_device != state_.device_id ||
+                execution_stream != pending.stream)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Forward graph mailbox read completion did not name its exact admitted stream"
+                    << " expected_stream=" << pending.stream
+                    << " actual_stream=" << execution_stream
+                    << " expected_device=" << state_.device_id.toString()
+                    << " actual_device=" << execution_device.toString());
+                return false;
+            }
+            if (!recordDeviceResidentLogicalSequenceStateReadCompletion(
+                    execution_stream,
+                    "forward_graph_logical_state",
+                    pending.publication_generation))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Forward graph failed at the resident logical-state reader terminal"
+                    << " device=" << state_.device_id.toString()
+                    << " stream=" << execution_stream
+                    << " publication_generation="
+                    << pending.publication_generation
+                    << " access_generation="
+                    << device_resident_logical_state_access_epoch_
+                           .publication_generation
+                    << " access_reader_streams="
+                    << device_resident_logical_state_access_epoch_
+                           .reader_stream_count);
+                return false;
+            }
+            pending.clear();
         }
-        if (!recordDeviceResidentLogicalSequenceStateReadCompletion(
-                execution_stream,
-                "forward_graph_logical_state",
-                pending.publication_generation))
+
+        const auto overlay_lease_state =
+            moe_overlay_epoch_lease_lifecycle_->load();
+        if (overlay_lease_state ==
+                MoEOverlayEpochLeaseState::CapturedMainForward ||
+            overlay_lease_state == MoEOverlayEpochLeaseState::ExternalForward ||
+            overlay_lease_state ==
+                MoEOverlayEpochLeaseState::HostedChildForward)
         {
-            return false;
+            if (!execution_stream || execution_device != state_.device_id ||
+                execution_stream !=
+                    moe_overlay_epoch_forward_submission_stream_)
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] Topology-wide ExpertOverlay forward completion lost its exact submission stream"
+                    << " expected_stream="
+                    << moe_overlay_epoch_forward_submission_stream_
+                    << " actual_stream=" << execution_stream
+                    << " expected_device=" << state_.device_id.toString()
+                    << " actual_device=" << execution_device.toString());
+                return false;
+            }
+
+            const bool captured_main =
+                overlay_lease_state ==
+                MoEOverlayEpochLeaseState::CapturedMainForward;
+            const bool borrowed_hosted_parent =
+                overlay_lease_state ==
+                MoEOverlayEpochLeaseState::HostedChildForward;
+            const bool external_sequence_verifier =
+                overlay_lease_state ==
+                    MoEOverlayEpochLeaseState::ExternalForward &&
+                moe_overlay_external_sequence_identity_.valid();
+            if (captured_main)
+            {
+                if (input.execution_role !=
+                    ForwardExecutionRole::MainInference)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Captured main ExpertOverlay completion found contradictory host reader state on "
+                        << state_.device_id.toString());
+                    return false;
+                }
+
+                auto submission =
+                    moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+                const auto captured_state = submission.state();
+                if (captured_state !=
+                    MoEOverlayEpochLeaseState::CapturedMainForward)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Captured main ExpertOverlay completion lost lease authority on "
+                        << state_.device_id.toString()
+                        << " lease_state="
+                        << moeOverlayEpochLeaseStateName(captured_state));
+                    return false;
+                }
+
+                /*
+                 * The graph's sole terminal is the captured Release stage.
+                 * Recording on the exact launch stream creates an immutable
+                 * receipt after that terminal; it does not submit another graph
+                 * or inspect the device-owned ticket.
+                 */
+                IBackend *const backend = getBackendFor(state_.device_id);
+                if (!backend || !moe_overlay_epoch_released_event_ ||
+                    !backend->recordEvent(
+                        moe_overlay_epoch_released_event_.get(),
+                        state_.device_id.gpu_ordinal(),
+                        execution_stream))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Captured main ExpertOverlay graph could not publish its terminal release receipt on "
+                        << state_.device_id.toString());
+                    std::terminate();
+                }
+                moe_overlay_epoch_acquire_producer_stream_ = nullptr;
+                if (!submission.publishRelease(execution_stream))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Captured main ExpertOverlay graph could not publish its terminal semantic receipt on "
+                        << state_.device_id.toString());
+                    std::terminate();
+                }
+            }
+            else if (borrowed_hosted_parent)
+            {
+                if (input.execution_role ==
+                        ForwardExecutionRole::MainInference ||
+                    !moe_overlay_epoch_acquire_producer_stream_)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Hosted ExpertOverlay child completion lost its parent-owned reader on "
+                        << state_.device_id.toString());
+                    return false;
+                }
+                /*
+                 * This forward consumed the parent's acquired-event on its exact
+                 * stream. Its semantic replay handoff subsequently joins that
+                 * stream back to the hosted scheduler. Clearing only the local
+                 * submission recipe leaves the parent ticket untouched until
+                 * the typed branch-terminal release fragment runs.
+                 */
+                auto submission =
+                    moe_overlay_epoch_lease_lifecycle_->beginSubmission();
+                const auto child_state = submission.state();
+                if (child_state !=
+                    MoEOverlayEpochLeaseState::HostedChildForward)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Hosted ExpertOverlay child could not return its parent lease on "
+                        << state_.device_id.toString()
+                        << " lease_state="
+                        << moeOverlayEpochLeaseStateName(child_state));
+                    return false;
+                }
+                if (!submission.commit(MoEOverlayEpochLeaseState::HostedParent))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphOrchestrator] Hosted ExpertOverlay child could not republish its parent owner on "
+                        << state_.device_id.toString());
+                    std::terminate();
+                }
+            }
+            else
+            {
+                if (external_sequence_verifier)
+                {
+                    const auto &identity =
+                        moe_overlay_external_sequence_identity_;
+                    if (input.execution_role !=
+                            ForwardExecutionRole::GroupedMTPVerifier ||
+                        input.moe_overlay_collective_generation_id !=
+                            identity.request_generation ||
+                        input.moe_overlay_sequence_id !=
+                            identity.sequence_id ||
+                        input.moe_overlay_sequence_placement_epoch !=
+                            identity.placement_epoch ||
+                        input.moe_overlay_sequence_graph_count !=
+                            identity.graph_count ||
+                        input.moe_overlay_sequence_graph_ordinal !=
+                            identity.graph_count - 1 ||
+                        identity.last_graph_ordinal !=
+                            input.moe_overlay_sequence_graph_ordinal)
+                    {
+                        LOG_ERROR(
+                            "[DeviceGraphOrchestrator] Grouped verifier "
+                            "terminal no longer matches its admitted "
+                            "ExpertOverlay MTP sequence");
+                        return false;
+                    }
+                }
+                if (!releaseMoEOverlayEpochForExternalTransaction(
+                        execution_stream,
+                        "forward_graph_exact_submission_terminal",
+                        MoEOverlayEpochLeaseState::ExternalForward))
+                {
+                    return false;
+                }
+                if (external_sequence_verifier)
+                {
+                    PerfStatsCollector::addCounter(
+                        "moe_overlay_epoch",
+                        "external_sequence_releases",
+                        1.0,
+                        perfPhaseName(),
+                        state_.device_id.toString(),
+                        {{"sequence_id",
+                          std::to_string(
+                              moe_overlay_external_sequence_identity_
+                                  .sequence_id)},
+                         {"graph_count",
+                          std::to_string(
+                              moe_overlay_external_sequence_identity_
+                                  .graph_count)},
+                         {"blocking", "false"}});
+                    moe_overlay_external_sequence_identity_.reset();
+                }
+            }
+
+            moe_overlay_epoch_forward_submission_stream_ = nullptr;
+            PerfStatsCollector::addCounter(
+                "moe_overlay_epoch",
+                "forward_submission_terminal_receipts",
+                1.0,
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"lifetime", "one_forward_submission"},
+                 {"forward_role",
+                  captured_main
+                      ? "main_inference"
+                      : borrowed_hosted_parent
+                            ? "hosted_parent_child"
+                            : "auxiliary_forward"},
+                 {"boundary_owner",
+                 captured_main
+                      ? "captured_main_graph"
+                      : borrowed_hosted_parent
+                            ? "borrowed_hosted_parent"
+                            : "retained_external_graphs"},
+                 {"blocking", "false"}});
         }
-        pending.clear();
+
+        if (moe_overlay_inference_transaction_coordinator_ &&
+            moe_overlay_inference_completion_fence_ &&
+            input.execution_role == ForwardExecutionRole::MainInference &&
+            input.execution_phase == ForwardExecutionPhase::Prefill &&
+            input.moe_overlay_collective_step_id != 0)
+        {
+            /*
+             * This hook runs after the forward executor has enqueued the graph
+             * and after the captured overlay Release terminal above. Recording
+             * one dedicated event here gives calibration the same device-side
+             * completion boundary as the production graph without blocking the
+             * inference thread or reusing the epoch-publication receipt.
+             */
+            std::string completion_error;
+            if (!moe_overlay_inference_transaction_coordinator_
+                     ->deferPrefillInterferenceCompletionAtDeviceTerminal(
+                         input.moe_overlay_collective_step_id,
+                         moe_overlay_inference_transaction_participant_index_,
+                         moe_overlay_inference_completion_fence_,
+                         execution_stream,
+                         &completion_error))
+            {
+                LOG_ERROR(
+                    "[DeviceGraphOrchestrator] ExpertOverlay prefill could not publish its exact device-terminal calibration receipt on "
+                    << state_.device_id.toString() << ": "
+                    << completion_error);
+                return false;
+            }
+        }
         return true;
     }
 
@@ -39911,6 +42304,100 @@ namespace llaminar2
                 probe.reject_stage_name = entry.reject_stage_name;
                 probe.reject_stage_type = entry.reject_stage_type;
                 snapshot.prefill_graphs.push_back(std::move(probe));
+            }
+        }
+
+        if ((snapshot_enabled_ ||
+             capture_policy.capture_device_logical_state) &&
+            state_.device_id.is_gpu() &&
+            mtp_committed_verifier_identity_dev_ &&
+            mtp_max_draft_depth_ > 0)
+        {
+            /*
+             * The reusable verifier row cannot prove which controller commit
+             * consumed it. The response/state kernel snapshots its exact active
+             * prefix into this record before publishing the same producer event,
+             * making the transaction ordinal, selected depth, and token bytes
+             * one typed diagnostic fact.
+             */
+            IBackend *const backend = getBackendFor(state_.device_id);
+            if (!arena_ ||
+                !arena_->isRegistered(
+                    BufferId::MTP_COMMITTED_VERIFIER_IDENTITY) ||
+                !arena_->prepareForRead(
+                    BufferId::MTP_COMMITTED_VERIFIER_IDENTITY,
+                    state_.device_id,
+                    probe_stream))
+            {
+                throw std::runtime_error(
+                    "Prefix-state diagnostics could not join the exact "
+                    "committed MTP verifier-identity producer event");
+            }
+            sampling_math::MTPCommittedVerifierIdentityRecord identity{};
+            if (!backend || !probe_stream ||
+                !backend->deviceToHostFast(
+                    &identity,
+                    mtp_committed_verifier_identity_dev_,
+                    sizeof(identity),
+                    state_.device_id.gpu_ordinal(),
+                    probe_stream))
+            {
+                throw std::runtime_error(
+                    "Prefix-state diagnostics could not export the resident "
+                    "committed MTP verifier identity");
+            }
+
+            /*
+             * Admission clears `valid` on the controller's exact stream. A
+             * non-valid record therefore means no transaction has committed in
+             * this request, while every malformed valid record is fatal rather
+             * than silently interpreted as an absent proposal.
+             */
+            if (identity.valid != 0)
+            {
+                const bool header_valid =
+                    identity.version ==
+                        sampling_math::
+                            kMTPCommittedVerifierIdentityVersion &&
+                    identity.transaction_count > 0 &&
+                    identity.draft_depth > 0 &&
+                    identity.draft_depth <= mtp_max_draft_depth_ &&
+                    identity.draft_depth <=
+                        sampling_math::kSpeculativeBatchMaxRows;
+                bool tokens_valid = header_valid;
+                for (int row = 0;
+                     tokens_valid &&
+                     row <= identity.draft_depth;
+                     ++row)
+                {
+                    tokens_valid =
+                        identity.verifier_input_tokens[row] >= 0;
+                }
+                for (int row = identity.draft_depth + 1;
+                     tokens_valid &&
+                     row <
+                         sampling_math::
+                             kSpeculativeBatchMaxOutputTokens;
+                     ++row)
+                {
+                    tokens_valid =
+                        identity.verifier_input_tokens[row] == -1;
+                }
+                if (!tokens_valid)
+                {
+                    throw std::runtime_error(
+                        "Prefix-state diagnostics observed a malformed "
+                        "committed MTP verifier identity");
+                }
+
+                snapshot.mtp_observed_verifier_transaction_count =
+                    identity.transaction_count;
+                snapshot.mtp_observed_verifier_draft_depth =
+                    identity.draft_depth;
+                snapshot.mtp_observed_verifier_draft_tokens.assign(
+                    identity.verifier_input_tokens + 1,
+                    identity.verifier_input_tokens +
+                        identity.draft_depth + 1);
             }
         }
 
@@ -45439,10 +47926,28 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::publishDeviceGenerationStateReady(
         void *producer_stream,
         int request_count,
-        const char *producer_name)
+        DeviceGenerationStatePublicationKind kind)
     {
         if (!state_.device_id.is_gpu())
             return true;
+
+        const char *const producer_name = [&]() -> const char *
+        {
+            switch (kind)
+            {
+            case DeviceGenerationStatePublicationKind::Admission:
+                return "device_generation_admission";
+            case DeviceGenerationStatePublicationKind::CommittedTransaction:
+                return "generation_response_and_state_commit";
+            case DeviceGenerationStatePublicationKind::Terminal:
+                return "device_generation_parent_terminal";
+            }
+            return "invalid_device_generation_publication";
+        }();
+        const char *const verifier_identity_state =
+            kind == DeviceGenerationStatePublicationKind::Admission
+                ? "reset"
+                : "committed";
 
         auto &ready = device_generation_state_ready_;
         if (!producer_stream || request_count <= 0 ||
@@ -45468,6 +47973,13 @@ namespace llaminar2
             !publishDeviceGenerationArenaState(
                 producer_stream,
                 producer_name) ||
+            (!mtp_committed_verifier_identity_dev_ ||
+             !publishPreparedArenaGraphInput(
+                 BufferId::MTP_COMMITTED_VERIFIER_IDENTITY,
+                 mtp_committed_verifier_identity_dev_,
+                 producer_stream,
+                 state_.device_id,
+                 producer_name)) ||
             !DeviceEventEdge::at(
                  DeviceTimelinePoint::DeviceGenerationStateReady)
                  .from(DeviceTimelineRole::DeviceGenerationController)
@@ -45490,11 +48002,9 @@ namespace llaminar2
             1.0,
             perfPhaseName(),
             state_.device_id.toString(),
-            {{"producer",
-              producer_name && producer_name[0] != '\0'
-                  ? producer_name
-                  : "unknown"},
+            {{"producer", producer_name},
              {"request_count", std::to_string(request_count)},
+             {"verifier_identity", verifier_identity_state},
              {"ordering", "event_wait"}});
         return true;
     }
@@ -45672,6 +48182,12 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Device-generation admission found a published controller without an active request");
             return false;
         }
+        if (!hosted_device_generation_cursor_.inactive() ||
+            !mtp_device_generation_loop_graph_.hosted_advance.idle())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-generation admission found an unretired hosted scheduler lifecycle");
+            return false;
+        }
 
         /*
          * Request admission mutates contents behind stable device addresses; it
@@ -45679,11 +48195,27 @@ namespace llaminar2
          * pointer bindings are authenticated by the child caches during parent
          * materialization. A changed child invalidates and rebuilds the parent,
          * while an identical request reuses the proven executable.
+         *
+         * The committed-verifier identity is request-owned diagnostic evidence,
+         * so admission invalidates it on this exact admission stream before the
+         * controller is published. This asynchronous reset neither blocks nor
+         * copies state to the host; the following state-ready event orders every
+         * consumer behind both the reset and controller initialization.
          */
 
         device_generation_storage_.active_request_count =
             request.request_count;
-        if (!backend->enqueueInitializeDeviceGeneration(
+        if (!mtp_committed_verifier_identity_dev_ ||
+            !backend->memset(
+                mtp_committed_verifier_identity_dev_,
+                0,
+                static_cast<size_t>(request.request_count) *
+                    sizeof(
+                        sampling_math::
+                            MTPCommittedVerifierIdentityRecord),
+                state_.device_id.gpu_ordinal(),
+                stream) ||
+            !backend->enqueueInitializeDeviceGeneration(
                 request.request_count,
                 request.max_new_tokens,
                 depth_policy,
@@ -45706,7 +48238,7 @@ namespace llaminar2
             !publishDeviceGenerationStateReady(
                 stream,
                 request.request_count,
-                "device_generation_admission"))
+                DeviceGenerationStatePublicationKind::Admission))
         {
             device_generation_storage_.active_request_count = 0;
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize and publish the device-generation controller");
@@ -45714,10 +48246,7 @@ namespace llaminar2
         }
 
         last_device_generation_dispatch_ticket_.reset();
-        device_generation_dispatch_ticket_copy_pending_ = false;
-        hosted_device_generation_scheduler_started_ = false;
-        hosted_device_generation_terminal_submitted_ = false;
-        hosted_device_generation_last_transaction_count_ = 0;
+        hosted_device_generation_cursor_.reset();
 
         PerfStatsCollector::addCounter(
             "mtp",
@@ -45790,8 +48319,7 @@ namespace llaminar2
          * graph or silently omit the first maintenance transaction.
          */
         const bool owns_dynamic_device_maintenance =
-            isMoeRebalancingActive() &&
-            usesHomogeneousDeviceResidentMoEOverlayAuthority();
+            usesParticipantLocalDeviceMoERebalanceController();
         if (owns_dynamic_device_maintenance &&
             !device_moe_rebalance_maintenance_graph_
                  .completion_event_in_flight &&
@@ -45875,14 +48403,17 @@ namespace llaminar2
             !device_generation_dispatch_ticket_host_scratch_->canServe(
                 request_count) ||
             !device_generation_dispatch_ticket_ready_event_ ||
-            device_generation_dispatch_ticket_copy_pending_ || !backend)
+            !hosted_device_generation_cursor_
+                 .maySubmitTicketObservation() ||
+            !backend)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation ticket observation has incomplete or overlapping ownership"
                       << " device=" << state_.device_id.toString()
                       << " requests=" << request_count
                       << " loop_valid=" << loop.valid
-                      << " copy_pending="
-                      << device_generation_dispatch_ticket_copy_pending_);
+                      << " lifecycle_state="
+                      << static_cast<int>(
+                             hosted_device_generation_cursor_.state()));
             return false;
         }
 
@@ -45906,7 +48437,17 @@ namespace llaminar2
                       << state_.device_id.toString());
             return false;
         }
-        device_generation_dispatch_ticket_copy_pending_ = true;
+        if (!hosted_device_generation_cursor_
+                 .markTicketObservationSubmitted())
+        {
+            /*
+             * The immutable ticket copy is already in flight. Re-entering the
+             * scheduler here could duplicate a retained transaction, so a
+             * failed post-submit transition is a fatal internal invariant.
+             */
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted ticket submission could not acquire its typed lifecycle state");
+            std::terminate();
+        }
         PerfStatsCollector::addCounter(
             "mtp",
             "device_generation_dispatch_ticket_d2h_submissions",
@@ -45937,13 +48478,13 @@ namespace llaminar2
                     HostedDispatchTicketPublisher ||
             !loop.valid || !loop.stream || loop.workspace_generation == 0 ||
             loop.workspace_generation != generation ||
-            hosted_device_generation_terminal_submitted_)
+            !hosted_device_generation_cursor_.mayObserveTicket())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation ticket observation has stale lifecycle identity");
             return false;
         }
 
-        if (!hosted_device_generation_scheduler_started_)
+        if (!hosted_device_generation_cursor_.schedulerStarted())
         {
             if (loop.launched ||
                 !consumeDeviceGenerationStateReady(
@@ -45951,7 +48492,7 @@ namespace llaminar2
                     DeviceTimelineRole::DeviceGenerationController,
                     request_count,
                     "hosted_device_generation_ticket_scheduler") ||
-                (usesHomogeneousDeviceResidentMoEOverlayAuthority() &&
+                (usesParticipantLocalDeviceMoERebalanceController() &&
                  !waitForPendingDeviceMoERebalanceMaintenance(
                      loop.stream.get(),
                      DeviceTimelineRole::MTPSidecarGraph,
@@ -45968,13 +48509,17 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation scheduler could not close the externally scheduled ExpertOverlay transaction");
                 return false;
             }
-            hosted_device_generation_scheduler_started_ = true;
+            if (!hosted_device_generation_cursor_.startScheduler())
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation scheduler rejected its initial typed transition");
+                return false;
+            }
             loop.launched = true;
             if (!enqueueDeviceGenerationDispatchTicketObservation())
                 return false;
         }
 
-        if (!device_generation_dispatch_ticket_copy_pending_ ||
+        if (!hosted_device_generation_cursor_.ticketObservationPending() ||
             !backend->waitForEvent(
                 device_generation_dispatch_ticket_ready_event_.get(),
                 state_.device_id.gpu_ordinal()))
@@ -45983,17 +48528,24 @@ namespace llaminar2
                       << state_.device_id.toString());
             return false;
         }
-        device_generation_dispatch_ticket_copy_pending_ = false;
 
         const DeviceGenerationDispatchTicket ticket =
             device_generation_dispatch_ticket_host_scratch_->tickets[0];
-        const int expected_transaction_count =
-            hosted_device_generation_last_transaction_count_ + 1;
+        const std::int32_t last_transaction_count =
+            hosted_device_generation_cursor_.lastTransactionCount();
+        const bool transaction_ordinal_available =
+            last_transaction_count <
+            std::numeric_limits<std::int32_t>::max();
+        const std::int32_t expected_transaction_count =
+            transaction_ordinal_available
+                ? last_transaction_count + 1
+                : std::numeric_limits<std::int32_t>::min();
         const bool valid_ticket =
             ticket.matchesLifecycle(session_epoch_, generation) &&
             ticket.healthy == 1 &&
             ticket.error_code ==
                 static_cast<int32_t>(DeviceGenerationError::None) &&
+            transaction_ordinal_available &&
             ticket.transaction_count == expected_transaction_count &&
             ticket.next_draft_depth >= loop.minimum_draft_depth &&
             ticket.next_draft_depth <= loop.maximum_draft_depth;
@@ -46019,8 +48571,12 @@ namespace llaminar2
             return false;
         }
 
-        hosted_device_generation_last_transaction_count_ =
-            ticket.transaction_count;
+        if (!hosted_device_generation_cursor_.acceptTicket(
+                ticket.transaction_count))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Authenticated hosted ticket could not enter its typed observed state");
+            return false;
+        }
         last_device_generation_dispatch_ticket_ = ticket;
         *out_ticket = ticket;
         PerfStatsCollector::addCounter(
@@ -46054,12 +48610,12 @@ namespace llaminar2
             !ticket.hasSameDispatchDecision(
                 *last_device_generation_dispatch_ticket_) ||
             request_count != 1 || !loop.valid || !loop.launched ||
-            !loop.stream || loop.hosted_advance_active ||
+            !loop.stream || !loop.hosted_advance.idle() ||
             loop.execution_kind !=
                 MTPDeviceGenerationLoopGraphCache::ExecutionKind::
                     HostedDispatchTicketPublisher ||
-            device_generation_dispatch_ticket_copy_pending_ ||
-            hosted_device_generation_terminal_submitted_)
+            !hosted_device_generation_cursor_.mayBeginAdvance(
+                ticket.transaction_count))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation advance rejected a stale, altered, or overlapping ticket");
             return false;
@@ -46108,43 +48664,55 @@ namespace llaminar2
         }
 
         /*
-         * Observing the next authenticated ticket proves that the preceding
-         * transaction consumed every sparse return and committed controller
-         * state. Participant zero owns the shared coordinator transition; the
-         * other LocalTP children validate the newly selected depth below.
+         * The authenticated device ticket is the sole sequence-transition
+         * authority. Every symmetric child presents it to the shared
+         * coordinator; the first caller applies the transition and siblings
+         * consume that same idempotent decision. No participant index or host
+         * worker scheduling order carries lifecycle meaning.
          */
-        if (moe_overlay_inference_transaction_coordinator_ &&
-            moe_overlay_inference_transaction_participant_index_ == 0)
+        if (moe_overlay_inference_transaction_coordinator_)
         {
             std::string sequence_error;
+            const std::optional<int> next_depth =
+                ticket.complete == 0
+                    ? std::optional<int>{ticket.next_draft_depth}
+                    : std::nullopt;
             if (!moe_overlay_inference_transaction_coordinator_
-                     ->retireCompletedGraphSequence(&sequence_error) ||
-                (ticket.complete == 0 &&
-                 !moe_overlay_inference_transaction_coordinator_
-                      ->beginGraphSequence(
-                          ticket.next_draft_depth, &sequence_error)))
+                     ->advanceHostedGraphSequence(
+                         static_cast<std::uint64_t>(
+                             ticket.transaction_count),
+                         next_depth,
+                         &sequence_error))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Hosted ExpertOverlay graph-sequence transition failed: "
                           << sequence_error);
                 return false;
             }
         }
-        else if (moe_overlay_inference_transaction_coordinator_ &&
-                 ticket.complete == 0 &&
-                 moe_overlay_inference_transaction_coordinator_
-                         ->activeMTPDraftDepth() !=
-                     ticket.next_draft_depth)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Hosted participant observed a coordinator depth different from the authenticated ticket");
-            return false;
-        }
 
-        loop.hosted_advance_fragment_count =
-            (ticket.maintenance_due != 0 ? 1u : 0u) +
-            (ticket.complete != 0 ? 0u : unconditional_count);
-        loop.hosted_advance_next_fragment = 0;
-        loop.hosted_advance_active = true;
-        *out_fragment_count = loop.hosted_advance_fragment_count;
+        const DeviceControlledLoopTicketSelection selection{
+            .iteration_admitted = ticket.complete == 0,
+            .conditional_word_nonzero = ticket.maintenance_due != 0,
+        };
+        const std::span<const HostedDeviceGenerationFragment>
+            ordered_branch(
+                loop.hosted_fragments.data() + branch_offset,
+                branch_count);
+        const size_t selected_fragment_count =
+            selection.countSelected(ordered_branch);
+        if (!hosted_device_generation_cursor_.beginAdvance(
+                ticket.transaction_count) ||
+            !loop.hosted_advance.begin(selected_fragment_count))
+        {
+            /*
+             * The cross-participant graph-sequence coordinator has already
+             * accepted this ticket. A partial local transition cannot be
+             * retried safely because it could submit the branch twice.
+             */
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted branch could not atomically acquire its typed submission cursors");
+            std::terminate();
+        }
+        *out_fragment_count = loop.hosted_advance.fragmentCount();
         return true;
     }
 
@@ -46154,12 +48722,11 @@ namespace llaminar2
             size_t fragment_index)
     {
         auto &loop = mtp_device_generation_loop_graph_;
-        if (!loop.hosted_advance_active ||
+        if (!hosted_device_generation_cursor_.submitting() ||
             !last_device_generation_dispatch_ticket_ ||
             !ticket.hasSameDispatchDecision(
                 *last_device_generation_dispatch_ticket_) ||
-            fragment_index != loop.hosted_advance_next_fragment ||
-            fragment_index >= loop.hosted_advance_fragment_count)
+            !loop.hosted_advance.maySubmit(fragment_index))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Hosted fragment submission is stale, duplicated, or out of order");
             return false;
@@ -46170,44 +48737,16 @@ namespace llaminar2
         const size_t branch_offset = loop.branch_offsets[branch_index];
         const size_t branch_count =
             loop.branch_fragment_counts[branch_index];
-        const HostedDeviceGenerationFragment *selected = nullptr;
-        size_t selected_ordinal = 0;
-
-        if (ticket.maintenance_due != 0)
-        {
-            for (size_t index = 0; index < branch_count; ++index)
-            {
-                const auto &candidate =
-                    loop.hosted_fragments[branch_offset + index];
-                if (candidate.execution !=
-                    DeviceControlledLoopFragmentExecution::Always)
-                {
-                    if (fragment_index == 0)
-                        selected = &candidate;
-                    break;
-                }
-            }
-            selected_ordinal = 1;
-        }
-        if (!selected && ticket.complete == 0)
-        {
-            for (size_t index = 0; index < branch_count; ++index)
-            {
-                const auto &candidate =
-                    loop.hosted_fragments[branch_offset + index];
-                if (candidate.execution !=
-                    DeviceControlledLoopFragmentExecution::Always)
-                {
-                    continue;
-                }
-                if (selected_ordinal == fragment_index)
-                {
-                    selected = &candidate;
-                    break;
-                }
-                ++selected_ordinal;
-            }
-        }
+        const DeviceControlledLoopTicketSelection selection{
+            .iteration_admitted = ticket.complete == 0,
+            .conditional_word_nonzero = ticket.maintenance_due != 0,
+        };
+        const std::span<const HostedDeviceGenerationFragment>
+            ordered_branch(
+                loop.hosted_fragments.data() + branch_offset,
+                branch_count);
+        const HostedDeviceGenerationFragment *const selected =
+            selection.selectOrdinal(ordered_branch, fragment_index);
         if (!selected)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Hosted fragment ordinal has no semantic branch member index="
@@ -46245,6 +48784,18 @@ namespace llaminar2
                 &producer_stream,
                 &replay_error);
             break;
+        case HostedDeviceGenerationFragment::Kind::MoEOverlayEpochAcquire:
+            submitted = acquireMoEOverlayEpochForHostedParent(
+                loop.stream.get(),
+                selected->capture,
+                "hosted_device_generation_branch_entry");
+            break;
+        case HostedDeviceGenerationFragment::Kind::MoEOverlayEpochRelease:
+            submitted = releaseMoEOverlayEpochForHostedParent(
+                loop.stream.get(),
+                selected->capture,
+                "hosted_device_generation_branch_terminal");
+            break;
         }
         if (!submitted)
         {
@@ -46258,7 +48809,12 @@ namespace llaminar2
             return false;
         }
 
-        ++loop.hosted_advance_next_fragment;
+        if (!loop.hosted_advance.recordSubmission(fragment_index))
+        {
+            /* The fragment ran; permitting a retry would duplicate it. */
+            LOG_ERROR("[DeviceGraphOrchestrator] Submitted hosted fragment could not advance its exact ordinal cursor");
+            std::terminate();
+        }
         PerfStatsCollector::addCounter(
             "mtp",
             "hosted_device_generation_fragment_submissions",
@@ -46278,9 +48834,8 @@ namespace llaminar2
         auto &loop = mtp_device_generation_loop_graph_;
         const int request_count =
             device_generation_storage_.active_request_count;
-        if (!loop.hosted_advance_active ||
-            loop.hosted_advance_next_fragment !=
-                loop.hosted_advance_fragment_count ||
+        if (!hosted_device_generation_cursor_.submitting() ||
+            !loop.hosted_advance.mayFinish() ||
             !last_device_generation_dispatch_ticket_ ||
             !ticket.hasSameDispatchDecision(
                 *last_device_generation_dispatch_ticket_))
@@ -46289,20 +48844,24 @@ namespace llaminar2
             return false;
         }
 
-        loop.hosted_advance_active = false;
-        loop.hosted_advance_fragment_count = 0;
-        loop.hosted_advance_next_fragment = 0;
         if (ticket.complete != 0)
         {
             if (!publishDeviceGenerationStateReady(
                     loop.stream.get(),
                     request_count,
-                    "hosted_device_generation_terminal"))
+                    DeviceGenerationStatePublicationKind::Terminal))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Hosted device-generation terminal event publication failed");
                 std::terminate();
             }
-            hosted_device_generation_terminal_submitted_ = true;
+            if (!loop.hosted_advance.finish() ||
+                !hosted_device_generation_cursor_.finishAdvance(
+                    ticket.transaction_count,
+                    /*terminal=*/true))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Hosted terminal branch could not retire its typed submission cursors");
+                std::terminate();
+            }
             PerfStatsCollector::addCounter(
                 "mtp",
                 "hosted_device_generation_terminal_submissions",
@@ -46314,6 +48873,14 @@ namespace llaminar2
             return true;
         }
 
+        if (!loop.hosted_advance.finish() ||
+            !hosted_device_generation_cursor_.finishAdvance(
+                ticket.transaction_count,
+                /*terminal=*/false))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hosted transaction branch could not retire its typed submission cursors");
+            std::terminate();
+        }
         last_device_generation_dispatch_ticket_.reset();
         if (!enqueueDeviceGenerationDispatchTicketObservation())
             return false;
@@ -46446,7 +49013,7 @@ namespace llaminar2
             return false;
         }
 
-        if (usesHomogeneousDeviceResidentMoEOverlayAuthority() &&
+        if (usesParticipantLocalDeviceMoERebalanceController() &&
             !waitForPendingDeviceMoERebalanceMaintenance(
                 loop_stream,
                 DeviceTimelineRole::MTPSidecarGraph,
@@ -46480,7 +49047,7 @@ namespace llaminar2
         if (!publishDeviceGenerationStateReady(
                 loop_stream,
                 request_count,
-                "native_device_generation_parent_terminal"))
+                DeviceGenerationStatePublicationKind::Terminal))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Native device-generation parent could not publish its terminal event on "
                       << state_.device_id.toString());
@@ -46920,18 +49487,22 @@ namespace llaminar2
          * not transfer state authority to the CPU. It merely releases the
          * persistent response ledger after its terminal contents were proven.
          */
-        if (!mtp_device_generation_loop_graph_.retireCompletedLaunch())
+        if ((!hosted_device_generation_cursor_.inactive() &&
+             !hosted_device_generation_cursor_.terminalSubmitted()) ||
+            !mtp_device_generation_loop_graph_.retireCompletedLaunch())
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Terminal device-generation response could not retire exactly one loop launch on "
+            LOG_ERROR("[DeviceGraphOrchestrator] Terminal device-generation response could not retire one complete loop lifecycle on "
                       << state_.device_id.toString());
             return false;
         }
+        if (!hosted_device_generation_cursor_.retireCompleted())
+        {
+            /* Preconditions above make this an internal transition defect. */
+            LOG_ERROR("[DeviceGraphOrchestrator] Terminal response bridge lost hosted scheduler lifecycle ownership");
+            std::terminate();
+        }
         device_generation_storage_.active_request_count = 0;
         last_device_generation_dispatch_ticket_.reset();
-        device_generation_dispatch_ticket_copy_pending_ = false;
-        hosted_device_generation_scheduler_started_ = false;
-        hosted_device_generation_terminal_submitted_ = false;
-        hosted_device_generation_last_transaction_count_ = 0;
         *out_result = std::move(parsed);
         PerfStatsCollector::addCounter(
             "mtp",
@@ -47201,10 +49772,8 @@ namespace llaminar2
             }
             device_generation_storage_.active_request_count = 0;
             last_device_generation_dispatch_ticket_.reset();
-            device_generation_dispatch_ticket_copy_pending_ = false;
-            hosted_device_generation_scheduler_started_ = false;
-            hosted_device_generation_terminal_submitted_ = false;
-            hosted_device_generation_last_transaction_count_ = 0;
+            hosted_device_generation_cursor_.reset();
+            mtp_device_generation_loop_graph_.hosted_advance.reset();
         }
         PerfStatsCollector::addCounter(
             "request_reset",
@@ -47691,33 +50260,51 @@ namespace llaminar2
          * allocated during initialization and remains alive until the exact
          * request-reuse event retires.
          */
-        const bool padding_enqueued =
-            padding_tokens == 0 ||
-            backend->hostToDeviceOnStream(
-                static_cast<int32_t *>(request_token_ids_dev_) + total_tokens,
-                request_padding_token_ids_host_.data(),
-                padding_bytes,
-                state_.device_id.gpu_ordinal(),
-                stream);
-        if (!padding_enqueued ||
-            !backend->hostToDeviceOnStream(
+        const auto enqueue_admission_member =
+            [&](const char *member,
+                void *destination,
+                const void *source,
+                size_t bytes)
+        {
+            if (backend->hostToDeviceOnStream(
+                    destination,
+                    source,
+                    bytes,
+                    state_.device_id.gpu_ordinal(),
+                    stream))
+            {
+                return true;
+            }
+            LOG_ERROR(
+                "[DeviceGraphOrchestrator] Failed to enqueue GPU request-input member"
+                << " member=" << member
+                << " bytes=" << bytes
+                << " destination=" << destination
+                << " source=" << source
+                << " stream=" << stream);
+            return false;
+        };
+        if ((padding_tokens > 0 &&
+             !enqueue_admission_member(
+                 "token_padding",
+                 static_cast<int32_t *>(request_token_ids_dev_) + total_tokens,
+                 request_padding_token_ids_host_.data(),
+                 padding_bytes)) ||
+            !enqueue_admission_member(
+                "tokens",
                 request_token_ids_dev_,
                 tokens,
-                row_bytes,
-                state_.device_id.gpu_ordinal(),
-                stream) ||
-            !backend->hostToDeviceOnStream(
+                row_bytes) ||
+            !enqueue_admission_member(
+                "positions",
                 request_position_ids_dev_,
                 position_ids,
-                row_bytes,
-                state_.device_id.gpu_ordinal(),
-                stream) ||
-            !backend->hostToDeviceOnStream(
+                row_bytes) ||
+            !enqueue_admission_member(
+                "batch_geometry",
                 request_batch_geometry_dev_,
                 request_batch_geometry_host_.data(),
-                geometry_bytes,
-                state_.device_id.gpu_ordinal(),
-                stream))
+                geometry_bytes))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to enqueue the complete GPU request-input admission");
             return false;
@@ -51234,8 +53821,7 @@ namespace llaminar2
          * for sampling and publication while carrying no movement clock.
          */
         const bool requires_rebalance_controller =
-            isMoeRebalancingActive() &&
-            usesHomogeneousDeviceResidentMoEOverlayAuthority();
+            usesParticipantLocalDeviceMoERebalanceController();
         std::string rebalance_controller_error;
         DeviceMoERebalanceGraphControllerState *rebalance_controller =
             requires_rebalance_controller

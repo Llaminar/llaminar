@@ -1420,6 +1420,65 @@ TEST(Test__ROCmMoEKernel,
 }
 
 /**
+ * @brief Prove async histogram setup is joined before HIP graph capture.
+ *
+ * HIP has the same producer/maintenance ordering requirement as CUDA even
+ * though its retained MTP transaction selection differs. The graph body may
+ * publish only a producer stream admitted before `beginCapture()`; otherwise
+ * the runtime table rejects the invalid lifecycle without inserting an event
+ * edge into an active capture.
+ */
+TEST(Test__ROCmMoEKernel,
+     AsyncHistogramProducerPreparationPrecedesGraphCapture)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    SKIP_IF_NO_ROCM();
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    ScopedHipDeviceStream producer_stream(/*device_ordinal=*/0);
+    ASSERT_EQ(producer_stream.status(), hipSuccess);
+
+    DeviceMoERuntimeTable::Config config;
+    config.device_id = DeviceId::rocm(0);
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.mirror_to_device = true;
+    DeviceMoERuntimeTable table(config);
+    table.enableAsyncDecodeHistogramDrain(
+        kAllRuntimeExpertHistogramSources);
+
+    EXPECT_THROW(
+        table.recordDecodeHistogramProducerStream(producer_stream.get()),
+        std::logic_error);
+    ASSERT_NO_THROW(
+        table.prepareDecodeHistogramProducerStream(producer_stream.get()));
+
+    HipAllocation graph_witness(sizeof(uint32_t));
+    ScopedHipTestGraph graph(
+        /*device_ordinal=*/0,
+        producer_stream.get(),
+        "async histogram producer pre-capture admission");
+    ASSERT_NO_THROW(
+        table.recordDecodeHistogramProducerStream(producer_stream.get()));
+    ASSERT_EQ(
+        hipMemsetAsync(
+            graph_witness.get(),
+            0xa5,
+            sizeof(uint32_t),
+            producer_stream.get()),
+        hipSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
+    ASSERT_EQ(hipStreamSynchronize(producer_stream.get()), hipSuccess);
+    EXPECT_EQ(
+        table.decodeHistogramProducerStream(),
+        producer_stream.get());
+#endif
+}
+
+/**
  * @brief Prove terminal LLEP evidence is reduced from the complete ROCm table.
  *
  * The seeded marker sets intentionally differ, proving the backend does not
@@ -2760,7 +2819,6 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillGroupingFiltersStaticOwnerLocalExperts)
     std::copy(routing_weights_data, routing_weights_data + total_slots, routing_weights->mutable_data());
     ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
     ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
-
     ASSERT_TRUE(gpu_kernel.groupPrefillRoutes(
         runtime_table.deviceLayerState(0),
         routing_indices.get(),
@@ -2842,7 +2900,7 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillGroupingFiltersStaticOwnerLocalExperts)
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 
     EXPECT_EQ(route_experts, (std::array<int32_t, total_slots>{0, 1, 2, 3, 2, 1}));
-    EXPECT_EQ(route_participants, (std::array<int32_t, total_slots>{0, -1, 0, -1, 0, -1}));
+    EXPECT_EQ(route_participants, (std::array<int32_t, total_slots>{0, 1, 0, 1, 0, 1}));
     EXPECT_EQ(counts, (std::array<int32_t, num_experts>{1, 0, 2, 0}));
     EXPECT_EQ(offsets, (std::array<int32_t, num_experts>{0, 1, 1, 3}));
     EXPECT_EQ(grouped_tokens[0], 0);
@@ -3158,6 +3216,15 @@ TEST(Test__ROCmMoEKernel,
     }
     ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream));
     ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream));
+    /*
+     * The production graph executor admits external tensor producers before
+     * beginning capture.  This direct kernel harness must reproduce that
+     * boundary so the HIP graph contains only the retained inference DAG.
+     */
+    ASSERT_NO_THROW(TransferEngine::requireDeviceInput(
+        routing_indices.get(), device, stream));
+    ASSERT_NO_THROW(TransferEngine::requireDeviceInput(
+        routing_weights.get(), device, stream));
     std::array<int32_t, max_m> logical_positions{};
     for (int row = 0; row < max_m; ++row)
         logical_positions[static_cast<size_t>(row)] = 73 + row;
@@ -5260,6 +5327,12 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeStateUpdatesTopKAndHistogram)
 
     DeviceMoELayerRuntime host_runtime = makeAllLocalRuntime(num_experts, top_k);
 
+    /* Participant-assigned decode requires one durable destination per route. */
+    HipAllocation route_participants(sizeof(int32_t) * top_k);
+    host_runtime.route_participant_ids =
+        static_cast<int32_t *>(route_participants.get());
+    host_runtime.prefill_route_capacity = static_cast<uint32_t>(top_k);
+
     DeviceMoELayerRuntime *device_runtime = nullptr;
     ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)), hipSuccess);
     ASSERT_EQ(hipMemcpy(device_runtime, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
@@ -5289,8 +5362,24 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeStateUpdatesTopKAndHistogram)
         RoutedExpertRowExecutionPolicy::ParticipantAssigned));
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 
-    DeviceMoELayerRuntime after{};
-    ASSERT_EQ(hipMemcpy(&after, device_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyDeviceToHost), hipSuccess);
+    DeviceMoELayerRuntime after_enabled{};
+    ASSERT_EQ(hipMemcpy(&after_enabled, device_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyDeviceToHost), hipSuccess);
+
+    /* Reset only test-owned runtime data, then prove Static collection-off
+     * preserves the same route while leaving both histogram families empty. */
+    ASSERT_EQ(hipMemcpy(device_runtime, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
+        device_runtime,
+        hidden.get(), gate_weights.get(),
+        d_model, num_experts, top_k,
+        true,
+        output_indices.get(), output_weights.get(),
+        true, /*update_runtime_histogram=*/false, nullptr,
+        RoutedExpertRowExecutionPolicy::ParticipantAssigned));
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    DeviceMoELayerRuntime after_disabled{};
+    ASSERT_EQ(hipMemcpy(&after_disabled, device_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyDeviceToHost), hipSuccess);
     ASSERT_EQ(hipFree(device_runtime), hipSuccess);
 
     ASSERT_TRUE(output_indices->ensureOnHost(rocmMoETestStream()));
@@ -5300,25 +5389,31 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeStateUpdatesTopKAndHistogram)
 
     uint64_t histogram_sum = 0;
     for (int expert = 0; expert < num_experts; ++expert)
-        histogram_sum += after.decode_histogram[expert];
+    {
+        histogram_sum += after_enabled.decode_histogram[expert];
+        EXPECT_EQ(after_disabled.decode_histogram[expert], 0u);
+        EXPECT_EQ(after_disabled.decode_local_histogram[expert], 0u);
+    }
     EXPECT_EQ(histogram_sum, static_cast<uint64_t>(top_k));
 
     for (int k = 0; k < top_k; ++k)
     {
-        const int expert_id = after.topk_expert_ids[k];
+        const int expert_id = after_enabled.topk_expert_ids[k];
         EXPECT_GE(expert_id, 0);
         EXPECT_LT(expert_id, num_experts);
         EXPECT_FLOAT_EQ(legacy_indices[k], static_cast<float>(expert_id));
-        EXPECT_NEAR(legacy_weights[k], after.topk_weights[k], 1e-6f);
-        EXPECT_GT(after.topk_weights[k], 0.0f);
+        EXPECT_NEAR(legacy_weights[k], after_enabled.topk_weights[k], 1e-6f);
+        EXPECT_GT(after_enabled.topk_weights[k], 0.0f);
+        EXPECT_EQ(after_disabled.topk_expert_ids[k], expert_id);
+        EXPECT_FLOAT_EQ(after_disabled.topk_weights[k], after_enabled.topk_weights[k]);
         ASSERT_GE(expert_id, 0);
         ASSERT_LT(expert_id, num_experts);
-        EXPECT_GE(after.decode_histogram[expert_id], 1u);
+        EXPECT_GE(after_enabled.decode_histogram[expert_id], 1u);
     }
 
     float weight_sum = 0.0f;
     for (int k = 0; k < top_k; ++k)
-        weight_sum += after.topk_weights[k];
+        weight_sum += after_disabled.topk_weights[k];
     EXPECT_NEAR(weight_sum, 1.0f, 1e-4f);
 }
 
@@ -14113,6 +14208,163 @@ TEST(Test__ROCmMoEKernel, DeviceRebalancePackHistogramsFeedsController)
 }
 
 /**
+ * @brief Prove retained controller snapshots are phase-pure window deltas.
+ *
+ * Inference owns monotonically increasing counters and never waits for the
+ * maintenance stream. Separate device-resident baselines must isolate prefill
+ * from decode/verifier traffic and advance only after the selected snapshot.
+ */
+TEST(Test__ROCmMoEKernel,
+     DeviceRebalancePackHistogramsPreservesPhaseWindowDeltas)
+{
+    SKIP_IF_NO_ROCM();
+
+    const DeviceId device = DeviceId::rocm(0);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    DeviceMoERuntimeTable::Config table_config;
+    table_config.device_id = device;
+    table_config.num_layers = 1;
+    table_config.num_experts = 4;
+    table_config.top_k = 2;
+    table_config.mirror_to_device = true;
+    MoERuntimeTable runtime_table(table_config);
+    auto update = makeParticipantOneBaseUpdate(1);
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(0, update));
+    ASSERT_TRUE(runtime_table.flipActiveBank(0, update.epoch, stream));
+
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 1;
+    config.participant_count = 3;
+    config.window_size_tokens = 1;
+
+    constexpr std::size_t kEntries = 4u;
+    HipAllocation packed_storage(kEntries * sizeof(std::uint64_t));
+    HipAllocation prefill_baseline_storage(
+        kEntries * sizeof(std::uint64_t));
+    HipAllocation decode_baseline_storage(
+        kEntries * sizeof(std::uint64_t));
+    auto *const packed = static_cast<std::uint64_t *>(packed_storage.get());
+    auto *const prefill_baseline = static_cast<std::uint64_t *>(
+        prefill_baseline_storage.get());
+    auto *const decode_baseline = static_cast<std::uint64_t *>(
+        decode_baseline_storage.get());
+    ASSERT_EQ(
+        hipMemsetAsync(
+            prefill_baseline, 0, kEntries * sizeof(std::uint64_t), stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemsetAsync(
+            decode_baseline, 0, kEntries * sizeof(std::uint64_t), stream),
+        hipSuccess);
+
+    const auto publish_local_counts = [&](const std::array<std::uint64_t, 4> &decode,
+                                          const std::array<std::uint64_t, 4> &prefill,
+                                          const std::array<std::uint64_t, 4> &verifier)
+    {
+        auto *const runtime = runtime_table.deviceLayerState(0);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                runtime->decode_local_histogram,
+                decode.data(),
+                sizeof(decode),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                runtime->prefill_local_histogram,
+                prefill.data(),
+                sizeof(prefill),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                runtime->grouped_verifier_local_histogram,
+                verifier.data(),
+                sizeof(verifier),
+                hipMemcpyHostToDevice,
+                stream),
+            hipSuccess);
+    };
+    ROCmMoEKernel gpu_kernel(0);
+    static_cast<IMoEKernel &>(gpu_kernel).setGPUStream(stream);
+    const auto snapshot = [&](std::uint32_t source_mask,
+                              std::uint64_t *baseline)
+    {
+        EXPECT_TRUE(gpu_kernel.packDeviceRebalanceHistograms(
+            moeLaunchContext(stream),
+            runtime_table.deviceLayerState(0),
+            packed,
+            config,
+            /*wave_state=*/nullptr,
+            /*controller_state=*/nullptr,
+            /*command_buffer_count=*/1u,
+            source_mask,
+            baseline));
+        std::array<std::uint64_t, kEntries> host{};
+        EXPECT_EQ(
+            hipMemcpyAsync(
+                host.data(),
+                packed,
+                sizeof(host),
+                hipMemcpyDeviceToHost,
+                stream),
+            hipSuccess);
+        EXPECT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        for (auto &word : host)
+        {
+            word = moe_rebalance_policy::collectedStateActivationCount(word);
+        }
+        return host;
+    };
+
+    const std::uint32_t prefill_mask =
+        moe_runtime_abi::histogramSourceBit(
+            moe_runtime_abi::HistogramSource::Prefill);
+    const std::uint32_t decode_mask =
+        moe_runtime_abi::histogramSourceBit(
+            moe_runtime_abi::HistogramSource::Decode) |
+        moe_runtime_abi::histogramSourceBit(
+            moe_runtime_abi::HistogramSource::GroupedVerifier);
+
+    publish_local_counts(
+        {5u, 6u, 7u, 8u},
+        {10u, 20u, 30u, 40u},
+        {1u, 2u, 3u, 4u});
+    EXPECT_EQ(
+        snapshot(prefill_mask, prefill_baseline),
+        (std::array<std::uint64_t, 4>{10u, 20u, 30u, 40u}));
+
+    publish_local_counts(
+        {105u, 206u, 307u, 408u},
+        {13u, 24u, 35u, 46u},
+        {11u, 12u, 13u, 14u});
+    EXPECT_EQ(
+        snapshot(prefill_mask, prefill_baseline),
+        (std::array<std::uint64_t, 4>{3u, 4u, 5u, 6u}));
+    EXPECT_EQ(
+        snapshot(decode_mask, decode_baseline),
+        (std::array<std::uint64_t, 4>{116u, 218u, 320u, 422u}));
+
+    publish_local_counts(
+        {107u, 209u, 311u, 413u},
+        {999u, 999u, 999u, 999u},
+        {12u, 14u, 16u, 18u});
+    EXPECT_EQ(
+        snapshot(decode_mask, decode_baseline),
+        (std::array<std::uint64_t, 4>{3u, 5u, 7u, 9u}));
+
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+/**
  * @brief Prove device claim audit accepts a promoted staging-origin slot.
  *
  * An authoritative LLEP owner can receive zero rows while its transfer-backed
@@ -16462,7 +16714,11 @@ TEST(
 
         if (capture)
         {
-            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            /* Reproduce DeviceGraphExecutor's external-input admission. */
+            ASSERT_NO_THROW(TransferEngine::requireDeviceInput(
+                publisher_shared.get(), device, stream));
+            ASSERT_NO_THROW(TransferEngine::requireDeviceInput(
+                publisher_payload.get(), device, stream));
             ScopedHipTestGraph graph(
                 /*device_ordinal=*/0,
                 stream,
@@ -16532,7 +16788,22 @@ TEST(
 
         if (capture)
         {
-            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            /*
+             * Join setup-time producers before native capture. The finalizer
+             * then captures only the inference DAG and its internal
+             * publication edges, exactly as DeviceGraphExecutor does.
+             */
+            for (ITensor *tensor : {
+                     grouped_input.get(),
+                     gate.get(),
+                     grouped_publication.get(),
+                     grouped_routed.get(),
+                     grouped_shared.get(),
+                     grouped_combined.get()})
+            {
+                ASSERT_NO_THROW(TransferEngine::requireDeviceInput(
+                    tensor, device, stream));
+            }
             ScopedHipTestGraph graph(
                 /*device_ordinal=*/0,
                 stream,
@@ -22420,6 +22691,7 @@ TEST(Test__ROCmMoEKernel, VerifierRowsRouteMatchesSerialDecodeRouter)
     config.num_experts = num_experts;
     config.top_k = top_k;
     config.mirror_to_device = true;
+    config.prefill_token_capacity = 1;
     MoERuntimeTable runtime_table(config);
 
     MoEPlacementUpdate update;
@@ -25016,19 +25288,6 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         }
         ASSERT_TRUE(router_gate->ensureOnDevice(device, stream));
 
-        DeviceMoELayerRuntime host_runtime = makeAllLocalRuntime(num_experts, top_k);
-        populateRuntimeDescriptors(host_runtime, &gate_descs, &up_descs, &down_descs);
-        DeviceMoELayerRuntime *device_runtime = nullptr;
-        ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime),
-                            sizeof(DeviceMoELayerRuntime)),
-                  hipSuccess);
-        ASSERT_EQ(hipMemcpyAsync(device_runtime,
-                                 &host_runtime,
-                                 sizeof(DeviceMoELayerRuntime),
-                                 hipMemcpyHostToDevice,
-                                 stream),
-                  hipSuccess);
-
         DeviceMoERuntimeTable::Config runtime_config;
         runtime_config.device_id = device;
         runtime_config.num_layers = 1;
@@ -25037,15 +25296,49 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         runtime_config.mirror_to_device = true;
         runtime_config.prefill_token_capacity = max_row_count;
         DeviceMoERuntimeTable runtime_table(runtime_config);
-        auto &runtime_host_state = runtime_table.hostLayerState(0);
-        populateRuntimeDescriptors(
-            runtime_host_state, &gate_descs, &up_descs, &down_descs);
-        ASSERT_EQ(hipMemcpyAsync(runtime_table.deviceLayerState(0),
-                                 &runtime_host_state,
-                                 sizeof(runtime_host_state),
-                                 hipMemcpyHostToDevice,
-                                 stream),
-                  hipSuccess);
+        MoEPlacementUpdate runtime_update;
+        runtime_update.epoch = 1;
+        runtime_update.expert_count = num_experts;
+        runtime_update.participant_id = 0;
+        runtime_update.participant_count = masked_local_tp ? 2 : 1;
+        runtime_update.experts.resize(num_experts);
+        runtime_update.local_compute_mask.assign(num_experts, 0u);
+        runtime_update.replica_role.assign(
+            num_experts,
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+        runtime_update.resident_participant_mask.assign(num_experts, 0u);
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const bool local =
+                !masked_local_tp || expert < num_experts / 2;
+            const int owner = local ? 0 : 1;
+            auto &descriptor =
+                runtime_update.experts[static_cast<size_t>(expert)];
+            descriptor.gate = gate_descs[static_cast<size_t>(expert)];
+            descriptor.up = up_descs[static_cast<size_t>(expert)];
+            descriptor.down = down_descs[static_cast<size_t>(expert)];
+            descriptor.logical_expert_id = expert;
+            descriptor.owner_participant = owner;
+            descriptor.local_slot = local ? expert : -1;
+            runtime_update.resident_participant_mask[
+                static_cast<size_t>(expert)] = 1u << owner;
+            if (local)
+            {
+                runtime_update.local_compute_mask[
+                    static_cast<size_t>(expert)] = 1u;
+                runtime_update.replica_role[static_cast<size_t>(expert)] =
+                    static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
+                descriptor.flags = toMoEExpertFlags(
+                    DeviceMoEExpertFlags::Valid |
+                    DeviceMoEExpertFlags::Resident |
+                    DeviceMoEExpertFlags::LocalCompute |
+                    DeviceMoEExpertFlags::PreferredOwner);
+            }
+        }
+        ASSERT_TRUE(runtime_table.prepareInactiveBank(0, runtime_update));
+        ASSERT_TRUE(runtime_table.flipActiveBank(
+            0, runtime_update.epoch, stream));
+        const auto &runtime_host_state = runtime_table.hostLayerState(0);
 
         PerfStatsCollector::reset();
         for (const int seq_len : row_inventory)
@@ -25210,8 +25503,17 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                             row_hidden->mutable_data());
                 ASSERT_TRUE(row_hidden->ensureOnDevice(device, stream));
 
+                /*
+                 * Production serial decode consumes the same typed runtime-table
+                 * authority as grouped verifier execution. A byte copy of only
+                 * DeviceMoELayerRuntime's value fields is not a valid runtime:
+                 * the structure also names immutable-address route ledgers
+                 * installed by DeviceMoERuntimeTable. Reusing the managed table
+                 * keeps those ledgers live and lets the two paths differ only in
+                 * row grouping, which is the intended arithmetic witness.
+                 */
                 ASSERT_TRUE(moe_kernel.decodeRouteSelect(
-                    device_runtime,
+                    runtime_table.deviceLayerState(0),
                     row_hidden.get(),
                     router_gate.get(),
                     d_model,
@@ -25242,7 +25544,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                     ASSERT_TRUE(row_indices->ensureOnDevice(device, stream));
                     ASSERT_TRUE(row_weights->ensureOnDevice(device, stream));
                     ASSERT_TRUE(moe_kernel.decodeRouteSelect(
-                        device_runtime,
+                        runtime_table.deviceLayerState(0),
                         row_hidden.get(),
                         router_gate.get(),
                         d_model,
@@ -25294,7 +25596,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 else
                 {
                     ASSERT_TRUE(moe_kernel.groupedExpertDecodeFromRuntime(
-                        device_runtime,
+                        runtime_table.deviceLayerState(0),
                         row_hidden.get(),
                         gateup_table,
                         down_table,
@@ -25503,7 +25805,6 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             }
         }
 
-        EXPECT_EQ(hipFree(device_runtime), hipSuccess);
         PerfStatsCollector::reset();
     }
 
@@ -25717,10 +26018,13 @@ TEST(Test__ROCmMoEKernel, ReplicatedMTPRoutedExpertROCm2AllNativeFormatsAreByteI
         runtime_config0.num_experts = num_experts;
         runtime_config0.top_k = top_k;
         runtime_config0.mirror_to_device = true;
+        runtime_config0.prefill_token_capacity = seq_len;
         DeviceMoERuntimeTable runtime0(runtime_config0);
         auto runtime_config1 = runtime_config0;
         runtime_config1.device_id = devices[1];
         DeviceMoERuntimeTable runtime1(runtime_config1);
+        ASSERT_TRUE(runtime0.hasPrefillRouteScratchCapacity(0, seq_len));
+        ASSERT_TRUE(runtime1.hasPrefillRouteScratchCapacity(0, seq_len));
 
         std::vector<int> owner_participants(static_cast<size_t>(num_experts));
         for (int expert = 0; expert < num_experts; ++expert)
@@ -26238,10 +26542,24 @@ TEST(Test__ROCmMoEKernel, RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ4XSDown_Ru
         down_descs.data(), num_experts, d_model, intermediate);
     ASSERT_GE(down_table, 0);
 
-    DeviceMoELayerRuntime host_runtime = makeAllLocalRuntime(num_experts, top_k);
-    populateRuntimeDescriptors(host_runtime, &gate_descs, &up_descs, &down_descs);
+    /*
+     * This fixture supplies captured route IDs directly to the M=1 arithmetic
+     * oracle; it does not execute the production router publisher. The raw
+     * runtime value is therefore intentionally limited to the test-only
+     * descriptor/top-k consumer boundary. Router-driven fixtures below use a
+     * managed DeviceMoERuntimeTable because publication also requires its
+     * immutable route-assignment ledger.
+     */
+    DeviceMoELayerRuntime host_runtime =
+        makeAllLocalRuntime(num_experts, top_k);
+    populateRuntimeDescriptors(
+        host_runtime, &gate_descs, &up_descs, &down_descs);
     DeviceMoELayerRuntime *device_runtime = nullptr;
-    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)), hipSuccess);
+    ASSERT_EQ(
+        hipMalloc(
+            reinterpret_cast<void **>(&device_runtime),
+            sizeof(DeviceMoELayerRuntime)),
+        hipSuccess);
 
     DeviceMoERuntimeTable::Config runtime_config;
     runtime_config.device_id = device;
@@ -26570,17 +26888,18 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
             87, 165, 88, 229, 48, 242, 185, 58};
         captured_layer27_weight_bits = {
             /*
-             * Row zero was refreshed after router-hidden Q8 publication adopted
-             * the reciprocal-multiply arithmetic used by ordinary NativeVNNI
-             * M=1 activation quantization.  Rows one and two did not cross a
-             * rounding boundary and retain their original captured bytes.
+             * These bytes follow the canonical rounded Q8 scale multiplier
+             * shared by serial NativeVNNI and grouped router publication. The
+             * change from independently formed division scales moves a handful
+             * of row-zero and row-two probabilities by one to four FP32 ULPs;
+             * retaining the exact bytes keeps future router drift visible.
              */
-            0x3e3d5903u, 0x3e29bed3u, 0x3df7b505u, 0x3df7143du,
-            0x3ddafa51u, 0x3dd6786bu, 0x3dcfff59u, 0x3dc194f9u,
+            0x3e3d5905u, 0x3e29bed4u, 0x3df7b506u, 0x3df7143fu,
+            0x3ddafa53u, 0x3dd6786cu, 0x3dcfff5au, 0x3dc194fbu,
             0x3e48b871u, 0x3e33dc01u, 0x3e0f49bfu, 0x3ddea924u,
             0x3dd70439u, 0x3dc90252u, 0x3db5544au, 0x3db43fa8u,
-            0x3e4cdf6au, 0x3e34c6d5u, 0x3e17d0a1u, 0x3dded8d6u,
-            0x3dce15f2u, 0x3dcbf61cu, 0x3db203f8u, 0x3da22962u};
+            0x3e4cdf6du, 0x3e34c6d5u, 0x3e17d0a1u, 0x3dded8d6u,
+            0x3dce15f3u, 0x3dcbf61du, 0x3db203fcu, 0x3da22962u};
     }
     else if (layer_index != 3)
     {
@@ -26810,11 +27129,6 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
         down_descs.data(), num_experts, d_model, intermediate);
     ASSERT_GE(down_table, 0);
 
-    DeviceMoELayerRuntime host_runtime = makeAllLocalRuntime(num_experts, top_k);
-    populateRuntimeDescriptors(host_runtime, &gate_descs, &up_descs, &down_descs);
-    DeviceMoELayerRuntime *device_runtime = nullptr;
-    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)), hipSuccess);
-
     DeviceMoERuntimeTable::Config runtime_config;
     runtime_config.device_id = device;
     runtime_config.num_layers = 1;
@@ -26823,20 +27137,42 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
     runtime_config.mirror_to_device = true;
     runtime_config.prefill_token_capacity = seq_len;
     DeviceMoERuntimeTable prefill_runtime_table(runtime_config);
-    auto &runtime_prefill_state = prefill_runtime_table.hostLayerState(0);
-    populateRuntimeDescriptors(
-        runtime_prefill_state,
-        &gate_descs,
-        &up_descs,
-        &down_descs);
-    ASSERT_EQ(
-        hipMemcpyAsync(
-            prefill_runtime_table.deviceLayerState(0),
-            &runtime_prefill_state,
-            sizeof(runtime_prefill_state),
-            hipMemcpyHostToDevice,
-            stream),
-        hipSuccess);
+    MoEPlacementUpdate runtime_update;
+    runtime_update.epoch = 1;
+    runtime_update.expert_count = num_experts;
+    runtime_update.participant_id = 0;
+    runtime_update.participant_count = 1;
+    runtime_update.experts.resize(num_experts);
+    runtime_update.local_compute_mask.assign(num_experts, 0u);
+    runtime_update.replica_role.assign(
+        num_experts,
+        static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+    runtime_update.resident_participant_mask.assign(num_experts, 0u);
+    for (const int expert : used_experts)
+    {
+        const size_t slot = static_cast<size_t>(expert);
+        auto &descriptor = runtime_update.experts[slot];
+        descriptor.gate = gate_descs[slot];
+        descriptor.up = up_descs[slot];
+        descriptor.down = down_descs[slot];
+        descriptor.logical_expert_id = expert;
+        descriptor.owner_participant = 0;
+        descriptor.local_slot = expert;
+        descriptor.flags = toMoEExpertFlags(
+            DeviceMoEExpertFlags::Valid |
+            DeviceMoEExpertFlags::Resident |
+            DeviceMoEExpertFlags::LocalCompute |
+            DeviceMoEExpertFlags::PreferredOwner);
+        runtime_update.local_compute_mask[slot] = 1u;
+        runtime_update.replica_role[slot] =
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
+        runtime_update.resident_participant_mask[slot] = 1u;
+    }
+    ASSERT_TRUE(prefill_runtime_table.prepareInactiveBank(0, runtime_update));
+    ASSERT_TRUE(prefill_runtime_table.flipActiveBank(
+        0, runtime_update.epoch, stream));
+    const auto &runtime_prefill_state =
+        prefill_runtime_table.hostLayerState(0);
 
     auto publish_grouped_router_q8 = [&]() -> bool
     {
@@ -26906,9 +27242,6 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
          * failure identifies either routing or the Q8 reuse handoff, rather
          * than presenting as an opaque downstream MoE mismatch.
          */
-        ASSERT_EQ(hipMemcpyAsync(device_runtime, &host_runtime, sizeof(host_runtime),
-                                 hipMemcpyHostToDevice, stream),
-                  hipSuccess);
         auto production_route_indices = TestTensorFactory::createFP32(
             {static_cast<size_t>(top_k)});
         auto production_route_weights = TestTensorFactory::createFP32(
@@ -26916,7 +27249,7 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
         ASSERT_TRUE(production_route_indices->ensureOnDevice(device, stream));
         ASSERT_TRUE(production_route_weights->ensureOnDevice(device, stream));
         ASSERT_TRUE(moe_kernel.decodeRouteSelect(
-            device_runtime,
+            prefill_runtime_table.deviceLayerState(0),
             row_hidden.get(),
             router_weight.get(),
             d_model,
@@ -26937,7 +27270,7 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
             router_reuse_row_output.get(),
             static_cast<size_t>(d_model) * sizeof(float));
         ASSERT_TRUE(moe_kernel.groupedExpertDecodeFromRuntime(
-            device_runtime,
+            prefill_runtime_table.deviceLayerState(0),
             row_hidden.get(),
             gateup_table,
             down_table,
@@ -27093,7 +27426,6 @@ void runRoutedOnlyVerifierPrefillQwen36RealWeightsM3MatchesRuntimeDecode(
         captured_runtime_output->numel(),
         static_cast<size_t>(d_model));
 
-    EXPECT_EQ(hipFree(device_runtime), hipSuccess);
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 

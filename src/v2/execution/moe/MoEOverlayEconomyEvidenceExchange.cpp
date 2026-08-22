@@ -41,6 +41,89 @@ namespace llaminar2
         }
     } // namespace
 
+    bool MoEOverlayMigrationProfileEvidence::valid() const noexcept
+    {
+        if (profile_sequence == 0 || !coordinate.valid() ||
+            coordinate.source_participant >=
+                coordinate.destination_participant ||
+            local_measurements.size() != 2)
+        {
+            return false;
+        }
+        const auto &forward = local_measurements[0];
+        const auto &reverse = local_measurements[1];
+        return forward.valid() && reverse.valid() &&
+               forward.source_participant ==
+                   coordinate.source_participant &&
+               forward.destination_participant ==
+                   coordinate.destination_participant &&
+               reverse.source_participant ==
+                   coordinate.destination_participant &&
+               reverse.destination_participant ==
+                   coordinate.source_participant &&
+               forward.layer == coordinate.layer &&
+               reverse.layer == coordinate.layer;
+    }
+
+    bool MoEOverlayMigrationProfileResult::valid() const noexcept
+    {
+        if (measurements.size() != 2)
+            return false;
+        return measurements[0].valid() && measurements[1].valid() &&
+               measurements[0].source_participant ==
+                   measurements[1].destination_participant &&
+               measurements[0].destination_participant ==
+                   measurements[1].source_participant &&
+               measurements[0].layer == measurements[1].layer;
+    }
+
+    MoEOverlayMigrationProfileResult
+    MoEOverlayEconomyEvidenceMerger::mergeMigrationProfile(
+        const std::vector<MoEOverlayMigrationProfileEvidence> &ranks)
+    {
+        if (ranks.empty() || !ranks.front().valid())
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay migration-profile merge requires valid rank evidence");
+        }
+        std::vector<std::vector<MoEOverlayCompletedMigrationMeasurement>>
+            local_rows;
+        local_rows.reserve(ranks.size());
+        for (const auto &rank : ranks)
+        {
+            if (!rank.valid() ||
+                rank.profile_sequence != ranks.front().profile_sequence ||
+                rank.coordinate != ranks.front().coordinate)
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay migration-profile ranks disagree on identity");
+            }
+            local_rows.push_back(rank.local_measurements);
+        }
+        MoEOverlayMigrationProfileResult result{
+            .measurements =
+                MoEOverlayMigrationMeasurementMerger::merge(local_rows),
+        };
+        if (!result.valid())
+        {
+            throw std::logic_error(
+                "ExpertOverlay migration-profile merge produced incomplete rows");
+        }
+        return result;
+    }
+
+    bool MoEOverlayCalibrationReadiness::valid() const noexcept
+    {
+        return kind ==
+                   MoEOverlayCalibrationReadinessKind::BaselineDeviceComplete &&
+               calibration_sequence != 0 && coordinate.valid() &&
+               coordinate.source_participant <
+                   coordinate.destination_participant &&
+               static_cast<std::size_t>(source) <
+                   kExpertHistogramProductionSourceCount &&
+               workload.valid() && workload.source == source;
+    }
+
     bool MoEOverlayCalibrationAttemptEvidence::valid() const noexcept
     {
         if (calibration_sequence == 0 || !coordinate.valid() ||

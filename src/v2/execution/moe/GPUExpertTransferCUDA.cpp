@@ -64,6 +64,49 @@ namespace llaminar2::detail
         return ordinal >= 0 && cudaSetDevice(ordinal) == cudaSuccess;
     }
 
+    bool prepareDirectPeerAccessCUDABackend(
+        const DeviceId &source,
+        const DeviceId &destination) noexcept
+    {
+        if (!source.is_cuda() || !destination.is_cuda() ||
+            source == destination)
+        {
+            return source == destination && source.is_cuda();
+        }
+
+        int original_device = -1;
+        if (cudaGetDevice(&original_device) != cudaSuccess)
+            return false;
+
+        const int source_ordinal = source.cuda_ordinal();
+        const int destination_ordinal = destination.cuda_ordinal();
+        bool prepared = false;
+        if (cudaSetDevice(destination_ordinal) == cudaSuccess)
+        {
+            int can_access = 0;
+            const cudaError_t query = cudaDeviceCanAccessPeer(
+                &can_access,
+                destination_ordinal,
+                source_ordinal);
+            if (query == cudaSuccess && can_access != 0)
+            {
+                const cudaError_t enable =
+                    cudaDeviceEnablePeerAccess(source_ordinal, 0);
+                prepared = enable == cudaSuccess ||
+                           enable == cudaErrorPeerAccessAlreadyEnabled;
+            }
+        }
+
+        if (cudaSetDevice(original_device) != cudaSuccess)
+        {
+            LOG_ERROR("[GPUExpertTransfer] Could not restore CUDA device "
+                      << original_device
+                      << " after direct-peer setup");
+            return false;
+        }
+        return prepared;
+    }
+
     bool transferExpertCUDABackend(
         const GPUExpertPointers &src_ptrs,
         const GPUExpertPointers &dst_ptrs,

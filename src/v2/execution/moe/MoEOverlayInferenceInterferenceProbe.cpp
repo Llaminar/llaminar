@@ -6,6 +6,8 @@
 #include "MoEOverlayInferenceInterferenceProbe.h"
 
 #include <chrono>
+#include <cstdio>
+#include <exception>
 #include <limits>
 
 namespace llaminar2
@@ -18,7 +20,65 @@ namespace llaminar2
             return static_cast<std::size_t>(source) <
                    kExpertHistogramProductionSourceCount;
         }
+
+        /** @brief Mix one fixed-width scalar in byte-stable FNV-1a order. */
+        std::uint64_t mixWorkloadScalar(
+            std::uint64_t hash,
+            std::uint64_t value) noexcept
+        {
+            constexpr std::uint64_t kPrime = 1099511628211ull;
+            for (std::size_t byte = 0; byte < sizeof(value); ++byte)
+            {
+                hash ^= value & 0xffu;
+                hash *= kPrime;
+                value >>= 8u;
+            }
+            return hash;
+        }
     } // namespace
+
+    MoEOverlayInferenceWorkloadIdentity
+    makeMoEOverlayInferenceWorkloadIdentity(
+        ExpertHistogramSource source,
+        int real_rows,
+        int execution_rows,
+        int transaction_count,
+        int speculative_depth,
+        std::uint64_t schedule_fingerprint) noexcept
+    {
+        if (!isProductionPhase(source) || real_rows <= 0 ||
+            execution_rows < real_rows || transaction_count <= 0 ||
+            speculative_depth < 0 ||
+            (source == ExpertHistogramSource::GroupedVerifier
+                 ? speculative_depth <= 0
+                 : speculative_depth != 0))
+        {
+            return {};
+        }
+
+        std::uint64_t fingerprint = schedule_fingerprint;
+        if (fingerprint == 0)
+        {
+            fingerprint = 14695981039346656037ull;
+            for (const std::uint64_t value : {
+                     static_cast<std::uint64_t>(source),
+                     static_cast<std::uint64_t>(real_rows),
+                     static_cast<std::uint64_t>(execution_rows),
+                     static_cast<std::uint64_t>(transaction_count),
+                     static_cast<std::uint64_t>(speculative_depth)})
+            {
+                fingerprint = mixWorkloadScalar(fingerprint, value);
+            }
+        }
+        return {
+            .source = source,
+            .real_rows = real_rows,
+            .execution_rows = execution_rows,
+            .transaction_count = transaction_count,
+            .speculative_depth = speculative_depth,
+            .schedule_fingerprint = fingerprint,
+        };
+    }
 
     bool MoEOverlayInferenceWorkloadIdentity::valid() const noexcept
     {
@@ -244,9 +304,27 @@ namespace llaminar2
     bool MoEOverlayInferenceInterferenceProbe::finishSample(
         const MoEOverlayInterferenceProbeTicket &ticket) noexcept
     {
+        if (deferred_completion_generation_.load(
+                std::memory_order_acquire) != 0)
+        {
+            rejected_operations_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        std::uint64_t end = steadyNanoseconds();
+        if (end <= ticket.begin_steady_nanoseconds)
+            end = ticket.begin_steady_nanoseconds + 1u;
+        return completeSample(ticket, end);
+    }
+
+    bool MoEOverlayInferenceInterferenceProbe::completeSample(
+        const MoEOverlayInterferenceProbeTicket &ticket,
+        std::uint64_t end_steady_nanoseconds) noexcept
+    {
         if (!ticket.valid() || request_.source != ticket.source ||
             request_.mode != ticket.mode ||
             request_.calibration_sequence != ticket.calibration_sequence ||
+            end_steady_nanoseconds <= ticket.begin_steady_nanoseconds ||
             state_word_.load(std::memory_order_acquire) !=
                 stateWord(
                     runningState(ticket.mode),
@@ -257,14 +335,11 @@ namespace llaminar2
             return false;
         }
 
-        std::uint64_t end = steadyNanoseconds();
-        if (end <= ticket.begin_steady_nanoseconds)
-            end = ticket.begin_steady_nanoseconds + 1u;
         completed_sample_ = {
             .request = request_,
             .workload = ticket.workload,
             .begin_steady_nanoseconds = ticket.begin_steady_nanoseconds,
-            .end_steady_nanoseconds = end,
+            .end_steady_nanoseconds = end_steady_nanoseconds,
         };
         /* Publish the complete result after every plain field is initialized. */
         state_word_.store(
@@ -277,12 +352,110 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEOverlayInferenceInterferenceProbe::deferSampleCompletion(
+        const MoEOverlayInterferenceProbeTicket &ticket,
+        std::shared_ptr<IMoEOverlayInferenceCompletionFence> fence,
+        std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+        const std::uint64_t expected_state = stateWord(
+            runningState(ticket.mode),
+            ticket.source,
+            ticket.probe_generation);
+        if (!ticket.valid() || !fence ||
+            request_.source != ticket.source ||
+            request_.mode != ticket.mode ||
+            request_.calibration_sequence != ticket.calibration_sequence ||
+            state_word_.load(std::memory_order_acquire) != expected_state ||
+            deferred_completion_generation_.load(
+                std::memory_order_acquire) != 0)
+        {
+            if (error)
+                *error =
+                    "ExpertOverlay device completion does not own the exact running sample";
+            rejected_operations_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        /*
+         * Every participant event is already recorded before these plain
+         * fields become visible. The maintenance producer's acquire load
+         * therefore cannot query an uninitialized fence or a prior sample.
+         */
+        deferred_completion_ticket_ = ticket;
+        deferred_completion_fence_ = std::move(fence);
+        deferred_completion_generation_.store(
+            ticket.probe_generation,
+            std::memory_order_release);
+        return true;
+    }
+
+    void MoEOverlayInferenceInterferenceProbe::pollDeferredCompletion()
+        noexcept
+    {
+        const std::uint64_t generation =
+            deferred_completion_generation_.load(std::memory_order_acquire);
+        if (generation == 0)
+            return;
+
+        const auto &ticket = deferred_completion_ticket_;
+        const auto &fence = deferred_completion_fence_;
+        if (!fence || !ticket.valid() ||
+            ticket.probe_generation != generation ||
+            state_word_.load(std::memory_order_acquire) !=
+                stateWord(
+                    runningState(ticket.mode),
+                    ticket.source,
+                    ticket.probe_generation))
+        {
+            std::fputs(
+                "ExpertOverlay calibration lost its deferred device-completion ownership\n",
+                stderr);
+            std::terminate();
+        }
+
+        std::string error;
+        const auto progress = fence->poll(&error);
+        if (progress ==
+            MoEOverlayInferenceCompletionFenceProgress::Pending)
+        {
+            return;
+        }
+        if (progress ==
+            MoEOverlayInferenceCompletionFenceProgress::Failed)
+        {
+            std::fprintf(
+                stderr,
+                "ExpertOverlay calibration device-completion query failed: %s\n",
+                error.empty() ? "backend event query failed" : error.c_str());
+            std::terminate();
+        }
+
+        std::uint64_t end = steadyNanoseconds();
+        if (end <= ticket.begin_steady_nanoseconds)
+            end = ticket.begin_steady_nanoseconds + 1u;
+        if (!completeSample(ticket, end))
+        {
+            std::fputs(
+                "ExpertOverlay calibration could not publish its device-complete sample\n",
+                stderr);
+            std::terminate();
+        }
+
+        deferred_completion_generation_.store(0, std::memory_order_release);
+        deferred_completion_fence_.reset();
+        deferred_completion_ticket_ = {};
+    }
+
     bool MoEOverlayInferenceInterferenceProbe::discardSample(
         const MoEOverlayInterferenceProbeTicket &ticket) noexcept
     {
         if (!ticket.valid() || request_.source != ticket.source ||
             request_.mode != ticket.mode ||
-            request_.calibration_sequence != ticket.calibration_sequence)
+            request_.calibration_sequence != ticket.calibration_sequence ||
+            deferred_completion_generation_.load(
+                std::memory_order_acquire) != 0)
         {
             rejected_operations_.fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -315,6 +488,7 @@ namespace llaminar2
             rejected_operations_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
+        pollDeferredCompletion();
         const std::uint64_t observed =
             state_word_.load(std::memory_order_acquire);
         const State observed_state = stateFromWord(observed);
@@ -369,6 +543,7 @@ namespace llaminar2
 
     bool MoEOverlayInferenceInterferenceProbe::discardAvailable() noexcept
     {
+        pollDeferredCompletion();
         std::uint64_t observed =
             state_word_.load(std::memory_order_acquire);
         for (;;)
@@ -420,10 +595,12 @@ namespace llaminar2
 
     MoEOverlayInterferenceProbeProgress
     MoEOverlayInferenceInterferenceProbe::progress(
-        const MoEOverlayInterferenceProbeRequest &request) const noexcept
+        const MoEOverlayInterferenceProbeRequest &request) noexcept
     {
         if (!request.valid())
             return MoEOverlayInterferenceProbeProgress::Missing;
+
+        pollDeferredCompletion();
 
         const std::uint64_t observed =
             state_word_.load(std::memory_order_acquire);

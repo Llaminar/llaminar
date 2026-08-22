@@ -12,6 +12,7 @@
 #include "CUDAMoEKernel.h"
 #include "CUDAMoEBatchInvariantPolicy.h"
 #include "CUDAMoEOverlayActivationPacketKernels.h"
+#include "CUDAMoEOverlayDeviceControllerKernels.h"
 #include "CUDAMoEOverlayEpochKernels.h"
 
 #include "../gemm/CUDADeviceWorkspace.h"
@@ -1225,6 +1226,8 @@ extern "C"
         const void *wave_state,
         const void *controller_state,
         uint32_t command_buffer_count,
+        uint32_t histogram_source_mask,
+        unsigned long long *previous_activation_counts,
         int device_idx,
         void *stream);
 
@@ -2172,6 +2175,148 @@ namespace llaminar2
             &consumption, device_ordinal_, stream);
     }
 
+    bool CUDAMoEKernel::beginNodeLocalDensePublication(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "beginNodeLocalDensePublication");
+        if (!stream || !publication.valid() ||
+            !publication.binding.isRoot())
+        {
+            LOG_ERROR("[CUDAMoEKernel::beginNodeLocalDensePublication] root binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayBeginNodeLocalDensePublication(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::finishNodeLocalDensePublication(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "finishNodeLocalDensePublication");
+        if (!stream || !publication.valid() ||
+            !publication.binding.isRoot())
+        {
+            LOG_ERROR("[CUDAMoEKernel::finishNodeLocalDensePublication] root binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayFinishNodeLocalDensePublication(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::beginNodeLocalDensePublicationConsume(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "beginNodeLocalDensePublicationConsume");
+        if (!stream || !publication.valid() || publication.binding.isRoot())
+        {
+            LOG_ERROR("[CUDAMoEKernel::beginNodeLocalDensePublicationConsume] peer binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayBeginNodeLocalDensePublicationConsume(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::finishNodeLocalDensePublicationConsume(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "finishNodeLocalDensePublicationConsume");
+        if (!stream || !publication.valid() || publication.binding.isRoot())
+        {
+            LOG_ERROR("[CUDAMoEKernel::finishNodeLocalDensePublicationConsume] peer binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return cudaMoEOverlayFinishNodeLocalDensePublicationConsume(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::runMoEOverlayDeviceControllerAction(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayDeviceControllerActionLaunch &action)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "runMoEOverlayDeviceControllerAction");
+        if (!stream || !action.valid())
+        {
+            LOG_ERROR("[CUDAMoEKernel::runMoEOverlayDeviceControllerAction] a valid mapped controller action and explicit CUDA stream are required");
+            return false;
+        }
+        return cudaMoEOverlayRunDeviceControllerAction(
+            &action, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::beginMoEOverlayServiceTelemetry(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayServiceTelemetrySample *sample)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "beginMoEOverlayServiceTelemetry");
+        if (!stream || !sample)
+            return false;
+        return cudaMoEOverlayBeginServiceTelemetry(
+            sample, device_ordinal_, stream);
+    }
+
+    bool CUDAMoEKernel::finishMoEOverlayServiceTelemetry(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        DeviceMoEOverlayServiceTelemetryCell *layer_telemetry,
+        DeviceMoEOverlayServiceTelemetrySample *sample,
+        std::uint32_t num_experts,
+        MoEOverlayServicePhaseHint hint,
+        const MoEOverlayInferenceGraphRole *runtime_graph_role)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "finishMoEOverlayServiceTelemetry");
+        if (!stream || !runtime_layer || !layer_telemetry || !sample ||
+            num_experts == 0u)
+        {
+            return false;
+        }
+        return cudaMoEOverlayFinishServiceTelemetry(
+            runtime_layer,
+            layer_telemetry,
+            sample,
+            num_experts,
+            static_cast<std::uint32_t>(hint),
+            runtime_graph_role,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::publishMoEOverlayServiceTelemetry(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoEOverlayServiceTelemetryCell *telemetry,
+        const DeviceMoEOverlayServiceTelemetrySample *samples,
+        std::uint32_t layer_count,
+        std::int32_t participant_id,
+        MoEOverlayDeviceServiceTelemetryPublicationHeader *publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "publishMoEOverlayServiceTelemetry");
+        if (!stream || !telemetry || !samples || !publication ||
+            layer_count == 0u ||
+            participant_id < 0)
+        {
+            return false;
+        }
+        return cudaMoEOverlayPublishServiceTelemetry(
+            telemetry,
+            samples,
+            layer_count,
+            participant_id,
+            publication,
+            device_ordinal_,
+            stream);
+    }
+
     CUDAMoEKernel::CUDAMoEKernel(int device_ordinal)
         : device_ordinal_(device_ordinal)
     {
@@ -2981,7 +3126,10 @@ namespace llaminar2
         const MoEKernelLaunchContext &launch,
         DeviceMoEOverlayEpochControl *control,
         DeviceMoEOverlayEpochTicket *ticket,
-        DeviceMoEOverlayEpochStatus *status)
+        DeviceMoEOverlayEpochStatus *status,
+        const std::uint64_t *external_admission_epoch,
+        DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier,
+        MoEOverlayPeerPlacementEpochBinding peer_placement_epoch)
     {
         void *stream = explicitMoELaunchStream(
             launch, "acquireMoEOverlayEpoch");
@@ -2991,7 +3139,14 @@ namespace llaminar2
             return false;
         }
         return cudaMoEOverlayEpochAcquire(
-            control, ticket, status, device_ordinal_, stream);
+            control,
+            ticket,
+            status,
+            external_admission_epoch,
+            admission_barrier,
+            peer_placement_epoch,
+            device_ordinal_,
+            stream);
     }
 
     bool CUDAMoEKernel::releaseMoEOverlayEpoch(
@@ -5273,11 +5428,15 @@ namespace llaminar2
         const DeviceMoERebalanceConfig &config,
         const DeviceMoERebalanceWaveState *wave_state,
         const DeviceMoERebalanceGraphControllerState *controller_state,
-        uint32_t command_buffer_count)
+        uint32_t command_buffer_count,
+        uint32_t histogram_source_mask,
+        uint64_t *previous_activation_counts)
     {
-        if (!validateDeviceMoERebalanceConfig(config))
+        if (!validateDeviceMoERebalanceConfig(config) ||
+            !moe_runtime_abi::validHistogramSourceMask(
+                histogram_source_mask))
         {
-            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceHistograms] invalid device rebalance config");
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceHistograms] invalid device rebalance config or histogram source mask");
             return false;
         }
         if (!runtime_layers || !local_histograms)
@@ -5298,6 +5457,9 @@ namespace llaminar2
             wave_state,
             controller_state,
             command_buffer_count,
+            histogram_source_mask,
+            reinterpret_cast<unsigned long long *>(
+                previous_activation_counts),
             device_ordinal_,
             stream);
     }
@@ -6956,7 +7118,8 @@ namespace llaminar2
         const DeviceNativeVNNIMatrixDesc *down_descs,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source)
     {
         if (!down_descs || num_experts <= 0 || d_model <= 0 || intermediate <= 0 || (intermediate % 32) != 0)
             return -1;
@@ -6968,9 +7131,16 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "uploadGroupedExpertDownDescriptorTable"))
             return -1;
 
-        uint8_t codebook_id = 0;
-        uint32_t codebook_mask = 0;
-        uint32_t policy_codebook_mask = 0;
+        const bool runtime_mutable =
+            descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if (!runtime_mutable &&
+            descriptor_source !=
+                MoEDecodeDescriptorSource::StaticDescriptorTable)
+        {
+            return -1;
+        }
+        NativeVnniExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
@@ -6983,21 +7153,40 @@ namespace llaminar2
                           << expert_id);
                 return -1;
             }
-            codebook_mask |= cudaGroupedPrefillCodebookBit(desc.codebook_id);
-            const uint32_t policy_bit =
-                cudaGroupedPrefillPolicyCodebookBit(desc);
-            if (policy_bit == 0)
-                return -1;
-            policy_codebook_mask |= policy_bit;
-            if (codebook_id == 0)
+            if (!addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable))
             {
-                codebook_id = desc.codebook_id;
+                return -1;
             }
         }
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
         if (codebook_mask == 0 || policy_codebook_mask == 0)
             return -1;
-        if (codebook_mask & (codebook_mask - 1u))
-            codebook_id = kCudaMoEMixedCodebookSentinel;
+        for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
+        {
+            if ((codebook_mask & nativeVnniCodebookMaskBit(codebook)) != 0u &&
+                !cudaGroupedPrefillSupportsCodebook(codebook))
+            {
+                return -1;
+            }
+        }
+        const int sole_codebook = singleCUDAMoECodebook(codebook_mask);
+        const uint8_t codebook_id =
+            sole_codebook >= 0
+                ? static_cast<uint8_t>(sole_codebook)
+                : kCudaMoEMixedCodebookSentinel;
 
         if (cudaGroupedPrefillMaskNeedsIQTables(codebook_mask))
         {
@@ -7036,6 +7225,7 @@ namespace llaminar2
                 existing.codebook_id != codebook_id ||
                 existing.codebook_mask != codebook_mask ||
                 existing.policy_codebook_mask != policy_codebook_mask ||
+                existing.descriptor_source != descriptor_source ||
                 existing.host_descs.size() != static_cast<size_t>(num_experts))
             {
                 continue;
@@ -7054,6 +7244,7 @@ namespace llaminar2
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
+        table.descriptor_source = descriptor_source;
         table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
         table.valid = true;
         if (!publishGroupedDownDescriptorTable(
@@ -7071,7 +7262,8 @@ namespace llaminar2
         const DeviceNativeVNNIMatrixDesc *up_descs,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source)
     {
         if (!gate_descs || !up_descs || num_experts <= 0 || d_model <= 0 || intermediate <= 0 || (d_model % 32) != 0)
             return -1;
@@ -7083,9 +7275,16 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "uploadGroupedExpertGateUpDescriptorTables"))
             return -1;
 
-        uint8_t codebook_id = 0;
-        uint32_t codebook_mask = 0;
-        uint32_t policy_codebook_mask = 0;
+        const bool runtime_mutable =
+            descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if (!runtime_mutable &&
+            descriptor_source !=
+                MoEDecodeDescriptorSource::StaticDescriptorTable)
+        {
+            return -1;
+        }
+        NativeVnniExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7110,23 +7309,45 @@ namespace llaminar2
                           << expert_id);
                 return -1;
             }
-            codebook_mask |= cudaGroupedPrefillCodebookBit(gate_desc.codebook_id);
-            const uint32_t gate_policy_bit =
-                cudaGroupedPrefillPolicyCodebookBit(gate_desc);
-            const uint32_t up_policy_bit =
-                cudaGroupedPrefillPolicyCodebookBit(up_desc);
-            if (gate_policy_bit == 0 || up_policy_bit == 0)
-                return -1;
-            policy_codebook_mask |= gate_policy_bit | up_policy_bit;
-            if (codebook_id == 0)
+            const auto add_descriptor = [&](
+                                            const DeviceNativeVNNIMatrixDesc &desc)
             {
-                codebook_id = gate_desc.codebook_id;
+                return addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable);
+            };
+            if (!add_descriptor(gate_desc) || !add_descriptor(up_desc))
+            {
+                return -1;
             }
         }
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
         if (codebook_mask == 0 || policy_codebook_mask == 0)
             return -1;
-        if (codebook_mask & (codebook_mask - 1u))
-            codebook_id = kCudaMoEMixedCodebookSentinel;
+        for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
+        {
+            if ((codebook_mask & nativeVnniCodebookMaskBit(codebook)) != 0u &&
+                !cudaGroupedPrefillSupportsCodebook(codebook))
+            {
+                return -1;
+            }
+        }
+        const int sole_codebook = singleCUDAMoECodebook(codebook_mask);
+        const uint8_t codebook_id =
+            sole_codebook >= 0
+                ? static_cast<uint8_t>(sole_codebook)
+                : kCudaMoEMixedCodebookSentinel;
 
         if (cudaGroupedPrefillMaskNeedsIQTables(codebook_mask))
         {
@@ -7165,6 +7386,7 @@ namespace llaminar2
                 existing.codebook_id != codebook_id ||
                 existing.codebook_mask != codebook_mask ||
                 existing.policy_codebook_mask != policy_codebook_mask ||
+                existing.descriptor_source != descriptor_source ||
                 existing.host_gate_descs.size() != static_cast<size_t>(num_experts) ||
                 existing.host_up_descs.size() != static_cast<size_t>(num_experts))
             {
@@ -7186,6 +7408,7 @@ namespace llaminar2
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
+        table.descriptor_source = descriptor_source;
         table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
         table.valid = true;
         if (!publishGroupedGateUpDescriptorTable(
@@ -7408,9 +7631,10 @@ namespace llaminar2
             return false;
         }
 
-        uint8_t codebook_id = 0;
-        uint32_t codebook_mask = 0;
-        uint32_t policy_codebook_mask = 0;
+        const bool runtime_mutable =
+            table.descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        NativeVnniExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
@@ -7418,19 +7642,32 @@ namespace llaminar2
                 continue;
             if (!validateCudaGroupedDescShape(desc, d_model, intermediate))
                 return false;
-            codebook_mask |= cudaGroupedPrefillCodebookBit(desc.codebook_id);
-            const uint32_t policy_bit =
-                cudaGroupedPrefillPolicyCodebookBit(desc);
-            if (policy_bit == 0)
+            if (!addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable))
+            {
                 return false;
-            policy_codebook_mask |= policy_bit;
-            if (codebook_id == 0)
-                codebook_id = desc.codebook_id;
+            }
         }
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
         if (codebook_mask == 0 || policy_codebook_mask == 0)
             return false;
-        if (codebook_mask & (codebook_mask - 1u))
-            codebook_id = kCudaMoEMixedCodebookSentinel;
+        const int sole_codebook = singleCUDAMoECodebook(codebook_mask);
+        const uint8_t codebook_id =
+            sole_codebook >= 0
+                ? static_cast<uint8_t>(sole_codebook)
+                : kCudaMoEMixedCodebookSentinel;
         if (table.codebook_id != codebook_id ||
             table.codebook_mask != codebook_mask ||
             table.policy_codebook_mask != policy_codebook_mask)
@@ -7528,9 +7765,10 @@ namespace llaminar2
             return false;
         }
 
-        uint8_t codebook_id = 0;
-        uint32_t codebook_mask = 0;
-        uint32_t policy_codebook_mask = 0;
+        const bool runtime_mutable =
+            table.descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        NativeVnniExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7550,21 +7788,37 @@ namespace llaminar2
             {
                 return false;
             }
-            codebook_mask |= cudaGroupedPrefillCodebookBit(gate_desc.codebook_id);
-            const uint32_t gate_policy_bit =
-                cudaGroupedPrefillPolicyCodebookBit(gate_desc);
-            const uint32_t up_policy_bit =
-                cudaGroupedPrefillPolicyCodebookBit(up_desc);
-            if (gate_policy_bit == 0 || up_policy_bit == 0)
+            const auto add_descriptor = [&](
+                                            const DeviceNativeVNNIMatrixDesc &desc)
+            {
+                return addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable);
+            };
+            if (!add_descriptor(gate_desc) || !add_descriptor(up_desc))
+            {
                 return false;
-            policy_codebook_mask |= gate_policy_bit | up_policy_bit;
-            if (codebook_id == 0)
-                codebook_id = gate_desc.codebook_id;
+            }
         }
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
         if (codebook_mask == 0 || policy_codebook_mask == 0)
             return false;
-        if (codebook_mask & (codebook_mask - 1u))
-            codebook_id = kCudaMoEMixedCodebookSentinel;
+        const int sole_codebook = singleCUDAMoECodebook(codebook_mask);
+        const uint8_t codebook_id =
+            sole_codebook >= 0
+                ? static_cast<uint8_t>(sole_codebook)
+                : kCudaMoEMixedCodebookSentinel;
         if (table.codebook_id != codebook_id ||
             table.codebook_mask != codebook_mask ||
             table.policy_codebook_mask != policy_codebook_mask)
@@ -10016,7 +10270,9 @@ namespace llaminar2
         int d_model,
         int intermediate,
         const uint8_t *expert_mask,
-        ITensor *canonical_route_contributions)
+        ITensor *canonical_route_contributions,
+        DeviceMoELayerRuntime *runtime_layer,
+        MoEDecodeDescriptorSource descriptor_source)
     {
         if (!input || !routing_indices || !routing_weights ||
             gateup_table_id < 0 || down_table_id < 0 || top_k <= 0 ||
@@ -10035,6 +10291,16 @@ namespace llaminar2
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRouting] "
                       "gate/up descriptor table is unavailable");
+            return false;
+        }
+        const bool use_runtime_descriptors =
+            descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if ((use_runtime_descriptors && (!runtime_layer || expert_mask)) ||
+            (!use_runtime_descriptors && runtime_layer))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRouting] "
+                      "runtime placement requires exactly one runtime layer and no host mask");
             return false;
         }
 
@@ -10099,8 +10365,38 @@ namespace llaminar2
             return false;
         }
 
+        const int *resolved_expert_ids = d_routing_decode_expert_ids_;
+        const float *resolved_weights = device_routing_weights;
+        if (use_runtime_descriptors)
+        {
+            /*
+             * The explicit packet remains the route-value producer, while the
+             * epoch-pinned runtime bank is the sole placement authority. This
+             * existing selector drops non-local experts, publishes compact
+             * runtime top-k state, and increments selected/local histograms in
+             * the same captured stream transaction.
+             */
+            if (!cudaMoE_decode_route_select_runtime(
+                    d_routing_decode_expert_ids_,
+                    device_routing_weights,
+                    runtime_layer,
+                    /*legacy_indices=*/nullptr,
+                    /*legacy_weights=*/nullptr,
+                    gateup_table.num_experts,
+                    top_k,
+                    /*write_legacy_outputs=*/false,
+                    /*update_runtime_histogram=*/true,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+            resolved_expert_ids = runtimeTopKExpertIdsDevice(runtime_layer);
+            resolved_weights = runtimeTopKWeightsDevice(runtime_layer);
+        }
+
         return groupedExpertDecodeResolved(
-            /*runtime_layer=*/nullptr,
+            runtime_layer,
             input,
             gateup_table_id,
             down_table_id,
@@ -10108,11 +10404,11 @@ namespace llaminar2
             output,
             d_model,
             intermediate,
-            d_routing_decode_expert_ids_,
-            device_routing_weights,
-            /*use_runtime_descriptors=*/false,
+            resolved_expert_ids,
+            resolved_weights,
+            use_runtime_descriptors,
             /*allow_router_q8_reuse=*/false,
-            "routing",
+            use_runtime_descriptors ? "routing_runtime" : "routing",
             canonical_route_contributions);
     }
 

@@ -64,6 +64,7 @@
 #include "stages/MTPConcatStage.h"
 #include "stages/MTPDraftTokenPublicationStage.h"
 #include "stages/MoEOverlayEpochBoundaryStage.h"
+#include "stages/MoEOverlayDeviceControllerStage.h"
 #include "stages/MTPVerifierPreparationStage.h"
 #include "stages/MTPVerifierOutcomeStage.h"
 #include "stages/MTPStochasticSerialOutcomeStage.h"

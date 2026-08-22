@@ -182,6 +182,7 @@ namespace llaminar2
             }
 
             MoEOverlayRemoteProjectionManifest manifest;
+            manifest.format_kind = ExpertWeightFormatKind::NativeVnni;
             manifest.identity = identity;
             manifest.N = N;
             manifest.K = K;
@@ -306,6 +307,7 @@ namespace llaminar2
         hashScalar(hash, magic);
         hashScalar(hash, abi_version);
         hashScalar(hash, packing);
+        hashScalar(hash, format_kind);
         hashIdentity(hash, identity);
         hashScalar(hash, N);
         hashScalar(hash, K);
@@ -334,41 +336,19 @@ namespace llaminar2
         std::string *error) const noexcept
     {
         if (magic != kMagic || abi_version != kABIVersion ||
-            reserved_protocol != 0 || !identity.valid() ||
+            !identity.valid() ||
             !allZero(reserved_format) || reserved_size != 0)
         {
             return reject(
                 error,
                 "Remote ExpertOverlay projection has invalid ABI, identity, or reserved fields");
         }
-        if (N <= 0 || K <= 0 || (K % 32) != 0 ||
-            N_padded != ((N + 63) / 64) * 64 ||
-            blocks_per_row != K / 32 || maximum_chunk_bytes == 0)
+        if (N <= 0 || K <= 0 || maximum_chunk_bytes == 0)
         {
             return reject(
                 error,
                 "Remote ExpertOverlay projection geometry or chunk capacity is invalid");
         }
-        const auto *source = native_vnni_formats::forSourceIdentity(
-            source_codebook_id, source_is_superblock != 0);
-        if (!source || cpu_codebook_id != source_codebook_id ||
-            cpu_is_asymmetric !=
-                static_cast<std::uint8_t>(source->is_asymmetric) ||
-            cpu_is_superblock != source_is_superblock ||
-            cpu_encoding !=
-                cpu::native_vnni::preparedEncodingForCodebook(
-                    source_codebook_id) ||
-            cpu_data_stride !=
-                cpu::native_vnni::preparedDataStride(cpu_encoding) ||
-            cpu_block_stride !=
-                cpu::native_vnni::preparedInterleavedBlockStride(
-                    cpu_encoding, cpu_is_asymmetric != 0))
-        {
-            return reject(
-                error,
-                "Remote ExpertOverlay projection provenance and CPU format disagree");
-        }
-
         std::uint64_t summed = 0;
         if (!sumRegions(region_bytes, summed) || summed == 0 ||
             summed != total_bytes)
@@ -378,8 +358,68 @@ namespace llaminar2
                 "Remote ExpertOverlay projection region byte totals are invalid");
         }
 
-        if (carriesCpuBytes())
+        if (carriesGpuFloatingBytes())
         {
+            const ExpertWeightFormat format{.kind = format_kind};
+            const auto element_bytes = format.floatingElementBytes();
+            const auto n = static_cast<std::uint64_t>(N);
+            const auto k = static_cast<std::uint64_t>(K);
+            const bool byte_count_valid = element_bytes != 0u &&
+                n <= std::numeric_limits<std::uint64_t>::max() / k &&
+                n * k <= std::numeric_limits<std::uint64_t>::max() /
+                             element_bytes;
+            if (!identity.source_device.is_gpu() ||
+                !identity.destination_device.is_gpu() ||
+                !format.isFloating() || N_padded != N ||
+                blocks_per_row != 0 || source_codebook_id != 0 ||
+                source_is_superblock != 0 || cpu_codebook_id != 0 ||
+                gpu_codebook_id != 0 ||
+                gpu_payload_bytes_per_block != 0 ||
+                cpu_is_asymmetric != 0 || cpu_is_superblock != 0 ||
+                gpu_is_asymmetric != 0 || gpu_has_emins != 0 ||
+                cpu_data_stride != 0 || cpu_block_stride != 0 ||
+                !byte_count_valid ||
+                region_bytes != std::array<std::uint64_t, 4>{
+                    n * k * element_bytes, 0u, 0u, 0u})
+            {
+                return reject(
+                    error,
+                    "GPU floating remote projection disagrees with its precision, geometry, or byte extent");
+            }
+        }
+        else
+        {
+            if (format_kind != ExpertWeightFormatKind::NativeVnni ||
+                (K % 32) != 0 ||
+                N_padded != ((N + 63) / 64) * 64 ||
+                blocks_per_row != K / 32)
+            {
+                return reject(
+                    error,
+                    "Remote ExpertOverlay NativeVNNI projection geometry or format kind is invalid");
+            }
+            const auto *source = native_vnni_formats::forSourceIdentity(
+                source_codebook_id, source_is_superblock != 0);
+            if (!source || cpu_codebook_id != source_codebook_id ||
+                cpu_is_asymmetric !=
+                    static_cast<std::uint8_t>(source->is_asymmetric) ||
+                cpu_is_superblock != source_is_superblock ||
+                cpu_encoding !=
+                    cpu::native_vnni::preparedEncodingForCodebook(
+                        source_codebook_id) ||
+                cpu_data_stride !=
+                    cpu::native_vnni::preparedDataStride(cpu_encoding) ||
+                cpu_block_stride !=
+                    cpu::native_vnni::preparedInterleavedBlockStride(
+                        cpu_encoding, cpu_is_asymmetric != 0))
+            {
+                return reject(
+                    error,
+                    "Remote ExpertOverlay projection provenance and CPU format disagree");
+            }
+
+            if (carriesCpuBytes())
+            {
             if (!identity.source_device.is_cpu() &&
                 !identity.destination_device.is_cpu())
             {
@@ -433,9 +473,9 @@ namespace llaminar2
                     error,
                     "CPU-to-CPU remote projection unexpectedly names a GPU format");
             }
-        }
-        else if (carriesGpuBytes())
-        {
+            }
+            else if (carriesGpuBytes())
+            {
             if (!identity.source_device.is_gpu() ||
                 !identity.destination_device.is_gpu() ||
                 !validGpuExecutionFormat(*this, *source))
@@ -459,12 +499,13 @@ namespace llaminar2
                     error,
                     "GPU blob remote projection separated-region sizes disagree with its format");
             }
-        }
-        else
-        {
-            return reject(
-                error,
-                "Remote ExpertOverlay projection packing is unknown");
+            }
+            else
+            {
+                return reject(
+                    error,
+                    "Remote ExpertOverlay projection packing is unknown");
+            }
         }
 
         if (manifest_hash == 0 || manifest_hash != computedHash())
@@ -620,6 +661,38 @@ namespace llaminar2
         return seal(std::move(manifest));
     }
 
+    MoEOverlayRemoteProjectionManifest
+    makeMoEOverlayRemoteGpuFloatingProjectionManifest(
+        const MoEOverlayRemoteProjectionIdentity &identity,
+        const ContiguousFloatingPointWeightDescriptor &source,
+        std::uint32_t maximum_chunk_bytes)
+    {
+        const auto format = ExpertWeightFormat::floating(source.type);
+        if (!source.valid() || !format.valid() ||
+            !identity.source_device.is_gpu() ||
+            !identity.destination_device.is_gpu() ||
+            maximum_chunk_bytes == 0u)
+        {
+            throw std::invalid_argument(
+                "Remote floating GPU projection requires valid GPU endpoints, storage, precision, and capacity");
+        }
+
+        MoEOverlayRemoteProjectionManifest manifest;
+        manifest.packing = MoEOverlayRemoteProjectionPacking::
+            GpuContiguousFloating;
+        manifest.format_kind = format.kind;
+        manifest.identity = identity;
+        manifest.N = source.n;
+        manifest.K = source.k;
+        manifest.N_padded = source.n;
+        manifest.blocks_per_row = 0;
+        manifest.cpu_encoding =
+            cpu::native_vnni::CPUNativeVNNIEncoding::NibbleLUT;
+        manifest.region_bytes[0] = source.bytes;
+        manifest.maximum_chunk_bytes = maximum_chunk_bytes;
+        return seal(std::move(manifest));
+    }
+
     ExpertTierWeightDeviceLayout remoteCpuProjectionDeviceLayout(
         const MoEOverlayRemoteProjectionManifest &manifest)
     {
@@ -716,7 +789,7 @@ namespace llaminar2
         writeLittleEndian(destination, offset, manifest.magic);
         writeLittleEndian(destination, offset, manifest.abi_version);
         writeLittleEndian(destination, offset, manifest.packing);
-        writeLittleEndian(destination, offset, manifest.reserved_protocol);
+        writeLittleEndian(destination, offset, manifest.format_kind);
         const auto &identity = manifest.identity;
         writeLittleEndian(destination, offset, identity.expected_epoch);
         writeLittleEndian(destination, offset, identity.candidate_epoch);
@@ -789,8 +862,8 @@ namespace llaminar2
             readLittleEndian<std::uint16_t>(packet, offset);
         manifest->packing =
             readLittleEndian<MoEOverlayRemoteProjectionPacking>(packet, offset);
-        manifest->reserved_protocol =
-            readLittleEndian<std::uint8_t>(packet, offset);
+        manifest->format_kind =
+            readLittleEndian<ExpertWeightFormatKind>(packet, offset);
         auto &identity = manifest->identity;
         identity.expected_epoch =
             readLittleEndian<std::uint64_t>(packet, offset);

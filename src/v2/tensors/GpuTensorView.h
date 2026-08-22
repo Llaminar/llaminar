@@ -161,6 +161,8 @@ namespace llaminar2
                 return 2;
             case TensorType::BF16:
                 return 2;
+            case TensorType::INT32:
+                return sizeof(int32_t);
             case TensorType::Q8_1:
                 return sizeof(Q8_1Block);
             case TensorType::AQ8:

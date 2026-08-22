@@ -822,6 +822,224 @@ TEST(Test__MoEOverlayCollectiveWorkspace, MTPCollectiveKeyRequiresDepth)
     EXPECT_TRUE(key.isValid());
 }
 
+TEST(Test__MoEOverlayCollectiveWorkspace,
+     RankLocalSparseCrossParticipantEdgeCopiesExactPacketsAndRejectsReplay)
+{
+    constexpr int kLayer = 3;
+    constexpr int kTier = 1;
+    constexpr int kTargetParticipant = 3;
+    constexpr int kContinuationParticipant = 0;
+    constexpr int kDModel = 4;
+    constexpr int kTopK = 2;
+
+    MoEOverlayCollectiveWorkspace continuation;
+    MoEOverlayCollectiveWorkspace local_endpoint;
+    continuation.ensureCapacity(4, 8, kDModel, kTopK, DeviceId::cpu());
+    local_endpoint.ensureCapacity(4, 8, kDModel, kTopK, DeviceId::cpu());
+    MoEOverlayRankLocalSparseCollectiveContext rank_local(
+        {.slot_count = 8});
+
+    const auto dispatch_key = makeMoEOverlayCollectiveKey(
+        /*generation_id=*/7,
+        /*step_id=*/11,
+        kLayer,
+        kTier,
+        /*domain_id=*/kTargetParticipant,
+        /*participant_id=*/kTargetParticipant,
+        MoEOverlayCollectiveDirection::Dispatch);
+    auto outbound = continuation.localExpertInput(kLayer, kTier);
+    outbound.key = dispatch_key;
+    outbound.residency_epoch = 29;
+    outbound.source_participant = kContinuationParticipant;
+    outbound.target_participant = kTargetParticipant;
+    outbound.live_row_count = 2;
+    outbound.live_entry_count = 3;
+    outbound.row_ids_host[0] = 2;
+    outbound.row_ids_host[1] = 5;
+    outbound.entry_offsets_host[0] = 0;
+    outbound.entry_offsets_host[1] = 1;
+    outbound.entry_offsets_host[2] = 3;
+    outbound.expert_ids_host[0] = 9;
+    outbound.expert_ids_host[1] = 4;
+    outbound.expert_ids_host[2] = 12;
+    outbound.route_weights_host[0] = 0.75f;
+    outbound.route_weights_host[1] = 0.125f;
+    outbound.route_weights_host[2] = 0.875f;
+    for (size_t element = 0;
+         element < outbound.live_row_count * static_cast<size_t>(kDModel);
+         ++element)
+    {
+        outbound.hidden_rows_fp32[element] =
+            20.0f + static_cast<float>(element);
+    }
+
+    auto inbound = local_endpoint.dispatchReceive(kLayer, kTier);
+    const auto dispatch_result =
+        rank_local.dispatch(dispatch_key, outbound, &inbound, nullptr);
+    ASSERT_TRUE(dispatch_result.ok) << dispatch_result.error;
+    EXPECT_TRUE(dispatch_result.collective_complete);
+    EXPECT_EQ(inbound.key, dispatch_key);
+    EXPECT_EQ(inbound.residency_epoch, 29u);
+    EXPECT_EQ(inbound.source_participant, kContinuationParticipant);
+    EXPECT_EQ(inbound.target_participant, kTargetParticipant);
+    EXPECT_EQ(inbound.live_row_count, 2u);
+    EXPECT_EQ(inbound.live_entry_count, 3u);
+    EXPECT_EQ(inbound.row_ids_host[1], 5);
+    EXPECT_EQ(inbound.entry_offsets_host[2], 3);
+    EXPECT_EQ(inbound.expert_ids_host[2], 12);
+    EXPECT_FLOAT_EQ(inbound.route_weights_host[1], 0.125f);
+    EXPECT_FLOAT_EQ(inbound.hidden_rows_fp32[7], 27.0f);
+
+    const auto repeated_dispatch =
+        rank_local.dispatch(dispatch_key, outbound, &inbound, nullptr);
+    EXPECT_FALSE(repeated_dispatch.ok);
+    EXPECT_EQ(repeated_dispatch.error_code, 3);
+
+    const auto return_key = makeMoEOverlayCollectiveKey(
+        /*generation_id=*/7,
+        /*step_id=*/11,
+        kLayer,
+        kTier,
+        /*domain_id=*/kTargetParticipant,
+        /*participant_id=*/kTargetParticipant,
+        MoEOverlayCollectiveDirection::ReturnReduce);
+    auto returned = local_endpoint.localExpertOutput(kLayer, kTier);
+    returned.key = return_key;
+    returned.residency_epoch = inbound.residency_epoch;
+    returned.source_participant = kTargetParticipant;
+    returned.target_participant = kContinuationParticipant;
+    returned.live_row_count = 2;
+    returned.row_ids_host[0] = 2;
+    returned.row_ids_host[1] = 5;
+    for (size_t element = 0;
+         element < returned.live_row_count * static_cast<size_t>(kDModel);
+         ++element)
+    {
+        returned.output_rows_fp32[element] =
+            100.0f + static_cast<float>(element);
+    }
+
+    auto return_inbound = continuation.returnReceive(kLayer, kTier);
+    const auto return_result =
+        rank_local.returnReduce(
+            return_key, returned, &return_inbound, nullptr);
+    ASSERT_TRUE(return_result.ok) << return_result.error;
+    EXPECT_TRUE(return_result.collective_complete);
+    EXPECT_EQ(return_inbound.key, return_key);
+    EXPECT_EQ(return_inbound.residency_epoch, 29u);
+    EXPECT_EQ(return_inbound.source_participant, kTargetParticipant);
+    EXPECT_EQ(return_inbound.target_participant, kContinuationParticipant);
+    EXPECT_EQ(return_inbound.live_row_count, 2u);
+    EXPECT_EQ(return_inbound.row_ids_host[1], 5);
+    EXPECT_FLOAT_EQ(return_inbound.output_rows_fp32[7], 107.0f);
+
+    auto aborted_key = makeMoEOverlayCollectiveKey(
+        /*generation_id=*/7,
+        /*step_id=*/12,
+        kLayer,
+        kTier,
+        /*domain_id=*/kTargetParticipant,
+        /*participant_id=*/kTargetParticipant,
+        MoEOverlayCollectiveDirection::Dispatch);
+    rank_local.abort(aborted_key, /*reason_code=*/41);
+    outbound.key = aborted_key;
+    const auto aborted =
+        rank_local.dispatch(aborted_key, outbound, &inbound, nullptr);
+    EXPECT_FALSE(aborted.ok);
+    EXPECT_EQ(aborted.error_code, 41);
+}
+
+TEST(Test__MoEOverlayCollectiveWorkspace,
+     RankLocalSparseContinuationLoopbackCopiesExactPacketsAndRejectsReplay)
+{
+    constexpr int kParticipant = 0;
+    constexpr int kDModel = 4;
+    constexpr int kTopK = 1;
+
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(
+        /*max_rows=*/2,
+        /*max_entries=*/2,
+        kDModel,
+        kTopK,
+        DeviceId::cpu());
+    MoEOverlayRankLocalSparseCollectiveContext rank_local(
+        {.slot_count = 8});
+
+    const auto dispatch_key = makeMoEOverlayCollectiveKey(
+        /*generation_id=*/13,
+        /*step_id=*/17,
+        /*layer_idx=*/0,
+        /*tier_idx=*/0,
+        /*domain_id=*/0,
+        kParticipant,
+        MoEOverlayCollectiveDirection::Dispatch);
+    auto outbound = workspace.localExpertInput(0, 0);
+    outbound.key = dispatch_key;
+    outbound.residency_epoch = 5;
+    outbound.source_participant = kParticipant;
+    outbound.target_participant = kParticipant;
+    outbound.live_row_count = 1;
+    outbound.live_entry_count = 1;
+    outbound.row_ids_host[0] = 1;
+    outbound.entry_offsets_host[0] = 0;
+    outbound.entry_offsets_host[1] = 1;
+    outbound.expert_ids_host[0] = 7;
+    outbound.route_weights_host[0] = 0.75f;
+    for (int column = 0; column < kDModel; ++column)
+    {
+        outbound.hidden_rows_fp32[column] =
+            10.0f + static_cast<float>(column);
+    }
+
+    auto inbound = workspace.dispatchReceive(0, 0);
+    const auto dispatch_result =
+        rank_local.dispatch(dispatch_key, outbound, &inbound, nullptr);
+    ASSERT_TRUE(dispatch_result.ok) << dispatch_result.error;
+    EXPECT_TRUE(dispatch_result.collective_complete);
+    EXPECT_EQ(inbound.source_participant, kParticipant);
+    EXPECT_EQ(inbound.target_participant, kParticipant);
+    EXPECT_EQ(inbound.live_row_count, 1u);
+    EXPECT_EQ(inbound.expert_ids_host[0], 7);
+    EXPECT_FLOAT_EQ(inbound.hidden_rows_fp32[3], 13.0f);
+
+    const auto replay =
+        rank_local.dispatch(dispatch_key, outbound, &inbound, nullptr);
+    EXPECT_FALSE(replay.ok);
+    EXPECT_EQ(replay.error_code, 3);
+
+    const auto return_key = makeMoEOverlayCollectiveKey(
+        /*generation_id=*/13,
+        /*step_id=*/17,
+        /*layer_idx=*/0,
+        /*tier_idx=*/0,
+        /*domain_id=*/0,
+        kParticipant,
+        MoEOverlayCollectiveDirection::ReturnReduce);
+    auto returned = workspace.localExpertOutput(0, 0);
+    returned.key = return_key;
+    returned.residency_epoch = 5;
+    returned.source_participant = kParticipant;
+    returned.target_participant = kParticipant;
+    returned.live_row_count = 1;
+    returned.row_ids_host[0] = 1;
+    for (int column = 0; column < kDModel; ++column)
+    {
+        returned.output_rows_fp32[column] =
+            20.0f + static_cast<float>(column);
+    }
+
+    auto return_inbound = workspace.returnReceive(0, 0);
+    const auto return_result = rank_local.returnReduce(
+        return_key, returned, &return_inbound, nullptr);
+    ASSERT_TRUE(return_result.ok) << return_result.error;
+    EXPECT_TRUE(return_result.collective_complete);
+    EXPECT_EQ(return_inbound.source_participant, kParticipant);
+    EXPECT_EQ(return_inbound.target_participant, kParticipant);
+    EXPECT_EQ(return_inbound.live_row_count, 1u);
+    EXPECT_FLOAT_EQ(return_inbound.output_rows_fp32[3], 23.0f);
+}
+
 TEST(Test__MoEOverlayCollectiveWorkspace, LocalSparseCollectiveSeparatesMainAndMTPNamespaces)
 {
     MoEOverlayCollectiveWorkspace workspace;
@@ -1716,7 +1934,8 @@ TEST(
     params.d_model = 4;
     params.manual_boundary_requires_collective_completion = true;
     params.dispatch_output_lifetime = dispatch_output;
-    params.release_residency_lease_on_completion = true;
+    params.residency_lease_terminal =
+        MoEOverlayHostDispatchLeaseTerminal::Release;
 
     MoESparseReturnReduceStage stage(std::move(params));
     ASSERT_TRUE(stage.execute(&ctx));

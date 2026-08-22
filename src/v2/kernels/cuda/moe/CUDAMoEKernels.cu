@@ -16,6 +16,9 @@
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
+#include "kernels/common/DeviceQ8ActivationNumericalContract.h"
+#include "kernels/common/DeviceSwiGLUNumericalContract.h"
+#include "kernels/common/MoEProjectionNumericalContract.h"
 #include "kernels/cuda/moe/CUDAMoEBatchInvariantPolicy.h"
 #include "kernels/cuda/moe/CUDAMoERouterPrefillPolicy.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
@@ -1702,6 +1705,16 @@ namespace
                runtime->top_k == static_cast<uint32_t>(top_k);
     }
 
+    /** @return Whether decode can publish one final participant per route. */
+    __device__ __forceinline__ bool runtime_route_assignment_ledger_ok(
+        const DeviceMoELayerRuntimeView *runtime,
+        int top_k)
+    {
+        return runtime && top_k > 0 && runtime->route_participant_ids &&
+               runtime->prefill_route_capacity >=
+                   static_cast<std::uint32_t>(top_k);
+    }
+
     __device__ __forceinline__ int runtime_expert_owner(
         const DeviceMoEPlacementBankView &bank,
         int expert_id)
@@ -2852,13 +2865,21 @@ namespace
         int32_t logical_position,
         bool fully_replicated_local_rows,
         bool record_balance,
-        bool *local_compute_flags)
+        bool *local_compute_flags,
+        int *assigned_participants)
     {
         if (!runtime_shape_ok(runtime, num_experts, top_k) ||
             !selected_experts ||
-            !local_compute_flags)
+            !local_compute_flags ||
+            !assigned_participants)
         {
             return;
+        }
+
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            local_compute_flags[slot] = false;
+            assigned_participants[slot] = -1;
         }
 
         const uint32_t execution_bank = runtime_execution_bank(runtime);
@@ -2884,10 +2905,15 @@ namespace
             for (int slot = 0; slot < top_k; ++slot)
             {
                 const int expert_id = selected_experts[slot];
-                local_compute_flags[slot] =
-                    expert_id >= 0 &&
-                    expert_id < num_experts &&
+                if (expert_id < 0 || expert_id >= num_experts)
+                    continue;
+                const bool local =
                     bank.local_compute_mask[expert_id] != 0u;
+                assigned_participants[slot] = fully_replicated_local_rows
+                                                  ? static_cast<int>(participant_id)
+                                                  : runtime_expert_owner(
+                                                        bank, expert_id);
+                local_compute_flags[slot] = local;
             }
             return;
         }
@@ -2924,6 +2950,7 @@ namespace
                 valid_participants &&
                 owner >= 0 &&
                 owner < static_cast<int>(participant_count);
+            assigned_participants[slot] = owner_valid ? owner : -1;
 
             if (track_balance && owner_valid)
                 ++default_load[owner];
@@ -2987,6 +3014,7 @@ namespace
             if (selected_participant >= 0 &&
                 selected_participant < static_cast<int>(participant_count))
             {
+                assigned_participants[slot] = selected_participant;
                 local_compute_flags[slot] =
                     local_resident &&
                     selected_participant == static_cast<int>(participant_id);
@@ -4649,9 +4677,13 @@ namespace
                             shared_expert_owners,
                             config.num_experts,
                             config.participant_count,
+                            llaminar2::moe_rebalance_policy::
+                                dynamicOwnershipEvidenceFromParticipantLoads(
+                                    shared_owner_policy_load,
+                                    config.participant_count,
+                                    config.dynamic_min_window_activations),
                             config.dynamic_imbalance_threshold_per_mille,
                             config.dynamic_min_improvement_per_mille,
-                            config.dynamic_min_window_activations,
                             shared_expert_transfer_backed_participant_mask,
                             shared_active_transfer_slot_counts,
                             config.active_transfer_slot_capacity);
@@ -6401,9 +6433,13 @@ namespace
                             shared_expert_owners,
                             config.num_experts,
                             config.participant_count,
+                            llaminar2::moe_rebalance_policy::
+                                dynamicOwnershipEvidenceFromParticipantLoads(
+                                    shared_owner_policy_load,
+                                    config.participant_count,
+                                    config.dynamic_min_window_activations),
                             config.dynamic_imbalance_threshold_per_mille,
                             config.dynamic_min_improvement_per_mille,
-                            config.dynamic_min_window_activations,
                             shared_expert_transfer_backed_participant_mask,
                             shared_active_transfer_slot_counts,
                             config.active_transfer_slot_capacity);
@@ -6851,7 +6887,9 @@ namespace
         DeviceMoERebalanceConfigView config,
         const DeviceMoERebalanceWaveStateView *wave_state,
         const DeviceMoERebalanceGraphControllerStateView *controller_state,
-        uint32_t command_buffer_count)
+        uint32_t command_buffer_count,
+        uint32_t histogram_source_mask,
+        unsigned long long *previous_activation_counts)
     {
         if (!runtime_layers || !local_histograms || !rebalance_config_ok(config))
             return;
@@ -6894,26 +6932,50 @@ namespace
                 const bool transfer_backed =
                     physically_resident &&
                     (descriptor_flags & kDeviceMoEFlagTransferSlot) != 0u;
+                const bool authoritative_owner =
+                    bank.experts[expert].owner_participant ==
+                    static_cast<int32_t>(config.participant_id);
                 const uint32_t active_transfer_slots =
                     idx == 0u
                         ? rebalance_active_transfer_slot_expert_count(
                               runtime_layers, config)
                         : 0u;
+                unsigned long long cumulative_count = 0ULL;
+                for (uint32_t source = 0u;
+                     source < llaminar2::moe_runtime_abi::kHistogramSourceCount;
+                     ++source)
+                {
+                    if ((histogram_source_mask & (1u << source)) == 0u)
+                        continue;
+                    auto *const counter = reinterpret_cast<unsigned long long *>(
+                        &runtime_local_histogram(
+                            const_cast<DeviceMoELayerRuntimeView &>(runtime),
+                            source)[expert]);
+                    // Inference writers use atomicAdd. A zero-valued atomic read
+                    // observes one indivisible cumulative value while permitting
+                    // the next captured inference transaction to continue.
+                    cumulative_count += atomicAdd(counter, 0ULL);
+                }
+                unsigned long long window_count = cumulative_count;
+                if (previous_activation_counts)
+                {
+                    const uint32_t baseline_index =
+                        layer * config.num_experts + expert;
+                    const unsigned long long previous =
+                        previous_activation_counts[baseline_index];
+                    window_count = cumulative_count >= previous
+                                       ? cumulative_count - previous
+                                       : cumulative_count;
+                    previous_activation_counts[baseline_index] =
+                        cumulative_count;
+                }
                 value =
                     llaminar2::moe_rebalance_policy::packCollectedState(
-                        static_cast<unsigned long long>(
-                            runtime_local_histogram(
-                                const_cast<DeviceMoELayerRuntimeView &>(runtime),
-                                0u)[expert] +
-                            runtime_local_histogram(
-                                const_cast<DeviceMoELayerRuntimeView &>(runtime),
-                                1u)[expert] +
-                            runtime_local_histogram(
-                                const_cast<DeviceMoELayerRuntimeView &>(runtime),
-                                2u)[expert]),
+                        window_count,
                         active_transfer_slots,
                         physically_resident,
-                        transfer_backed);
+                        transfer_backed,
+                        authoritative_owner);
             }
             local_histograms[idx] = value;
             idx += blockDim.x * gridDim.x;
@@ -12494,7 +12556,7 @@ namespace
 
     __device__ __forceinline__ float silu(float x)
     {
-        return x / (1.0f + expf(-x));
+        return llaminar2::device_swiglu_contract::siluValue(x);
     }
 
     bool finishLaunch(const char *name)
@@ -13398,6 +13460,16 @@ namespace
         }
     }
 
+    /**
+     * @brief Publish one decode route with compile-time maintenance policy.
+     *
+     * Static graphs instantiate `<false, false>` so the compiler removes both
+     * global histogram atomics and every ready-wave control read. Observe and
+     * Dynamic graphs retain the exact evidence/apply work they own. Keeping
+     * these as template policies prevents a captured Static graph from paying
+     * register and branch costs for maintenance pointers that are always null.
+     */
+    template <bool UpdateRuntimeHistogram, bool ApplyReadyRebalance>
     __global__ void softmax_topk_decode_runtime_kernel(
         float *__restrict__ logits,
         DeviceMoELayerRuntimeView *__restrict__ runtime,
@@ -13407,7 +13479,6 @@ namespace
         int num_experts, int top_k,
         bool normalize_weights,
         bool write_legacy_outputs,
-        bool update_runtime_histogram,
         bool fully_replicated_local_rows,
         const int32_t *__restrict__ absolute_position_ids,
         const DeviceMoERebalancePlanEntryView *rebalance_plan_entries,
@@ -13427,18 +13498,21 @@ namespace
         __shared__ int selected[kMaxTopK];
         __shared__ float selected_weights[kMaxTopK];
 
-        try_apply_ready_rebalance_wave_for_layer_thread0(
-            runtime_layers,
-            rebalance_plan_entries,
-            rebalance_plan_capacity,
-            rebalance_command_header,
-            rebalance_local_transfer_slots,
-            rebalance_local_transfer_slot_count,
-            rebalance_config,
-            rebalance_apply_status,
-            rebalance_controller_state,
-            rebalance_target_layer,
-            rebalance_command_buffer_count);
+        if constexpr (ApplyReadyRebalance)
+        {
+            try_apply_ready_rebalance_wave_for_layer_thread0(
+                runtime_layers,
+                rebalance_plan_entries,
+                rebalance_plan_capacity,
+                rebalance_command_header,
+                rebalance_local_transfer_slots,
+                rebalance_local_transfer_slot_count,
+                rebalance_config,
+                rebalance_apply_status,
+                rebalance_controller_state,
+                rebalance_target_layer,
+                rebalance_command_buffer_count);
+        }
 
         float local_max = -INFINITY;
         for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
@@ -13483,11 +13557,18 @@ namespace
         if (threadIdx.x == 0)
         {
             const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
+            if (!runtime_route_assignment_ledger_ok(runtime, top_k))
+            {
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                    "decode route assignment ledger is absent or undersized");
+                return;
+            }
             float topk_sum = 0.0f;
             for (int k = 0; k < top_k; ++k)
                 topk_sum += selected_weights[k];
 
             bool local_compute_flags[kMaxTopK] = {};
+            int assigned_participants[kMaxTopK] = {};
             if (shape_ok)
             {
                 runtime_resolve_decode_dispatch(
@@ -13499,8 +13580,9 @@ namespace
                         ? absolute_position_ids[0]
                         : -1,
                     fully_replicated_local_rows,
-                    update_runtime_histogram,
-                    local_compute_flags);
+                    UpdateRuntimeHistogram,
+                    local_compute_flags,
+                    assigned_participants);
             }
             for (int k = 0; k < top_k; ++k)
             {
@@ -13512,6 +13594,8 @@ namespace
                     const bool local_compute = local_compute_flags[k];
                     runtime->topk_expert_ids[k] = local_compute ? selected[k] : -1;
                     runtime->topk_weights[k] = local_compute ? weight : 0.0f;
+                    runtime->route_participant_ids[k] =
+                        assigned_participants[k];
                 }
                 if (write_legacy_outputs)
                 {
@@ -13519,7 +13603,7 @@ namespace
                     legacy_weights[k] = weight;
                 }
             }
-            if (update_runtime_histogram)
+            if constexpr (UpdateRuntimeHistogram)
             {
                 for (int k = 0; k < top_k; ++k)
                 {
@@ -13556,7 +13640,14 @@ namespace
             return;
 
         const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
+        if (!runtime_route_assignment_ledger_ok(runtime, top_k))
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
+                "decode route assignment ledger is absent or undersized");
+            return;
+        }
         bool local_compute_flags[kMaxTopK] = {};
+        int assigned_participants[kMaxTopK] = {};
         if (shape_ok)
         {
             runtime_resolve_decode_dispatch(
@@ -13569,7 +13660,8 @@ namespace
                     : -1,
                 /*fully_replicated_local_rows=*/false,
                 update_runtime_histogram,
-                local_compute_flags);
+                local_compute_flags,
+                assigned_participants);
         }
         for (int k = 0; k < top_k; ++k)
         {
@@ -13580,6 +13672,7 @@ namespace
                 const bool local_compute = local_compute_flags[k];
                 runtime->topk_expert_ids[k] = local_compute ? expert : -1;
                 runtime->topk_weights[k] = local_compute ? weight : 0.0f;
+                runtime->route_participant_ids[k] = assigned_participants[k];
             }
             if (write_legacy_outputs)
             {
@@ -14330,6 +14423,40 @@ namespace
         {
             if (threadIdx.x == 0)
             {
+                const DeviceMoEPlacementBankView *const placement_banks =
+                    runtime_durable_placement_banks(runtime);
+                const llaminar2::DeviceMoEOverlayEpochTicket *const ticket =
+                    runtime ? runtime->overlay_epoch_ticket : nullptr;
+                printf("runtime_prefill_invalid_contract "
+                       "runtime=%p gate=%p up=%p down=%p experts=%d "
+                       "active_ids=%p max_active=%d expert_counts=%p "
+                       "expected_format=%u execution_bank=%u active_bank=%u "
+                       "active_epoch=%u transient=%u ticket=%p "
+                       "ticket_epoch=%llu ticket_selector=%llu "
+                       "placement_banks=%p bank0_epoch=%u bank1_epoch=%u\n",
+                       runtime,
+                       gate_descs,
+                       up_descs,
+                       down_descs,
+                       num_experts,
+                       active_expert_ids,
+                       max_active_experts,
+                       runtime ? runtime->expert_counts : nullptr,
+                       static_cast<unsigned>(expected_format),
+                       execution_bank,
+                       runtime ? runtime->active_bank : 0xffffffffu,
+                       runtime ? runtime->active_epoch : 0u,
+                       runtime
+                           ? runtime->current_batch_llep_transient_bank_active
+                           : 0xffffffffu,
+                       ticket,
+                       static_cast<unsigned long long>(
+                           ticket ? ticket->epoch : 0u),
+                       static_cast<unsigned long long>(
+                           ticket ? ticket->selector : 0u),
+                       placement_banks,
+                       placement_banks ? placement_banks[0].epoch : 0u,
+                       placement_banks ? placement_banks[1].epoch : 0u);
                 FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
                     "runtime descriptor publication has an invalid device contract");
             }
@@ -14902,16 +15029,52 @@ namespace
         {
             if (tid == 0)
             {
+                const auto *const ticket =
+                    runtime ? runtime->overlay_epoch_ticket : nullptr;
+                const auto *const durable_banks =
+                    runtime_durable_placement_banks(runtime);
                 printf("runtime_small_group_invalid_contract "
-                       "publish_inputs=%d current_slots=%d max_slots=%d "
-                       "num_experts=%d top_k=%d route_capacity=%u deferred_capacity=%u\n",
+                       "publish_inputs=%d complete_plan=%d current_slots=%d max_slots=%d "
+                       "num_experts=%d top_k=%d block=%u bank=%u "
+                       "runtime=%p indices=%p weights=%p inverse=%p "
+                       "route_capacity=%u route_ids=%p route_weights=%p route_participants=%p "
+                       "expert_counts=%p expert_offsets=%p grouped_ids=%p grouped_weights=%p "
+                       "retain_deferred=%d deferred_capacity=%u deferred_ids=%p deferred_participants=%p "
+                       "ticket=%p ticket_epoch=%llu ticket_selector=%llu durable_banks=%p "
+                       "bank0_epoch=%u bank1_epoch=%u active_bank=%u transient=%u overlay_banks=%p\n",
                        PublishRouterInputs ? 1 : 0,
+                       PublishCompletePlan ? 1 : 0,
                        current_slots,
                        max_slots,
                        num_experts,
                        top_k,
+                       static_cast<unsigned>(blockDim.x),
+                       execution_bank,
+                       runtime,
+                       routing_indices,
+                       routing_weights,
+                       original_to_grouped,
                        runtime ? runtime->prefill_route_capacity : 0u,
-                       runtime ? runtime->deferred_verifier_route_capacity : 0u);
+                       runtime ? runtime->route_expert_ids : nullptr,
+                       runtime ? runtime->route_weights : nullptr,
+                       runtime ? runtime->route_participant_ids : nullptr,
+                       runtime ? runtime->expert_counts : nullptr,
+                       runtime ? runtime->expert_offsets : nullptr,
+                       runtime ? runtime->grouped_token_ids : nullptr,
+                       runtime ? runtime->grouped_route_weights : nullptr,
+                       retain_routes_for_deferred_commit,
+                       runtime ? runtime->deferred_verifier_route_capacity : 0u,
+                       runtime ? runtime->deferred_verifier_route_expert_ids : nullptr,
+                       runtime ? runtime->deferred_verifier_route_participant_ids : nullptr,
+                       ticket,
+                       static_cast<unsigned long long>(ticket ? ticket->epoch : 0u),
+                       static_cast<unsigned long long>(ticket ? ticket->selector : 0u),
+                       durable_banks,
+                       durable_banks ? durable_banks[0].epoch : 0u,
+                       durable_banks ? durable_banks[1].epoch : 0u,
+                       runtime ? runtime->active_bank : 0u,
+                       runtime ? runtime->current_batch_llep_transient_bank_active : 0u,
+                       runtime ? runtime->overlay_placement_banks : nullptr);
                 FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
                     "verifier-sized runtime grouping has an invalid device contract");
             }
@@ -14938,14 +15101,26 @@ namespace
                         expert_id = -1;
                         route_weight = 0.0f;
                     }
-                    else if (filter_to_local_runtime_experts != 0 &&
-                             !prefill_static_local_runtime_ready(
-                                 runtime,
-                                 expert_id,
-                                 num_experts))
+                    else if (filter_to_local_runtime_experts != 0)
                     {
-                        // Preserve the selected expert while excluding local work.
-                        route_weight = 0.0f;
+                        /* StaticOwner still publishes one globally canonical
+                         * participant ledger on every shard.  Local grouping
+                         * is a filtered view of that ledger; encoding a remote
+                         * owner as -1 made mapped sparse reducers mistake a
+                         * valid peer route for a heterogeneous/no-op route. */
+                        const DeviceMoEPlacementBankView &bank =
+                            runtime_placement_banks(runtime)[execution_bank];
+                        participant_id =
+                            runtime_expert_owner(bank, expert_id);
+                        if (participant_id !=
+                                static_cast<int>(runtime->participant_id) ||
+                            !prefill_static_local_runtime_ready(
+                                runtime,
+                                expert_id,
+                                num_experts))
+                        {
+                            route_weight = 0.0f;
+                        }
                     }
                     else
                     {
@@ -15234,27 +15409,36 @@ namespace
         {
             expert_id = static_cast<int>(routing_indices[slot]);
             weight = routing_weights[slot];
-            if (expert_id < 0 || expert_id >= num_experts)
+        if (expert_id < 0 || expert_id >= num_experts)
+        {
+            expert_id = -1;
+            weight = 0.0f;
+        }
+        else if (filter_to_local_runtime_experts != 0)
+        {
+            /*
+             * Preserve the authoritative StaticOwner participant even on a
+             * non-owner shard. Local route weights remain the execution
+             * filter; the participant ledger is shared by node-local sparse
+             * exchange, accepted-history publication, and later controllers.
+             */
+            const uint32_t execution_bank = runtime_execution_bank(runtime);
+            const DeviceMoEPlacementBankView &bank =
+                runtime_placement_banks(runtime)[execution_bank];
+            participant_id = runtime_expert_owner(bank, expert_id);
+            if (participant_id !=
+                    static_cast<int>(runtime->participant_id) ||
+                !prefill_static_local_runtime_ready(
+                    runtime,
+                    expert_id,
+                    num_experts))
             {
-                expert_id = -1;
                 weight = 0.0f;
             }
-            else if (filter_to_local_runtime_experts != 0 &&
-                     !prefill_static_local_runtime_ready(
-                         runtime,
-                         expert_id,
-                         num_experts))
-            {
-                /*
-                 * Preserve the router's selected expert for accepted-history
-                 * publication. An inactive participant id is sufficient to
-                 * exclude this route from local counts and grouped compute.
-                 */
-                weight = 0.0f;
-            }
-            else
-            {
-                participant_id = static_cast<int>(runtime->participant_id);
+        }
+        else
+        {
+            participant_id = static_cast<int>(runtime->participant_id);
             }
         }
 
@@ -16689,12 +16873,14 @@ namespace
         for (int mask = 16; mask > 0; mask >>= 1)
             abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
-        const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+        const float scale =
+            llaminar2::device_q8_activation_contract::scale(abs_value);
         if (lane == 0)
             scales_A_blockwise[block_idx] = scale;
 
-        const float q = hidden[col] / scale;
-        A_int8[col] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+        A_int8[col] = static_cast<int8_t>(
+            llaminar2::device_q8_activation_contract::quantize(
+                hidden[col], scale));
     }
 
     __global__ void router_gate_quantize_q8_kernel(
@@ -16723,13 +16909,15 @@ namespace
         for (int mask = 16; mask > 0; mask >>= 1)
             abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
-        const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+        const float scale =
+            llaminar2::device_q8_activation_contract::scale(abs_value);
         if (lane == 0)
             gate_scales[scale_idx] = scale;
 
-        const float q = value / scale;
         gate_weights_q8[scale_idx * kBlockSize + lane] =
-            static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+            static_cast<int8_t>(
+                llaminar2::device_q8_activation_contract::quantize(
+                    value, scale));
     }
 
     __global__ void router_gate_logits_single_token_q8_kernel(
@@ -16814,13 +17002,14 @@ namespace
         for (int mask = 16; mask > 0; mask >>= 1)
             abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
-        const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+        const float scale =
+            llaminar2::device_q8_activation_contract::scale(abs_value);
         if (lane == 0)
             scales_A_blockwise[static_cast<size_t>(row) * blocks_per_row + block_idx] = scale;
 
-        const float q = value / scale;
-        A_int8[row_offset + col] =
-            static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+        A_int8[row_offset + col] = static_cast<int8_t>(
+            llaminar2::device_q8_activation_contract::quantize(
+                value, scale));
     }
 
     /**
@@ -16945,19 +17134,22 @@ namespace
         {
             const int col = block_idx * kBlockSize + lane;
             const float g = gate[col];
-            const float value = (g / (1.0f + expf(-g))) * up[col];
+            const float value =
+                llaminar2::device_swiglu_contract::swigluValue(g, up[col]);
 
             float abs_value = fabsf(value);
 #pragma unroll
             for (int mask = 16; mask > 0; mask >>= 1)
                 abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
-            const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+            const float scale =
+                llaminar2::device_q8_activation_contract::scale(abs_value);
             if (lane == 0)
                 row_scales[block_idx] = scale;
 
-            const float q = value / scale;
-            row_int8[col] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+            row_int8[col] = static_cast<int8_t>(
+                llaminar2::device_q8_activation_contract::quantize(
+                    value, scale));
         }
     }
 
@@ -17026,13 +17218,15 @@ namespace
         for (int mask = 16; mask > 0; mask >>= 1)
             abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
-        const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+        const float scale =
+            llaminar2::device_q8_activation_contract::scale(abs_value);
         if (lane == 0)
             scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx] = scale;
 
-        const float q = value / scale;
         A_int8[static_cast<size_t>(slot) * K + col] =
-            static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+            static_cast<int8_t>(
+                llaminar2::device_q8_activation_contract::quantize(
+                    value, scale));
     }
 
     /**
@@ -17045,7 +17239,19 @@ namespace
      * different contraction inside a larger grouped kernel body.  The MoE
      * grouped prefill kernels need the same per-block contract; otherwise a
      * layer-0 ULP drift is amplified by recurrent GDN/short-conv state several
-     * layers later.
+     * layers later. This adapter computes only exact integer terms and then
+     * delegates publication to the shared CUDA/cross-backend contract.
+     *
+     * @tparam CodebookId Canonical NativeVNNI source-policy identifier.
+     * @param a_vals Eight packed activation groups for one 32-value K block.
+     * @param packed_groups Eight decoded signed-weight groups.
+     * @param payload Prepared codebook payload for IQ1_M sign extraction.
+     * @param scale_base Prepared primary binary16 scale plane.
+     * @param min_base Optional secondary scale or minimum plane.
+     * @param emin_base Optional Q2_K paired-minimum plane.
+     * @param linear Block-major prepared-metadata index.
+     * @param scale_a FP32 scale for the quantized activation block.
+     * @return Canonically rounded contribution, not yet row-accumulated.
      */
     template <uint8_t CodebookId>
     __device__ __forceinline__ float moe_native_vnni_block_contribution_rn(
@@ -17073,60 +17279,46 @@ namespace
                 sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[group + 4]);
             }
 
-            const float scale_lo =
-                llaminar2::cuda_native_vnni::fp16_bits_to_float(scale_base[linear]);
-            const float scale_hi = min_base
-                                       ? llaminar2::cuda_native_vnni::fp16_bits_to_float(min_base[linear])
-                                       : 0.0f;
-            const float dot_term = __fadd_rn(
-                __fmul_rn(scale_lo, static_cast<float>(dot_lo)),
-                __fmul_rn(scale_hi, static_cast<float>(dot_hi)));
-            float contribution = __fmul_rn(scale_a, dot_term);
-
-            if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale_asym)
-            {
-                const uint32_t emin = emin_base ? emin_base[linear] : 0u;
-                const float min_lo =
-                    llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin));
-                const float min_hi =
-                    llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
-                const float min_term = __fadd_rn(
-                    __fmul_rn(min_lo, static_cast<float>(sum_lo)),
-                    __fmul_rn(min_hi, static_cast<float>(sum_hi)));
-                contribution = __fadd_rn(contribution, __fmul_rn(scale_a, min_term));
-            }
-
+            uint16_t iq1m_qh = 0u;
+            int subgroup_sum0 = 0;
+            int subgroup_sum1 = 0;
+            int subgroup_sum2 = 0;
+            int subgroup_sum3 = 0;
             if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq1_m)
             {
-                constexpr float kIQ1SDelta = 0.125f;
-                const uint8_t qh0 = payload[4];
-                const uint8_t qh1 = payload[5];
-                const int sg0 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[0]) +
-                                llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[1]);
-                const int sg1 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[2]) +
-                                llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[3]);
-                const int sg2 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[4]) +
-                                llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[5]);
-                const int sg3 = llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[6]) +
-                                llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[7]);
-                const float delta0 = (qh0 & 0x08) ? -kIQ1SDelta : kIQ1SDelta;
-                const float delta1 = (qh0 & 0x80) ? -kIQ1SDelta : kIQ1SDelta;
-                const float delta2 = (qh1 & 0x08) ? -kIQ1SDelta : kIQ1SDelta;
-                const float delta3 = (qh1 & 0x80) ? -kIQ1SDelta : kIQ1SDelta;
-                const float lo_delta = __fmul_rn(
-                    __fadd_rn(__fmul_rn(delta0, static_cast<float>(sg0)),
-                              __fmul_rn(delta1, static_cast<float>(sg1))),
-                    scale_lo);
-                const float hi_delta = __fmul_rn(
-                    __fadd_rn(__fmul_rn(delta2, static_cast<float>(sg2)),
-                              __fmul_rn(delta3, static_cast<float>(sg3))),
-                    scale_hi);
-                contribution = __fadd_rn(
-                    contribution,
-                    __fmul_rn(scale_a, __fadd_rn(lo_delta, hi_delta)));
+                iq1m_qh = static_cast<uint16_t>(payload[4]) |
+                          (static_cast<uint16_t>(payload[5]) << 8u);
+                subgroup_sum0 =
+                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[0]) +
+                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[1]);
+                subgroup_sum1 =
+                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[2]) +
+                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[3]);
+                subgroup_sum2 =
+                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[4]) +
+                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[5]);
+                subgroup_sum3 =
+                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[6]) +
+                    llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[7]);
             }
 
-            return contribution;
+            return llaminar2::cuda_native_vnni::
+                native_vnni_block_contribution_from_reduced_terms_rn<
+                    CodebookId>(
+                    dot_lo,
+                    dot_hi,
+                    scale_a,
+                    scale_base[linear],
+                    min_base ? min_base[linear] : 0u,
+                    emin_base ? emin_base[linear] : 0u,
+                    sum_lo + sum_hi,
+                    sum_lo,
+                    sum_hi,
+                    iq1m_qh,
+                    subgroup_sum0,
+                    subgroup_sum1,
+                    subgroup_sum2,
+                    subgroup_sum3);
         }
         else
         {
@@ -17139,23 +17331,23 @@ namespace
                 sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(a_vals[group]);
             }
 
-            const float scale_b =
-                llaminar2::cuda_native_vnni::fp16_bits_to_float(scale_base[linear]);
-            float contribution = __fmul_rn(
-                __fmul_rn(scale_a, scale_b),
-                static_cast<float>(dot));
-
-            if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_asymmetric)
-            {
-                const float min_b = min_base
-                                        ? llaminar2::cuda_native_vnni::fp16_bits_to_float(min_base[linear])
-                                        : 0.0f;
-                contribution = __fadd_rn(
-                    contribution,
-                    __fmul_rn(__fmul_rn(scale_a, min_b), static_cast<float>(sum_a)));
-            }
-
-            return contribution;
+            return llaminar2::cuda_native_vnni::
+                native_vnni_block_contribution_from_reduced_terms_rn<
+                    CodebookId>(
+                    dot,
+                    0,
+                    scale_a,
+                    scale_base[linear],
+                    min_base ? min_base[linear] : 0u,
+                    0u,
+                    sum_a,
+                    0,
+                    0,
+                    0u,
+                    0,
+                    0,
+                    0,
+                    0);
         }
     }
 
@@ -17478,14 +17670,16 @@ namespace
             for (int mask = 16; mask > 0; mask >>= 1)
                 abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
-            const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+            const float scale =
+                llaminar2::device_q8_activation_contract::scale(abs_value);
             if (active)
             {
                 if (lane == 0)
                     swiglu_scales[static_cast<size_t>(slot) * blocks_per_row_out + quant_block] = scale;
-                const float q = value / scale;
                 swiglu_int8[static_cast<size_t>(slot) * N + n] =
-                    static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+                    static_cast<int8_t>(
+                        llaminar2::device_q8_activation_contract::quantize(
+                            value, scale));
             }
         }
     }
@@ -17514,13 +17708,15 @@ namespace
         for (int mask = 16; mask > 0; mask >>= 1)
             abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
-        const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+        const float scale =
+            llaminar2::device_q8_activation_contract::scale(abs_value);
         const int blocks_per_row = (K + 31) / 32;
         if (lane == 0)
             scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx] = scale;
 
-        const float q = value / scale;
-        A_int8[idx] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+        A_int8[idx] = static_cast<int8_t>(
+            llaminar2::device_q8_activation_contract::quantize(
+                value, scale));
     }
 
     template <uint8_t CodebookId, int kTileM, int kTileN>
@@ -18315,7 +18511,8 @@ namespace
         for (int mask = 16; mask > 0; mask >>= 1)
             abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
-        const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+        const float scale =
+            llaminar2::device_q8_activation_contract::scale(abs_value);
         const int blocks_per_row = (N + kTileN - 1) / kTileN;
         if (lane == 0)
             swiglu_scales[static_cast<size_t>(grouped_slot) * static_cast<size_t>(blocks_per_row) +
@@ -18323,14 +18520,15 @@ namespace
 
         if (active)
         {
-            const float q = value / scale;
             swiglu_int8[static_cast<size_t>(grouped_slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
-                static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+                static_cast<int8_t>(
+                    llaminar2::device_q8_activation_contract::quantize(
+                        value, scale));
         }
     }
 
     /**
-     * @brief Compute one weighted split-K partial per original router slot.
+     * @brief Compute one unweighted split-K partial per original router slot.
      *
      * Unlike the ordinary decode kernel, this launch never sums different
      * routes.  The route dimension survives the participant collective, which
@@ -18342,7 +18540,6 @@ namespace
         const float *__restrict__ scales_A_blockwise,
         const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
         const int *__restrict__ expert_ids,
-        const float *__restrict__ route_weights,
         float *__restrict__ partials,
         int num_active,
         int N,
@@ -18384,16 +18581,15 @@ namespace
         const int8_t *slot_A = A_int8 + static_cast<size_t>(route) * K;
         const float *slot_scales =
             scales_A_blockwise + static_cast<size_t>(route) * blocks_per_row;
-        const float expert_value =
+        partials[partial_index] =
             native_vnni_dot_desc_range_dispatch<CodebookId>(
                 desc, n, slot_A, slot_scales, N, K, b_start, b_end);
-        partials[partial_index] =
-            moe_weight_route_rn(route_weights[route], expert_value);
     }
 
     /** @brief Sum split-K partials while preserving the route dimension. */
     __global__ void grouped_native_vnni_down_kpart_route_reduce_kernel(
         const float *__restrict__ partials,
+        const float *__restrict__ route_weights,
         float *__restrict__ route_output,
         int num_active,
         int N,
@@ -18420,7 +18616,8 @@ namespace
         }
         route_output[
             static_cast<size_t>(route) * static_cast<size_t>(N) +
-            static_cast<size_t>(n)] = sum;
+            static_cast<size_t>(n)] =
+            moe_weight_route_rn(route_weights[route], sum);
     }
 
     /**
@@ -18435,6 +18632,7 @@ namespace
      */
     __global__ void grouped_native_vnni_down_kpart_routes_reduce_kernel(
         const float *__restrict__ partials,
+        const float *__restrict__ route_weights,
         float *__restrict__ output,
         int num_active,
         int N,
@@ -18462,7 +18660,9 @@ namespace
                                          static_cast<size_t>(N) +
                         static_cast<size_t>(n)]);
             }
-            output_sum = moe_accumulate_rn(output_sum, route_sum);
+            output_sum = moe_accumulate_rn(
+                output_sum,
+                moe_weight_route_rn(route_weights[route], route_sum));
         }
         output[n] = output_sum;
     }
@@ -18482,7 +18682,6 @@ namespace
         const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
         const int *__restrict__ original_to_grouped,
         const int *__restrict__ original_expert_ids,
-        const float *__restrict__ grouped_weights,
         float *__restrict__ partials,
         int original_slot_base,
         int tile_route_slots,
@@ -18532,16 +18731,22 @@ namespace
         const float *slot_scales =
             scales_A_blockwise +
             static_cast<size_t>(grouped_slot) * blocks_per_row;
-        const float expert_value =
+        partials[partial_index] =
             native_vnni_dot_desc_range_dispatch<CodebookId>(
                 desc, n, slot_A, slot_scales, N, K, b_start, b_end);
-        partials[partial_index] =
-            moe_weight_route_rn(grouped_weights[grouped_slot], expert_value);
     }
 
-    /** @brief Reduce grouped split-K partials into persistent route slots. */
+    /**
+     * @brief Reduce one expert row, then weight its persistent route slot.
+     *
+     * Applying the router weight after the ordered K fold is part of the
+     * cross-backend arithmetic contract. Multiplying every partial separately
+     * is algebraically similar but changes FP32 parenthesization.
+     */
     __global__ void grouped_prefill_down_canonical_kpart_reduce_kernel(
         const float *__restrict__ partials,
+        const int *__restrict__ original_to_grouped,
+        const float *__restrict__ grouped_weights,
         float *__restrict__ route_output,
         int original_slot_base,
         int tile_route_slots,
@@ -18567,10 +18772,14 @@ namespace
                                        static_cast<size_t>(N) +
                     static_cast<size_t>(n)]);
         }
+        const int original_slot = original_slot_base + local_route;
+        const int grouped_slot = original_to_grouped[original_slot];
         route_output[
-            static_cast<size_t>(original_slot_base + local_route) *
-                static_cast<size_t>(N) +
-            static_cast<size_t>(n)] = sum;
+            static_cast<size_t>(original_slot) * static_cast<size_t>(N) +
+            static_cast<size_t>(n)] =
+            grouped_slot >= 0
+                ? moe_weight_route_rn(grouped_weights[grouped_slot], sum)
+                : 0.0f;
     }
 
     /**
@@ -18578,9 +18787,9 @@ namespace
      *
      * One eight-warp block owns 32 output columns for one verifier token. Each
      * warp evaluates one router route at a time. It preserves the canonical
-     * arithmetic by weighting every K-partition independently, summing those
-     * partials in ascending partition order, and then having warp zero sum the
-     * completed routes in ascending router order.
+     * arithmetic by summing K partitions in ascending order, applying one
+     * router weight to the completed expert row, and then having warp zero sum
+     * the completed routes in ascending router order.
      */
     template <uint8_t CodebookId>
     __global__ void grouped_prefill_down_canonical_kpart_fused_direct_kernel(
@@ -18633,6 +18842,7 @@ namespace
                         scales_A_blockwise +
                         static_cast<size_t>(grouped_slot) * blocks_per_row;
                     const float route_weight = grouped_weights[grouped_slot];
+                    float expert_sum = 0.0f;
 
 #pragma unroll 1
                     for (int k_part = 0; k_part < k_partitions; ++k_part)
@@ -18640,19 +18850,18 @@ namespace
                         const int b_start = k_part * blocks_per_part;
                         const int b_end =
                             min(blocks_per_row, b_start + blocks_per_part);
-                        float weighted_partial = 0.0f;
+                        float expert_partial = 0.0f;
                         if (b_start < b_end)
                         {
-                            const float expert_partial =
+                            expert_partial =
                                 native_vnni_dot_desc_range_dispatch<CodebookId>(
                                     desc, n, slot_A, slot_scales, N, K,
                                     b_start, b_end);
-                            weighted_partial =
-                                moe_weight_route_rn(route_weight, expert_partial);
                         }
-                        route_sum =
-                            moe_accumulate_rn(route_sum, weighted_partial);
+                        expert_sum =
+                            moe_accumulate_rn(expert_sum, expert_partial);
                     }
+                    route_sum = moe_weight_route_rn(route_weight, expert_sum);
                 }
             }
             route_sums[route][lane] = route_sum;
@@ -18863,7 +19072,8 @@ namespace
                     const float gate = gate_rows[route][k];
                     const float up = up_rows[route][k];
                     const float swiglu =
-                        (gate / (1.0f + expf(-gate))) * up;
+                        llaminar2::device_swiglu_contract::swigluValue(
+                            gate, up);
                     sum = fmaf(
                         swiglu,
                         load_floating_moe_weight(
@@ -19063,7 +19273,8 @@ namespace
                     const float gate = grouped_gate[row_base + k];
                     const float up = grouped_up[row_base + k];
                     const float swiglu =
-                        (gate / (1.0f + expf(-gate))) * up;
+                        llaminar2::device_swiglu_contract::swigluValue(
+                            gate, up);
                     sum = fmaf(
                         swiglu,
                         load_floating_moe_weight(
@@ -19483,7 +19694,6 @@ namespace
         const float *__restrict__ scales_A_blockwise,
         const DeviceMoELayerRuntimeView *__restrict__ runtime,
         const int *__restrict__ expert_ids,
-        const float *__restrict__ route_weights,
         float *__restrict__ partials,
         int num_active,
         int N,
@@ -19539,11 +19749,9 @@ namespace
         const float *route_scales =
             scales_A_blockwise +
             static_cast<size_t>(route) * static_cast<size_t>(blocks_per_row);
-        const float expert_value =
+        partials[partial_index] =
             native_vnni_dot_desc_range_dispatch<CodebookId>(
                 desc, n, route_A, route_scales, N, K, b_start, b_end);
-        partials[partial_index] =
-            moe_weight_route_rn(route_weights[route], expert_value);
     }
 
     /** Static compiler and occupancy evidence for one exact CUDA kernel. */
@@ -20289,26 +20497,62 @@ extern "C"
             top_k > num_experts)
             return false;
         cudaSetDevice(device_idx);
+        const bool apply_ready_rebalance = runtime_layers != nullptr;
+        const bool complete_rebalance_binding =
+            runtime_layers && rebalance_plan_entries &&
+            rebalance_plan_capacity > 0u && rebalance_command_header &&
+            rebalance_config && rebalance_apply_status &&
+            rebalance_controller_state &&
+            rebalance_command_buffer_count > 0u;
+        const bool any_rebalance_binding =
+            runtime_layers || rebalance_plan_entries ||
+            rebalance_plan_capacity > 0u || rebalance_command_header ||
+            rebalance_local_transfer_slots ||
+            rebalance_local_transfer_slot_count > 0u || rebalance_config ||
+            rebalance_apply_status || rebalance_controller_state ||
+            rebalance_target_layer >= 0;
+        if (any_rebalance_binding && !complete_rebalance_binding)
+            return false;
+
         DeviceMoERebalanceConfigView rebalance_cfg{};
         if (rebalance_config)
             rebalance_cfg = *static_cast<const DeviceMoERebalanceConfigView *>(rebalance_config);
-        softmax_topk_decode_runtime_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-            logits, static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),
-            static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
-            legacy_indices, legacy_weights, num_experts, top_k, normalize_weights,
-            write_legacy_outputs, update_runtime_histogram,
-            fully_replicated_local_rows,
-            absolute_position_ids,
-            static_cast<const DeviceMoERebalancePlanEntryView *>(rebalance_plan_entries),
-            rebalance_plan_capacity,
-            static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(rebalance_command_header),
-            static_cast<const DeviceMoEExpertDirectoryEntryView *>(rebalance_local_transfer_slots),
-            rebalance_local_transfer_slot_count,
-            rebalance_cfg,
-            static_cast<DeviceMoERebalanceApplyStatusView *>(rebalance_apply_status),
-            static_cast<DeviceMoERebalanceGraphControllerStateView *>(rebalance_controller_state),
-            rebalance_target_layer,
-            rebalance_command_buffer_count);
+
+#define LLAMINAR_LAUNCH_DECODE_ROUTE(HISTOGRAM, APPLY)                                      \
+        softmax_topk_decode_runtime_kernel<HISTOGRAM, APPLY>                                \
+            <<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(                         \
+                logits, static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),             \
+                static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),                    \
+                legacy_indices, legacy_weights, num_experts, top_k, normalize_weights,       \
+                write_legacy_outputs, fully_replicated_local_rows, absolute_position_ids,    \
+                static_cast<const DeviceMoERebalancePlanEntryView *>(rebalance_plan_entries),\
+                rebalance_plan_capacity,                                                     \
+                static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(                    \
+                    rebalance_command_header),                                               \
+                static_cast<const DeviceMoEExpertDirectoryEntryView *>(                      \
+                    rebalance_local_transfer_slots),                                         \
+                rebalance_local_transfer_slot_count, rebalance_cfg,                          \
+                static_cast<DeviceMoERebalanceApplyStatusView *>(rebalance_apply_status),     \
+                static_cast<DeviceMoERebalanceGraphControllerStateView *>(                   \
+                    rebalance_controller_state),                                             \
+                rebalance_target_layer, rebalance_command_buffer_count)
+
+        if (update_runtime_histogram)
+        {
+            if (apply_ready_rebalance)
+                LLAMINAR_LAUNCH_DECODE_ROUTE(true, true);
+            else
+                LLAMINAR_LAUNCH_DECODE_ROUTE(true, false);
+        }
+        else if (apply_ready_rebalance)
+        {
+            LLAMINAR_LAUNCH_DECODE_ROUTE(false, true);
+        }
+        else
+        {
+            LLAMINAR_LAUNCH_DECODE_ROUTE(false, false);
+        }
+#undef LLAMINAR_LAUNCH_DECODE_ROUTE
         return finishLaunch("cudaMoE_softmax_topk_decode_runtime");
     }
 
@@ -20499,10 +20743,14 @@ extern "C"
         const void *wave_state,
         const void *controller_state,
         uint32_t command_buffer_count,
+        uint32_t histogram_source_mask,
+        unsigned long long *previous_activation_counts,
         int device_idx,
         void *stream)
     {
-        if (!runtime_layers || !local_histograms || !config || !stream)
+        if (!runtime_layers || !local_histograms || !config || !stream ||
+            !llaminar2::moe_runtime_abi::validHistogramSourceMask(
+                histogram_source_mask))
             return false;
         cudaSetDevice(device_idx);
         const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
@@ -20522,7 +20770,9 @@ extern "C"
             cfg,
             static_cast<const DeviceMoERebalanceWaveStateView *>(wave_state),
             static_cast<const DeviceMoERebalanceGraphControllerStateView *>(controller_state),
-            command_buffer_count);
+            command_buffer_count,
+            histogram_source_mask,
+            previous_activation_counts);
         return finishLaunch("cudaMoE_pack_rebalance_histograms");
     }
 
@@ -22649,7 +22899,7 @@ extern "C"
     grouped_native_vnni_down_kpart_decode_route_kernel<CB>                                 \
         <<<scatter_grid, block, 0, cuda_stream>>>(                                         \
             d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids,                    \
-            d_weights, d_down_partials, num_active, N, K, num_experts,                     \
+            d_down_partials, num_active, N, K, num_experts,                                \
             k_partitions)
 
         switch (codebook_id)
@@ -22689,6 +22939,7 @@ extern "C"
             grouped_native_vnni_down_kpart_route_reduce_kernel<<<
                 route_reduce_grid, block, 0, cuda_stream>>>(
                 d_down_partials,
+                d_weights,
                 d_canonical_route_contributions,
                 num_active,
                 N,
@@ -22698,7 +22949,8 @@ extern "C"
         {
             grouped_native_vnni_down_kpart_routes_reduce_kernel<<<
                 direct_reduce_grid, block, 0, cuda_stream>>>(
-                d_down_partials, d_output, num_active, N, k_partitions);
+                d_down_partials, d_weights, d_output,
+                num_active, N, k_partitions);
         }
 
         return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart reduce");
@@ -22755,7 +23007,7 @@ extern "C"
 
 #define LAUNCH_GROUPED_DOWN_RUNTIME_KPART(CB)                                                   \
     grouped_native_vnni_down_kpart_decode_runtime_kernel<CB><<<scatter_grid, block, 0, cuda_stream>>>( \
-        d_swiglu_int8, d_swiglu_scales, runtime, d_expert_ids, d_weights,                       \
+        d_swiglu_int8, d_swiglu_scales, runtime, d_expert_ids,                                  \
         d_down_partials, num_active, N, K, num_experts, k_partitions)
 
         switch (codebook_id)
@@ -22791,7 +23043,8 @@ extern "C"
 
         grouped_native_vnni_down_kpart_routes_reduce_kernel<<<
             reduce_grid, block, 0, cuda_stream>>>(
-            d_down_partials, d_output, num_active, N, k_partitions);
+            d_down_partials, d_weights, d_output,
+            num_active, N, k_partitions);
 
         return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart reduce");
     }
@@ -23330,7 +23583,7 @@ extern "C"
                 <<<scatter_grid, scatter_block, 0, cuda_stream>>>(                   \
                     d_scratch_swiglu_int8, d_scratch_swiglu_scales,                  \
                     d_down_desc_table, d_original_to_grouped,                        \
-                    d_original_expert_ids, d_group_weights, d_down_partials,         \
+                    d_original_expert_ids, d_down_partials,                          \
                     original_slot_base, tile_route_slots, N, K, num_experts,         \
                     down_k_partitions);                                              \
         } else {                                                                     \
@@ -23405,6 +23658,8 @@ extern "C"
                     grouped_prefill_down_canonical_kpart_reduce_kernel<<<
                         route_reduce_grid, reduce_block, 0, cuda_stream>>>(
                         d_down_partials,
+                        d_original_to_grouped,
+                        d_group_weights,
                         d_canonical_route_contributions,
                         original_slot_base,
                         tile_route_slots,

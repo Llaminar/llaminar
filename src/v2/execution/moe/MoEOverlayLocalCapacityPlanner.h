@@ -12,7 +12,9 @@
 
 #pragma once
 
+#include "MoEOverlayActivationChannelPlan.h"
 #include "MoEOverlayCapacityAdmission.h"
+#include "MoEExpertOverlayExecutionPlan.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "loaders/GPUVramPreflight.h"
@@ -47,7 +49,11 @@ namespace llaminar2
         const RankExecutionPlan *rank_plan = nullptr;
         const MoERoutedExpertPlacementPlan *overlay_plan = nullptr;
         const RankInventory *rank_inventory = nullptr;
-        bool builds_root_graph = false;
+        /** Complete physical-node authority for distributed activation lanes. */
+        const ClusterInventory *cluster_inventory = nullptr;
+        /** Exclusive graph/command lifecycle assigned by overlay planning. */
+        OverlayRankExecutionKind rank_execution_kind =
+            OverlayRankExecutionKind::RelayOnly;
         /** Include CPU authority even when no tier participant computes on CPU. */
         bool require_host_memory_authority = false;
         /** Optional hard physical limits; absent means inventory capacity. */
@@ -55,6 +61,12 @@ namespace llaminar2
         std::optional<std::size_t> max_cpu_memory_bytes;
         /** Candidate graph rows; zero selects the configured maximum shape. */
         int resident_graph_rows = 0;
+        /** Exact max rows embedded by every retained activation transaction. */
+        int activation_channel_row_capacity = 0;
+        /** Main plus routed MTP graph families sharing each channel. */
+        std::size_t activation_graph_family_count = 0;
+        /** Native graph executables simultaneously retained on each GPU. */
+        std::size_t captured_graph_executable_count = 0;
         /** Required whenever this rank's physical resources include a GPU. */
         std::optional<MoEOverlayGPUWeightLoadCapacityInput>
             gpu_weight_load;
@@ -65,6 +77,8 @@ namespace llaminar2
     {
         int resident_graph_rows = 0;
         MemoryPlan fixed_memory_plan;
+        /** Shared pure topology/BOM also consumed by transport preflight. */
+        MoEOverlayActivationChannelPlan activation_channel_plan;
         std::vector<MoEOverlayBoundPhysicalMemoryBudget> physical_budgets;
     };
 
@@ -77,6 +91,28 @@ namespace llaminar2
         int first_layer = 0;
         int last_layer = -1;
     };
+
+    /**
+     * @brief Replace discovery-time GPU memory with a runtime-stable observation.
+     *
+     * CUDA and ROCm discovery may run before the production device context,
+     * BLAS handles, streams, and collective resources exist. Expert capacity
+     * must therefore use a second observation after those fixed runtime owners
+     * have been created. This helper is the single typed mutation point for
+     * that observation and deliberately treats both GPU backends identically.
+     *
+     * @param inventory Rank-local hardware inventory to update.
+     * @param device Exact CUDA or ROCm device whose production context is live.
+     * @param total_bytes Physical device memory reported by the live backend.
+     * @param free_bytes Free memory after fixed runtime initialization.
+     * @throws std::invalid_argument for a non-GPU device, invalid byte counts,
+     *         or a device absent from the rank inventory.
+     */
+    void installMoEOverlayRuntimeGPUCapacityObservation(
+        RankInventory &inventory,
+        DeviceId device,
+        std::size_t total_bytes,
+        std::size_t free_bytes);
 
     /**
      * @brief Build exact fixed setup charges without assigning a live expert.
@@ -99,15 +135,15 @@ namespace llaminar2
          * device plus several expert-only devices.
          *
          * @param rank_plan Fully resolved production rank plan.
-         * @param builds_root_graph Whether this rank constructs continuation
-         *        graph shards at all.
+         * @param execution_kind Exclusive overlay rank lifecycle. Authority and
+         *        peer kinds own continuation shards; follower/relay kinds do not.
          * @return Participant-local continuation shard descriptors.
          * @throws std::invalid_argument for malformed LocalPP boundaries.
          */
         [[nodiscard]] static std::vector<MoEOverlayContinuationShard>
         continuationShards(
             const RankExecutionPlan &rank_plan,
-            bool builds_root_graph);
+            OverlayRankExecutionKind execution_kind);
 
         /**
          * @brief Create a stable diagnostic identity for one physical resource.

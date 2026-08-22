@@ -7,11 +7,14 @@
 
 #include "backends/DeviceId.h"
 #include "DecodeExpertHistogram.h"
+#include "MoEOverlayActivationPayloadLayout.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -222,12 +225,70 @@ namespace llaminar2
         size_t live_entry_count = 0;
         size_t row_capacity = 0;
         size_t entry_capacity = 0;
+        /**
+         * Number of addressable rows in @ref hidden_rows_fp32.
+         *
+         * This is deliberately independent of compact @ref row_capacity. A
+         * node-local multi-row activation packet stores compact CSR metadata
+         * but references the source transaction's shared physical-row matrix.
+         */
+        size_t hidden_row_capacity = 0;
+        /** Immutable interpretation of @ref hidden_rows_fp32 for this view. */
+        MoEOverlayActivationHiddenPayloadLayout hidden_payload_layout =
+            MoEOverlayActivationHiddenPayloadLayout::CompactRows;
 
         int32_t *row_ids_host = nullptr;
         int32_t *entry_offsets_host = nullptr;
         int32_t *expert_ids_host = nullptr;
         float *route_weights_host = nullptr;
         float *hidden_rows_fp32 = nullptr;
+
+        /**
+         * @brief Resolve one compact packet row to its authoritative hidden row.
+         *
+         * Compact payloads use @p compact_row directly. Shared physical
+         * payloads use the authenticated packet's logical row id. Returning a
+         * null pointer is a structural protocol failure: callers must reject
+         * it rather than reading another matrix or copying a fallback payload.
+         *
+         * @param compact_row Row ordinal in the compact CSR packet.
+         * @return Exact hidden-row address, or null for invalid geometry.
+         */
+        [[nodiscard]] const float *hiddenRowForCompactIndex(
+            size_t compact_row) const noexcept
+        {
+            if (!hidden_rows_fp32 || !row_ids_host || d_model <= 0 ||
+                compact_row >= live_row_count ||
+                !isValidMoEOverlayActivationHiddenPayloadLayout(
+                    hidden_payload_layout))
+            {
+                return nullptr;
+            }
+            size_t hidden_row = compact_row;
+            if (hidden_payload_layout ==
+                MoEOverlayActivationHiddenPayloadLayout::SharedPhysicalRows)
+            {
+                const int32_t physical_row = row_ids_host[compact_row];
+                if (physical_row < 0)
+                    return nullptr;
+                hidden_row = static_cast<size_t>(physical_row);
+            }
+            if (hidden_row >= hidden_row_capacity)
+                return nullptr;
+            return hidden_rows_fp32 +
+                   hidden_row * static_cast<size_t>(d_model);
+        }
+
+        /**
+         * @copydoc hiddenRowForCompactIndex(size_t) const
+         */
+        [[nodiscard]] float *hiddenRowForCompactIndex(
+            size_t compact_row) noexcept
+        {
+            return const_cast<float *>(
+                static_cast<const MoEOverlaySparseRows &>(*this)
+                    .hiddenRowForCompactIndex(compact_row));
+        }
     };
 
     struct MoEOverlayReturnRows
@@ -266,6 +327,12 @@ namespace llaminar2
 
     size_t denseMoEOverlayDispatchBytes(int seq_len, int top_k, int d_model);
     size_t denseMoEOverlayReturnBytes(int seq_len, int d_model);
+    /**
+     * @brief Return exact live dispatch bytes under the device packet ABI.
+     *
+     * Empty participant contributions publish no payload bytes; their
+     * setup-owned CSR sentinel remains outside the live-byte accounting.
+     */
     size_t compactMoEOverlayDispatchBytes(const MoEOverlaySparseRows &rows);
     size_t compactMoEOverlayReturnBytes(const MoEOverlayReturnRows &rows);
     MoEOverlaySparseTransferCounters measureMoEOverlaySparseTransferCounters(
@@ -426,6 +493,76 @@ namespace llaminar2
                                                         IDeviceContext *ctx) = 0;
 
         virtual void abort(const MoEOverlayCollectiveKey &key, int reason_code) = 0;
+    };
+
+    /**
+     * @brief Allocation-free sparse transport between endpoints on one rank.
+     *
+     * A distributed rank graph may contain the continuation endpoint itself
+     * and/or colocated participants from another tier. Neither relation needs
+     * an MPI collective: a rank-local packet has one exact consumer and its
+     * return has one exact destination. The endpoints may share a logical
+     * participant ID (continuation loopback) or use distinct participant IDs
+     * (colocated cross-participant execution). Both are the same ownership and
+     * ordering lifecycle, so one context handles them without manufacturing a
+     * second loopback protocol or empty contributions for remote ranks.
+     *
+     * The context copies between setup-owned sparse views immediately and
+     * retains a fixed replay ledger. It never allocates during execution.
+     */
+    class MoEOverlayRankLocalSparseCollectiveContext final
+        : public IMoEOverlaySparseCollectiveContext
+    {
+    public:
+        /** @brief Immutable stale-key ledger capacity. */
+        struct Config
+        {
+            size_t slot_count = 0;
+        };
+
+        /**
+         * @brief Allocate the fixed replay ledger.
+         * @param config Positive model-lifetime slot capacity.
+         * @throws std::invalid_argument when no slots are provided.
+         */
+        explicit MoEOverlayRankLocalSparseCollectiveContext(Config config);
+        ~MoEOverlayRankLocalSparseCollectiveContext() override = default;
+
+        /** @brief Publish one compact packet directly into its local consumer view. */
+        MoEOverlayCollectiveResult dispatch(
+            const MoEOverlayCollectiveKey &key,
+            const MoEOverlaySparseRows &outbound,
+            MoEOverlaySparseRows *inbound,
+            IDeviceContext *ctx) override;
+
+        /** @brief Publish one compact result directly into its local continuation view. */
+        MoEOverlayCollectiveResult returnReduce(
+            const MoEOverlayCollectiveKey &key,
+            const MoEOverlayReturnRows &outbound,
+            MoEOverlayReturnRows *inbound,
+            IDeviceContext *ctx) override;
+
+        /** @brief Mark one exact key terminal so a later publication is rejected. */
+        void abort(
+            const MoEOverlayCollectiveKey &key,
+            int reason_code) override;
+
+    private:
+        /** @brief One bounded replay slot for each protocol direction. */
+        struct ReplaySlot
+        {
+            std::optional<MoEOverlayCollectiveKey> completed;
+            std::optional<MoEOverlayCollectiveKey> aborted;
+            int abort_reason = 0;
+        };
+
+        /** @return Direction-qualified fixed ledger containing @p key. */
+        std::vector<ReplaySlot> &ledgerFor(
+            const MoEOverlayCollectiveKey &key) noexcept;
+
+        std::vector<ReplaySlot> dispatch_slots_; ///< Dispatch replay ledger.
+        std::vector<ReplaySlot> return_slots_;   ///< Return replay ledger.
+        std::mutex mutex_; ///< Protects direct edges executed by concurrent graph segments.
     };
 
     class MoEOverlayLocalSparseCollectiveContext final : public IMoEOverlaySparseCollectiveContext

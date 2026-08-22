@@ -712,8 +712,14 @@ namespace llaminar2
             graph_config.moe.overlay_mpi_ctx = config.moe_expert_overlay_mpi_ctx
                                                    ? config.moe_expert_overlay_mpi_ctx
                                                    : runner_mpi_ctx;
+            graph_config.moe.rank_batch_transport_registry =
+                config.moe_rank_batch_transport_registry;
+            graph_config.moe.device_controller_fabric =
+                config.moe_device_controller_fabric;
             graph_config.moe.node_local_route_exchange =
                 config.moe_node_local_route_exchange;
+            graph_config.moe.node_local_route_transport =
+                config.moe_node_local_route_transport;
             graph_config.dense_tp_enabled = !overlayPlanDisablesDenseTP(*plan);
             graph_config.dense_tp_decode_replicated =
                 graph_config.dense_tp_enabled &&
@@ -1873,10 +1879,11 @@ namespace llaminar2
      * A generic dense continuation plan normally includes every routed-expert
      * parent for its graph device. That is not valid for an overlay: a
      * participant-local graph may prepare only the expert IDs owned by logical
-     * participants mapped to that exact physical device. Filtering by both MPI
-     * rank and device is important for LocalTP, where several graphs share one
-     * rank and one additive PreparedWeightStore but retain independent frozen
-     * binding sets and device memory authorities.
+     * participants mapped to its explicit execution devices. Ordinarily that
+     * is one exact physical device. A heterogeneous continuation-root graph is
+     * also the execution owner of colocated CPU sparse endpoints, so their
+     * exact slices join the same frozen plan. LocalTP sibling GPU graphs remain
+     * device-specific and cannot materialize each other's experts.
      *
      * Replace every generic parent with the exact expert-axis requirements
      * declared by the canonical owner map for this graph. This makes source
@@ -1899,6 +1906,13 @@ namespace llaminar2
         const MoEExpertOwnerMap owner_map =
             MoEExpertOwnerMap::build(*placement);
         const int rank = execution->currentRankPlan().world_rank;
+        const bool graph_owns_colocated_cpu_endpoints =
+            graph_device.is_gpu() &&
+            graph_config.moe.expert_overlay_runtime_plan &&
+            execution->currentRankPlan().hasRole(
+                OverlayRankRole::ContinuationRoot) &&
+            graph_device == graph_config.moe.expert_overlay_runtime_plan
+                                ->continuationDevice();
 
         std::vector<const MoEExpertOwnerParticipant *> graph_local;
         for (const auto &participant : owner_map.participants())
@@ -1912,7 +1926,9 @@ namespace llaminar2
                     "cannot be materialized");
             }
             if (participant.world_rank == rank &&
-                participant.device == graph_device)
+                (participant.device == graph_device ||
+                 (graph_owns_colocated_cpu_endpoints &&
+                  participant.device.is_cpu())))
             {
                 graph_local.push_back(&participant);
             }

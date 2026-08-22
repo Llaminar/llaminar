@@ -347,12 +347,46 @@ namespace llaminar2
         };
     }
 
+    MoEOverlayInferenceWorkloadIdentity
+    MoEOverlayInferenceTransactionTicket::prefillScheduleWorkload()
+        const noexcept
+    {
+        if (prefill_schedule_real_rows == 0 &&
+            prefill_schedule_execution_rows == 0 &&
+            prefill_schedule_transaction_count == 0 &&
+            prefill_schedule_fingerprint == 0)
+        {
+            return {};
+        }
+        return {
+            .source = ExpertHistogramSource::PrefillChunk,
+            .real_rows = prefill_schedule_real_rows,
+            .execution_rows = prefill_schedule_execution_rows,
+            .transaction_count = prefill_schedule_transaction_count,
+            .speculative_depth = 0,
+            .schedule_fingerprint = prefill_schedule_fingerprint,
+        };
+    }
+
     bool MoEOverlayInferenceTransactionTicket::valid() const noexcept
     {
+        const bool no_prefill_schedule =
+            prefill_schedule_real_rows == 0 &&
+            prefill_schedule_execution_rows == 0 &&
+            prefill_schedule_transaction_count == 0 &&
+            prefill_schedule_reserved == 0 &&
+            prefill_schedule_fingerprint == 0;
+        const auto prefill_schedule = prefillScheduleWorkload();
+        const bool valid_prefill_schedule =
+            prefill_schedule_reserved == 0 &&
+            prefill_schedule.valid() &&
+            prefill_schedule.source == ExpertHistogramSource::PrefillChunk &&
+            prefill_schedule.speculative_depth == 0;
         if (magic != kMagic || abi_version != kABIVersion ||
             !validAction(action) || !topologyIdentity().valid() ||
             request_generation == 0 || command_id == 0 ||
-            transaction_ordinal == 0 || placement_epoch == 0)
+            transaction_ordinal == 0 || placement_epoch == 0 ||
+            (!no_prefill_schedule && !valid_prefill_schedule))
         {
             return false;
         }
@@ -368,12 +402,14 @@ namespace llaminar2
                    graph_role == MoEOverlayInferenceGraphRole::None &&
                    request_count == 0 && logical_rows_per_request == 0 &&
                    physical_rows_per_request == 0 && draft_depth == -1 &&
-                   sidecar_depth == -1;
+                   sidecar_depth == -1 && no_prefill_schedule;
         }
 
         if (!executableRole(graph_role) || error_code != 0 ||
             request_count <= 0 || logical_rows_per_request <= 0 ||
-            physical_rows_per_request < logical_rows_per_request)
+            physical_rows_per_request < logical_rows_per_request ||
+            (!no_prefill_schedule &&
+             graph_role != MoEOverlayInferenceGraphRole::MainPrefill))
         {
             return false;
         }
@@ -419,7 +455,15 @@ namespace llaminar2
                << physical_rows_per_request
                << ",draft_depth=" << draft_depth
                << ",sidecar_depth=" << sidecar_depth
-               << ",error_code=" << error_code;
+               << ",error_code=" << error_code
+               << ",prefill_schedule_real_rows="
+               << prefill_schedule_real_rows
+               << ",prefill_schedule_execution_rows="
+               << prefill_schedule_execution_rows
+               << ",prefill_schedule_transactions="
+               << prefill_schedule_transaction_count
+               << ",prefill_schedule_fingerprint="
+               << prefill_schedule_fingerprint;
         return stream.str();
     }
 
@@ -435,8 +479,21 @@ namespace llaminar2
         int logical_rows_per_request,
         int physical_rows_per_request,
         int draft_depth,
-        int sidecar_depth)
+        int sidecar_depth,
+        const MoEOverlayInferenceWorkloadIdentity &
+            prefill_schedule_workload)
     {
+        const bool carries_prefill_schedule =
+            prefill_schedule_workload.valid();
+        if (carries_prefill_schedule &&
+            (graph_role != MoEOverlayInferenceGraphRole::MainPrefill ||
+             prefill_schedule_workload.source !=
+                 ExpertHistogramSource::PrefillChunk ||
+             prefill_schedule_workload.speculative_depth != 0))
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay aggregate prefill workload may accompany only a main-prefill ticket");
+        }
         MoEOverlayInferenceTransactionTicket ticket{
             .magic = MoEOverlayInferenceTransactionTicket::kMagic,
             .abi_version =
@@ -459,6 +516,23 @@ namespace llaminar2
             .draft_depth = draft_depth,
             .sidecar_depth = sidecar_depth,
             .error_code = 0,
+            .prefill_schedule_real_rows =
+                carries_prefill_schedule
+                    ? prefill_schedule_workload.real_rows
+                    : 0,
+            .prefill_schedule_execution_rows =
+                carries_prefill_schedule
+                    ? prefill_schedule_workload.execution_rows
+                    : 0,
+            .prefill_schedule_transaction_count =
+                carries_prefill_schedule
+                    ? prefill_schedule_workload.transaction_count
+                    : 0,
+            .prefill_schedule_reserved = 0,
+            .prefill_schedule_fingerprint =
+                carries_prefill_schedule
+                    ? prefill_schedule_workload.schedule_fingerprint
+                    : 0,
         };
         if (!topology.valid() || !command.valid() || !ticket.valid() ||
             placement_epoch < command.initial_placement_epoch)

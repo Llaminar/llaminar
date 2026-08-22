@@ -10,7 +10,11 @@
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../memory/StageBufferContract.h"
+#include "../../../execution/moe/MoEOverlayNodeLocalRouteExchange.h"
+#include "../../../kernels/IMoEKernel.h"
+#include "../../../kernels/KernelFactory.h"
 #include "../../../tensors/TensorClasses.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/DebugEnv.h"
@@ -26,6 +30,8 @@
 
 namespace llaminar2
 {
+    using KernelFactory = llaminar::v2::kernels::KernelFactory;
+
     const char *toString(TPLocalRootedCollectiveOperation operation) noexcept
     {
         switch (operation)
@@ -81,11 +87,10 @@ namespace llaminar2
         {
             if (!tp_ctx)
                 return "none";
-            if (tp_ctx->isLocal())
-                return "local";
-            if (tp_ctx->isNodeLocal())
-                return "node_local";
-            return "global";
+            // PerfStats must use the same canonical taxonomy as configuration
+            // and topology planning; private aliases make cross-gate evidence
+            // impossible to compare reliably.
+            return tpScopeToString(tp_ctx->scope());
         }
 
         std::string requestedTransportPrecision(const TPAllreduceParams &params)
@@ -690,7 +695,45 @@ namespace llaminar2
          */
         bound_sidebands_.reserve(
             params_.sideband_workspace_bindings.size());
+
+        if (params_.mapped_dense_publication_exchange)
+        {
+            if (params_.operation !=
+                    TPLocalRootedCollectiveOperation::Broadcast ||
+                params_.dtype != CollectiveDataType::FLOAT32 ||
+                !params_.sideband_workspace_bindings.empty())
+            {
+                throw std::invalid_argument(
+                    "mapped dense LocalTP publication supports only an FP32 broadcast without collective sidebands");
+            }
+            if (!params_.mapped_dense_publication_exchange->materialized())
+            {
+                throw std::invalid_argument(
+                    "mapped dense LocalTP publication requires a materialized node-local exchange");
+            }
+            mapped_dense_publication_binding_ =
+                params_.mapped_dense_publication_exchange
+                    ->densePublicationBinding(params_.device_id);
+            mapped_dense_publication_region_ =
+                params_.mapped_dense_publication_exchange->mappedRegion();
+            mapped_dense_publication_payload_offset_ =
+                params_.mapped_dense_publication_exchange
+                    ->densePublicationPayloadOffset();
+            mapped_dense_publication_kernel_ =
+                KernelFactory::createMoEKernel(params_.device_id);
+            if (!mapped_dense_publication_binding_.valid() ||
+                !mapped_dense_publication_region_ ||
+                !mapped_dense_publication_kernel_ ||
+                params_.count >
+                    mapped_dense_publication_binding_.element_capacity)
+            {
+                throw std::invalid_argument(
+                    "mapped dense LocalTP publication has incomplete endpoint bindings or insufficient capacity");
+            }
+        }
     }
+
+    TPLocalRootedCollectiveStage::~TPLocalRootedCollectiveStage() = default;
 
     TPLocalRootedCollectiveTensorRole
     TPLocalRootedCollectiveStage::tensorRole() const noexcept
@@ -750,6 +793,107 @@ namespace llaminar2
                       << " stream=" << stream
                       << " buffer=" << buffer);
             return false;
+        }
+
+        if (params_.mapped_dense_publication_exchange)
+        {
+            const bool graph_role_is_root =
+                params_.participant_device_index ==
+                params_.root_device_index;
+            if (!mapped_dense_publication_binding_.valid() ||
+                !mapped_dense_publication_region_ ||
+                !mapped_dense_publication_kernel_ ||
+                mapped_dense_publication_binding_.isRoot() !=
+                    graph_role_is_root ||
+                params_.tensor->native_type() != TensorType::FP32 ||
+                params_.count >
+                    mapped_dense_publication_binding_.element_capacity)
+            {
+                LOG_ERROR("TPLocalRootedCollectiveStage: mapped dense publication role, type, or capacity disagrees with the graph"
+                          << " stage="
+                          << (params_.stage_name.empty()
+                                  ? "(none)"
+                                  : params_.stage_name)
+                          << " graph_root=" << graph_role_is_root
+                          << " binding_root="
+                          << mapped_dense_publication_binding_.isRoot()
+                          << " count=" << params_.count
+                          << " capacity="
+                          << mapped_dense_publication_binding_.element_capacity);
+                return false;
+            }
+
+            IMoEKernel *const kernel =
+                bindStageStream(mapped_dense_publication_kernel_.get());
+            if (!kernel)
+            {
+                LOG_ERROR("TPLocalRootedCollectiveStage: mapped dense publication could not bind its exact stream");
+                return false;
+            }
+            const MoEKernelLaunchContext launch_context{
+                .stream = stream,
+            };
+            const MoENodeLocalDensePublicationLaunch publication{
+                .binding = mapped_dense_publication_binding_,
+                .element_count = params_.count,
+            };
+            try
+            {
+                if (graph_role_is_root)
+                {
+                    if (!kernel->beginNodeLocalDensePublication(
+                            launch_context, publication))
+                    {
+                        return false;
+                    }
+                    TransferEngine::instance().enqueueDeviceToMappedHost(
+                        params_.tensor,
+                        0u,
+                        *mapped_dense_publication_region_,
+                        mapped_dense_publication_payload_offset_,
+                        params_.count * sizeof(float),
+                        params_.device_id,
+                        stream);
+                    if (!kernel->finishNodeLocalDensePublication(
+                            launch_context, publication))
+                    {
+                        return false;
+                    }
+                }
+                else
+                {
+                    if (!kernel->beginNodeLocalDensePublicationConsume(
+                            launch_context, publication))
+                    {
+                        return false;
+                    }
+                    TransferEngine::instance().enqueueMappedHostToDevice(
+                        *mapped_dense_publication_region_,
+                        mapped_dense_publication_payload_offset_,
+                        params_.tensor,
+                        0u,
+                        params_.count * sizeof(float),
+                        params_.device_id,
+                        stream);
+                    if (!kernel->finishNodeLocalDensePublicationConsume(
+                            launch_context, publication))
+                    {
+                        return false;
+                    }
+                }
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR("TPLocalRootedCollectiveStage: mapped dense publication transfer failed"
+                          << " stage="
+                          << (params_.stage_name.empty()
+                                  ? "(none)"
+                                  : params_.stage_name)
+                          << " error=" << error.what());
+                return false;
+            }
+            recordBillOfMaterials();
+            return true;
         }
 
         bool success = false;
@@ -861,7 +1005,18 @@ namespace llaminar2
 
     bool TPLocalRootedCollectiveStage::isGraphCapturable() const
     {
-        return params_.device_id.is_gpu() && params_.tp_ctx &&
+        const bool mapped_contract_complete =
+            !params_.mapped_dense_publication_exchange ||
+            (params_.operation ==
+                 TPLocalRootedCollectiveOperation::Broadcast &&
+             params_.dtype == CollectiveDataType::FLOAT32 &&
+             mapped_dense_publication_binding_.valid() &&
+             mapped_dense_publication_region_ &&
+             mapped_dense_publication_kernel_ &&
+             params_.count <=
+                 mapped_dense_publication_binding_.element_capacity);
+        return mapped_contract_complete && params_.device_id.is_gpu() &&
+               params_.tp_ctx &&
                params_.tp_ctx->degree() > 1 && params_.tensor &&
                params_.count > 0 && params_.participant_device_index >= 0 &&
                params_.participant_device_index < params_.tp_ctx->degree() &&
@@ -1054,6 +1209,10 @@ namespace llaminar2
              std::to_string(params_.participant_device_index)},
             {"elements", std::to_string(params_.count)},
             {"element_bytes", std::to_string(element_bytes)},
+            {"transport",
+             params_.mapped_dense_publication_exchange
+                 ? "mapped_dense_publication"
+                 : "native_collective"},
             {"host_rendezvous", "false"},
             {"graph_capturable", "true"},
             {"accounting", "graph_template_or_eager_launch"},

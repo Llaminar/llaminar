@@ -43,6 +43,7 @@
 #include "../../moe/MoERebalanceController.h"          // For ExpertReplicaSet
 #include "../../moe/CPUCurrentBatchLLEP.h"             // CPU transient LLEP authority
 #include "../../moe/MoEExpertOverlayProfiler.h"        // For overlay profiling summary flush
+#include "../../moe/MoEOverlayEpochLeaseLifecycle.h"  // Typed epoch submission ownership
 #include "../../factory/InferenceRunnerFactory.h"      // For FactoryPPStageConfig
 #include "../../../snapshots/SnapshotCapture.h"        // Snapshot capture (extracted Phase 2)
 #include "../engine/ForwardExecutionEngine.h"          // Forward execution engine (extracted Phase 3)
@@ -55,6 +56,7 @@
 #include "../../mtp/MTPSpecDecodeMetadata.h"
 #include "../../mtp/MTPSidecarCaptureLayout.h"
 #include "../../mtp/MTPVerifierPolicy.h"
+#include "../../mtp/HostedDeviceGenerationLifecycle.h"
 #include "../../../interfaces/IMPITopology.h"          // For interface-based construction
 #include "../../../interfaces/ICollectiveContext.h"    // For interface-based construction
 #include "../../../config/TPDomain.h"                  // For MultiDomainTPConfig (Phase 6.3)
@@ -64,6 +66,7 @@
 #include "../../../collective/ILocalTPContext.h"       // For unique_ptr<ILocalTPContext> in maps
 #include "../../../collective/IGlobalTPContext.h"      // For shared_ptr<IGlobalTPContext> ownership
 #include <memory>
+#include <atomic>
 #include <optional>
 #include <algorithm>
 #include <array>
@@ -98,7 +101,10 @@ namespace llaminar2
     class TensorParallelConfig;
     class TurboQuantContext;
     class MoERebalanceController;
+    class MappedTransferProgressEpoch;
     class ExpertWeightPayloadProvider;
+    class IMoEOverlayInferenceCompletionEvent;
+    struct MoEOverlayInferenceParticipantGraphBinding;
     class PreparedWeightStore;
     class FrozenModelWeightSet;
     class PrefixStateCache;
@@ -532,7 +538,8 @@ namespace llaminar2
      */
     class DeviceGraphOrchestrator : public IInferenceRunner,
                                     public IForwardExecutionHost,
-                                    public ICPUCurrentBatchLLEPPhysicalExecutor
+                                    public ICPUCurrentBatchLLEPPhysicalExecutor,
+                                    public IMoEOverlayDeviceInferenceBoundary
     {
     public:
         // =========================================================================
@@ -2548,6 +2555,16 @@ namespace llaminar2
 
         bool forwardPrefill(const int *tokens, int seq_len) override;
 
+        /** @copydoc IInferenceRunner::servingGraphPreparationKind */
+        ServingGraphPreparationKind
+        servingGraphPreparationKind() const noexcept override
+        {
+            return state_.device_id.is_gpu()
+                       ? ServingGraphPreparationKind::
+                             NativeDeviceExecutableFamily
+                       : ServingGraphPreparationKind::EagerHostGraph;
+        }
+
         /** @copydoc IInferenceRunner::materializeServingGraphFamilyWithoutLaunch */
         bool materializeServingGraphFamilyWithoutLaunch(
             const ServingGraphFamilyMaterializationPlan &plan) override;
@@ -2564,12 +2581,14 @@ namespace llaminar2
             uint64_t generation_id) override;
 
         /**
-         * @brief Bind this participant to the rank-wide heterogeneous graph authority.
+         * @brief Bind this participant to rank-wide heterogeneous graph submission.
          *
-         * The binding is installed once during orchestration setup.  The
-         * participant index is stable for the lifetime of the LocalTP cell and
-         * is used to prove that every symmetric continuation graph entered and
-         * finished the same remote transaction.
+         * The coordinator owns only retained-graph tickets and symmetric local
+         * submission accounting. Placement policy and durable epochs remain
+         * with the topology-selected ExpertOverlay authority. The binding is
+         * installed once during setup; its participant index is stable for the
+         * LocalTP cell and proves that every symmetric continuation graph
+         * entered and finished the same remote transaction.
          */
         bool setMoEOverlayInferenceTransactionCoordinator(
             std::shared_ptr<MoEOverlayInferenceTransactionCoordinator>
@@ -3424,7 +3443,25 @@ namespace llaminar2
                 reset_transaction.enter(
                     RequestStateResetTransaction::Phase::
                         ReleaseOverlayEpoch);
-                if (moe_overlay_epoch_external_reader_active_ &&
+                const auto overlay_lease_state =
+                    moe_overlay_epoch_lease_lifecycle_->load();
+                if (overlay_lease_state !=
+                        MoEOverlayEpochLeaseState::Idle &&
+                    overlay_lease_state !=
+                        MoEOverlayEpochLeaseState::ExternalReader &&
+                    overlay_lease_state !=
+                        MoEOverlayEpochLeaseState::ReleasePublished)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Request-state reset reached an unterminated ExpertOverlay lease"
+                              << " reason=" << reset_reason
+                              << " device=" << state_.device_id.toString()
+                              << " lease_state="
+                              << moeOverlayEpochLeaseStateName(
+                                     overlay_lease_state));
+                    std::terminate();
+                }
+                if (overlay_lease_state ==
+                        MoEOverlayEpochLeaseState::ExternalReader &&
                     !releaseMoEOverlayEpochForExternalTransaction(
                         reset_transaction.executionStream(),
                         "request_state_reset"))
@@ -3755,7 +3792,8 @@ namespace llaminar2
          * cannot race verifier rollback or be omitted when MTP performs no
          * ordinary one-token main-model forward.
          */
-        bool maybeApplyDecodeBoundaryMaintenance() override;
+        bool maybeApplyDecodeBoundaryMaintenance(
+            uint64_t committed_tokens) override;
 
         /**
          * @brief Select this participant's backend-exact MoE scheduler.
@@ -3769,6 +3807,27 @@ namespace llaminar2
         DeviceMoERebalanceHostedObservationSchedule
         deviceMoERebalanceHostedObservationSchedule()
             const noexcept override;
+
+        /** @brief Return this graph's one canonical overlay runtime source. */
+        std::vector<MoEOverlayDeviceControllerRuntimeBinding>
+        moeOverlayDeviceControllerRuntimeBindings() const override;
+
+        /**
+         * @brief Join committed inference and release its overlay reader.
+         *
+         * The topology-wide controller calls this only on this device's worker
+         * with its exact dedicated maintenance stream.  It queues event edges
+         * and the retained epoch-release graph, but performs no host or device
+         * synchronization.
+         */
+        MoEOverlayInferenceBoundaryStatus
+        enqueueMoEOverlayDeviceInferenceBoundary(
+            void *maintenance_stream,
+            MoEOverlayInferenceBoundaryRequest request) override;
+
+        /** @copydoc IMoEOverlayDeviceInferenceBoundary::installMoEOverlayTransferProgressEpoch */
+        [[nodiscard]] bool installMoEOverlayTransferProgressEpoch(
+            std::shared_ptr<MappedTransferProgressEpoch> epoch) override;
 
         /** @brief Validate one graph-embedded, D2H-free boundary known not to be due. */
         bool submitHostScheduledDeviceMoERebalanceKnownNonDueBoundary()
@@ -4153,6 +4212,20 @@ namespace llaminar2
         struct PinnedMoERebalanceDispatchTicketScratch;
 
         /**
+         * @brief Remote retained-graph width for one exact-shape CPU prefill.
+         *
+         * A CPU continuation executes only logical rows, while an expert-only
+         * GPU follower may replay a padded retained bucket.  This descriptor
+         * keeps that authenticated remote width distinct from `seq_len`, which
+         * remains the local arithmetic shape.  It is present only for an
+         * explicitly scheduled prefill chunk.
+         */
+        struct RemotePrefillTransactionGeometry
+        {
+            int physical_rows_per_request = 0;
+        };
+
+        /**
          * @brief Shared implementation for host-token and device-token forwards.
          *
          * `tokens` is always the host shadow used for request bookkeeping. When
@@ -4167,6 +4240,9 @@ namespace llaminar2
          * and therefore cannot safely serve as asynchronous admission input.
          * `execution_role` is mandatory because graph shape does not distinguish
          * prefill, grouped verification, and request-batched decode.
+         * `remote_prefill_geometry` is supplied only when an eager CPU graph
+         * executes exact rows while its retained remote follower uses the
+         * scheduler's larger physical bucket.
          */
         const float *forwardImpl(
             const int *tokens,
@@ -4178,7 +4254,9 @@ namespace llaminar2
             bool force_decode_phase = false,
             const void *position_ids_device_override = nullptr,
             const int32_t *sequence_lengths_device_override = nullptr,
-            std::span<const int> request_real_lengths = {});
+            std::span<const int> request_real_lengths = {},
+            std::optional<RemotePrefillTransactionGeometry>
+                remote_prefill_geometry = std::nullopt);
 
         /**
          * @brief Execute a host-token rectangular batch under an explicit role.
@@ -4254,7 +4332,7 @@ namespace llaminar2
          *
          * ExpertOverlay mutates model-lifetime runtime banks and publishes an
          * epoch selector. Captured graphs retain those stable addresses, so
-         * neither host-coordinated nor device-resident publication requires
+         * neither host-resident nor device-resident publication requires
          * graph recapture.
          */
         bool usesGraphStableMoEOverlayResidency() const;
@@ -4266,7 +4344,31 @@ namespace llaminar2
          * and sole-authority contract. Hot-cache capacity and diagnostic
          * environment settings must never change publication ownership.
          */
-        bool usesHomogeneousDeviceResidentMoEOverlayAuthority() const;
+        bool usesDeviceResidentMoEOverlayAuthority() const;
+
+        /**
+         * @brief Return whether maintenance belongs to the mapped topology authority.
+         *
+         * A mapped multi-group overlay has one topology-wide controller service.
+         * Participant-local CUDA conditional graphs and ROCm ticket graphs are
+         * different authorities and must remain absent in this regime.  The
+         * participant contributes only its stable runtime table and exact
+         * inference-boundary event interface to the topology-wide service.
+         */
+        bool usesTopologyWideDeviceMoEOverlayController() const noexcept;
+
+        /**
+         * @brief Return whether this participant owns an embedded maintenance clock.
+         *
+         * Single-domain homogeneous Dynamic execution advances one retained
+         * participant-local controller from its decode and MTP graphs. A mapped
+         * topology-wide controller instead admits maintenance only after the
+         * orchestration layer publishes a complete inference transaction, so it
+         * must never be bound as an in-transaction row budget or epoch writer.
+         *
+         * @return True only for native CUDA-conditional or HIP-ticket maintenance.
+         */
+        bool usesParticipantLocalDeviceMoERebalanceController() const noexcept;
 
         /**
          * @brief Update dynamic parameters in a cached graph
@@ -4337,6 +4439,30 @@ namespace llaminar2
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
             bool has_collective_nodes,
             IDeviceContext *ctx) const override;
+
+        /**
+         * @brief Build capture policy constrained by one graph's native envelope.
+         *
+         * Runtime topology selects whether heterogeneous segmentation is
+         * generally available, while the graph declares whether its event DAG
+         * is ordinary, one indivisible device-owned transaction, or an
+         * explicitly ticket-segmented heterogeneous transaction. The capture
+         * controller applies that typed declaration here so initial capture and
+         * retained replay cannot derive different executable identities.
+         *
+         * @param graph Exact graph whose native envelope constrains replay.
+         * @param has_collective_nodes Whether @p graph contains collectives.
+         * @param ctx Exact device context that owns capture and replay.
+         * @param consumer Human-readable owner used in fatal diagnostics.
+         * @return Complete immutable policy, or no value when the graph's
+         *         required native execution mode is unavailable.
+         */
+        std::optional<DeviceGraphExecutor::DecodeCapturePolicy>
+        buildDecodeCapturePolicyForGraph(
+            const ComputeGraph &graph,
+            bool has_collective_nodes,
+            IDeviceContext *ctx,
+            const char *consumer) const;
 
         /**
          * @brief Check whether this graph spans genuinely mixed device types
@@ -4444,6 +4570,12 @@ namespace llaminar2
         bool prepareLiveStateForForwardGraphExecution(
             const ForwardInput &input,
             void *execution_stream,
+            DeviceId execution_device) override;
+
+        /** @copydoc IForwardExecutionHost::forwardGraphAuxiliaryBranchFactory */
+        GraphCaptureAuxiliaryBranchFactory
+        forwardGraphAuxiliaryBranchFactory(
+            const ForwardInput &input,
             DeviceId execution_device) override;
 
         /** Queue the cold graph-build publication onto a setup capture stream. */
@@ -4562,14 +4694,16 @@ namespace llaminar2
             const char *reason);
 
         /**
-         * @brief Initialize persistent target/draft sample banks before decode.
+         * @brief Initialize persistent sample and verifier token banks before decode.
          *
-         * The banks are range-published by independent sampler operations, but
-         * BufferArena tracks authority at tensor granularity. Setup therefore
-         * fills every slot with an invalid sentinel and publishes each backing
-         * tensor once. This establishes stable completion-event storage before
-         * the hot path; later readiness publication only re-records existing
-         * events on the exact sampler stream.
+         * The sample banks are range-published by independent sampler
+         * operations, while the verifier row is transaction-published by its
+         * preparation graph. BufferArena tracks authority at tensor
+         * granularity, so setup fills every token slot with an invalid sentinel
+         * and publishes each backing tensor once. This establishes stable
+         * completion-event storage before the hot path; later readiness
+         * publication only re-records existing events on the exact producer
+         * stream.
          *
          * Per-slot readiness remains the semantic validity gate. Initializing
          * the backing tensors does not make any slot consumable.
@@ -4603,17 +4737,20 @@ namespace llaminar2
             const char *reason);
 
         /**
-         * @brief Publish both device-generation arena tensors as one lifecycle edge.
+         * @brief Publish the core device-generation arena tensors as one edge.
          *
-         * Every device-generation producer writes the response ledger and the
-         * controller as one logical transaction.  Keeping their arena
-         * publication behind this helper prevents the private controller event
-         * and the graph executor's arena frontier from observing different
-         * generations of the same transaction.
+         * Every device-generation producer writes the response ledger,
+         * controller, and authenticated dispatch-ticket bank as one logical
+         * transaction. Keeping their arena publication behind this helper
+         * prevents the private controller event and the graph executor's arena
+         * frontier from observing different generations of that transaction.
+         * The verifier identity row is deliberately added by
+         * `publishDeviceGenerationStateReady()` only after a committed or
+         * terminal transition; admission has not materialized it yet.
          *
          * @param producer_stream Exact stream carrying the complete transaction.
          * @param producer Stable producer name used by diagnostics.
-         * @return true only when both arena tensors publish the exact stream.
+         * @return true only when all core arena tensors publish the exact stream.
          */
         bool publishDeviceGenerationArenaState(
             void *producer_stream,
@@ -5280,13 +5417,15 @@ namespace llaminar2
         /**
          * @brief Materialize the production MoE maintenance graph before workspace publication.
          *
-         * Dynamic residency maintenance is a real member of the device graph
-         * family, even though its scheduler launches it only after a decode
-         * window closes. Current-batch LLEP is ordinary prefill graph work and
-         * does not enter this maintenance family.
-         * Building and retaining that exact graph during eager family declaration
-         * makes every workspace name, capacity, collective node, and captured
-         * pointer visible before generation one is allocated.
+         * Homogeneous-domain Dynamic residency maintenance is a real member of
+         * the participant graph family, even though its scheduler launches it
+         * only after a decode window closes. A mapped multi-group overlay
+         * instead certifies the stable runtime/publication binding consumed by
+         * its sole topology-wide controller; materializing another local graph
+         * there would create a second placement writer. Current-batch LLEP is
+         * ordinary prefill graph work and does not enter either maintenance
+         * family. Eager declaration therefore proves exactly one applicable
+         * ownership contract before generation one is allocated.
          *
          * @return true when maintenance is disabled/inapplicable or the retained
          *         production graph is complete and ready to join family planning.
@@ -5309,6 +5448,26 @@ namespace llaminar2
          * @return true when inapplicable or the exact terminal stage was added.
          */
         bool appendHostedDeviceMoEDecodeCommitBoundary(
+            ComputeGraph &graph,
+            const ForwardInput &input,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Enclose one topology-wide main forward in its device epoch lease.
+         *
+         * Ordinary prefill and decode are complete production transactions, so
+         * their reader acquire must be a graph root and their release must be
+         * the sole terminal after every model, collective, and auxiliary-stream
+         * join.  Embedding both stages avoids launching a separate release graph
+         * beside a still-running captured MoE lane.  MTP parents already own an
+         * equivalent complete transaction and are deliberately excluded.
+         *
+         * @param graph Fully built participant-local production graph.
+         * @param input Typed role and mathematical phase for that graph.
+         * @param error Optional construction diagnostic.
+         * @return true when inapplicable or the exact root/terminal pair exists.
+         */
+        bool appendCapturedMainForwardMoEOverlayEpochTransaction(
             ComputeGraph &graph,
             const ForwardInput &input,
             std::string *error = nullptr);
@@ -5391,7 +5550,9 @@ namespace llaminar2
          *         successfully; false when graph preparation or launch failed.
          */
         bool maybeRunDeviceMoERebalanceMaintenanceGraph(
-            bool boundary_already_published = false);
+            MoEOverlayEpochMaintenanceBoundarySource boundary_source =
+                MoEOverlayEpochMaintenanceBoundarySource::
+                    GraphLaunchDependency);
 
         /**
          * @brief Order a live graph consumer after pending device-side MoE maintenance.
@@ -5424,6 +5585,101 @@ namespace llaminar2
             DeviceTimelineRole consumer_role,
             const char *consumer_name,
             bool acquire_overlay_epoch = true);
+
+        /** @return Stable diagnostic name for a lease lifecycle phase. */
+        static const char *moeOverlayEpochLeaseStateName(
+            MoEOverlayEpochLeaseState state) noexcept;
+
+        /**
+         * @brief Complete identity of one externally submitted graph sequence.
+         *
+         * A valid identity exists exactly while an @c ExternalSequence lease,
+         * or its final verifier's @c ExternalForward phase, is live.  Keeping
+         * the expected next ordinal here makes skipped, duplicated, or crossed
+         * MTP graphs unrepresentable as a successful residency transaction.
+         */
+        struct MoEOverlayExternalSequenceIdentity
+        {
+            std::uint64_t request_generation = 0; ///< Outer request generation.
+            std::uint64_t sequence_id = 0; ///< Coordinator-assigned sequence identity.
+            std::uint64_t placement_epoch = 0; ///< Placement pinned for every graph.
+            int graph_count = 0; ///< Exact number of graphs admitted by the coordinator.
+            int last_graph_ordinal = -1; ///< Last graph admitted to device execution.
+
+            /** @return True only when every identity component is meaningful. */
+            [[nodiscard]] bool valid() const noexcept
+            {
+                return request_generation != 0 && sequence_id != 0 &&
+                       placement_epoch != 0 && graph_count > 1 &&
+                       last_graph_ordinal >= 0 &&
+                       last_graph_ordinal < graph_count;
+            }
+
+            /** @brief Return this object to its sole invalid/empty state. */
+            void reset() noexcept
+            {
+                *this = {};
+            }
+        };
+
+        /**
+         * @brief Lexical owner for one direct MTP graph's sequence admission.
+         *
+         * The first draft acquires the residency epoch, intermediate drafts
+         * retain it, and the grouped verifier converts it into the ordinary
+         * forward terminal.  Any early return releases the epoch on the exact
+         * admitted stream so a failed graph cannot strand maintenance.
+         */
+        class MoEOverlayExternalSequenceGraphLease final
+        {
+        public:
+            /** @brief Construct an inactive graph lease. */
+            MoEOverlayExternalSequenceGraphLease() = default;
+
+            /** @brief Abort and release an admitted graph left unfinished. */
+            ~MoEOverlayExternalSequenceGraphLease() noexcept;
+
+            MoEOverlayExternalSequenceGraphLease(
+                const MoEOverlayExternalSequenceGraphLease &) = delete;
+            MoEOverlayExternalSequenceGraphLease &operator=(
+                const MoEOverlayExternalSequenceGraphLease &) = delete;
+
+            /**
+             * @brief Join one coordinator binding to its device residency lease.
+             * @param owner Device orchestrator owning the epoch arena.
+             * @param binding Immutable coordinator graph binding.
+             * @param execution_stream Exact stream that will launch the graph.
+             * @param consumer_role Typed device-timeline role for diagnostics.
+             * @param consumer_name Stable diagnostic owner.
+             * @return True when the graph is inactive or successfully admitted.
+             */
+            bool admit(
+                DeviceGraphOrchestrator &owner,
+                const MoEOverlayInferenceParticipantGraphBinding &binding,
+                void *execution_stream,
+                DeviceTimelineRole consumer_role,
+                const char *consumer_name);
+
+            /**
+             * @brief Publish this graph's successful or failed terminal exactly once.
+             * @param execution_succeeded Whether the graph completed normally.
+             * @return True when the sequence lease reached its required state.
+             */
+            bool finish(bool execution_succeeded) noexcept;
+
+            /** @return Whether this object currently owes a terminal action. */
+            [[nodiscard]] bool active() const noexcept
+            {
+                return owner_ != nullptr && !finished_;
+            }
+
+        private:
+            DeviceGraphOrchestrator *owner_ = nullptr; ///< Epoch authority.
+            const MoEOverlayInferenceParticipantGraphBinding *binding_ = nullptr; ///< Immutable graph identity.
+            void *execution_stream_ = nullptr; ///< Exact graph stream.
+            const char *consumer_name_ = nullptr; ///< Stable diagnostic label.
+            bool finished_ = false; ///< True after the sole terminal action.
+        };
 
         /**
          * @brief Resolve and validate the model-lifetime epoch binding at setup.
@@ -5461,7 +5717,75 @@ namespace llaminar2
         bool acquireMoEOverlayEpochForExternalTransaction(
             void *consumer_stream,
             DeviceTimelineRole consumer_role,
+            const char *consumer_name,
+            MoEOverlayEpochLeaseState acquired_state =
+                MoEOverlayEpochLeaseState::ExternalReader);
+
+        /**
+         * @brief Admit one graph into a complete direct MTP residency sequence.
+         *
+         * The first graph acquires once; later graphs consume the immutable
+         * acquire event and must arrive in exact ordinal order with an unchanged
+         * placement epoch.  No intermediate graph may release the ticket.
+         */
+        bool admitMoEOverlayExternalSequenceGraph(
+            const MoEOverlayInferenceParticipantGraphBinding &binding,
+            void *execution_stream,
+            DeviceTimelineRole consumer_role,
             const char *consumer_name);
+
+        /**
+         * @brief Complete or abort one admitted direct MTP sequence graph.
+         *
+         * Successful draft graphs retain the lease for their successor.  A
+         * failure releases immediately.  The successful final verifier is
+         * completed by the ordinary forward epilogue after it publishes all
+         * inference state.
+         */
+        bool finishMoEOverlayExternalSequenceGraph(
+            const MoEOverlayInferenceParticipantGraphBinding &binding,
+            void *execution_stream,
+            bool execution_succeeded,
+            const char *consumer_name);
+
+        /**
+         * @brief Claim the exact inference terminal for placement maintenance.
+         *
+         * The authenticated due-ticket path may encounter either an ambient
+         * external reader or the immutable release already published by a
+         * self-contained forward.  This method selects and submits exactly one
+         * legal action while holding the lifecycle submission authority: close
+         * the reader once, or join the existing release event.  It performs no
+         * host or device synchronization.
+         *
+         * @param maintenance_stream Exact retained maintenance stream.
+         * @param boundary_name Stable diagnostic identity for the claim.
+         * @return true after the release edge is constructed or joined.
+         */
+        bool claimMoEOverlayEpochForPlacementMaintenance(
+            void *maintenance_stream,
+            const char *boundary_name);
+
+        /**
+         * @brief Submit a validated external release under existing authority.
+         *
+         * The caller owns @p submission for the whole event-wait, retained
+         * release launch, terminal-event record, and semantic commit recipe.
+         * Sharing this primitive keeps ordinary inference release and an
+         * authenticated maintenance close byte-for-byte identical without
+         * making the public release operation idempotent.
+         *
+         * @param submission Exclusive lifecycle submission authority.
+         * @param release_stream Exact stream which owns the release recipe.
+         * @param boundary_name Stable diagnostic identity for the release.
+         * @param expected_state Exact live external owner to close.
+         * @return true after publishing the immutable release receipt.
+         */
+        bool submitMoEOverlayEpochExternalRelease(
+            MoEOverlayEpochLeaseLifecycle::Submission &submission,
+            void *release_stream,
+            const char *boundary_name,
+            MoEOverlayEpochLeaseState expected_state);
 
         /**
          * @brief Release an active external reader after its complete state commit.
@@ -5473,7 +5797,66 @@ namespace llaminar2
          */
         bool releaseMoEOverlayEpochForExternalTransaction(
             void *release_stream,
-            const char *boundary_name);
+            const char *boundary_name,
+            MoEOverlayEpochLeaseState expected_state =
+                MoEOverlayEpochLeaseState::ExternalReader);
+
+        /**
+         * @brief Acquire the sole reader owned by one hosted MTP transaction.
+         *
+         * A heterogeneous hosted branch cannot clone its segmented sidecar into
+         * one native parent graph. Its full sidecar therefore submits the same
+         * retained acquire capture on the sidecar's exact stream and publishes
+         * one durable event for every later child. The method joins the prior
+         * branch release before launching the new acquire and rejects nested
+         * parent or externally owned readers.
+         *
+         * @param acquire_stream Exact full-sidecar replay stream.
+         * @param acquire_capture Retained epoch-acquire executable.
+         * @param parent_name Stable diagnostic owner of the transaction.
+         * @return true when the acquire and its publication event were enqueued.
+         */
+        bool acquireMoEOverlayEpochForHostedParent(
+            void *acquire_stream,
+            const IGPUGraphCapture *acquire_capture,
+            const char *parent_name);
+
+        /**
+         * @brief Join a hosted parent's acquired reader at one child launch.
+         *
+         * Hosted sidecars and grouped verifiers replay retained executables
+         * directly, so they do not pass through the ordinary forward-engine
+         * live-state prelude. Every such executable must consume the durable
+         * acquire event on its exact launch stream before ticket publication
+         * or graph launch. Repeated children may wait on the same immutable
+         * event; none of them gains authority to release the parent ticket.
+         *
+         * @param consumer_stream Exact retained-executable launch stream.
+         * @param child_name Stable diagnostic identity for the child graph.
+         * @return true when the acquire dependency was enqueued or no overlay
+         *         epoch binding exists.
+         */
+        bool consumeMoEOverlayEpochForHostedChild(
+            void *consumer_stream,
+            const char *child_name);
+
+        /**
+         * @brief Close the sole reader owned by one hosted MTP transaction.
+         *
+         * The typed release fragment runs only after every sidecar, verifier,
+         * sampler, and publication child has joined the scheduler stream. Its
+         * event becomes the only legal predecessor of the next hosted acquire.
+         * No child forward may call this method or clear the parent's ticket.
+         *
+         * @param release_stream Exact hosted scheduler stream.
+         * @param release_capture Retained epoch-release executable.
+         * @param parent_name Stable diagnostic owner of the transaction.
+         * @return true when the release and its publication event were enqueued.
+         */
+        bool releaseMoEOverlayEpochForHostedParent(
+            void *release_stream,
+            const IGPUGraphCapture *release_capture,
+            const char *parent_name);
 
         /**
          * @brief Close/join the host-scheduled reader before an internal parent.
@@ -6550,11 +6933,19 @@ namespace llaminar2
          * device-resident logical sequence-state publication. Callers that
          * export KV, GDN, or MTP state must go through this helper instead of
          * assembling partial waits locally.
+         *
+         * @param observation_stream Exact non-null consumer stream.
+         * @param observation_name Stable diagnostic identity.
+         * @param observation_role Typed timeline consumer role.
+         * @param logical_state_mailbox_already_joined True only when the caller
+         *        already queued the same mailbox root as an admission preflight.
+         * @return True after every remaining producer edge is enqueued.
          */
         bool waitForLiveInferenceStateReadyForObservation(
             void *observation_stream,
             const char *observation_name,
-            DeviceTimelineRole observation_role) const;
+            DeviceTimelineRole observation_role,
+            bool logical_state_mailbox_already_joined = false) const;
 
         /**
          * @brief Allocate the durable main-forward completion event.
@@ -7092,6 +7483,10 @@ namespace llaminar2
                 MTPFullSidecarReplay,
                 MTPChainedSidecarReplay,
                 MTPGroupedVerifierReplay,
+                /** Entry boundary owned by the hosted scheduler stream. */
+                MoEOverlayEpochAcquire,
+                /** Terminal boundary that closes the hosted parent's reader. */
+                MoEOverlayEpochRelease,
             };
 
             const char *name = nullptr;
@@ -7142,10 +7537,6 @@ namespace llaminar2
 
             std::shared_ptr<void> stream;
             std::unique_ptr<IGPUGraphCapture> capture;
-            /** Scheduler-to-retained-fragment event, allocated before admission. */
-            std::shared_ptr<void> handoff_to_fragment_event;
-            /** Retained-fragment-to-scheduler event, allocated before admission. */
-            std::shared_ptr<void> handoff_from_fragment_event;
             /** Exact child capture, policy, and predicate identities in the executable. */
             std::vector<DeviceControlledLoopFragment> source_fragments;
             /** Exact semantic branch inventory for hosted heterogeneous replay. */
@@ -7182,9 +7573,8 @@ namespace llaminar2
             ExecutionKind execution_kind = ExecutionKind::Unmaterialized;
             bool valid = false;
             bool launched = false;
-            bool hosted_advance_active = false;
-            size_t hosted_advance_fragment_count = 0;
-            size_t hosted_advance_next_fragment = 0;
+            /** Exact ordinal lifecycle for one authenticated hosted branch. */
+            HostedDeviceGenerationAdvanceCursor hosted_advance{};
 
             /**
              * @brief Retire one successfully materialized request launch.
@@ -7224,9 +7614,7 @@ namespace llaminar2
                 execution_kind = ExecutionKind::Unmaterialized;
                 valid = false;
                 launched = false;
-                hosted_advance_active = false;
-                hosted_advance_fragment_count = 0;
-                hosted_advance_next_fragment = 0;
+                hosted_advance.reset();
                 source_fragments.clear();
                 hosted_fragments.clear();
             }
@@ -7235,8 +7623,6 @@ namespace llaminar2
             {
                 invalidateGraph();
                 capture.reset();
-                handoff_to_fragment_event.reset();
-                handoff_from_fragment_event.reset();
                 stream.reset();
             }
         };
@@ -7486,6 +7872,10 @@ namespace llaminar2
         DeviceMoEOverlayEpochExecutionBinding
             moe_overlay_epoch_execution_binding_;
 
+        /** Shared finite relay epoch submitted before each local inference graph. */
+        std::shared_ptr<MappedTransferProgressEpoch>
+            moe_overlay_transfer_progress_epoch_;
+
         /**
          * Durable publication from the first acquire stream to every later child.
          * The event is model-runner lifetime and may be waited by multiple streams.
@@ -7498,18 +7888,21 @@ namespace llaminar2
         /// Completion edge preventing a later acquire from racing prior release.
         std::shared_ptr<void> moe_overlay_epoch_released_event_;
 
-        /// Exact stream that most recently published the released-event.
-        void *moe_overlay_epoch_release_producer_stream_ = nullptr;
-
-        /// Whether the next external acquire owes the released-event a wait.
-        bool moe_overlay_epoch_release_pending_ = false;
-
         /**
-         * Host lifecycle ownership only; never a mirror of epoch/selector state.
-         * true means one enqueued acquire owns the immutable request ticket until
-         * a correspondingly ordered release is submitted.
+         * Single host authority consumed by inference and maintenance threads.
+         * It owns the exact release producer stream together with the
+         * `ReleasePublished` state so those values cannot be raced apart.
          */
-        bool moe_overlay_epoch_external_reader_active_ = false;
+        std::unique_ptr<MoEOverlayEpochLeaseLifecycle>
+            moe_overlay_epoch_lease_lifecycle_ =
+                std::make_unique<MoEOverlayEpochLeaseLifecycle>();
+
+        /// Identity pinned while one complete direct MTP sequence owns the epoch.
+        MoEOverlayExternalSequenceIdentity
+            moe_overlay_external_sequence_identity_{};
+
+        /// Exact stream admitted by the active forward phase of the lease.
+        void *moe_overlay_epoch_forward_submission_stream_ = nullptr;
 
         /**
          * @brief Device-checkpoint bank written by the last successful hidden producer.
@@ -7994,6 +8387,8 @@ namespace llaminar2
          */
         std::vector<int32_t> request_batch_geometry_host_;
         void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 stable compact verifier token row/matrix.
+        sampling_math::MTPCommittedVerifierIdentityRecord *
+            mtp_committed_verifier_identity_dev_ = nullptr; ///< Device-owned identity coupled to the last response/state commit.
         void *mtp_verifier_stop_tokens_dev_ = nullptr; ///< INT32 fixed-width stop-token controls read inside captured reducers.
         void *mtp_greedy_penalty_policy_dev_ = nullptr; ///< Graph-stable MTPGreedyPenaltyPolicy written on the exact verifier stream.
         void *mtp_generated_token_counts_dev_ = nullptr; ///< INT32 [vocab], device-authoritative generated-token histogram.
@@ -8020,10 +8415,8 @@ namespace llaminar2
         std::shared_ptr<void> device_generation_terminal_host_ready_event_;
         std::optional<sampling_math::DeviceGenerationDispatchTicket>
             last_device_generation_dispatch_ticket_;
-        bool device_generation_dispatch_ticket_copy_pending_ = false;
-        bool hosted_device_generation_scheduler_started_ = false;
-        bool hosted_device_generation_terminal_submitted_ = false;
-        int hosted_device_generation_last_transaction_count_ = 0;
+        /** Typed scheduler/ticket/terminal lifecycle for hosted generation. */
+        HostedDeviceGenerationCursor hosted_device_generation_cursor_{};
 
         /**
          * @brief Device representation stored in a stochastic verifier row slot.
@@ -8260,6 +8653,26 @@ namespace llaminar2
             void *producer_stream = nullptr;
             bool valid = false;
             int request_count = 0;
+        };
+
+        /**
+         * @brief Semantic writer crossing the generation-controller event edge.
+         *
+         * Admission initializes only controller-owned scheduling storage. A
+         * committed transaction and the composed-parent terminal also close
+         * the verifier identity row written by their retained preparation
+         * graph. Encoding that distinction here prevents admission from
+         * falsely publishing an unmaterialized verifier row and prevents a
+         * terminal parent from leaving the arena pointed at transaction zero.
+         */
+        enum class DeviceGenerationStatePublicationKind : std::uint8_t
+        {
+            /// Request admission initialized response, control, and ticket rows.
+            Admission,
+            /// The externally scheduled transaction committed state and identity.
+            CommittedTransaction,
+            /// The retained generation parent completed every admitted transaction.
+            Terminal,
         };
 
         /**
@@ -9411,7 +9824,7 @@ namespace llaminar2
         /**
          * Rank-owned control authority for heterogeneous sparse graph launches.
          *
-         * Homogeneous device-resident overlay execution deliberately leaves
+         * Single-domain native device-resident overlay execution deliberately leaves
          * this null: its device controller remains the sole authority and no
          * host ticket is introduced into the captured generation loop.
          */
@@ -9419,6 +9832,13 @@ namespace llaminar2
             moe_overlay_inference_transaction_coordinator_;
         /** Stable LocalTP participant index authenticated by the coordinator. */
         int moe_overlay_inference_transaction_participant_index_ = -1;
+        /**
+         * Setup-owned GPU terminal receipt for this continuation participant.
+         * Null only for CPU participants; every GPU child contributes its exact
+         * event to the coordinator's rank-wide calibration fence.
+         */
+        std::shared_ptr<IMoEOverlayInferenceCompletionEvent>
+            moe_overlay_inference_completion_fence_;
         uint64_t live_replay_state_epoch_ = 1;
         uint64_t live_state_mutation_count_ = 0;
         uint64_t live_state_accepted_publications_ = 0;
@@ -9926,18 +10346,6 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
-         * @brief Order a retained semantic replay after the scheduler stream.
-         * @param fragment_stream Exact retained replay stream.
-         */
-        bool beginHostedSemanticFragmentHandoff(void *fragment_stream);
-
-        /**
-         * @brief Return retained semantic replay completion to the scheduler stream.
-         * @param fragment_stream Exact retained replay producer stream.
-         */
-        bool finishHostedSemanticFragmentHandoff(void *fragment_stream);
-
-        /**
          * @brief Resolve one typed preparation key to its deterministic slot.
          *
          * Scalar keys must already be canonical power-of-two/final physical
@@ -10356,11 +10764,17 @@ namespace llaminar2
             DeviceTimelineRole consumer_role,
             const char *consumer_name);
 
-        /** Publish the newest complete generation-controller transaction. */
+        /**
+         * @brief Publish the newest complete generation-controller transition.
+         * @param producer_stream Exact stream closing the typed transition.
+         * @param request_count Number of request rows owned by the controller.
+         * @param kind Typed payload surface completed by this producer.
+         * @return true after arena and private controller events are coherent.
+         */
         bool publishDeviceGenerationStateReady(
             void *producer_stream,
             int request_count,
-            const char *producer_name);
+            DeviceGenerationStatePublicationKind kind);
 
         /** Consume the current generation-controller transaction exactly once. */
         bool consumeDeviceGenerationStateReady(
@@ -10455,10 +10869,18 @@ namespace llaminar2
          * lengths in canonical GPU metadata. Host-visible diagnostics must wait
          * for the producer stream before reading paired live KV/GDN/MTP state,
          * but observation never adopts or replaces that device ownership.
+         *
+         * @param consumer_stream Exact non-null observation stream.
+         * @param consumer_name Stable diagnostic identity.
+         * @param replacement_writer_pending Optional typed deferral output;
+         *        set only when a writer has closed admission but has not yet
+         *        recorded the replacement publication event.
+         * @return True after the immutable mailbox event wait is enqueued.
          */
         bool waitForDeviceResidentLogicalSequenceStateMailboxForObservation(
             void *consumer_stream,
-            const char *consumer_name) const;
+            const char *consumer_name,
+            bool *replacement_writer_pending = nullptr) const;
 
         /**
          * @brief Whether DGO can consume device-published logical sequence state.

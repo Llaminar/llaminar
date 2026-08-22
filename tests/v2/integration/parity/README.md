@@ -100,6 +100,28 @@ multi-gigabyte scans and stale pathname trust. Qwen2/Qwen3 use
 their MoE variants use the architecture-specific generators under
 `python/reference/`.
 
+Reference generation has one node-local writer authority because every
+backend's Hugging Face oracle consumes the same host cores and can require well
+over 100 GiB for a 35B model. The ordinary fixture and architecture-specific
+MTP helpers use `ReferenceGenerationLease` and follow the same double-checked
+publication lifecycle:
+
+```mermaid
+flowchart LR
+    A[Validate authenticated pack] -->|usable| R[Read concurrently]
+    A -->|missing or stale| L[Acquire node-local writer lease]
+    L --> V[Validate again]
+    V -->|peer published while waiting| R
+    V -->|still missing| G[Run one CPU Hugging Face generator]
+    G --> P[Atomically publish and authenticate]
+    P --> R
+```
+
+The lease covers only generation and publication. Validated reference reads
+and production CPU/CUDA/ROCm inference still overlap. Any new custom reference
+helper must join this lifecycle; spawning Python directly from a backend test
+creates an unbounded RAM race and is not a supported campaign path.
+
 ## Process campaign and ownership
 
 `discover_v2_parity_tests()` runs `--gtest_list_tests` after each parity binary
@@ -108,14 +130,23 @@ is built. Focused diagnostics remain isolated CTests. Every discovered
 filter per test type and backend signature. All precision cells for that test
 type/backend execute in one process.
 
-Across compatible precision cells, the process retains one bounded
-`ModelContext` and its authoritative `PreparedWeightStore`. The reuse key
-includes model path, weight distribution, topology, devices, collectives,
+Across compatible non-overlay precision cells, the process may retain one
+bounded `ModelContext` and its authoritative `PreparedWeightStore`. The reuse
+key includes model path, weight distribution, topology, devices, collectives,
 activation precision, ranks, and PP partitioning. KV precision is deliberately
-excluded because KV storage is runner-owned. Every cell still constructs an
-exact runner, arena, stream set, graph identity, and KV policy; a key change
-evicts the prior model before loading another, so the cache cannot grow without
-bound.
+excluded when it cannot affect prepared-weight capacity because KV storage is
+runner-owned. Every cell still constructs an exact runner, arena, stream set,
+graph identity, and KV policy; a key change evicts the prior model before
+loading another, so the cache cannot grow without bound.
+
+ExpertOverlay has a stricter boundary. A bare `ModelContext` cannot prove the
+resolved rank plan, model-frozen tier quotas, owner order, or prepared expert
+set. Fresh overlay cells let the production runner own loading and
+certification. Reuse is legal only through a `ModelContextReuseContract`
+emitted by an initialized runner and accepted after exact plan and routed-weight
+identity validation. Cells that change residency policy, owner placement, or
+another capacity-affecting field construct a fresh authority rather than
+guessing compatibility in the fixture.
 
 ## Production-path evidence
 
@@ -157,6 +188,16 @@ artifacts:
 - `decode_steps.csv`
 - `decode_layers.csv`
 - `decode_stages.csv`
+
+MTP cells additionally write `mtp_sidecar_token_trace.csv`. Its committed
+verifier columns (`verifier_identity_transaction_count`,
+`verifier_identity_depth`, and `production_verifier_draft_tokens`) come from
+the device-owned identity published by the same fused response/state commit
+that advances the generation controller. They must agree with the transaction
+delta and selected depth for every speculative call; reusable proposal or
+verifier-input scratch is not admissible post-transaction evidence. A terminal
+absorbing call may retain the preceding committed identity while selecting
+depth zero, because it does not claim a new verifier transaction.
 
 Cross-rank pipeline cells first write rank-local diagnostic fragments, then
 merge them into the same canonical files. The merged result must contain every

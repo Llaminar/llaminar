@@ -71,6 +71,19 @@ namespace llaminar2
         CaptureReady       ///< Require strict capture readiness for every stage
     };
 
+    /**
+     * @brief Declares whether active MoE placement is immutable for this graph.
+     *
+     * This is deliberately a scoped type rather than a Boolean.  It precedes
+     * optional diagnostic pointers in `preflight()`, so a caller cannot
+     * accidentally bind a pointer to a newly inserted Boolean policy slot.
+     */
+    enum class PrefillMoEGraphStability : uint8_t
+    {
+        Unstable, ///< Placement may change and padded capture must be rejected.
+        Stable    ///< Placement is graph-stable for the captured transaction.
+    };
+
     /// Reasons a prefill graph capture can be rejected.
     enum class PrefillGraphRejectReason
     {
@@ -158,7 +171,8 @@ namespace llaminar2
             PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default,
             bool collectives_graph_capturable = false,
             bool heterogeneous_segmentation_admitted = false,
-            bool moe_rebalancing_graph_stable = false,
+            PrefillMoEGraphStability moe_graph_stability =
+                PrefillMoEGraphStability::Unstable,
             std::string *reject_stage_name = nullptr,
             std::string *reject_stage_type = nullptr) const;
 

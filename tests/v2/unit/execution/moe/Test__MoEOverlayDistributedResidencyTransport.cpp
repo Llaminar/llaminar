@@ -3,7 +3,7 @@
  * @brief CPU-only adversarial tests for globally coordinated residency waves.
  *
  * An in-process asynchronous lane models independently progressing MPI ranks.
- * These tests prove that local backpressure, physical failure, and commit-start
+ * These tests prove that local backpressure, physical failure, and prepare-start
  * failure are exchanged by every participant, that no peer is stranded in a
  * different phase, that a deferred transaction can be retried unchanged, and
  * that no local old bank retires before every rank reaches its lease fence.
@@ -366,29 +366,54 @@ namespace llaminar2::test
                     return owner_->stage_progress;
                 }
 
-                /** @brief Record and return the scripted local commit enqueue. */
-                bool beginCommit(std::string *error) noexcept override
+                /** @brief Record the scripted local inactive-bank preparation. */
+                bool beginPrepare(std::string *error) noexcept override
                 {
-                    ++owner_->commit_begins;
-                    if (!owner_->commit_begin_ok && error)
-                        *error = "injected local commit enqueue failure";
-                    return owner_->commit_begin_ok;
+                    ++owner_->prepare_begins;
+                    if (!owner_->prepare_begin_ok && error)
+                        *error = "injected local prepare enqueue failure";
+                    return owner_->prepare_begin_ok;
                 }
 
-                /** @brief Return the currently scripted local bank event. */
-                MoEOverlayResidencyWaveProgress pollCommit(
+                /** @brief Return the scripted local preparation event. */
+                MoEOverlayResidencyWaveProgress pollPrepare(
                     std::string *error) noexcept override
                 {
-                    ++owner_->commit_polls;
-                    if (owner_->commit_progress !=
+                    ++owner_->prepare_polls;
+                    if (owner_->prepare_progress !=
                             MoEOverlayResidencyWaveProgress::Ready &&
-                        owner_->commit_progress !=
+                        owner_->prepare_progress !=
                             MoEOverlayResidencyWaveProgress::Pending &&
                         error)
                     {
-                        *error = "injected local commit event failure";
+                        *error = "injected local preparation event failure";
                     }
-                    return owner_->commit_progress;
+                    return owner_->prepare_progress;
+                }
+
+                /** @brief Record selector publication on this process. */
+                bool beginPublication(std::string *error) noexcept override
+                {
+                    ++owner_->publication_begins;
+                    if (!owner_->publication_begin_ok && error)
+                        *error = "injected local publication enqueue failure";
+                    return owner_->publication_begin_ok;
+                }
+
+                /** @brief Return the scripted selector-publication event. */
+                MoEOverlayResidencyWaveProgress pollPublication(
+                    std::string *error) noexcept override
+                {
+                    ++owner_->publication_polls;
+                    if (owner_->publication_progress !=
+                            MoEOverlayResidencyWaveProgress::Ready &&
+                        owner_->publication_progress !=
+                            MoEOverlayResidencyWaveProgress::Pending &&
+                        error)
+                    {
+                        *error = "injected local publication event failure";
+                    }
+                    return owner_->publication_progress;
                 }
 
                 /** @brief Record asynchronous cleanup initiation. */
@@ -454,14 +479,19 @@ namespace llaminar2::test
                 MoEOverlayResidencyStageStartStatus::Started;
             MoEOverlayResidencyWaveProgress stage_progress =
                 MoEOverlayResidencyWaveProgress::Ready;
-            bool commit_begin_ok = true;
-            MoEOverlayResidencyWaveProgress commit_progress =
+            bool prepare_begin_ok = true;
+            MoEOverlayResidencyWaveProgress prepare_progress =
+                MoEOverlayResidencyWaveProgress::Ready;
+            bool publication_begin_ok = true;
+            MoEOverlayResidencyWaveProgress publication_progress =
                 MoEOverlayResidencyWaveProgress::Ready;
             bool failure_owns_cleanup = false;
             int begin_calls = 0;
             int stage_polls = 0;
-            int commit_begins = 0;
-            int commit_polls = 0;
+            int prepare_begins = 0;
+            int prepare_polls = 0;
+            int publication_begins = 0;
+            int publication_polls = 0;
             int aborts = 0;
             int abort_polls = 0;
             int retirements = 0;
@@ -544,8 +574,8 @@ namespace llaminar2::test
             return results;
         }
 
-        /** @brief Poll all independent commit waves until each is terminal. */
-        std::vector<TerminalProgress> finishCommits(
+        /** @brief Poll all independent prepare waves until each is terminal. */
+        std::vector<TerminalProgress> finishPreparations(
             std::vector<MoEOverlayResidencyStageStart> &starts)
         {
             std::vector<TerminalProgress> results(starts.size());
@@ -557,7 +587,7 @@ namespace llaminar2::test
                         MoEOverlayResidencyWaveProgress::Pending)
                     {
                         results[rank].progress =
-                            starts[rank].wave->pollCommit(
+                            starts[rank].wave->pollPrepare(
                                 &results[rank].error);
                     }
                 }
@@ -573,7 +603,40 @@ namespace llaminar2::test
                     return results;
                 }
             }
-            ADD_FAILURE() << "Distributed commit did not converge";
+            ADD_FAILURE() << "Distributed preparation did not converge";
+            return results;
+        }
+
+        /** @brief Poll selector fan-out and its consensus to a terminal. */
+        std::vector<TerminalProgress> finishPublications(
+            std::vector<MoEOverlayResidencyStageStart> &starts)
+        {
+            std::vector<TerminalProgress> results(starts.size());
+            for (int pass = 0; pass < 32; ++pass)
+            {
+                for (std::size_t rank = 0; rank < starts.size(); ++rank)
+                {
+                    if (results[rank].progress ==
+                        MoEOverlayResidencyWaveProgress::Pending)
+                    {
+                        results[rank].progress =
+                            starts[rank].wave->pollPublication(
+                                &results[rank].error);
+                    }
+                }
+                if (std::all_of(
+                        results.begin(),
+                        results.end(),
+                        [](const auto &result)
+                        {
+                            return result.progress !=
+                                   MoEOverlayResidencyWaveProgress::Pending;
+                        }))
+                {
+                    return results;
+                }
+            }
+            ADD_FAILURE() << "Distributed publication did not converge";
             return results;
         }
 
@@ -681,16 +744,26 @@ namespace llaminar2::test
             ASSERT_TRUE(interval.has_value());
             EXPECT_TRUE(interval->valid());
             std::string error;
-            EXPECT_TRUE(start.wave->beginCommit(&error)) << error;
+            EXPECT_TRUE(start.wave->beginPrepare(&error)) << error;
         }
-        const auto committed = finishCommits(retry);
+        const auto prepared = finishPreparations(retry);
         for (std::size_t rank = 0; rank < retry.size(); ++rank)
         {
             EXPECT_EQ(
-                committed[rank].progress,
+                prepared[rank].progress,
                 MoEOverlayResidencyWaveProgress::Ready)
-                << committed[rank].error;
-            retry[rank].wave->markPublished();
+                << prepared[rank].error;
+            std::string error;
+            EXPECT_TRUE(retry[rank].wave->beginPublication(&error)) << error;
+        }
+        const auto published = finishPublications(retry);
+        for (std::size_t rank = 0; rank < retry.size(); ++rank)
+        {
+            EXPECT_EQ(
+                published[rank].progress,
+                MoEOverlayResidencyWaveProgress::Ready)
+                << published[rank].error;
+            retry[rank].wave->markAuthorityPublished();
         }
         const auto retirement_ready = finishRetirementFences(retry);
         for (std::size_t rank = 0; rank < retry.size(); ++rank)
@@ -717,7 +790,7 @@ namespace llaminar2::test
         EXPECT_EQ(rank_one_stats.reservation_consensus_deferred, 1u);
         EXPECT_EQ(rank_one_stats.reservation_consensus_ready, 1u);
         EXPECT_EQ(rank_one_stats.stage_consensus_ready, 1u);
-        EXPECT_EQ(rank_one_stats.commit_consensus_ready, 1u);
+        EXPECT_EQ(rank_one_stats.preparation_consensus_ready, 1u);
         EXPECT_EQ(rank_one_stats.retirement_consensus_started, 1u);
         EXPECT_EQ(rank_one_stats.retirement_consensus_ready, 1u);
         EXPECT_EQ(rank_one_stats.retirement_consensus_failed, 0u);
@@ -728,11 +801,11 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayDistributedResidencyTransport,
-        CommitEnqueueFailureIsGloballyVotedWithoutStrandingPeers)
+        PreparationEnqueueFailureIsGloballyVotedWithoutStrandingPeers)
     {
         auto transaction = makeTransaction();
         DistributedTransportFixture distributed;
-        distributed.locals[1]->commit_begin_ok = false;
+        distributed.locals[1]->prepare_begin_ok = false;
 
         auto starts = startEveryRank(distributed, transaction.transaction);
         const auto staged = finishStages(starts);
@@ -742,9 +815,9 @@ namespace llaminar2::test
         for (auto &start : starts)
         {
             std::string error;
-            EXPECT_TRUE(start.wave->beginCommit(&error)) << error;
+            EXPECT_TRUE(start.wave->beginPrepare(&error)) << error;
         }
-        const auto failed = finishCommits(starts);
+        const auto failed = finishPreparations(starts);
         for (const auto &result : failed)
         {
             EXPECT_EQ(
@@ -758,14 +831,14 @@ namespace llaminar2::test
         abortEveryRank(starts);
 
         EXPECT_EQ(
-            distributed.transports[1]->stats().local_commit_begin_failed,
+            distributed.transports[1]->stats().local_preparation_begin_failed,
             1u);
         for (std::size_t rank = 0; rank < starts.size(); ++rank)
         {
             EXPECT_EQ(
                 distributed.transports[rank]
                     ->stats()
-                    .commit_consensus_failed,
+                    .preparation_consensus_failed,
                 1u);
             EXPECT_TRUE(distributed.lanes[rank]->idle());
         }

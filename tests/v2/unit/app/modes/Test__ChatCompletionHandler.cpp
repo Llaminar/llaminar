@@ -41,7 +41,7 @@ protected:
 
         // Default: runner is initialized
         runner_->simulateInitialized();
-        EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+        EXPECT_CALL(*runner_, maybeApplyMoERebalance(_))
             .Times(AnyNumber())
             .WillRepeatedly(Return(true));
         EXPECT_CALL(*runner_, prefixStateProbe())
@@ -856,7 +856,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_AppliesRebalanceHookAfterDecod
     EXPECT_CALL(*runner_, decodeStep())
         .Times(3)
         .WillRepeatedly(Return(makeToken(42, false)));
-    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance(1u))
         .Times(3)
         .WillRepeatedly(Return(true));
 
@@ -885,7 +885,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_AppliesRebalanceHookAfterFinal
     EXPECT_CALL(*runner_, clearCache()).Times(2);
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(42, true)));
-    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance(1u))
         .Times(1)
         .WillOnce(Return(true));
 
@@ -912,7 +912,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_UsesUnifiedDecodeBoundaryMaint
     EXPECT_CALL(*runner_, clearCache()).Times(2);
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(42, true)));
-    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance(1u))
         .Times(1)
         .WillOnce(Return(true));
 
@@ -2300,7 +2300,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_AppliesRebalanceHookAfterFinalComp
 
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(1, true)));
-    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance(1u))
         .Times(1)
         .WillOnce(Return(true));
 
@@ -2335,7 +2335,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_UsesUnifiedDecodeBoundaryMaintenan
 
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(1, true)));
-    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance(1u))
         .Times(1)
         .WillOnce(Return(true));
 

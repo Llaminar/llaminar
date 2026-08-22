@@ -21,6 +21,7 @@
 #include "../backends/IBackend.h"
 #include "fort.hpp"
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iterator>
@@ -28,13 +29,22 @@
 #include <sstream>
 #include <stdexcept>
 #include <numeric>
+#include <limits>
 #include <nlohmann/json.hpp>
 
 namespace llaminar2
 {
 
-    // Prefill graph capture warmup is separate from request warmup and remains fixed.
-    static constexpr int PREFILL_GRAPH_WARMUP_ITERATIONS = 3;
+    /**
+     * @brief Maximum request submissions needed by the prefill graph lifecycle.
+     *
+     * A graph key can require one submission for Cold -> Warmup, one for
+     * Warmup -> Ready/capture, and one Ready replay. Long segmented prompts
+     * commonly cross all three edges inside one request. Preparation therefore
+     * observes readiness after every submission and stops immediately instead
+     * of always replaying the whole prompt three times.
+     */
+    static constexpr int kMaxPrefillGraphPreparationSubmissions = 3;
 
     // Log GPU memory on all GPUs (enabled via LLAMINAR_BENCH_MEM_LOG=1).
     static void logGPUMemorySnapshot(const char *label)
@@ -192,10 +202,20 @@ namespace llaminar2
             snapshot.prefill_graphs.end(),
             [](const PrefillGraphRuntimeProbe &probe)
             {
-                return probe.capture_count > 0 ||
-                       probe.replay_count > 0 ||
-                       probe.capture_phase == "capture" ||
-                       probe.capture_phase == "replay";
+                /*
+                 * Lifecycle observations are historical evidence; readiness is
+                 * current executable state. In particular, a segmented prefill
+                 * may retain its last "replay" observation after the underlying
+                 * graph has been invalidated. Require the backend-neutral probe
+                 * to prove a live, non-empty Ready executable before benchmark
+                 * setup or the HTTP/server readiness surface can call it usable.
+                 */
+                return probe.phase == "ready" &&
+                       probe.node_count > 0 &&
+                       probe.capture_count > 0 &&
+                       probe.replay_count > 0 &&
+                       (probe.capture_phase == "capture" ||
+                        probe.capture_phase == "replay");
             });
     }
 
@@ -230,23 +250,49 @@ namespace llaminar2
                 std::to_string(after.prefill_graphs.size()));
         }
 
+        const auto same_identity = [](
+            const PrefillGraphRuntimeProbe &lhs,
+            const PrefillGraphRuntimeProbe &rhs)
+        {
+            return lhs.domain_id == rhs.domain_id &&
+                   lhs.participant_id == rhs.participant_id &&
+                   lhs.chunk_index == rhs.chunk_index &&
+                   lhs.bucket_seq_len == rhs.bucket_seq_len &&
+                   lhs.real_token_count == rhs.real_token_count &&
+                   lhs.placement_epoch == rhs.placement_epoch &&
+                   lhs.topology_signature == rhs.topology_signature;
+        };
+        const auto ready_executable = [](
+            const PrefillGraphRuntimeProbe &probe)
+        {
+            return probe.phase == "ready" &&
+                   probe.node_count > 0 &&
+                   probe.capture_count > 0 &&
+                   probe.replay_count > 0;
+        };
+
+        size_t prior_ready_count = 0;
         for (size_t index = 0; index < before.prefill_graphs.size(); ++index)
         {
             const auto &prior = before.prefill_graphs[index];
-            const auto &current = after.prefill_graphs[index];
-            const bool same_identity =
-                prior.domain_id == current.domain_id &&
-                prior.participant_id == current.participant_id &&
-                prior.chunk_index == current.chunk_index &&
-                prior.bucket_seq_len == current.bucket_seq_len &&
-                prior.placement_epoch == current.placement_epoch &&
-                prior.topology_signature == current.topology_signature;
-            if (!same_identity)
+            if (!ready_executable(prior))
+                continue;
+            ++prior_ready_count;
+
+            const auto current_it = std::find_if(
+                after.prefill_graphs.begin(),
+                after.prefill_graphs.end(),
+                [&](const PrefillGraphRuntimeProbe &candidate)
+                {
+                    return same_identity(prior, candidate);
+                });
+            if (current_it == after.prefill_graphs.end())
             {
                 return fail(
-                    "prefill graph identity changed at probe " +
+                    "ready prefill graph identity disappeared at probe " +
                     std::to_string(index));
             }
+            const auto &current = *current_it;
             if (current.capture_count != prior.capture_count)
             {
                 return fail(
@@ -266,6 +312,25 @@ namespace llaminar2
                     "prefill graph did not finish in ready/replay phase at probe " +
                     std::to_string(index));
             }
+        }
+
+        if (prior_ready_count == 0)
+            return fail("prefill graph probe contains no ready executable");
+
+        for (const auto &current : after.prefill_graphs)
+        {
+            if (!ready_executable(current))
+                continue;
+            const bool existed_before = std::any_of(
+                before.prefill_graphs.begin(),
+                before.prefill_graphs.end(),
+                [&](const PrefillGraphRuntimeProbe &prior)
+                {
+                    return ready_executable(prior) &&
+                           same_identity(prior, current);
+                });
+            if (!existed_before)
+                return fail("a new prefill graph became ready during measurement");
         }
         return true;
     }
@@ -381,6 +446,7 @@ namespace llaminar2
             "kernel",
             "memory",
             "moe_overlay",
+            "moe_overlay_controller",
             "moe_rebalance",
             "tp_allreduce_bom",
             "tp_allreduce_runtime",
@@ -444,6 +510,166 @@ namespace llaminar2
             {"enabled", PerfStatsCollector::isEnabled()},
             {"filters", filters},
             {"records", std::move(records_json)}};
+    }
+
+    /** Monotonic host-owned diagnostic totals for completed device-authored work. */
+    struct CompletedDynamicMovementSnapshot
+    {
+        std::uint64_t transactions = 0;
+        std::uint64_t commands = 0;
+        std::uint64_t physical_bytes = 0;
+        std::uint64_t promotions = 0;
+        std::uint64_t demotions = 0;
+        std::uint64_t same_priority_moves = 0;
+    };
+
+    /**
+     * @brief Snapshot cumulative completed Dynamic work without device polling.
+     *
+     * Dynamic movement completes on a background worker while inference keeps
+     * running. Snapshotting the process-global PerfStats ledger at a request
+     * boundary gives the benchmark a monotonic progress marker without a GPU
+     * event wait, stream synchronization, or host placement mirror.
+     */
+    static CompletedDynamicMovementSnapshot
+    completedDynamicMovementSnapshot()
+    {
+        CompletedDynamicMovementSnapshot snapshot;
+        for (const auto &record : PerfStatsCollector::snapshot(
+                 {"moe_overlay_controller"}))
+        {
+            if (record.domain != "moe_overlay_controller" ||
+                record.value <= 0.0)
+            {
+                continue;
+            }
+            const auto value = static_cast<std::uint64_t>(
+                std::llround(record.value));
+            if (record.name == "dynamic_movement_transactions")
+                snapshot.transactions += value;
+            else if (record.name == "dynamic_movement_commands")
+                snapshot.commands += value;
+            else if (record.name == "dynamic_physical_bytes")
+                snapshot.physical_bytes += value;
+            else if (record.name == "dynamic_promotions")
+                snapshot.promotions += value;
+            else if (record.name == "dynamic_demotions")
+                snapshot.demotions += value;
+            else if (record.name == "dynamic_same_priority_moves")
+                snapshot.same_priority_moves += value;
+        }
+        return snapshot;
+    }
+
+    /** Return a saturating delta across a measurement interval. */
+    static std::uint64_t monotonicDelta(
+        std::uint64_t before,
+        std::uint64_t after) noexcept
+    {
+        return after >= before ? after - before : 0u;
+    }
+
+    /**
+     * @brief Publish only movement completed during one measured request.
+     *
+     * PerfStats is cumulative after the post-warmup reset. Taking an explicit
+     * boundary delta prevents later benchmark iterations from double-counting
+     * every transaction completed by earlier requests.
+     */
+    static void captureCompletedDynamicMovement(
+        BenchmarkIterationResult *iteration,
+        const CompletedDynamicMovementSnapshot &before)
+    {
+        if (!iteration)
+            return;
+        const auto after = completedDynamicMovementSnapshot();
+        iteration->dynamic_movement_transactions =
+            monotonicDelta(before.transactions, after.transactions);
+        iteration->dynamic_movement_commands =
+            monotonicDelta(before.commands, after.commands);
+        iteration->dynamic_physical_bytes =
+            monotonicDelta(before.physical_bytes, after.physical_bytes);
+        iteration->dynamic_promotions =
+            monotonicDelta(before.promotions, after.promotions);
+        iteration->dynamic_demotions =
+            monotonicDelta(before.demotions, after.demotions);
+        iteration->dynamic_same_priority_moves = monotonicDelta(
+            before.same_priority_moves, after.same_priority_moves);
+    }
+
+    /** @return JSON representation of one measured adaptive-policy request. */
+    static nlohmann::json benchmarkIterationToJson(
+        const BenchmarkIterationResult &iteration)
+    {
+        nlohmann::json result{
+            {"iteration", iteration.iteration},
+            {"tokens", {{"prefill", iteration.prefill_tokens},
+                        {"decode", iteration.decode_tokens},
+                        {"decode_after_prefill",
+                         iteration.decode_after_prefill_tokens}}},
+            {"timing_ms", {{"prefill", iteration.prefill_time_ms},
+                           {"decode", iteration.decode_time_ms}}},
+            {"throughput_tokens_per_sec",
+             {{"prefill", iteration.prefill_tokens_per_sec},
+              {"decode", iteration.decode_tokens_per_sec},
+              {"decode_after_prefill",
+               iteration.decode_after_prefill_tokens_per_sec}}},
+            {"moe_runtime_movement_epoch_start",
+             iteration.moe_runtime_movement_epoch_start},
+            {"moe_runtime_movement_epoch",
+             iteration.moe_runtime_movement_epoch},
+            {"completed_dynamic_movement",
+             {{"transactions", iteration.dynamic_movement_transactions},
+              {"commands", iteration.dynamic_movement_commands},
+              {"physical_bytes", iteration.dynamic_physical_bytes},
+              {"promotions", iteration.dynamic_promotions},
+              {"demotions", iteration.dynamic_demotions},
+              {"same_priority_moves",
+               iteration.dynamic_same_priority_moves}}}};
+        result["decode_windows"] = nlohmann::json::array();
+        for (const auto &window : iteration.decode_windows)
+        {
+            result["decode_windows"].push_back(
+                {{"start_token", window.start_token},
+                 {"token_count", window.token_count},
+                 {"time_ms", window.time_ms},
+                 {"tokens_per_sec", window.tokens_per_sec}});
+        }
+        return result;
+    }
+
+    /** Partition existing per-token samples without instrumenting inference. */
+    static void appendDecodeWindows(
+        BenchmarkIterationResult *iteration,
+        const std::vector<double> &latencies_ms,
+        int requested_window_size)
+    {
+        if (!iteration || latencies_ms.empty())
+            return;
+        const std::size_t window_size = static_cast<std::size_t>(
+            std::max(1, requested_window_size));
+        for (std::size_t begin = 0u; begin < latencies_ms.size();
+             begin += window_size)
+        {
+            const std::size_t end = std::min(
+                latencies_ms.size(), begin + window_size);
+            const double elapsed_ms = std::accumulate(
+                latencies_ms.begin() + static_cast<std::ptrdiff_t>(begin),
+                latencies_ms.begin() + static_cast<std::ptrdiff_t>(end),
+                0.0);
+            const int count = static_cast<int>(end - begin);
+            iteration->decode_windows.push_back(
+                BenchmarkDecodeWindowResult{
+                    .start_token = static_cast<int>(begin),
+                    .token_count = count,
+                    .time_ms = elapsed_ms,
+                    .tokens_per_sec =
+                        elapsed_ms > 0.0
+                            ? (static_cast<double>(count) * 1000.0) /
+                                  elapsed_ms
+                            : 0.0,
+                });
+        }
     }
 
     static double meanLatencyMs(const std::vector<double> &samples)
@@ -583,12 +809,16 @@ namespace llaminar2
                         {"sha256", result.prompt_sha256}}},
             {"tokens", {{"prefill", result.prefill_tokens},
                          {"decode", result.decode_tokens},
+                         {"decode_after_prefill",
+                          result.decode_after_prefill_tokens},
                          {"total", result.prefill_tokens + result.decode_tokens}}},
             {"timing_ms", {{"prefill", result.prefill_time_ms},
                             {"decode", result.decode_time_ms},
                             {"total", result.total_time_ms}}},
             {"throughput_tokens_per_sec", {{"prefill", result.prefill_tokens_per_sec},
                                             {"decode", result.decode_tokens_per_sec},
+                                            {"decode_after_prefill",
+                                             result.decode_after_prefill_tokens_per_sec},
                                             {"overall", result.total_time_ms > 0.0
                                                             ? ((result.prefill_tokens + result.decode_tokens) * 1000.0) /
                                                                   result.total_time_ms
@@ -597,6 +827,7 @@ namespace llaminar2
                                     {"p50", result.decode_latency_p50_ms},
                                     {"p90", result.decode_latency_p90_ms},
                                     {"samples", result.decode_token_latencies_ms.size()}}},
+            {"iterations", nlohmann::json::array()},
             {"generated_text_bytes", result.generated_text.size()},
             {"generated_token_ids", result.generated_token_ids},
             {"runtime_state", {{"initialized", state.initialized},
@@ -605,6 +836,8 @@ namespace llaminar2
                                 {"primary_device", state.primary_device.toString()},
                                 {"current_position", state.current_position},
                                 {"session_epoch", state.session_epoch},
+                                {"moe_runtime_movement_epoch",
+                                 state.moe_runtime_movement_epoch},
                                 {"prefill_logits_ready", state.prefill_logits_ready},
                                 {"has_hidden", state.has_hidden},
                                 {"has_logits", state.has_logits},
@@ -679,6 +912,10 @@ namespace llaminar2
             {"perf_stats", benchmarkPerfStatsToJson()},
         };
 
+        for (const auto &iteration : result.iterations)
+            doc["iterations"].push_back(
+                benchmarkIterationToJson(iteration));
+
         if (!result.prompt_file_path.empty())
             doc["prompt"]["file_path"] = result.prompt_file_path;
 
@@ -690,6 +927,8 @@ namespace llaminar2
                 {"prefix_cache_enabled", config->prefix_cache.enabled},
                 {"mtp_enabled", config->mtp.enabled},
                 {"mtp_draft_tokens", config->mtp.draft_tokens},
+                {"mtp_graph_capacity_draft_tokens",
+                 config->mtp.graph_capacity_draft_tokens},
                 {"mtp_max_request_batch", config->mtp.max_request_batch},
                 {"mtp_verify_mode", mtpVerifyModeToString(config->mtp.verify_mode)},
                 {"mtp_depth_policy", mtpDepthPolicyModeToString(config->mtp.depth_policy.mode)},
@@ -1186,7 +1425,9 @@ namespace llaminar2
                 const auto maintenance_start =
                     profile_sampler ? std::chrono::high_resolution_clock::now()
                                     : std::chrono::high_resolution_clock::time_point{};
-                const bool maintenance_success = runner_->maybeApplyDecodeBoundaryMaintenance();
+                const bool maintenance_success =
+                    runner_->maybeApplyDecodeBoundaryMaintenance(
+                        static_cast<uint64_t>(emitted_this_step));
                 record_decode_loop_interval(
                     "request_batch_maintenance",
                     maintenance_start,
@@ -1312,7 +1553,9 @@ namespace llaminar2
                 const auto maintenance_start =
                     profile_sampler ? std::chrono::high_resolution_clock::now()
                                     : std::chrono::high_resolution_clock::time_point{};
-                const bool maintenance_success = runner_->maybeApplyDecodeBoundaryMaintenance();
+                const bool maintenance_success =
+                    runner_->maybeApplyDecodeBoundaryMaintenance(
+                        static_cast<uint64_t>(step_token_count));
                 record_decode_loop_interval(
                     "orchestrated_maintenance",
                     maintenance_start,
@@ -1503,6 +1746,24 @@ namespace llaminar2
             return result;
         };
 
+        /*
+         * Application startup owns all model preparation through the same
+         * generic readiness boundary used by serving. BenchmarkRunner must not
+         * know which subsystem prepared the model, nor submit hidden workloads
+         * whose cost and routing differ from ordinary admitted requests.
+         */
+        const InferenceReadiness readiness = runner_->inferenceReadiness();
+        if (!readiness.ready())
+        {
+            last_failure_reason_ = readiness.failed()
+                                       ? "inference preparation failed"
+                                       : "inference runner is not ready";
+            if (!readiness.diagnostic.empty())
+                last_failure_reason_ += ": " + readiness.diagnostic;
+            LOG_ERROR(last_failure_reason_);
+            return capture_and_return();
+        }
+
         // Resolve and tokenize once in the sole benchmark controller.
         std::string prompt;
         std::vector<int> tokens;
@@ -1649,7 +1910,7 @@ namespace llaminar2
             return false;
         };
 
-        auto warmPrefillGraphCapture = [&]() -> bool
+        auto preparePrefillGraphCapture = [&]() -> bool
         {
             if (!has_gpu)
             {
@@ -1675,18 +1936,96 @@ namespace llaminar2
                 return true;
             }
 
-            LOG_INFO("Preparing prefill graph capture for steady-state benchmark...");
+            const auto graph_is_ready = [&]()
+            {
+                const PrefixRuntimeStateSnapshot snapshot =
+                    runner_->prefixStateProbe();
+                return prefillGraphProbeShowsCaptureOrReplay(snapshot);
+            };
 
-            for (int iter = 0; iter < PREFILL_GRAPH_WARMUP_ITERATIONS; ++iter)
+            const PrefixRuntimeStateSnapshot initial_graph_snapshot =
+                runner_->prefixStateProbe();
+            if (prefillGraphProbeShowsCaptureOrReplay(initial_graph_snapshot))
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "prefill_graph_preparation_ready_reuse",
+                    1.0,
+                    "model_setup",
+                    runner_->primaryDeviceId().toString(),
+                    {{"hidden_prefill_submissions", "0"}});
+                return true;
+            }
+
+            LOG_INFO(
+                "Preparing retained prefill graph to its first replay-ready state; "
+                "current_state="
+                << summarizePrefillGraphProbe(initial_graph_snapshot));
+            const auto preparation_start =
+                std::chrono::steady_clock::now();
+            int submissions = 0;
+            for (; submissions < kMaxPrefillGraphPreparationSubmissions;
+                 ++submissions)
             {
                 runner_->clear_cache();
                 auto [graph_warmup_success, graph_warmup_time] = runPrefill(tokens);
                 if (!graph_warmup_success)
                 {
-                    LOG_ERROR("Prefill graph warmup failed on iteration " << (iter + 1));
+                    LOG_ERROR(
+                        "Prefill graph preparation failed on submission "
+                        << (submissions + 1));
                     return false;
                 }
+
+                const bool ready = graph_is_ready();
+                PerfStatsCollector::recordTimingNs(
+                    "forward_graph",
+                    "prefill_graph_preparation_submission",
+                    static_cast<std::uint64_t>(
+                        std::max(0.0, graph_warmup_time) * 1.0e6),
+                    "model_setup",
+                    runner_->primaryDeviceId().toString(),
+                    {{"submission", std::to_string(submissions + 1)},
+                     {"ready_after_submission", ready ? "true" : "false"}});
+
+                /*
+                 * A backend-neutral probe is available on production runners.
+                 * Minimal GPU test doubles may expose no graph inventory when
+                 * capture is not mandatory; one ordinary request remains the
+                 * complete warmup contract for those callers.
+                 */
+                const auto snapshot = runner_->prefixStateProbe();
+                if (ready ||
+                    (snapshot.prefill_graphs.empty() &&
+                     !debugEnv().execution.prefill_graph_required))
+                {
+                    ++submissions;
+                    break;
+                }
             }
+
+            const auto preparation_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - preparation_start)
+                    .count();
+            PerfStatsCollector::recordTimingNs(
+                "forward_graph",
+                "prefill_graph_preparation_total",
+                static_cast<std::uint64_t>(
+                    std::max<std::int64_t>(0, preparation_ns)),
+                "model_setup",
+                runner_->primaryDeviceId().toString(),
+                {{"submissions", std::to_string(submissions)},
+                 {"state_driven", "true"}});
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "prefill_graph_preparation_submissions",
+                static_cast<double>(submissions),
+                "model_setup",
+                runner_->primaryDeviceId().toString(),
+                {{"maximum",
+                  std::to_string(kMaxPrefillGraphPreparationSubmissions)},
+                 {"state_driven", "true"}});
 
             return requirePrefillGraphCapture("prefill graph warmup");
         };
@@ -1694,9 +2033,13 @@ namespace llaminar2
         /*
          * Prefill graph capture clears graph/runtime state as it warms capture
          * buckets. Run it before the decode warmup so post-warmup rebalance sees
-         * the histogram from the immediately preceding decode window.
+         * the histogram from the immediately preceding decode window. Dynamic
+         * ExpertOverlay placement uses persistent ticketed residency banks:
+         * publishing a new epoch changes immutable ticket data and stable
+         * engine bindings, never captured topology or embedded buffer addresses,
+         * so maintenance does not invalidate these warmed bucket families.
          */
-        if (!warmPrefillGraphCapture())
+        if (!preparePrefillGraphCapture())
         {
             return capture_and_return();
         }
@@ -1755,12 +2098,19 @@ namespace llaminar2
                 int eos_token = tokenizer_->eos_token();
                 (void)runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
             }
-            if (rw_ok && !warmPrefillGraphCapture())
+            if (!rw_ok)
+            {
+                if (last_failure_reason_.empty())
+                    last_failure_reason_ =
+                        "post-warmup cache rewarm prefill failed";
+                return capture_and_return();
+            }
+            if (!preparePrefillGraphCapture())
             {
                 return capture_and_return();
             }
         }
-        else if (!warmPrefillGraphCapture())
+        else if (!preparePrefillGraphCapture())
         {
             return capture_and_return();
         }
@@ -1797,13 +2147,17 @@ namespace llaminar2
          * materialized, so discarding their BOM records here would leave an
          * optimized captured replay with no stage/payload attribution at all.
          *
-         * Runtime collective and MoE rebalance domains are intentionally not
-         * preserved. They must describe only steady-state measured work rather
-         * than graph capture, setup, or post-warmup placement activity.
+         * Runtime collective and MoE rebalance records are intentionally not
+         * preserved. They must describe only steady-state measured work. Exact
+         * ExpertOverlay capacity and named materialization records are setup
+         * BOM evidence, however, and must survive so auto-capacity, shadow
+         * width, and movement concurrency remain auditable beside throughput.
          */
         PerfStatsCollector::resetPreserving(
             {"memory",
+             "weight_loading",
              "gpu_graph_inventory",
+             "moe_overlay_capacity",
              "tp_allreduce_bom",
              "tp_rooted_collective_bom"},
             {
@@ -1812,9 +2166,20 @@ namespace llaminar2
                 {"forward_graph", "full_graph_capture_executable_nodes"},
                 {"forward_graph", "prefill_graph_lifecycle"},
                 {"forward_graph", "prefill_graph_phase"},
+                {"forward_graph", "prefill_graph_preparation_submission"},
+                {"forward_graph", "prefill_graph_preparation_total"},
+                {"forward_graph", "prefill_graph_preparation_submissions"},
+                {"forward_graph", "prefill_graph_preparation_ready_reuse"},
                 {"forward_graph", "decode_graph_phase"},
                 {"moe_overlay_activation_epoch",
                  "shared_physical_dispatch_d2h_bytes"},
+                {"moe_overlay_transport", "selection"},
+                {"moe_overlay_controller",
+                 "captured_participant_graphs"},
+                {"moe_overlay_residency",
+                 "physical_fabrics_materialized"},
+                {"moe_overlay_residency",
+                 "production_maintenance_composed"},
                 {"kernel", "rocm_moe_grouped_prefill_batch_invariant_calls"},
                 {"kernel", "cuda_moe_grouped_prefill_active_expert_grid_calls"},
                 {"kernel", "cuda_moe_grouped_prefill_swiglu_path_calls"},
@@ -1848,6 +2213,13 @@ namespace llaminar2
             logGPUMemorySnapshot(("after-clear-cache iter=" + std::to_string(iter + 1)).c_str());
 
             LOG_DEBUG("  Iteration " << (iter + 1) << "/" << benchmark_iterations << "...");
+            BenchmarkIterationResult iteration_result;
+            iteration_result.iteration = iter + 1;
+            iteration_result.prefill_tokens = result.prefill_tokens;
+            iteration_result.moe_runtime_movement_epoch_start =
+                runner_ ? runner_->moeRuntimeMovementEpoch() : 0u;
+            const auto dynamic_movement_start =
+                completedDynamicMovementSnapshot();
 
             // Run prefill
             KernelProfiler::setCurrentPhase(KernelProfiler::Phase::PREFILL);
@@ -1891,6 +2263,12 @@ namespace llaminar2
                     std::move(measured_prefill_graph_after);
             }
             prefill_times.push_back(prefill_time);
+            iteration_result.prefill_time_ms = prefill_time;
+            iteration_result.prefill_tokens_per_sec =
+                prefill_time > 0.0
+                    ? (static_cast<double>(result.prefill_tokens) * 1000.0) /
+                          prefill_time
+                    : 0.0;
             logGPUMemorySnapshot(("after-prefill iter=" + std::to_string(iter + 1)).c_str());
 
             // Run decode (if requested)
@@ -1918,6 +2296,36 @@ namespace llaminar2
                 }
                 decode_times.push_back(decode_result.time_ms);
                 decode_token_counts.push_back(decode_result.tokens_generated);
+                iteration_result.decode_tokens =
+                    decode_result.tokens_generated;
+                iteration_result.decode_time_ms = decode_result.time_ms;
+                iteration_result.decode_tokens_per_sec =
+                    decode_result.time_ms > 0.0
+                        ? (static_cast<double>(decode_result.tokens_generated) *
+                           1000.0) /
+                              decode_result.time_ms
+                        : 0.0;
+                /*
+                 * Prefill has already produced the logits for the first
+                 * output of every logical request. Keep user-visible emitted
+                 * throughput, but also expose the work-normalized rate used
+                 * to compare steady decode kernels and protocols. The rule is
+                 * a property of autoregressive inference, not ExpertOverlay.
+                 */
+                iteration_result.decode_after_prefill_tokens = std::max(
+                    0,
+                    decode_result.tokens_generated - decode_request_batch_);
+                iteration_result.decode_after_prefill_tokens_per_sec =
+                    decode_result.time_ms > 0.0
+                        ? (static_cast<double>(
+                               iteration_result.decode_after_prefill_tokens) *
+                           1000.0) /
+                              decode_result.time_ms
+                        : 0.0;
+                appendDecodeWindows(
+                    &iteration_result,
+                    decode_result.token_latencies_ms,
+                    config.moe_rebalance.window_size);
                 decode_token_latencies_ms.insert(
                     decode_token_latencies_ms.end(),
                     decode_result.token_latencies_ms.begin(),
@@ -1926,6 +2334,8 @@ namespace llaminar2
                 result.generated_token_ids = std::move(decode_result.generated_token_ids);
                 const PrefixRuntimeStateSnapshot iteration_state =
                     runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+                iteration_result.moe_runtime_movement_epoch =
+                    iteration_state.moe_runtime_movement_epoch;
                 if (!has_measured_mtp_state)
                 {
                     measured_mtp_state = iteration_state;
@@ -1937,6 +2347,9 @@ namespace llaminar2
                 }
                 logGPUMemorySnapshot(("after-decode iter=" + std::to_string(iter + 1)).c_str());
             }
+            captureCompletedDynamicMovement(
+                &iteration_result, dynamic_movement_start);
+            result.iterations.push_back(std::move(iteration_result));
             LOG_DEBUG("    Prefill: " << std::fixed << std::setprecision(2) << prefill_time << " ms"
                                       << (n_decode > 0 ? ", Decode: " + std::to_string(static_cast<int>(decode_times.back())) + " ms" : ""));
         }
@@ -1960,6 +2373,12 @@ namespace llaminar2
             result.decode_time_ms = avg_decode_time;
             result.decode_tokens = avg_decode_tokens;
             result.decode_tokens_per_sec = (avg_decode_tokens * 1000.0) / avg_decode_time;
+            result.decode_after_prefill_tokens = std::max(
+                0, avg_decode_tokens - decode_request_batch_);
+            result.decode_after_prefill_tokens_per_sec =
+                (static_cast<double>(result.decode_after_prefill_tokens) *
+                 1000.0) /
+                avg_decode_time;
             result.decode_latency_mean_ms = meanLatencyMs(decode_token_latencies_ms);
             result.decode_latency_p50_ms = percentileLatencyMs(decode_token_latencies_ms, 0.50);
             result.decode_latency_p90_ms = percentileLatencyMs(decode_token_latencies_ms, 0.90);
@@ -1973,6 +2392,8 @@ namespace llaminar2
             result.decode_tokens = 0;
             result.decode_time_ms = 0.0;
             result.decode_tokens_per_sec = 0.0;
+            result.decode_after_prefill_tokens = 0;
+            result.decode_after_prefill_tokens_per_sec = 0.0;
             result.decode_token_latencies_ms.clear();
             result.decode_latency_mean_ms = 0.0;
             result.decode_latency_p50_ms = 0.0;
@@ -2050,14 +2471,22 @@ namespace llaminar2
         // Decode results
         if (result.decode_tokens > 0)
         {
-            std::ostringstream tokens_ss, time_ss, throughput_ss;
+            std::ostringstream tokens_ss, time_ss, throughput_ss,
+                after_prefill_ss;
             tokens_ss << result.decode_tokens << " tokens";
             time_ss << std::fixed << std::setprecision(2) << result.decode_time_ms << " ms";
             throughput_ss << std::fixed << std::setprecision(2) << result.decode_tokens_per_sec << " tok/s";
+            after_prefill_ss << std::fixed << std::setprecision(2)
+                             << result.decode_after_prefill_tokens_per_sec
+                             << " tok/s ("
+                             << result.decode_after_prefill_tokens
+                             << " tokens)";
 
             table << "DECODE" << "Tokens" << tokens_ss.str() << fort::endr;
             table << "" << "Time" << time_ss.str() << fort::endr;
             table << "" << "Throughput" << throughput_ss.str() << fort::endr;
+            table << "" << "After prefill" << after_prefill_ss.str()
+                  << fort::endr;
         }
         else
         {

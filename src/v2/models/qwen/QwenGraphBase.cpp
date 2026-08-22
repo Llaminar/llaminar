@@ -3978,8 +3978,22 @@ namespace llaminar2
                 "attention execution policy requires a valid CPU, CUDA, or ROCm device");
         }
 
+        /*
+         * Native floating rings retain stable row addresses and can publish
+         * post-RoPE K once at append time. Re-transforming and linearizing
+         * their complete history on every decode token is both unnecessary
+         * O(context) work and prevents FlashAttention from consuming the
+         * device-owned ring directly. Quantized caches still require their
+         * explicit device conversion path because rotating before
+         * quantization changes that representation's established arithmetic.
+         */
+        const bool native_floating_cache =
+            config_.kv_cache_precision == KVCachePrecision::AUTO ||
+            config_.kv_cache_precision == KVCachePrecision::FP16 ||
+            config_.kv_cache_precision == KVCachePrecision::FP32;
         const bool device_transforms_cached_keys =
-            cache_backed && device.is_gpu() && config_.rope_on_read;
+            cache_backed && device.is_gpu() && config_.rope_on_read &&
+            !native_floating_cache;
         return {
             .prefill_parallel_axis =
                 attention::AttentionPrefillParallelAxis::GeometrySelected,

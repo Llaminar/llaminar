@@ -146,4 +146,72 @@ namespace llaminar2
         output.weight_format = formats[0];
         return output.weightsReady();
     }
+
+    /**
+     * @brief Export a prepared expert while deriving its coherent geometry.
+     *
+     * Migration destinations already own fully prepared gate/up/down engines,
+     * but the device-authored command intentionally carries only logical
+     * placement and byte identity.  Requiring a host policy object merely to
+     * repeat `d_model` and intermediate width would create a second source of
+     * truth.  This overload derives those two dimensions from the immutable
+     * engine descriptors, then delegates to the exact geometry validator above.
+     *
+     * @param gate Prepared gate projection engine.
+     * @param up Prepared up projection engine.
+     * @param down Prepared down projection engine.
+     * @param output Runtime descriptor to populate.
+     * @return True only for one complete coherent NativeVNNI or floating family.
+     */
+    inline bool exportDeviceMoEExpertWeightDescriptors(
+        ITensorGemm *gate,
+        ITensorGemm *up,
+        ITensorGemm *down,
+        DeviceMoEExpertDescriptor &output) noexcept
+    {
+        if (!gate || !up || !down)
+            return false;
+
+        DeviceNativeVNNIMatrixDesc native_gate{};
+        DeviceNativeVNNIMatrixDesc native_up{};
+        DeviceNativeVNNIMatrixDesc native_down{};
+        const bool gate_native = gate->exportNativeVNNIMatrixDesc(native_gate);
+        const bool up_native = up->exportNativeVNNIMatrixDesc(native_up);
+        const bool down_native = down->exportNativeVNNIMatrixDesc(native_down);
+        if (gate_native || up_native || down_native)
+        {
+            if (!gate_native || !up_native || !down_native ||
+                !native_gate.valid() || !native_up.valid() ||
+                !native_down.valid())
+            {
+                return false;
+            }
+            return exportDeviceMoEExpertWeightDescriptors(
+                gate,
+                up,
+                down,
+                native_gate.k,
+                native_gate.n,
+                output);
+        }
+
+        ContiguousFloatingPointWeightDescriptor floating_gate{};
+        ContiguousFloatingPointWeightDescriptor floating_up{};
+        ContiguousFloatingPointWeightDescriptor floating_down{};
+        if (!gate->exportContiguousFloatingPointWeights(floating_gate) ||
+            !up->exportContiguousFloatingPointWeights(floating_up) ||
+            !down->exportContiguousFloatingPointWeights(floating_down) ||
+            !floating_gate.valid() || !floating_up.valid() ||
+            !floating_down.valid())
+        {
+            return false;
+        }
+        return exportDeviceMoEExpertWeightDescriptors(
+            gate,
+            up,
+            down,
+            floating_gate.k,
+            floating_gate.n,
+            output);
+    }
 } // namespace llaminar2

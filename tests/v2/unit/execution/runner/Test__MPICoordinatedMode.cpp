@@ -23,6 +23,10 @@
 #include "backends/GlobalDeviceAddress.h"
 #include "interfaces/IMPIContext.h"
 
+#include <fstream>
+#include <iterator>
+#include <string_view>
+
 using namespace llaminar2;
 using namespace testing;
 
@@ -374,7 +378,7 @@ namespace
 
         // Expected broadcasts:
         // 1. Command tag (PREFILL = 3)
-        // 2. Token count (5)
+        // 2. Typed header: token count plus retired prefill/decode progress
         // 3. Token data (10, 20, 30, 40, 50)
         ASSERT_EQ(mpi->broadcastCount(), 3u);
 
@@ -385,11 +389,10 @@ namespace
         EXPECT_EQ(cmd.int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL));
 
-        // Token count
+        // Typed prefill command header
         const auto &count = mpi->broadcasts()[1];
         EXPECT_EQ(count.type, RecordingMPIContext::BroadcastRecord::Type::INT32);
-        ASSERT_EQ(count.int_data.size(), 1u);
-        EXPECT_EQ(count.int_data[0], 5);
+        EXPECT_THAT(count.int_data, ElementsAre(5, 0, 0));
 
         // Token data
         const auto &data = mpi->broadcasts()[2];
@@ -454,7 +457,7 @@ namespace
         ASSERT_EQ(mpi->broadcastCount(), 3u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
-        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0, 0, 0));
         EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(3));
     }
 
@@ -478,7 +481,7 @@ namespace
         ASSERT_EQ(mpi->broadcastCount(), 3u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
-        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0, 0, 0));
         EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(7));
     }
 
@@ -500,7 +503,7 @@ namespace
         ASSERT_EQ(mpi->broadcastCount(), 3u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
-        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0, 0, 0));
         EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(7));
     }
 
@@ -519,7 +522,7 @@ namespace
         ASSERT_EQ(mpi->broadcastCount(), 2u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::FORCE_DECODE_TOKEN));
-        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(90));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(90, 0, 0));
         EXPECT_EQ(mpi->barrierCount(), 1u);
     }
 
@@ -711,6 +714,40 @@ namespace
         ASSERT_EQ(mpi->broadcastCount(), 1u);
         EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN));
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           ShutdownPublishesTerminalAdmissionBeforeCollectiveDrain)
+    {
+        /* This is an architecture sanitizer for a real MPI deadlock: worker
+         * ranks block in the command Bcast, so the root cannot enter a
+         * maintenance Barrier until SHUTDOWN has released that receive. The
+         * runtime test above proves wire identity and this source invariant
+         * locks down the otherwise unobservable cross-component ordering. */
+        std::ifstream source(LLAMINAR_ORCHESTRATION_RUNNER_SOURCE);
+        ASSERT_TRUE(source.good());
+        const std::string text{
+            std::istreambuf_iterator<char>(source),
+            std::istreambuf_iterator<char>()};
+        const auto function_begin = text.find(
+            "void OrchestrationRunner::shutdownMPIWorkers()");
+        ASSERT_NE(function_begin, std::string::npos);
+        const auto function_end = text.find(
+            "[[noreturn]] void OrchestrationRunner::terminateFailedMPIWorkerCommand",
+            function_begin);
+        ASSERT_NE(function_end, std::string::npos);
+        const std::string_view body(
+            text.data() + function_begin,
+            function_end - function_begin);
+        const auto publish = body.find(
+            "broadcastCommand(MPICommand::SHUTDOWN);");
+        const auto drain = body.find(
+            "shutdownMoEExpertOverlayResidencyMaintenance();");
+        ASSERT_NE(publish, std::string_view::npos);
+        ASSERT_NE(drain, std::string_view::npos);
+        EXPECT_LT(publish, drain)
+            << "Barrier-before-Bcast mismatches the root maintenance drain "
+               "against the worker command receive and deadlocks teardown";
     }
 
     // =========================================================================
@@ -1077,8 +1114,8 @@ namespace
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         // PREFILL command
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        // Token count
-        scripted->scriptInt32({3});
+        // Token count plus retired prefill/decode progress
+        scripted->scriptInt32({3, 0, 0});
         // Token data
         scripted->scriptInt32({100, 200, 300});
         // SHUTDOWN
@@ -1096,7 +1133,7 @@ namespace
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         // Prefill first so decode has state
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({1});
+        scripted->scriptInt32({1, 0, 0});
         scripted->scriptInt32({42});
         // First decode: consumes prefill logits (no forward)
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
@@ -1120,7 +1157,7 @@ namespace
     {
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({1});
+        scripted->scriptInt32({1, 0, 0});
         scripted->scriptInt32({42});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
         scripted->scriptInt32({0}); // decode token budget
@@ -1208,7 +1245,7 @@ namespace
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SET_SAMPLING)});
         scripted->scriptFloat({0.0f, 1.0f, 0.0f, 0.0f}); // greedy params
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({2}); // token count
+        scripted->scriptInt32({2, 0, 0}); // token count and retired progress
         scripted->scriptInt32({10, 20}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
         scripted->scriptInt32({0}); // decode token budget
@@ -1299,7 +1336,7 @@ namespace
         // blocked in a sparse collective that this worker will not enter.
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({2}); // token count
+        scripted->scriptInt32({2, 0, 0}); // token count and retired progress
         scripted->scriptInt32({10, 20}); // tokens
         // This command must remain unread after the failure.
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
@@ -1324,7 +1361,7 @@ namespace
         // this worker before it consumes a later coordinated command.
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({2}); // token count
+        scripted->scriptInt32({2, 0, 0}); // token count and retired progress
         scripted->scriptInt32({10, 20}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
@@ -1346,7 +1383,7 @@ namespace
         auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
         // Prefill to set up state (1st forward call — succeeds)
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({2});
+        scripted->scriptInt32({2, 0, 0});
         scripted->scriptInt32({10, 20});
         // First decode uses prefill logits (no forward call)
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
@@ -1397,7 +1434,7 @@ namespace
         // Request 1: clear → prefill → decode → decode
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({3}); // token count
+        scripted->scriptInt32({3, 0, 0}); // token count and retired progress
         scripted->scriptInt32({1, 2, 3}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
         scripted->scriptInt32({0}); // decode token budget
@@ -1409,7 +1446,7 @@ namespace
         // Request 2: clear → prefill → decode
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
-        scripted->scriptInt32({2}); // token count
+        scripted->scriptInt32({2, 0, 0}); // token count and retired progress
         scripted->scriptInt32({4, 5}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
         scripted->scriptInt32({0}); // decode token budget

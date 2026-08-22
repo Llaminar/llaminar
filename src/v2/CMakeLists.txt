@@ -387,6 +387,7 @@ if(HAVE_CUDA)
         # MoE (Mixture of Experts) kernels
         kernels/cuda/moe/CUDAMoEKernels.cu            # MoE routing, gather, scatter, gate, swiglu
         kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.cu # Device-owned node-local sparse activation packets
+        kernels/cuda/moe/CUDAMoEOverlayDeviceControllerKernels.cu # Node-local sole-controller lifecycle
         kernels/cuda/moe/CUDAMoEOverlayEpochKernels.cu # Captured ExpertOverlay placement-epoch RCU
         # GPU repack kernels (GGUF → VNNI layout on device)
         kernels/cuda/repack/CUDAVnniRepackKernels.cu   # VNNI repack for all 18 quantization formats
@@ -649,6 +650,7 @@ if(HAVE_ROCM)
         # MoE (Mixture of Experts) kernels
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
         kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
+        kernels/rocm/moe/ROCmMoEOverlayDeviceControllerKernels.hip # Node-local sole-controller lifecycle
         kernels/rocm/moe/ROCmMoEOverlayEpochKernels.hip       # Captured ExpertOverlay placement-epoch RCU
         # GPU weight loading pipeline repack kernels
         kernels/rocm/repack/VnniRepackKernels.hip            # VNNI repack: Q4_0, IQ4_NL, Q4_K on-device
@@ -1407,6 +1409,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
+    execution/compute_stages/stages/MoEOverlayPinnedRouteEvidenceViews.cpp
     execution/compute_stages/stages/MoEExpertDispatchStage.cpp
     execution/compute_stages/stages/MoEOverlayTicketPublishStage.cpp
     execution/compute_stages/stages/MoEOverlayTicketConsumeStage.cpp
@@ -1432,6 +1435,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/MTPConcatStage.cpp
     execution/compute_stages/stages/MTPDraftTokenPublicationStage.cpp
     execution/compute_stages/stages/MoEOverlayEpochBoundaryStage.cpp
+    execution/compute_stages/stages/MoEOverlayDeviceControllerStage.cpp
     execution/compute_stages/stages/MTPVerifierPreparationStage.cpp
     execution/compute_stages/stages/PrefillChunkMaterializationStage.cpp
     execution/compute_stages/stages/MTPVerifierOutcomeStage.cpp
@@ -1458,9 +1462,22 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEOverlayMigrationMeasurementExchange.cpp
     execution/moe/MoEOverlayCapacityResolver.cpp
     execution/moe/MoEOverlayCapacityAdmission.cpp
+    execution/moe/MoEOverlayActivationChannelPlan.cpp
     execution/moe/MoEOverlayLocalCapacityPlanner.cpp
     execution/moe/MoEExpertOverlayAuthorityPlan.cpp
     execution/moe/MoEExpertOwnerMap.cpp
+    execution/moe/MoEOverlayDevicePlacementPolicy.cpp
+    execution/moe/MoEOverlayDeviceControllerProtocol.cpp
+    execution/moe/MoEOverlayDeviceTransportProtocol.cpp
+    execution/moe/MoEOverlayDevicePhysicalMovement.cpp
+    execution/moe/MoEOverlayDevicePhysicalSlotLedger.cpp
+    execution/moe/MoEOverlayDevicePreparedArrivalInbox.cpp
+    execution/moe/MoEOverlayDeviceControllerTopology.cpp
+    execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.cpp
+    execution/moe/MoEOverlayServiceTelemetryPublication.cpp
+    execution/moe/MoEOverlayDeviceServiceTelemetryPublisher.cpp
+    execution/moe/MoEOverlayHostAuthorityDeviceBankPublisher.cpp
+    execution/moe/MoEOverlayDeviceControllerGraphService.cpp
     execution/moe/MoEOverlayResidencyAuthority.cpp
     execution/moe/DeviceMoEOverlayEpochArena.cpp
     execution/moe/MoEOverlayDeviceEpochProtocol.cpp
@@ -1571,6 +1588,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/device/WorkspaceAllocator.cpp
     # Unified transfer engine (explicit coherence state machine + centralized data movement)
     transfer/TransferEngine.cpp
+    transfer/MappedTransferProgressEpoch.cpp
     # Tensor parallelism configuration (proportional sharding for heterogeneous TP)
     config/TensorParallelConfig.cpp
     # Pipeline parallelism configuration (layer range assignment for PP)
@@ -1821,6 +1839,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/parallelism_tree/PipelineRunner.cpp
     execution/parallelism_tree/TreeToRunnerCompiler.cpp
     # Orchestration runner (Phase 5: end-to-end integration)
+    execution/runner/RankInitializationLifecycle.cpp
     execution/runner/OrchestrationRunner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp
     execution/runner/NamedDomainGlobalRunner.cpp

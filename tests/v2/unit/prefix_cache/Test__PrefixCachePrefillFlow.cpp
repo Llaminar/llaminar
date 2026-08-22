@@ -962,7 +962,10 @@ TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixUsesChunkScheduleWhenRunnerSu
     EXPECT_EQ(probe.prefill_chunk_successful_schedules, 1u);
     EXPECT_EQ(probe.prefill_chunks, 2u);
     EXPECT_EQ(probe.prefill_chunk_real_tokens, 3u);
-    EXPECT_EQ(probe.prefill_chunk_padded_tokens, 1u);
+    // This lightweight host runner consumes only the three live rows. The
+    // retained bucket still authenticates the schedule, but padding is charged
+    // only when a native device executable actually launches physical rows.
+    EXPECT_EQ(probe.prefill_chunk_padded_tokens, 0u);
     EXPECT_EQ(probe.prefill_chunk_failures, 0u);
 }
 

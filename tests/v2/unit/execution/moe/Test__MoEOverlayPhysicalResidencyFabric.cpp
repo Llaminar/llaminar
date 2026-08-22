@@ -19,12 +19,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -448,7 +450,11 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     EXPECT_EQ(stats.cpu_shadow_slots, 4u)
         << "Wave capacity must not be reduced to current endpoint occupancy";
     EXPECT_EQ(stats.gpu_shadow_slots, 0u);
-    EXPECT_EQ(stats.persistent_transfer_lanes, 0u);
+    EXPECT_EQ(stats.persistent_transfer_lanes, 6u)
+        << "Both directed CPU address edges own gate/up/down workers";
+    EXPECT_EQ(stats.maximum_parallel_cpu_copy_lanes, 1u);
+    EXPECT_EQ(stats.parallel_cpu_copy_lane_reservations, 0u);
+    EXPECT_EQ(stats.parallel_cpu_copy_lane_pool_exhaustions, 0u);
     EXPECT_EQ(stats.inference_stream_waits, 0u);
     EXPECT_EQ(stats.blocking_synchronizations, 0u);
 }
@@ -536,11 +542,12 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
         {
             progress = authority->advanceBackground();
             ASSERT_TRUE(progress.ok()) << progress.error;
-            if (progress.status == MoEOverlayResidencyApplyStatus::Committed)
+            if (progress.status == MoEOverlayResidencyApplyStatus::Published)
             {
                 committed = true;
                 break;
             }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
         ASSERT_TRUE(committed)
             << "Bounded CPU-copy polling did not publish epoch "
@@ -588,6 +595,14 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
     EXPECT_EQ(fabric_stats.waves_failed, 0u);
     EXPECT_EQ(fabric_stats.projection_operations_prepared, 18u);
     EXPECT_EQ(fabric_stats.cpu_copy_operations, 18u);
+    EXPECT_EQ(fabric_stats.persistent_transfer_lanes, 6u);
+    EXPECT_EQ(fabric_stats.maximum_parallel_cpu_copy_lanes, 1u);
+    EXPECT_EQ(fabric_stats.parallel_cpu_copy_lane_reservations, 18u);
+    EXPECT_EQ(fabric_stats.parallel_cpu_copy_lane_pool_exhaustions, 0u);
+    EXPECT_EQ(fabric_stats.maximum_concurrent_cpu_copy_operations, 6u)
+        << "All gate/up/down operations for both cycle edges must reach the "
+           "launch barrier before any CPU copy starts";
+    EXPECT_EQ(fabric_stats.active_cpu_copy_operations, 0u);
     EXPECT_EQ(fabric_stats.gpu_cpu_operations, 0u);
     EXPECT_EQ(fabric_stats.inference_stream_waits, 0u);
     EXPECT_EQ(fabric_stats.blocking_synchronizations, 0u);

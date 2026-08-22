@@ -15,6 +15,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace llaminar2
@@ -101,7 +102,11 @@ namespace llaminar2
 
     DeviceMoEOverlayEpochArena::DeviceMoEOverlayEpochArena(Config config)
         : device_id_(config.device_id),
-          request_slot_capacity_(config.request_slot_capacity)
+          request_slot_capacity_(config.request_slot_capacity),
+          external_admission_epoch_(config.external_admission_epoch),
+          external_admission_lifetime_(
+              std::move(config.external_admission_lifetime)),
+          admission_barrier_(config.admission_barrier)
     {
         if (!device_id_.is_valid())
         {
@@ -128,6 +133,19 @@ namespace llaminar2
         {
             throw std::invalid_argument(
                 "ExpertOverlay epoch arena requires at least one request slot");
+        }
+        if ((external_admission_epoch_ == nullptr) !=
+            (external_admission_lifetime_ == nullptr))
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay external admission pointer and lifetime must be bound together");
+        }
+        if (!admission_barrier_.empty() &&
+            (!admission_barrier_.valid() || !external_admission_epoch_ ||
+             !external_admission_lifetime_))
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay continuation admission barrier requires a complete external admission binding");
         }
 
         const std::size_t ticket_bytes =
@@ -237,7 +255,11 @@ namespace llaminar2
             {{"bytes", std::to_string(allocationBytes())},
              {"request_slots", std::to_string(request_slot_capacity_)},
              {"initial_epoch", std::to_string(config.initial_epoch)},
-             {"initial_bank", std::to_string(config.initial_bank)}});
+             {"initial_bank", std::to_string(config.initial_bank)},
+             {"external_admission",
+              external_admission_epoch_ ? "true" : "false"},
+             {"transaction_barrier",
+              admission_barrier_.valid() ? "true" : "false"}});
     }
 
     DeviceMoEOverlayEpochArena::~DeviceMoEOverlayEpochArena()
@@ -264,6 +286,12 @@ namespace llaminar2
 
     DeviceMoEOverlayEpochStatus *DeviceMoEOverlayEpochArena::requestStatus(
         std::uint32_t slot)
+    {
+        return request_statuses_ + checkedSlot(slot);
+    }
+
+    const DeviceMoEOverlayEpochStatus *
+    DeviceMoEOverlayEpochArena::requestStatus(std::uint32_t slot) const
     {
         return request_statuses_ + checkedSlot(slot);
     }

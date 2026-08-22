@@ -93,6 +93,7 @@ TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
 
     EXPECT_FALSE(config.mtp.enabled);
     EXPECT_EQ(config.mtp.draft_tokens, 1);
+    EXPECT_EQ(config.mtp.graph_capacity_draft_tokens, 0);
     EXPECT_EQ(config.mtp.max_request_batch, 1);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
     EXPECT_EQ(
@@ -199,6 +200,7 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
         "--prefix-cache-moe-policy", "invalidate-on-rebalance",
         "--mtp",
         "--mtp-draft-tokens", "2",
+        "--mtp-graph-capacity-draft-tokens", "15",
         "--mtp-max-request-batch", "4",
         "--mtp-verify-mode", "speculative-sampling",
         "--mtp-terminal-head-policy", "mirrored-full-vocabulary",
@@ -230,6 +232,7 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
 
     EXPECT_TRUE(config.mtp.enabled);
     EXPECT_EQ(config.mtp.draft_tokens, 2);
+    EXPECT_EQ(config.mtp.graph_capacity_draft_tokens, 15);
     EXPECT_EQ(config.mtp.max_request_batch, 4);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
     EXPECT_EQ(
@@ -291,6 +294,61 @@ TEST(Test__PrefixMTPConfig, MTPGraphCapacityUsesMaximumPolicyDepthAndRequestCoun
     EXPECT_EQ(resolveMTPMaximumDraftDepth(mtp), 31);
     EXPECT_EQ(resolveMTPMaxTargetQueryRows(mtp), 64)
         << "Sixteen verifier rows are a certification default, not an architectural maximum.";
+
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+    mtp.draft_tokens = 2;
+    mtp.graph_capacity_draft_tokens = 15;
+    EXPECT_EQ(resolveMTPMaximumExecutionDraftDepth(mtp), 2)
+        << "Retained over-capacity must not widen a fixed execution policy.";
+    EXPECT_EQ(resolveMTPMaximumDraftDepth(mtp), 15)
+        << "One retained graph family may cover several fixed-depth requests.";
+    EXPECT_EQ(resolveMTPMaxTargetQueryRows(mtp), 32)
+        << "The retained request-batched verifier shape uses graph capacity.";
+}
+
+TEST(Test__PrefixMTPConfig, ValidateRejectsGraphCapacityBelowExecutionPolicy)
+{
+    OrchestrationConfig config;
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 3;
+    config.mtp.graph_capacity_draft_tokens = 2;
+
+    const auto errors = config.validate();
+
+    EXPECT_NE(
+        std::find_if(
+            errors.begin(),
+            errors.end(),
+            [](const std::string &error)
+            {
+                return error.find("graph capacity draft tokens must cover") !=
+                       std::string::npos;
+            }),
+        errors.end());
+}
+
+TEST(Test__PrefixMTPConfig, RetainedGraphCapacityCoversPrefillAndMTPShapes)
+{
+    MTPRuntimeConfig mtp;
+    mtp.enabled = true;
+    mtp.draft_tokens = 15;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Fixed;
+
+    EXPECT_EQ(resolveRetainedGraphRowCapacity(/*prefill_rows=*/9, mtp), 16)
+        << "A small captured-prefill bucket must not truncate depth-fifteen verification.";
+    EXPECT_EQ(resolveRetainedGraphRowCapacity(/*prefill_rows=*/32, mtp), 32)
+        << "A larger prefill graph already covers the verifier shape.";
+
+    mtp.draft_tokens = 3;
+    mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    mtp.depth_policy.initial_depth = 3;
+    mtp.depth_policy.max_depth = 15;
+    EXPECT_EQ(resolveRetainedGraphRowCapacity(/*prefill_rows=*/9, mtp), 16)
+        << "Dynamic planning must reserve the promotion ceiling, not its initial depth.";
+
+    mtp.enabled = false;
+    EXPECT_EQ(resolveRetainedGraphRowCapacity(/*prefill_rows=*/9, mtp), 9)
+        << "Non-MTP retained graphs preserve their selected prefill capacity.";
 }
 
 TEST(Test__PrefixMTPConfig, MTPTerminalHiddenArchiveCoversRequestAndVerifierRows)
@@ -398,6 +456,7 @@ prefix_cache:
 mtp:
   enabled: true
   draft_tokens: 3
+  graph_capacity_draft_tokens: 15
   max_request_batch: 2
   verify_mode: greedy
   terminal_head_policy: mirrored-full-vocabulary
@@ -430,6 +489,7 @@ mtp:
 
     EXPECT_TRUE(config.mtp.enabled);
     EXPECT_EQ(config.mtp.draft_tokens, 3);
+    EXPECT_EQ(config.mtp.graph_capacity_draft_tokens, 15);
     EXPECT_EQ(config.mtp.max_request_batch, 2);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
     EXPECT_EQ(
@@ -463,6 +523,7 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
     source.prefix_cache.moe_policy = PrefixCacheMoEPolicy::InvalidateOnRebalance;
     source.mtp.enabled = true;
     source.mtp.draft_tokens = 2;
+    source.mtp.graph_capacity_draft_tokens = 15;
     source.mtp.max_request_batch = 4;
     source.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
     source.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
@@ -512,6 +573,7 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
 
     EXPECT_TRUE(graph_config.mtp.enabled);
     EXPECT_EQ(graph_config.mtp.draft_tokens, 2);
+    EXPECT_EQ(graph_config.mtp.graph_capacity_draft_tokens, 15);
     EXPECT_EQ(graph_config.mtp.max_request_batch, 4);
     EXPECT_EQ(graph_config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
     EXPECT_EQ(graph_config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
@@ -537,6 +599,7 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
     config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::InvalidateOnRebalance;
     config.mtp.enabled = true;
     config.mtp.draft_tokens = 2;
+    config.mtp.graph_capacity_draft_tokens = 15;
     config.mtp.max_request_batch = 3;
     config.mtp.verify_mode = MTPVerifyMode::Greedy;
     config.mtp.terminal_head_policy =
@@ -560,6 +623,9 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
     EXPECT_NE(explanation.find("moe_policy: invalidate-on-rebalance"), std::string::npos);
     EXPECT_NE(explanation.find("mtp:"), std::string::npos);
     EXPECT_NE(explanation.find("draft_tokens: 2"), std::string::npos);
+    EXPECT_NE(
+        explanation.find("graph_capacity_draft_tokens: 15"),
+        std::string::npos);
     EXPECT_NE(explanation.find("max_request_batch: 3"), std::string::npos);
     EXPECT_NE(explanation.find("verify_mode: greedy"), std::string::npos);
     EXPECT_NE(

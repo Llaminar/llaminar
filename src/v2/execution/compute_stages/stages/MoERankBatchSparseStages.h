@@ -251,7 +251,9 @@ namespace llaminar2
             int continuation_root_tp_index = 0;
 
             std::shared_ptr<MoEExpertDispatchOutput> dispatch_output;
-            bool release_residency_lease_on_completion = false;
+            /** Typed terminal authority for the host dispatch epoch lease. */
+            MoEOverlayHostDispatchLeaseTerminal residency_lease_terminal =
+                MoEOverlayHostDispatchLeaseTerminal::Retain;
         };
 
         static_assert(StageParamsRequired<Params>);

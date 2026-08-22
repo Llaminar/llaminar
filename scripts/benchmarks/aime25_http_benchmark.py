@@ -563,7 +563,9 @@ def validate_execution_contract(
     if rejected_prefill:
         raise ValueError("AIME25 GPU prefill graph capture was rejected")
     if invalid_decode_policy:
-        raise ValueError("AIME25 decode admitted a non-monolithic graph policy")
+        raise ValueError(
+            "AIME25 decode admitted a segmented/non-monolithic graph policy"
+        )
 
     def phase_value(name: str, phase: str) -> float:
         return sum(

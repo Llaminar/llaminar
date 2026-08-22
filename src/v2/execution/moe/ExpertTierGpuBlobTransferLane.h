@@ -1,16 +1,18 @@
 /**
  * @file ExpertTierGpuBlobTransferLane.h
- * @brief Persistent, event-polled packed expert transfer between CUDA and ROCm.
+ * @brief Persistent packed-expert relay through retained GPU progress epochs.
  *
  * CUDA and ROCm consume the same separated NativeVNNI expert layout, so a
- * heterogeneous GPU edge must preserve the packed bytes instead of decoding
- * and repacking them. The two runtimes cannot portably wait on each other's
- * events or copy directly between their allocations. This lane therefore uses
- * a bounded, double-buffered host relay: the source runtime performs D2H into
- * source-owned pinned memory, a maintenance worker copies completed bytes into
- * destination-owned pinned memory, and the destination runtime performs H2D.
- * Every device transition is event-polled and all resources are materialized
- * before inference begins.
+ * GPU edge must preserve the packed bytes instead of decoding and repacking
+ * them. Cross-runtime edges cannot portably share events or allocations, while
+ * a same-runtime edge without driver-reported peer access must not rely on a
+ * runtime's implicit `MemcpyPeerAsync` fallback. Both cases use this bounded,
+ * double-buffered host relay. One retained source epoch writes into
+ * source-mapped pages, a maintenance worker copies completed bytes into
+ * destination-mapped pages, and one retained destination epoch copies them
+ * into the inactive residency bank. Device executors submit those finite
+ * epochs ahead of inference, so neither direction launches late behind an
+ * already-resident inference graph.
  */
 
 #pragma once
@@ -19,18 +21,19 @@
 #include "ExpertTierTransferMeasurement.h"
 #include "GPUExpertTransfer.h"
 #include "../../backends/DeviceId.h"
+#include "../../transfer/MappedTransferProgressEpoch.h"
 
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 
 namespace llaminar2
 {
-    class IBackend;
-    class IWorkerGPUContext;
+    class MappedHostTransferRegion;
 
     /** @brief Named separated-array region carried by one packed blob chunk. */
     enum class ExpertTierGpuBlobRegion : std::uint8_t
@@ -153,6 +156,13 @@ namespace llaminar2
         Failed,  ///< Submission or event observation failed fatally.
     };
 
+    /** @brief Why a byte-compatible GPU edge uses the explicit host relay. */
+    enum class ExpertTierGpuBlobRelayKind : std::uint8_t
+    {
+        CrossBackend, ///< CUDA/ROCm runtimes have no shared native peer domain.
+        SameBackendWithoutPeerAccess, ///< Driver denied the exact directed edge.
+    };
+
     /** @brief Cumulative proof counters for one persistent blob-transfer lane. */
     struct ExpertTierGpuBlobTransferLaneStats
     {
@@ -162,7 +172,11 @@ namespace llaminar2
         std::uint64_t chunks_completed = 0;
         std::uint64_t bytes_submitted = 0;
         std::uint64_t source_d2h_submissions = 0;
+        /** Source chunks submitted through latency-critical mapped writes. */
+        std::uint64_t source_progress_kernel_submissions = 0;
         std::uint64_t destination_h2d_submissions = 0;
+        /** Destination chunks submitted through retained mapped reads. */
+        std::uint64_t destination_progress_kernel_submissions = 0;
         std::uint64_t host_relay_copies = 0;
         std::uint64_t host_relay_bytes = 0;
         std::uint64_t pending_event_polls = 0;
@@ -172,18 +186,26 @@ namespace llaminar2
         std::uint64_t blocking_synchronizations = 0;
         /** Most recent exact completed-transfer timing evidence. */
         ExpertTierProjectionTransferMeasurement last_measurement;
+        /** Longest submit-to-observation interval for a source D2H chunk. */
+        std::uint64_t last_max_source_dma_residence_nanoseconds = 0;
+        /** Longest submit-to-observation interval for a destination H2D chunk. */
+        std::uint64_t last_max_destination_dma_residence_nanoseconds = 0;
+        /** Longest interval between maintenance polls during the last transfer. */
+        std::uint64_t last_max_maintenance_poll_gap_nanoseconds = 0;
         /** Timing API failures; non-zero invalidates economy certification. */
         std::uint64_t timing_measurement_failures = 0;
     };
 
     /**
-     * @brief Double-buffered CUDA-to-ROCm or ROCm-to-CUDA packed blob lane.
+     * @brief Double-buffered host relay for a byte-compatible GPU edge.
      *
      * The source and destination descriptors must be byte-compatible and must
-     * refer to different GPU backend types. Source and destination streams are
-     * context-owned auxiliary streams. The caller supplies the exact event that
-     * made the immutable source bank ready; the source transfer stream waits on
-     * it, but no inference stream ever waits on migration.
+     * match the explicitly configured relay reason. Source and destination
+     * progress epochs are shared by every physical relay lane on each endpoint
+     * GPU. Each lane permanently leases two source and two destination command
+     * slots. The caller must supply published-residency-bank readiness. A
+     * producer event is rejected because a shared graph already in flight
+     * could claim a newly published command before a dynamically inserted wait.
      *
      * `poll()` is intended to run on the background residency-maintenance
      * worker. It performs only non-blocking event queries plus at most two
@@ -197,7 +219,16 @@ namespace llaminar2
         {
             DeviceId source_device;
             DeviceId destination_device;
+            /** Typed topology fact authorizing host relay instead of peer DMA. */
+            ExpertTierGpuBlobRelayKind relay_kind =
+                ExpertTierGpuBlobRelayKind::CrossBackend;
             std::size_t staging_capacity_bytes = 0;
+            /** Source-device epoch shared across every physical relay lane. */
+            std::shared_ptr<MappedTransferProgressEpoch>
+                source_progress_epoch;
+            /** Destination-device epoch shared across every physical relay lane. */
+            std::shared_ptr<MappedTransferProgressEpoch>
+                destination_progress_epoch;
             std::string lane_name;
             std::string perf_device;
             /** Collect per-runtime timing-event evidence for certification. */
@@ -207,8 +238,8 @@ namespace llaminar2
         /**
          * @brief Store and validate heterogeneous lane topology.
          * @param config Exact endpoints and persistent capacity.
-         * @throws std::invalid_argument For non-GPU, same-backend, zero-capacity,
-         *         or unnamed lanes.
+         * @throws std::invalid_argument For non-GPU, contradictory topology,
+         *         zero-capacity, or unnamed lanes.
          */
         explicit ExpertTierGpuBlobTransferLane(Config config);
 
@@ -226,7 +257,7 @@ namespace llaminar2
             const ExpertTierGpuBlobTransferLane &) = delete;
 
         /**
-         * @brief Allocate both streams' events and both runtimes' pinned slots.
+         * @brief Lease epoch slots and allocate both mapped staging directions.
          * @param error Optional exact construction failure.
          * @return Whether the complete persistent resource set exists.
          *
@@ -283,16 +314,15 @@ namespace llaminar2
         [[nodiscard]] bool materialized() const noexcept;
 
         /**
-         * @brief Return whether neither GPU runtime can still touch slot storage.
-         * @return True only after every recorded slot event is ready and no work
-         *         lost its completion fence.
+         * @brief Return whether neither retained epoch can touch slot storage.
+         * @return True only after every published command was observed terminal.
          *
          * This query lets an aborted composite wave retain the lane until it is
          * safe to recycle. It never queries an event or synchronizes a stream.
          */
         [[nodiscard]] bool quiescent() const noexcept
         {
-            return !hasInFlightWork() && !unfenced_work_;
+            return !hasInFlightWork();
         }
 
         /** @brief Return cumulative proof counters for integration assertions. */
@@ -313,48 +343,41 @@ namespace llaminar2
             return config_.destination_device;
         }
 
-        /**
-         * @brief Return the last destination event after successful completion.
-         * @return Destination-owned event, or nullptr before any H2D submission.
-         *
-         * The lane retains event ownership. At `Ready` the event has already
-         * been observed complete and can be used as publication provenance.
-         */
-        [[nodiscard]] void *destinationReadyEvent() const noexcept
-        {
-            return last_destination_event_;
-        }
-
     private:
         /** @brief State of one reusable double-buffer slot. */
         enum class SlotPhase : std::uint8_t
         {
             Idle,
-            SourceDmaPending,
-            DestinationDmaPending,
+            SourceProgressPending,
+            DestinationProgressPending,
         };
 
         /** @brief Runtime-owned resources and current chunk for one slot. */
         struct Slot
         {
-            std::uint8_t *source_pinned = nullptr;
-            std::uint8_t *destination_pinned = nullptr;
-            void *source_event = nullptr;
-            void *destination_event = nullptr;
-            void *source_timing_start_event = nullptr;
-            void *source_timing_stop_event = nullptr;
-            void *destination_timing_start_event = nullptr;
-            void *destination_timing_stop_event = nullptr;
+            /** Source-registered mapped pages written by asynchronous D2H DMA. */
+            std::shared_ptr<MappedHostTransferRegion> source_mapped;
+            /** Destination-registered mapped pages read by asynchronous H2D DMA. */
+            std::shared_ptr<MappedHostTransferRegion> destination_mapped;
+            /** Permanent source command identity from the shared source epoch. */
+            MappedTransferProgressSlot source_progress;
+            /** Permanent destination command identity from its shared epoch. */
+            MappedTransferProgressSlot destination_progress;
             ExpertTierGpuBlobChunk chunk;
+            /** Host submission time used to expose queue plus poll residence. */
+            std::chrono::steady_clock::time_point source_submitted_at{};
+            /** Host submission time used to expose queue plus poll residence. */
+            std::chrono::steady_clock::time_point destination_submitted_at{};
             SlotPhase phase = SlotPhase::Idle;
-            bool source_timing_valid = false;
-            bool destination_timing_valid = false;
         };
 
         /** @brief Initialize common event-polled state after binding byte views. */
         bool beginTransfer(
             const ExpertTierSourceReadiness &source_readiness,
             std::string *error) noexcept;
+
+        /** @brief Prove every device-side projection address before publication. */
+        bool validateBoundDeviceStorage(std::string *error) noexcept;
 
         /** @brief Set a stable terminal failure once and publish its counter. */
         void requestFailure(
@@ -372,29 +395,19 @@ namespace llaminar2
         /** @brief Fill every idle slot while unissued chunks remain. */
         bool enqueueAvailableSourceChunks(std::string *error) noexcept;
 
-        /** @brief Submit one D2H chunk and record its source-owned event. */
+        /** @brief Publish one device-to-mapped command to the source epoch. */
         bool enqueueSourceChunk(
             Slot &slot,
             const ExpertTierGpuBlobChunk &chunk,
             std::string *error) noexcept;
 
-        /** @brief Relay one completed source chunk and submit destination H2D. */
+        /** @brief Relay one completed chunk and publish mapped-to-device work. */
         bool relayAndEnqueueDestination(
             Slot &slot,
             std::string *error) noexcept;
 
         /** @brief Publish PerfStats evidence for a complete transfer. */
         void recordCompletion() noexcept;
-
-        /** @brief Accumulate one completed source-DMA timing interval. */
-        bool collectSourceTiming(
-            const Slot &slot,
-            std::string *error) noexcept;
-
-        /** @brief Accumulate one completed destination-DMA timing interval. */
-        bool collectDestinationTiming(
-            const Slot &slot,
-            std::string *error) noexcept;
 
         /** @brief Return true when either runtime may still touch slot storage. */
         [[nodiscard]] bool hasInFlightWork() const noexcept;
@@ -404,14 +417,6 @@ namespace llaminar2
 
         Config config_;
         ExpertTierGpuBlobChunkProtocol protocol_;
-        IBackend *source_backend_ = nullptr;
-        IBackend *destination_backend_ = nullptr;
-        IWorkerGPUContext *source_context_ = nullptr;
-        IWorkerGPUContext *destination_context_ = nullptr;
-        int source_ordinal_ = -1;
-        int destination_ordinal_ = -1;
-        void *source_stream_ = nullptr;
-        void *destination_stream_ = nullptr;
         std::array<Slot, 2> slots_{};
         GpuExpertPackedDescriptor source_;
         GpuExpertPackedDescriptor destination_;
@@ -422,14 +427,16 @@ namespace llaminar2
             ExpertTierGpuBlobTransferProgress::Idle;
         std::size_t active_slots_ = 0;
         std::size_t completed_bytes_ = 0;
-        void *last_destination_event_ = nullptr;
         bool failure_requested_ = false;
         bool failure_counted_ = false;
-        bool unfenced_work_ = false;
         std::string failure_;
         std::chrono::steady_clock::time_point transfer_started_at_{};
+        std::chrono::steady_clock::time_point last_poll_at_{};
         std::uint64_t transfer_device_nanoseconds_ = 0;
         std::uint64_t transfer_host_nanoseconds_ = 0;
+        std::uint64_t max_source_dma_residence_nanoseconds_ = 0;
+        std::uint64_t max_destination_dma_residence_nanoseconds_ = 0;
+        std::uint64_t max_maintenance_poll_gap_nanoseconds_ = 0;
         ExpertTierGpuBlobTransferLaneStats stats_;
     };
 } // namespace llaminar2

@@ -474,6 +474,62 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
+        RemoteFloatingGpuManifestAuthenticatesPrecisionGeometryAndRawBytes)
+    {
+        auto fixture = makeTransaction();
+        const auto identity = remoteProjectionIdentity(
+            fixture.transaction, DeviceId::cuda(1), DeviceId::rocm(0));
+        constexpr int n = 7;
+        constexpr int k = 13;
+        std::array<std::uint16_t, n * k> bytes{};
+        const ContiguousFloatingPointWeightDescriptor source{
+            .data = bytes.data(),
+            .type = TensorType::BF16,
+            .n = n,
+            .k = k,
+            .bytes = sizeof(bytes),
+        };
+        const auto manifest =
+            makeMoEOverlayRemoteGpuFloatingProjectionManifest(
+                identity,
+                source,
+                /*maximum_chunk_bytes=*/37u);
+        ASSERT_TRUE(manifest.valid());
+        EXPECT_TRUE(manifest.carriesGpuFloatingBytes());
+        EXPECT_EQ(manifest.format_kind, ExpertWeightFormatKind::BF16);
+        EXPECT_EQ(manifest.N_padded, n);
+        EXPECT_EQ(manifest.blocks_per_row, 0);
+        EXPECT_EQ(
+            manifest.region_bytes,
+            (std::array<std::uint64_t, 4>{sizeof(bytes), 0u, 0u, 0u}));
+
+        std::array<
+            std::uint8_t,
+            MoEOverlayRemoteProjectionManifest::kWireBytes> packet{};
+        std::string error;
+        ASSERT_TRUE(encodeMoEOverlayRemoteProjectionManifest(
+            manifest, packet, &error)) << error;
+        MoEOverlayRemoteProjectionManifest decoded;
+        ASSERT_TRUE(decodeMoEOverlayRemoteProjectionManifest(
+            packet, &decoded, &error)) << error;
+        EXPECT_EQ(decoded, manifest);
+
+        auto wrong_precision = manifest;
+        wrong_precision.format_kind = ExpertWeightFormatKind::FP32;
+        wrong_precision.manifest_hash = wrong_precision.computedHash();
+        EXPECT_FALSE(wrong_precision.valid(&error));
+        EXPECT_NE(error.find("precision"), std::string::npos);
+
+        auto quantized_masquerade = manifest;
+        quantized_masquerade.packing =
+            MoEOverlayRemoteProjectionPacking::GpuSeparatedNativeVnni;
+        quantized_masquerade.manifest_hash =
+            quantized_masquerade.computedHash();
+        EXPECT_FALSE(quantized_masquerade.valid(&error));
+    }
+
+    TEST(
+        Test__MoEOverlayDistributedResidencyProtocol,
         CpuGpuManifestUsesWholeRepackUnitsAndRejectsPartialWireCapacity)
     {
         auto fixture = makeTransaction();
@@ -851,7 +907,7 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
-        RequiresUnanimousStageAndCommitBeforeEveryRankCanPublish)
+        RequiresUnanimousPrepareAndSelectorPublicationBeforeAuthorityPublish)
     {
         auto fixture = makeTransaction();
         const auto identity =
@@ -860,7 +916,9 @@ namespace llaminar2::test
         auto protocols = makeProtocols(identity);
 
         for (auto &protocol : protocols)
-            EXPECT_THROW(protocol->markPublished(), std::logic_error);
+            EXPECT_THROW(
+                protocol->markAuthorityPublished(),
+                std::logic_error);
 
         const auto reservation_votes = readyVotes(protocols);
         for (auto &protocol : protocols)
@@ -872,7 +930,9 @@ namespace llaminar2::test
                 protocol->state(),
                 MoEOverlayDistributedResidencyProtocolState::
                     AwaitingLocalStage);
-            EXPECT_THROW(protocol->markPublished(), std::logic_error);
+            EXPECT_THROW(
+                protocol->markAuthorityPublished(),
+                std::logic_error);
         }
 
         const auto stage_votes = readyVotes(protocols);
@@ -885,21 +945,38 @@ namespace llaminar2::test
             EXPECT_EQ(
                 protocol->state(),
                 MoEOverlayDistributedResidencyProtocolState::
-                    AwaitingLocalCommit);
-            EXPECT_THROW(protocol->markPublished(), std::logic_error);
+                    AwaitingLocalPrepare);
+            EXPECT_THROW(
+                protocol->markAuthorityPublished(),
+                std::logic_error);
         }
 
-        const auto commit_votes = readyVotes(protocols);
+        const auto prepare_votes = readyVotes(protocols);
         for (auto &protocol : protocols)
         {
             std::string error;
-            EXPECT_TRUE(protocol->acceptConsensus(commit_votes, &error))
+            EXPECT_TRUE(protocol->acceptConsensus(prepare_votes, &error))
                 << error;
             EXPECT_EQ(
                 protocol->state(),
                 MoEOverlayDistributedResidencyProtocolState::
-                    ReadyToPublish);
-            protocol->markPublished();
+                    AwaitingLocalPublication);
+            EXPECT_THROW(
+                protocol->markAuthorityPublished(),
+                std::logic_error);
+        }
+
+        const auto publication_votes = readyVotes(protocols);
+        for (auto &protocol : protocols)
+        {
+            std::string error;
+            EXPECT_TRUE(protocol->acceptConsensus(publication_votes, &error))
+                << error;
+            EXPECT_EQ(
+                protocol->state(),
+                MoEOverlayDistributedResidencyProtocolState::
+                    ReadyForAuthorityPublication);
+            protocol->markAuthorityPublished();
             EXPECT_EQ(
                 protocol->state(),
                 MoEOverlayDistributedResidencyProtocolState::Published);
@@ -997,7 +1074,9 @@ namespace llaminar2::test
             EXPECT_EQ(
                 protocol->state(),
                 MoEOverlayDistributedResidencyProtocolState::Deferred);
-            EXPECT_THROW(protocol->markPublished(), std::logic_error);
+            EXPECT_THROW(
+                protocol->markAuthorityPublished(),
+                std::logic_error);
             EXPECT_TRUE(protocol->abort());
             EXPECT_EQ(
                 protocol->state(),
@@ -1007,7 +1086,7 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
-        CommitFailureNeverBecomesPublishable)
+        PreparationFailureNeverBecomesPublishable)
     {
         auto fixture = makeTransaction();
         auto protocols = makeProtocols(
@@ -1022,29 +1101,31 @@ namespace llaminar2::test
         for (auto &protocol : protocols)
             ASSERT_TRUE(protocol->acceptConsensus(stage_votes));
 
-        std::vector<MoEOverlayDistributedResidencyVote> commit_votes;
-        commit_votes.push_back(protocols[0]->makeLocalVote(
+        std::vector<MoEOverlayDistributedResidencyVote> prepare_votes;
+        prepare_votes.push_back(protocols[0]->makeLocalVote(
             MoEOverlayDistributedResidencyVoteDecision::Ready));
-        commit_votes.push_back(protocols[1]->makeLocalVote(
+        prepare_votes.push_back(protocols[1]->makeLocalVote(
             MoEOverlayDistributedResidencyVoteDecision::Ready));
-        commit_votes.push_back(protocols[2]->makeLocalVote(
+        prepare_votes.push_back(protocols[2]->makeLocalVote(
             MoEOverlayDistributedResidencyVoteDecision::Failed,
             88,
             "rank two inactive bank install failed"));
 
         for (auto &protocol : protocols)
         {
-            EXPECT_FALSE(protocol->acceptConsensus(commit_votes));
+            EXPECT_FALSE(protocol->acceptConsensus(prepare_votes));
             EXPECT_EQ(
                 protocol->state(),
                 MoEOverlayDistributedResidencyProtocolState::Failed);
-            EXPECT_THROW(protocol->markPublished(), std::logic_error);
+            EXPECT_THROW(
+                protocol->markAuthorityPublished(),
+                std::logic_error);
         }
     }
 
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
-        DivergentTransactionIdentityIsFatalBeforeAnyCommit)
+        DivergentTransactionIdentityIsFatalBeforeAnyPreparation)
     {
         auto fixture = makeTransaction();
         auto protocols = makeProtocols(

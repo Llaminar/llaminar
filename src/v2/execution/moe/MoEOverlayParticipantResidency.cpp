@@ -16,6 +16,101 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief One immutable bank plus lock-free inference-reader accounting.
+     *
+     * The node is allocated and validated before publication.  Its embedded
+     * retired link lets maintenance defer reclamation without allocating at
+     * retirement time.  Only the maintenance writer mutates `retired_next`;
+     * inference touches only `reader_count` and the immutable bank.
+     */
+    struct MoEOverlayParticipantPublishedBank
+    {
+        /** @brief Adopt one validated bank for exactly one endpoint state. */
+        MoEOverlayParticipantPublishedBank(
+            MoEOverlayParticipantResidencyBank value,
+            const MoEOverlayParticipantResidencyState *authority_value)
+            : bank(std::move(value)), authority(authority_value)
+        {
+        }
+
+        const MoEOverlayParticipantResidencyBank bank;
+        const MoEOverlayParticipantResidencyState *authority = nullptr;
+        std::atomic<uint64_t> reader_count{0};
+        std::unique_ptr<MoEOverlayParticipantPublishedBank> retired_next;
+    };
+
+    /**
+     * @brief Fixed publication slots and asynchronous reclamation for one endpoint.
+     *
+     * Publication pointers and acquire hazards are native lock-free atomics on
+     * every supported 64-bit execution host.  The mutex is maintenance-only:
+     * installation, abort, and retirement use it to maintain sole-writer slot
+     * ownership, while inference never observes or waits on it.
+     */
+    class MoEOverlayParticipantResidencyState final
+    {
+    public:
+        /** @brief Allocate the exact retained-epoch slot count at model setup. */
+        explicit MoEOverlayParticipantResidencyState(std::size_t capacity)
+            : capacity_(capacity),
+              slots_(std::make_unique<Slot[]>(capacity))
+        {
+        }
+
+    private:
+        friend class MoEOverlayParticipantBankLease;
+        friend class MoEOverlayParticipantResidency;
+
+        /** @brief One raw inference publication and its maintenance owner. */
+        struct Slot
+        {
+            std::atomic<MoEOverlayParticipantPublishedBank *> published{
+                nullptr};
+            std::unique_ptr<MoEOverlayParticipantPublishedBank> owner;
+        };
+
+        /**
+         * @brief Reclaim retired nodes that no acquisition can still adopt.
+         *
+         * The caller owns `writer_mutex_`. A non-zero acquire hazard means a
+         * reader may have loaded a just-cleared raw pointer but not incremented
+         * that node yet, so reclamation is deferred wholesale and never waits.
+         */
+        void reclaimRetiredBanks() noexcept
+        {
+            if (acquires_in_flight_.load(std::memory_order_seq_cst) != 0)
+                return;
+
+            auto *link = &retired_head_;
+            while (*link)
+            {
+                if ((*link)->reader_count.load(std::memory_order_acquire) != 0)
+                {
+                    link = &((*link)->retired_next);
+                    continue;
+                }
+
+                auto reclaimed = std::move(*link);
+                *link = std::move(reclaimed->retired_next);
+                /* Destruction and prepared-engine release stay on maintenance. */
+            }
+        }
+
+        const std::size_t capacity_;
+        std::unique_ptr<Slot[]> slots_;
+        std::mutex writer_mutex_;
+        std::unique_ptr<MoEOverlayParticipantPublishedBank> retired_head_;
+        std::atomic<uint64_t> acquires_in_flight_{0};
+    };
+
+    static_assert(
+        std::atomic<MoEOverlayParticipantPublishedBank *>::is_always_lock_free,
+        "ExpertOverlay inference publication requires lock-free pointer atomics");
+    static_assert(
+        std::atomic<uint64_t>::is_always_lock_free,
+        "ExpertOverlay inference leases require lock-free 64-bit atomics");
+
     namespace
     {
         /** @return Dense production-phase index, or the sentinel count. */
@@ -281,6 +376,130 @@ namespace llaminar2
         return true;
     }
 
+    MoEOverlayPreparedParticipantBank::MoEOverlayPreparedParticipantBank()
+        noexcept = default;
+
+    MoEOverlayPreparedParticipantBank::~MoEOverlayPreparedParticipantBank() =
+        default;
+
+    MoEOverlayPreparedParticipantBank::MoEOverlayPreparedParticipantBank(
+        MoEOverlayPreparedParticipantBank &&other) noexcept = default;
+
+    MoEOverlayPreparedParticipantBank &
+    MoEOverlayPreparedParticipantBank::operator=(
+        MoEOverlayPreparedParticipantBank &&other) noexcept = default;
+
+    MoEOverlayPreparedParticipantBank::MoEOverlayPreparedParticipantBank(
+        std::unique_ptr<MoEOverlayParticipantPublishedBank> node) noexcept
+        : node_(std::move(node))
+    {
+    }
+
+    bool MoEOverlayPreparedParticipantBank::valid() const noexcept
+    {
+        return node_ != nullptr;
+    }
+
+    uint64_t MoEOverlayPreparedParticipantBank::epoch() const noexcept
+    {
+        return node_ ? node_->bank.epoch : 0;
+    }
+
+    MoEOverlayParticipantBankLease::MoEOverlayParticipantBankLease() noexcept =
+        default;
+
+    MoEOverlayParticipantBankLease::~MoEOverlayParticipantBankLease()
+    {
+        reset();
+    }
+
+    MoEOverlayParticipantBankLease::MoEOverlayParticipantBankLease(
+        std::shared_ptr<MoEOverlayParticipantResidencyState> state,
+        MoEOverlayParticipantPublishedBank *node) noexcept
+        : state_(std::move(state)), node_(node)
+    {
+    }
+
+    MoEOverlayParticipantBankLease::MoEOverlayParticipantBankLease(
+        const MoEOverlayParticipantBankLease &other) noexcept
+        : state_(other.state_), node_(other.node_)
+    {
+        retain();
+    }
+
+    MoEOverlayParticipantBankLease &
+    MoEOverlayParticipantBankLease::operator=(
+        const MoEOverlayParticipantBankLease &other) noexcept
+    {
+        if (this == &other)
+            return *this;
+        reset();
+        state_ = other.state_;
+        node_ = other.node_;
+        retain();
+        return *this;
+    }
+
+    MoEOverlayParticipantBankLease::MoEOverlayParticipantBankLease(
+        MoEOverlayParticipantBankLease &&other) noexcept
+        : state_(std::move(other.state_)),
+          node_(std::exchange(other.node_, nullptr))
+    {
+    }
+
+    MoEOverlayParticipantBankLease &
+    MoEOverlayParticipantBankLease::operator=(
+        MoEOverlayParticipantBankLease &&other) noexcept
+    {
+        if (this == &other)
+            return *this;
+        reset();
+        state_ = std::move(other.state_);
+        node_ = std::exchange(other.node_, nullptr);
+        return *this;
+    }
+
+    const MoEOverlayParticipantResidencyBank *
+    MoEOverlayParticipantBankLease::get() const noexcept
+    {
+        return node_ ? &node_->bank : nullptr;
+    }
+
+    const MoEOverlayParticipantResidencyBank &
+    MoEOverlayParticipantBankLease::operator*() const noexcept
+    {
+        return node_->bank;
+    }
+
+    const MoEOverlayParticipantResidencyBank *
+    MoEOverlayParticipantBankLease::operator->() const noexcept
+    {
+        return get();
+    }
+
+    MoEOverlayParticipantBankLease::operator bool() const noexcept
+    {
+        return node_ != nullptr;
+    }
+
+    void MoEOverlayParticipantBankLease::retain() noexcept
+    {
+        if (node_)
+        {
+            node_->reader_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void MoEOverlayParticipantBankLease::reset() noexcept
+    {
+        if (node_)
+        {
+            node_->reader_count.fetch_sub(1, std::memory_order_release);
+            node_ = nullptr;
+        }
+        state_.reset();
+    }
+
     MoEOverlayParticipantResidency::MoEOverlayParticipantResidency(Config config)
         : config_(std::move(config))
     {
@@ -292,6 +511,8 @@ namespace llaminar2
                 "ExpertOverlay participant residency requires valid identity, "
                 "geometry, and at least two retained epoch slots");
         }
+        state_ = std::make_shared<MoEOverlayParticipantResidencyState>(
+            config_.retained_epoch_capacity);
         if (config_.collect_economy_service_measurements)
         {
             const std::size_t cell_count =
@@ -326,6 +547,11 @@ namespace llaminar2
     {
         if (!config_.collect_economy_service_measurements)
             return MoEOverlayServiceMeasurementRecordStatus::Disabled;
+        if (device_service_measurements_imported_.load(
+                std::memory_order_acquire))
+        {
+            return MoEOverlayServiceMeasurementRecordStatus::Invalid;
+        }
 
         const std::size_t offset =
             serviceMeasurementOffset(layer, source);
@@ -361,6 +587,122 @@ namespace llaminar2
         return overflowed
                    ? MoEOverlayServiceMeasurementRecordStatus::Overflow
                    : MoEOverlayServiceMeasurementRecordStatus::Recorded;
+    }
+
+    bool MoEOverlayParticipantResidency::importServiceMeasurements(
+        const std::vector<MoEOverlayParticipantLayerServiceTotals> &rows,
+        std::string *error)
+    {
+        if (error)
+            error->clear();
+        if (!config_.collect_economy_service_measurements ||
+            !service_measurements_ ||
+            rows.size() != static_cast<std::size_t>(config_.num_layers))
+        {
+            if (error)
+                *error = "service snapshot does not match an enabled endpoint";
+            return false;
+        }
+        const bool replacing_device_snapshot =
+            device_service_measurements_imported_.load(
+                std::memory_order_acquire);
+        for (int layer = 0; layer < config_.num_layers; ++layer)
+        {
+            const auto &row = rows[static_cast<std::size_t>(layer)];
+            if (row.participant_id != config_.participant_id ||
+                row.layer != layer || !row.valid())
+            {
+                if (error)
+                    *error = "service snapshot contains invalid participant/layer totals";
+                return false;
+            }
+        }
+
+        const std::size_t cell_count =
+            static_cast<std::size_t>(config_.num_layers) *
+            kExpertHistogramProductionSourceCount;
+        std::vector<ServiceMeasurementCell *> acquired;
+        acquired.reserve(cell_count);
+        const auto release_all = [&acquired]() noexcept
+        {
+            for (auto *cell : acquired)
+                cell->owned.clear(std::memory_order_release);
+            acquired.clear();
+        };
+        for (std::size_t offset = 0u; offset < cell_count; ++offset)
+        {
+            auto &cell = service_measurements_[offset];
+            if (cell.owned.test_and_set(std::memory_order_acquire))
+            {
+                release_all();
+                if (error)
+                    *error = "service snapshot endpoint is busy with an inference writer";
+                return false;
+            }
+            acquired.push_back(&cell);
+        }
+
+        for (int layer = 0; layer < config_.num_layers; ++layer)
+        {
+            const auto &row = rows[static_cast<std::size_t>(layer)];
+            for (std::size_t phase = 0u;
+                 phase < kExpertHistogramProductionSourceCount;
+                 ++phase)
+            {
+                auto &cell = service_measurements_[
+                    static_cast<std::size_t>(layer) *
+                        kExpertHistogramProductionSourceCount +
+                    phase];
+                const bool empty = cell.total_nanoseconds == 0u &&
+                                   cell.activation_count == 0u &&
+                                   cell.sample_count == 0u &&
+                                   !cell.overflowed;
+                const bool identical =
+                    cell.total_nanoseconds == row.total_nanoseconds[phase] &&
+                    cell.activation_count == row.activation_count[phase] &&
+                    cell.sample_count == row.sample_count[phase] &&
+                    cell.overflowed == row.overflowed[phase];
+                const bool monotonic_device_update =
+                    replacing_device_snapshot &&
+                    row.total_nanoseconds[phase] >=
+                        cell.total_nanoseconds &&
+                    row.activation_count[phase] >=
+                        cell.activation_count &&
+                    row.sample_count[phase] >= cell.sample_count &&
+                    (!cell.overflowed || row.overflowed[phase]);
+                if ((!replacing_device_snapshot && !empty && !identical) ||
+                    (replacing_device_snapshot &&
+                     !monotonic_device_update))
+                {
+                    release_all();
+                    if (error)
+                        *error = "service snapshot conflicts with existing endpoint evidence";
+                    return false;
+                }
+            }
+        }
+
+        for (int layer = 0; layer < config_.num_layers; ++layer)
+        {
+            const auto &row = rows[static_cast<std::size_t>(layer)];
+            for (std::size_t phase = 0u;
+                 phase < kExpertHistogramProductionSourceCount;
+                 ++phase)
+            {
+                auto &cell = service_measurements_[
+                    static_cast<std::size_t>(layer) *
+                        kExpertHistogramProductionSourceCount +
+                    phase];
+                cell.total_nanoseconds = row.total_nanoseconds[phase];
+                cell.activation_count = row.activation_count[phase];
+                cell.sample_count = row.sample_count[phase];
+                cell.overflowed = row.overflowed[phase];
+            }
+        }
+        device_service_measurements_imported_.store(
+            true, std::memory_order_release);
+        release_all();
+        return true;
     }
 
     bool MoEOverlayParticipantResidency::trySnapshotServiceMeasurements(
@@ -415,23 +757,22 @@ namespace llaminar2
                 "ExpertOverlay candidate epoch must be newer than its source");
         }
 
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        const auto found = banks_.find(previous_epoch);
-        if (found == banks_.end() || !found->second)
+        const auto previous = acquire(previous_epoch);
+        if (!previous)
         {
             throw std::out_of_range(
                 "ExpertOverlay candidate source epoch is not retained");
         }
 
-        MoEOverlayParticipantResidencyBank candidate = *found->second;
+        MoEOverlayParticipantResidencyBank candidate = *previous;
         candidate.epoch = candidate_epoch;
         return candidate;
     }
 
-    MoEOverlayParticipantBankInstallStatus
-    MoEOverlayParticipantResidency::installReadyBank(
-        const MoEOverlayParticipantResidencyBank &bank,
-        std::string *error)
+    std::optional<MoEOverlayPreparedParticipantBank>
+    MoEOverlayParticipantResidency::prepareReadyBank(
+        MoEOverlayParticipantResidencyBank bank,
+        std::string *error) const noexcept
     {
         if (error)
             error->clear();
@@ -442,65 +783,189 @@ namespace llaminar2
                 config_.num_experts))
         {
             if (error)
-                *error = "ExpertOverlay participant ready bank is incomplete or has wrong geometry";
+            {
+                *error =
+                    "ExpertOverlay participant ready bank is incomplete or has wrong geometry";
+            }
+            return std::nullopt;
+        }
+
+        try
+        {
+            return MoEOverlayPreparedParticipantBank(
+                std::make_unique<MoEOverlayParticipantPublishedBank>(
+                    std::move(bank), state_.get()));
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+            {
+                *error =
+                    "ExpertOverlay participant ready-bank preparation failed: " +
+                    std::string(exception.what());
+            }
+        }
+        catch (...)
+        {
+            if (error)
+            {
+                *error =
+                    "ExpertOverlay participant ready-bank preparation failed with a non-standard exception";
+            }
+        }
+        return std::nullopt;
+    }
+
+    MoEOverlayParticipantBankInstallStatus
+    MoEOverlayParticipantResidency::installReadyBank(
+        MoEOverlayPreparedParticipantBank &&prepared,
+        std::string *error)
+    {
+        if (error)
+            error->clear();
+        if (!prepared.node_ ||
+            prepared.node_->authority != state_.get())
+        {
+            if (error)
+            {
+                *error =
+                    "ExpertOverlay prepared participant bank is empty or belongs to another endpoint";
+            }
             return MoEOverlayParticipantBankInstallStatus::Invalid;
         }
 
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        if (const auto found = banks_.find(bank.epoch); found != banks_.end())
+        const auto &bank = prepared.node_->bank;
+        std::lock_guard<std::mutex> lock(state_->writer_mutex_);
+        MoEOverlayParticipantResidencyState::Slot *empty_slot = nullptr;
+        for (std::size_t index = 0; index < state_->capacity_; ++index)
         {
-            if (found->second && found->second->sameIdentity(bank))
+            auto &slot = state_->slots_[index];
+            if (!slot.owner)
+            {
+                if (!empty_slot)
+                    empty_slot = &slot;
+                continue;
+            }
+            if (slot.owner->bank.epoch != bank.epoch)
+                continue;
+            if (slot.owner->bank.sameIdentity(bank))
                 return MoEOverlayParticipantBankInstallStatus::AlreadyInstalled;
             if (error)
-                *error = "ExpertOverlay participant epoch already names a different bank";
+            {
+                *error =
+                    "ExpertOverlay participant epoch already names a different bank";
+            }
             return MoEOverlayParticipantBankInstallStatus::EpochConflict;
         }
-        if (banks_.size() >= config_.retained_epoch_capacity)
+        if (!empty_slot)
         {
             if (error)
-                *error = "ExpertOverlay participant retained-bank capacity is exhausted";
+            {
+                *error =
+                    "ExpertOverlay participant retained-bank capacity is exhausted";
+            }
             return MoEOverlayParticipantBankInstallStatus::CapacityUnavailable;
         }
 
-        /* Copy under the lock so no caller can mutate a published-ready value. */
-        banks_.emplace(
-            bank.epoch,
-            std::make_shared<const MoEOverlayParticipantResidencyBank>(bank));
+        /*
+         * Every expensive operation happened in prepareReadyBank(). The raw
+         * pointer becomes visible only after its sole owner occupies the fixed
+         * slot, and the sequentially-consistent store participates in the
+         * acquire-versus-retire hazard proof used below.
+         */
+        empty_slot->owner = std::move(prepared.node_);
+        empty_slot->published.store(
+            empty_slot->owner.get(), std::memory_order_seq_cst);
         return MoEOverlayParticipantBankInstallStatus::Installed;
     }
 
-    std::shared_ptr<const MoEOverlayParticipantResidencyBank>
+    MoEOverlayParticipantBankLease
     MoEOverlayParticipantResidency::acquire(uint64_t epoch) const noexcept
     {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        const auto found = banks_.find(epoch);
-        return found == banks_.end() ? nullptr : found->second;
+        auto state = state_;
+        state->acquires_in_flight_.fetch_add(
+            1, std::memory_order_seq_cst);
+
+        for (std::size_t index = 0; index < state->capacity_; ++index)
+        {
+            auto *node = state->slots_[index].published.load(
+                std::memory_order_seq_cst);
+            if (!node || node->bank.epoch != epoch)
+                continue;
+
+            /*
+             * The global hazard remains set until this exact node owns its
+             * reader. Retirement may unlink it meanwhile, but cannot reclaim
+             * it while either counter proves this acquisition is in progress.
+             */
+            node->reader_count.fetch_add(1, std::memory_order_relaxed);
+            state->acquires_in_flight_.fetch_sub(
+                1, std::memory_order_seq_cst);
+            return MoEOverlayParticipantBankLease(
+                std::move(state), node);
+        }
+
+        state->acquires_in_flight_.fetch_sub(
+            1, std::memory_order_seq_cst);
+        return {};
     }
 
     bool MoEOverlayParticipantResidency::abortUnpublished(
         uint64_t epoch) noexcept
     {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        return banks_.erase(epoch) != 0;
+        return retire(epoch);
     }
 
     bool MoEOverlayParticipantResidency::retire(uint64_t epoch) noexcept
     {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        return banks_.erase(epoch) != 0;
+        std::lock_guard<std::mutex> lock(state_->writer_mutex_);
+        for (std::size_t index = 0; index < state_->capacity_; ++index)
+        {
+            auto &slot = state_->slots_[index];
+            if (!slot.owner || slot.owner->bank.epoch != epoch)
+                continue;
+
+            /*
+             * Stop new readers before detaching ownership. A reader that saw
+             * the old pointer first is protected by acquires_in_flight_ until
+             * it increments this node's reader_count.
+             */
+            slot.published.store(nullptr, std::memory_order_seq_cst);
+            auto retired = std::move(slot.owner);
+            retired->retired_next = std::move(state_->retired_head_);
+            state_->retired_head_ = std::move(retired);
+            state_->reclaimRetiredBanks();
+            return true;
+        }
+        state_->reclaimRetiredBanks();
+        return false;
     }
 
     std::size_t
     MoEOverlayParticipantResidency::retainedEpochCount() const noexcept
     {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        return banks_.size();
+        std::size_t retained = 0;
+        for (std::size_t index = 0; index < state_->capacity_; ++index)
+        {
+            retained += state_->slots_[index].published.load(
+                            std::memory_order_acquire) != nullptr
+                            ? 1u
+                            : 0u;
+        }
+        return retained;
     }
 
     bool MoEOverlayParticipantResidency::hasCandidateCapacity() const noexcept
     {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        return banks_.size() < config_.retained_epoch_capacity;
+        for (std::size_t index = 0; index < state_->capacity_; ++index)
+        {
+            if (!state_->slots_[index].published.load(
+                    std::memory_order_acquire))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     MoEOverlayParticipantResidencyRegistry::
@@ -601,8 +1066,17 @@ namespace llaminar2
                     [](bool registered) { return registered; }))
             {
                 std::string error;
-                const auto status = assembly.endpoint->installReadyBank(
+                auto prepared = assembly.endpoint->prepareReadyBank(
                     assembly.initial_bank, &error);
+                if (!prepared)
+                {
+                    throw std::runtime_error(
+                        error.empty()
+                            ? "ExpertOverlay could not prepare an initially empty participant bank"
+                            : error);
+                }
+                const auto status = assembly.endpoint->installReadyBank(
+                    std::move(*prepared), &error);
                 if (status !=
                         MoEOverlayParticipantBankInstallStatus::Installed &&
                     status !=
@@ -699,10 +1173,12 @@ namespace llaminar2
             return true;
         }
 
-        const auto status =
-            assembly.endpoint->installReadyBank(
-                assembly.initial_bank,
-                error);
+        auto prepared = assembly.endpoint->prepareReadyBank(
+            assembly.initial_bank, error);
+        if (!prepared)
+            return false;
+        const auto status = assembly.endpoint->installReadyBank(
+            std::move(*prepared), error);
         return status == MoEOverlayParticipantBankInstallStatus::Installed ||
                status ==
                    MoEOverlayParticipantBankInstallStatus::AlreadyInstalled;
@@ -741,6 +1217,85 @@ namespace llaminar2
                 return entry.second.endpoint->acquire(
                            config_.initial_epoch) != nullptr;
             });
+    }
+
+    std::vector<
+        MoEOverlayParticipantResidencyRegistry::InitialBankExpertSelection>
+    MoEOverlayParticipantResidencyRegistry::initialBankExpertSelections() const
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        std::vector<int> participant_ids;
+        participant_ids.reserve(endpoints_.size());
+        for (const auto &[participant_id, _] : endpoints_)
+            participant_ids.push_back(participant_id);
+        std::sort(participant_ids.begin(), participant_ids.end());
+
+        std::vector<InitialBankExpertSelection> selections;
+        selections.reserve(
+            participant_ids.size() *
+            static_cast<std::size_t>(config_.num_layers));
+        for (const int participant_id : participant_ids)
+        {
+            const auto found = endpoints_.find(participant_id);
+            if (found == endpoints_.end())
+            {
+                throw std::logic_error(
+                    "ExpertOverlay initial-bank snapshot lost a registered participant");
+            }
+
+            const auto lease = found->second.endpoint->acquire(
+                config_.initial_epoch);
+            if (!lease)
+            {
+                throw std::logic_error(
+                    "ExpertOverlay initial-bank snapshot requires every local bank to be installed");
+            }
+            if (lease->participant_id != participant_id ||
+                lease->device != found->second.endpoint->device() ||
+                lease->layers.size() !=
+                    static_cast<std::size_t>(config_.num_layers))
+            {
+                throw std::logic_error(
+                    "ExpertOverlay installed initial bank has stale identity or geometry");
+            }
+
+            for (int layer_idx = 0;
+                 layer_idx < config_.num_layers;
+                 ++layer_idx)
+            {
+                const auto &layer =
+                    lease->layers[static_cast<std::size_t>(layer_idx)];
+                if (layer.resident_mask.size() !=
+                    static_cast<std::size_t>(config_.num_experts))
+                {
+                    throw std::logic_error(
+                        "ExpertOverlay installed initial bank has stale expert geometry");
+                }
+
+                InitialBankExpertSelection selection{
+                    .participant_id = participant_id,
+                    .device = lease->device,
+                    .layer_idx = layer_idx,
+                };
+                selection.expert_ids.reserve(
+                    static_cast<std::size_t>(std::count(
+                        layer.resident_mask.begin(),
+                        layer.resident_mask.end(),
+                        true)));
+                for (int expert_id = 0;
+                     expert_id < config_.num_experts;
+                     ++expert_id)
+                {
+                    if (layer.resident_mask[
+                            static_cast<std::size_t>(expert_id)])
+                    {
+                        selection.expert_ids.push_back(expert_id);
+                    }
+                }
+                selections.push_back(std::move(selection));
+            }
+        }
+        return selections;
     }
 
     std::vector<
@@ -820,5 +1375,24 @@ namespace llaminar2
                 std::make_move_iterator(rows.end()));
         }
         return true;
+    }
+
+    bool MoEOverlayParticipantResidencyRegistry::
+        importDeviceServiceMeasurements(
+            int participant_id,
+            const std::vector<MoEOverlayParticipantLayerServiceTotals> &rows,
+            std::string *error)
+    {
+        if (error)
+            error->clear();
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        const auto found = endpoints_.find(participant_id);
+        if (found == endpoints_.end() || !found->second.endpoint)
+        {
+            if (error)
+                *error = "device service snapshot names a non-local participant";
+            return false;
+        }
+        return found->second.endpoint->importServiceMeasurements(rows, error);
     }
 } // namespace llaminar2

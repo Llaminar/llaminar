@@ -37,6 +37,8 @@ struct DeviceMemoryPlan
     size_t persistent_state_bytes = 0;
     size_t live_recurrent_state_bytes = 0;
     size_t checkpoint_state_bytes = 0;
+    /** Persistent backend and FP16 scratch allocations owned by LocalTP. */
+    size_t collective_bytes = 0;
     size_t activation_bytes = 0;
     size_t workspace_bytes = 0;
 
@@ -47,7 +49,7 @@ struct DeviceMemoryPlan
     size_t total_bytes() const
     {
         return weight_bytes + additional_weight_bytes + kv_cache_bytes + persistent_state_bytes +
-               activation_bytes + workspace_bytes;
+               collective_bytes + activation_bytes + workspace_bytes;
     }
 
     /** @return Complete persistent weight footprint across every physical view. */
@@ -72,7 +74,8 @@ struct DeviceMemoryPlan
     size_t incremental_bytes() const
     {
         return incremental_weight_bytes() + kv_cache_bytes +
-               persistent_state_bytes + activation_bytes + workspace_bytes;
+               persistent_state_bytes + collective_bytes + activation_bytes +
+               workspace_bytes;
     }
 
     bool fits() const
@@ -103,6 +106,7 @@ struct DeviceMemoryPlan
            << "retained_weights=" << mb(retained_weight_bytes) << " MB, "
            << "kv_cache=" << mb(kv_cache_bytes) << " MB, "
            << "state=" << mb(persistent_state_bytes) << " MB, "
+           << "collective=" << mb(collective_bytes) << " MB, "
            << "activations=" << mb(activation_bytes) << " MB, "
            << "workspace=" << mb(workspace_bytes) << " MB, "
            << "total=" << mb(total_bytes()) << " MB, "

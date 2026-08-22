@@ -8,8 +8,10 @@
 
 #include "ROCmMoEKernel.h"
 #include "ROCmMoEOverlayActivationPacketKernels.h"
+#include "ROCmMoEOverlayDeviceControllerKernels.h"
 #include "ROCmMoEOverlayEpochKernels.h"
 #include "../gemm/HipBLASGemmKernel.h"
+#include "../gemm/ROCmWeightPacker.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -315,6 +317,24 @@ namespace
         return groupedDecodeSupportsCodebook(codebook_id)
                    ? (uint32_t{1} << static_cast<uint32_t>(codebook_id))
                    : 0u;
+    }
+
+    /**
+     * @brief Return whether an execution envelope requires the IQ grid LUTs.
+     *
+     * The compact IQ3/IQ2/IQ1 formats use device-constant decode tables. The
+     * descriptor publication boundary owns making those immutable tables live
+     * before any retained graph can embed the descriptors; model loaders are
+     * not required to duplicate that execution-kernel invariant.
+     */
+    bool groupedPrefillMaskNeedsIQTables(uint32_t codebook_mask)
+    {
+        for (uint8_t codebook = 11u; codebook <= 17u; ++codebook)
+        {
+            if ((codebook_mask & groupedPrefillCodebookBit(codebook)) != 0u)
+                return true;
+        }
+        return false;
     }
 
     /**
@@ -723,6 +743,8 @@ extern "C"
         const void *wave_state,
         const void *controller_state,
         uint32_t command_buffer_count,
+        uint32_t histogram_source_mask,
+        unsigned long long *previous_activation_counts,
         int device_idx,
         void *stream);
 
@@ -1951,6 +1973,148 @@ namespace llaminar2
             &consumption, device_ordinal_, stream);
     }
 
+    bool ROCmMoEKernel::beginNodeLocalDensePublication(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "beginNodeLocalDensePublication");
+        if (!stream || !publication.valid() ||
+            !publication.binding.isRoot())
+        {
+            LOG_ERROR("[ROCmMoEKernel::beginNodeLocalDensePublication] root binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return hipMoEOverlayBeginNodeLocalDensePublication(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::finishNodeLocalDensePublication(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "finishNodeLocalDensePublication");
+        if (!stream || !publication.valid() ||
+            !publication.binding.isRoot())
+        {
+            LOG_ERROR("[ROCmMoEKernel::finishNodeLocalDensePublication] root binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return hipMoEOverlayFinishNodeLocalDensePublication(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::beginNodeLocalDensePublicationConsume(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "beginNodeLocalDensePublicationConsume");
+        if (!stream || !publication.valid() || publication.binding.isRoot())
+        {
+            LOG_ERROR("[ROCmMoEKernel::beginNodeLocalDensePublicationConsume] peer binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return hipMoEOverlayBeginNodeLocalDensePublicationConsume(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::finishNodeLocalDensePublicationConsume(
+        const MoEKernelLaunchContext &launch,
+        const MoENodeLocalDensePublicationLaunch &publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "finishNodeLocalDensePublicationConsume");
+        if (!stream || !publication.valid() || publication.binding.isRoot())
+        {
+            LOG_ERROR("[ROCmMoEKernel::finishNodeLocalDensePublicationConsume] peer binding, bounded payload, and explicit stream are required");
+            return false;
+        }
+        return hipMoEOverlayFinishNodeLocalDensePublicationConsume(
+            &publication, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::runMoEOverlayDeviceControllerAction(
+        const MoEKernelLaunchContext &launch,
+        const MoEOverlayDeviceControllerActionLaunch &action)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "runMoEOverlayDeviceControllerAction");
+        if (!stream || !action.valid())
+        {
+            LOG_ERROR("[ROCmMoEKernel::runMoEOverlayDeviceControllerAction] a valid mapped controller action and explicit HIP stream are required");
+            return false;
+        }
+        return hipMoEOverlayRunDeviceControllerAction(
+            &action, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::beginMoEOverlayServiceTelemetry(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoEOverlayServiceTelemetrySample *sample)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "beginMoEOverlayServiceTelemetry");
+        if (!stream || !sample)
+            return false;
+        return hipMoEOverlayBeginServiceTelemetry(
+            sample, device_ordinal_, stream);
+    }
+
+    bool ROCmMoEKernel::finishMoEOverlayServiceTelemetry(
+        const MoEKernelLaunchContext &launch,
+        DeviceMoELayerRuntime *runtime_layer,
+        DeviceMoEOverlayServiceTelemetryCell *layer_telemetry,
+        DeviceMoEOverlayServiceTelemetrySample *sample,
+        std::uint32_t num_experts,
+        MoEOverlayServicePhaseHint hint,
+        const MoEOverlayInferenceGraphRole *runtime_graph_role)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "finishMoEOverlayServiceTelemetry");
+        if (!stream || !runtime_layer || !layer_telemetry || !sample ||
+            num_experts == 0u)
+        {
+            return false;
+        }
+        return hipMoEOverlayFinishServiceTelemetry(
+            runtime_layer,
+            layer_telemetry,
+            sample,
+            num_experts,
+            static_cast<std::uint32_t>(hint),
+            runtime_graph_role,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::publishMoEOverlayServiceTelemetry(
+        const MoEKernelLaunchContext &launch,
+        const DeviceMoEOverlayServiceTelemetryCell *telemetry,
+        const DeviceMoEOverlayServiceTelemetrySample *samples,
+        std::uint32_t layer_count,
+        std::int32_t participant_id,
+        MoEOverlayDeviceServiceTelemetryPublicationHeader *publication)
+    {
+        void *stream = explicitMoELaunchStream(
+            launch, "publishMoEOverlayServiceTelemetry");
+        if (!stream || !telemetry || !samples || !publication ||
+            layer_count == 0u ||
+            participant_id < 0)
+        {
+            return false;
+        }
+        return hipMoEOverlayPublishServiceTelemetry(
+            telemetry,
+            samples,
+            layer_count,
+            participant_id,
+            publication,
+            device_ordinal_,
+            stream);
+    }
+
     ROCmMoEKernel::ROCmMoEKernel(int device_ordinal)
         : device_ordinal_(device_ordinal)
     {
@@ -2770,7 +2934,10 @@ namespace llaminar2
         const MoEKernelLaunchContext &launch,
         DeviceMoEOverlayEpochControl *control,
         DeviceMoEOverlayEpochTicket *ticket,
-        DeviceMoEOverlayEpochStatus *status)
+        DeviceMoEOverlayEpochStatus *status,
+        const std::uint64_t *external_admission_epoch,
+        DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier,
+        MoEOverlayPeerPlacementEpochBinding peer_placement_epoch)
     {
         void *stream = explicitMoELaunchStream(
             launch, "acquireMoEOverlayEpoch");
@@ -2780,7 +2947,14 @@ namespace llaminar2
             return false;
         }
         return hipMoEOverlayEpochAcquire(
-            control, ticket, status, device_ordinal_, stream);
+            control,
+            ticket,
+            status,
+            external_admission_epoch,
+            admission_barrier,
+            peer_placement_epoch,
+            device_ordinal_,
+            stream);
     }
 
     bool ROCmMoEKernel::releaseMoEOverlayEpoch(
@@ -5734,11 +5908,15 @@ namespace llaminar2
         const DeviceMoERebalanceConfig &config,
         const DeviceMoERebalanceWaveState *wave_state,
         const DeviceMoERebalanceGraphControllerState *controller_state,
-        uint32_t command_buffer_count)
+        uint32_t command_buffer_count,
+        uint32_t histogram_source_mask,
+        uint64_t *previous_activation_counts)
     {
-        if (!validateDeviceMoERebalanceConfig(config))
+        if (!validateDeviceMoERebalanceConfig(config) ||
+            !moe_runtime_abi::validHistogramSourceMask(
+                histogram_source_mask))
         {
-            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceHistograms] invalid device rebalance config");
+            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceHistograms] invalid device rebalance config or histogram source mask");
             return false;
         }
         if (!runtime_layers || !local_histograms)
@@ -5762,6 +5940,9 @@ namespace llaminar2
             wave_state,
             controller_state,
             command_buffer_count,
+            histogram_source_mask,
+            reinterpret_cast<unsigned long long *>(
+                previous_activation_counts),
             device_ordinal_,
             stream);
     }
@@ -6896,7 +7077,8 @@ namespace llaminar2
         const DeviceNativeVNNIMatrixDesc *down_descs,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source)
     {
         if (!down_descs || num_experts <= 0 || d_model <= 0 ||
             intermediate <= 0 || (intermediate % 32) != 0)
@@ -6912,9 +7094,16 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "uploadGroupedExpertDownDescriptorTable"))
             return -1;
 
-        uint8_t codebook_id = 0;
-        uint32_t codebook_mask = 0;
-        uint32_t policy_codebook_mask = 0;
+        const bool runtime_mutable =
+            descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if (!runtime_mutable &&
+            descriptor_source !=
+                MoEDecodeDescriptorSource::StaticDescriptorTable)
+        {
+            return -1;
+        }
+        NativeVnniExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
@@ -6934,19 +7123,50 @@ namespace llaminar2
                           << expert_id);
                 return -1;
             }
-            codebook_mask |= groupedPrefillCodebookBit(desc.codebook_id);
-            const uint32_t policy_bit =
-                groupedPrefillPolicyCodebookBit(desc);
-            if (policy_bit == 0)
+            if (!addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable))
+            {
                 return -1;
-            policy_codebook_mask |= policy_bit;
-            if (codebook_id == 0)
-                codebook_id = desc.codebook_id;
+            }
         }
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
         if (codebook_mask == 0 || policy_codebook_mask == 0)
             return -1;
-        if (codebook_mask & (codebook_mask - 1u))
-            codebook_id = kROCmMoEMixedCodebookSentinel;
+        uint8_t codebook_id = kROCmMoEMixedCodebookSentinel;
+        for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
+        {
+            const uint32_t bit = nativeVnniCodebookMaskBit(codebook);
+            if ((codebook_mask & bit) == 0u)
+                continue;
+            if (groupedPrefillCodebookBit(codebook) == 0u)
+                return -1;
+            if ((codebook_mask & (codebook_mask - 1u)) == 0u)
+                codebook_id = codebook;
+        }
+
+        // Publish immutable IQ tables before accepting or reusing a retained
+        // descriptor table. A cache hit must never bypass device prerequisites.
+        if (groupedPrefillMaskNeedsIQTables(codebook_mask) &&
+            !rocm::ensureIQGridTablesInitialized(device_ordinal_))
+        {
+            LOG_ERROR(
+                "[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] "
+                "IQ grid table initialization failed on ROCm device "
+                << device_ordinal_);
+            return -1;
+        }
 
         const size_t desc_bytes =
             static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
@@ -6962,6 +7182,7 @@ namespace llaminar2
                 existing.codebook_id != codebook_id ||
                 existing.codebook_mask != codebook_mask ||
                 existing.policy_codebook_mask != policy_codebook_mask ||
+                existing.descriptor_source != descriptor_source ||
                 existing.host_descs.size() != static_cast<size_t>(num_experts))
             {
                 continue;
@@ -6978,6 +7199,7 @@ namespace llaminar2
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
+        table.descriptor_source = descriptor_source;
         table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
         table.valid = true;
         if (!publishGroupedDownDescriptorTable(
@@ -6995,7 +7217,8 @@ namespace llaminar2
         const DeviceNativeVNNIMatrixDesc *up_descs,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source)
     {
         if (!gate_descs || !up_descs || num_experts <= 0 || d_model <= 0 ||
             intermediate <= 0 || (d_model % 32) != 0)
@@ -7011,9 +7234,16 @@ namespace llaminar2
         if (!setMoEDevice(device_ordinal_, "uploadGroupedExpertGateUpDescriptorTables"))
             return -1;
 
-        uint8_t codebook_id = 0;
-        uint32_t codebook_mask = 0;
-        uint32_t policy_codebook_mask = 0;
+        const bool runtime_mutable =
+            descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if (!runtime_mutable &&
+            descriptor_source !=
+                MoEDecodeDescriptorSource::StaticDescriptorTable)
+        {
+            return -1;
+        }
+        NativeVnniExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7051,21 +7281,55 @@ namespace llaminar2
                           << expert_id);
                 return -1;
             }
-            codebook_mask |= groupedPrefillCodebookBit(gate_desc.codebook_id);
-            const uint32_t gate_policy_bit =
-                groupedPrefillPolicyCodebookBit(gate_desc);
-            const uint32_t up_policy_bit =
-                groupedPrefillPolicyCodebookBit(up_desc);
-            if (gate_policy_bit == 0 || up_policy_bit == 0)
+            const auto add_descriptor = [&](
+                                            const DeviceNativeVNNIMatrixDesc &desc)
+            {
+                return addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable);
+            };
+            if (!add_descriptor(gate_desc) || !add_descriptor(up_desc))
+            {
                 return -1;
-            policy_codebook_mask |= gate_policy_bit | up_policy_bit;
-            if (codebook_id == 0)
-                codebook_id = gate_desc.codebook_id;
+            }
         }
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
         if (codebook_mask == 0 || policy_codebook_mask == 0)
             return -1;
-        if (codebook_mask & (codebook_mask - 1u))
-            codebook_id = kROCmMoEMixedCodebookSentinel;
+        uint8_t codebook_id = kROCmMoEMixedCodebookSentinel;
+        for (uint8_t codebook = 0u; codebook < 32u; ++codebook)
+        {
+            const uint32_t bit = nativeVnniCodebookMaskBit(codebook);
+            if ((codebook_mask & bit) == 0u)
+                continue;
+            if (groupedPrefillCodebookBit(codebook) == 0u)
+                return -1;
+            if ((codebook_mask & (codebook_mask - 1u)) == 0u)
+                codebook_id = codebook;
+        }
+
+        // Gate/up graphs use the same device-constant tables as down graphs.
+        // Establish the prerequisite before a cached table can be returned.
+        if (groupedPrefillMaskNeedsIQTables(codebook_mask) &&
+            !rocm::ensureIQGridTablesInitialized(device_ordinal_))
+        {
+            LOG_ERROR(
+                "[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] "
+                "IQ grid table initialization failed on ROCm device "
+                << device_ordinal_);
+            return -1;
+        }
 
         const size_t desc_bytes =
             static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
@@ -7082,6 +7346,7 @@ namespace llaminar2
                 existing.codebook_id != codebook_id ||
                 existing.codebook_mask != codebook_mask ||
                 existing.policy_codebook_mask != policy_codebook_mask ||
+                existing.descriptor_source != descriptor_source ||
                 existing.host_gate_descs.size() != static_cast<size_t>(num_experts) ||
                 existing.host_up_descs.size() != static_cast<size_t>(num_experts))
             {
@@ -7101,6 +7366,7 @@ namespace llaminar2
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
+        table.descriptor_source = descriptor_source;
         table.weight_format = DeviceMoEWeightFormat::NativeVNNI;
         table.valid = true;
         if (!publishGroupedGateUpDescriptorTable(
@@ -7323,9 +7589,10 @@ namespace llaminar2
             return false;
         }
 
-        uint8_t codebook_id = 0;
-        uint32_t codebook_mask = 0;
-        uint32_t policy_codebook_mask = 0;
+        const bool runtime_mutable =
+            table.descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        NativeVnniExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
@@ -7333,19 +7600,32 @@ namespace llaminar2
                 continue;
             if (!desc.valid() || !validateGroupedDownDesc(desc, d_model, intermediate))
                 return false;
-            codebook_mask |= groupedPrefillCodebookBit(desc.codebook_id);
-            const uint32_t policy_bit =
-                groupedPrefillPolicyCodebookBit(desc);
-            if (policy_bit == 0)
+            if (!addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable))
+            {
                 return false;
-            policy_codebook_mask |= policy_bit;
-            if (codebook_id == 0)
-                codebook_id = desc.codebook_id;
+            }
         }
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
         if (codebook_mask == 0 || policy_codebook_mask == 0)
             return false;
-        if (codebook_mask & (codebook_mask - 1u))
-            codebook_id = kROCmMoEMixedCodebookSentinel;
+        const int sole_codebook = singleCodebookFromMask(codebook_mask);
+        const uint8_t codebook_id =
+            sole_codebook >= 0
+                ? static_cast<uint8_t>(sole_codebook)
+                : kROCmMoEMixedCodebookSentinel;
         if (table.codebook_id != codebook_id ||
             table.codebook_mask != codebook_mask ||
             table.policy_codebook_mask != policy_codebook_mask)
@@ -7442,9 +7722,10 @@ namespace llaminar2
             return false;
         }
 
-        uint8_t codebook_id = 0;
-        uint32_t codebook_mask = 0;
-        uint32_t policy_codebook_mask = 0;
+        const bool runtime_mutable =
+            table.descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        NativeVnniExecutionFormatEnvelope format_envelope;
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7464,21 +7745,37 @@ namespace llaminar2
             {
                 return false;
             }
-            codebook_mask |= groupedPrefillCodebookBit(gate_desc.codebook_id);
-            const uint32_t gate_policy_bit =
-                groupedPrefillPolicyCodebookBit(gate_desc);
-            const uint32_t up_policy_bit =
-                groupedPrefillPolicyCodebookBit(up_desc);
-            if (gate_policy_bit == 0 || up_policy_bit == 0)
+            const auto add_descriptor = [&](
+                                            const DeviceNativeVNNIMatrixDesc &desc)
+            {
+                return addNativeVnniExecutionFormat(
+                    format_envelope,
+                    desc.codebook_id,
+                    NativeVnniSourceIdentity{
+                        .codebook_id = desc.source_codebook_id,
+                        .is_superblock =
+                            desc.source_is_superblock != 0u,
+                        .present =
+                            desc.source_identity_present != 0u,
+                    },
+                    runtime_mutable);
+            };
+            if (!add_descriptor(gate_desc) || !add_descriptor(up_desc))
+            {
                 return false;
-            policy_codebook_mask |= gate_policy_bit | up_policy_bit;
-            if (codebook_id == 0)
-                codebook_id = gate_desc.codebook_id;
+            }
         }
+        const uint32_t codebook_mask =
+            format_envelope.execution_codebook_mask;
+        const uint32_t policy_codebook_mask =
+            format_envelope.policy_codebook_mask;
         if (codebook_mask == 0 || policy_codebook_mask == 0)
             return false;
-        if (codebook_mask & (codebook_mask - 1u))
-            codebook_id = kROCmMoEMixedCodebookSentinel;
+        const int sole_codebook = singleCodebookFromMask(codebook_mask);
+        const uint8_t codebook_id =
+            sole_codebook >= 0
+                ? static_cast<uint8_t>(sole_codebook)
+                : kROCmMoEMixedCodebookSentinel;
         if (table.codebook_id != codebook_id ||
             table.codebook_mask != codebook_mask ||
             table.policy_codebook_mask != policy_codebook_mask)
@@ -8246,7 +8543,9 @@ namespace llaminar2
         int d_model,
         int intermediate,
         const uint8_t *expert_mask,
-        ITensor *canonical_route_contributions)
+        ITensor *canonical_route_contributions,
+        DeviceMoELayerRuntime *runtime_layer,
+        MoEDecodeDescriptorSource descriptor_source)
     {
         if (!input || !routing_indices || !routing_weights ||
             gateup_descriptor_table_id < 0 || down_descriptor_table_id < 0 ||
@@ -8267,6 +8566,16 @@ namespace llaminar2
         {
             LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRouting] "
                       "gate/up descriptor table is unavailable");
+            return false;
+        }
+        const bool use_runtime_descriptors =
+            descriptor_source ==
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
+        if ((use_runtime_descriptors && (!runtime_layer || expert_mask)) ||
+            (!use_runtime_descriptors && runtime_layer))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRouting] "
+                      "runtime placement requires exactly one runtime layer and no host mask");
             return false;
         }
         if (!setMoEDevice(
@@ -8355,8 +8664,33 @@ namespace llaminar2
             return false;
         }
 
+        const int *resolved_expert_ids = d_grouped_gateup_expert_ids_;
+        const float *resolved_weights = device_routing_weights;
+        if (use_runtime_descriptors)
+        {
+            /* Keep route publication, placement filtering, and histogram
+             * accounting in one exact captured follower stream. */
+            if (!hipMoE_decode_route_select_runtime(
+                    d_grouped_gateup_expert_ids_,
+                    device_routing_weights,
+                    runtime_layer,
+                    /*legacy_indices=*/nullptr,
+                    /*legacy_weights=*/nullptr,
+                    gateup_table.num_experts,
+                    top_k,
+                    /*write_legacy_outputs=*/false,
+                    /*update_runtime_histogram=*/true,
+                    device_ordinal_,
+                    stream))
+            {
+                return false;
+            }
+            resolved_expert_ids = runtimeTopKExpertIdsDevice(runtime_layer);
+            resolved_weights = runtimeTopKWeightsDevice(runtime_layer);
+        }
+
         return groupedExpertDecodeResolved(
-            /*runtime_layer=*/nullptr,
+            runtime_layer,
             input,
             gateup_descriptor_table_id,
             down_descriptor_table_id,
@@ -8364,11 +8698,11 @@ namespace llaminar2
             output,
             d_model,
             intermediate,
-            d_grouped_gateup_expert_ids_,
-            device_routing_weights,
-            /*use_runtime_descriptors=*/false,
+            resolved_expert_ids,
+            resolved_weights,
+            use_runtime_descriptors,
             /*allow_router_q8_reuse=*/false,
-            "routing",
+            use_runtime_descriptors ? "routing_runtime" : "routing",
             canonical_route_contributions);
     }
 

@@ -15,6 +15,8 @@
 
 #include <cstdint>
 
+#include "kernels/common/MoEProjectionNumericalContract.h"
+
 namespace llaminar2
 {
     /**
@@ -44,8 +46,10 @@ namespace llaminar2
             TensorCoreImmaPrefill = 1,
         };
 
-        static constexpr int gate_up_k_partitions = 16;
-        static constexpr int down_k_partitions = 16;
+        static constexpr int gate_up_k_partitions =
+            MoEProjectionNumericalContract::ordered_k_partitions;
+        static constexpr int down_k_partitions =
+            MoEProjectionNumericalContract::ordered_k_partitions;
         static constexpr int maximum_verifier_rows = 16;
 
         /**

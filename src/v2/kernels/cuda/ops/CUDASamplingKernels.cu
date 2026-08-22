@@ -5243,7 +5243,11 @@ cuda_commit_device_generation_and_derive_speculative_publication_metadata_kernel
     int *__restrict__ out_stopped_flags,
     int32_t *__restrict__ out_next_sidecar_condition_tokens,
     int32_t *__restrict__ out_next_sidecar_position_ids,
-    int32_t *__restrict__ out_next_verifier_condition_tokens)
+    int32_t *__restrict__ out_next_verifier_condition_tokens,
+    const int32_t *__restrict__ verifier_input_tokens,
+    int verifier_input_token_stride,
+    llaminar2::sampling_math::MTPCommittedVerifierIdentityRecord *
+        __restrict__ out_committed_verifier_identity)
 {
     const int request_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (request_index >= request_count)
@@ -5257,7 +5261,45 @@ cuda_commit_device_generation_and_derive_speculative_publication_metadata_kernel
                       static_cast<size_t>(control_stride);
     const int base_cached_tokens_for_request =
         base_cached_tokens ? base_cached_tokens[request_index] : -1;
-    llaminar2::sampling_math::
+    const bool has_verifier_identity_binding =
+        verifier_input_tokens != nullptr ||
+        verifier_input_token_stride != 0 ||
+        out_committed_verifier_identity != nullptr;
+    const bool has_complete_verifier_identity_binding =
+        verifier_input_tokens != nullptr &&
+        verifier_input_token_stride > 0 &&
+        out_committed_verifier_identity != nullptr;
+    const bool controller_is_live =
+        request_control[
+            llaminar2::sampling_math::kDeviceGenerationControlOk] != 0 &&
+        request_control[
+            llaminar2::sampling_math::
+                kDeviceGenerationControlRequestComplete] == 0;
+    const int32_t *request_verifier_input_tokens =
+        has_complete_verifier_identity_binding
+            ? verifier_input_tokens +
+                  static_cast<size_t>(request_index) *
+                      static_cast<size_t>(verifier_input_token_stride)
+            : nullptr;
+    if ((has_verifier_identity_binding &&
+         !has_complete_verifier_identity_binding) ||
+        (has_complete_verifier_identity_binding && controller_is_live &&
+         !llaminar2::sampling_math::
+              valid_committed_verifier_identity_input(
+                  request_verifier_input_tokens,
+                  verifier_input_token_stride,
+                  request_control)))
+    {
+        if (out_ok)
+            out_ok[request_index] = 0;
+        llaminar2::sampling_math::fail_device_generation_control(
+            request_control,
+            llaminar2::sampling_math::DeviceGenerationError::
+                InvalidVerifierTransactionIdentity);
+        return;
+    }
+
+    const bool committed = llaminar2::sampling_math::
         commit_device_generation_and_derive_speculative_publication_metadata(
         compact_tokens,
         output_token_stride,
@@ -5284,6 +5326,22 @@ cuda_commit_device_generation_and_derive_speculative_publication_metadata_kernel
             ? out_all_drafts_accepted_flags + request_index
             : nullptr,
         out_stopped_flags ? out_stopped_flags + request_index : nullptr);
+
+    if (committed && out_ok && out_ok[request_index] != 0 &&
+        has_complete_verifier_identity_binding &&
+        !llaminar2::sampling_math::publish_committed_verifier_identity(
+            request_verifier_input_tokens,
+            verifier_input_token_stride,
+            request_control,
+            out_committed_verifier_identity + request_index))
+    {
+        out_ok[request_index] = 0;
+        llaminar2::sampling_math::fail_device_generation_control(
+            request_control,
+            llaminar2::sampling_math::DeviceGenerationError::
+                InvalidVerifierTransactionIdentity);
+        return;
+    }
 
     /*
      * These mirrors are the direct inputs of the next loop iteration's full
@@ -8719,6 +8777,10 @@ extern "C"
         int *out_next_sidecar_condition_tokens,
         int *out_next_sidecar_position_ids,
         int *out_next_verifier_condition_tokens,
+        const int32_t *verifier_input_tokens,
+        int verifier_input_token_stride,
+        llaminar2::sampling_math::MTPCommittedVerifierIdentityRecord *
+            out_committed_verifier_identity,
         int device_idx,
         void *stream)
     {
@@ -8739,6 +8801,12 @@ extern "C"
               !out_next_condition_tokens)) ||
             (out_next_verifier_condition_tokens &&
              !out_next_condition_tokens) ||
+            ((verifier_input_tokens ||
+              verifier_input_token_stride != 0 ||
+              out_committed_verifier_identity) &&
+             (!verifier_input_tokens ||
+              verifier_input_token_stride <= 0 ||
+              !out_committed_verifier_identity)) ||
             !stream)
         {
             return false;
@@ -8778,7 +8846,10 @@ extern "C"
                 out_next_sidecar_condition_tokens),
             reinterpret_cast<int32_t *>(out_next_sidecar_position_ids),
             reinterpret_cast<int32_t *>(
-                out_next_verifier_condition_tokens));
+                out_next_verifier_condition_tokens),
+            verifier_input_tokens,
+            verifier_input_token_stride,
+            out_committed_verifier_identity);
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {

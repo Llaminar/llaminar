@@ -1778,39 +1778,33 @@ namespace
                 auto row_hidden = makeTensor({1, static_cast<size_t>(d_model)}, row_hidden_values);
                 EXPECT_TRUE(row_hidden->ensureOnDevice(device, stream));
 
-                std::vector<int> expert_ids(static_cast<size_t>(top_k));
-                std::vector<float> expert_weights(static_cast<size_t>(top_k));
-                for (int k = 0; k < top_k; ++k)
-                {
-                    const size_t slot = static_cast<size_t>(row) * top_k + k;
-                    expert_ids[static_cast<size_t>(k)] = static_cast<int>(routing_indices[slot]);
-                    expert_weights[static_cast<size_t>(k)] = routing_weights[slot];
-                }
-
-                std::vector<std::shared_ptr<llaminar2::FP32Tensor>> gate_owned;
-                std::vector<std::shared_ptr<llaminar2::FP32Tensor>> up_owned;
-                std::vector<llaminar2::ITensor *> gate_outputs(static_cast<size_t>(top_k));
-                std::vector<llaminar2::ITensor *> up_outputs(static_cast<size_t>(top_k));
-                gate_owned.reserve(top_k);
-                up_owned.reserve(top_k);
-                for (int k = 0; k < top_k; ++k)
-                {
-                    gate_owned.push_back(makeZeros({static_cast<size_t>(intermediate)}));
-                    up_owned.push_back(makeZeros({static_cast<size_t>(intermediate)}));
-                    EXPECT_TRUE(gate_owned.back()->ensureOnDevice(device, stream));
-                    EXPECT_TRUE(up_owned.back()->ensureOnDevice(device, stream));
-                    gate_outputs[static_cast<size_t>(k)] = gate_owned.back().get();
-                    up_outputs[static_cast<size_t>(k)] = up_owned.back().get();
-                }
+                const auto route_begin =
+                    routing_indices.begin() +
+                    static_cast<ptrdiff_t>(row) * top_k;
+                const auto weight_begin =
+                    routing_weights.begin() +
+                    static_cast<ptrdiff_t>(row) * top_k;
+                auto row_route_indices = makeTensor(
+                    {static_cast<size_t>(top_k)},
+                    std::vector<float>(route_begin, route_begin + top_k));
+                auto row_route_weights = makeTensor(
+                    {static_cast<size_t>(top_k)},
+                    std::vector<float>(weight_begin, weight_begin + top_k));
+                EXPECT_TRUE(row_route_indices->ensureOnDevice(device, stream));
+                EXPECT_TRUE(row_route_weights->ensureOnDevice(device, stream));
 
                 auto decode_output = makeZeros({static_cast<size_t>(d_model)});
                 EXPECT_TRUE(decode_output->ensureOnDevice(device, stream));
-                EXPECT_TRUE(moe->groupedExpertGateUpDecodeFromTable(
-                    row_hidden.get(), expert_ids.data(), gateup_table, top_k,
-                    gate_outputs.data(), up_outputs.data(), d_model, intermediate));
-                EXPECT_TRUE(moe->groupedExpertDownDecodeFromTable(
-                    gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(),
-                    down_table, top_k, decode_output.get(), d_model, intermediate));
+                EXPECT_TRUE(moe->groupedExpertDecodeFromRouting(
+                    row_hidden.get(),
+                    row_route_indices.get(),
+                    row_route_weights.get(),
+                    gateup_table,
+                    down_table,
+                    top_k,
+                    decode_output.get(),
+                    d_model,
+                    intermediate));
                 EXPECT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
                 TransferEngine::publishDeviceWrite(decode_output, device, stream);
                 decoded.insert(

@@ -356,7 +356,7 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             * len(gpu_prefill_measurements())
             * len(GPU_PREFILL_M_BUCKETS)
         )
-        self.assertEqual(expected_count, 33075)
+        self.assertEqual(expected_count, 35721)
         for backend in ("cuda", "rocm"):
             with self.subTest(backend=backend):
                 cells = production_dense_prefill_cells(backend)

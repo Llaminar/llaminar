@@ -24,10 +24,19 @@
 namespace llaminar2
 {
 
-    Q8_KTensor::Q8_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
+    Q8_KTensor::Q8_KTensor(
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw_data)
+        : Q8_KTensor(shape, AlignedVector<uint8_t>(raw_data))
+    {
+    }
+
+    Q8_KTensor::Q8_KTensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint8_t> raw_data)
         : shape_(shape),
           is_view_(false),
-          raw_data_(raw_data),
+          raw_data_(std::move(raw_data)),
           raw_data_ptr_(nullptr),
           view_byte_offset_(0),
           parent_(nullptr),
@@ -261,7 +270,7 @@ namespace llaminar2
         // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
         // during implicit member destruction of large 3D MoE expert weight tensors.
         // See Q4_KTensor teardown investigation for details.
-        { std::vector<uint8_t>().swap(raw_data_); }
+        { AlignedVector<uint8_t>().swap(raw_data_); }
         { std::vector<size_t>().swap(shape_); }
     }
 

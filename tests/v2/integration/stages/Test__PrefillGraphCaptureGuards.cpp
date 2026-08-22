@@ -16,6 +16,7 @@
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
 #include "backends/DeviceId.h"
 #include "tensors/Tensors.h"
+#include "transfer/TransferEngine.h"
 #include "../../utils/ScopedGPUStream.h"
 
 #include <memory>
@@ -121,9 +122,11 @@ TEST_F(Test__PrefillGraphCaptureGuards, MoE_PrepareExpertGroupsAsync_RequiresBou
         rw[i] = 1.0f / warm_topk;
     }
 
-    // Upload to device before calling prepareExpertGroupsAsync
-    ASSERT_TRUE(routing_indices->ensureOnDevice(DeviceId::rocm(0), stream()));
-    ASSERT_TRUE(routing_weights->ensureOnDevice(DeviceId::rocm(0), stream()));
+    // Production prepares residency through the sole transfer authority.
+    TransferEngine::prepareDeviceInput(
+        routing_indices.get(), DeviceId::rocm(0), stream());
+    TransferEngine::prepareDeviceInput(
+        routing_weights.get(), DeviceId::rocm(0), stream());
 
     auto warm_workspace = bind_moe_workspace(warm_seq, warm_experts, warm_topk);
     ASSERT_NE(warm_workspace, nullptr);
@@ -145,9 +148,21 @@ TEST_F(Test__PrefillGraphCaptureGuards, MoE_PrepareExpertGroupsAsync_RequiresBou
         bw[i] = 1.0f / big_topk;
     }
 
-    // Upload to device
-    ASSERT_TRUE(big_indices->ensureOnDevice(DeviceId::rocm(0), stream()));
-    ASSERT_TRUE(big_weights->ensureOnDevice(DeviceId::rocm(0), stream()));
+    TransferEngine::prepareDeviceInput(
+        big_indices.get(), DeviceId::rocm(0), stream());
+    TransferEngine::prepareDeviceInput(
+        big_weights.get(), DeviceId::rocm(0), stream());
+
+    /*
+     * A captured consumer may import only producer edges joined before
+     * capture begins. DeviceGraphExecutor performs this frontier pass in
+     * production; the focused kernel test owns that boundary explicitly so
+     * the assertion below isolates workspace-capacity behavior.
+     */
+    TransferEngine::requireDeviceInput(
+        big_indices.get(), DeviceId::rocm(0), stream());
+    TransferEngine::requireDeviceInput(
+        big_weights.get(), DeviceId::rocm(0), stream());
 
     // The kernel must not allocate a hidden larger scratch buffer under capture.
     {

@@ -65,6 +65,18 @@ step plus native/reference token IDs and exact/Top-3/Top-5 token matches. Find
 the first bad decode step. A later-only failure often implicates KV indexing,
 position/rope state, cache reset, sampling state, or MTP advancement.
 
+For an MTP cell, inspect `mtp_sidecar_token_trace.csv` at the same time. Every
+call with positive `selected_depth` must have an equally sized
+`production_verifier_draft_tokens` vector, and
+`verifier_identity_transaction_count` / `verifier_identity_depth` must agree
+with that call's committed device-controller transaction. These fields come
+from the persistent identity copied by the fused response/state commit, not
+from reusable proposal or verifier-input scratch. A later row containing the
+prior transaction's draft vector is stale publication; an empty vector on a
+speculative row is missing publication. A terminal absorbing row may retain the
+last committed identity while selecting depth zero because it commits no new
+verifier transaction.
+
 ### 3. Layer rollups
 
 `prefill_layers.csv` and `decode_layers.csv` identify the first failing layer,
@@ -114,6 +126,9 @@ native tensor also contains no NaN or Inf.
   position state, or stale graph scalar/pointer.
 - MTP sidecar stage first: sidecar weights, depth-specific state binding,
   recursive hidden-state input, or dynamic-controller selection.
+- MTP checkpoints pass but the committed verifier vector is missing, delayed,
+  or has the wrong depth: response/controller/diagnostic publication ordering,
+  arena-event identity, or mirrored-rank aggregation—not sidecar arithmetic.
 - routing set differs while dense stages match: router normalization/top-K tie
   policy or expert index mapping, not expert GEMM arithmetic.
 - metrics look good but counts/stages differ: snapshot publication or PP merge

@@ -780,13 +780,26 @@ namespace llaminar2
                 prefill_reset.ready_demoted > 0 ||
                 prefill_reset.initialized > 0 ||
                 prefill_reset.dropped > 0;
-            last_prefill_graph_observation = {};
+            const bool captured_replay_preserved =
+                (segment_cache.initialized && !segment_cache.needs_capture) ||
+                prefill_reset.ready_preserved > 0;
+            if (!captured_replay_preserved)
+            {
+                last_prefill_graph_observation = {};
+            }
+            /*
+             * The observation also carries the complete durable cache-key
+             * identity (domain, participant, placement epoch, and topology
+             * signature) used by backend-neutral readiness probes.  When a
+             * Ready executable survives this reset, clearing that identity
+             * would make diagnostics query a synthetic default key and report
+             * the live graph as Cold.  Request-shaped token offsets remain a
+             * historical last-execution observation until the next replay;
+             * current readiness still comes exclusively from PrefillGraphCache.
+             */
 
             if (graph)
             {
-                const bool captured_replay_preserved =
-                    (segment_cache.initialized && !segment_cache.needs_capture) ||
-                    prefill_reset.ready_preserved > 0;
                 const bool lazy_prefill_only =
                     !captured_replay_preserved &&
                     (prefill_reset.ready_demoted > 0 || prefill_reset.initialized > 0);

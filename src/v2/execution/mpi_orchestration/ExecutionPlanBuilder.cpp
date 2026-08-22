@@ -947,7 +947,6 @@ namespace llaminar2
         else if (mapped_device_for_rank.has_value())
         {
             plan.primary_device = *mapped_device_for_rank;
-            plan.primary_device_numa_explicit = mapped_device_numa_explicit;
 
             // For ambiguous short-form GPU specs from --device-map (e.g., "rocm:0"),
             // pick first matching device across NUMA nodes, preferring lower NUMA IDs.
@@ -983,7 +982,6 @@ namespace llaminar2
         {
             const auto &requested = *config.device_for_this_rank;
             plan.primary_device = requested;
-            plan.primary_device_numa_explicit = config.device_for_this_rank_numa_explicit;
 
             // For ambiguous short-form GPU specs (e.g., "rocm:0"), pick the first
             // matching device across NUMA nodes, preferring lower NUMA IDs.

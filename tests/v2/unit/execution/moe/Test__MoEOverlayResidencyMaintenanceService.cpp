@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -237,7 +238,7 @@ namespace llaminar2::test
          *
          * Every readiness flag models an exact device/network event. Polls only
          * inspect flags, allowing the tests to prove that ticket execution can
-         * continue while neither staging nor commit is permitted to advance.
+         * continue while staging, preparation, or publication is pending.
          */
         class ControlledTransport final
             : public IMoEOverlayResidencyTransport
@@ -266,23 +267,44 @@ namespace llaminar2::test
                                : MoEOverlayResidencyWaveProgress::Pending;
                 }
 
-                /** @brief Record commit enqueue without making it ready. */
-                bool beginCommit(std::string *) noexcept override
+                /** @brief Record inactive-bank preparation enqueue. */
+                bool beginPrepare(std::string *) noexcept override
                 {
                     std::lock_guard<std::mutex> lock(owner_->mutex_);
-                    ++owner_->commit_begins_;
+                    ++owner_->prepare_begins_;
                     owner_->cv_.notify_all();
                     return true;
                 }
 
-                /** @brief Poll the independently controlled commit event. */
-                MoEOverlayResidencyWaveProgress pollCommit(
+                /** @brief Poll the independently controlled prepare event. */
+                MoEOverlayResidencyWaveProgress pollPrepare(
                     std::string *) noexcept override
                 {
                     std::lock_guard<std::mutex> lock(owner_->mutex_);
-                    ++owner_->commit_polls_;
+                    ++owner_->prepare_polls_;
                     owner_->cv_.notify_all();
-                    return owner_->commit_ready_
+                    return owner_->prepare_ready_
+                               ? MoEOverlayResidencyWaveProgress::Ready
+                               : MoEOverlayResidencyWaveProgress::Pending;
+                }
+
+                /** @brief Record inference-visible selector publication. */
+                bool beginPublication(std::string *) noexcept override
+                {
+                    std::lock_guard<std::mutex> lock(owner_->mutex_);
+                    ++owner_->publication_begins_;
+                    owner_->cv_.notify_all();
+                    return true;
+                }
+
+                /** @brief Poll the independently controlled publication event. */
+                MoEOverlayResidencyWaveProgress pollPublication(
+                    std::string *) noexcept override
+                {
+                    std::lock_guard<std::mutex> lock(owner_->mutex_);
+                    ++owner_->publication_polls_;
+                    owner_->cv_.notify_all();
+                    return owner_->publication_ready_
                                ? MoEOverlayResidencyWaveProgress::Ready
                                : MoEOverlayResidencyWaveProgress::Pending;
                 }
@@ -313,8 +335,10 @@ namespace llaminar2::test
                 int begin_calls = 0;
                 int waves_started = 0;
                 int stage_polls = 0;
-                int commit_begins = 0;
-                int commit_polls = 0;
+                int prepare_begins = 0;
+                int prepare_polls = 0;
+                int publication_begins = 0;
+                int publication_polls = 0;
                 int aborts = 0;
                 int retirements = 0;
                 uint64_t first_generation = 0;
@@ -392,11 +416,19 @@ namespace llaminar2::test
                 cv_.notify_all();
             }
 
-            /** @brief Enable the exact inactive-bank commit event. */
-            void setCommitReady(bool ready)
+            /** @brief Enable the exact inactive-bank preparation event. */
+            void setPrepareReady(bool ready)
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                commit_ready_ = ready;
+                prepare_ready_ = ready;
+                cv_.notify_all();
+            }
+
+            /** @brief Enable the exact selector-publication event. */
+            void setPublicationReady(bool ready)
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                publication_ready_ = ready;
                 cv_.notify_all();
             }
 
@@ -416,8 +448,10 @@ namespace llaminar2::test
                     .begin_calls = begin_calls_,
                     .waves_started = waves_started_,
                     .stage_polls = stage_polls_,
-                    .commit_begins = commit_begins_,
-                    .commit_polls = commit_polls_,
+                    .prepare_begins = prepare_begins_,
+                    .prepare_polls = prepare_polls_,
+                    .publication_begins = publication_begins_,
+                    .publication_polls = publication_polls_,
                     .aborts = aborts_,
                     .retirements = retirements_,
                     .first_generation = first_generation_,
@@ -433,13 +467,16 @@ namespace llaminar2::test
             bool start_enabled_ = true;
             bool defer_during_stage_ = false;
             bool stage_ready_ = false;
-            bool commit_ready_ = false;
+            bool prepare_ready_ = false;
+            bool publication_ready_ = false;
             bool fail_start_ = false;
             int begin_calls_ = 0;
             int waves_started_ = 0;
             int stage_polls_ = 0;
-            int commit_begins_ = 0;
-            int commit_polls_ = 0;
+            int prepare_begins_ = 0;
+            int prepare_polls_ = 0;
+            int publication_begins_ = 0;
+            int publication_polls_ = 0;
             int aborts_ = 0;
             int retirements_ = 0;
             uint64_t first_generation_ = 0;
@@ -493,6 +530,7 @@ namespace llaminar2::test
                 std::string *error) override
             {
                 std::lock_guard<std::mutex> lock(mutex_);
+                ++polls_;
                 if (received)
                     received->reset();
                 if (!active_)
@@ -503,6 +541,8 @@ namespace llaminar2::test
                 }
                 if (coordinator_)
                 {
+                    if (!publication_ready_)
+                        return MoEOverlayResidencyWaveProgress::Pending;
                     active_ = false;
                     ++publication_completions_;
                     if (error)
@@ -567,6 +607,13 @@ namespace llaminar2::test
                 return publication_completions_;
             }
 
+            /** @return Number of non-blocking lane progress polls. */
+            int polls() const
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return polls_;
+            }
+
             /** @return Number of authenticated peer window deliveries. */
             int deliveries() const
             {
@@ -579,6 +626,13 @@ namespace llaminar2::test
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 return receive_rearms_;
+            }
+
+            /** @brief Release or retain the coordinator publication terminal. */
+            void setPublicationReady(bool ready)
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                publication_ready_ = ready;
             }
 
             /** @return Coordinator window copied at beginPublish(). */
@@ -596,8 +650,10 @@ namespace llaminar2::test
             std::shared_ptr<const DecodeExpertHistogramWindow>
                 published_window_;
             bool active_ = false;
+            bool publication_ready_ = true;
             int publication_begins_ = 0;
             int publication_completions_ = 0;
+            int polls_ = 0;
             int deliveries_ = 0;
             int receive_rearms_ = 0;
         };
@@ -608,7 +664,7 @@ namespace llaminar2::test
             std::shared_ptr<ControlledTransport> transport,
             std::shared_ptr<IMoEOverlayHistogramPublisher> publisher = {})
         {
-            return std::make_unique<
+            auto service = std::make_unique<
                 MoEOverlayResidencyMaintenanceService>(
                 MoEOverlayResidencyMaintenanceService::Config{
                     .authority = std::move(authority),
@@ -617,8 +673,95 @@ namespace llaminar2::test
                     .idle_poll_interval = 100us,
                     .perf_device = "device-free-test",
                 });
+            service->start();
+            return service;
         }
     } // namespace
+
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        ConstructionRemainsPreparedUntilCompositionConsensusStartsWorker)
+    {
+        auto histogram = fullMovementHistogram();
+        auto authority = dynamicAuthority(histogram.get());
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->setStageReady(true);
+        transport->setPrepareReady(true);
+        transport->setPublicationReady(true);
+        MoEOverlayResidencyMaintenanceService service({
+            .authority = authority,
+            .transport = transport,
+            .idle_poll_interval = 100us,
+            .perf_device = "prepared-lifecycle-test",
+        });
+
+        std::this_thread::sleep_for(2ms);
+        EXPECT_EQ(service.state(), MoEOverlayMaintenanceState::Prepared);
+        EXPECT_EQ(service.stats().worker_starts, 0u);
+        service.start();
+        ASSERT_TRUE(waitUntil(
+            [&] { return service.stats().worker_starts == 1u; }));
+        EXPECT_THROW(service.start(), std::logic_error);
+        service.stopAndDrain();
+        EXPECT_EQ(service.state(), MoEOverlayMaintenanceState::Stopped);
+        EXPECT_THROW(service.start(), std::logic_error);
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        PreparedServiceStopsWithoutCreatingAWorker)
+    {
+        auto histogram = fullMovementHistogram();
+        MoEOverlayResidencyMaintenanceService service({
+            .authority = dynamicAuthority(histogram.get()),
+            .transport = std::make_shared<ControlledTransport>(),
+            .idle_poll_interval = 100us,
+            .perf_device = "prepared-stop-test",
+        });
+
+        ASSERT_EQ(service.state(), MoEOverlayMaintenanceState::Prepared);
+        service.stopAndDrain();
+        service.stopAndDrain();
+        EXPECT_EQ(service.state(), MoEOverlayMaintenanceState::Stopped);
+        EXPECT_EQ(service.stats().worker_starts, 0u);
+        EXPECT_THROW(service.start(), std::logic_error);
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
+        DistributedReadinessRoundPausesButDoesNotStopGPUServicePublication)
+    {
+        using Action = MoEOverlayDeviceServicePublicationAction;
+        using State = MoEOverlayEconomyCertificationState;
+
+        EXPECT_EQ(
+            moeOverlayDeviceServicePublicationAction(
+                State::CalibratingMovement),
+            Action::Pause);
+        EXPECT_EQ(
+            moeOverlayDeviceServicePublicationAction(
+                State::AwaitingServiceEvidence),
+            Action::PollAndImport);
+        EXPECT_EQ(
+            moeOverlayDeviceServicePublicationAction(
+                State::ExchangingServiceReadiness),
+            Action::Pause)
+            << "An unsuccessful all-rank readiness round must be resumable";
+        EXPECT_EQ(
+            moeOverlayDeviceServicePublicationAction(
+                State::ExchangingServiceEvidence),
+            Action::Stop)
+            << "The ready snapshot is immutable once evidence exchange begins";
+        EXPECT_EQ(
+            moeOverlayDeviceServicePublicationAction(State::Complete),
+            Action::Stop);
+        EXPECT_EQ(
+            moeOverlayDeviceServicePublicationAction(State::Failed),
+            Action::Stop);
+        EXPECT_EQ(
+            moeOverlayDeviceServicePublicationAction(State::Stopped),
+            Action::Stop);
+    }
 
     TEST(
         Test__MoEOverlayResidencyMaintenanceService,
@@ -643,7 +786,7 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayResidencyMaintenanceService,
-        TicketsRemainLiveWhileStageAndCommitEventsArePending)
+        TicketsRemainLiveWhilePrepareAndPublicationEventsArePending)
     {
         auto histogram = fullMovementHistogram();
         auto authority = dynamicAuthority(histogram.get());
@@ -672,10 +815,10 @@ namespace llaminar2::test
         service->notifyMaintenanceProgress();
         ASSERT_TRUE(waitUntil(
             [&]
-            { return transport->observations().commit_begins == 1; }));
+            { return transport->observations().prepare_begins == 1; }));
         EXPECT_EQ(authority->snapshot()->epoch, 1u);
 
-        /* Commit readiness is a second independent event; it cannot be guessed. */
+        /* Preparation readiness is an independent event; it cannot be guessed. */
         for (int iteration = 0; iteration < 128; ++iteration)
         {
             auto ticket = authority->tryAcquireTicketSnapshot();
@@ -683,7 +826,15 @@ namespace llaminar2::test
             EXPECT_EQ((*ticket)->epoch, 1u);
         }
 
-        transport->setCommitReady(true);
+        transport->setPrepareReady(true);
+        service->notifyMaintenanceProgress();
+        ASSERT_TRUE(waitUntil(
+            [&]
+            { return transport->observations().publication_begins == 1; }));
+        EXPECT_EQ(authority->snapshot()->epoch, 1u)
+            << "public admission must not advance during selector fan-out";
+
+        transport->setPublicationReady(true);
         service->notifyMaintenanceProgress();
         ASSERT_TRUE(waitUntil(
             [&]
@@ -720,7 +871,8 @@ namespace llaminar2::test
         auto transport = std::make_shared<ControlledTransport>();
         transport->setStartEnabled(false);
         transport->setStageReady(true);
-        transport->setCommitReady(true);
+        transport->setPrepareReady(true);
+        transport->setPublicationReady(true);
         auto service = startService(authority, transport);
 
         ASSERT_TRUE(waitUntil(
@@ -764,7 +916,8 @@ namespace llaminar2::test
         auto transport = std::make_shared<ControlledTransport>();
         transport->setDeferDuringStage(true);
         transport->setStageReady(true);
-        transport->setCommitReady(true);
+        transport->setPrepareReady(true);
+        transport->setPublicationReady(true);
         auto service = startService(authority, transport);
 
         ASSERT_TRUE(waitUntil(
@@ -807,7 +960,8 @@ namespace llaminar2::test
         auto authority = dynamicAuthority(histogram.get());
         auto transport = std::make_shared<ControlledTransport>();
         transport->setStageReady(true);
-        transport->setCommitReady(true);
+        transport->setPrepareReady(true);
+        transport->setPublicationReady(true);
         auto publisher =
             std::make_shared<ImmediateHistogramPublisher>(true);
         auto service = startService(authority, transport, publisher);
@@ -835,6 +989,62 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayResidencyMaintenanceService,
+        ShutdownCompletesIrrevocablyPublishedDistributedGeneration)
+    {
+        auto histogram = fullMovementHistogram();
+        auto authority = dynamicAuthority(histogram.get());
+        auto transport = std::make_shared<ControlledTransport>();
+        transport->setStageReady(true);
+        transport->setPrepareReady(true);
+        transport->setPublicationReady(true);
+        auto publisher =
+            std::make_shared<ImmediateHistogramPublisher>(true);
+        publisher->setPublicationReady(false);
+        auto service = startService(authority, transport, publisher);
+
+        ASSERT_TRUE(waitUntil(
+            [&]
+            {
+                return publisher->publicationBegins() == 1 &&
+                       publisher->polls() > 0;
+            }));
+
+        /*
+         * Once the coordinator has started publishing a frozen generation, a
+         * peer may already have derived and staged it. Shutdown must therefore
+         * finish the same generation locally before the root releases worker
+         * ranks; discarding it would strand the peer in residency consensus.
+         */
+        std::atomic<bool> drain_returned{false};
+        std::jthread drain_thread(
+            [&]
+            {
+                service->stopAndDrain();
+                drain_returned.store(true, std::memory_order_release);
+            });
+        ASSERT_TRUE(waitUntil(
+            [&]
+            {
+                return service->state() ==
+                       MoEOverlayMaintenanceState::Draining;
+            }));
+        EXPECT_FALSE(drain_returned.load(std::memory_order_acquire));
+
+        publisher->setPublicationReady(true);
+        service->notifyMaintenanceProgress();
+        drain_thread.join();
+
+        EXPECT_TRUE(drain_returned.load(std::memory_order_acquire));
+        EXPECT_EQ(service->state(), MoEOverlayMaintenanceState::Stopped);
+        EXPECT_EQ(publisher->publicationCompletions(), 1);
+        EXPECT_EQ(authority->snapshot()->epoch, 2u);
+        EXPECT_EQ(service->stats().committed_waves, 1u);
+        EXPECT_TRUE(service->healthy()) << service->failureMessage();
+        publisher->stopAndDrain();
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyMaintenanceService,
         DistributedPeerIgnoresPartialLocalHistogramAndRearmsImmediately)
     {
         auto histogram = fullMovementHistogram();
@@ -847,7 +1057,8 @@ namespace llaminar2::test
         auto authority = dynamicAuthority(histogram.get());
         auto transport = std::make_shared<ControlledTransport>();
         transport->setStageReady(true);
-        transport->setCommitReady(true);
+        transport->setPrepareReady(true);
+        transport->setPublicationReady(true);
         auto publisher = std::make_shared<ImmediateHistogramPublisher>(
             false,
             published_window);
@@ -915,6 +1126,13 @@ namespace llaminar2::test
         auto service = startService(authority, transport);
 
         ASSERT_TRUE(waitUntil([&] { return !service->healthy(); }));
+        const auto failure_poll = service->stats().poll_iterations;
+        ASSERT_TRUE(waitUntil(
+            [&]
+            {
+                return service->stats().poll_iterations >=
+                       failure_poll + 8u;
+            }));
         EXPECT_EQ(service->state(), MoEOverlayMaintenanceState::Failed);
         EXPECT_EQ(
             service->failureMessage(),
@@ -922,6 +1140,9 @@ namespace llaminar2::test
         EXPECT_EQ(authority->snapshot()->epoch, 1u);
         EXPECT_EQ(authority->stats().stage_failures, 1u);
         EXPECT_EQ(service->stats().fatal_failures, 1u);
+        EXPECT_EQ(transport->observations().begin_calls, 1)
+            << "A fatal transport result must clear retry intent before the "
+               "worker publishes its Failed state";
         EXPECT_EQ(transport->observations().waves_started, 0);
 
         service->stopAndDrain();

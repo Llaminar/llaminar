@@ -49,6 +49,36 @@ namespace llaminar2::sampling_math
      */
     constexpr uint32_t kMTPFirstTransactionDiagnosticVersion = 2;
 
+    /** @brief ABI version for the last committed verifier transaction identity. */
+    constexpr uint32_t kMTPCommittedVerifierIdentityVersion = 1;
+
+    /**
+     * @brief Device-owned identity of the last response-visible MTP transaction.
+     *
+     * The verifier input row is reusable graph scratch: observing it after a
+     * transaction does not prove that the row belongs to the transaction whose
+     * response and controller counters became visible.  The response/state
+     * commit kernel copies the exact active `[target, drafts...]` prefix into
+     * this record in the same request-owned lane that advances those counters.
+     * It writes @ref valid last, so an event-ordered diagnostic read observes
+     * either no committed identity or one complete, versioned transaction.
+     *
+     * This record is evidence only.  It is never read by sampling, controller,
+     * KV, or response-publication code and therefore cannot become a host
+     * shadow of device execution state.
+     */
+    struct alignas(8) MTPCommittedVerifierIdentityRecord
+    {
+        uint32_t valid = 0; ///< Written last after every other field is complete.
+        uint32_t version = kMTPCommittedVerifierIdentityVersion;
+        int32_t transaction_count = 0;
+        int32_t draft_depth = 0;
+        int32_t verifier_input_tokens[kSpeculativeBatchMaxOutputTokens] = {};
+    };
+    static_assert(
+        sizeof(MTPCommittedVerifierIdentityRecord) % sizeof(int32_t) == 0,
+        "The arena stores committed verifier identities as whole INT32 words");
+
     /**
      * @brief Ordered MTP-sidecar boundaries retained for transaction zero.
      *
@@ -614,6 +644,7 @@ namespace llaminar2::sampling_math
         InvalidDepthPolicy = 10,
         InvalidDepthSelector = 11,
         InvalidMaintenanceState = 12,
+        InvalidVerifierTransactionIdentity = 13,
     };
 
     /**
@@ -765,6 +796,102 @@ namespace llaminar2::sampling_math
                 static_cast<int>(error);
         }
         return false;
+    }
+
+    /**
+     * @brief Validate the verifier row that will identify one controller commit.
+     *
+     * The active depth is device-owned.  Re-deriving it from host configuration
+     * would make dynamic depth ambiguous and could certify a stale suffix from
+     * the reusable verifier bank.  Only the target plus the selected number of
+     * drafts are required to contain real token ids.
+     *
+     * @param verifier_input_tokens Request-local verifier row.
+     * @param verifier_input_token_stride Physical row capacity in INT32 words.
+     * @param control Request-local authoritative generation controller.
+     * @return true when the complete active verifier prefix is materialized.
+     */
+    LLAMINAR_SAMPLING_HD bool valid_committed_verifier_identity_input(
+        const int32_t *verifier_input_tokens,
+        int verifier_input_token_stride,
+        const int *control)
+    {
+        if (!verifier_input_tokens || !control)
+            return false;
+        const int draft_depth =
+            control[kDeviceGenerationControlCurrentDraftDepth];
+        if (draft_depth <= 0 ||
+            draft_depth > kSpeculativeBatchMaxRows ||
+            verifier_input_token_stride < draft_depth + 1)
+        {
+            return false;
+        }
+        for (int row = 0; row <= draft_depth; ++row)
+        {
+            if (verifier_input_tokens[row] < 0)
+                return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Materialize a complete identity after response/state commit.
+     *
+     * Callers must invoke this only after
+     * append_speculative_outcome_to_device_generation() has advanced the same
+     * controller row. One GPU lane owns both operations, so writing @ref valid
+     * last is sufficient; the producer event supplies the inter-stream and
+     * device-to-host visibility edge.
+     *
+     * @param verifier_input_tokens Request-local verifier row validated before
+     *        the response ledger was mutated.
+     * @param verifier_input_token_stride Physical row capacity in INT32 words.
+     * @param control Committed request-local generation controller.
+     * @param record Request-local persistent identity destination.
+     * @return true when a complete committed identity was published.
+     */
+    LLAMINAR_SAMPLING_HD bool publish_committed_verifier_identity(
+        const int32_t *verifier_input_tokens,
+        int verifier_input_token_stride,
+        const int *control,
+        MTPCommittedVerifierIdentityRecord *record)
+    {
+        if (!record || !verifier_input_tokens || !control)
+            return false;
+
+        /*
+         * Dynamic policy observation may already have selected the *next*
+         * transaction's depth.  The identity belongs to the transaction just
+         * committed, so its immutable last-depth word is the only valid copy
+         * extent here.
+         */
+        const int draft_depth =
+            control[kDeviceGenerationControlLastTransactionDraftDepth];
+        const int transaction_count =
+            control[kDeviceGenerationControlTransactionCount];
+        if (draft_depth <= 0 || draft_depth > kSpeculativeBatchMaxRows ||
+            verifier_input_token_stride < draft_depth + 1 ||
+            transaction_count <= 0)
+        {
+            return false;
+        }
+        for (int row = 0; row <= draft_depth; ++row)
+        {
+            if (verifier_input_tokens[row] < 0)
+                return false;
+        }
+
+        record->valid = 0;
+        record->version = kMTPCommittedVerifierIdentityVersion;
+        record->transaction_count = transaction_count;
+        record->draft_depth = draft_depth;
+        for (int row = 0; row < kSpeculativeBatchMaxOutputTokens; ++row)
+        {
+            record->verifier_input_tokens[row] =
+                row <= draft_depth ? verifier_input_tokens[row] : -1;
+        }
+        record->valid = 1;
+        return true;
     }
 
     /**

@@ -145,6 +145,30 @@ namespace
         bool skip_logits_gather_prefill_called_ = false;
     };
 
+    /** @brief Generic application-readiness fixture with no subsystem details. */
+    class MockInferenceReadinessRunner : public MockCPUInferenceRunner
+    {
+    public:
+        explicit MockInferenceReadinessRunner(
+            InferenceReadinessState state,
+            std::string diagnostic = {})
+            : state_(state), diagnostic_(std::move(diagnostic))
+        {
+        }
+
+        InferenceReadiness inferenceReadiness() const override
+        {
+            return {
+                .state = state_,
+                .diagnostic = diagnostic_,
+            };
+        }
+
+    private:
+        InferenceReadinessState state_;
+        std::string diagnostic_;
+    };
+
     /**
      * @brief Mock inference runner that simulates GPU execution.
      *
@@ -174,6 +198,13 @@ namespace
             {
                 for (auto &graph : snapshot_.prefill_graphs)
                 {
+                    /*
+                     * A production probe includes inactive forward-cache
+                     * signatures. Only the graph selected for this request is
+                     * submitted; cold entries remain historical diagnostics.
+                     */
+                    if (graph.phase == "cold")
+                        continue;
                     graph.phase = "ready";
                     if (prefill_forward_count_ == capture_on_forward_)
                     {
@@ -268,6 +299,7 @@ namespace
             return configured_stop_tokens_;
         }
         int completionWaitCount() const { return completion_wait_count_; }
+        int prefillForwardCount() const { return prefill_forward_count_; }
         bool completionOrderValid() const { return completion_order_valid_; }
         void setCompletionDelay(std::chrono::milliseconds delay)
         {
@@ -337,11 +369,14 @@ namespace
                 output.tokens.push_back(10 + ((emitted_tokens_ + i) % 5));
             }
             emitted_tokens_ += accepted;
+            decoded_tokens_returned_ += output.tokens.size();
             return output;
         }
 
-        bool maybeApplyDecodeBoundaryMaintenance() override
+        bool maybeApplyDecodeBoundaryMaintenance(
+            uint64_t committed_tokens) override
         {
+            maintenance_tokens_ += committed_tokens;
             ++maintenance_calls_;
             return true;
         }
@@ -354,6 +389,11 @@ namespace
 
         int decodeStepCalls() const { return decode_step_calls_; }
         int maintenanceCalls() const { return maintenance_calls_; }
+        uint64_t maintenanceTokens() const { return maintenance_tokens_; }
+        uint64_t decodedTokensReturned() const
+        {
+            return decoded_tokens_returned_;
+        }
         int sampleGreedyCalls() const { return sample_greedy_calls_; }
         bool samplingParamsSet() const { return sampling_params_set_; }
         float lastTemperature() const { return last_sampling_params_.temperature; }
@@ -368,6 +408,8 @@ namespace
         int decode_step_budget_ = 0;
         int decode_step_calls_ = 0;
         int maintenance_calls_ = 0;
+        uint64_t maintenance_tokens_ = 0u;
+        uint64_t decoded_tokens_returned_ = 0u;
         int sample_greedy_calls_ = 0;
         int emitted_tokens_ = 0;
         bool sampling_params_set_ = false;
@@ -423,8 +465,10 @@ namespace
     class MockPerfStatsMaintenanceRunner : public MockOrchestratedDecodeRunner
     {
     public:
-        bool maybeApplyDecodeBoundaryMaintenance() override
+        bool maybeApplyDecodeBoundaryMaintenance(
+            uint64_t committed_tokens) override
         {
+            maintenance_tokens_ += committed_tokens;
             ++maintenance_calls_;
             PerfStatsCollector::addCounter(
                 "moe_rebalance",
@@ -447,10 +491,12 @@ namespace
         }
 
         int maintenanceCalls() const { return maintenance_calls_; }
+        uint64_t maintenanceTokens() const { return maintenance_tokens_; }
         int drainCalls() const { return drain_calls_; }
 
     private:
         int maintenance_calls_ = 0;
+        uint64_t maintenance_tokens_ = 0u;
         int drain_calls_ = 0;
     };
 
@@ -518,11 +564,16 @@ namespace
                 }
             }
 
+            for (const auto &request_tokens : output.tokens_by_request)
+                decoded_tokens_returned_ += request_tokens.size();
+
             return output;
         }
 
-        bool maybeApplyDecodeBoundaryMaintenance() override
+        bool maybeApplyDecodeBoundaryMaintenance(
+            uint64_t committed_tokens) override
         {
+            maintenance_tokens_ += committed_tokens;
             ++maintenance_calls_;
             return true;
         }
@@ -537,6 +588,11 @@ namespace
         int batchPrefillCalls() const { return batch_prefill_calls_; }
         int batchDecodeStepCalls() const { return batch_decode_step_calls_; }
         int maintenanceCalls() const { return maintenance_calls_; }
+        uint64_t maintenanceTokens() const { return maintenance_tokens_; }
+        uint64_t decodedTokensReturned() const
+        {
+            return decoded_tokens_returned_;
+        }
         int lastPrefillBatch() const { return last_prefill_batch_; }
         int lastRequestBatch() const { return last_request_batch_; }
         bool samplingParamsSet() const { return sampling_params_set_; }
@@ -549,6 +605,8 @@ namespace
         int single_decode_step_calls_ = 0;
         int batch_decode_step_calls_ = 0;
         int maintenance_calls_ = 0;
+        uint64_t maintenance_tokens_ = 0u;
+        uint64_t decoded_tokens_returned_ = 0u;
         int last_prefill_batch_ = 0;
         int last_request_batch_ = 0;
         std::vector<int> emitted_by_request_;
@@ -822,6 +880,68 @@ TEST(Test__BenchmarkRunnerCPU, RejectsAmbiguousOrInvalidPromptFiles)
     EXPECT_THROW((void)resolveBenchmarkPrompt(missing), std::runtime_error);
 }
 
+TEST(Test__BenchmarkRunnerCPU,
+     PreparingRunnerCannotLeakSubsystemWorkIntoBenchmark)
+{
+    {
+        ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+        ScopedEnv warmups(
+            "LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+        mutableDebugEnv().runtime_debug.reload();
+
+        auto runner =
+            std::make_shared<MockInferenceReadinessRunner>(
+                InferenceReadinessState::Preparing);
+        BenchmarkRunner benchmark(runner, createMockTokenizer());
+
+        OrchestrationConfig config;
+        config.prompt = "Hello world";
+        config.n_predict = 0;
+
+        const BenchmarkResult result = benchmark.run(config);
+
+        EXPECT_FALSE(result.success);
+        EXPECT_NE(
+            result.failure_reason.find("not ready"),
+            std::string::npos)
+            << result.failure_reason;
+        EXPECT_EQ(runner->forwardCount(), 0)
+            << "BenchmarkRunner must never drive preparation workloads";
+    }
+    mutableDebugEnv().runtime_debug.reload();
+}
+
+TEST(Test__BenchmarkRunnerCPU,
+     FailedProductionPreparationCannotFallThroughIntoMeasurement)
+{
+    {
+        ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+        ScopedEnv warmups(
+            "LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+        mutableDebugEnv().runtime_debug.reload();
+
+        auto runner = std::make_shared<MockInferenceReadinessRunner>(
+            InferenceReadinessState::Failed,
+            "injected preparation failure");
+        BenchmarkRunner benchmark(runner, createMockTokenizer());
+
+        OrchestrationConfig config;
+        config.prompt = "Hello world";
+        config.n_predict = 0;
+
+        const BenchmarkResult result = benchmark.run(config);
+
+        EXPECT_FALSE(result.success);
+        EXPECT_NE(
+            result.failure_reason.find("injected preparation failure"),
+            std::string::npos)
+            << result.failure_reason;
+        EXPECT_EQ(runner->forwardCount(), 0)
+            << "A failed readiness contract must abort before timed inference";
+    }
+    mutableDebugEnv().runtime_debug.reload();
+}
+
 /**
  * @brief Verify that CPU benchmark does NOT enable skip-logits-gather.
  *
@@ -1015,14 +1135,178 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureAcceptsCapturedProbe)
     EXPECT_EQ(result.prefix_state.prefill_graphs[0].domain_id, "mock_tp");
 }
 
+TEST(
+    Test__BenchmarkRunnerCPU,
+    PrefillGraphPreparationStopsAtFirstReplayReadyState)
+{
+    {
+        ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+        ScopedEnv warmups(
+            "LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+        mutableDebugEnv().runtime_debug.reload();
+        ScopedGpuGraphsSetting force_gpu_graphs(true);
+        ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
+
+        auto runner = std::make_shared<MockGPUInferenceRunner>();
+        PrefixRuntimeStateSnapshot snapshot;
+        PrefillGraphRuntimeProbe graph;
+        graph.phase = "ready";
+        graph.capture_phase = "capture";
+        graph.capture_count = 1;
+        graph.node_count = 42;
+        graph.domain_id = "state_driven";
+        snapshot.prefill_graphs.push_back(graph);
+        runner->setPrefixRuntimeState(snapshot);
+        runner->setAdvancePrefillGraphOnForward(true);
+
+        BenchmarkRunner bench(runner, createMockTokenizer());
+        OrchestrationConfig config;
+        config.prompt = "Hello world";
+        config.n_predict = 0;
+
+        const auto result = bench.run(config);
+        EXPECT_TRUE(result.success) << result.failure_reason;
+        EXPECT_EQ(runner->prefillForwardCount(), 2)
+            << "One preparation replay plus one measured replay is sufficient; "
+               "fixed repeated full-prompt warmups are forbidden.";
+    }
+    mutableDebugEnv().runtime_debug.reload();
+}
+
+TEST(
+    Test__BenchmarkRunnerCPU,
+    RequiredPrefillGraphCaptureRejectsStaleColdReplayObservation)
+{
+    ScopedGpuGraphsSetting force_gpu_graphs(true);
+    ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
+    auto runner = std::make_shared<MockGPUInferenceRunner>();
+    PrefixRuntimeStateSnapshot snapshot;
+    PrefillGraphRuntimeProbe graph;
+    graph.phase = "cold";
+    graph.capture_phase = "replay";
+    graph.capture_count = 1;
+    graph.replay_count = 4;
+    graph.node_count = 42;
+    graph.domain_id = "stale_domain";
+    snapshot.prefill_graphs.push_back(graph);
+    runner->setPrefixRuntimeState(snapshot);
+
+    BenchmarkRunner bench(runner, createMockTokenizer());
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 0;
+
+    const auto result = bench.run(config);
+    EXPECT_FALSE(result.success);
+    EXPECT_NE(
+        result.failure_reason.find(
+            "required prefill graph capture/replay was not observed"),
+        std::string::npos)
+        << result.failure_reason;
+}
+
+TEST(
+    Test__BenchmarkRunnerCPU,
+    RequiredPrefillGraphReplayIgnoresInactiveColdCacheEntries)
+{
+    ScopedGpuGraphsSetting force_gpu_graphs(true);
+    ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
+    auto runner = std::make_shared<MockGPUInferenceRunner>();
+    PrefixRuntimeStateSnapshot snapshot;
+
+    PrefillGraphRuntimeProbe active;
+    active.phase = "ready";
+    active.capture_phase = "capture";
+    active.capture_count = 1;
+    active.node_count = 42;
+    active.domain_id = "active_domain";
+    active.participant_id = 0;
+    active.bucket_seq_len = 512;
+    snapshot.prefill_graphs.push_back(active);
+
+    PrefillGraphRuntimeProbe inactive;
+    inactive.phase = "cold";
+    inactive.capture_phase = "unknown";
+    inactive.domain_id = "";
+    inactive.bucket_seq_len = 256;
+    snapshot.prefill_graphs.push_back(inactive);
+
+    runner->setPrefixRuntimeState(snapshot);
+    runner->setAdvancePrefillGraphOnForward(true);
+
+    BenchmarkRunner bench(runner, createMockTokenizer());
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 0;
+
+    const auto result = bench.run(config);
+    EXPECT_TRUE(result.success) << result.failure_reason;
+    ASSERT_EQ(result.prefix_state.prefill_graphs.size(), 2u);
+    EXPECT_GT(result.prefix_state.prefill_graphs[0].replay_count, 0);
+    EXPECT_EQ(result.prefix_state.prefill_graphs[1].replay_count, 0);
+    EXPECT_EQ(result.prefix_state.prefill_graphs[1].phase, "cold");
+}
+
+/**
+ * @brief A padded active graph must not alias its full-width cache template.
+ *
+ * Padded prompts and eagerly materialized bucket templates legitimately share
+ * domain, participant, chunk, and physical bucket coordinates. The real token
+ * count is part of PrefillGraphCacheKey and must therefore participate in the
+ * benchmark proof identity as well. Otherwise the first cold template can
+ * hide a replay by the active one-token graph.
+ */
+TEST(
+    Test__BenchmarkRunnerCPU,
+    RequiredPrefillGraphReplayDistinguishesPaddedRealTokenCount)
+{
+    ScopedGpuGraphsSetting force_gpu_graphs(true);
+    ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
+    auto runner = std::make_shared<MockGPUInferenceRunner>();
+    PrefixRuntimeStateSnapshot snapshot;
+
+    PrefillGraphRuntimeProbe full_bucket_template;
+    full_bucket_template.phase = "cold";
+    full_bucket_template.capture_phase = "materialized_without_launch";
+    full_bucket_template.capture_count = 1;
+    full_bucket_template.node_count = 43;
+    full_bucket_template.domain_id = "padded_domain";
+    full_bucket_template.participant_id = 0;
+    full_bucket_template.chunk_index = 0;
+    full_bucket_template.bucket_seq_len = 256;
+    full_bucket_template.real_token_count = 256;
+    snapshot.prefill_graphs.push_back(full_bucket_template);
+
+    PrefillGraphRuntimeProbe active_padded_graph = full_bucket_template;
+    active_padded_graph.phase = "ready";
+    active_padded_graph.capture_phase = "replay";
+    active_padded_graph.replay_count = 1;
+    active_padded_graph.node_count = 42;
+    active_padded_graph.real_token_count = 1;
+    snapshot.prefill_graphs.push_back(active_padded_graph);
+
+    runner->setPrefixRuntimeState(snapshot);
+    runner->setAdvancePrefillGraphOnForward(true);
+
+    BenchmarkRunner bench(runner, createMockTokenizer());
+    OrchestrationConfig config;
+    config.prompt = "Hello";
+    config.n_predict = 0;
+
+    const auto result = bench.run(config);
+    EXPECT_TRUE(result.success) << result.failure_reason;
+    ASSERT_EQ(result.prefix_state.prefill_graphs.size(), 2u);
+    EXPECT_EQ(result.prefix_state.prefill_graphs[0].replay_count, 0);
+    EXPECT_GT(result.prefix_state.prefill_graphs[1].replay_count, 1);
+}
+
 /**
  * @brief A measured prefill sample must never perform graph capture.
  *
- * With the default benchmark schedule, forwards 1-3 prepare the first graph,
- * forward 4 is the ordinary warmup, forwards 5-7 re-arm steady-state capture,
- * and forward 8 is the first measured sample. The mock deliberately reports a
- * new capture on that sample; accepting it would mix setup work into the
- * production replay speedometer.
+ * State-driven preparation uses forward 1 to reach replay-ready, forward 2 is
+ * the configured ordinary warmup, and forward 3 is the first measured sample.
+ * The mock deliberately reports a new capture on that sample; accepting it
+ * would mix setup work into the production replay speedometer.
  */
 TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphReplayRejectsMeasuredCapture)
 {
@@ -1041,7 +1325,7 @@ TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphReplayRejectsMeasuredCapture)
     snapshot.prefill_graphs.push_back(graph);
     runner->setPrefixRuntimeState(snapshot);
     runner->setAdvancePrefillGraphOnForward(true);
-    runner->setCaptureOnForward(8);
+    runner->setCaptureOnForward(3);
 
     auto tokenizer = createMockTokenizer();
     BenchmarkRunner bench(runner, tokenizer);
@@ -1147,12 +1431,23 @@ TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
     ASSERT_TRUE(result.success);
     EXPECT_TRUE(result.decode_success);
     EXPECT_EQ(result.decode_tokens, 3);
+    EXPECT_EQ(result.decode_after_prefill_tokens, 2)
+        << "The first emitted token is sampled from terminal prefill logits";
+    EXPECT_GT(result.decode_after_prefill_tokens_per_sec, 0.0);
+    EXPECT_LT(
+        result.decode_after_prefill_tokens_per_sec,
+        result.decode_tokens_per_sec)
+        << "Short-run headline throughput must remain distinguishable from "
+           "post-prefill decode work";
     EXPECT_THAT(result.generated_token_ids, ::testing::ElementsAre(14, 10, 11))
         << "Benchmark JSON should report the final measured iteration, not warmup output";
     EXPECT_TRUE(runner->samplingParamsSet());
     EXPECT_EQ(runner->lastTemperature(), 0.0f);
     EXPECT_GT(runner->decodeStepCalls(), 0);
     EXPECT_GT(runner->maintenanceCalls(), 0);
+    EXPECT_EQ(runner->maintenanceTokens(), runner->decodedTokensReturned())
+        << "Every grouped decode transaction must retire exactly the logical "
+           "tokens it returned, including warmup and measured iterations.";
     EXPECT_EQ(runner->sampleGreedyCalls(), 0)
         << "BenchmarkRunner must not bypass orchestration decodeStep when it is available";
     EXPECT_TRUE(runner->configuredStopTokens().empty())
@@ -1253,10 +1548,9 @@ TEST(Test__BenchmarkRunnerCPU, PostWarmupCallbackSeesDecodeHistogramBeforePrefil
     EXPECT_LT(last_clear_before_callback, last_decode_before_callback)
         << "Prefill graph warmup must not clear the decode histogram before rebalance: "
         << ::testing::PrintToString(events);
-    EXPECT_GE(prefill_count_before_callback, 4u)
-        << "Exact prefill graph capture needs three graph-warmup forwards plus the ordinary "
-           "warmup prefill before post-warmup rebalance; otherwise measured 2-card prefill "
-           "can pay warmup/capture instead of replaying."
+    EXPECT_GE(prefill_count_before_callback, 2u)
+        << "State-driven graph preparation and the ordinary warmup prefill must "
+           "both precede post-warmup rebalance."
         << ::testing::PrintToString(events);
 }
 
@@ -1287,6 +1581,9 @@ TEST(Test__BenchmarkRunnerCPU, PerfStatsResetDropsPostWarmupMoEStatsBeforeMeasur
 
     ASSERT_TRUE(result.success) << result.failure_reason;
     EXPECT_GT(runner->maintenanceCalls(), 0);
+    EXPECT_EQ(runner->maintenanceTokens(), runner->decodedTokensReturned())
+        << "The measured maintenance path must preserve exact logical-token "
+           "accounting while exporting diagnostics.";
     EXPECT_GT(runner->drainCalls(), 0);
 
     const auto records = PerfStatsCollector::snapshot({"moe_rebalance"});
@@ -1353,9 +1650,9 @@ TEST(Test__BenchmarkRunnerCPU, StaticWarmupRearmsPrefillGraphAfterDecodeWorkspac
             ++prefill_after_decode_before_reset;
     }
 
-    EXPECT_GE(prefill_after_decode_before_reset, 3u)
-        << "Static benchmark warmup must re-arm exact prefill graph capture after warmup decode "
-           "has had a chance to grow/rebind workspace; otherwise measured prefill pays warmup/capture."
+    EXPECT_GE(prefill_after_decode_before_reset, 1u)
+        << "Static benchmark setup must re-check graph readiness after warmup decode "
+           "without unconditionally replaying the prompt three times."
         << ::testing::PrintToString(events);
 }
 
@@ -1420,6 +1717,9 @@ TEST(Test__BenchmarkRunnerCPU, UsesRequestBatchedDecodeStepWhenMTPBatchRequested
     EXPECT_GT(runner->batchPrefillCalls(), 0);
     EXPECT_GT(runner->batchDecodeStepCalls(), 0);
     EXPECT_GT(runner->maintenanceCalls(), 0);
+    EXPECT_EQ(runner->maintenanceTokens(), runner->decodedTokensReturned())
+        << "Request-batched maintenance must account for every logical token "
+           "across all request rows, not merely one host boundary.";
     EXPECT_EQ(runner->forwardCount(), 0)
         << "Request-batched benchmark must not prefill only request 0";
     EXPECT_EQ(runner->singleDecodeStepCalls(), 0)
@@ -1857,6 +2157,13 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
          {"work_scheduler", "compact_directory_grid"},
          {"policy_source", "tensor_core_imma_prefill"}});
     PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
+    PerfStatsCollector::addCounter(
+        "moe_overlay_controller",
+        "dynamic_movement_transactions",
+        2.0,
+        "maintenance",
+        "cuda:0",
+        {{"policy_owner", "device"}});
 
     BenchmarkResult result;
     result.prefill_tokens = 10;
@@ -1866,6 +2173,8 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     result.decode_tokens = 2;
     result.decode_time_ms = 2.0;
     result.decode_tokens_per_sec = 1000.0;
+    result.decode_after_prefill_tokens = 1;
+    result.decode_after_prefill_tokens_per_sec = 500.0;
     result.decode_token_latencies_ms = {0.9, 1.1};
     result.decode_latency_mean_ms = 1.0;
     result.decode_latency_p50_ms = 1.0;
@@ -1880,6 +2189,32 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     result.prompt_bytes = 22;
     result.prompt_sha256 =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    result.iterations.push_back(BenchmarkIterationResult{
+        .iteration = 1,
+        .prefill_tokens = 10,
+        .prefill_time_ms = 4.5,
+        .prefill_tokens_per_sec = 2222.222222222222,
+        .decode_tokens = 2,
+        .decode_time_ms = 2.2,
+        .decode_tokens_per_sec = 909.090909090909,
+        .decode_after_prefill_tokens = 1,
+        .decode_after_prefill_tokens_per_sec = 454.5454545454545,
+        .moe_runtime_movement_epoch_start = 5,
+        .moe_runtime_movement_epoch = 7,
+        .dynamic_movement_transactions = 2,
+        .dynamic_movement_commands = 9,
+        .dynamic_physical_bytes = 4096,
+        .dynamic_promotions = 3,
+        .dynamic_demotions = 3,
+        .dynamic_same_priority_moves = 3,
+        .decode_windows = {
+            BenchmarkDecodeWindowResult{
+                .start_token = 0,
+                .token_count = 2,
+                .time_ms = 2.2,
+                .tokens_per_sec = 909.090909090909,
+            }},
+    });
 
     auto &snapshot = result.prefix_state;
     snapshot.initialized = true;
@@ -1887,6 +2222,7 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     snapshot.execution_path = "GRAPH";
     snapshot.primary_device = DeviceId::cpu();
     snapshot.current_position = 12;
+    snapshot.moe_runtime_movement_epoch = 7;
     snapshot.prefix_cache_config_enabled = true;
     snapshot.prefix_cache_ready = true;
     snapshot.prefix_cache_lookups = 3;
@@ -1977,6 +2313,7 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     config.prefix_cache.enabled = true;
     config.mtp.enabled = true;
     config.mtp.draft_tokens = 3;
+    config.mtp.graph_capacity_draft_tokens = 15;
     config.mtp.max_request_batch = 4;
     config.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
     config.mtp.depth_policy.max_depth = 3;
@@ -1997,14 +2334,57 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     EXPECT_EQ(doc.at("tokens").at("prefill"), 10);
     EXPECT_EQ(doc.at("tokens").at("decode"), 2);
+    EXPECT_EQ(doc.at("tokens").at("decode_after_prefill"), 1);
     EXPECT_DOUBLE_EQ(doc.at("timing_ms").at("total").get<double>(), 6.0);
     EXPECT_DOUBLE_EQ(doc.at("throughput_tokens_per_sec").at("overall").get<double>(), 2000.0);
+    EXPECT_DOUBLE_EQ(
+        doc.at("throughput_tokens_per_sec")
+            .at("decode_after_prefill")
+            .get<double>(),
+        500.0);
     EXPECT_DOUBLE_EQ(doc.at("decode_latency_ms").at("mean").get<double>(), 1.0);
     EXPECT_DOUBLE_EQ(doc.at("decode_latency_ms").at("p50").get<double>(), 1.0);
     EXPECT_DOUBLE_EQ(doc.at("decode_latency_ms").at("p90").get<double>(), 1.08);
     EXPECT_EQ(doc.at("decode_latency_ms").at("samples"), 2);
     EXPECT_EQ(doc.at("generated_text_bytes"), 2);
     EXPECT_EQ(doc.at("generated_token_ids"), nlohmann::json::array({77, 88}));
+    ASSERT_EQ(doc.at("iterations").size(), 1u);
+    const auto &iteration = doc.at("iterations").front();
+    EXPECT_EQ(iteration.at("iteration"), 1);
+    EXPECT_DOUBLE_EQ(
+        iteration.at("throughput_tokens_per_sec").at("decode").get<double>(),
+        909.090909090909);
+    EXPECT_DOUBLE_EQ(
+        iteration.at("throughput_tokens_per_sec")
+            .at("decode_after_prefill")
+            .get<double>(),
+        454.5454545454545);
+    EXPECT_EQ(iteration.at("moe_runtime_movement_epoch_start"), 5);
+    EXPECT_EQ(iteration.at("moe_runtime_movement_epoch"), 7);
+    EXPECT_EQ(
+        iteration.at("completed_dynamic_movement").at("transactions"), 2);
+    EXPECT_EQ(
+        iteration.at("completed_dynamic_movement").at("commands"), 9);
+    EXPECT_EQ(
+        iteration.at("completed_dynamic_movement").at("promotions"), 3);
+    EXPECT_EQ(
+        iteration.at("completed_dynamic_movement").at("same_priority_moves"),
+        3);
+    ASSERT_EQ(iteration.at("decode_windows").size(), 1u);
+    EXPECT_EQ(iteration.at("decode_windows").front().at("start_token"), 0);
+    EXPECT_EQ(iteration.at("decode_windows").front().at("token_count"), 2);
+    EXPECT_EQ(doc.at("runtime_state").at("moe_runtime_movement_epoch"), 7);
+    const auto &perf_records = doc.at("perf_stats").at("records");
+    EXPECT_TRUE(std::any_of(
+        perf_records.begin(),
+        perf_records.end(),
+        [](const auto &record)
+        {
+            return record.at("domain") == "moe_overlay_controller" &&
+                   record.at("name") == "dynamic_movement_transactions" &&
+                   record.at("value") == 2.0;
+        })) << "Machine-readable benchmark evidence omitted completed "
+               "device-owned movement";
 
     const auto &prefix = doc.at("prefix_cache");
     EXPECT_TRUE(prefix.at("config_enabled").get<bool>());
@@ -2055,6 +2435,7 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_TRUE(doc.at("config").at("prefix_cache_enabled").get<bool>());
     EXPECT_TRUE(doc.at("config").at("mtp_enabled").get<bool>());
     EXPECT_EQ(doc.at("config").at("mtp_draft_tokens"), 3);
+    EXPECT_EQ(doc.at("config").at("mtp_graph_capacity_draft_tokens"), 15);
     EXPECT_EQ(doc.at("config").at("mtp_max_request_batch"), 4);
     EXPECT_EQ(doc.at("config").at("mtp_depth_policy"), "dynamic");
     EXPECT_EQ(doc.at("config").at("mtp_max_draft_tokens"), 3);
@@ -2161,6 +2542,13 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
         "cuda:0",
         {{"buffer_count", "2"}});
     PerfStatsCollector::addCounter(
+        "weight_loading",
+        "graph_build_ms",
+        125.0,
+        "model_setup",
+        "cuda:0",
+        {{"source", "weight_loading_profiler"}});
+    PerfStatsCollector::addCounter(
         "gpu_graph_inventory",
         "fragment_kernel_nodes",
         17.0,
@@ -2233,6 +2621,8 @@ TEST(Test__BenchmarkRunnerCPU, PreservesImmutableSetupEvidenceAcrossMeasuredRese
     };
     EXPECT_TRUE(has_record("memory", "workspace_block_bytes"))
         << "Benchmark JSON diagnostics need the allocation BOM after warmup reset";
+    EXPECT_TRUE(has_record("weight_loading", "graph_build_ms"))
+        << "Startup and eager graph-family costs must remain attributable in the benchmark artifact";
     EXPECT_TRUE(has_record("gpu_graph_inventory", "fragment_kernel_nodes"))
         << "Captured graph metadata is emitted during warmup and must survive into the benchmark artifact";
     EXPECT_TRUE(has_record("tp_allreduce_bom", "stages"))

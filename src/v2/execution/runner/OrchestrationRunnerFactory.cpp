@@ -147,7 +147,9 @@ namespace llaminar2
             return createFromOrchestrationConfigImpl(
                 std::move(config),
                 nullptr,
-                std::nullopt);
+                std::nullopt,
+                nullptr,
+                {});
         }
 
         std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
@@ -164,7 +166,9 @@ namespace llaminar2
             return createFromOrchestrationConfigImpl(
                 std::move(config),
                 std::move(model_context),
-                std::nullopt);
+                std::nullopt,
+                nullptr,
+                {});
         }
 
         std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfig(
@@ -181,10 +185,16 @@ namespace llaminar2
             auto model_context = std::move(reuse_contract.context);
             auto prepared_weight_plan =
                 std::move(reuse_contract.prepared_weight_plan);
+            auto prepared_routed_weight_plan =
+                std::move(reuse_contract.prepared_routed_weight_plan);
+            auto routed_weight_authority_identity =
+                std::move(reuse_contract.routed_weight_authority_identity);
             return createFromOrchestrationConfigImpl(
                 std::move(config),
                 std::move(model_context),
-                std::move(prepared_weight_plan));
+                std::move(prepared_weight_plan),
+                std::move(prepared_routed_weight_plan),
+                std::move(routed_weight_authority_identity));
         }
 
     private:
@@ -200,7 +210,10 @@ namespace llaminar2
         std::unique_ptr<IOrchestrationRunner> createFromOrchestrationConfigImpl(
             OrchestrationConfig config,
             std::shared_ptr<ModelContext> model_context,
-            std::optional<RankExecutionPlan> prepared_weight_plan)
+            std::optional<RankExecutionPlan> prepared_weight_plan,
+            std::shared_ptr<const MoERoutedExpertPlacementPlan>
+                prepared_routed_weight_plan,
+            std::string routed_weight_authority_identity)
         {
             auto normalize_errors = normalizeMoERoutedExpertPlacementDomains(config);
             if (!normalize_errors.empty())
@@ -311,6 +324,10 @@ namespace llaminar2
                         .context = std::move(model_context),
                         .prepared_weight_plan =
                             std::move(*prepared_weight_plan),
+                        .prepared_routed_weight_plan =
+                            std::move(prepared_routed_weight_plan),
+                        .routed_weight_authority_identity =
+                            std::move(routed_weight_authority_identity),
                     });
             }
             if (model_context)

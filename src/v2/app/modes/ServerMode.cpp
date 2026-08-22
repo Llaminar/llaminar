@@ -392,6 +392,21 @@ namespace llaminar2
         if (mpi_ctx->world_size() > 1)
             runner->setMPICoordinatedMode(true);
 
+        /* Do not bind or advertise the HTTP endpoint until the same generic
+         * production-readiness lifecycle used by benchmark mode is complete. */
+        if (!runner->prepareForInference())
+        {
+            LOG_ERROR(
+                "Inference runtime did not become ready for serving: "
+                << runner->lastError());
+            if (mpi_ctx->world_size() > 1)
+                runner->shutdownMPIWorkers();
+            runner->shutdown();
+            flushPerfStatsFromEnv();
+            mpiShutdown();
+            return 1;
+        }
+
         // Extract model name from path for response metadata
         std::string model_name = std::filesystem::path(config.model_path).stem().string();
 

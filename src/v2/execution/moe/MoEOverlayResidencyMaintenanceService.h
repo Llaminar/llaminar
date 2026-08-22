@@ -12,8 +12,10 @@
 #pragma once
 
 #include "MoEOverlayEconomyCertificationController.h"
+#include "MoEOverlayDeviceServiceTelemetryPublisher.h"
 #include "MoEOverlayHistogramPublisher.h"
 #include "MoEOverlayResidencyAuthority.h"
+#include "../InferenceMeasurementReadiness.h"
 
 #include <atomic>
 #include <chrono>
@@ -29,6 +31,7 @@ namespace llaminar2
     /** @brief Observable lifecycle of the ExpertOverlay maintenance worker. */
     enum class MoEOverlayMaintenanceState
     {
+        Prepared,   ///< Dependencies validated; no worker or protocol progress.
         Starting,   ///< Worker created but not yet inside its poll loop.
         CertifyingEconomy, ///< Real service/movement evidence is still sealing.
         Waiting,    ///< No full histogram window or migration wave is ready.
@@ -37,11 +40,52 @@ namespace llaminar2
         ReceivingEvidence, ///< Peer is awaiting authoritative routing evidence.
         Deferred,   ///< Frozen transaction awaits destination shadow capacity.
         Staging,    ///< Preparation and transfer events remain in flight.
-        Committing, ///< Inactive participant banks are being published.
+        Preparing, ///< Inactive participant banks are being completed.
+        Publishing, ///< Ready device selectors are being published globally.
         Draining,   ///< Shutdown rejected new work and is reaping resources.
         Failed,     ///< Fatal protocol or transport error stopped proposals.
         Stopped,    ///< Every wave, abort, and retirement has quiesced.
     };
+
+    /**
+     * @brief Typed ownership decision for the finite GPU service publisher.
+     *
+     * Readiness exchange is a temporary collective substate, not the end of
+     * service observation. Keeping pause distinct from stop prevents one
+     * unsuccessful all-rank readiness round from irreversibly destroying the
+     * only GPU evidence source before production inference can exercise it.
+     */
+    enum class MoEOverlayDeviceServicePublicationAction : std::uint8_t
+    {
+        Pause,         ///< Preserve the publisher without launching a snapshot.
+        PollAndImport, ///< Advance one boundary/publication/import edge.
+        Stop,          ///< No later certification state may need new evidence.
+    };
+
+    /**
+     * @brief Map certification lifecycle to exact publisher ownership.
+     * @param state Current economy-certification state.
+     * @return Whether maintenance must pause, poll, or permanently stop.
+     */
+    [[nodiscard]] constexpr MoEOverlayDeviceServicePublicationAction
+    moeOverlayDeviceServicePublicationAction(
+        MoEOverlayEconomyCertificationState state) noexcept
+    {
+        switch (state)
+        {
+        case MoEOverlayEconomyCertificationState::AwaitingServiceEvidence:
+            return MoEOverlayDeviceServicePublicationAction::PollAndImport;
+        case MoEOverlayEconomyCertificationState::CalibratingMovement:
+        case MoEOverlayEconomyCertificationState::ExchangingServiceReadiness:
+            return MoEOverlayDeviceServicePublicationAction::Pause;
+        case MoEOverlayEconomyCertificationState::ExchangingServiceEvidence:
+        case MoEOverlayEconomyCertificationState::Complete:
+        case MoEOverlayEconomyCertificationState::Failed:
+        case MoEOverlayEconomyCertificationState::Stopped:
+            return MoEOverlayDeviceServicePublicationAction::Stop;
+        }
+        return MoEOverlayDeviceServicePublicationAction::Stop;
+    }
 
     /** @brief Race-safe counters for one maintenance-service lifetime. */
     struct MoEOverlayResidencyMaintenanceStats
@@ -51,6 +95,7 @@ namespace llaminar2
         uint64_t notifications = 0;       ///< Explicit early-wake notifications.
         uint64_t economy_certification_polls = 0; ///< Setup evidence progress.
         uint64_t economy_certifications = 0; ///< Immutable installs observed.
+        uint64_t device_service_snapshots_imported = 0; ///< GPU cumulative views accepted.
         uint64_t proposals = 0;           ///< Frozen histogram/static proposals.
         uint64_t deferred_attempts = 0;   ///< Backpressured stage attempts.
         uint64_t waves_started = 0;       ///< Async migration waves begun.
@@ -96,6 +141,16 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayEconomyCertificationController>
                 economy_certification;
             /**
+             * Optional finite GPU observation graphs for host authority.
+             *
+             * CPU service measurements already land in the registry directly.
+             * This owner is present only when the same host authority also has
+             * local CUDA/ROCm participants whose counters require an explicit
+             * mapped publication boundary.
+             */
+            std::shared_ptr<MoEOverlayDeviceServiceTelemetryPublisher>
+                device_service_telemetry_publisher;
+            /**
              * Optional authoritative frozen-window publication lane.
              *
              * When present, this service is in distributed mode. Only its
@@ -115,7 +170,12 @@ namespace llaminar2
         };
 
         /**
-         * @brief Validate dependencies and immediately start the worker.
+         * @brief Validate dependencies and retain a dormant prepared service.
+         *
+         * Construction never launches protocol progress. The owner must call
+         * `start()` only after every distributed participant has committed the
+         * complete composition phase.
+         *
          * @throws std::invalid_argument for null dependencies or bad cadence.
          */
         explicit MoEOverlayResidencyMaintenanceService(Config config);
@@ -129,6 +189,20 @@ namespace llaminar2
             const MoEOverlayResidencyMaintenanceService &) = delete;
 
         /**
+         * @brief Perform the sole `Prepared -> Starting` worker transition.
+         *
+         * This method is intentionally explicit so a rank cannot enter
+         * background MPI/device progress while a peer is still composing its
+         * transport, publication bank, or captured serving graph. It may be
+         * called exactly once; starting a running, failed, or stopped service
+         * is a lifecycle error.
+         *
+         * @throws std::logic_error unless the service is exactly Prepared.
+         * @throws std::system_error if the host worker cannot be created.
+         */
+        void start();
+
+        /**
          * @brief Wake the worker after routing evidence or capacity changes.
          *
          * Notification is optional because the worker also polls at the
@@ -138,10 +212,13 @@ namespace llaminar2
         void notifyMaintenanceProgress() noexcept;
 
         /**
-         * @brief Stop accepting proposals and drain active/retiring waves.
+         * @brief Stop accepting unpublished proposals and drain owned work.
          *
-         * This method is idempotent. It joins only the maintenance host thread;
-         * GPU and network completion is observed through non-blocking polls.
+         * A distributed histogram generation that crossed publication remains
+         * irrevocable and is completed through migration/publication before
+         * shutdown. This method is idempotent. It joins only the maintenance
+         * host thread; GPU and network completion is observed through
+         * non-blocking polls.
          */
         void stopAndDrain();
 
@@ -156,6 +233,15 @@ namespace llaminar2
 
         /** @return Race-safe copy of service counters. */
         [[nodiscard]] MoEOverlayResidencyMaintenanceStats stats() const noexcept;
+
+        /**
+         * @brief Report whether measured host-authority economics are installed.
+         *
+         * This method only snapshots atomics and the immutable certification
+         * owner.  It does not wake or poll the worker.
+         */
+        [[nodiscard]] InferenceMeasurementReadiness
+        measurementReadiness() const;
 
     private:
         /** @brief Worker entry that catches all failures and owns state progress. */
@@ -188,12 +274,13 @@ namespace llaminar2
         std::jthread worker_;
 
         std::atomic<MoEOverlayMaintenanceState> state_{
-            MoEOverlayMaintenanceState::Starting};
+            MoEOverlayMaintenanceState::Prepared};
         std::atomic<bool> healthy_{true};
         /** Serializes first-failure publication before `healthy_` becomes false. */
         std::atomic<bool> failure_recorded_{false};
         std::atomic<bool> shutdown_requested_{false};
-        std::mutex shutdown_mutex_;
+        /** Serializes the one start edge against idempotent stop/drain. */
+        std::mutex lifecycle_mutex_;
 
         std::mutex wake_mutex_;
         std::condition_variable wake_cv_;
@@ -219,6 +306,7 @@ namespace llaminar2
         std::atomic<uint64_t> notifications_{0};
         std::atomic<uint64_t> economy_certification_polls_{0};
         std::atomic<uint64_t> economy_certifications_{0};
+        std::atomic<uint64_t> device_service_snapshots_imported_{0};
         std::atomic<uint64_t> proposals_{0};
         std::atomic<uint64_t> deferred_attempts_{0};
         std::atomic<uint64_t> waves_started_{0};

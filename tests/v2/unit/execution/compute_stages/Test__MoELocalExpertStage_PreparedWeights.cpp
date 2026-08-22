@@ -26,6 +26,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace llaminar2;
@@ -124,6 +125,18 @@ namespace
         desc.blocks_per_row = static_cast<uint32_t>(std::max(k / 32, 1));
         desc.codebook_id = 4;
         return desc;
+    }
+
+    /** @brief Exercise immutable preparation before fixed-slot publication. */
+    MoEOverlayParticipantBankInstallStatus prepareAndInstall(
+        MoEOverlayParticipantResidency &residency,
+        const MoEOverlayParticipantResidencyBank &bank,
+        std::string *error)
+    {
+        auto prepared = residency.prepareReadyBank(bank, error);
+        if (!prepared)
+            return MoEOverlayParticipantBankInstallStatus::Invalid;
+        return residency.installReadyBank(std::move(*prepared), error);
     }
 
     void attachFakePreparedEngines(
@@ -839,12 +852,12 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
         });
     std::string error;
     ASSERT_EQ(
-        residency->installReadyBank(epoch_one, &error),
+        prepareAndInstall(*residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::Installed)
         << error;
     const auto epoch_two = residency->cloneCandidate(1, 2);
     ASSERT_EQ(
-        residency->installReadyBank(epoch_two, &error),
+        prepareAndInstall(*residency, epoch_two, &error),
         MoEOverlayParticipantBankInstallStatus::Installed)
         << error;
 
@@ -902,7 +915,7 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     bank.layers[0].experts.resize(kNumExperts);
     std::string error;
     ASSERT_EQ(
-        residency->installReadyBank(bank, &error),
+        prepareAndInstall(*residency, bank, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
 
     MoERuntimeTable runtime_table(DeviceId::cpu(), 1, kNumExperts, 1);
@@ -964,6 +977,10 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
             .num_layers = 1,
             .num_experts = kNumExperts,
         });
+    DeviceMoELayerRuntime telemetry_runtime{};
+    DeviceMoEOverlayServiceTelemetryCell telemetry_cells
+        [kDeviceMoEOverlayServicePhaseCount]{};
+    DeviceMoEOverlayServiceTelemetrySample telemetry_sample{};
 
     MoELocalExpertStage::Params params;
     params.device_id = device;
@@ -981,12 +998,21 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     params.runtime_participant_index = 7;
     params.expert_mask.assign(kNumExperts, true);
     params.overlay_participant_residency = residency;
+    params.overlay_service_telemetry = {
+        .runtime_layer = &telemetry_runtime,
+        .layer_telemetry = telemetry_cells,
+        .sample = &telemetry_sample,
+    };
     std::vector<std::unique_ptr<FakePreparedGemm>> owned;
     attachFakePreparedEngines(params, owned);
 
     MoELocalExpertStage producer(params);
     EXPECT_TRUE(producer.usesDeferredCompletion());
     EXPECT_FALSE(producer.hasPendingDeferredOutput());
+    EXPECT_TRUE(
+        producer.allDeferredReplayFamiliesUseServiceTelemetryForTesting())
+        << "Every retained sparse shape/route-width family must preserve the "
+           "canonical observation capability without borrowing placement authority.";
 
     MoELocalExpertCompletionStage completion(
         MoELocalExpertCompletionStage::Params{

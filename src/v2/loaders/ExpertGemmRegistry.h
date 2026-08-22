@@ -170,6 +170,15 @@ namespace llaminar2
         /// Number of engines registered for a device, optionally constrained to a layer.
         size_t countEnginesForDevice(DeviceId device) const;
         size_t countEnginesForDeviceInDomain(const std::string &domain_name, DeviceId device) const;
+        /**
+         * @brief Count owned engine records for a device across every scope.
+         *
+         * ExpertOverlay publishes domain- and participant-scoped keys rather
+         * than the legacy unscoped key. This model-lifetime accounting query
+         * intentionally includes all of them; aliases may count more than once,
+         * so callers use it only as residency evidence, never a byte estimate.
+         */
+        size_t countOwnedEnginesForDeviceAcrossScopes(DeviceId device) const;
         size_t countEnginesForLayer(DeviceId device, int layer) const;
         size_t countEnginesForLayerInDomain(const std::string &domain_name, DeviceId device, int layer) const;
 

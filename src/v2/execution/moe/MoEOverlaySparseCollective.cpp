@@ -4,6 +4,7 @@
  */
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
+#include "execution/moe/MoEOverlayActivationPacketABI.h"
 
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
@@ -482,8 +483,25 @@ namespace llaminar2
                                    rows.expert_ids_host + rows.live_entry_count);
             copy.route_weights.assign(rows.route_weights_host,
                                       rows.route_weights_host + rows.live_entry_count);
-            copy.hidden_rows.assign(rows.hidden_rows_fp32,
-                                    rows.hidden_rows_fp32 + rows.live_row_count * static_cast<size_t>(rows.d_model));
+            copy.hidden_rows.resize(
+                rows.live_row_count * static_cast<size_t>(rows.d_model));
+            for (size_t compact_row = 0u;
+                 compact_row < rows.live_row_count;
+                 ++compact_row)
+            {
+                const float *const source =
+                    rows.hiddenRowForCompactIndex(compact_row);
+                if (!source)
+                {
+                    throw std::invalid_argument(
+                        "sparse dispatch payload has an invalid hidden-row address contract");
+                }
+                std::copy_n(
+                    source,
+                    static_cast<size_t>(rows.d_model),
+                    copy.hidden_rows.data() +
+                        compact_row * static_cast<size_t>(rows.d_model));
+            }
             return copy;
         }
 
@@ -1151,11 +1169,14 @@ namespace llaminar2
         if (rows.d_model <= 0)
             return 0;
 
-        return rows.live_row_count * sizeof(int32_t) +
-               (rows.live_row_count + 1u) * sizeof(int32_t) +
-               rows.live_entry_count * sizeof(int32_t) +
-               rows.live_entry_count * sizeof(float) +
-               rows.live_row_count * static_cast<size_t>(rows.d_model) * sizeof(float);
+        /* Keep host-side transport accounting byte-identical to the device
+         * packet ABI. In particular, an empty contribution advances only the
+         * timeline: its dormant CSR sentinel is setup-owned capacity, not a
+         * published payload byte. */
+        return static_cast<size_t>(moeOverlayDispatchPayloadBytes(
+            static_cast<std::uint64_t>(rows.live_row_count),
+            static_cast<std::uint64_t>(rows.live_entry_count),
+            static_cast<std::uint32_t>(rows.d_model)));
     }
 
     size_t compactMoEOverlayReturnBytes(const MoEOverlayReturnRows &rows)
@@ -1318,6 +1339,9 @@ namespace llaminar2
         view.top_k = top_k_;
         view.row_capacity = storage.row_ids_host.size();
         view.entry_capacity = storage.expert_ids_host.size();
+        view.hidden_row_capacity = storage.row_ids_host.size();
+        view.hidden_payload_layout =
+            MoEOverlayActivationHiddenPayloadLayout::CompactRows;
         view.row_ids_host = storage.row_ids_host.data();
         view.entry_offsets_host = storage.entry_offsets_host.data();
         view.expert_ids_host = storage.expert_ids_host.data();
@@ -1338,6 +1362,9 @@ namespace llaminar2
         view.top_k = top_k_;
         view.row_capacity = storage.row_ids_host.size();
         view.entry_capacity = storage.expert_ids_host.size();
+        view.hidden_row_capacity = storage.row_ids_host.size();
+        view.hidden_payload_layout =
+            MoEOverlayActivationHiddenPayloadLayout::CompactRows;
         view.row_ids_host = storage.row_ids_host.data();
         view.entry_offsets_host = storage.entry_offsets_host.data();
         view.expert_ids_host = storage.expert_ids_host.data();
@@ -1372,6 +1399,231 @@ namespace llaminar2
         view.output_rows_fp32 = storage.output_rows_fp32.data();
         view.live_row_count = 0;
         return view;
+    }
+
+    MoEOverlayRankLocalSparseCollectiveContext::
+        MoEOverlayRankLocalSparseCollectiveContext(Config config)
+        : dispatch_slots_(config.slot_count),
+          return_slots_(config.slot_count)
+    {
+        if (config.slot_count == 0u)
+        {
+            throw std::invalid_argument(
+                "rank-local sparse collective requires slot_count > 0");
+        }
+    }
+
+    std::vector<MoEOverlayRankLocalSparseCollectiveContext::ReplaySlot> &
+    MoEOverlayRankLocalSparseCollectiveContext::ledgerFor(
+        const MoEOverlayCollectiveKey &key) noexcept
+    {
+        return key.direction == MoEOverlayCollectiveDirection::Dispatch
+                   ? dispatch_slots_
+                   : return_slots_;
+    }
+
+    MoEOverlayCollectiveResult
+    MoEOverlayRankLocalSparseCollectiveContext::dispatch(
+        const MoEOverlayCollectiveKey &key,
+        const MoEOverlaySparseRows &outbound,
+        MoEOverlaySparseRows *inbound,
+        IDeviceContext *)
+    {
+        MoEOverlayCollectiveResult result;
+        std::string validation_error;
+        if (key.direction != MoEOverlayCollectiveDirection::Dispatch ||
+            !key.isValid() || outbound.key != key ||
+            outbound.target_participant != key.participant_id ||
+            outbound.source_participant < 0 ||
+            !validateSparseRows(outbound, &validation_error) ||
+            !ensureSparseInboundCapacity(
+                inbound,
+                outbound.live_row_count,
+                outbound.live_entry_count,
+                &validation_error))
+        {
+            result.ok = false;
+            result.error_code = 1;
+            result.error = validation_error.empty()
+                               ? "invalid rank-local sparse dispatch contract"
+                               : validation_error;
+            return result;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto &ledger = ledgerFor(key);
+        auto &slot = ledger[static_cast<size_t>(key.sequence) % ledger.size()];
+        if (slot.aborted && *slot.aborted == key)
+        {
+            result.ok = false;
+            result.error_code = slot.abort_reason == 0 ? 2 : slot.abort_reason;
+            result.error = "rank-local sparse dispatch key was aborted";
+            return result;
+        }
+        if (slot.completed && *slot.completed == key)
+        {
+            result.ok = false;
+            result.error_code = 3;
+            result.error = "stale rank-local sparse dispatch key reuse rejected";
+            return result;
+        }
+
+        /* Both views are model-lifetime fixed storage. memmove deliberately
+         * permits the zero-copy alias used by a colocated CPU endpoint while
+         * preserving the same code path for distinct diagnostic workspaces. */
+        inbound->key = key;
+        inbound->residency_epoch = outbound.residency_epoch;
+        inbound->source_participant = outbound.source_participant;
+        inbound->target_participant = outbound.target_participant;
+        inbound->d_model = outbound.d_model;
+        inbound->top_k = outbound.top_k;
+        inbound->live_row_count = outbound.live_row_count;
+        inbound->live_entry_count = outbound.live_entry_count;
+        if (inbound->row_ids_host != outbound.row_ids_host)
+        {
+            std::memmove(
+                inbound->row_ids_host,
+                outbound.row_ids_host,
+                outbound.live_row_count * sizeof(std::int32_t));
+        }
+        if (inbound->entry_offsets_host != outbound.entry_offsets_host)
+        {
+            std::memmove(
+                inbound->entry_offsets_host,
+                outbound.entry_offsets_host,
+                (outbound.live_row_count + 1u) * sizeof(std::int32_t));
+        }
+        if (inbound->expert_ids_host != outbound.expert_ids_host)
+        {
+            std::memmove(
+                inbound->expert_ids_host,
+                outbound.expert_ids_host,
+                outbound.live_entry_count * sizeof(std::int32_t));
+        }
+        if (inbound->route_weights_host != outbound.route_weights_host)
+        {
+            std::memmove(
+                inbound->route_weights_host,
+                outbound.route_weights_host,
+                outbound.live_entry_count * sizeof(float));
+        }
+        if (inbound->hidden_rows_fp32 != outbound.hidden_rows_fp32)
+        {
+            std::memmove(
+                inbound->hidden_rows_fp32,
+                outbound.hidden_rows_fp32,
+                outbound.live_row_count *
+                    static_cast<size_t>(outbound.d_model) * sizeof(float));
+        }
+        if (!validateSparseRows(*inbound, &validation_error))
+        {
+            result.ok = false;
+            result.error_code = 4;
+            result.error = validation_error;
+            return result;
+        }
+
+        slot.aborted.reset();
+        slot.abort_reason = 0;
+        slot.completed = key;
+        result.collective_complete = true;
+        return result;
+    }
+
+    MoEOverlayCollectiveResult
+    MoEOverlayRankLocalSparseCollectiveContext::returnReduce(
+        const MoEOverlayCollectiveKey &key,
+        const MoEOverlayReturnRows &outbound,
+        MoEOverlayReturnRows *inbound,
+        IDeviceContext *)
+    {
+        MoEOverlayCollectiveResult result;
+        std::string validation_error;
+        if (key.direction !=
+                MoEOverlayCollectiveDirection::ReturnReduce ||
+            !key.isValid() || outbound.key != key ||
+            outbound.source_participant != key.participant_id ||
+            outbound.target_participant < 0 ||
+            !validateReturnRows(outbound, &validation_error) ||
+            !ensureReturnInboundCapacity(
+                inbound,
+                outbound.live_row_count,
+                &validation_error))
+        {
+            result.ok = false;
+            result.error_code = 1;
+            result.error = validation_error.empty()
+                               ? "invalid rank-local sparse return contract"
+                               : validation_error;
+            return result;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto &ledger = ledgerFor(key);
+        auto &slot = ledger[static_cast<size_t>(key.sequence) % ledger.size()];
+        if (slot.aborted && *slot.aborted == key)
+        {
+            result.ok = false;
+            result.error_code = slot.abort_reason == 0 ? 2 : slot.abort_reason;
+            result.error = "rank-local sparse return key was aborted";
+            return result;
+        }
+        if (slot.completed && *slot.completed == key)
+        {
+            result.ok = false;
+            result.error_code = 3;
+            result.error = "stale rank-local sparse return key reuse rejected";
+            return result;
+        }
+
+        inbound->key = key;
+        inbound->residency_epoch = outbound.residency_epoch;
+        inbound->source_participant = outbound.source_participant;
+        inbound->target_participant = outbound.target_participant;
+        inbound->d_model = outbound.d_model;
+        inbound->live_row_count = outbound.live_row_count;
+        if (inbound->row_ids_host != outbound.row_ids_host)
+        {
+            std::memmove(
+                inbound->row_ids_host,
+                outbound.row_ids_host,
+                outbound.live_row_count * sizeof(std::int32_t));
+        }
+        if (inbound->output_rows_fp32 != outbound.output_rows_fp32)
+        {
+            std::memmove(
+                inbound->output_rows_fp32,
+                outbound.output_rows_fp32,
+                outbound.live_row_count *
+                    static_cast<size_t>(outbound.d_model) * sizeof(float));
+        }
+        if (!validateReturnRows(*inbound, &validation_error))
+        {
+            result.ok = false;
+            result.error_code = 4;
+            result.error = validation_error;
+            return result;
+        }
+
+        slot.aborted.reset();
+        slot.abort_reason = 0;
+        slot.completed = key;
+        result.collective_complete = true;
+        return result;
+    }
+
+    void MoEOverlayRankLocalSparseCollectiveContext::abort(
+        const MoEOverlayCollectiveKey &key,
+        int reason_code)
+    {
+        if (!key.isValid())
+            return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto &ledger = ledgerFor(key);
+        auto &slot = ledger[static_cast<size_t>(key.sequence) % ledger.size()];
+        slot.completed.reset();
+        slot.aborted = key;
+        slot.abort_reason = reason_code == 0 ? 1 : reason_code;
     }
 
     struct MoEOverlayLocalSparseCollectiveContext::Slot

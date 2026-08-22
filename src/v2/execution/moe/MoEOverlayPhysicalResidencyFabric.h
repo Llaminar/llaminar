@@ -27,6 +27,9 @@ namespace llaminar2
 {
     struct GGUFModel;
     class MoEOverlayMPIRemoteProjectionTransport;
+    class MappedTransferProgressEpoch;
+    struct MoEOverlayDevicePhysicalMovementBatch;
+    struct MoEOverlayResidencyTransactionFingerprint;
 
     /**
      * @brief Device-independent shape and source provenance for one projection.
@@ -99,6 +102,30 @@ namespace llaminar2
         std::uint64_t cpu_shadow_slots = 0;
         std::uint64_t gpu_shadow_slots = 0;
         std::uint64_t persistent_transfer_lanes = 0;
+        /** Same-device or driver-authorized direct GPU peer lanes. */
+        std::uint64_t direct_gpu_peer_lanes = 0;
+        /** Same-backend GPU lanes explicitly relayed because P2P is unavailable. */
+        std::uint64_t same_backend_no_peer_relay_lanes = 0;
+        /** CUDA/ROCm lanes using the portable host relay. */
+        std::uint64_t cross_backend_gpu_relay_lanes = 0;
+        /** Largest number of lanes installed for one directed edge/projection. */
+        std::uint64_t maximum_parallel_edge_lanes = 0;
+        /** Local GPU projection operations that reserved distinct pool lanes. */
+        std::uint64_t parallel_lane_reservations = 0;
+        /** Fatal attempts to exceed or overlap a pre-materialized lane pool. */
+        std::uint64_t parallel_lane_pool_exhaustions = 0;
+        /** Number of admitted operations that encountered an occupied lane. */
+        std::uint64_t serialized_lane_deferrals = 0;
+        /** CPU projection workers installed for the widest address edge. */
+        std::uint64_t maximum_parallel_cpu_copy_lanes = 0;
+        /** CPU projection operations that reserved distinct background workers. */
+        std::uint64_t parallel_cpu_copy_lane_reservations = 0;
+        /** Fatal CPU worker-pool reservations beyond the admitted wave BOM. */
+        std::uint64_t parallel_cpu_copy_lane_pool_exhaustions = 0;
+        /** Largest simultaneous CPU worker set released by one wave barrier. */
+        std::uint64_t maximum_concurrent_cpu_copy_operations = 0;
+        /** CPU workers still armed or copying when the snapshot was read. */
+        std::uint64_t active_cpu_copy_operations = 0;
         std::uint64_t waves_prepared = 0;
         std::uint64_t waves_deferred = 0;
         std::uint64_t waves_failed = 0;
@@ -133,6 +160,7 @@ namespace llaminar2
      */
     class MoEOverlayPhysicalResidencyFabric final
         : public IMoEOverlayParticipantTransferProvider,
+          public IMoEOverlayTransferProgressAuthority,
           public std::enable_shared_from_this<
               MoEOverlayPhysicalResidencyFabric>
     {
@@ -177,8 +205,16 @@ namespace llaminar2
              * backpressure, because runtime allocation is forbidden.
              */
             std::size_t shadow_slots_per_endpoint_layer = 1;
-            /** Bounded CPU-format or heterogeneous-blob staging bytes per lane. */
+            /** Bounded CPU-format or GPU host-relay staging bytes per lane. */
             std::size_t staging_capacity_bytes = 4u * 1024u * 1024u;
+            /**
+             * Maximum closed migration cycles admitted in one wave.
+             *
+             * The fabric combines this with logical-participant multiplicity
+             * per physical device and pre-materializes the resulting lane
+             * pools. It must equal the residency authority's scheduling cap.
+             */
+            std::size_t maximum_concurrent_cycles = 1;
             /** Bytes kept free after each GPU shadow-slot arena allocation. */
             std::size_t gpu_vram_safety_margin_bytes = 0;
             /**
@@ -222,6 +258,71 @@ namespace llaminar2
             const std::vector<int> &local_destination_participants) override;
 
         /**
+         * @brief Prepare real weight arrivals for a device-authored Dynamic wave.
+         *
+         * The supplied batch has already projected the immutable device command
+         * into physical endpoints and closed cycles. This method consumes those
+         * facts only; it cannot inspect histograms or author an owner map. A
+         * zero-movement command is completed by the transport protocol without
+         * entering the physical fabric, and transient LLEP lifetime management
+         * uses its separately typed restoration path.
+         *
+         * @param batch Authenticated non-empty durable device movement.
+         * @param local_destination_participants Sorted ids owned by this process.
+         * @return Started asynchronous projection work, typed backpressure, or
+         *         a fatal physical topology/capacity diagnostic.
+         */
+        MoEOverlayParticipantPreparedTransfers prepareDeviceTransfers(
+            const MoEOverlayDevicePhysicalMovementBatch &batch,
+            const std::vector<int> &local_destination_participants);
+
+        /**
+         * @brief Retain completed destination triplets before device RCU apply.
+         * @param batch Exact begun device movement identity.
+         * @param prepared Physical operations after all projection polls are Ready.
+         * @param error Optional exact rejection diagnostic.
+         * @return True after every process-local destination lifetime is staged.
+         */
+        [[nodiscard]] bool stageDevicePreparedTransfers(
+            const MoEOverlayDevicePhysicalMovementBatch &batch,
+            const MoEOverlayParticipantPreparedTransfers &prepared,
+            std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Make staged lifetimes durable before bounded device RCU apply.
+         * @param batch Exact staged device movement identity.
+         * @param error Optional exact rejection diagnostic.
+         * @return True after the physical ledger advances to the candidate epoch.
+         *
+         * The physical ledger owns allocation lifetimes only. Advancing it
+         * does not expose the candidate to inference; the device publication
+         * epoch remains the sole runtime selector and admission authority.
+         */
+        [[nodiscard]] bool publishDevicePreparedTransfers(
+            const MoEOverlayDevicePhysicalMovementBatch &batch,
+            std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Release old physical sources after device reader retirement.
+         * @param batch Exact published device movement identity.
+         * @param error Optional exact rejection diagnostic.
+         * @return True after departed slots are recyclable and the wave is closed.
+         */
+        [[nodiscard]] bool retireDevicePreviousSources(
+            const MoEOverlayDevicePhysicalMovementBatch &batch,
+            std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Forget an unpublished physical wave after operation abort drains.
+         * @param batch Exact begun or staged device movement identity.
+         * @param error Optional exact rejection diagnostic.
+         * @return True when no prepared destination remains publishable.
+         */
+        [[nodiscard]] bool abortDeviceTransfers(
+            const MoEOverlayDevicePhysicalMovementBatch &batch,
+            std::string *error = nullptr) noexcept;
+
+        /**
          * @brief Return departed bootstrap slots to the recyclable live arena.
          *
          * The participant transaction invokes this only after publication and
@@ -233,11 +334,65 @@ namespace llaminar2
             std::uint64_t retired_epoch,
             const std::vector<MoEOverlayTierMigration> &migrations) noexcept override;
 
+        /**
+         * @brief Return the shared retained relay epoch for one local GPU.
+         * @param device Exact process-local GPU endpoint.
+         * @return Shared epoch, or null when that GPU has no host-relay edge.
+         *
+         * Device executors retain this handle as a cache-owned captured branch.
+         * The physical fabric remains the sole authority for topology-sized
+         * command-slot accounting.
+         */
+        [[nodiscard]] std::shared_ptr<MappedTransferProgressEpoch>
+        transferProgressEpoch(DeviceId device) const noexcept;
+
+        /**
+         * @brief Enumerate exact GPUs whose lane BOM requires mapped progress.
+         * @return Stable device-sorted setup inventory.
+         *
+         * Orchestration uses this code-owned inventory to install every epoch
+         * before native serving graphs are captured. It must not infer demand
+         * again from controller bindings, because host-authoritative overlays
+         * intentionally have no device-controller runtime table.
+         */
+        [[nodiscard]] std::vector<DeviceId> transferProgressDevices() const;
+
+        /**
+         * @brief Enqueue every outstanding mapped GPU relay epoch once.
+         * @param error Optional exact device/worker submission diagnostic.
+         * @return True after every non-idle epoch is enqueued without waiting
+         *         for device completion.
+         *
+         * The inventory is keyed by physical device, so several lanes and
+         * projections sharing an epoch never create duplicate launch authority.
+         */
+        [[nodiscard]] bool submitOutstandingTransferProgress(
+            std::string *error = nullptr) noexcept override;
+
         /** @return Race-safe cumulative model-lifetime proof counters. */
         [[nodiscard]] MoEOverlayPhysicalResidencyFabricStats stats()
             const noexcept;
 
     private:
+        /**
+         * @brief Common physical implementation after either authority validates.
+         *
+         * Every argument is transport identity or byte/slot work. Keeping the
+         * host transaction and device command wrappers outside this method
+         * prevents the shared data plane from acquiring a second policy input.
+         */
+        MoEOverlayParticipantPreparedTransfers preparePhysicalTransfers(
+            MoEOverlayResidencyTransactionPurpose purpose,
+            std::uint64_t expected_epoch,
+            std::uint64_t candidate_epoch,
+            const MoEOverlayResidencyTransactionFingerprint &fingerprint,
+            const std::vector<MoEOverlayTierMigration> &migrations,
+            const std::vector<MoEOverlayTierMigrationCycle> &migration_cycles,
+            const std::vector<MoEOverlayTierShadowRequirement> &
+                shadow_requirements,
+            const MoEOverlayDevicePhysicalMovementBatch *device_batch,
+            const std::vector<int> &local_destination_participants);
+
         /** @brief Retain a completely materialized implementation. */
         explicit MoEOverlayPhysicalResidencyFabric(
             Config config,

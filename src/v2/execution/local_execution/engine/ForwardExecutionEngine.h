@@ -312,6 +312,29 @@ namespace llaminar2
             bool has_collective_nodes,
             IDeviceContext *ctx) const = 0;
 
+        /**
+         * @brief Describe bounded maintenance captured with this forward graph.
+         *
+         * The engine asks only for real model forward executables, never for
+         * tiny publication, sampler, or maintenance graphs. An empty descriptor
+         * means no branch is configured. A non-empty descriptor is cached as
+         * part of the executable's immutable identity and must continue naming
+         * the same authority on every replay.
+         *
+         * @param input Exact role and geometry of the forward graph family.
+         * @param execution_device GPU that will own the native executable.
+         * @return Empty or complete cache-private branch factory.
+         */
+        virtual GraphCaptureAuxiliaryBranchFactory
+        forwardGraphAuxiliaryBranchFactory(
+            const ForwardInput &input,
+            DeviceId execution_device)
+        {
+            (void)input;
+            (void)execution_device;
+            return {};
+        }
+
         // ----- PP Copy Info -----
 
         /**
@@ -1049,6 +1072,14 @@ namespace llaminar2
          * @param sparse_params Root-authoritative generation/operation identity.
          * @param launch_dependency Exact pre-launch edge used to arm an
          *        external heterogeneous follower after native graph setup.
+         * @param auxiliary_branch_factory Exact cache-private background-work
+         *        authority captured by the retained forward executable. An
+         *        empty factory is valid only when the cache was materialized
+         *        without an auxiliary branch.
+         * @param transaction_stream Exact external scheduler stream ordered
+         *        before and after this retained replay through the cache-owned
+         *        device event. It must be non-null and may not alias another
+         *        device.
          * @param out_producer_stream Receives the exact replay producer stream.
          * @param error Optional first violated lifecycle invariant.
          * @return True after the retained plan has been enqueued successfully.
@@ -1060,6 +1091,9 @@ namespace llaminar2
                 &sparse_params,
             const DeviceGraphExecutor::GraphLaunchDependencyHook
                 &launch_dependency,
+            const GraphCaptureAuxiliaryBranchFactory
+                &auxiliary_branch_factory,
+            void *transaction_stream,
             void **out_producer_stream,
             std::string *error = nullptr);
 

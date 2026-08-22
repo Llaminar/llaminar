@@ -19,8 +19,10 @@
 #include <stdexcept>
 
 #include "../../../backends/DeviceId.h"
+#include "../../InferenceReadiness.h"
 #include "../../moe/DeviceMoERebalanceABI.h"
 #include "../../moe/MoEOverlayAuthorityExecution.h"
+#include "../../moe/MoEOverlayDeviceControllerRuntimeBinding.h"
 #include "../../mtp/MTPRejectionSampler.h"
 #include "../../mtp/MTPVerifierOutcomeGraph.h"
 #include "../../prefix_cache/PrefixCacheStateProbe.h"
@@ -39,27 +41,65 @@ namespace llaminar2
     struct MTPSpecDecodeVerifierInputPlan;
     struct PrefillChunkSchedulerPolicy;
     class MoERebalanceController;
+    class MoEOverlayInferenceInterferenceProbe;
     class MoEOverlayInferenceTransactionCoordinator;
+
+    /**
+     * @brief Decode member required in a frozen serving-graph inventory.
+     *
+     * A continuation rank cannot admit a remote ExpertOverlay follower until
+     * every native executable that may own the first request is resident.  A
+     * history-bearing serial decode is distinct from the position-zero graph
+     * in @ref ForwardGraphSignature, so naming it explicitly prevents setup
+     * from accidentally certifying a prefill-only family.
+     */
+    enum class ServingMainDecodeGraphKind : uint8_t
+    {
+        Unspecified = 0,      ///< Invalid inventory with no decode executable.
+        HistoryBearingSerial ///< One request, one row, and existing KV history.
+    };
+
+    /**
+     * @brief Setup transition required before a runner may accept inference.
+     *
+     * CPU graphs are fully materialized by ordinary eager graph construction.
+     * GPU runners must additionally capture and instantiate every admitted
+     * serving executable before distributed ticket authority is installed.
+     * Composite runners report the strongest required transition; an
+     * unresolved value is fatal rather than an invitation to probe a method.
+     */
+    enum class ServingGraphPreparationKind : uint8_t
+    {
+        Unresolved = 0,               ///< Runner has not declared its setup lifecycle.
+        EagerHostGraph,               ///< Host graph construction already completed setup.
+        NativeDeviceExecutableFamily, ///< Retained device executables must be materialized.
+    };
 
     /**
      * @brief Frozen setup contract for the executable serving graph family.
      *
      * The orchestration memory plan is the authority for every physical
-     * prefill shape admitted by a distributed ExpertOverlay cell.  Passing
-     * that exact list into graph materialization prevents a device runner from
-     * independently re-deriving capacity from local environment state.  The
+     * prefill shape admitted by a distributed ExpertOverlay cell. Passing that
+     * exact list into graph materialization prevents a device runner from
+     * independently re-deriving capacity from local environment state. The
      * padding token participates in native graph identity because it is an
-     * immediate parameter of the captured chunk-materialization kernel.
+     * immediate parameter of the captured chunk-materialization kernel. The
+     * typed decode member makes the request-opening graph part of the same
+     * setup proof instead of leaving it to a cold first-request capture.
      */
     struct ServingGraphFamilyMaterializationPlan
     {
         std::vector<int> prefill_bucket_rows; ///< Complete admitted physical bucket ladder.
         int prefill_pad_token_id = 0;         ///< Token written to inactive rows in every bucket.
+        ServingMainDecodeGraphKind main_decode_graph =
+            ServingMainDecodeGraphKind::Unspecified; ///< Required request-opening decode executable.
 
-        /** @brief True when the setup contract names at least one physical graph. */
+        /** @brief True when both prefill and serial-decode inventory are explicit. */
         bool valid() const noexcept
         {
             return !prefill_bucket_rows.empty() &&
+                   main_decode_graph ==
+                       ServingMainDecodeGraphKind::HistoryBearingSerial &&
                    std::all_of(
                        prefill_bucket_rows.begin(),
                        prefill_bucket_rows.end(),
@@ -1254,6 +1294,18 @@ namespace llaminar2
         }
 
         /**
+         * @brief Report whether production performance measurement may begin.
+         *
+         * Implementations with real-inference calibration return Calibrating
+         * until their immutable certificate is installed.  The default is
+         * ready so runners without such a lifecycle remain unaffected.
+         */
+        virtual InferenceReadiness inferenceReadiness() const
+        {
+            return {};
+        }
+
+        /**
          * @brief Run a prompt/suffix prefill forward pass.
          *
          * Unlike generic forward(), this must keep prefill phase semantics even
@@ -1268,13 +1320,29 @@ namespace llaminar2
         }
 
         /**
+         * @brief Report the runner-owned serving preparation transition.
+         *
+         * Distributed orchestration switches on this value before installing
+         * request ticket authority. Returning @c Unresolved fails setup; the
+         * caller must never discover lifecycle by invoking a GPU-only method
+         * on a host runner and interpreting failure.
+         */
+        virtual ServingGraphPreparationKind
+        servingGraphPreparationKind() const noexcept
+        {
+            return ServingGraphPreparationKind::Unresolved;
+        }
+
+        /**
          * @brief Capture and instantiate the complete serving graph family.
          *
          * This setup-only operation must not execute model arithmetic, mutate
          * request/KV state, publish sparse tickets, or advance a transaction.
          * GPU implementations retain the resulting native executables so the
-         * first admitted request is an ordinary replay. Composite runners must
-         * invoke every symmetric LocalTP participant concurrently.
+         * first admitted request is an ordinary replay. Eager host follower
+         * implementations certify their already-built CPU endpoints and enter
+         * the same sealed ticket-admission state. Composite runners must invoke
+         * every symmetric LocalTP participant concurrently.
          *
          * @param plan Frozen orchestration-owned physical graph inventory.
          * @return True only when every required executable is resident.
@@ -1306,13 +1374,14 @@ namespace llaminar2
         }
 
         /**
-         * @brief Bind the rank-wide heterogeneous ExpertOverlay ticket authority.
+         * @brief Bind rank-wide heterogeneous ExpertOverlay graph submission.
          *
          * A single-device continuation uses participant index zero. Composite
          * rank runners propagate the same shared coordinator to every local
          * graph with a distinct stable index. The coordinator publishes one
          * remote ticket only after authenticating symmetric graph geometry;
          * remote expert-only runners never receive this source-side binding.
+         * It does not own placement policy or durable epoch publication.
          *
          * @param coordinator Setup-owned rank transaction coordinator.
          * @param continuation_participant_index Stable local graph index.
@@ -1325,6 +1394,28 @@ namespace llaminar2
         {
             (void)coordinator;
             (void)continuation_participant_index;
+            return false;
+        }
+
+        /**
+         * @brief Bind the rank-local live-inference interval used by economy calibration.
+         *
+         * A multi-rank ExpertOverlay calibration must observe the actual
+         * participant-local LocalTP transaction on every rank. Measuring only
+         * above the coordinating MPI runner leaves follower ranks waiting for
+         * an interval that they can never see. Composite rank runners override
+         * this method and place the scope around their complete device fan-out;
+         * ordinary runners return false so their orchestration owner may retain
+         * the single-process outer scope.
+         *
+         * @param probe Model-lifetime one-shot interval authority.
+         * @return True only when future production forwards will expose the
+         *         rank-local interval through @p probe.
+         */
+        virtual bool setMoEOverlayInferenceInterferenceProbe(
+            std::shared_ptr<MoEOverlayInferenceInterferenceProbe> probe)
+        {
+            (void)probe;
             return false;
         }
 
@@ -3303,13 +3394,22 @@ namespace llaminar2
         }
 
         /**
-         * @brief Apply decode-boundary maintenance after a successful committed step.
+         * @brief Retire a successful decode transaction into maintenance policy.
          *
          * Implementations that own graph-captured MoE maintenance launch it
-         * here, after MTP verifier publication or rollback has closed.  Raw
+         * here, after MTP verifier publication or rollback has closed. Raw
          * forward execution is deliberately not a substitute for this hook.
+         * The count is the logical advancement of the transaction, rather than
+         * one host call, so grouped MTP cannot under-report maintenance progress.
+         *
+         * @param committed_tokens Number of logical decode tokens durably
+         *        committed by the transaction. Must be positive.
          */
-        virtual bool maybeApplyDecodeBoundaryMaintenance() { return true; }
+        virtual bool maybeApplyDecodeBoundaryMaintenance(
+            uint64_t committed_tokens)
+        {
+            return committed_tokens != 0u;
+        }
 
         /**
          * @brief Select the exact maintenance scheduler before a boundary.
@@ -3337,6 +3437,38 @@ namespace llaminar2
         deviceMoERebalanceHostedObservationSchedule() const noexcept
         {
             return {};
+        }
+
+        /**
+         * @brief Enumerate model-owned runtime sources for overlay snapshots.
+         *
+         * Composite runners concatenate their participant-local children.
+         * Values and placement remain on device; this setup-only query exposes
+         * stable addresses and identities solely for retained graph capture.
+         */
+        virtual std::vector<MoEOverlayDeviceControllerRuntimeBinding>
+        moeOverlayDeviceControllerRuntimeBindings() const
+        {
+            return {};
+        }
+
+        /**
+         * @brief Install one topology-accounted GPU transfer-progress authority.
+         *
+         * This setup-only operation is independent of controller placement
+         * policy: host-authoritative and device-authoritative overlays both need
+         * the same graph-owned branch when a GPU participates in a mapped weight
+         * relay. Composite runners route the epoch to the exact device child.
+         * Implementations must reject installation after serving graphs seal.
+         *
+         * @param epoch Non-null model-lifetime epoch for one exact local GPU.
+         * @return True after an idempotent pre-capture installation.
+         */
+        virtual bool installMoEOverlayTransferProgressEpoch(
+            std::shared_ptr<MappedTransferProgressEpoch> epoch)
+        {
+            (void)epoch;
+            return false;
         }
 
         /**
@@ -4550,8 +4682,9 @@ namespace llaminar2
          * any fragment. Implementations must authenticate the last observed
          * ticket, retire the prior sparse graph sequence at its exact ticket
          * fence, and open the selected next sequence without launching work.
-         * The returned count includes due maintenance and is zero only for a
-         * terminal ticket with no maintenance.
+         * The returned count includes due maintenance after the transaction's
+         * unconditional release tail. A terminal ticket always returns zero,
+         * because the corresponding native loop would not admit another body.
          *
          * @param ticket Last authenticated device dispatch decision.
          * @param out_fragment_count Number of fragments selected by the ticket.

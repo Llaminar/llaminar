@@ -6,9 +6,13 @@
 #include <gtest/gtest.h>
 
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "execution/moe/MoEOverlayParticipantResidency.h"
+#include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "collective/IGlobalTPContext.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/compute_stages/stages/MoERankBatchSparseStages.h"
 #include "execution/compute_stages/stages/MoERoutingStage.h"
+#include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "execution/compute_stages/stages/GDNLiveStateLocalizeStage.h"
 #include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
@@ -29,6 +33,7 @@
 #include "kernels/KernelFactory.h"
 #include "mocks/MockLocalTPContext.h"
 #include "mocks/MockMPIContext.h"
+#include "mocks/MockMPITopology.h"
 #include "tensors/TensorSlice.h"
 #include "utils/TestTensorFactory.h"
 
@@ -643,6 +648,10 @@ namespace
         bool prepareInactiveBank(int, const MoEPlacementUpdate &) override { return false; }
         bool flipActiveBank(int, uint32_t, void *) override { return false; }
         bool hasPrefillRouteScratchCapacity(int, int) const override { return false; }
+        void prepareDecodeHistogramProducerStream(void *stream) override
+        {
+            prepared_producer_stream = stream;
+        }
         void recordDecodeHistogramProducerStream(void *stream) override
         {
             producer_stream = stream;
@@ -712,6 +721,7 @@ namespace
         RuntimeExpertHistogramSourceMask async_sources{};
         bool async_enabled = false;
 
+        void *prepared_producer_stream = nullptr;
         void *producer_stream = nullptr;
     };
 
@@ -1150,8 +1160,14 @@ TEST(Test__Qwen35MoEGraph,
         GraphConfig config = makeMoEConfig(&tp_ctx);
         config.tp_device_idx = rank;
         config.moe.routed_expert_plan = plan;
-        config.moe.overlay_mpi_ctx =
+        auto overlay_mpi =
             std::make_shared<MockMPIContext>(rank, 2);
+        overlay_mpi->set_topology(
+            MockMPITopology::createSimple(
+                rank,
+                /*world_size=*/2,
+                /*ranks_per_node=*/1));
+        config.moe.overlay_mpi_ctx = std::move(overlay_mpi);
         config.moe.expert_overlay_runtime_plan =
             resolveMoEExpertOverlayRuntimePlan(
                 config.moe.routed_expert_plan,
@@ -1196,10 +1212,14 @@ TEST(Test__Qwen35MoEGraph,
         EXPECT_TRUE(std::any_of(
             publication_node->dependencies.begin(),
             publication_node->dependencies.end(),
-            [](const std::string &dependency)
+            [&](const std::string &dependency)
             {
-                return dependency.find("moe_sparse_return_reduce") !=
-                       std::string::npos;
+                const auto *return_node = graph.getNode(dependency);
+                return return_node &&
+                       (dynamic_cast<const MoESparseReturnReduceStage *>(
+                            return_node->stage.get()) != nullptr ||
+                        dynamic_cast<const MoERankBatchReturnReduceStage *>(
+                            return_node->stage.get()) != nullptr);
             })) << "rank=" << rank;
         EXPECT_TRUE(hasDependency(
             graph,
@@ -1210,6 +1230,148 @@ TEST(Test__Qwen35MoEGraph,
             "layer0_moe_combine",
             kPublication)) << "rank=" << rank;
     }
+}
+
+/**
+ * @brief One ordered host return owns one residency-lease terminal.
+ *
+ * The continuation rank owns participant zero locally and participant one is
+ * reached through a rank batch. Remote rank batches are lowered before the
+ * rank-local loopback, so only that final loopback may release the descriptor
+ * lease. Giving each transport family its own notion of "final" would retire
+ * the same epoch twice.
+ */
+TEST(Test__Qwen35MoEGraph,
+     DistributedOverlayHasOneHostDispatchLeaseTerminalAcrossTransports)
+{
+    const auto plan = makeOverlayPlan("cold_cpu");
+    const auto model_ctx = makeNodeTPOverlayModelContext(*plan);
+    auto residency_authority =
+        std::make_shared<MoEOverlayResidencyAuthority>(
+            MoEOverlayResidencyAuthority::Config{
+                .initial_plan = *plan,
+                .model_metadata =
+                    MoERoutedExpertModelMetadata{
+                        .num_layers = 1,
+                        .num_experts = 2,
+                        .d_model = 4,
+                        .routed_intermediate_size = 3,
+                        .shared_intermediate_size = 3,
+                        .has_shared_expert = true,
+                        .routed_quant_type = "F32",
+                        .shared_quant_type = "F32",
+                    },
+                .maintenance_mode = MoERebalanceRuntimeMode::Off,
+                .perf_device = "CPU",
+            });
+    const auto residency_snapshot = residency_authority->snapshot();
+    ASSERT_NE(residency_snapshot, nullptr);
+    ASSERT_TRUE(residency_snapshot->valid());
+    std::vector<int> local_participants;
+    for (const auto &participant :
+         residency_snapshot->owner_map.participants())
+    {
+        if (participant.world_rank_known && participant.world_rank == 0)
+            local_participants.push_back(participant.participant_id);
+    }
+    auto participant_residency =
+        std::make_shared<MoEOverlayParticipantResidencyRegistry>(
+            MoEOverlayParticipantResidencyRegistry::Config{
+                .owner_map = residency_snapshot->owner_map,
+                .local_participant_ids = std::move(local_participants),
+                .num_layers = 1,
+                .num_experts = 2,
+                .initial_epoch = residency_snapshot->epoch,
+            });
+
+    GraphConfig config = makeMoEConfig();
+    config.moe.routed_expert_plan = plan;
+    auto overlay_mpi =
+        std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/2);
+    /*
+     * This device-free unit exercises the transport-independent return-order
+     * contract with an explicit inter-node rank batch.  Node-local shared-row
+     * channel construction has a bilateral first-touch handshake and belongs
+     * to the native production-lowering integration fixture; choosing one rank
+     * per node here still drives the production MPI rank-batch implementation
+     * while keeping this structural state-machine test single-process.
+     */
+    overlay_mpi->set_topology(
+        MockMPITopology::createSimple(
+            /*rank=*/0,
+            /*world_size=*/2,
+            /*ranks_per_node=*/1));
+    config.moe.overlay_mpi_ctx = std::move(overlay_mpi);
+    config.moe.expert_overlay_runtime_plan =
+        resolveMoEExpertOverlayRuntimePlan(
+            plan,
+            MoEExpertOverlayRuntimeResolverOptions{
+                .current_world_rank = 0,
+                .validate_mvp_root_reachability = false,
+            });
+    config.moe.expert_overlay_residency_authority =
+        std::move(residency_authority);
+    config.moe.durable_residency_authority =
+        MoEDurableResidencyAuthorityKind::ExpertOverlayRCU;
+    config.moe.authority_execution =
+        MoEOverlayAuthorityExecutionKind::HostResident;
+    config.moe.expert_overlay_participant_residency =
+        std::move(participant_residency);
+    config.refreshMoEExecutionPolicy();
+
+    Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+    TensorArena arena;
+    auto layer = makeMoELayerWeights(arena);
+    auto buffers = makeActivationBuffers(
+        arena,
+        /*tokens=*/2,
+        config.d_model,
+        config.moe.num_experts,
+        config.moe.top_k);
+    ComputeGraph graph = graph_builder.buildFFNGraph(
+        layer,
+        buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/2,
+        /*batch_size=*/1,
+        DeviceId::cpu(),
+        /*device_state_publication_stream=*/nullptr);
+
+    std::size_t rank_batch_returns = 0;
+    std::size_t rank_local_returns = 0;
+    std::size_t lease_terminals = 0;
+    for (const std::string &name : graph.getExecutionOrder())
+    {
+        const auto *node = graph.getNode(name);
+        ASSERT_NE(node, nullptr);
+        if (const auto *stage = dynamic_cast<
+                const MoERankBatchReturnReduceStage *>(
+                node->stage.get()))
+        {
+            ++rank_batch_returns;
+            const bool releases =
+                stage->params().residency_lease_terminal ==
+                MoEOverlayHostDispatchLeaseTerminal::Release;
+            lease_terminals += releases ? 1u : 0u;
+            EXPECT_FALSE(releases)
+                << "a later rank-local return still owns canonical order";
+        }
+        if (const auto *stage = dynamic_cast<
+                const MoESparseReturnReduceStage *>(
+                node->stage.get()))
+        {
+            ++rank_local_returns;
+            lease_terminals +=
+                stage->params().residency_lease_terminal ==
+                        MoEOverlayHostDispatchLeaseTerminal::Release
+                    ? 1u
+                    : 0u;
+        }
+    }
+
+    EXPECT_GT(rank_batch_returns, 0u);
+    EXPECT_GT(rank_local_returns, 0u);
+    EXPECT_EQ(lease_terminals, 1u);
 }
 
 TEST(Test__Qwen35MoEGraph, PhaseSplitOverlayApportionsPrefillButReplicatesVerifier)
@@ -3173,6 +3335,25 @@ TEST(Test__Qwen35MoEGraph, SnapshotShardingDeclaresFinalCombinedOutputReplicated
         sharding.at("MOE_CANONICAL_ROUTES_REDUCE_TO_ROOT"),
         SnapshotShardingMode::ROOT_ONLY);
     EXPECT_EQ(
+        sharding.at("MOE_DOMAIN_ROUTE_PARTICIPANT_IDS"),
+        SnapshotShardingMode::ROOT_ONLY)
+        << "The continuation root owns the device-published domain schedule";
+    EXPECT_EQ(
+        sharding.at("MOE_RUNTIME_ROUTE_WEIGHTS"),
+        SnapshotShardingMode::ROOT_ONLY)
+        << "The continuation root owns the exact post-filter execution weight";
+    EXPECT_EQ(
+        sharding.at("MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0"),
+        SnapshotShardingMode::ROOT_ONLY);
+    EXPECT_EQ(
+        sharding.at("MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1"),
+        SnapshotShardingMode::ROOT_ONLY);
+    EXPECT_EQ(
+        sharding.at("MOE_OVERLAY_ROUTE_SELECTED_BANK"),
+        SnapshotShardingMode::ROOT_ONLY)
+        << "Global placement evidence must retain the request-pinned device "
+           "selector instead of rebuilding placement from host topology";
+    EXPECT_EQ(
         sharding.at("MOE_CANONICAL_PUBLICATION_BROADCAST"),
         SnapshotShardingMode::REPLICATED);
     EXPECT_EQ(
@@ -3378,7 +3559,7 @@ TEST(Test__Qwen35MoEGraph, AttentionDoesNotBindRecycledGemmScratchAsExternalMask
            "consume the legacy GEMM scratch alias as an additive mask";
 }
 
-TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithFullKVRows)
+TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithPostRotaryFullKVRows)
 {
     auto tp_ctx = std::make_unique<MockLocalTPContext>();
     tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
@@ -3479,10 +3660,10 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithFull
         << "Fused QKV writes packed local K rows even when phase-split storage is full-width";
     EXPECT_EQ(handoff->getParams().local_v_stride, local_kv_dim)
         << "Fused QKV writes packed local V rows even when phase-split storage is full-width";
-    EXPECT_TRUE(hasDependency(graph, "layer0_tp_kv_state_allgather", "layer0_q_norm"));
-    EXPECT_TRUE(hasDependency(graph, "layer0_tp_kv_state_allgather", "layer0_k_norm"));
-    EXPECT_FALSE(hasDependency(graph, "layer0_rope", "layer0_tp_kv_state_allgather"))
-        << "RoPE-on-read leaves K untouched, so Q RoPE and the pre-RoPE KV handoff should run concurrently.";
+    EXPECT_TRUE(hasDependency(graph, "layer0_rope", "layer0_q_norm"));
+    EXPECT_TRUE(hasDependency(graph, "layer0_rope", "layer0_k_norm"));
+    EXPECT_TRUE(hasDependency(graph, "layer0_tp_kv_state_allgather", "layer0_rope"))
+        << "Native floating caches publish post-RoPE K once, so replicated full rows must consume the complete rotary transform.";
 
     const auto *kv_append_node = graph.getNode("layer0_kv_append");
     ASSERT_NE(kv_append_node, nullptr);
@@ -3497,8 +3678,8 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithFull
     ASSERT_NE(rope_node, nullptr);
     const auto *rope = dynamic_cast<const RoPEStage *>(rope_node->stage.get());
     ASSERT_NE(rope, nullptr);
-    EXPECT_TRUE(rope->getParams().skip_k)
-        << "Phase-split prefill and decode share the pre-RoPE cache and apply K RoPE only while reading it.";
+    EXPECT_FALSE(rope->getParams().skip_k)
+        << "Native floating phase-split caches retain post-RoPE K and must not re-transform their complete history during decode.";
 
     const auto *attention_node = graph.getNode("layer0_attention");
     ASSERT_NE(attention_node, nullptr);
@@ -3512,14 +3693,14 @@ TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithFull
     EXPECT_EQ(attention->getParams().gqa_n_rep,
               config.n_heads / config.n_kv_heads);
     EXPECT_TRUE(attention->getParams().read_kv_from_cache);
-    EXPECT_TRUE(
+    EXPECT_FALSE(
         attention->getParams().execution_policy.key_cache.transformsOnRead());
     EXPECT_TRUE(hasDependency(graph, "layer0_attention", "layer0_kv_append"));
     EXPECT_TRUE(hasDependency(graph, "layer0_attention", "layer0_rope"))
         << "Local prefill attention must consume RoPE-applied Q/K after the cache handoff captured pre-RoPE K.";
 }
 
-TEST(Test__Qwen35MoEGraph, DirectAttentionDecodeGraphUsesPhaseSplitReplicatedAttentionPolicy)
+TEST(Test__Qwen35MoEGraph, DirectAttentionDecodeGraphUsesPhaseSplitReplicatedPostRotaryCachePolicy)
 {
     auto tp_ctx = std::make_unique<MockLocalTPContext>();
     tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
@@ -3585,7 +3766,7 @@ TEST(Test__Qwen35MoEGraph, DirectAttentionDecodeGraphUsesPhaseSplitReplicatedAtt
     EXPECT_EQ(attention->getParams().n_kv_heads, config.n_kv_heads);
     EXPECT_EQ(attention->getParams().head_start, config.head_start);
     EXPECT_TRUE(attention->getParams().read_kv_from_cache);
-    EXPECT_TRUE(
+    EXPECT_FALSE(
         attention->getParams().execution_policy.key_cache.transformsOnRead());
 }
 
@@ -3780,6 +3961,57 @@ TEST(Test__Qwen35MoEGraph, RuntimeHistogramRegistrationIsDecodeOnly)
         source.substr(prefill_call, prefill_call_end - prefill_call);
     EXPECT_NE(prefill_call_text.find("/*register_decode_histogram=*/false"), std::string::npos)
         << "Prefill runtime tables must not register stale decode histogram sync callbacks";
+}
+
+/**
+ * @brief Static graph lowering removes device histogram work at its source.
+ *
+ * The runtime table is also the durable placement authority in Static mode,
+ * so table presence cannot be used as a proxy for evidence collection. This
+ * test proves the configured maintenance mode is the single source of truth:
+ * Off omits counters, while Observe and Dynamic retain them.
+ */
+TEST(Test__Qwen35MoEGraph, RuntimeHistogramCollectionFollowsMaintenanceMode)
+{
+    for (const auto &[mode, expected_collection] :
+         std::array<std::pair<MoERebalanceRuntimeMode, bool>, 3>{
+             std::pair{MoERebalanceRuntimeMode::Off, false},
+             std::pair{MoERebalanceRuntimeMode::Observe, true},
+             std::pair{MoERebalanceRuntimeMode::Dynamic, true}})
+    {
+        GraphConfig config = makeMoEConfig();
+        config.n_layers = 1;
+        config.total_n_layers = 1;
+        config.moe.rebalance_config.mode = mode;
+
+        TensorArena arena;
+        auto layer = makeMoELayerWeights(arena);
+        auto buffers = makeActivationBuffers(
+            arena,
+            /*tokens=*/1,
+            config.d_model,
+            config.moe.num_experts,
+            config.moe.top_k);
+        Qwen35MoEGraph builder(config, nullptr);
+        ComputeGraph graph = builder.buildFFNGraph(
+            layer,
+            buffers,
+            /*layer_idx=*/0,
+            /*seq_len=*/1,
+            /*batch_size=*/1,
+            DeviceId::cpu(),
+            /*device_state_publication_stream=*/nullptr);
+
+        const auto *node = graph.getNode("layer0_moe_routing");
+        ASSERT_NE(node, nullptr);
+        const auto *routing =
+            dynamic_cast<const MoERoutingStage *>(node->stage.get());
+        ASSERT_NE(routing, nullptr);
+        EXPECT_EQ(
+            routing->collectsDeviceRuntimeHistogramForTesting(),
+            expected_collection)
+            << "mode=" << moeRebalanceRuntimeModeToString(mode);
+    }
 }
 
 TEST(Test__Qwen35MoEGraph, CurrentBatchLLEPPrefillCannotAliasDurableDecodeRuntime)
@@ -4213,6 +4445,58 @@ TEST(Test__Qwen35MoEGraph, GroupedMainVerifierBindsStandardGpuRuntimeGrouping)
             "             grouped_main_verifier_layer ||"),
         std::string::npos)
         << "Apportioned LocalTP verifier rows need the same device runtime binding";
+}
+
+/**
+ * @brief Keep mapped sparse route publication independent of residency mode.
+ *
+ * Static and Dynamic choose placement differently, but both reducers consume
+ * the same final domain-local route ledger.  The original regression bound
+ * that pointer for Static ordinary prefill while guarding its only producer
+ * behind `device_resident_authority`.  This device-free architecture test
+ * keeps the four captured workloads explicit and prevents policy mode from
+ * re-entering the publication lifecycle.
+ */
+TEST(Test__Qwen35MoEGraph, CapturedOverlayRouteLedgerHasOneTypedProducerLifecycle)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open())
+        << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t lifecycle = source.find(
+        "enum class CapturedOverlayRouteLedgerWorkload");
+    ASSERT_NE(lifecycle, std::string::npos);
+    const size_t mutable_descriptors = source.find(
+        "const bool dynamic_distributed_overlay_uses_mutable_descriptors",
+        lifecycle);
+    ASSERT_NE(mutable_descriptors, std::string::npos);
+    const std::string lifecycle_body =
+        source.substr(lifecycle, mutable_descriptors - lifecycle);
+
+    EXPECT_NE(
+        lifecycle_body.find("SerialDecode"), std::string::npos);
+    EXPECT_NE(
+        lifecycle_body.find("GroupedVerifier"), std::string::npos);
+    EXPECT_NE(
+        lifecycle_body.find("OrdinaryPrefill"), std::string::npos);
+    EXPECT_EQ(
+        lifecycle_body.find("device_resident_authority"),
+        std::string::npos)
+        << "Static and Dynamic must share route-ledger publication";
+    EXPECT_NE(
+        source.find(
+            "captured_overlay_route_ledger_uses_grouped_publication"),
+        std::string::npos)
+        << "Ordinary prefill and grouped verification need one explicit "
+           "runtime-grouping producer gate";
+    EXPECT_EQ(
+        source.find(
+            "captured_distributed_overlay_dynamic_prefill_runtime_table"),
+        std::string::npos)
+        << "The retired Dynamic-only route publication gate must not return";
 }
 
 TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSelectsDecodeBindingByRole)

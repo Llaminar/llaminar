@@ -379,21 +379,20 @@ namespace llaminar2
     };
 
     /**
-     * @brief Derive the only valid authority execution backend for a plan.
+     * @brief Derive the only valid live-authority owner for a frozen plan.
      *
-     * One routed tier can keep its complete control plane on participant
-     * devices only when every participant has the same device type and the
-     * selected collective does not explicitly request host staging or a
-     * heterogeneous backend. Multiple tiers always require host coordination,
-     * even when two tiers happen to use the same accelerator vendor, because
-     * capacity arbitration and promotion/demotion span distinct priorities.
-     * CPU participants are considered device-resident: their participant
-     * device is host memory, so no additional control-plane transfer exists.
+     * Tier count, GPU vendor mix, collective backend, and use of a host-staged
+     * byte transport do not make GPU execution state host-owned. Every all-GPU
+     * overlay therefore selects the device-resident authority. A plan with any
+     * CPU routed participant selects the host-resident authority because CPU
+     * runtime state is host-owned. Later controller-topology validation must
+     * fail setup when the selected locus lacks a certified transport; it must
+     * never change this answer as a fallback.
      *
      * @param plan Declarative or model-frozen ExpertOverlay plan.
-     * @return Topology-required execution kind.
-     * @throws std::invalid_argument when the sole tier cannot resolve a domain
-     *         or the domain has no participants.
+     * @return State-ownership-required execution kind.
+     * @throws std::invalid_argument when a tier cannot resolve a non-empty
+     *         routed domain.
      */
     [[nodiscard]] inline MoEOverlayAuthorityExecutionKind
     resolveMoEOverlayAuthorityExecutionKind(
@@ -401,58 +400,45 @@ namespace llaminar2
     {
         if (!plan.usesExpertOverlayAuthority())
             return MoEOverlayAuthorityExecutionKind::Unresolved;
-        if (plan.routed_tiers.size() != 1u)
-            return MoEOverlayAuthorityExecutionKind::HostCoordinated;
 
-        const RoutedExpertTier &tier = plan.routed_tiers.front();
-        const auto domain_it = std::find_if(
-            plan.domains.begin(),
-            plan.domains.end(),
-            [&](const RoutedExpertDomain &domain)
+        bool observed_participant = false;
+        bool all_gpu = true;
+        for (const RoutedExpertTier &tier : plan.routed_tiers)
+        {
+            const auto domain_it = std::find_if(
+                plan.domains.begin(),
+                plan.domains.end(),
+                [&](const RoutedExpertDomain &domain)
+                {
+                    return domain.name == tier.domain;
+                });
+            if (domain_it == plan.domains.end())
             {
-                return domain.name == tier.domain;
-            });
-        if (domain_it == plan.domains.end())
+                throw std::invalid_argument(
+                    "ExpertOverlay authority execution cannot resolve routed tier '" +
+                    tier.name + "' domain '" + tier.domain + "'");
+            }
+            if (domain_it->participants.empty())
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay authority execution requires at least one participant in domain '" +
+                    domain_it->name + "'");
+            }
+            for (const GlobalDeviceAddress &participant :
+                 domain_it->participants)
+            {
+                observed_participant = true;
+                all_gpu = all_gpu && participant.isGPU();
+            }
+        }
+        if (!observed_participant)
         {
             throw std::invalid_argument(
-                "ExpertOverlay authority execution cannot resolve routed tier '" +
-                tier.name + "' domain '" + tier.domain + "'");
+                "ExpertOverlay authority execution requires at least one routed participant");
         }
-        if (domain_it->participants.empty())
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay authority execution requires at least one participant in domain '" +
-                domain_it->name + "'");
-        }
-
-        const DeviceType device_type =
-            domain_it->participants.front().device_type;
-        const bool homogeneous = std::all_of(
-            domain_it->participants.begin(),
-            domain_it->participants.end(),
-            [&](const GlobalDeviceAddress &participant)
-            {
-                return participant.device_type == device_type;
-            });
-        if (!homogeneous ||
-            domain_it->backend == CollectiveBackendType::HETEROGENEOUS ||
-            domain_it->backend == CollectiveBackendType::HOST)
-        {
-            return MoEOverlayAuthorityExecutionKind::HostCoordinated;
-        }
-
-        const bool device_native_collective =
-            domain_it->backend == CollectiveBackendType::AUTO ||
-            (device_type == DeviceType::CUDA &&
-             domain_it->backend == CollectiveBackendType::NCCL) ||
-            (device_type == DeviceType::ROCm &&
-             domain_it->backend == CollectiveBackendType::RCCL) ||
-            (device_type == DeviceType::CPU &&
-             (domain_it->backend == CollectiveBackendType::UPI ||
-              domain_it->backend == CollectiveBackendType::MPI));
-        return device_native_collective
-                   ? MoEOverlayAuthorityExecutionKind::HomogeneousDeviceResident
-                   : MoEOverlayAuthorityExecutionKind::HostCoordinated;
+        return all_gpu
+                   ? MoEOverlayAuthorityExecutionKind::DeviceResident
+                   : MoEOverlayAuthorityExecutionKind::HostResident;
     }
 
     struct MoERoutedExpertPlacementValidationOptions

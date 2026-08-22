@@ -164,6 +164,24 @@ namespace llaminar2
             return (bytes + alignment - 1) & ~(alignment - 1);
         }
 
+        /** @brief Return one equal TP shard's exact row count. */
+        size_t equalShardRows(
+            size_t rows,
+            int shard_index,
+            int total_shards)
+        {
+            if (total_shards <= 1)
+                return rows;
+            if (shard_index < 0 || shard_index >= total_shards)
+            {
+                throw std::invalid_argument(
+                    "Weight memory estimator received an invalid TP shard index");
+            }
+            const size_t degree = static_cast<size_t>(total_shards);
+            const size_t index = static_cast<size_t>(shard_index);
+            return rows / degree + (index < rows % degree ? 1u : 0u);
+        }
+
         size_t exactGpuPackedMatrixBytes(
             size_t rows,
             size_t columns,
@@ -346,6 +364,7 @@ namespace llaminar2
             name.find("attn_v") != std::string::npos ||
             name.find("ffn_gate") != std::string::npos ||
             name.find("ffn_up") != std::string::npos ||
+            isEmbeddingTensor(name) ||
             name == "output.weight")
         {
             return TensorParallelWeightShardAxis::OutputColumns;
@@ -467,10 +486,12 @@ namespace llaminar2
                     const size_t rows =
                         t.elements /
                         static_cast<size_t>(profile.d_model);
+                    const size_t local_rows = equalShardRows(
+                        rows, shard_index, total_shards);
                     const size_t blocks_per_row =
                         (static_cast<size_t>(profile.d_model) + 31) / 32;
                     device_size =
-                        rows * blocks_per_row * sizeof(EmbedQ8Block);
+                        local_rows * blocks_per_row * sizeof(EmbedQ8Block);
                     est.prepared_embedding_bytes += device_size;
 
                     if (!has_explicit_lm_head)
@@ -480,16 +501,19 @@ namespace llaminar2
                         const size_t tied_lm_head_bytes =
                             format
                                 ? exactGpuPackedMatrixBytes(
-                                      rows,
+                                      local_rows,
                                       static_cast<size_t>(profile.d_model),
                                       *format)
                                 : static_cast<size_t>(
-                                      static_cast<float>(t.elements) *
+                                      static_cast<float>(
+                                          local_rows *
+                                          static_cast<size_t>(profile.d_model)) *
                                       getGPUPackedBytesPerWeight(
                                           t.quant_type,
                                           static_cast<size_t>(
                                               profile.d_model)));
                         device_size += tied_lm_head_bytes;
+                        est.lm_head_bytes += tied_lm_head_bytes;
                         est.tied_lm_head_bytes += tied_lm_head_bytes;
                     }
                 }
@@ -549,6 +573,8 @@ namespace llaminar2
                 }
                 device_size = static_cast<size_t>(static_cast<float>(elements) * bytes_per_weight);
             }
+            if (isLMHeadTensor(t.name))
+                est.lm_head_bytes += device_size;
             est.device_bytes += device_size;
         }
 

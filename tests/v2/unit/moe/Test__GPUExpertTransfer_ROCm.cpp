@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <chrono>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
@@ -71,6 +72,47 @@ namespace
         const int count = rocmDeviceCount();
         if (count < 2)
             GTEST_SKIP() << "Need >= 2 ROCm devices, have " << count;
+    }
+
+    /** Directed peer edge whose destination stream may read source memory. */
+    struct DirectedROCmPeerPair
+    {
+        int source = -1;      ///< Device that owns the source allocation.
+        int destination = -1; ///< Device whose stream owns the peer copy.
+    };
+
+    /**
+     * @brief Find a driver-authorized directed HIP peer edge on this host.
+     *
+     * PCIe/IOMMU topology is not implied by ordinal order and can change when
+     * cards move between sockets. The production lane deliberately rejects an
+     * unauthorized edge, so this hardware certificate selects an actual edge
+     * instead of weakening that invariant or assuming devices zero and one.
+     *
+     * @return First stable directed edge, or empty when this host exposes none.
+     */
+    std::optional<DirectedROCmPeerPair> findDirectedROCmPeerPair()
+    {
+        const int count = rocmDeviceCount();
+        for (int destination = 0; destination < count; ++destination)
+        {
+            for (int source = 0; source < count; ++source)
+            {
+                if (source == destination)
+                    continue;
+                int can_access = 0;
+                if (hipDeviceCanAccessPeer(
+                        &can_access, destination, source) == hipSuccess &&
+                    can_access != 0)
+                {
+                    return DirectedROCmPeerPair{
+                        .source = source,
+                        .destination = destination,
+                    };
+                }
+            }
+        }
+        return std::nullopt;
     }
 
     void runROCmD2DTransfer(bool include_optional_arrays, int repetitions = 1)
@@ -382,9 +424,15 @@ namespace
      */
     void runROCmPeerLaneTransfer()
     {
-        requireTwoROCmDevices();
-        constexpr int src_dev = 0;
-        constexpr int dst_dev = 1;
+        const auto peer_pair = findDirectedROCmPeerPair();
+        if (!peer_pair.has_value())
+        {
+            GTEST_SKIP()
+                << "No driver-authorized directed ROCm peer edge across "
+                << rocmDeviceCount() << " visible devices";
+        }
+        const int src_dev = peer_pair->source;
+        const int dst_dev = peer_pair->destination;
         constexpr int n = 2048;
         constexpr int k = 256;
         constexpr uint8_t payload_bytes_per_block = 16;
@@ -575,10 +623,16 @@ namespace
         std::size_t element_bytes,
         std::uint32_t seed)
     {
-        requireTwoROCmDevices();
         ASSERT_TRUE(element_bytes == 2 || element_bytes == 4);
-        constexpr int src_dev = 0;
-        constexpr int dst_dev = 1;
+        const auto peer_pair = findDirectedROCmPeerPair();
+        if (!peer_pair.has_value())
+        {
+            GTEST_SKIP()
+                << "No driver-authorized directed ROCm peer edge across "
+                << rocmDeviceCount() << " visible devices";
+        }
+        const int src_dev = peer_pair->source;
+        const int dst_dev = peer_pair->destination;
         constexpr std::size_t element_count = 32771;
         const std::size_t bytes = element_count * element_bytes;
 

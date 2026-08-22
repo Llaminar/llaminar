@@ -6985,6 +6985,166 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_CausalMasking)
     LOG_INFO("[FlashAttn2_CausalMasking] PASSED");
 }
 
+/**
+ * @brief Direct native FP16 ring attention is byte-identical to contiguous K/V.
+ *
+ * The physical cache rows deliberately cross the ring boundary. Device-owned
+ * head/count metadata derives their logical origin on the HIP stream, and the
+ * production kernel must match its contiguous execution byte for byte for
+ * both decode and suffix-prefill.
+ */
+TEST_F(Test__ROCmFlashAttentionParity, NativeFP16RingWrappedDecodeAndPrefillAreByteExact)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    constexpr int capacity = 64;
+    constexpr int kv_len = 37;
+    constexpr int ring_origin = 53;
+    constexpr int n_heads = 8;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr size_t kv_cols =
+        static_cast<size_t>(n_kv_heads) * head_dim;
+    constexpr size_t q_cols =
+        static_cast<size_t>(n_heads) * head_dim;
+
+    const auto logical_k_fp32 = randomFP32(
+        static_cast<size_t>(kv_len) * kv_cols);
+    const auto logical_v_fp32 = randomFP32(
+        static_cast<size_t>(kv_len) * kv_cols);
+    std::vector<uint16_t> logical_k(logical_k_fp32.size());
+    std::vector<uint16_t> logical_v(logical_v_fp32.size());
+    std::vector<uint16_t> physical_k(
+        static_cast<size_t>(capacity) * kv_cols, 0);
+    std::vector<uint16_t> physical_v(
+        static_cast<size_t>(capacity) * kv_cols, 0);
+    quantizeToFP16(
+        logical_k_fp32.data(), logical_k.data(), logical_k.size());
+    quantizeToFP16(
+        logical_v_fp32.data(), logical_v.data(), logical_v.size());
+    for (int logical_row = 0; logical_row < kv_len; ++logical_row)
+    {
+        const int physical_row =
+            (ring_origin + logical_row) % capacity;
+        std::copy_n(
+            logical_k.data() + static_cast<size_t>(logical_row) * kv_cols,
+            kv_cols,
+            physical_k.data() + static_cast<size_t>(physical_row) * kv_cols);
+        std::copy_n(
+            logical_v.data() + static_cast<size_t>(logical_row) * kv_cols,
+            kv_cols,
+            physical_v.data() + static_cast<size_t>(physical_row) * kv_cols);
+    }
+
+    FP16Tensor contiguous_k(
+        {static_cast<size_t>(kv_len), kv_cols}, logical_k);
+    FP16Tensor contiguous_v(
+        {static_cast<size_t>(kv_len), kv_cols}, logical_v);
+    FP16Tensor ring_k(
+        {static_cast<size_t>(capacity), kv_cols}, physical_k);
+    FP16Tensor ring_v(
+        {static_cast<size_t>(capacity), kv_cols}, physical_v);
+
+    const DeviceId gpu_device = DeviceId::rocm(0);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(
+        hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    auto &transfer = TransferEngine::instance();
+    ASSERT_TRUE(transfer.uploadFull(&contiguous_k, gpu_device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&contiguous_v, gpu_device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&ring_k, gpu_device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&ring_v, gpu_device, stream).success);
+
+    int *device_count = nullptr;
+    int *device_head = nullptr;
+    const int ring_head = (ring_origin + kv_len) % capacity;
+    ASSERT_EQ(hipMalloc(&device_count, sizeof(int)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&device_head, sizeof(int)), hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_count, &kv_len, sizeof(int), hipMemcpyHostToDevice, stream),
+        hipSuccess);
+    ASSERT_EQ(
+        hipMemcpyAsync(
+            device_head, &ring_head, sizeof(int), hipMemcpyHostToDevice, stream),
+        hipSuccess);
+
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32>
+        kernel(0);
+    ASSERT_TRUE(setupWorkspace(
+        kernel, /*batch_size=*/1, n_heads, head_dim, stream));
+
+    for (const int seq_len : {1, 7})
+    {
+        const auto query = randomFP32(
+            static_cast<size_t>(seq_len) * q_cols);
+        FP32Tensor q_tensor({static_cast<size_t>(seq_len), q_cols});
+        FP32Tensor ring_output({static_cast<size_t>(seq_len), q_cols});
+        FP32Tensor contiguous_output({static_cast<size_t>(seq_len), q_cols});
+        std::copy(query.begin(), query.end(), q_tensor.mutable_data());
+        ASSERT_TRUE(transfer.uploadFull(&q_tensor, gpu_device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(&ring_output, gpu_device, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(&contiguous_output, gpu_device, stream).success);
+
+        ASSERT_TRUE(kernel.prepareDynamicAttnParamsFromDeviceSequenceState(
+            device_count,
+            seq_len,
+            /*query_rows=*/1,
+            stream,
+            capacity,
+            /*active_query_rows_device=*/nullptr,
+            /*prefill_capture=*/{},
+            device_head,
+            capacity));
+        ASSERT_TRUE(kernel.compute_tensor(
+            &q_tensor, &ring_k, &ring_v, &ring_output,
+            /*batch_size=*/1, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            /*causal=*/true, /*window_size=*/-1,
+            nullptr, nullptr, &mpi_ctx_, 0));
+
+        ASSERT_TRUE(kernel.prepareDynamicAttnParams(
+            kv_len, kv_len - seq_len, /*query_rows=*/1, stream));
+        ASSERT_TRUE(kernel.compute_tensor(
+            &q_tensor, &contiguous_k, &contiguous_v, &contiguous_output,
+            /*batch_size=*/1, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            /*causal=*/true, /*window_size=*/-1,
+            nullptr, nullptr, &mpi_ctx_, 0));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        const size_t output_bytes =
+            static_cast<size_t>(seq_len) * q_cols * sizeof(float);
+        std::vector<float> ring_result(
+            static_cast<size_t>(seq_len) * q_cols);
+        std::vector<float> contiguous_result(ring_result.size());
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                ring_result.data(), ring_output.gpu_data_ptr(), output_bytes,
+                hipMemcpyDeviceToHost, stream),
+            hipSuccess);
+        ASSERT_EQ(
+            hipMemcpyAsync(
+                contiguous_result.data(),
+                contiguous_output.gpu_data_ptr(), output_bytes,
+                hipMemcpyDeviceToHost, stream),
+            hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        EXPECT_EQ(
+            std::memcmp(
+                ring_result.data(), contiguous_result.data(), output_bytes),
+            0)
+            << "direct wrapped ring changed ROCm attention bytes for seq_len="
+            << seq_len;
+    }
+
+    cleanupWorkspace(kernel);
+    EXPECT_EQ(hipFree(device_count), hipSuccess);
+    EXPECT_EQ(hipFree(device_head), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
 #endif // HAVE_ROCM
 
 // ============================================================================

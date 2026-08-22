@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include "MoEOverlayInferenceInterferenceProbe.h"
 #include "MoEOverlayInferenceTransaction.h"
 
 #include <mpi.h>
@@ -26,6 +27,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -34,6 +36,26 @@
 namespace llaminar2
 {
     class IMPIContext;
+
+    /**
+     * @brief Non-blocking sink for one fully retired prefill transaction.
+     *
+     * The count comes from the authenticated ticket's real rows, never its
+     * padded graph bucket. Production binds this to the process-local device
+     * controller's coalescing counter. The sink must not launch policy, perform
+     * MPI, allocate, or wait; returning false makes the command terminal.
+     */
+    using MoEOverlayRetiredPrefillProgressSink =
+        std::function<bool(std::uint64_t completed_tokens,
+                           std::string *error)>;
+
+    /** @brief Exact terminal owned by one continuation graph participant. */
+    enum class MoEOverlayInferenceCompletionBoundaryKind : std::uint8_t
+    {
+        Unspecified = 0,  ///< Invalid setup state; callers must choose.
+        HostSynchronous, ///< CPU graph calls return only after execution.
+        DeviceEvent,     ///< GPU graph completion is proven by an exact event.
+    };
 
     /** @brief Result of receiving one authenticated fixed-size control ticket. */
     struct MoEOverlayInferenceTransactionReceiveResult
@@ -184,6 +206,15 @@ namespace llaminar2
         int physical_rows_per_request = 0; ///< Captured/admitted rows per request.
         int draft_depth = -1; ///< Admitted speculative width, when applicable.
         int sidecar_depth = -1; ///< Speculative ordinal, not learned graph depth.
+        /**
+         * Complete logical prefill schedule containing this graph ticket.
+         *
+         * The coordinator fills this field from its schedule declaration; an
+         * ordinary graph caller must leave it invalid.  Carrying it on every
+         * authenticated segment lets a remote follower time the same complete
+         * interval without owning tokens or recreating root scheduling policy.
+         */
+        MoEOverlayInferenceWorkloadIdentity prefill_schedule_workload{};
 
         bool operator==(
             const MoEOverlayInferenceExecutionDescriptor &) const = default;
@@ -326,8 +357,27 @@ namespace llaminar2
         std::uint64_t group_id = 0; ///< Rank-wide graph invocation identity.
         int participant_index = -1; ///< Exact continuation participant owner.
         std::uint64_t request_generation = 0; ///< Wire generation to stamp.
+        std::uint64_t sequence_id = 0; ///< Rank-local immutable sequence identity.
+        int sequence_graph_ordinal = -1; ///< Zero-based role ordinal in sequence.
+        int sequence_graph_count = 0; ///< Complete admitted sequence cardinality.
         MoEOverlayInferenceExecutionDescriptor descriptor{}; ///< Effective geometry.
         std::string error; ///< Stable failure diagnostic.
+
+        /** @return Whether this graph acquires the sequence residency lease. */
+        [[nodiscard]] bool beginsSequence() const noexcept
+        {
+            return active && sequence_id != 0 &&
+                   sequence_graph_ordinal == 0 &&
+                   sequence_graph_count > 0;
+        }
+
+        /** @return Whether this graph publishes the sequence terminal. */
+        [[nodiscard]] bool endsSequence() const noexcept
+        {
+            return active && sequence_id != 0 &&
+                   sequence_graph_count > 0 &&
+                   sequence_graph_ordinal == sequence_graph_count - 1;
+        }
     };
 
     /**
@@ -355,12 +405,55 @@ namespace llaminar2
                 publishers; ///< One direct lane per remote follower rank.
             int continuation_participant_count = 0; ///< Symmetric local graph count.
             int ticket_authority_participant_index = -1; ///< Planner-resolved LocalTP child owning the remote packet parent.
+            std::vector<MoEOverlayInferenceCompletionBoundaryKind>
+                participant_completion_boundaries; ///< Exact CPU/GPU terminal for every continuation child.
             std::size_t max_transactions_per_command = 0; ///< Fixed retained ring.
             int max_mtp_draft_depth = 0; ///< Maximum admitted speculative width.
+            /** Optional process-local device-controller wake sideband. */
+            MoEOverlayRetiredPrefillProgressSink
+                retired_prefill_progress_sink;
         };
 
         /** @brief Validate topology and allocate every command-local slot. */
         explicit MoEOverlayInferenceTransactionCoordinator(Config config);
+
+        /**
+         * @brief Bind the one-shot calibration probe before command admission.
+         *
+         * The coordinator owns the only rank-wide view of a heterogeneous
+         * prefill graph group.  Binding here lets it time each real retained
+         * chunk from first participant entry through last participant finish,
+         * while the ordinary RankOrchestrator scope remains responsible for
+         * non-segmented phases. Rebinding the same owner is idempotent; changing
+         * it or binding after a command starts is rejected.
+         *
+         * @param probe Model-lifetime lock-free timing authority.
+         * @param error Optional stable validation diagnostic.
+         * @return True when future prefill groups own the probe boundary.
+         */
+        bool bindPrefillInterferenceProbe(
+            std::shared_ptr<MoEOverlayInferenceInterferenceProbe> probe,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Declare one complete segmented-prefill calibration interval.
+         *
+         * This call precedes the first graph of a caller-visible chunk schedule.
+         * It claims the probe once for the aggregate workload, stamps the same
+         * identity into every remote execution ticket, and defers completion to
+         * the final continuation graph's exact participant-event fence.  A
+         * declaration is retained even when no probe request is armed, which
+         * prevents a request published mid-schedule from timing a misleading
+         * tail segment.
+         *
+         * @param workload Exact complete bucket/chunk schedule identity.
+         * @param error Optional stable lifecycle diagnostic.
+         * @return True when this schedule exclusively owns the next declared
+         *         number of main-prefill transactions.
+         */
+        bool declarePrefillInterferenceSchedule(
+            MoEOverlayInferenceWorkloadIdentity workload,
+            std::string *error = nullptr);
 
         /** @brief Open one monotonic command on every target publisher. */
         bool beginCommand(
@@ -417,8 +510,10 @@ namespace llaminar2
          * The first entrant allocates a command-local operation id and reserves
          * every target handle. Publication is deferred to the designated ticket
          * authority's @ref armParticipantGraph call so cold capture cannot
-         * consume a follower epoch. No participant may enter the next graph
-         * until all participants finish the current one.
+         * consume a follower epoch. An ahead participant waits, with the
+         * standard bounded collective timeout, for every sibling to submit the
+         * current graph before entering the next one. This wait protects only
+         * rank-local host metadata; device streams continue asynchronously.
          */
         [[nodiscard]] MoEOverlayInferenceParticipantGraphBinding
         beginParticipantGraph(
@@ -449,6 +544,30 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
+         * @brief Bind an active prefill probe to its exact GPU terminal event.
+         *
+         * Every GPU participant calls this from the forward engine's
+         * post-launch hook on its exact producer stream. If no probe claimed
+         * this graph, the call is an allocation-free no-op and does not record
+         * the reusable event. The coordinator publishes one aggregate probe
+         * fence only after every continuation participant has supplied its
+         * configured CPU-call or GPU-event terminal.
+         *
+         * @param logical_step_id Active graph descriptor operation id.
+         * @param participant_index Exact continuation participant caller.
+         * @param event Setup-owned participant-local persistent backend event.
+         * @param producer_stream Exact non-null graph terminal stream.
+         * @param error Optional precise lifecycle/backend diagnostic.
+         * @return True when no sample was active or device completion owns it.
+         */
+        bool deferPrefillInterferenceCompletionAtDeviceTerminal(
+            std::uint64_t logical_step_id,
+            int participant_index,
+            std::shared_ptr<IMoEOverlayInferenceCompletionEvent> event,
+            void *producer_stream,
+            std::string *error = nullptr);
+
+        /**
          * @brief Recycle the current fixed slots after an exact return fence.
          *
          * The caller may invoke this only after the submitted continuation graph
@@ -462,6 +581,34 @@ namespace llaminar2
          * @return True when all sequence slots were retired and may be reused.
          */
         bool retireCompletedGraphSequence(std::string *error = nullptr);
+
+        /**
+         * @brief Idempotently advance one hosted device-generation sequence.
+         *
+         * Every symmetric continuation participant presents the same
+         * authenticated dispatch-ticket transaction id before submitting its
+         * retained branch. The first caller retires the completed sparse graph
+         * sequence and, for a non-terminal ticket, opens the controller-selected
+         * next depth. Later callers carrying that exact transition observe the
+         * already-published result. Participant order is therefore irrelevant:
+         * no child is elected as a host-side lifecycle authority.
+         *
+         * A different decision for an already observed id, or a stale id, is a
+         * fatal protocol disagreement. The transition never waits for device
+         * work; the authenticated ticket is itself the proof that every sparse
+         * return and controller publication in the prior sequence completed.
+         *
+         * @param transaction_id Positive monotonically increasing ticket id.
+         * @param next_draft_depth Controller-selected next depth, or nullopt
+         *        when the ticket closes the outer generation command.
+         * @param error Optional stable lifecycle diagnostic.
+         * @return True when this exact transition was applied or had already
+         *         been applied by a symmetric participant.
+         */
+        bool advanceHostedGraphSequence(
+            std::uint64_t transaction_id,
+            std::optional<int> next_draft_depth,
+            std::string *error = nullptr);
 
         /** @brief Retire all graph slots and publish Complete to every target. */
         bool completeCommand(
@@ -480,6 +627,30 @@ namespace llaminar2
             return config_.continuation_participant_count;
         }
 
+        /** @return Planner-selected participant owning remote ticket publication. */
+        [[nodiscard]] int ticketAuthorityParticipantIndex() const noexcept
+        {
+            return config_.ticket_authority_participant_index;
+        }
+
+        /**
+         * @brief Return the exact terminal required from one participant.
+         * @param participant_index Stable continuation participant ordinal.
+         * @return Planner-resolved CPU-call or GPU-event boundary.
+         */
+        [[nodiscard]] MoEOverlayInferenceCompletionBoundaryKind
+        participantCompletionBoundary(int participant_index) const noexcept
+        {
+            if (participant_index < 0 ||
+                static_cast<std::size_t>(participant_index) >=
+                    config_.participant_completion_boundaries.size())
+            {
+                return MoEOverlayInferenceCompletionBoundaryKind::Unspecified;
+            }
+            return config_.participant_completion_boundaries[
+                static_cast<std::size_t>(participant_index)];
+        }
+
         /** @return Current coordinator lifecycle. */
         [[nodiscard]] MoEOverlayInferenceProtocolState state() const noexcept;
 
@@ -490,15 +661,127 @@ namespace llaminar2
         [[nodiscard]] int activeMTPDraftDepth() const noexcept;
 
     private:
-        /** @brief One preallocated command slot containing all target handles. */
-        struct RetainedTransaction
+        /** @brief Preallocated poll-only fence aggregating participant events. */
+        class CompletionFenceSet;
+
+        /** @brief Complete lifecycle of one serial or speculative sequence. */
+        enum class ExecutionSequenceState : std::uint8_t
         {
-            bool used = false;
-            bool armed = false; ///< Every target ticket has been published.
+            Idle = 0,     ///< No residency-owning execution sequence exists.
+            Open,         ///< The next graph role may be admitted.
+            GraphInFlight,///< One symmetric graph group owns the sequence.
+            Releasing,    ///< Every graph is terminal and slots are retiring.
+            Failed,       ///< An invalid transition made the sequence unusable.
+        };
+
+        /**
+         * @brief Immutable shape and single cursor for one execution sequence.
+         *
+         * Depth zero admits exactly one main prefill or decode graph. Positive
+         * depth admits exactly `depth` MTP draft graphs followed by one grouped
+         * verifier. The first graph pins the placement epoch for the sequence;
+         * every later graph must name that same epoch. This replaces independent
+         * depth, sidecar ordinal, and per-role counters whose combinations could
+         * describe impossible partial sequences.
+         */
+        struct ExecutionSequencePlan
+        {
+            ExecutionSequenceState state = ExecutionSequenceState::Idle;
+            int draft_depth = -1;
+            int next_graph_ordinal = 0;
+            std::uint64_t placement_epoch = 0;
+            std::uint64_t sequence_id = 0;
+
+            /** @return Whether a sequence currently owns lifecycle state. */
+            [[nodiscard]] bool active() const noexcept
+            {
+                return state != ExecutionSequenceState::Idle;
+            }
+
+            /** @return Whether a participant graph currently owns the cursor. */
+            [[nodiscard]] bool graphInFlight() const noexcept
+            {
+                return state == ExecutionSequenceState::GraphInFlight;
+            }
+
+            /** @return Exact number of graph groups required by this shape. */
+            [[nodiscard]] int expectedGraphCount() const noexcept
+            {
+                return draft_depth == 0 ? 1 : draft_depth + 1;
+            }
+
+            /** @brief Reset to the only reusable state. */
+            void reset() noexcept
+            {
+                state = ExecutionSequenceState::Idle;
+                draft_depth = -1;
+                next_graph_ordinal = 0;
+                placement_epoch = 0;
+                sequence_id = 0;
+            }
+        };
+
+        /** @brief Typed lifecycle of one setup-owned graph-group slot. */
+        enum class GraphGroupSlotState : std::uint8_t
+        {
+            Available = 0, ///< Slot contains no live descriptor or handles.
+            Admitting,     ///< Participants may enter; ticket is not armed.
+            Armed,         ///< Remote tickets are published; terminals may arrive.
+            AdmittingFailed, ///< A participant failed before ticket publication.
+            ArmedFailed,   ///< A participant failed after ticket publication.
+            Terminal,      ///< Every participant published its submission terminal.
+            Failed,        ///< Every participant retired a failed execution.
+        };
+
+        /** @brief One preallocated command slot containing all target handles. */
+        struct GraphGroupSlot
+        {
+            GraphGroupSlotState state = GraphGroupSlotState::Available;
             std::uint64_t group_id = 0;
+            std::uint64_t sequence_id = 0;
+            int sequence_graph_ordinal = -1;
+            int sequence_graph_count = 0;
             MoEOverlayInferenceExecutionDescriptor descriptor{};
+            /** One entry mark per symmetric continuation participant. */
+            std::vector<std::uint8_t> entered_participants;
+            /** One submission-terminal mark per symmetric participant. */
+            std::vector<std::uint8_t> terminal_participants;
+            /** Rank-wide interval claimed only by a matching prefill group. */
+            MoEOverlayInterferenceProbeTicket interference_ticket{};
+            /** True after every local terminal owns the probe completion. */
+            bool interference_completion_published = false;
+            /** Setup-sized participant-local GPU events; null for CPU children. */
+            std::vector<std::shared_ptr<IMoEOverlayInferenceCompletionEvent>>
+                participant_completion_events;
+            /** One mark per exact CPU-call or GPU-event terminal. */
+            std::vector<std::uint8_t> participant_completion_recorded;
             std::vector<MoEOverlayPublishedInferenceTransaction>
                 target_transactions;
+
+            /** @return Whether this slot is the currently admitted group. */
+            [[nodiscard]] bool inFlight() const noexcept
+            {
+                return state == GraphGroupSlotState::Admitting ||
+                       state == GraphGroupSlotState::Armed ||
+                       state == GraphGroupSlotState::AdmittingFailed ||
+                       state == GraphGroupSlotState::ArmedFailed;
+            }
+
+            /** @return Whether remote execution tickets were published. */
+            [[nodiscard]] bool armed() const noexcept
+            {
+                return state == GraphGroupSlotState::Armed ||
+                       state == GraphGroupSlotState::ArmedFailed ||
+                       state == GraphGroupSlotState::Terminal;
+            }
+
+            /** @return Whether any participant reported execution failure. */
+            [[nodiscard]] bool failed() const noexcept
+            {
+                return state == GraphGroupSlotState::AdmittingFailed ||
+                       state == GraphGroupSlotState::ArmedFailed ||
+                       state == GraphGroupSlotState::Failed;
+            }
         };
 
         /** @brief Transition to Failed while preserving the first diagnostic. */
@@ -509,33 +792,48 @@ namespace llaminar2
         bool retireCompletedGraphSequenceLocked(std::string *error);
         /** @brief Open one graph sequence while mutex_ is already held. */
         bool beginGraphSequenceLocked(int draft_depth, std::string *error);
+        /** @brief Publish the probe terminal once every local boundary exists. */
+        bool tryPublishPrefillInterferenceCompletionLocked(
+            GraphGroupSlot &transaction,
+            std::string *error);
         /** @brief Clear fixed slots and sequence-local role counters. */
         void resetGraphSequenceLocked() noexcept;
 
         Config config_;
+        /** Optional model-lifetime probe; policy/calibration remain host-owned. */
+        std::shared_ptr<MoEOverlayInferenceInterferenceProbe>
+            prefill_interference_probe_;
         mutable std::mutex mutex_;
         /** Wakes an ahead prefill submitter after the last sibling seals a group. */
         std::condition_variable graph_group_completion_cv_;
-        std::vector<RetainedTransaction> retained_transactions_;
-        std::vector<std::uint8_t> entered_participants_;
-        std::vector<std::uint8_t> finished_participants_;
+        std::vector<GraphGroupSlot> graph_group_slots_;
+        /** One reusable aggregate because the probe admits one sample at a time. */
+        std::shared_ptr<CompletionFenceSet> prefill_completion_fence_set_;
         MoEOverlayInferenceProtocolState state_ =
             MoEOverlayInferenceProtocolState::Idle;
         MoEOverlayInferenceCommandIdentity active_command_{};
         std::size_t transaction_count_ = 0;
         std::size_t total_transaction_count_ = 0;
         std::size_t graph_sequence_count_ = 0;
-        bool graph_group_active_ = false;
-        bool graph_execution_failed_ = false;
-        bool mtp_depth_declared_ = false;
-        int active_mtp_draft_depth_ = -1;
-        int next_sidecar_ordinal_ = 0;
-        int sequence_main_graph_count_ = 0;
-        int sequence_sidecar_graph_count_ = 0;
-        int sequence_verifier_graph_count_ = 0;
+        /** Last authenticated hosted transition accepted in this command. */
+        std::uint64_t last_hosted_sequence_transition_id_ = 0;
+        /** Decision paired with @ref last_hosted_sequence_transition_id_. */
+        std::optional<int> last_hosted_sequence_next_draft_depth_;
+        ExecutionSequencePlan execution_sequence_{};
         std::uint64_t next_group_id_ = 1;
+        std::uint64_t next_sequence_id_ = 1;
         std::uint64_t next_logical_step_id_ = 1;
         std::uint64_t current_placement_epoch_ = 0;
+        /** Current aggregate prefill schedule, if explicitly declared. */
+        std::optional<MoEOverlayInferenceWorkloadIdentity>
+            declared_prefill_schedule_;
+        /** Absolute one-based transaction ordinals covered by the declaration. */
+        std::size_t declared_prefill_schedule_begin_ordinal_ = 0;
+        std::size_t declared_prefill_schedule_end_ordinal_ = 0;
+        /** One probe ticket transferred to the final graph's event fence. */
+        MoEOverlayInterferenceProbeTicket declared_prefill_probe_ticket_{};
+        bool declared_prefill_probe_released_ = false;
+        bool declared_prefill_terminal_published_ = false;
         std::string failure_;
     };
 
@@ -648,6 +946,12 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayMPIInferenceTransactionChannel> channel;
             IMoEOverlayInferenceTransactionExecutor *executor = nullptr;
             MoEOverlayInferenceTransactionProtocol::Config protocol;
+            /** Sole timing owner for complete follower-side transactions. */
+            std::shared_ptr<MoEOverlayInferenceInterferenceProbe>
+                interference_probe;
+            /** Optional process-local device-controller wake sideband. */
+            MoEOverlayRetiredPrefillProgressSink
+                retired_prefill_progress_sink;
         };
 
         /**
@@ -677,6 +981,10 @@ namespace llaminar2
         std::shared_ptr<MoEOverlayMPIInferenceTransactionChannel> channel_;
         IMoEOverlayInferenceTransactionExecutor *executor_ = nullptr;
         MoEOverlayInferenceTransactionProtocol protocol_;
+        std::shared_ptr<MoEOverlayInferenceInterferenceProbe>
+            interference_probe_;
+        MoEOverlayRetiredPrefillProgressSink
+            retired_prefill_progress_sink_;
     };
 
 } // namespace llaminar2

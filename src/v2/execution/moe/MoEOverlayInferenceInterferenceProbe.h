@@ -21,6 +21,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <string>
 
 namespace llaminar2
 {
@@ -44,6 +46,59 @@ namespace llaminar2
         Armed,
         Running,
         Completed,
+    };
+
+    /** @brief Result of one non-blocking device-terminal event observation. */
+    enum class MoEOverlayInferenceCompletionFenceProgress : std::uint8_t
+    {
+        Pending, ///< Recorded device work has not reached the event yet.
+        Ready,   ///< Every operation preceding the event has completed.
+        Failed,  ///< The backend rejected the non-blocking event query.
+    };
+
+    /**
+     * @brief Stable setup-owned device event used to close one live sample.
+     *
+     * Implementations expose an already-armed completion condition to the
+     * maintenance producer, which later calls `poll()` without blocking. A
+     * fence may aggregate several participant-local backend events; recording
+     * those exact producer-stream events remains the topology coordinator's
+     * responsibility.
+     */
+    class IMoEOverlayInferenceCompletionFence
+    {
+    public:
+        virtual ~IMoEOverlayInferenceCompletionFence() = default;
+
+        /**
+         * @brief Query the recorded event without waiting on the host.
+         * @param error Optional precise backend/lifecycle diagnostic.
+         * @return Pending, Ready, or Failed; never blocks.
+         */
+        [[nodiscard]] virtual MoEOverlayInferenceCompletionFenceProgress poll(
+            std::string *error = nullptr) noexcept = 0;
+    };
+
+    /**
+     * @brief One reusable participant-local event with an exact producer stream.
+     *
+     * Graph setup allocates an implementation for every GPU continuation
+     * participant. The rank coordinator records each event at that participant's
+     * post-launch terminal and aggregates them behind one probe fence.
+     */
+    class IMoEOverlayInferenceCompletionEvent
+        : public IMoEOverlayInferenceCompletionFence
+    {
+    public:
+        /**
+         * @brief Record the persistent event after one graph terminal.
+         * @param producer_stream Exact non-null graph producer stream.
+         * @param error Optional precise backend/lifecycle diagnostic.
+         * @return True when the event now represents this sample.
+         */
+        virtual bool record(
+            void *producer_stream,
+            std::string *error = nullptr) noexcept = 0;
     };
 
     /**
@@ -70,6 +125,33 @@ namespace llaminar2
         bool operator==(
             const MoEOverlayInferenceWorkloadIdentity &) const = default;
     };
+
+    /**
+     * @brief Build the canonical identity for one live production transaction.
+     *
+     * Every calibration participant names the same semantic workload even when
+     * its local graph has a different implementation, such as a padded dense
+     * continuation graph paired with a live-row-only remote expert graph.
+     * Centralizing the fingerprint arithmetic prevents rank-local orchestration
+     * layers from publishing subtly incompatible evidence identities.
+     *
+     * @param source Production phase represented by the transaction.
+     * @param real_rows Logical rows consumed by the transaction.
+     * @param execution_rows Planner-declared physical row geometry.
+     * @param transaction_count Number of graph transactions in the interval.
+     * @param speculative_depth MTP draft depth, or zero outside MTP.
+     * @param schedule_fingerprint Optional composed schedule identity; zero
+     *        requests the canonical scalar-derived fingerprint.
+     * @return A complete identity, or an invalid value for invalid geometry.
+     */
+    [[nodiscard]] MoEOverlayInferenceWorkloadIdentity
+    makeMoEOverlayInferenceWorkloadIdentity(
+        ExpertHistogramSource source,
+        int real_rows,
+        int execution_rows,
+        int transaction_count,
+        int speculative_depth,
+        std::uint64_t schedule_fingerprint = 0) noexcept;
 
     /** @brief Maintenance-owned identity for one requested live-path sample. */
     struct MoEOverlayInterferenceProbeRequest
@@ -181,6 +263,25 @@ namespace llaminar2
             const MoEOverlayInterferenceProbeTicket &ticket) noexcept;
 
         /**
+         * @brief Close a running sample from an exact device-terminal event.
+         *
+         * The already-armed fence is release-published to the maintenance
+         * thread. `consume()` and `progress()` then poll it
+         * non-blockingly and publish the sample only after device completion.
+         * This path prevents graph submission from masquerading as execution
+         * completion while adding no host wait or callback to inference.
+         *
+         * @param ticket Exact currently running sample ticket.
+         * @param fence Setup-owned, already-armed terminal implementation.
+         * @param error Optional precise validation/backend diagnostic.
+         * @return True when device completion now owns the sample terminal.
+         */
+        bool deferSampleCompletion(
+            const MoEOverlayInterferenceProbeTicket &ticket,
+            std::shared_ptr<IMoEOverlayInferenceCompletionFence> fence,
+            std::string *error = nullptr) noexcept;
+
+        /**
          * @brief Release a claimed sample that did not execute its named phase.
          * @return True only for the exact currently running ticket.
          */
@@ -221,7 +322,7 @@ namespace llaminar2
          * only after the matching inference caller has published `Running`.
          */
         [[nodiscard]] MoEOverlayInterferenceProbeProgress progress(
-            const MoEOverlayInterferenceProbeRequest &request) const noexcept;
+            const MoEOverlayInterferenceProbeRequest &request) noexcept;
 
         /** @return Whether no request, sample, or ticket currently owns the slot. */
         [[nodiscard]] bool idle() const noexcept;
@@ -275,11 +376,34 @@ namespace llaminar2
         [[nodiscard]] static std::uint64_t generationFromWord(
             std::uint64_t word) noexcept;
 
+        /**
+         * @brief Advance a deferred device terminal without blocking.
+         *
+         * Only the maintenance producer calls this helper. Backend query
+         * failure is fatal because retaining a Running sample would permit an
+         * inference/migration ordering defect to degrade into a timeout.
+         */
+        void pollDeferredCompletion() noexcept;
+
+        /** @brief Publish a complete interval using the supplied end time. */
+        bool completeSample(
+            const MoEOverlayInterferenceProbeTicket &ticket,
+            std::uint64_t end_steady_nanoseconds) noexcept;
+
         std::atomic<std::uint64_t> state_word_{0};
         /** Sole-maintenance-producer generation, embedded in state_word_. */
         std::uint64_t next_probe_generation_ = 0;
         MoEOverlayInterferenceProbeRequest request_;
         MoEOverlayInterferenceProbeSample completed_sample_;
+
+        /**
+         * Release-published generation owning the plain deferred fields below.
+         * Zero means host completion still owns the running ticket.
+         */
+        std::atomic<std::uint64_t> deferred_completion_generation_{0};
+        MoEOverlayInterferenceProbeTicket deferred_completion_ticket_;
+        std::shared_ptr<IMoEOverlayInferenceCompletionFence>
+            deferred_completion_fence_;
 
         std::atomic<std::uint64_t> arms_{0};
         std::atomic<std::uint64_t> claims_{0};

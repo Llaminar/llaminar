@@ -112,6 +112,11 @@ namespace llaminar2
         void *createStream() override;
         void destroyStream(void *stream) override;
         void *getOrCreateAuxiliaryStream(const std::string &name, bool *created = nullptr) override;
+        /** @copydoc IWorkerGPUContext::getOrCreateAuxiliaryStream(const std::string &, GPUAuxiliaryStreamSchedulingClass, bool *) */
+        void *getOrCreateAuxiliaryStream(
+            const std::string &name,
+            GPUAuxiliaryStreamSchedulingClass scheduling_class,
+            bool *created = nullptr) override;
         void resetAuxiliaryStreams() override;
 
         // =========================================================================
@@ -210,6 +215,11 @@ namespace llaminar2
 
         cudaStream_t default_stream_ = nullptr;
         std::unordered_map<std::string, cudaStream_t> auxiliary_streams_;
+        /** Immutable scheduling class paired with every named stream. */
+        std::unordered_map<
+            std::string,
+            GPUAuxiliaryStreamSchedulingClass>
+            auxiliary_stream_scheduling_classes_;
         std::mutex auxiliary_streams_mutex_;
 
         /**

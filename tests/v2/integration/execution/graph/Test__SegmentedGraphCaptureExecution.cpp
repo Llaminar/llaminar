@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 #include <memory>
+#include <span>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -882,12 +883,18 @@ TEST_F(CachedGraphReplayExecutionTest,
     void *dispatch_stream = gpu_ctx_->defaultStream();
     ASSERT_NE(dispatch_stream, nullptr);
 
-    const auto execute = [&]()
+    const auto execute_with_cache = [&graph,
+                                     &executor,
+                                     this,
+                                     dispatch_stream](
+                                        DeviceGraphExecutor::GraphSegmentCache &cache,
+                                        DeviceGraphExecutor::GraphInitialSubmissionPolicy
+                                            initial_submission)
     {
         return executor.executeWithCachedGraphReplay(
             graph,
             device_ctx_.get(),
-            segment_cache,
+            cache,
             dispatch_stream,
             gpu_ctx_,
             nullptr,
@@ -896,7 +903,18 @@ TEST_F(CachedGraphReplayExecutionTest,
             /*defer_final_sync=*/false,
             {},
             DeviceGraphExecutor::GraphReplayPlanPolicy::
-                AllowHeterogeneousBoundarySegmentation);
+                AllowHeterogeneousBoundarySegmentation,
+            {},
+            {},
+            {},
+            initial_submission);
+    };
+    const auto execute = [&]()
+    {
+        return execute_with_cache(
+            segment_cache,
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+                CaptureInstantiateAndLaunch);
     };
 
     const auto expect_output = [&](int logical_rows, float base)
@@ -1001,6 +1019,27 @@ TEST_F(CachedGraphReplayExecutionTest,
     EXPECT_DOUBLE_EQ(ticket_fence_count, 2.0);
     EXPECT_TRUE(saw_capture_fence);
     EXPECT_TRUE(saw_replay_fence);
+
+    /*
+     * Server readiness seals every graph before request admission. Reset the
+     * mutable ticket to an explicitly incomplete state and prove that native
+     * recording needs only its immutable pinned address. No manual participant
+     * may execute and no graph unit may launch during this setup transaction.
+     */
+    ticket_storage->ticket().header->return_logical_row_count = 0;
+    ASSERT_FALSE(ticket_storage->ticket().returnPayloadReady());
+    graph.reset();
+    DeviceGraphExecutor::GraphSegmentCache setup_cache;
+    ASSERT_TRUE(execute_with_cache(
+        setup_cache,
+        DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+            MaterializeWithoutLaunch));
+    EXPECT_EQ(manual_probe->callCount(), 2u);
+    EXPECT_EQ(
+        setup_cache.executable_submission_state,
+        DeviceGraphExecutor::GraphSegmentCache::
+            ExecutableSubmissionState::MaterializedUnlaunched);
+    EXPECT_EQ(setup_cache.successful_submission_count, 0u);
 }
 
 TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamForRecapture)

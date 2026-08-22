@@ -114,6 +114,11 @@ execute_process(
     OUTPUT_VARIABLE V2_TEST_CORES_PER_SOCKET
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
+execute_process(
+    COMMAND bash -c "lscpu | grep 'Thread(s) per core:' | awk '{print $4}'"
+    OUTPUT_VARIABLE V2_TEST_THREADS_PER_CORE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
 
 if(NOT V2_TEST_SOCKETS OR V2_TEST_SOCKETS EQUAL "")
     set(V2_TEST_SOCKETS 1)
@@ -121,17 +126,20 @@ endif()
 if(NOT V2_TEST_CORES_PER_SOCKET OR V2_TEST_CORES_PER_SOCKET EQUAL "")
     set(V2_TEST_CORES_PER_SOCKET 1)
 endif()
+if(NOT V2_TEST_THREADS_PER_CORE OR V2_TEST_THREADS_PER_CORE EQUAL "")
+    set(V2_TEST_THREADS_PER_CORE 1)
+endif()
 
 # Always use at least 2 MPI ranks for testing (even on single-socket systems)
 if(V2_TEST_SOCKETS LESS 2)
     set(V2_TEST_MIN_RANKS 2)
     set(V2_TEST_NEEDS_OVERSUBSCRIBE TRUE)
-    message(STATUS "V2 Test Configuration: ${V2_TEST_SOCKETS} socket(s), ${V2_TEST_CORES_PER_SOCKET} cores/socket")
+    message(STATUS "V2 Test Configuration: ${V2_TEST_SOCKETS} socket(s), ${V2_TEST_CORES_PER_SOCKET} cores/socket, ${V2_TEST_THREADS_PER_CORE} threads/core")
     message(STATUS "V2 Tests will use: mpirun -np 2 --oversubscribe with OMP_NUM_THREADS=${V2_TEST_CORES_PER_SOCKET}")
 else()
     set(V2_TEST_MIN_RANKS ${V2_TEST_SOCKETS})
     set(V2_TEST_NEEDS_OVERSUBSCRIBE FALSE)
-    message(STATUS "V2 Test Configuration: ${V2_TEST_SOCKETS} sockets, ${V2_TEST_CORES_PER_SOCKET} cores/socket")
+    message(STATUS "V2 Test Configuration: ${V2_TEST_SOCKETS} sockets, ${V2_TEST_CORES_PER_SOCKET} cores/socket, ${V2_TEST_THREADS_PER_CORE} threads/core")
     message(STATUS "V2 Tests will use: mpirun -np ${V2_TEST_SOCKETS} with OMP_NUM_THREADS=${V2_TEST_CORES_PER_SOCKET}")
 endif()
 
@@ -274,49 +282,37 @@ function(add_v2_test TEST_NAME)
         ${ARGN}                         # Arguments to parse
     )
     
-    # Detect CPU topology for optimal thread/process counts
-    # Use lscpu for reliable topology detection
-    execute_process(
-        COMMAND bash -c "lscpu | grep 'Socket(s):' | awk '{print $2}'"
-        OUTPUT_VARIABLE NUM_SOCKETS
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-    execute_process(
-        COMMAND bash -c "lscpu | grep 'Core(s) per socket:' | awk '{print $4}'"
-        OUTPUT_VARIABLE CORES_PER_SOCKET
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-    
-    # Fallback to safe defaults if detection fails
-    if(NOT NUM_SOCKETS OR NUM_SOCKETS EQUAL "")
-        set(NUM_SOCKETS 1)
-    endif()
-    if(NOT CORES_PER_SOCKET OR CORES_PER_SOCKET EQUAL "")
-        set(CORES_PER_SOCKET 1)
-    endif()
-    
     # Default MPI processes: at least 2 (or user override)
     if(NOT DEFINED ARG_MPI_PROCS)
-        if(NUM_SOCKETS LESS 2)
+        if(V2_TEST_SOCKETS LESS 2)
             set(ARG_MPI_PROCS 2)
         else()
-            set(ARG_MPI_PROCS ${NUM_SOCKETS})
+            set(ARG_MPI_PROCS ${V2_TEST_SOCKETS})
         endif()
     endif()
-    
+
+    # Independent one-rank unit jobs cannot all be pinned to socket zero: each
+    # mpirun instance would choose the same socket and defeat CTest's otherwise
+    # correct node-wide CPU accounting. Leave only that case to the Linux
+    # scheduler. Multi-rank topology tests retain socket mapping, as do all
+    # integration and performance processes.
+    set(TEST_MPI_PLACEMENT --bind-to socket --map-by socket)
+    if("${ARG_LABELS}" MATCHES "Unit" AND ARG_MPI_PROCS EQUAL 1)
+        set(TEST_MPI_PLACEMENT --bind-to none --map-by slot)
+    endif()
+
     # Build mpirun command with optimal settings
     set(MPI_CMD
         mpirun
         -np ${ARG_MPI_PROCS}
-        --bind-to socket
-        --map-by socket
+        ${TEST_MPI_PLACEMENT}
         --mca mpi_leave_pinned 1
         --mca btl_vader_single_copy_mechanism none
         --mca orte_allowed_exit_without_sync 1
     )
     
     # Add --oversubscribe if we have fewer sockets than MPI ranks
-    if(NUM_SOCKETS LESS ARG_MPI_PROCS)
+    if(V2_TEST_SOCKETS LESS ARG_MPI_PROCS)
         list(APPEND MPI_CMD --oversubscribe)
     endif()
     
@@ -376,19 +372,46 @@ function(add_v2_test TEST_NAME)
         set(DEFAULT_LOG_LEVEL "INFO")
     endif()
     
-    # Build base environment variables for optimal performance + logging
+    # Production and integration work deliberately use every physical core in
+    # the rank's socket. Unit tests instead share the host under unrestricted
+    # CTest parallelism, so their implicit OpenMP width must agree with the CPU
+    # slots advertised to CTest. Keep four slots as the ordinary unit budget,
+    # divide those slots across MPI ranks, and grow the budget for tests that
+    # intentionally exercise more than four ranks. Focused thread-totality
+    # tests choose their own explicit widths; a unit test must never inherit a
+    # hidden 28-thread team merely because this host has 28 cores per socket.
+    set(TEST_OMP_THREADS ${V2_TEST_CORES_PER_SOCKET})
+    set(TEST_OMP_PLACES sockets)
+    set(TEST_OMP_PROC_BIND close)
+    set(TEST_KMP_AFFINITY "granularity=fine,compact,1,0")
+    set(TEST_PROCESSORS 4)
+    if("${ARG_LABELS}" MATCHES "Unit")
+        if(ARG_MPI_PROCS GREATER TEST_PROCESSORS)
+            set(TEST_PROCESSORS ${ARG_MPI_PROCS})
+        endif()
+        math(EXPR TEST_OMP_THREADS
+             "${TEST_PROCESSORS} / ${ARG_MPI_PROCS}")
+        if(TEST_OMP_THREADS LESS 1)
+            set(TEST_OMP_THREADS 1)
+        endif()
+        set(TEST_OMP_PLACES cores)
+        set(TEST_OMP_PROC_BIND false)
+        set(TEST_KMP_AFFINITY disabled)
+    endif()
+
+    # Build base environment variables for optimal performance + logging.
     set(TEST_ENV 
         "LLAMINAR_LOG_LEVEL=${DEFAULT_LOG_LEVEL}"
         "LLAMINAR_TP_COLLECT_TIMEOUT_MS=30000"
         "HWLOC_COMPONENTS=-gl,-opencl"
-        "OMP_NUM_THREADS=${CORES_PER_SOCKET}"
-        "OMP_PLACES=sockets"
-        "OMP_PROC_BIND=close"
+        "OMP_NUM_THREADS=${TEST_OMP_THREADS}"
+        "OMP_PLACES=${TEST_OMP_PLACES}"
+        "OMP_PROC_BIND=${TEST_OMP_PROC_BIND}"
         "OMP_NESTED=false"
         "OMP_DYNAMIC=false"
-        "KMP_AFFINITY=granularity=fine,compact,1,0"
+        "KMP_AFFINITY=${TEST_KMP_AFFINITY}"
         "KMP_BLOCKTIME=0"
-        "MKL_NUM_THREADS=${CORES_PER_SOCKET}"
+        "MKL_NUM_THREADS=${TEST_OMP_THREADS}"
         "MKL_DYNAMIC=false"
         "OMPI_MCA_mpi_leave_pinned=1"
         "OMPI_MCA_btl_vader_single_copy_mechanism=none"
@@ -437,12 +460,14 @@ function(add_v2_test TEST_NAME)
     #
     # CTest uses PROCESSORS to cap concurrent tests so the total does not
     # exceed the --parallel limit (defaults to nproc = 112 on 2×28c HT).
-    # Setting each test to 4 processors means at most ~28 tests run
-    # concurrently (112 / 4), which avoids MPI/OpenMP oversubscription
-    # while still allowing good parallelism across the test suite.
+    # Unit slots and their MPI/OpenMP widths are derived together above. This
+    # is the accounting authority that permits the documented unrestricted
+    # gate without starving unrelated tests. Non-unit work retains four CTest
+    # slots here because Integration is serialized separately and performance
+    # tests are selected deliberately.
     # =========================================================================
     set_tests_properties(${TEST_NAME} PROPERTIES
-        PROCESSORS 4
+        PROCESSORS ${TEST_PROCESSORS}
     )
 
     # Add RESOURCE_LOCK if specified (prevents parallel execution of tests needing same resource)
@@ -874,9 +899,49 @@ add_v2_routed_expert_policy_unit(
     unit/execution/moe/Test__MoEContinuationTPContextPlumbing.cpp
 )
 add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_node_local_route_transport
+    V2_Unit_MoEOverlayNodeLocalRouteTransport
+    unit/execution/moe/Test__MoEOverlayNodeLocalRouteTransport.cpp
+)
+add_v2_routed_expert_policy_unit(
     v2_unit_moe_expert_owner_map
     V2_Unit_MoEExpertOwnerMap
     unit/execution/moe/Test__MoEExpertOwnerMap.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_device_controller_topology
+    V2_Unit_MoEOverlayDeviceControllerTopology
+    unit/execution/moe/Test__MoEOverlayDeviceControllerTopology.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_device_controller_protocol
+    V2_Unit_MoEOverlayDeviceControllerProtocol
+    unit/execution/moe/Test__MoEOverlayDeviceControllerProtocol.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_epoch_lease_lifecycle
+    V2_Unit_MoEOverlayEpochLeaseLifecycle
+    unit/execution/moe/Test__MoEOverlayEpochLeaseLifecycle.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_device_transport_protocol
+    V2_Unit_MoEOverlayDeviceTransportProtocol
+    unit/execution/moe/Test__MoEOverlayDeviceTransportProtocol.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_device_physical_movement
+    V2_Unit_MoEOverlayDevicePhysicalMovement
+    unit/execution/moe/Test__MoEOverlayDevicePhysicalMovement.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_device_physical_slot_ledger
+    V2_Unit_MoEOverlayDevicePhysicalSlotLedger
+    unit/execution/moe/Test__MoEOverlayDevicePhysicalSlotLedger.cpp
+)
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_device_placement_policy
+    V2_Unit_MoEOverlayDevicePlacementPolicy
+    unit/execution/moe/Test__MoEOverlayDevicePlacementPolicy.cpp
 )
 add_v2_routed_expert_policy_unit(
     v2_unit_moe_overlay_residency_authority
@@ -908,8 +973,13 @@ add_v2_routed_expert_policy_unit(
     V2_Unit_MoEOverlayResidencyMaintenanceService
     unit/execution/moe/Test__MoEOverlayResidencyMaintenanceService.cpp
 )
+add_v2_routed_expert_policy_unit(
+    v2_unit_moe_overlay_service_telemetry_publication
+    V2_Unit_MoEOverlayServiceTelemetryPublication
+    unit/execution/moe/Test__MoEOverlayServiceTelemetryPublication.cpp
+)
 
-# Test: CPU-only cross-rank ExpertOverlay prepare/commit consensus protocol
+# Test: CPU-only cross-rank ExpertOverlay stage/prepare/publish consensus protocol
 add_v2_routed_expert_policy_unit(
     v2_unit_moe_overlay_distributed_residency_protocol
     V2_Unit_MoEOverlayDistributedResidencyProtocol
@@ -1208,6 +1278,22 @@ add_v2_test(V2_Unit_Sha256
     MPI_PROCS 1
 )
 
+# Test: heavyweight parity-reference generation has one node-local writer.
+add_executable(v2_test_reference_generation_lease
+    unit/utils/Test__ReferenceGenerationLease.cpp
+)
+target_link_libraries(v2_test_reference_generation_lease
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME V2_Unit_ReferenceGenerationLease
+    COMMAND $<TARGET_FILE:v2_test_reference_generation_lease>
+)
+set_tests_properties(V2_Unit_ReferenceGenerationLease PROPERTIES
+    LABELS "V2;Unit;Utils;Parity;ReferenceGeneration;Lifecycle;Regression"
+    TIMEOUT 10
+)
+
 # Test: StageDumpConfig - Environment variable parsing and filtering for stage dumps
 add_executable(v2_test_stage_dump_config unit/execution/debug/Test__StageDumpConfig.cpp)
 target_link_libraries(v2_test_stage_dump_config 
@@ -1387,6 +1473,38 @@ add_v2_test(V2_Integration_UnifiedPP_Execution
 
 # Cross-vendor integration tests (require both CUDA and ROCm)
 if(HAVE_CUDA AND HAVE_ROCM)
+
+    # Process-isolated emitters for the heterogeneous ExpertOverlay arithmetic
+    # contract.  CUDA and HIP runtimes are deliberately never initialized in
+    # the same process; the Python integration gate joins their exact FP32 CSVs
+    # and byte sidecars while retaining both sets as diagnostic artifacts.
+    set(CROSS_VENDOR_MOE_ARITHMETIC_SOURCE
+        integration/kernels/moe/CrossVendorNativeVNNIArithmeticEmitter.cpp)
+    add_executable(v2_cross_vendor_moe_arithmetic_cuda
+        ${CROSS_VENDOR_MOE_ARITHMETIC_SOURCE})
+    target_compile_definitions(v2_cross_vendor_moe_arithmetic_cuda PRIVATE
+        LLAMINAR_CROSS_VENDOR_ARITHMETIC_CUDA=1)
+    target_link_libraries(v2_cross_vendor_moe_arithmetic_cuda PRIVATE
+        llaminar2_core CUDA::cudart)
+
+    add_executable(v2_cross_vendor_moe_arithmetic_rocm
+        ${CROSS_VENDOR_MOE_ARITHMETIC_SOURCE})
+    target_compile_definitions(v2_cross_vendor_moe_arithmetic_rocm PRIVATE
+        LLAMINAR_CROSS_VENDOR_ARITHMETIC_ROCM=1)
+    target_link_libraries(v2_cross_vendor_moe_arithmetic_rocm PRIVATE
+        llaminar2_core)
+
+    add_v2_test(V2_Integration_CrossVendor_MoE_AllCodebooks_ArithmeticParity
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/integration/kernels/moe/compare_cross_vendor_native_vnni_arithmetic.py
+            --cuda-emitter $<TARGET_FILE:v2_cross_vendor_moe_arithmetic_cuda>
+            --rocm-emitter $<TARGET_FILE:v2_cross_vendor_moe_arithmetic_rocm>
+            --output-dir ${CMAKE_CURRENT_BINARY_DIR}/cross_vendor_moe_arithmetic_evidence
+        LABELS "V2;Integration;CUDA;ROCm;CrossVendor;Kernels;MoE;ExpertOverlay;Parity;AllFormats;AllCodebooks;NativeVNNI;PreparedWeights;DecodeEquivalent;DeviceResident;Regression"
+        MPI_PROCS 1
+        TIMEOUT 900
+        NO_MODELS
+    )
 
     # Test: CUDA Vector Add Kernels - Accuracy tests for FP32/FP16/BF16/INT8/INT32 reduction kernels
     add_executable(v2_integration_cuda_vector_add_kernels integration/kernels/cuda/ops/Test__CUDAVectorAddKernels.cpp)
@@ -2946,21 +3064,69 @@ foreach(NATIVE_VNNI_UNIT_TEST IN LISTS NATIVE_VNNI_UNIT_TESTS)
 endforeach()
 
 # These tests intentionally create nested worker pools or run the largest
-# policy reductions. Advertise sixteen logical CTest slots per process: on the
-# canonical 112-thread/56-core host this admits at most seven heavy jobs, whose
-# nested pools still fit on the physical cores. Eight slots admitted every
-# profiler shard plus all heavy trainers in the first wave and could starve an
-# otherwise five-second shard beyond its sixty-second timeout.
+# policy reductions. Reserve sixteen physical cores here; the final Unit-test
+# normalization below translates that reservation into the host's logical
+# CTest slots. The numerical-Python tests are also affinity-bound below, so
+# their affinity-aware process-pool defaults cannot silently exceed the same
+# reservation advertised to CTest.
 set(NATIVE_VNNI_HEAVY_UNIT_TESTS
     V2_Unit_CUDANativeVNNIDecodeTrainer
     V2_Unit_CPUNativeVNNIVerifierTrainer
     V2_Unit_NativeVNNICommonDispatchPolicy
+    V2_Unit_NativeVNNIProductionMoEPrefillSweep
 )
 foreach(SHARD_INDEX RANGE 0 ${NATIVE_VNNI_PROFILER_EVIDENCE_LAST_SHARD})
     list(APPEND NATIVE_VNNI_HEAVY_UNIT_TESTS
          V2_Unit_NativeVNNIProfilerEvidence_${SHARD_INDEX})
 endforeach()
 set_tests_properties(${NATIVE_VNNI_HEAVY_UNIT_TESTS} PROPERTIES PROCESSORS 16)
+
+# Importing NumPy, SciPy, and scikit-learn loads two independent OpenBLAS
+# runtimes plus libgomp. Left unconstrained, one tiny Python unit process on the
+# canonical host creates 127 numerical-library threads before an
+# affinity-aware NativeVNNI process pool is considered. Several such tests can
+# therefore turn a five-second focused regression into a timeout even though
+# their CTest PROCESSORS declarations are otherwise correct.
+#
+# Keep process-level parallelism authoritative for these pure-policy tests:
+# CTest assigns the advertised CPU set, every child inherits that affinity,
+# and the NativeVNNI worker-count helpers derive their physical-core cap from
+# that exact set. Numerical libraries stay single-threaded inside each worker,
+# preventing a nested threads-times-processes explosion while preserving every
+# parallel-policy assertion in the tests themselves.
+set(NATIVE_VNNI_NUMERICAL_PYTHON_UNIT_TESTS
+    V2_Unit_CPUNativeVNNIDecodeSealedPlan
+    V2_Unit_CPUNativeVNNIDecodeTrainer
+    V2_Unit_CPUNativeVNNIGroupedSealedPlan
+    V2_Unit_CPUNativeVNNIPrefillTrainer
+    V2_Unit_CPUNativeVNNIPrefillTrainingPlan
+    V2_Unit_CPUNativeVNNIVerifierTrainer
+    V2_Unit_CUDANativeVNNIDecodeTrainer
+    V2_Unit_NativeVNNICommonDispatchPolicy
+    V2_Unit_NativeVNNIDispatchRefreshScript
+    V2_Unit_NativeVNNIPairedRequests
+    V2_Unit_NativeVNNIProfilerDiagnostics
+    V2_Unit_ROCmNativeVNNIDecodeTrainer
+)
+foreach(SHARD_INDEX RANGE 0 ${NATIVE_VNNI_PROFILER_EVIDENCE_LAST_SHARD})
+    list(APPEND NATIVE_VNNI_NUMERICAL_PYTHON_UNIT_TESTS
+         V2_Unit_NativeVNNIProfilerEvidence_${SHARD_INDEX})
+endforeach()
+set_tests_properties(${NATIVE_VNNI_NUMERICAL_PYTHON_UNIT_TESTS} PROPERTIES
+    PROCESSOR_AFFINITY TRUE
+)
+set_property(TEST ${NATIVE_VNNI_NUMERICAL_PYTHON_UNIT_TESTS}
+    APPEND PROPERTY ENVIRONMENT
+    "OMP_NUM_THREADS=1"
+    "OMP_DYNAMIC=false"
+    "OPENBLAS_NUM_THREADS=1"
+    "MKL_NUM_THREADS=1"
+    "MKL_DYNAMIC=false"
+    "NUMEXPR_NUM_THREADS=1"
+    "BLIS_NUM_THREADS=1"
+    "VECLIB_MAXIMUM_THREADS=1"
+    "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
+)
 
 # Performance: Q16 Fixed-Scale SIMD Quantization
 add_executable(v2_perf_q16_fixed_scale_simd performance/tensors/Perf__Q16_FixedScaleSIMD.cpp)
@@ -6237,6 +6403,15 @@ add_v2_test(V2_Integration_CUDAMoEKernel
     LABELS "V2;Integration;CUDA;MoE;Routing;Gather;Scatter;SwiGLU;KernelFactory"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_CUDA_MoEAsyncHistogramCaptureLifecycle
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+            --gtest_filter=Test__CUDAMoEKernel.AsyncHistogramProducerPreparationPrecedesGraphCapture
+            --gtest_brief=1
+    LABELS "V2;Integration;CUDA;MoE;Dynamic;Histogram;GraphCapture;Async;ExplicitStream;Regression"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
 add_v2_test(V2_Integration_CUDA_MoEOverlayCPUColdPromotionGroupedParity
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
             --gtest_filter=Test__CUDAMoEKernel.CPUColdPromotedAsymmetricGroupedDecodeAndPrefillMatchCompactBytes
@@ -7139,6 +7314,11 @@ if(ZLIB_FOUND)
         "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf")
     set(V2_PARITY_MODEL_QWEN35_MOE_Q3
         "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-35B-A3B-Q3_K_S.gguf")
+    set(V2_PARITY_MODEL_QWEN35_MOE_122B_Q8
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-122B-A10B-UD-Q8_K_XL-00001-of-00004.gguf"
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-122B-A10B-UD-Q8_K_XL-00002-of-00004.gguf"
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-122B-A10B-UD-Q8_K_XL-00003-of-00004.gguf"
+        "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-122B-A10B-UD-Q8_K_XL-00004-of-00004.gguf")
     set(V2_PARITY_MODEL_QWEN36_MOE
         "${WORKSPACE_ROOT_PARITY}/models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf")
 
@@ -7871,7 +8051,7 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;ExpertOverlay;SparseCollectives;CUDA;ROCm;NCCL;RCCL;CPU;LocalTP;PyTorch"
         MPI_PROCS 1
         TIMEOUT 2400
-        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,weight_loading,moe_rebalance,kernel"
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,weight_loading,moe_rebalance,moe_overlay_controller,kernel"
         MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
 
@@ -7891,7 +8071,7 @@ if(ZLIB_FOUND)
         LABELS "V2;Integration;Parity;Qwen36MoE;MixtureOfExperts;GatedDeltaNet;CPU;CUDA;ROCm;LocalTP;ExpertOverlay;PrefillTensorParallelDecodeReplicated;Dynamic;LLEP;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
         TIMEOUT 3600
-        PRODUCTION_PERF_STATS_FILTER "forward_graph,moe_rebalance,moe_placement"
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,moe_rebalance,moe_placement,moe_overlay_controller"
         MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
 
@@ -8026,7 +8206,7 @@ if(ZLIB_FOUND)
         # Keep the ownership proof enabled without rendering every generic
         # workspace allocation in the production campaign summary. Qualified
         # metric filters still activate the `memory` producer domain.
-        PRODUCTION_PERF_STATS_FILTER "forward_graph,moe_overlay,moe_overlay_participant_graph,moe_overlay_residency,memory.moe_serial_local_expert_buffer_arena_allocations,memory.moe_serial_local_expert_buffer_arena_bytes"
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,moe_overlay,moe_overlay_controller,moe_overlay_participant_graph,moe_overlay_residency,memory.moe_serial_local_expert_buffer_arena_allocations,memory.moe_serial_local_expert_buffer_arena_bytes"
         # A production process owns one OrchestrationRunner/MPI application
         # lifetime. Topology variants and the segmented-prefill proof therefore
         # each get a fresh world instead of following another complete runner
@@ -8037,6 +8217,49 @@ if(ZLIB_FOUND)
     )
 
     message(STATUS "V2: Qwen3.5 MoE GraphNative parity tests enabled")
+
+    # ---- Exact 122B 2xCUDA continuation + 4xROCm secondary matrix ----
+    # The source is shared with the mature coordinated two-rank graph-native
+    # fixture, while the compile definition registers only the 122B cells in
+    # this binary. This keeps model manifests exact: the 35B campaign does not
+    # stage 126 GiB of unrelated weights and the 122B campaign cannot start
+    # unless all four split GGUF files are authenticated in tmpfs.
+    add_executable(v2_integration_parity_qwen35moe_122b_cuda2_rocm4
+        integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_compile_definitions(
+        v2_integration_parity_qwen35moe_122b_cuda2_rocm4 PRIVATE
+        LLAMINAR_QWEN122_MATRIX_ONLY=1
+    )
+    target_link_libraries(v2_integration_parity_qwen35moe_122b_cuda2_rocm4
+        llaminar2_core
+        v2_test_utils
+        GTest::gtest
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35moe_122b_cuda2_rocm4 PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_122b_cuda2_rocm4
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_122B_CUDA2_ROCm4
+        LABELS "V2;Integration;Parity;Qwen35MoE;122B;Q8;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;NCCL;RCCL;MPI;MTP;DynamicDepth;Static;Dynamic;Ordinal;Random;PyTorch;GoldenReference;FullModel"
+        MPI_PROCS 2
+        # The aggregate one-hour target remains a campaign-runner economy
+        # result. This is only the independent stuck-process completion guard.
+        TIMEOUT 21600
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,weight_loading,moe_rebalance,moe_placement,moe_overlay,moe_overlay_endpoint,moe_overlay_controller,moe_overlay_participant_graph,moe_overlay_residency,memory.moe_serial_local_expert_buffer_arena_allocations,memory.moe_serial_local_expert_buffer_arena_bytes"
+        # One MPI application runs the complete matrix sequentially. Each cell
+        # still owns a fresh runner, arena, graph family, streams, KV state, and
+        # authenticated relay generation; only the immutable ModelContext and
+        # PreparedWeightStore survive between cells. This makes teardown/re-entry
+        # part of the canonical lifecycle proof and amortizes the 126-GiB model
+        # preparation cost instead of paying it twenty times.
+        MODEL_FILES ${V2_PARITY_MODEL_QWEN35_MOE_122B_Q8}
+    )
+
+    message(STATUS "V2: Qwen3.5 MoE 122B CUDA2/ROCm4 parity matrix enabled")
 
     # ---- One-tier CPU ExpertOverlay parity (cross-socket routed partials + dense TP) ----
     #
@@ -8883,7 +9106,13 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsBaselineThenMTPRegr
 )
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmPaddedPrefillBucketRegression
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmPaddedPrefillBucketGraphCaptureRegression
-    LABELS "V2;Integration;PrefixCache;RealModel;Qwen36;ROCm;GPU;GraphCapture;Regression"
+    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;GraphCapture;PaddedPrefill;ShiftedState;AcceptedDraft;Regression"
+    MPI_PROCS 1
+    TIMEOUT 900
+)
+add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36CUDAPaddedPrefillBucketRegression
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36CUDAPaddedPrefillBucketGraphCaptureRegression
+    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;CUDA;GPU;GraphCapture;PaddedPrefill;ShiftedState;AcceptedDraft;Regression"
     MPI_PROCS 1
     TIMEOUT 900
 )
@@ -11719,7 +11948,6 @@ add_v2_test(V2_Integration_MoEOverlaySparseTransport_MPI
 # Test: non-blocking two-phase ExpertOverlay residency votes over real MPI
 add_executable(v2_integration_moe_overlay_residency_consensus_mpi
     integration/moe/Test__MoEOverlayMPIResidencyConsensus.cpp
-    integration/moe/Test__MoEOverlayHeterogeneousResidencyMPI.cpp
     integration/mpi_gtest_main.cpp
 )
 target_link_libraries(v2_integration_moe_overlay_residency_consensus_mpi
@@ -11729,7 +11957,7 @@ target_link_libraries(v2_integration_moe_overlay_residency_consensus_mpi
 )
 add_v2_test(V2_Integration_MoEOverlayResidencyConsensus_MPI
     COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
-    LABELS "V2;Integration;CUDA;ROCm;CPU;MoE;Overlay;Residency;Async;TwoPhase;MPI;NodeTP;TopologyFlexible;PerfStats;ByteExact;NoBlocking"
+    LABELS "V2;Integration;CPU;MoE;Overlay;Residency;Async;TypedLifecycle;MPI;PerfStats;ByteExact;NoBlocking"
     MPI_PROCS 2
     TIMEOUT 60
     NO_MODELS
@@ -13147,6 +13375,34 @@ if(HAVE_CUDA)
 endif()
 
 # =============================================================================
+# Performance Test: CUDA expert host-relay progress under captured inference
+# =============================================================================
+# Compares ordinary D2H DMA with a high-priority mapped-host copy kernel while a
+# retained memory-pressure graph is live. The candidate must improve progress,
+# remain byte exact, and stay within the simultaneous inference-interference gate
+# before it may be installed in ExpertOverlay's same-backend no-P2P relay.
+if(HAVE_CUDA)
+    add_executable(v2_perf_cuda_expert_host_relay_progress
+        performance/Perf__CUDAExpertHostRelayProgress.cu
+    )
+    target_link_libraries(v2_perf_cuda_expert_host_relay_progress PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        CUDA::cudart
+    )
+    add_v2_test(V2_Perf_CUDAExpertHostRelayProgress
+        COMMAND $<TARGET_FILE:v2_perf_cuda_expert_host_relay_progress>
+                --gtest_brief=1
+        LABELS "V2;Performance;CUDA;MoE;ExpertOverlay;MappedHost;GraphCapture;Async;ByteExact;NoBlocking"
+        MPI_PROCS 1
+        TIMEOUT 120
+        NO_MODELS
+    )
+    message(STATUS "V2 Tests: Added CUDA expert host-relay progress benchmark")
+endif()
+
+# =============================================================================
 # ROCm MoE Kernel Integration Tests
 # =============================================================================
 if(HAVE_ROCM)
@@ -13162,6 +13418,15 @@ if(HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
         LABELS "V2;Integration;ROCm;MoE;Routing;Gather;Scatter;gfx906"
         MPI_PROCS 1
+    )
+    add_v2_test(V2_Integration_ROCm_MoEAsyncHistogramCaptureLifecycle
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+                --gtest_filter=Test__ROCmMoEKernel.AsyncHistogramProducerPreparationPrecedesGraphCapture
+                --gtest_brief=1
+        LABELS "V2;Integration;ROCm;MoE;Dynamic;Histogram;GraphCapture;Async;ExplicitStream;Regression;gfx906"
+        MPI_PROCS 1
+        NO_MODELS
+        TIMEOUT 30
     )
     add_v2_test(V2_Integration_ROCm_MoEOverlayCPUColdPromotionGroupedParity
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
@@ -13236,6 +13501,7 @@ endif()
 if(HAVE_CUDA OR HAVE_ROCM)
     set(V2_GPU_EXPERT_TRANSFER_TEST_SOURCES
         unit/moe/Test__GPUExpertTransfer.cpp
+        integration/transfer/Test__MappedTransferProgressEpoch.cpp
         integration/moe/Test__ExpertTierGpuBlobTransferIntegration.cpp
         integration/moe/Test__MoEOverlayThreeTierMigrationIntegration.cpp
     )
@@ -13291,6 +13557,15 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 --gtest_filter=ExpertTierGpuBlobTransferIntegration.*
                 --gtest_brief=1
         LABELS "V2;Integration;CUDA;ROCm;MoE;ExpertOverlay;WeightStreaming;Async;DoubleBuffered;PerfStats;ByteExact;NoBlocking"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+    )
+    add_v2_test(V2_Integration_MappedTransferProgressEpoch
+        COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                --gtest_filter=MappedTransferProgressEpochIntegration.*
+                --gtest_brief=1
+        LABELS "V2;Integration;CUDA;ROCm;TransferEngine;MoE;ExpertOverlay;MappedHost;GraphCapture;Parallel;ByteExact;NoBlocking"
         MPI_PROCS 1
         TIMEOUT 30
         NO_MODELS
@@ -13710,6 +13985,34 @@ if(HAVE_CUDA AND HAVE_ROCM)
             "LLAMINAR_PERF_STATS_FILTER=moe_overlay_activation_epoch"
     )
 
+    # Topology-wide controller mapping proof on the production 2xCUDA/4xROCm
+    # cardinality. The two synthetic ranks construct the POSIX mapping in
+    # parallel so NUMA first-touch necessarily precedes both driver families'
+    # registrations, then exact streams prove bytes in both owner directions.
+    add_executable(v2_integration_moe_overlay_device_controller_fabric_cuda_rocm
+        integration/transfer/Test__MoEOverlayDeviceControllerFabricCUDAAndROCm.cpp
+    )
+    target_include_directories(
+        v2_integration_moe_overlay_device_controller_fabric_cuda_rocm PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    target_link_libraries(
+        v2_integration_moe_overlay_device_controller_fabric_cuda_rocm PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_MoEOverlayDeviceControllerFabric_CUDA_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_moe_overlay_device_controller_fabric_cuda_rocm>
+        LABELS "V2;Integration;ExpertOverlay;CUDA;ROCm;Heterogeneous;MappedHost;DeviceController;NUMA;ExplicitStream;PerfStats;Regression"
+        MPI_PROCS 1
+        TIMEOUT 30
+        NO_MODELS
+        ENVIRONMENT
+            "LLAMINAR_PERF_STATS_SUMMARY=1"
+            "LLAMINAR_PERF_STATS_FILTER=moe_overlay_controller"
+    )
+
     # Production packet proof over the topology-resolved node-local transport.
     # Both tests reverse CUDA/ROCm endpoint roles, inspect the flattened HIP
     # device-wait DAG, and submit the complete zero-copy sparse round trip before
@@ -13735,6 +14038,60 @@ if(HAVE_CUDA AND HAVE_ROCM)
         ENVIRONMENT
             "LLAMINAR_PERF_STATS_SUMMARY=1"
             "LLAMINAR_PERF_STATS_FILTER=moe_overlay_activation_epoch"
+    )
+
+    # Cross-process admission proof for the production POSIX-mapped channel.
+    # The follower host arms the shared control in one MPI process and retained
+    # CUDA/ROCm graphs in both ranks must observe that publication before
+    # producing their endpoint timeline words. Both rank/backend assignments
+    # run so no backend role is encoded by the protocol.
+    add_executable(v2_integration_mapped_activation_admission_mpi
+        integration/transfer/Test__MappedActivationAdmissionMPI.cpp
+        integration/mpi_gtest_main.cpp
+    )
+    target_link_libraries(
+        v2_integration_mapped_activation_admission_mpi PRIVATE
+        llaminar2_core
+        GTest::gtest
+        MPI::MPI_CXX
+    )
+    add_v2_test(V2_Integration_MappedActivationAdmission_MPI
+        COMMAND $<TARGET_FILE:v2_integration_mapped_activation_admission_mpi>
+        LABELS "V2;Integration;ExpertOverlay;CUDA;ROCm;Heterogeneous;MappedHost;DeviceEpoch;MPI;ExplicitStream;Regression"
+        MPI_PROCS 2
+        TIMEOUT 30
+        NO_MODELS
+        ENVIRONMENT
+            "LLAMINAR_PERF_STATS_SUMMARY=1"
+            "LLAMINAR_PERF_STATS_FILTER=moe_overlay_activation_epoch"
+    )
+
+    # Lifecycle-simplification proof: every non-authority CUDA/ROCm graph is
+    # pre-armed before the leader creates an epoch, and one complete retained
+    # transaction replays without the historical host-stepped phase scheduler.
+    add_executable(v2_integration_moe_overlay_prearmed_transaction_mpi
+        integration/transfer/Test__MoEOverlayPrearmedTransactionMPI.cpp
+        integration/mpi_gtest_main.cpp
+    )
+    target_include_directories(
+        v2_integration_moe_overlay_prearmed_transaction_mpi PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/integration/transfer
+    )
+    target_link_libraries(
+        v2_integration_moe_overlay_prearmed_transaction_mpi PRIVATE
+        llaminar2_core
+        GTest::gtest
+        MPI::MPI_CXX
+    )
+    add_v2_test(V2_Integration_MoEOverlayPrearmedTransaction_MPI
+        COMMAND $<TARGET_FILE:v2_integration_moe_overlay_prearmed_transaction_mpi>
+        LABELS "V2;Integration;ExpertOverlay;CUDA;ROCm;Heterogeneous;MappedHost;DeviceController;DeviceEpoch;MPI;ExplicitStream;Regression"
+        MPI_PROCS 2
+        TIMEOUT 30
+        NO_MODELS
+        ENVIRONMENT
+            "LLAMINAR_PERF_STATS_SUMMARY=1"
+            "LLAMINAR_PERF_STATS_FILTER=moe_overlay_controller"
     )
 endif()
 
@@ -13766,6 +14123,10 @@ message(STATUS "V2 Tests: Added prefill→decode transition regression tests")
 add_executable(v2_unit_mpi_coordinated_mode
     unit/execution/runner/Test__MPICoordinatedMode.cpp
 )
+target_compile_definitions(v2_unit_mpi_coordinated_mode
+    PRIVATE
+        LLAMINAR_ORCHESTRATION_RUNNER_SOURCE="${CMAKE_CURRENT_LIST_DIR}/../../src/v2/execution/runner/OrchestrationRunner.cpp"
+)
 target_link_libraries(v2_unit_mpi_coordinated_mode
     llaminar2_core
     GTest::gtest
@@ -13778,6 +14139,27 @@ add_v2_test(V2_Unit_MPICoordinatedMode
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added MPI coordinated mode unit tests")
+
+# Exception-safe rank initialization lifecycle regression. This is registered
+# as Integration because it exercises a real two-rank MPI collective, while
+# remaining model-free and device-free so failures reproduce in seconds.
+add_executable(v2_integration_rank_initialization_lifecycle_mpi
+    integration/execution/runner/Test__RankInitializationLifecycleMPI.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_link_libraries(v2_integration_rank_initialization_lifecycle_mpi
+    llaminar2_core
+    GTest::gtest
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Integration_RankInitializationLifecycle_MPI
+    COMMAND $<TARGET_FILE:v2_integration_rank_initialization_lifecycle_mpi>
+    LABELS "V2;Integration;Orchestration;Lifecycle;MPI;Regression"
+    MPI_PROCS 2
+    TIMEOUT 30
+    NO_MODELS
+)
+message(STATUS "V2 Tests: Added rank initialization lifecycle MPI regressions")
 
 # MoE overlay plan freezing unit tests
 # Locks in that OrchestrationRunner uses model metadata to freeze YAML overlay
@@ -14199,6 +14581,7 @@ endif()
 add_executable(v2_test_snapshot_capture
     unit/snapshots/Test__SnapshotCapture.cpp
     unit/snapshots/Test__ParityGDNHeadPermutation.cpp
+    unit/snapshots/Test__ParityNumericalAggregation.cpp
     unit/snapshots/Test__ParitySnapshotSelection.cpp
     unit/snapshots/Test__MTPParitySnapshotContext.cpp
     unit/snapshots/Test__MoERoutingBoundary.cpp
@@ -15882,3 +16265,29 @@ add_v2_test(V2_Integration_FPWeightPipeline
     LABELS "V2;Integration;WeightLoading;GpuPipeline;FP;CUDA;ROCm"
     MPI_PROCS 1
 )
+
+# CTest's unrestricted parallel level is expressed in logical CPUs, whereas
+# unit-test worker budgets above are deliberately expressed in physical cores.
+# Normalize every configured Unit test in one final pass, including direct
+# add_test() registrations and explicit heavyweight overrides. This keeps the
+# wrapper, raw Python tests, and nested-worker trainers under one accounting
+# authority instead of relying on per-test timeout luck on SMT hosts.
+get_property(V2_CONFIGURED_TESTS DIRECTORY PROPERTY TESTS)
+foreach(V2_CONFIGURED_TEST IN LISTS V2_CONFIGURED_TESTS)
+    get_property(V2_CONFIGURED_TEST_LABELS
+        TEST ${V2_CONFIGURED_TEST} PROPERTY LABELS)
+    if("${V2_CONFIGURED_TEST_LABELS}" MATCHES "Unit")
+        get_property(V2_TEST_HAS_PROCESSORS
+            TEST ${V2_CONFIGURED_TEST} PROPERTY PROCESSORS SET)
+        if(V2_TEST_HAS_PROCESSORS)
+            get_property(V2_TEST_PHYSICAL_PROCESSORS
+                TEST ${V2_CONFIGURED_TEST} PROPERTY PROCESSORS)
+        else()
+            set(V2_TEST_PHYSICAL_PROCESSORS 1)
+        endif()
+        math(EXPR V2_TEST_LOGICAL_PROCESSORS
+             "${V2_TEST_PHYSICAL_PROCESSORS} * ${V2_TEST_THREADS_PER_CORE}")
+        set_tests_properties(${V2_CONFIGURED_TEST} PROPERTIES
+            PROCESSORS ${V2_TEST_LOGICAL_PROCESSORS})
+    endif()
+endforeach()

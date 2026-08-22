@@ -24,6 +24,7 @@
 #include "../../backends/DeviceId.h"
 #include "../../config/OrchestrationConfig.h"
 #include "../prefix_cache/PrefixCacheStateProbe.h"
+#include "../InferenceReadiness.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../utils/Sampler.h"
 #include "../../utils/ToolCallTypes.h"
@@ -45,6 +46,24 @@ namespace llaminar2
 {
 
     /**
+     * @brief Exact model-state effect of a caller-selected generation token.
+     *
+     * Ordinary decode returns a sampled token before that token necessarily
+     * owns a model row. Forced continuations likewise differ in whether the
+     * returned token is merely selected for the next transaction or has
+     * already been forwarded by a device-resident transaction. Publishing the
+     * distinction prevents callers from guessing from backend or MTP policy
+     * and accidentally forwarding a token twice.
+     */
+    enum class ReturnedTokenCommitState : std::uint8_t
+    {
+        Unspecified = 0, ///< Operation publishes no forced-token contract.
+        NoModelRow = 1, ///< Control-only token (for example EOS) made no row.
+        Pending = 2, ///< Token is authoritative but has not been forwarded.
+        Committed = 3, ///< Model state and terminal logits include the token.
+    };
+
+    /**
      * @brief Model authority plus the production plan that prepared its weights.
      *
      * Packed weights may outlive one runner, but their validity is narrower than
@@ -62,6 +81,26 @@ namespace llaminar2
     {
         std::shared_ptr<ModelContext> context;
         RankExecutionPlan prepared_weight_plan;
+        /**
+         * Model-frozen quotas and initial placements whose prepared engines are
+         * retained by @ref context. Null when no routed authority participated.
+         * Consumers may install this immutable physical plan only after the
+         * requested identity below matches exactly.
+         */
+        std::shared_ptr<const MoERoutedExpertPlacementPlan>
+            prepared_routed_weight_plan;
+        /**
+         * Canonical, collision-free identity of the requested routed-weight
+         * topology that populated @ref context.
+         *
+         * The identity is empty when no ExpertOverlay plan participated.  It
+         * includes participant/device topology, whole-expert owner order,
+         * tier capacities, explicit placements, capacity-affecting maintenance
+         * policy, and normalized retained-graph geometry. This prevents a
+         * consumer from re-solving automatic capacity against VRAM already
+         * occupied by the retained physical plan.
+         */
+        std::string routed_weight_authority_identity;
     };
 
     /**
@@ -73,6 +112,9 @@ namespace llaminar2
         std::vector<float> logprobs; ///< Log probabilities (optional)
         bool is_complete{false};     ///< Whether generation is complete (EOS reached)
         std::string error;           ///< Error message if failed (empty on success)
+        /** Typed state effect populated by forced-continuation operations. */
+        ReturnedTokenCommitState returned_token_commit =
+            ReturnedTokenCommitState::Unspecified;
 
         /**
          * @brief Check if generation was successful
@@ -201,6 +243,33 @@ namespace llaminar2
         }
 
         /**
+         * @brief Report mandatory production preparation before timing.
+         *
+         * This is a read-only lifecycle snapshot.  It never advances a
+         * controller or waits for a transfer; ordinary inference and the
+         * background maintenance owner remain responsible for progress.
+         */
+        virtual InferenceReadiness inferenceReadiness() const
+        {
+            return {};
+        }
+
+        /**
+         * @brief Complete all mandatory internal preparation for inference.
+         *
+         * The concrete runner owns any production-shaped setup workload and
+         * protocol progress. Applications call this same idempotent boundary
+         * before serving, benchmarking, parity, or interactive inference and
+         * never learn which subsystem required preparation.
+         *
+         * @return True only when @ref inferenceReadiness is Ready.
+         */
+        virtual bool prepareForInference()
+        {
+            return inferenceReadiness().ready();
+        }
+
+        /**
          * @brief Whether prefillBatch() is implemented for this runner.
          *
          * A request-batched decode lane is valid only if every request slot has
@@ -251,6 +320,8 @@ namespace llaminar2
          *
          * Unlike appending text at the HTTP layer, this keeps model state,
          * sampler history, and later decode output coherent.
+         * The result publishes whether the returned token's model row was
+         * committed by this call or remains pending for the next transaction.
          */
         virtual GenerationResult forceDecodeToken(int32_t token)
         {
@@ -322,13 +393,21 @@ namespace llaminar2
         virtual void setDecodeStepTokenBudget(int max_tokens) { (void)max_tokens; }
 
         /**
-         * @brief Apply any decode-boundary maintenance after a successful token step.
+         * @brief Retire a completed decode transaction into maintenance policy.
          *
          * Server and streaming paths drive decodeStep() directly instead of using
-         * generate(), so they call this hook to share maintenance such as dynamic
-         * MoE hot-expert replica updates.
+         * generate(), so they call this hook after the complete transaction has
+         * committed.  The exact token count matters for grouped MTP: one verifier
+         * transaction may advance several logical decode tokens, and maintenance
+         * cadence must observe every committed token without inspecting MTP state.
+         *
+         * @param committed_tokens Number of logical decode tokens durably committed
+         *        by the completed transaction. Must be positive.
          */
-        virtual bool maybeApplyMoERebalance() { return true; }
+        virtual bool maybeApplyMoERebalance(uint64_t committed_tokens)
+        {
+            return committed_tokens != 0u;
+        }
 
         /**
          * @brief Observable MoE expert movement epoch for parity/diagnostics.

@@ -11,9 +11,12 @@
 
 #include "MoEOverlayLocalCapacityPlanner.h"
 
+#include "backends/GPUAllocationPolicy.h"
 #include "planning/ActivationBufferSizing.h"
+#include "planning/CapturedGraphMemoryEstimator.h"
 #include "planning/MemoryPlanner.h"
 #include "planning/WeightMemoryEstimator.h"
+#include "utils/Logger.h"
 
 #include <algorithm>
 #include <limits>
@@ -137,6 +140,47 @@ namespace llaminar2
         }
     } // namespace
 
+    void installMoEOverlayRuntimeGPUCapacityObservation(
+        RankInventory &inventory,
+        DeviceId device,
+        std::size_t total_bytes,
+        std::size_t free_bytes)
+    {
+        if (!device.is_gpu())
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay runtime capacity observation requires a CUDA or ROCm device");
+        }
+        if (total_bytes == 0 || free_bytes == 0 || free_bytes > total_bytes)
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay runtime capacity observation has invalid memory geometry for " +
+                device.toString());
+        }
+
+        const auto found = std::find_if(
+            inventory.gpus.begin(), inventory.gpus.end(),
+            [&](const DeviceInfo &gpu)
+            {
+                return gpu.type == device.type &&
+                       gpu.local_device_id == device.ordinal;
+            });
+        if (found == inventory.gpus.end())
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay runtime capacity observation names a device absent from rank " +
+                std::to_string(inventory.rank) + ": " + device.toString());
+        }
+
+        /*
+         * Replace both values as one observation. Mixing discovery-time total
+         * memory with runtime free memory would make percentage reserves and
+         * the final fit equation describe different allocator generations.
+         */
+        found->memory_bytes = total_bytes;
+        found->free_memory_bytes = free_bytes;
+    }
+
     std::string MoEOverlayLocalCapacityPlanner::physicalResourceId(
         int world_rank,
         DeviceId device)
@@ -153,10 +197,13 @@ namespace llaminar2
     std::vector<MoEOverlayContinuationShard>
     MoEOverlayLocalCapacityPlanner::continuationShards(
         const RankExecutionPlan &rank_plan,
-        bool builds_root_graph)
+        OverlayRankExecutionKind execution_kind)
     {
         std::vector<MoEOverlayContinuationShard> shards;
-        if (!builds_root_graph)
+        if (execution_kind !=
+                OverlayRankExecutionKind::ContinuationAuthority &&
+            execution_kind !=
+                OverlayRankExecutionKind::ContinuationPeer)
             return shards;
 
         const auto append = [&shards](
@@ -267,9 +314,49 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay local capacity planner received invalid model/rank geometry");
         }
+        if (rank_plan.runtime.mtp.enabled &&
+            input.resident_graph_rows > 0 &&
+            input.resident_graph_rows <
+                resolveMTPMaxTargetQueryRows(rank_plan.runtime.mtp))
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay resident graph rows cannot hold the configured MTP verification ceiling: resident=" +
+                std::to_string(input.resident_graph_rows) +
+                " required=" + std::to_string(
+                    resolveMTPMaxTargetQueryRows(rank_plan.runtime.mtp)));
+        }
 
         const auto bound =
             MoEOverlayCapacityAdmission::boundParticipants(overlay_plan);
+        /* Rank locality, not tier priority, determines whether the retained
+         * graph needs a cross-rank activation channel. Keep this predicate in
+         * the channel planner so capacity admission and runtime preflight
+         * cannot silently classify a same-tier peer differently. */
+        const bool has_remote_activation_participant =
+            MoEOverlayActivationChannelPlanner::hasRemoteRankParticipants(
+                overlay_plan);
+        MoEOverlayActivationChannelPlan activation_channel_plan;
+        if (has_remote_activation_participant)
+        {
+            if (!input.cluster_inventory ||
+                input.activation_channel_row_capacity <= 0 ||
+                input.activation_graph_family_count == 0u)
+            {
+                throw std::invalid_argument(
+                    "Distributed ExpertOverlay capacity requires the complete activation-channel topology and graph geometry");
+            }
+            activation_channel_plan =
+                MoEOverlayActivationChannelPlanner::plan({
+                    .placement_plan = &overlay_plan,
+                    .cluster_inventory = input.cluster_inventory,
+                    .row_capacity = static_cast<std::size_t>(
+                        input.activation_channel_row_capacity),
+                    .d_model = profile.d_model,
+                    .top_k = profile.expert_used_count,
+                    .graph_family_count =
+                        input.activation_graph_family_count,
+                });
+        }
         std::set<DeviceId> endpoint_devices;
         std::map<DeviceId, int> endpoint_participant_counts;
         for (const auto &participant : bound)
@@ -393,7 +480,9 @@ namespace llaminar2
                     resolveAdditionalPersistentWeightSets(
                         overlay_plan.continuation_domain_spec
                             .effectiveDensePolicy(),
-                        total_shards);
+                        total_shards,
+                        config.mtp_enabled,
+                        config.mtp_terminal_logits_layout);
             }
             config.weight_residency =
                 role == DeviceExecutionMemoryRole::ContinuationGraph
@@ -406,7 +495,7 @@ namespace llaminar2
         };
 
         for (const auto &shard : continuationShards(
-                 rank_plan, input.builds_root_graph))
+                 rank_plan, input.rank_execution_kind))
         {
             auto config = makeConfig(
                 shard.device,
@@ -433,6 +522,8 @@ namespace llaminar2
 
         MoEOverlayLocalCapacityPlannerResult result;
         result.resident_graph_rows = input.resident_graph_rows;
+        result.activation_channel_plan =
+            std::move(activation_channel_plan);
         result.fixed_memory_plan = MemoryPlanner::plan(profile, configs);
 
         struct GroupedBytes
@@ -443,6 +534,19 @@ namespace llaminar2
         std::map<DeviceId, GroupedBytes> grouped;
         for (const auto &device_plan : result.fixed_memory_plan.devices)
         {
+            LOG_DEBUG(
+                "[MoEOverlayCapacity] fixed component BOM device="
+                << device_plan.device.toString()
+                << " weights=" << device_plan.weight_bytes
+                << " additional_weights="
+                << device_plan.additional_weight_bytes
+                << " kv_cache=" << device_plan.kv_cache_bytes
+                << " persistent_state="
+                << device_plan.persistent_state_bytes
+                << " collective=" << device_plan.collective_bytes
+                << " activations=" << device_plan.activation_bytes
+                << " workspace=" << device_plan.workspace_bytes
+                << " total=" << device_plan.total_bytes());
             auto &entry = grouped[device_plan.device];
             entry.fixed = checkedAdd(
                 entry.fixed,
@@ -466,16 +570,38 @@ namespace llaminar2
                 gpu_load == gpu_weight_load_boms.end()
                     ? 0
                     : gpu_load->second.staging_bytes;
+            const std::size_t activation_staging_bytes =
+                result.activation_channel_plan.stagingBytesFor(
+                    rank_plan.rank, device);
+            const std::size_t captured_graph_bytes =
+                device.is_gpu()
+                    ? estimateCapturedGraphExecutableBytes(
+                          profile.n_layers,
+                          input.captured_graph_executable_count)
+                    : 0u;
             result.physical_budgets.push_back({
                 .world_rank = rank_plan.rank,
                 .device = device,
                 .resource_id = physicalResourceId(rank_plan.rank, device),
                 .usable_budget_bytes = usableMemory(
                     available_bytes, device, input),
-                .fixed_bytes = bytes.fixed,
+                .fixed_bytes = checkedAdd(
+                    bytes.fixed,
+                    captured_graph_bytes,
+                    "captured graph driver storage"),
                 .additional_transfer_staging_bytes =
-                    gpu_load_staging_bytes,
-                .safety_reserve_bytes = bytes.safety,
+                    checkedAdd(
+                        gpu_load_staging_bytes,
+                        activation_staging_bytes,
+                        "combined transfer staging"),
+                .safety_reserve_bytes =
+                    device.is_gpu()
+                        ? checkedAdd(
+                              bytes.safety,
+                              gpu_allocation_policy::
+                                  kMinimumFreeHeadroomBytes,
+                              "allocator free-memory reserve")
+                        : bytes.safety,
             });
         }
         return result;

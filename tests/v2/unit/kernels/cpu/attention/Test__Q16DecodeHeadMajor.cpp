@@ -31,6 +31,7 @@
 #include <random>
 #include <vector>
 
+#include "v2/backends/BackendManager.h"
 #include "v2/kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "v2/kernels/attention/AttentionDeviceParams.h"
 #include "v2/tensors/Tensors.h"
@@ -465,6 +466,8 @@ protected:
 
     void SetUp() override
     {
+        if (!hasCPUBackend())
+            initCPUBackend(-1);
         rng().seed(12345);
     }
 

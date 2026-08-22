@@ -24,6 +24,8 @@
 #include "../../../collective/ITPContext.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
+#include "../../moe/MoEOverlayNodeLocalRouteExchangeABI.h"
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -31,6 +33,9 @@
 namespace llaminar2
 {
     class DeviceWorkspaceManager;
+    class IMoEKernel;
+    class MappedHostTransferRegion;
+    class MoEOverlayNodeLocalRouteExchange;
     struct WorkspaceRequirements;
 
     /**
@@ -310,6 +315,16 @@ namespace llaminar2
             std::string stage_name;
             std::optional<BufferId> tensor_buffer_id;
             /**
+             * @brief Explicit no-P2P dense publication authority.
+             *
+             * Non-null is valid only for `Broadcast`. The graph builder sets
+             * this after topology selection proves the native homogeneous
+             * collective has no peer path. Native NCCL/RCCL remains mandatory
+             * whenever this owner is absent.
+             */
+            std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
+                mapped_dense_publication_exchange;
+            /**
              * @brief Persistent-workspace metadata collectives ordered after
              *        the rooted activation collective on the same stream.
              *
@@ -323,6 +338,9 @@ namespace llaminar2
         };
 
         explicit TPLocalRootedCollectiveStage(Params params);
+
+        /** @brief Release the endpoint-local kernel facade after graph teardown. */
+        ~TPLocalRootedCollectiveStage() override;
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override
@@ -383,6 +401,20 @@ namespace llaminar2
          * populated outside graph capture by bindWorkspace().
          */
         std::vector<LocalTPCollectiveSidebandBuffer> bound_sidebands_;
+
+        /** Capture-stable endpoint aliases for mapped dense publication. */
+        MoENodeLocalDensePublicationDeviceBinding
+            mapped_dense_publication_binding_{};
+
+        /** Registration lifetime retained by every embedded copy node. */
+        std::shared_ptr<const MappedHostTransferRegion>
+            mapped_dense_publication_region_;
+
+        /** Byte offset of the one shared dense FP32 payload bank. */
+        std::size_t mapped_dense_publication_payload_offset_ = 0u;
+
+        /** Backend facade that owns only explicit-stream progress kernels. */
+        std::unique_ptr<IMoEKernel> mapped_dense_publication_kernel_;
     };
 
 } // namespace llaminar2

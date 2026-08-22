@@ -36,10 +36,32 @@ namespace llaminar2
 
     const char *toString(OverlayRankRole role);
 
+    /**
+     * @brief Exclusive production execution lifecycle assigned to one rank.
+     *
+     * Topology roles above are composable: a continuation rank may also own
+     * local routed experts.  The execution kind is deliberately not
+     * composable.  It identifies the one command/graph protocol the rank must
+     * enter, so a dense NodeTP peer cannot accidentally be treated as an
+     * expert-only retained-graph follower.
+     */
+    enum class OverlayRankExecutionKind
+    {
+        ContinuationAuthority, ///< Dense graph plus command/artifact authority.
+        ContinuationPeer,      ///< Dense NodeTP shard following normal commands.
+        ExpertOnlyFollower,    ///< Retained sparse graph following signed tickets.
+        RelayOnly,             ///< No model graph participates on this rank.
+    };
+
+    /** @brief Stable diagnostic spelling for a rank execution lifecycle. */
+    const char *toString(OverlayRankExecutionKind kind);
+
     struct OverlayRankPlan
     {
         int world_rank = -1;
         OverlayRankRole role = OverlayRankRole::RelayOnly;
+        OverlayRankExecutionKind execution_kind =
+            OverlayRankExecutionKind::RelayOnly;
         std::vector<OverlayRankRole> roles;
         std::vector<std::string> owned_domains;
         std::vector<std::string> root_weight_domains;
@@ -48,8 +70,6 @@ namespace llaminar2
         std::vector<std::string> cpu_fallback_expert_domains;
         std::vector<std::string> worker_fallback_expert_domains;
         std::vector<DeviceId> local_devices;
-        /// Builds this rank's dense continuation graph (root or TP shard).
-        bool builds_root_graph = false;
         bool loads_tokenizer = false;
         bool loads_worker_tokenizer_state = false;
         bool loads_full_model_metadata = false;
@@ -63,6 +83,15 @@ namespace llaminar2
         bool hasRole(OverlayRankRole role) const;
         bool ownsDomain(const std::string &domain_name) const;
         bool hasLocalDevice(DeviceId device) const;
+
+        /** @brief Whether this rank owns one dense continuation graph shard. */
+        bool ownsContinuationGraph() const;
+
+        /** @brief Whether this rank publishes expert-only transaction tickets. */
+        bool ownsTransactionAuthority() const;
+
+        /** @brief Whether this rank consumes retained expert-graph tickets. */
+        bool usesExpertTransactionFollower() const;
     };
 
     struct MoEExpertOverlayExecutionPlanResolverOptions
@@ -87,7 +116,10 @@ namespace llaminar2
 
         const OverlayRankPlan &currentRankPlan() const { return current_rank; }
         const OverlayRankPlan *rankPlanFor(int world_rank) const;
-        bool buildsRootGraph() const { return current_rank.builds_root_graph; }
+        bool ownsContinuationGraph() const
+        {
+            return current_rank.ownsContinuationGraph();
+        }
         std::string diagnostics() const;
     };
 

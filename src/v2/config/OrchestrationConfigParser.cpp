@@ -624,6 +624,15 @@ namespace llaminar2
                 if (config.mtp.draft_tokens <= 0)
                     throw std::invalid_argument("mtp draft_tokens must be > 0");
             }
+            else if (key == "graph_capacity_draft_tokens")
+            {
+                config.mtp.graph_capacity_draft_tokens = std::stoi(value);
+                if (config.mtp.graph_capacity_draft_tokens < 0)
+                {
+                    throw std::invalid_argument(
+                        "mtp graph_capacity_draft_tokens must be >= 0");
+                }
+            }
             else if (key == "max_request_batch")
             {
                 config.mtp.max_request_batch = std::stoi(value);
@@ -2469,6 +2478,22 @@ namespace llaminar2
                     if (c.mtp.draft_tokens <= 0)
                     {
                         throw std::invalid_argument("--mtp-draft-tokens must be > 0");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-graph-capacity-draft-tokens",
+            .category = "MTP",
+            .value_label = "<n>",
+            .description = "Retained MTP graph/arena draft capacity; 0 derives from the execution-policy maximum",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.graph_capacity_draft_tokens = std::stoi(v);
+                    if (c.mtp.graph_capacity_draft_tokens < 0)
+                    {
+                        throw std::invalid_argument(
+                            "--mtp-graph-capacity-draft-tokens must be >= 0");
                     }
                 }),
         });

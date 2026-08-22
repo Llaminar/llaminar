@@ -118,6 +118,9 @@ namespace llaminar2
         /** @return Hidden width shared by every peer lane. */
         [[nodiscard]] std::uint32_t dModel() const noexcept;
 
+        /** @return Maximum physical rows retained by every captured graph. */
+        [[nodiscard]] std::uint32_t maxRows() const noexcept;
+
         /**
          * @brief Resolve one producer lane through that producer's exact alias.
          * @param producer_device Non-root endpoint executing the publication.
@@ -135,6 +138,34 @@ namespace llaminar2
          */
         [[nodiscard]] std::vector<MoENodeLocalRoutePeerDeviceBinding>
         rootPeerBindings(DeviceId root_device) const;
+
+        /**
+         * @brief Resolve the dense root-publication channel for one endpoint.
+         *
+         * The returned aliases are capture-stable and endpoint-correct. Root
+         * and peer roles derive from immutable device identity, never from the
+         * caller's requested collective operation.
+         *
+         * @param device Exact continuation endpoint embedding the binding.
+         * @return Device-facing control, payload, and acknowledgement aliases.
+         * @throws std::logic_error when materialization or identity is invalid.
+         */
+        [[nodiscard]] MoENodeLocalDensePublicationDeviceBinding
+        densePublicationBinding(DeviceId device) const;
+
+        /**
+         * @brief Retain the registered mapped region used by dense publication.
+         * @return Shared registration lifetime for captured transfer nodes.
+         * @throws std::logic_error before complete materialization.
+         */
+        [[nodiscard]] std::shared_ptr<const MappedHostTransferRegion>
+        mappedRegion() const;
+
+        /** @return Byte offset of the shared dense FP32 payload matrix. */
+        [[nodiscard]] std::size_t densePublicationPayloadOffset() const;
+
+        /** @return Maximum dense FP32 elements admitted by setup. */
+        [[nodiscard]] std::size_t densePublicationElementCapacity() const;
 
         /** @return Immutable endpoint identities sorted by participant id. */
         [[nodiscard]] std::vector<MoENodeLocalRouteEndpoint> endpoints() const;
@@ -175,8 +206,13 @@ namespace llaminar2
         bool materialized_ = false;
         int root_participant_ = -1;
         std::uint32_t route_capacity_ = 0u;
+        std::uint32_t max_rows_ = 0u;
         std::uint32_t d_model_ = 0u;
         std::size_t mapping_bytes_ = 0u;
+        std::size_t dense_publication_control_offset_ = 0u;
+        std::size_t dense_publication_peers_offset_ = 0u;
+        std::size_t dense_publication_payload_offset_ = 0u;
+        std::size_t dense_publication_element_capacity_ = 0u;
         std::vector<MoENodeLocalRouteEndpoint> endpoints_;
         std::vector<LaneLayout> lanes_;
         std::shared_ptr<void> mapping_lifetime_;

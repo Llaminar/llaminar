@@ -357,6 +357,55 @@ namespace llaminar2
         }
 
         /**
+         * @brief Remap a model-layer direct ring read to its compressed FA slot.
+         *
+         * The physical ROCm ring and its canonical device head/count arrays
+         * share the full-attention layer map. Resolve that map here before a
+         * graph captures their stable addresses; passing the global hybrid
+         * layer to the compact parent would either fail or select the wrong
+         * full-attention payload.
+         *
+         * @return true when @p layer names a full-attention layer with a
+         *         complete native floating ring contract.
+         */
+        bool get_kv_device_ring_view(
+            int layer,
+            int seq_idx,
+            ITensor **out_k,
+            ITensor **out_v,
+            const int **device_head,
+            const int **device_count,
+            int *physical_capacity,
+            void *gpu_stream) override
+        {
+            const int kv_idx =
+                layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+            {
+                if (out_k)
+                    *out_k = nullptr;
+                if (out_v)
+                    *out_v = nullptr;
+                if (device_head)
+                    *device_head = nullptr;
+                if (device_count)
+                    *device_count = nullptr;
+                if (physical_capacity)
+                    *physical_capacity = 0;
+                return false;
+            }
+            return Base::get_kv_device_ring_view(
+                kv_idx,
+                seq_idx,
+                out_k,
+                out_v,
+                device_head,
+                device_count,
+                physical_capacity,
+                gpu_stream);
+        }
+
+        /**
          * @brief Remap a model-layer batched read to its compressed FA slot.
          *
          * Hybrid Qwen graphs address full-attention stages by global model

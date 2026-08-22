@@ -716,6 +716,39 @@ namespace
         EXPECT_EQ(kv_cache.lastDynamicStream(), stream);
     }
 
+    TEST_F(Test__PrefillGraphCaptureDynamicParams,
+           KVCacheAppend_SetupOnlyCaptureBindsResidentRequestLength)
+    {
+        DynamicAppendRecordingKVCache kv_cache;
+        const auto *resident_length = reinterpret_cast<const int32_t *>(
+            static_cast<uintptr_t>(0x2400));
+        KVCacheAppendStage::Params params{};
+        params.device_id = DeviceId::cuda(0);
+        params.kv_cache = &kv_cache;
+        params.layer_idx = 5;
+        params.seq_idx = 0;
+        params.num_tokens = 128;
+        params.batch_size = 1;
+        params.seq_len = 128;
+        params.request_sequence_lengths_device = resident_length;
+
+        KVCacheAppendStage stage(params);
+        EXPECT_EQ(
+            stage.graphLaunchPreparationPolicy(),
+            GraphLaunchPreparationPolicy::CaptureOnly)
+            << "The immutable append-count pointer must be sealed before native capture";
+
+        void *stream = reinterpret_cast<void *>(static_cast<uintptr_t>(0x5678));
+        ASSERT_TRUE(stage.prepareGraphLaunch(/*ctx=*/nullptr, stream));
+
+        EXPECT_EQ(kv_cache.dynamicAppendCalls(), 1);
+        EXPECT_EQ(kv_cache.lastDynamicLayer(), 5);
+        EXPECT_EQ(kv_cache.lastDynamicSeqIdx(), 0);
+        EXPECT_EQ(kv_cache.lastDynamicAppendSource(), resident_length);
+        EXPECT_EQ(kv_cache.lastCapturedMaxTokens(), 128);
+        EXPECT_EQ(kv_cache.lastDynamicStream(), stream);
+    }
+
     TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_GraphCaptureNeverMutatesHostState)
     {
         RecordingKVCache kv_cache;

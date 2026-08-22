@@ -487,9 +487,11 @@ class TestQwen35SnapshotGeneration:
             hf_model = FakeHFModel()
 
         output_dir = tmp_path / "missing" / "qwen36"
+        model_path = tmp_path / "qwen36.gguf"
+        model_path.write_bytes(b"authenticated fixture model")
         write_metadata(
             output_dir,
-            "/models/qwen36.gguf",
+            str(model_path),
             FakeModel(),
             "hello",
             [1, 2],

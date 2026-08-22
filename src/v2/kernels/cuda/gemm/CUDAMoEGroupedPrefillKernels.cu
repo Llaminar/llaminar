@@ -20,6 +20,8 @@
 #include "CUDAMoEGroupedPrefillKernels.h"
 
 #include "CUDANativeVNNIDecodeCommon.cuh"
+#include "kernels/common/DeviceQ8ActivationNumericalContract.h"
+#include "kernels/common/DeviceSwiGLUNumericalContract.h"
 
 #include <cuda_runtime.h>
 
@@ -137,18 +139,6 @@ namespace
     __device__ __forceinline__ int mmaFragmentColumn(int lane, int element)
     {
         return (lane & 3) * 2 + (element & 1);
-    }
-
-    /**
-     * @brief Evaluate the canonical grouped-prefill SiLU expression.
-     *
-     * This deliberately matches `grouped_prefill_swiglu_quantize_blockwise_kernel`
-     * instead of substituting an approximation or algebraically different form.
-     * The fused IMMA epilogue must reproduce every serial-row output byte.
-     */
-    __device__ __forceinline__ float groupedPrefillSilu(float value)
-    {
-        return value / (1.0f + expf(-value));
     }
 
     /** Load one row-major 16x32 signed-INT8 A fragment from shared memory. */
@@ -710,7 +700,7 @@ namespace
         const int *__restrict__ group_counts,
         const int *__restrict__ group_offsets,
         const uint32_t *__restrict__ directory,
-        const float *__restrict__ partition_weights,
+        const float *__restrict__ route_weights,
         float *__restrict__ output,
         int directory_entries,
         int num_experts,
@@ -935,16 +925,9 @@ namespace
             for (int element = 0; element < 4; ++element)
             {
                 const int local_row = mmaFragmentRow(lane, element);
-                float partition_contribution = partial[element];
-                if (partition_weights && local_row < active_rows)
-                {
-                    partition_contribution = __fmul_rn(
-                        partition_weights[grouped_row_base + local_row],
-                        partition_contribution);
-                }
                 total[element] = __fadd_rn(
                     total[element],
-                    partition_contribution);
+                    partial[element]);
             }
         }
 
@@ -956,9 +939,15 @@ namespace
                 column_base + mmaFragmentColumn(lane, element);
             if (local_row < active_rows && column < N)
             {
+                float value = total[element];
+                if (route_weights)
+                {
+                    value = __fmul_rn(
+                        route_weights[grouped_row_base + local_row], value);
+                }
                 output[
                     static_cast<size_t>(grouped_row_base + local_row) * N +
-                    column] = total[element];
+                    column] = value;
             }
         }
     }
@@ -1241,8 +1230,12 @@ namespace
                                  ? shared_projections[
                                        kRows * ColumnsPerBlock + fragment_index]
                                  : 0.0f;
+            // Grouping and the weight codebook must not select a different
+            // activation program. Reuse the serial decode contract so every
+            // supported weight format publishes the same SwiGLU FP32 word.
             const float value = quant_column_active
-                                    ? groupedPrefillSilu(gate) * up
+                                    ? llaminar2::device_swiglu_contract::
+                                          swigluValue(gate, up)
                                     : 0.0f;
 
             float abs_value = fabsf(value);
@@ -1255,7 +1248,7 @@ namespace
             }
 
             const float scale =
-                abs_value > 0.0f ? abs_value / 127.0f : 1.0f;
+                llaminar2::device_q8_activation_contract::scale(abs_value);
             if (quant_column_active)
             {
                 const int grouped_row = grouped_row_base + local_row;
@@ -1267,12 +1260,12 @@ namespace
                         static_cast<int>(blockIdx.x) * kQuantBlocksPerCta +
                         local_quant_block] = scale;
                 }
-                const float quantized = value / scale;
                 swiglu_int8[
                     static_cast<size_t>(grouped_row) * N + quant_column] =
-                    static_cast<int8_t>(rintf(fminf(
-                        127.0f,
-                        fmaxf(-127.0f, quantized))));
+                    static_cast<int8_t>(
+                        llaminar2::device_q8_activation_contract::quantize(
+                            value,
+                            scale));
             }
         }
     }
@@ -1650,9 +1643,12 @@ namespace
                 static_cast<int>(blockIdx.x) * ColumnsPerBlock + local_column;
             if (local_row < active_rows && column < N)
             {
+                // Keep the paired schedule byte-identical to serial decode and
+                // to the parallel gate/up schedule for every weight codebook.
                 shared_values[local_row * ColumnsPerBlock + local_column] =
-                    groupedPrefillSilu(gate_total[element]) *
-                    up_total[element];
+                    llaminar2::device_swiglu_contract::swigluValue(
+                        gate_total[element],
+                        up_total[element]);
             }
         }
         __syncthreads();
@@ -1686,7 +1682,7 @@ namespace
             }
 
             const float scale =
-                abs_value > 0.0f ? abs_value / 127.0f : 1.0f;
+                llaminar2::device_q8_activation_contract::scale(abs_value);
             if (quant_column_active)
             {
                 const int grouped_row = grouped_row_base + local_row;
@@ -1698,12 +1694,12 @@ namespace
                         static_cast<int>(blockIdx.x) * kQuantBlocksPerCta +
                         local_quant_block] = scale;
                 }
-                const float quantized = value / scale;
                 swiglu_int8[
                     static_cast<size_t>(grouped_row) * N + quant_column] =
-                    static_cast<int8_t>(rintf(fminf(
-                        127.0f,
-                        fmaxf(-127.0f, quantized))));
+                    static_cast<int8_t>(
+                        llaminar2::device_q8_activation_contract::quantize(
+                            value,
+                            scale));
             }
         }
     }
@@ -1744,7 +1740,7 @@ namespace
         const int *group_counts,
         const int *group_offsets,
         const uint32_t *directory,
-        const float *partition_weights,
+        const float *route_weights,
         float *output,
         int directory_entries,
         int num_experts,
@@ -1767,7 +1763,7 @@ namespace
             group_counts,
             group_offsets,
             directory,
-            partition_weights,
+            route_weights,
             output,
             directory_entries,
             num_experts,
@@ -1890,7 +1886,7 @@ namespace
         const int *group_counts,
         const int *group_offsets,
         const uint32_t *directory,
-        const float *partition_weights,
+        const float *route_weights,
         float *output,
         int directory_entries,
         int num_experts,
@@ -1909,7 +1905,7 @@ namespace
     {                                                                            \
         if (!launchCodebookProjection<CB, ColumnsPerBlock>(                      \
                 codebook_mask, grid, stream, A_int8, scales_A, descriptors,     \
-                group_counts, group_offsets, directory, partition_weights,      \
+                group_counts, group_offsets, directory, route_weights,          \
                 output, directory_entries, num_experts, total_slots, N, K,      \
                 k_partitions, launched))                                         \
         {                                                                        \
@@ -2107,7 +2103,7 @@ extern "C" bool cudaMoEGroupedImma_project(
     const int *d_group_counts,
     const int *d_group_offsets,
     const uint32_t *d_directory,
-    const float *d_partition_weights,
+    const float *d_route_weights,
     float *d_output,
     int directory_entries,
     int num_experts,
@@ -2141,25 +2137,25 @@ extern "C" bool cudaMoEGroupedImma_project(
     case GroupedImmaColumns::Columns32:
         return launchGroupedImmaProjectionTable<32>(
             codebook_mask, cuda_stream, d_A_int8, d_scales_A, d_desc_table,
-            d_group_counts, d_group_offsets, d_directory, d_partition_weights,
+            d_group_counts, d_group_offsets, d_directory, d_route_weights,
             d_output, directory_entries, num_experts, total_slots, N, K,
             k_partitions);
     case GroupedImmaColumns::Columns64:
         return launchGroupedImmaProjectionTable<64>(
             codebook_mask, cuda_stream, d_A_int8, d_scales_A, d_desc_table,
-            d_group_counts, d_group_offsets, d_directory, d_partition_weights,
+            d_group_counts, d_group_offsets, d_directory, d_route_weights,
             d_output, directory_entries, num_experts, total_slots, N, K,
             k_partitions);
     case GroupedImmaColumns::Columns128:
         return launchGroupedImmaProjectionTable<128>(
             codebook_mask, cuda_stream, d_A_int8, d_scales_A, d_desc_table,
-            d_group_counts, d_group_offsets, d_directory, d_partition_weights,
+            d_group_counts, d_group_offsets, d_directory, d_route_weights,
             d_output, directory_entries, num_experts, total_slots, N, K,
             k_partitions);
     case GroupedImmaColumns::Columns256:
         return launchGroupedImmaProjectionTable<256>(
             codebook_mask, cuda_stream, d_A_int8, d_scales_A, d_desc_table,
-            d_group_counts, d_group_offsets, d_directory, d_partition_weights,
+            d_group_counts, d_group_offsets, d_directory, d_route_weights,
             d_output, directory_entries, num_experts, total_slots, N, K,
             k_partitions);
     }

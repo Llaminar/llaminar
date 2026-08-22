@@ -8,15 +8,19 @@
  * transport, backend, stream, or topology policy: the topology planner and the
  * selected transport resolve each pointer before graph capture.
  *
- * Dispatch entries retain original row-major/router-slot order.  Return rows
- * retain the dispatch row order.  A continuation consumes participant lanes in
- * planner-canonical participant order, preserving deterministic FP32 addition
- * independently of device completion order.
+ * Dispatch entries retain original row-major/router-slot order and carry both
+ * their source slot and their compact follower slot.  GPU followers publish
+ * one preweighted FP32 contribution per original route slot into a shared
+ * canonical matrix.  The continuation materializes those slots and performs
+ * the only top-k reduction in original router order.  Expert movement may
+ * therefore change transport ownership without changing floating-point
+ * parentheses.
  */
 
 #pragma once
 
 #include "MoEOverlayActivationEpochABI.h"
+#include "MoEOverlayActivationPayloadLayout.h"
 #include "DeviceMoEOverlayEpochABI.h"
 
 #include <cstddef>
@@ -31,33 +35,6 @@
 
 namespace llaminar2
 {
-    /**
-     * @brief Immutable interpretation of a dispatch packet's hidden matrix.
-     *
-     * Decode-sized direct packets carry only the compact rows selected for one
-     * participant. Bulk node-local prefill publishes the continuation's
-     * physical-row matrix once for all participants sharing a rank-pair
-     * channel; each follower then gathers its compact rows with the packet's
-     * lane-local `row_ids`. The value is retained graph identity and may not be
-     * selected from mutable packet contents during replay.
-     */
-    enum class MoEOverlayActivationHiddenPayloadLayout : std::uint8_t
-    {
-        CompactRows = 0, ///< Matrix row N is compact packet row N.
-        SharedPhysicalRows = 1, ///< Matrix row N is original physical row N.
-    };
-
-    /** @return Whether @p layout is a supported captured packet layout. */
-    [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool
-    isValidMoEOverlayActivationHiddenPayloadLayout(
-        MoEOverlayActivationHiddenPayloadLayout layout) noexcept
-    {
-        return layout ==
-                   MoEOverlayActivationHiddenPayloadLayout::CompactRows ||
-               layout == MoEOverlayActivationHiddenPayloadLayout::
-                             SharedPhysicalRows;
-    }
-
     /**
      * @brief Device-local execution grant for one admitted activation lane.
      *
@@ -79,7 +56,8 @@ namespace llaminar2
     {
         MoEOverlayActivationDigest digest{}; ///< Admitted identity witness.
         std::uint64_t generation = 0u; ///< Strict scheduler epoch generation.
-        std::uint64_t placement_epoch = 0u; ///< Request-pinned placement bank.
+        /** Exact endpoint-local epoch selected by the device request ticket. */
+        std::uint64_t placement_epoch = 0u;
         std::uint64_t published_payload_bytes = 0u; ///< Endpoint-owned traffic total.
         std::uint64_t published_live_rows = 0u; ///< Published compact rows.
         std::uint64_t published_live_entries = 0u; ///< Published route entries.
@@ -94,6 +72,47 @@ namespace llaminar2
         std::uint32_t endpoint = 0u; ///< Raw @ref MoEOverlayActivationEndpoint.
         std::uint32_t state = 0u; ///< Raw @ref MoEOverlayActivationEndpointState.
         std::uint32_t code = 0u; ///< Raw @ref MoEOverlayActivationStatusCode.
+        /**
+         * Authenticated semantic family copied from the admitted epoch.
+         * Retained compute and telemetry kernels read this device-local value;
+         * the scheduler cannot mutate it after admission.
+         */
+        MoEOverlayInferenceGraphRole graph_role =
+            MoEOverlayInferenceGraphRole::None;
+    };
+
+    /**
+     * @brief Generation-authenticated placement epoch source for a follower.
+     *
+     * Retained activation graphs reuse bank-local timeline values after the
+     * scheduler has retired both endpoints and reset the channel lease.  A
+     * fixed `wait >= 1` is consequently an ordering hint, not transaction
+     * identity: a device may briefly observe the preceding lease's signal
+     * while the new stage-zero descriptor is still empty.  The follower epoch
+     * acquire kernel consumes this binding and waits until the mapped identity
+     * is strictly newer than its device-local grant and the stage descriptor's
+     * digest belongs to that identity.  Only then may it read
+     * `placement_epoch` and acquire the matching local RCU bank.
+     *
+     * The pointers are immutable graph identity. `control` addresses the
+     * planner-owned node-local mapped channel, while `grant` addresses the
+     * endpoint-private device record retained across replays.
+     */
+    struct MoEOverlayPeerPlacementEpochBinding
+    {
+        const MoEOverlayActivationEpochControl *control = nullptr;
+        const MoEOverlayActivationDeviceEpochGrant *grant = nullptr;
+        std::uint32_t stage_ordinal = 0u;
+
+        /** @return Whether the binding names a representable packet stage. */
+        [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
+            const noexcept
+        {
+            return control != nullptr && grant != nullptr;
+        }
+
+        bool operator==(
+            const MoEOverlayPeerPlacementEpochBinding &) const = default;
     };
 
     /**
@@ -111,38 +130,48 @@ namespace llaminar2
         std::int32_t *entry_offsets = nullptr; ///< CSR offsets, capacity `row_capacity + 1`.
         std::int32_t *expert_ids = nullptr; ///< Expert id for every compact route entry.
         float *route_weights = nullptr; ///< Router weight for every compact route entry.
+        /** Original `physical_row * top_k + router_slot` for every entry. */
+        std::int32_t *original_route_slots = nullptr;
+        /** Follower-local `compact_row * top_k + compact_slot` per entry. */
+        std::int32_t *compact_route_slots = nullptr;
         float *hidden_rows_fp32 = nullptr; ///< Compact FP32 activation matrix.
         std::size_t row_capacity = 0u; ///< Maximum compact rows admitted by setup.
         std::size_t entry_capacity = 0u; ///< Maximum compact route entries.
         std::int32_t d_model = 0; ///< Hidden width of one compact row.
         std::int32_t top_k = 0; ///< Maximum route entries in one logical row.
-
         /** @return Whether all aliases and immutable geometry are complete. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
             return row_ids && entry_offsets && expert_ids && route_weights &&
+                   original_route_slots && compact_route_slots &&
                    hidden_rows_fp32 && row_capacity > 0u &&
                    entry_capacity >= row_capacity && d_model > 0 && top_k > 0;
         }
     };
 
     /**
-     * @brief Device-visible compact return view inside one shared activation lane.
+     * @brief Device-visible canonical return matrix for one rank-pair channel.
+     *
+     * Every participant lane in the same channel aliases this matrix.  A route
+     * slot has exactly one authoritative participant, so followers write
+     * disjoint rows even when their kernels execute concurrently.  The matrix
+     * is indexed by original router slot rather than participant or completion
+     * order; timeline descriptors authenticate which sparse rows are live.
      */
     struct MoEOverlayMappedReturnDeviceView
     {
-        std::int32_t *row_ids = nullptr; ///< Original row identity preserved by the follower.
-        float *output_rows_fp32 = nullptr; ///< Participant-local FP32 expert result rows.
-        std::size_t row_capacity = 0u; ///< Maximum compact rows admitted by setup.
-        std::int32_t d_model = 0; ///< Hidden width of one result row.
-
+        /** Shared `[route_slot_capacity, d_model]` preweighted contributions. */
+        float *canonical_route_contributions_fp32 = nullptr;
+        /** Maximum original route slots admitted by model setup. */
+        std::size_t route_slot_capacity = 0u;
+        std::int32_t d_model = 0; ///< Hidden width of one contribution row.
         /** @return Whether all aliases and immutable geometry are complete. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
-            return row_ids && output_rows_fp32 && row_capacity > 0u &&
-                   d_model > 0;
+            return canonical_route_contributions_fp32 &&
+                   route_slot_capacity > 0u && d_model > 0;
         }
     };
 
@@ -183,6 +212,15 @@ namespace llaminar2
             banks[kDeviceMoEOverlayEpochBankCount] = {};
         /** Request-lifetime placement bank selected before retained replay. */
         const DeviceMoEOverlayEpochTicket *ticket = nullptr;
+        /**
+         * Ordered semantic result produced beside @ref ticket by acquisition.
+         *
+         * Packet kernels normally consume only the successful ticket. Keeping
+         * the paired status address in the same typed binding lets a terminal
+         * activation failure preserve the exact RCU acquisition evidence
+         * without a diagnostic D2H copy or a second host-side epoch mirror.
+         */
+        const DeviceMoEOverlayEpochStatus *status = nullptr;
         /** Exact logical expert geometry shared by both banks. */
         std::uint32_t expert_count = 0u;
 
@@ -190,7 +228,7 @@ namespace llaminar2
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
-            return banks[0].valid() && banks[1].valid() && ticket &&
+            return banks[0].valid() && banks[1].valid() && ticket && status &&
                    expert_count > 0u;
         }
     };
@@ -261,6 +299,8 @@ namespace llaminar2
     struct MoEOverlayActivationDispatchConsumeLaunch
     {
         MoEOverlayMappedDispatchDeviceView packet{}; ///< Shared input packet.
+        /** Exact follower-local ticket and durable placement banks. */
+        MoEOverlayRoutePlacementDeviceBinding placement{};
         MoEOverlayActivationHiddenPayloadLayout hidden_payload_layout =
             MoEOverlayActivationHiddenPayloadLayout::CompactRows; ///< Fixed matrix interpretation.
         const MoEOverlayActivationEpochControl *control = nullptr; ///< Exact mapped control.
@@ -277,7 +317,7 @@ namespace llaminar2
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
-            return packet.valid() &&
+            return packet.valid() && placement.valid() &&
                    isValidMoEOverlayActivationHiddenPayloadLayout(
                        hidden_payload_layout) &&
                    control && grant && hidden_rows_fp32 &&
@@ -294,9 +334,10 @@ namespace llaminar2
      */
     struct MoEOverlayActivationReturnPackLaunch
     {
-        const float *local_output_rows_fp32 = nullptr; ///< Follower fixed output tensor.
+        /** Follower `[compact_row * top_k + slot, d_model]` contribution bank. */
+        const float *local_canonical_route_contributions_fp32 = nullptr;
         MoEOverlayMappedDispatchDeviceView dispatch{}; ///< Source row identities/counts.
-        MoEOverlayMappedReturnDeviceView returned{}; ///< Shared compact return destination.
+        MoEOverlayMappedReturnDeviceView returned{}; ///< Shared canonical destination.
         MoEOverlayActivationEpochControl *control = nullptr; ///< Exact mapped lane control.
         MoEOverlayActivationDeviceEpochGrant *grant = nullptr; ///< Follower-local epoch state.
         std::int32_t physical_rows = 0; ///< Captured follower row capacity.
@@ -307,24 +348,25 @@ namespace llaminar2
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
-            return local_output_rows_fp32 && dispatch.valid() &&
+            return local_canonical_route_contributions_fp32 &&
+                   dispatch.valid() &&
                    returned.valid() && control && grant && physical_rows > 0 &&
                    dispatch.d_model == returned.d_model &&
                    static_cast<std::size_t>(physical_rows) <=
                        dispatch.row_capacity &&
-                   static_cast<std::size_t>(physical_rows) <=
-                       returned.row_capacity &&
+                   dispatch.entry_capacity <=
+                       returned.route_slot_capacity &&
                    model_layer_index >= 0;
         }
     };
 
     /**
-     * @brief Captured continuation launch for one ordered participant return.
+     * @brief Captured continuation launch materializing one sparse route return.
      *
-     * Callers enqueue these launches in the planner's canonical participant
-     * order on one exact continuation stream. One thread owns each output
-     * element, so the resulting FP32 additions match the scalar participant
-     * fold and never depend on peer completion order.
+     * This operation performs no reduction.  It authenticates one lane and
+     * copies each returned contribution into its original route slot in the
+     * continuation-owned canonical bank.  A later canonical reducer is the
+     * sole authority for top-k arithmetic.
      */
     struct MoEOverlayActivationReturnConsumeLaunch
     {
@@ -332,7 +374,8 @@ namespace llaminar2
         MoEOverlayMappedReturnDeviceView returned{}; ///< Shared compact return source.
         const MoEOverlayActivationEpochControl *control = nullptr; ///< Exact mapped control.
         MoEOverlayActivationDeviceEpochGrant *grant = nullptr; ///< Continuation-local epoch state.
-        float *dense_output_rows_fp32 = nullptr; ///< Continuation accumulation tensor.
+        /** Continuation `[physical_rows * top_k, d_model]` route bank. */
+        float *canonical_route_contributions_fp32 = nullptr;
         std::int32_t physical_rows = 0; ///< Captured destination row capacity.
         std::uint32_t stage_ordinal = 0u; ///< Ordered stage in the transaction.
         std::int32_t model_layer_index = -1; ///< Expected layer identity.
@@ -343,7 +386,10 @@ namespace llaminar2
         {
             return dispatch.valid() && returned.valid() &&
                    dispatch.d_model == returned.d_model && control && grant &&
-                   dense_output_rows_fp32 && physical_rows > 0 &&
+                   canonical_route_contributions_fp32 && physical_rows > 0 &&
+                   static_cast<std::size_t>(physical_rows) *
+                           static_cast<std::size_t>(dispatch.top_k) <=
+                       returned.route_slot_capacity &&
                    model_layer_index >= 0;
         }
     };
@@ -473,65 +519,60 @@ namespace llaminar2
     };
 
     /**
-     * @brief Parallel return acquisition followed by a canonical FP32 fold.
+     * @brief Parallel one-row return acquisition and route-slot materialization.
      *
-     * The first kernel gives each lane an independent block which waits on and
-     * validates only that lane, then copies its row into @ref gathered_rows_fp32.
-     * A second kernel walks the resident rows in descriptor order and performs
-     * explicit round-to-nearest FP32 additions. Completion order therefore no
-     * longer serializes mapped waits, while arithmetic order remains identical
-     * to the historical one-kernel-per-lane fold.
+     * One block authenticates each independent lane.  A second kernel copies
+     * disjoint original route rows into the continuation-owned canonical bank.
+     * No participant-level arithmetic occurs at this boundary.
      */
     struct MoEOverlayActivationSingleRowReturnBatchLaunch
     {
         /** Device array in planner-canonical participant order. */
         const MoEOverlayActivationSingleRowReturnConsumeLaunch *lanes = nullptr;
-        float *gathered_rows_fp32 = nullptr; ///< `[lane_count, d_model]` device scratch.
-        std::int32_t *lane_live_rows = nullptr; ///< `[lane_count]`, written by gather.
-        float *dense_output_rows_fp32 = nullptr; ///< Canonical continuation accumulator.
+        std::int32_t *lane_valid = nullptr; ///< `[lane_count]`, written by validation.
+        /** Continuation `[top_k, d_model]` canonical route bank. */
+        float *canonical_route_contributions_fp32 = nullptr;
         std::uint32_t lane_count = 0u; ///< Positive topology-derived lane count.
         std::int32_t d_model = 0; ///< Exact one-row width shared by every lane.
+        std::int32_t top_k = 0; ///< Exact original route width.
 
         /** @return Whether setup supplied complete persistent batch storage. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
-            return lanes && gathered_rows_fp32 && lane_live_rows &&
-                   dense_output_rows_fp32 && lane_count > 0u && d_model > 0;
+            return lanes && lane_valid &&
+                   canonical_route_contributions_fp32 && lane_count > 0u &&
+                   d_model > 0 && top_k > 0;
         }
     };
 
     /**
-     * @brief Validate and fold a topology-sized batch of multi-row returns.
+     * @brief Validate and materialize a topology-sized multi-row return batch.
      *
-     * Every descriptor is prepared once in planner-canonical participant
-     * order.  The validation kernel gives each lane one independent block and
-     * materializes a destination-row to compact-row lookup.  A second kernel
-     * gives each dense output element one writer and walks those lookups in
-     * descriptor order using explicit FP32 additions.  This removes the former
-     * one-validation-plus-one-fold launch pair per participant without making
-     * completion timing an arithmetic-order authority.
+     * Every descriptor is prepared once in planner order. Validation remains
+     * lane-parallel, while the payload kernel copies disjoint original route
+     * rows. The later route reducer—not this transport stage—owns arithmetic.
      */
     struct MoEOverlayActivationMultiRowReturnBatchLaunch
     {
         /** Device array in planner-canonical participant order. */
         const MoEOverlayActivationReturnConsumeLaunch *lanes = nullptr;
-        /** `[lane_count, physical_rows]`; -1 means the lane omitted the row. */
-        std::int32_t *lane_row_to_compact = nullptr;
         /** `[lane_count]`; set only after the lane descriptor is authenticated. */
         std::int32_t *lane_valid = nullptr;
-        float *dense_output_rows_fp32 = nullptr; ///< Canonical continuation accumulator.
+        /** Continuation canonical route bank. */
+        float *canonical_route_contributions_fp32 = nullptr;
         std::uint32_t lane_count = 0u; ///< Positive topology-derived lane count.
         std::int32_t physical_rows = 0; ///< Captured destination row capacity.
         std::int32_t d_model = 0; ///< Exact output width shared by every lane.
+        std::int32_t top_k = 0; ///< Exact original route width.
 
         /** @return Whether setup supplied complete persistent batch storage. */
         [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr bool valid()
             const noexcept
         {
-            return lanes && lane_row_to_compact && lane_valid &&
-                   dense_output_rows_fp32 && lane_count > 0u &&
-                   physical_rows > 1 && d_model > 0;
+            return lanes && lane_valid &&
+                   canonical_route_contributions_fp32 && lane_count > 0u &&
+                   physical_rows > 1 && d_model > 0 && top_k > 0;
         }
     };
 
@@ -548,8 +589,8 @@ namespace llaminar2
     /**
      * @brief Compute live dispatch payload bytes without descriptor padding.
      *
-     * The result covers row ids, CSR offsets, expert ids, route weights, and
-     * FP32 hidden rows. An empty `(0, 0)` packet intentionally has zero payload
+     * The result covers row ids, CSR offsets, expert ids, route weights, both
+     * route-slot identities, and FP32 hidden rows. An empty `(0, 0)` packet intentionally has zero payload
      * bytes but still advances its epoch timeline. Zero for non-empty geometry
      * indicates invalid geometry or integer overflow.
      */
@@ -567,7 +608,7 @@ namespace llaminar2
         constexpr std::uint64_t maximum = ~std::uint64_t{0};
         if (live_rows > (maximum / sizeof(std::int32_t)) - 1u ||
             live_entries > maximum /
-                               (sizeof(std::int32_t) + sizeof(float)) ||
+                               (3u * sizeof(std::int32_t) + sizeof(float)) ||
             live_rows > maximum /
                             (static_cast<std::uint64_t>(d_model) *
                              sizeof(float)))
@@ -578,7 +619,8 @@ namespace llaminar2
             live_rows * sizeof(std::int32_t) +
             (live_rows + 1u) * sizeof(std::int32_t);
         const std::uint64_t entries =
-            live_entries * (sizeof(std::int32_t) + sizeof(float));
+            live_entries *
+            (3u * sizeof(std::int32_t) + sizeof(float));
         const std::uint64_t activations =
             live_rows * static_cast<std::uint64_t>(d_model) * sizeof(float);
         if (row_metadata > maximum - entries ||
@@ -590,29 +632,28 @@ namespace llaminar2
     }
 
     /**
-     * @brief Compute live compact return bytes without descriptor padding.
+     * @brief Compute live canonical route-return bytes without padding.
      * An empty return intentionally has zero bytes and still advances its
      * timeline. For a non-empty return, zero means invalid geometry/overflow.
      */
     [[nodiscard]] LLAMINAR_MOE_PACKET_HD constexpr std::uint64_t
     moeOverlayReturnPayloadBytes(
-        std::uint64_t live_rows,
+        std::uint64_t live_entries,
         std::uint32_t d_model) noexcept
     {
         if (d_model == 0u)
             return 0u;
-        if (live_rows == 0u)
+        if (live_entries == 0u)
             return 0u;
         constexpr std::uint64_t maximum = ~std::uint64_t{0};
-        const std::uint64_t row_bytes = sizeof(std::int32_t);
-        const std::uint64_t output_bytes =
+        const std::uint64_t contribution_bytes =
             static_cast<std::uint64_t>(d_model) * sizeof(float);
-        if (output_bytes > maximum - row_bytes ||
-            live_rows > maximum / (row_bytes + output_bytes))
+        if (contribution_bytes == 0u ||
+            live_entries > maximum / contribution_bytes)
         {
             return 0u;
         }
-        return live_rows * (row_bytes + output_bytes);
+        return live_entries * contribution_bytes;
     }
 
     static_assert(std::is_trivially_copyable_v<

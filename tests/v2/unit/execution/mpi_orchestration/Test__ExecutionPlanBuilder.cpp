@@ -304,7 +304,7 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeTP_ExplicitCPUDeviceMapKeepsRan
         EXPECT_EQ(plan.tp_scope, TPScope::NODE_LOCAL);
         EXPECT_TRUE(plan.primary_device.isCPU());
         EXPECT_EQ(plan.primary_device.numa_node, r);
-        EXPECT_TRUE(plan.primary_device_numa_explicit);
+        EXPECT_TRUE(plan.hasResolvedPrimaryDeviceNuma());
         EXPECT_TRUE(plan.local_tp_devices.empty());
         EXPECT_EQ(plan.global_tp_domain_size, 2);
         EXPECT_EQ(plan.weight_shard.total_shards, 2);

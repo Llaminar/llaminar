@@ -50,7 +50,15 @@ public:
 
     // ---- Inject fake state for testing ----
 
-    void injectCompletionEvent(void *event) { device_completion_event_ = event; }
+    void injectCompletionEvent(void *event)
+    {
+        device_completion_event_ = event;
+        completion_event_protection_ = event
+                                           ? CompletionEventProtection::DeviceValue
+                                           : CompletionEventProtection::None;
+        if (!event)
+            event_device_.reset();
+    }
     void injectGpuDevice(DeviceId device) { gpu_device_ = device; }
     void injectDeviceValid(bool valid)
     {
@@ -134,6 +142,8 @@ protected:
     /// Safe cleanup: free mock allocation and null out gpu_data_ptr before destruction
     void cleanupTensor(CoherenceProtocolTensor *tensor)
     {
+        if (tensor->getCompletionEvent())
+            TransferEngine::publishSynchronized(tensor);
         void *gpu_ptr = tensor->getGpuDataPtr();
         if (gpu_ptr && mock_backend_.isAllocated(gpu_ptr))
         {
@@ -407,9 +417,10 @@ TEST_F(Test__CoherenceProtocol, MarkDirtyWithEvent_CreatesAndRecordsEvent)
     ASSERT_TRUE(tensor->ensureOnDevice(device_));
     mock_backend_.resetAll();
 
-    // Pre-condition: may or may not have an event from ensureOnDevice
-    // Clear it so we test fresh event creation
-    tensor->injectCompletionEvent(nullptr);
+    // Retire the setup upload generation through the production lifecycle so
+    // the following publication must allocate its own device-value event.
+    TransferEngine::publishSynchronized(tensor);
+    mock_backend_.resetAll();
 
     void *fake_stream = reinterpret_cast<void *>(0xBEEF);
     TransferEngine::publishCurrentDeviceWrite(tensor, fake_stream);
@@ -436,7 +447,8 @@ TEST_F(Test__CoherenceProtocol, MarkDirtyWithEvent_ReusesExistingEvent)
     ASSERT_TRUE(tensor->ensureOnDevice(device_));
     mock_backend_.resetAll();
 
-    // First call: creates event + records
+    // The upload already owns one event. A device write re-records that exact
+    // handle and preserves its still-live host-source protection.
     TransferEngine::publishCurrentDeviceWrite(
         tensor,
         reinterpret_cast<void *>(0x5055424C));
@@ -444,7 +456,7 @@ TEST_F(Test__CoherenceProtocol, MarkDirtyWithEvent_ReusesExistingEvent)
     size_t records_after_first = mock_backend_.getEventRecordCount();
     void *event_after_first = tensor->getCompletionEvent();
 
-    EXPECT_GE(creates_after_first, 1u);
+    EXPECT_EQ(creates_after_first, 0u);
     EXPECT_GE(records_after_first, 1u);
 
     // Second call: should reuse existing event, only record again
@@ -666,6 +678,11 @@ protected:
     DeviceId device_ = DeviceId::rocm(0);
     FailingMockBackend mock_backend_;
 
+    void SetUp() override
+    {
+        mock_backend_.setMockDeviceType(DeviceType::ROCm);
+    }
+
     std::unique_ptr<CoherenceProtocolTensor> createTensor()
     {
         auto tensor = std::make_unique<CoherenceProtocolTensor>(
@@ -682,6 +699,8 @@ protected:
 
     void cleanupTensor(CoherenceProtocolTensor *tensor)
     {
+        if (tensor->getCompletionEvent())
+            TransferEngine::publishSynchronized(tensor);
         void *gpu_ptr = tensor->getGpuDataPtr();
         if (gpu_ptr && mock_backend_.isAllocated(gpu_ptr))
         {
@@ -731,7 +750,9 @@ TEST_F(Test__CoherenceProtocolFailure, D2HFailure_EnsureOnHostReturnsFalse)
     gpu_mem[0] = 999.0f;
 
     // Mark dirty so ensureOnHost will attempt D2H
-    TransferEngine::publishGraphOwnedCurrentDeviceWrite(tensor);
+    TransferEngine::publishCurrentDeviceWrite(
+        tensor,
+        reinterpret_cast<void *>(0x5055424C));
 
     // Now make D2H fail
     mock_backend_.fail_d2h = true;

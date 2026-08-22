@@ -128,6 +128,7 @@ extern "C" bool hipMoEOverlayActivationPackReturn(
         dim3(1u), dim3(kThreads), 0u, hip_stream, *launch);
     const std::size_t output_elements =
         static_cast<std::size_t>(launch->physical_rows) *
+        static_cast<std::size_t>(launch->dispatch.top_k) *
         static_cast<std::size_t>(launch->returned.d_model);
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::packMappedReturnPayloadKernel,
@@ -152,9 +153,10 @@ extern "C" bool hipMoEOverlayActivationConsumeReturn(
         dim3(1u), dim3(kThreads), 0u, hip_stream, *launch);
     const std::size_t output_elements =
         static_cast<std::size_t>(launch->physical_rows) *
+        static_cast<std::size_t>(launch->dispatch.top_k) *
         static_cast<std::size_t>(launch->returned.d_model);
     hipLaunchKernelGGL(
-        llaminar2::moe_activation_packet_device::accumulateMappedReturnKernel,
+        llaminar2::moe_activation_packet_device::materializeMappedCanonicalReturnKernel,
         dim3(blocksFor(output_elements)), dim3(kThreads), 0u, hip_stream,
         *launch);
     return launchAccepted();
@@ -260,13 +262,16 @@ extern "C" bool hipMoEOverlayActivationConsumeSingleRowReturnBatch(
     const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::
-            gatherSingleRowReturnBatchKernel,
+            validateSingleRowReturnBatchKernel,
         dim3(launch->lane_count), dim3(kSingleRowThreads), 0u, hip_stream,
         *launch);
+    const std::size_t route_elements =
+        static_cast<std::size_t>(launch->top_k) *
+        static_cast<std::size_t>(launch->d_model);
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::
-            foldSingleRowReturnBatchKernel,
-        dim3(blocksFor(static_cast<std::size_t>(launch->d_model))),
+            materializeSingleRowCanonicalReturnBatchKernel,
+        dim3(blocksFor(route_elements), launch->lane_count, 1u),
         dim3(kThreads), 0u, hip_stream, *launch);
     return launchAccepted();
 }
@@ -288,11 +293,13 @@ extern "C" bool hipMoEOverlayActivationConsumeMultiRowReturnBatch(
         dim3(launch->lane_count), dim3(kThreads), 0u, hip_stream, *launch);
     const std::size_t output_elements =
         static_cast<std::size_t>(launch->physical_rows) *
+        static_cast<std::size_t>(launch->top_k) *
         static_cast<std::size_t>(launch->d_model);
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::
-            foldMultiRowReturnBatchKernel,
-        dim3(blocksFor(output_elements)), dim3(kThreads), 0u, hip_stream,
+            materializeMultiRowCanonicalReturnBatchKernel,
+        dim3(blocksFor(output_elements), launch->lane_count, 1u),
+        dim3(kThreads), 0u, hip_stream,
         *launch);
     return launchAccepted();
 }
@@ -388,5 +395,73 @@ extern "C" bool hipMoEOverlayFoldNodeLocalCanonicalRoutes(
     hipLaunchKernelGGL(
         llaminar2::moe_node_local_route_device::finishRouteConsumeKernel,
         dim3(launch->peer_count), dim3(1u), 0u, hip_stream, *launch);
+    return launchAccepted();
+}
+
+extern "C" bool hipMoEOverlayBeginNodeLocalDensePublication(
+    const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() || !launch->binding.isRoot() ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL(
+        llaminar2::moe_node_local_route_device::beginDensePublicationKernel,
+        dim3(1u), dim3(1u), 0u, hip_stream, *launch);
+    return launchAccepted();
+}
+
+extern "C" bool hipMoEOverlayFinishNodeLocalDensePublication(
+    const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() || !launch->binding.isRoot() ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL(
+        llaminar2::moe_node_local_route_device::finishDensePublicationKernel,
+        dim3(1u), dim3(1u), 0u, hip_stream, *launch);
+    return launchAccepted();
+}
+
+extern "C" bool hipMoEOverlayBeginNodeLocalDensePublicationConsume(
+    const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() || launch->binding.isRoot() ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL(
+        llaminar2::moe_node_local_route_device::beginDensePublicationConsumeKernel,
+        dim3(1u), dim3(1u), 0u, hip_stream, *launch);
+    return launchAccepted();
+}
+
+extern "C" bool hipMoEOverlayFinishNodeLocalDensePublicationConsume(
+    const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() || launch->binding.isRoot() ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL(
+        llaminar2::moe_node_local_route_device::finishDensePublicationConsumeKernel,
+        dim3(1u), dim3(1u), 0u, hip_stream, *launch);
     return launchAccepted();
 }

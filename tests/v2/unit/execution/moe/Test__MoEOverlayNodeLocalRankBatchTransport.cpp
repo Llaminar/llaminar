@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <exception>
@@ -113,7 +114,12 @@ namespace
                     .model_layer_indices = {4},
                 },
             },
-            .local_devices = {DeviceId::cpu()},
+            .local_lanes = {
+                {.participant_id = kParticipants[0],
+                 .device = DeviceId::cpu()},
+                {.participant_id = kParticipants[1],
+                 .device = DeviceId::cpu()},
+            },
         };
     }
 
@@ -192,6 +198,23 @@ namespace
 } // namespace
 
 TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
+     EmptyDispatchAccountingMatchesDevicePacketABI)
+{
+    const MoEOverlaySparseRows empty_rows{
+        .d_model = kDModel,
+        .top_k = kTopK,
+    };
+
+    EXPECT_EQ(compactMoEOverlayDispatchBytes(empty_rows), 0u);
+    EXPECT_EQ(
+        moeOverlayDispatchPayloadBytes(
+            /*live_rows=*/0u,
+            /*live_entries=*/0u,
+            /*d_model=*/kDModel),
+        0u);
+}
+
+TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
      SelectionIsStrictlyPhysicalNodeScoped)
 {
     auto same_node = makeContext(/*rank=*/0, /*ranks_per_node=*/2);
@@ -219,6 +242,30 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
             cross_node,
             uniqueIdentity("forbidden_inter_node"))),
         std::runtime_error);
+}
+
+TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
+     ChannelIdentityRequiresCanonicalParticipantOrder)
+{
+    EXPECT_EQ(
+        makeMoEOverlayRankBatchChannelIdentity(
+            /*tier_index=*/1,
+            /*domain_ordinal=*/2,
+            /*source_world_rank=*/0,
+            /*target_world_rank=*/1,
+            kParticipants),
+        "tier1#domain2#rank0to1#p4,7,");
+
+    const std::vector<int> reversed{7, 4};
+    EXPECT_THROW(
+        static_cast<void>(
+            makeMoEOverlayRankBatchChannelIdentity(1, 2, 0, 1, reversed)),
+        std::invalid_argument);
+    EXPECT_THROW(
+        static_cast<void>(
+            makeMoEOverlayRankBatchChannelIdentity(
+                1, 2, 0, 0, kParticipants)),
+        std::invalid_argument);
 }
 
 TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
@@ -269,6 +316,23 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
               MoEOverlayRankBatchTransportKind::NodeLocalSharedRows);
     ASSERT_EQ(target->kind(),
               MoEOverlayRankBatchTransportKind::NodeLocalSharedRows);
+
+    const std::string canonical_identity =
+        makeMoEOverlayRankBatchChannelIdentity(1, 2, 0, 1, kParticipants);
+    MoEOverlayRankBatchTransportRegistry registry;
+    registry.install(canonical_identity, source);
+    EXPECT_EQ(registry.size(), 1u);
+    EXPECT_EQ(
+        registry.require(
+            canonical_identity, 0, 1, kParticipants),
+        source);
+    EXPECT_THROW(
+        registry.install(canonical_identity, source),
+        std::logic_error);
+    EXPECT_THROW(
+        static_cast<void>(registry.require(
+            canonical_identity, 1, 0, kParticipants)),
+        std::logic_error);
 
     auto *const source_channel = dynamic_cast<
         IMoEOverlayMappedActivationTransport *>(source.get());
@@ -388,12 +452,24 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
         source_device_lane.dispatch.row_ids,
         source->sharedDispatchRows(kParticipants[0]).row_ids_host);
     EXPECT_EQ(
-        target_device_lane.returned.output_rows_fp32,
+        target_device_lane.returned.canonical_route_contributions_fp32,
+        target_second_device_lane.returned.
+            canonical_route_contributions_fp32);
+    EXPECT_EQ(
+        source_device_lane.returned.canonical_route_contributions_fp32,
+        source_second_device_lane.returned.
+            canonical_route_contributions_fp32);
+    EXPECT_EQ(
+        target_device_lane.returned.route_slot_capacity,
+        kEntriesPerParticipant);
+    EXPECT_NE(
+        target_device_lane.returned.canonical_route_contributions_fp32,
         target->sharedReturnRows(kParticipants[0]).output_rows_fp32);
     /* Participant-local compact packet matrices remain disjoint for the CPU
      * rank-batch codec, while activation graphs bind one physical hidden page
-     * per rank-pair mapping. This is the accounting invariant that removes N
-     * duplicate bulk publications without conflating CSR route authority. */
+     * and one canonical route-return matrix per rank-pair mapping. This is the
+     * accounting invariant that removes N duplicate bulk publications without
+     * conflating compact codec storage with device route-slot authority. */
     EXPECT_NE(
         source_device_lane.dispatch.hidden_rows_fp32,
         source_second_device_lane.dispatch.hidden_rows_fp32);
@@ -415,6 +491,12 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
     EXPECT_EQ(
         source_device_lane.shared_dispatch_hidden_offset,
         target_device_lane.shared_dispatch_hidden_offset);
+    EXPECT_EQ(
+        target_device_lane.return_output_offset,
+        target_second_device_lane.return_output_offset);
+    EXPECT_EQ(
+        source_device_lane.return_output_offset,
+        target_device_lane.return_output_offset);
     EXPECT_EQ(
         source_device_lane.admission_signal_offset,
         source_mapping->mappedOffset(
@@ -573,6 +655,39 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
 
     constexpr int participant = 4;
     constexpr size_t family = 0u;
+    const auto source_lane = source_channel->activationDeviceLane(
+        participant, family, DeviceId::cpu());
+    const auto target_lane = target_channel->activationDeviceLane(
+        participant, family, DeviceId::cpu());
+    ASSERT_TRUE(source_lane.valid());
+    ASSERT_TRUE(target_lane.valid());
+
+    /* Payload selection is one geometry-bound authority for both endpoints.
+     * A decode view names the lane-local compact matrix. A wider prefill view
+     * names the rank-pair physical matrix and resolves compact rows through
+     * their non-contiguous row ids. */
+    const auto direct_source = source_lane.dispatchPayload(1);
+    const auto direct_target = target_lane.hostDispatchPayload(1);
+    ASSERT_TRUE(direct_source.valid());
+    EXPECT_TRUE(direct_source.selection.usesCompactRows());
+    EXPECT_EQ(
+        direct_source.packet.hidden_rows_fp32,
+        source_lane.dispatch.hidden_rows_fp32);
+    EXPECT_EQ(
+        direct_target.hidden_payload_layout,
+        MoEOverlayActivationHiddenPayloadLayout::CompactRows);
+    EXPECT_EQ(direct_target.hidden_row_capacity, 1u);
+
+    const auto shared_source = source_lane.dispatchPayload(3);
+    ASSERT_TRUE(shared_source.valid());
+    EXPECT_TRUE(shared_source.requiresBulkPublication());
+    EXPECT_EQ(
+        shared_source.packet.hidden_rows_fp32,
+        source_lane.shared_dispatch_hidden_rows_fp32);
+    EXPECT_NE(
+        shared_source.packet.hidden_rows_fp32,
+        source_lane.dispatch.hidden_rows_fp32);
+
     const auto scheduler_config =
         target_channel->activationEpochConfig(participant, family);
     MoEOverlayActivationEpochProtocol source_protocol(
@@ -602,7 +717,7 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
         /*transaction_ordinal=*/1u,
         /*logical_step_id=*/5u,
         /*placement_epoch=*/44u,
-        MoEOverlayInferenceGraphRole::MainDecode,
+        MoEOverlayInferenceGraphRole::MainPrefill,
         /*request_count=*/1,
         /*logical_rows_per_request=*/1,
         /*physical_rows_per_request=*/3);
@@ -645,6 +760,28 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
             /*live_rows=*/2u,
             /*live_entries=*/3u,
             base);
+        /* The compact matrix is stable mapped storage but is not authoritative
+         * for this three-row transaction. Poison it, publish non-contiguous
+         * row ids, and populate only the selected shared physical matrix. */
+        std::fill_n(
+            source_rows.hidden_rows_fp32,
+            source_rows.row_capacity * static_cast<size_t>(kDModel),
+            -1000.0f - base);
+        source_rows.row_ids_host[0] = 0;
+        source_rows.row_ids_host[1] = 2;
+        for (size_t physical_row = 0u;
+             physical_row < 3u;
+             ++physical_row)
+        {
+            for (int column = 0; column < kDModel; ++column)
+            {
+                shared_source.packet.hidden_rows_fp32[
+                    physical_row * static_cast<size_t>(kDModel) +
+                    static_cast<size_t>(column)] =
+                    base + static_cast<float>(physical_row * 100u) +
+                    static_cast<float>(column);
+            }
+        }
         ASSERT_TRUE(source_protocol.publishDispatch(
             *epoch,
             stage,
@@ -659,10 +796,25 @@ TEST(Test__MoEOverlayNodeLocalRankBatchTransport,
         ASSERT_TRUE(dispatch.has_value()) << error;
         EXPECT_EQ(dispatch->model_layer_index, static_cast<int>(stage));
         EXPECT_EQ(dispatch->live_rows, 2u);
-        EXPECT_EQ(target_rows.row_ids_host[1], 1);
-        EXPECT_FLOAT_EQ(
-            target_rows.hidden_rows_fp32[kDModel + 3],
-            base + 7.0f);
+        EXPECT_EQ(target_rows.row_ids_host[1], 2);
+
+        auto selected_target = target_lane.hostDispatchPayload(3);
+        selected_target.live_row_count =
+            static_cast<size_t>(dispatch->live_rows);
+        selected_target.live_entry_count =
+            static_cast<size_t>(dispatch->live_entries);
+        ASSERT_EQ(
+            selected_target.hidden_payload_layout,
+            MoEOverlayActivationHiddenPayloadLayout::SharedPhysicalRows);
+        const float *const first_hidden =
+            selected_target.hiddenRowForCompactIndex(0u);
+        const float *const second_hidden =
+            selected_target.hiddenRowForCompactIndex(1u);
+        ASSERT_NE(first_hidden, nullptr);
+        ASSERT_NE(second_hidden, nullptr);
+        EXPECT_FLOAT_EQ(first_hidden[3], base + 3.0f);
+        EXPECT_FLOAT_EQ(second_hidden[3], base + 203.0f);
+        EXPECT_LT(target_rows.hidden_rows_fp32[kDModel + 3], -1000.0f);
 
         populateReturn(
             target_return,

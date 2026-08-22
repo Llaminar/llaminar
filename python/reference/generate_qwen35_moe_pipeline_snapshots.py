@@ -24,6 +24,7 @@ Usage:
 
 import sys
 import argparse
+import json
 from pathlib import Path
 
 # Add parent directories to path
@@ -60,6 +61,40 @@ MTP_SIDECAR_SNAPSHOT_SCHEMA = QWEN36_MTP_SIDECAR_SNAPSHOT_SCHEMA
 # post-softmax probability distribution retained by the live CUDA/ROCm routing
 # workspace. Packs without this marker used the retired raw linear projection.
 MOE_ROUTER_SNAPSHOT_SCHEMA = 1
+
+
+def normalize_mtp_branch_override_batches(raw_overrides):
+    """Normalize one legacy override map or a campaign batch of maps.
+
+    A single map remains accepted for direct developer use.  The production
+    campaign supplies an array so every branch observed by all matrix cells can
+    share one loaded 122B Hugging Face model.  Each batch intentionally retains
+    at most one branch per decode step because the reference replay API owns one
+    recurrent trajectory per pass.
+    """
+
+    raw_batches = (
+        raw_overrides if isinstance(raw_overrides, list) else [raw_overrides]
+    )
+    if not raw_batches or any(not isinstance(batch, dict) for batch in raw_batches):
+        raise ValueError(
+            "MTP branch overrides must be a JSON object or a non-empty "
+            "array of JSON objects"
+        )
+
+    normalized_batches = []
+    for batch in raw_batches:
+        normalized = {}
+        for step, tokens in batch.items():
+            if not isinstance(tokens, list) or any(
+                isinstance(token, (list, dict)) for token in tokens
+            ):
+                raise ValueError(
+                    "Every MTP branch override must be one flat token array"
+                )
+            normalized[int(step)] = [int(token) for token in tokens]
+        normalized_batches.append(normalized)
+    return normalized_batches
 
 
 def main():
@@ -122,7 +157,26 @@ Examples:
     parser.add_argument(
         "--mtp-sidecar-snapshots",
         action="store_true",
-        help="Also save decode-step MTP0..MTP2 sidecar reference snapshots",
+        help="Also save recursive decode-step MTP sidecar reference snapshots",
+    )
+    parser.add_argument(
+        "--mtp-max-draft-depth",
+        type=int,
+        default=3,
+        help=(
+            "Maximum recursive MTP draft depth to materialize when sidecar "
+            "snapshots are enabled (default: 3)"
+        ),
+    )
+    parser.add_argument(
+        "--mtp-branch-overrides",
+        type=Path,
+        default=None,
+        help=(
+            "JSON object mapping decode steps to production recursive MTP "
+            "condition tokens; generates additive branch-qualified sidecar "
+            "snapshots without rewriting the canonical main-model pack"
+        ),
     )
 
     args = parser.parse_args()
@@ -138,51 +192,107 @@ Examples:
     print(f"  Metadata only: {args.metadata_only}")
     print(f"  Decode snapshots only: {args.decode_snapshots_only}")
     print(f"  MTP sidecar snapshots: {args.mtp_sidecar_snapshots}")
+    print(f"  MTP maximum draft depth: {args.mtp_max_draft_depth}")
+    print(f"  MTP branch overrides: {args.mtp_branch_overrides}")
 
-    # Create and load model via registry
+    if args.mtp_max_draft_depth < 1 or args.mtp_max_draft_depth > 15:
+        raise ValueError("--mtp-max-draft-depth must be in [1, 15]")
+
+    branch_override_batches = None
+    if args.mtp_branch_overrides is not None:
+        raw_overrides = json.loads(
+            args.mtp_branch_overrides.read_text(encoding="utf-8")
+        )
+        branch_override_batches = normalize_mtp_branch_override_batches(
+            raw_overrides
+        )
+        if not args.mtp_sidecar_snapshots:
+            raise ValueError(
+                "--mtp-branch-overrides requires --mtp-sidecar-snapshots"
+            )
+
+    # Create and load model via registry. Additive branch campaigns consume
+    # the authenticated main-model trajectory already in ``args.output`` and
+    # therefore load only the graph-external MTP sidecar context. Canonical
+    # pack generation still owns the complete Hugging Face model.
     print("\nLoading model...")
-    model = create_reference_model("qwen35_moe", args.model)
+    reference_kwargs = (
+        {"mtp_sidecar_reference_pack": args.output}
+        if branch_override_batches is not None
+        else {}
+    )
+    model = create_reference_model(
+        "qwen35_moe", args.model, **reference_kwargs
+    )
     print("Model loaded successfully")
 
     # Run inference and save snapshots
-    total, token_ids, decode_tokens = run_prefill_and_decode(
-        model,
-        args.prompt,
-        args.decode_steps,
-        args.output,
-        verbose=args.verbose,
-        save_snapshots=not args.metadata_only,
-        save_prefill_snapshots=not args.decode_snapshots_only,
-        save_decode_snapshots=True,
-    )
-
-    if args.mtp_sidecar_snapshots and not args.metadata_only:
-        mtp_total = model.generate_mtp_sidecar_decode_snapshots(
+    if branch_override_batches is None:
+        total, token_ids, decode_tokens = run_prefill_and_decode(
+            model,
             args.prompt,
             args.decode_steps,
             args.output,
-            max_draft_depth=3,
             verbose=args.verbose,
+            save_snapshots=not args.metadata_only,
+            save_prefill_snapshots=not args.decode_snapshots_only,
+            save_decode_snapshots=True,
         )
+    else:
+        if not args.output.is_dir() or not (args.output / "metadata.txt").is_file():
+            raise ValueError(
+                "Additive MTP branch generation requires an existing canonical pack"
+            )
+        total = 0
+        token_ids = []
+        decode_tokens = []
+
+    if args.mtp_sidecar_snapshots and not args.metadata_only:
+        mtp_total = 0
+        batches = branch_override_batches or [None]
+        for branch_overrides in batches:
+            mtp_total += model.generate_mtp_sidecar_decode_snapshots(
+                args.prompt,
+                args.decode_steps,
+                args.output,
+                max_draft_depth=args.mtp_max_draft_depth,
+                verbose=args.verbose,
+                draft_token_overrides=branch_overrides,
+            )
         total += mtp_total
         (args.output / "mtp_sidecar_snapshot_schema.txt").write_text(
             f"{MTP_SIDECAR_SNAPSHOT_SCHEMA}\n", encoding="ascii"
         )
         print(f"  Captured {mtp_total} MTP sidecar snapshots")
+        if branch_override_batches is not None:
+            (args.output / "mtp_sidecar_branch_overrides.json").write_text(
+                json.dumps(branch_override_batches, sort_keys=True, indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
 
     # Write metadata
-    write_metadata(
-        args.output,
-        args.model,
-        model,
-        args.prompt,
-        token_ids,
-        args.decode_steps,
-        decode_tokens,
-        extra_metadata_lines=[
-            f"moe_router_snapshot_schema: {MOE_ROUTER_SNAPSHOT_SCHEMA}"
-        ],
-    )
+    if branch_override_batches is None:
+        write_metadata(
+            args.output,
+            args.model,
+            model,
+            args.prompt,
+            token_ids,
+            args.decode_steps,
+            decode_tokens,
+            extra_metadata_lines=[
+                f"moe_router_snapshot_schema: {MOE_ROUTER_SNAPSHOT_SCHEMA}",
+                *(
+                    [
+                        "mtp_sidecar_max_draft_depth: "
+                        f"{args.mtp_max_draft_depth}"
+                    ]
+                    if args.mtp_sidecar_snapshots
+                    else []
+                ),
+            ],
+        )
 
     print(f"\n✓ Done! {total} snapshots saved to: {args.output}")
 

@@ -383,6 +383,35 @@ namespace llaminar2
             return OverlayRankRole::RelayOnly;
         }
 
+        OverlayRankExecutionKind executionKindFor(
+            const OverlayRankPlan &rank_plan)
+        {
+            const bool is_authority =
+                rank_plan.hasRole(OverlayRankRole::ContinuationRoot);
+            const bool is_peer =
+                rank_plan.hasRole(OverlayRankRole::ContinuationParticipant);
+            if (is_authority && is_peer)
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay rank cannot be both continuation authority and continuation peer");
+            }
+            if (is_authority)
+                return OverlayRankExecutionKind::ContinuationAuthority;
+            if (is_peer)
+                return OverlayRankExecutionKind::ContinuationPeer;
+
+            const bool owns_expert_endpoint =
+                rank_plan.hasRole(
+                    OverlayRankRole::LocalAcceleratorParticipant) ||
+                rank_plan.hasRole(
+                    OverlayRankRole::CpuFallbackParticipant) ||
+                rank_plan.hasRole(
+                    OverlayRankRole::RemoteExpertParticipant);
+            return owns_expert_endpoint
+                       ? OverlayRankExecutionKind::ExpertOnlyFollower
+                       : OverlayRankExecutionKind::RelayOnly;
+        }
+
         void appendRoles(std::ostringstream &out, const std::vector<OverlayRankRole> &roles)
         {
             if (roles.empty())
@@ -679,6 +708,22 @@ namespace llaminar2
         return "Unknown";
     }
 
+    const char *toString(OverlayRankExecutionKind kind)
+    {
+        switch (kind)
+        {
+        case OverlayRankExecutionKind::ContinuationAuthority:
+            return "ContinuationAuthority";
+        case OverlayRankExecutionKind::ContinuationPeer:
+            return "ContinuationPeer";
+        case OverlayRankExecutionKind::ExpertOnlyFollower:
+            return "ExpertOnlyFollower";
+        case OverlayRankExecutionKind::RelayOnly:
+            return "RelayOnly";
+        }
+        return "Unknown";
+    }
+
     bool OverlayRankPlan::hasRole(OverlayRankRole candidate) const
     {
         return std::find(roles.begin(), roles.end(), candidate) != roles.end();
@@ -692,6 +737,26 @@ namespace llaminar2
     bool OverlayRankPlan::hasLocalDevice(DeviceId device) const
     {
         return std::find(local_devices.begin(), local_devices.end(), device) != local_devices.end();
+    }
+
+    bool OverlayRankPlan::ownsContinuationGraph() const
+    {
+        return execution_kind ==
+                   OverlayRankExecutionKind::ContinuationAuthority ||
+               execution_kind ==
+                   OverlayRankExecutionKind::ContinuationPeer;
+    }
+
+    bool OverlayRankPlan::ownsTransactionAuthority() const
+    {
+        return execution_kind ==
+               OverlayRankExecutionKind::ContinuationAuthority;
+    }
+
+    bool OverlayRankPlan::usesExpertTransactionFollower() const
+    {
+        return execution_kind ==
+               OverlayRankExecutionKind::ExpertOnlyFollower;
     }
 
     const OverlayRankPlan *MoEExpertOverlayExecutionPlan::rankPlanFor(int world_rank) const
@@ -800,7 +865,6 @@ namespace llaminar2
                 addUnique(rank_plan.shared_expert_weight_domains, source_plan.shared_expert_domain);
                 addDomainDevicesForRank(rank_plan, *continuation, rank_plan.world_rank);
                 addDomainDevicesForRank(rank_plan, *base_model, rank_plan.world_rank);
-                rank_plan.builds_root_graph = true;
             }
 
             for (const auto &descriptor : descriptors)
@@ -816,7 +880,7 @@ namespace llaminar2
                     addUnique(rank_plan.roles, OverlayRankRole::CpuFallbackParticipant);
                     addUnique(rank_plan.owned_domains, descriptor.source->name);
                     addUnique(rank_plan.cpu_fallback_expert_domains, descriptor.source->name);
-                    if (!rank_plan.builds_root_graph)
+                    if (!command_root && !distributed_dense_participant)
                         addUnique(rank_plan.worker_fallback_expert_domains, descriptor.source->name);
                     continue;
                 }
@@ -846,12 +910,13 @@ namespace llaminar2
                 addUnique(rank_plan.roles, OverlayRankRole::RelayOnly);
 
             rank_plan.role = primaryRoleFor(rank_plan);
+            rank_plan.execution_kind = executionKindFor(rank_plan);
             rank_plan.loads_tokenizer =
                 rank_plan.hasRole(OverlayRankRole::ContinuationRoot);
-            rank_plan.loads_worker_tokenizer_state = !rank_plan.builds_root_graph &&
+            rank_plan.loads_worker_tokenizer_state = !rank_plan.ownsContinuationGraph() &&
                                                      rank_plan.hasRole(OverlayRankRole::CpuFallbackParticipant);
             rank_plan.loads_full_model_metadata = !rank_plan.hasRole(OverlayRankRole::RelayOnly);
-            rank_plan.loads_root_weights = rank_plan.builds_root_graph;
+            rank_plan.loads_root_weights = rank_plan.ownsContinuationGraph();
             rank_plan.loads_shared_expert_weights = !rank_plan.shared_expert_weight_domains.empty();
             rank_plan.loads_accelerator_routed_experts = !rank_plan.accelerator_routed_expert_domains.empty();
             rank_plan.loads_cpu_fallback_experts = !rank_plan.cpu_fallback_expert_domains.empty();
@@ -1117,7 +1182,8 @@ namespace llaminar2
                        {
                            return device.to_string();
                        });
-            out << " builds_root_graph=" << (rank_plan.builds_root_graph ? "true" : "false")
+            out << " execution_kind=" << toString(rank_plan.execution_kind)
+                << " owns_continuation_graph=" << (rank_plan.ownsContinuationGraph() ? "true" : "false")
                 << " loads_tokenizer=" << (rank_plan.loads_tokenizer ? "true" : "false")
                 << " loads_worker_tokenizer_state=" << (rank_plan.loads_worker_tokenizer_state ? "true" : "false")
                 << " loads_full_model_metadata=" << (rank_plan.loads_full_model_metadata ? "true" : "false")

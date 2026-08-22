@@ -43,6 +43,16 @@ namespace
         int device_ordinal = -1;
     };
 
+    /** @brief One progress-kernel launch observed below TransferEngine. */
+    struct MappedProgressCall
+    {
+        void *destination_alias = nullptr;
+        const void *source = nullptr;
+        size_t bytes = 0u;
+        int device_ordinal = -1;
+        void *stream = nullptr;
+    };
+
     /**
      * @brief Backend spy for setup registration and non-blocking timeline calls.
      *
@@ -145,6 +155,24 @@ namespace
             return timeline_calls_succeed;
         }
 
+        /** @brief Record the exact mapped alias and stream without GPU work. */
+        bool deviceToMappedHostByKernelOnStream(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int device_id,
+            void *stream) override
+        {
+            progress_calls.push_back({
+                .destination_alias = dst,
+                .source = src,
+                .bytes = bytes,
+                .device_ordinal = device_id,
+                .stream = stream,
+            });
+            return progress_calls_succeed;
+        }
+
         /** @return Deterministic aligned alias for an exact backend/device pair. */
         [[nodiscard]] void *aliasFor(void *host_ptr, int device_id) const
         {
@@ -155,6 +183,7 @@ namespace
 
         bool registration_succeeds = true;
         bool timeline_calls_succeed = true;
+        bool progress_calls_succeed = true;
         size_t register_count = 0u;
         size_t alias_count = 0u;
         size_t unregister_count = 0u;
@@ -165,6 +194,7 @@ namespace
         int unregister_ordinal = -1;
         bool unregister_saw_live_lifetime = false;
         std::vector<TimelineCall> timeline_calls;
+        std::vector<MappedProgressCall> progress_calls;
 
     private:
         std::uintptr_t alias_bias_ = 0u;
@@ -393,6 +423,78 @@ TEST_F(
                     DeviceId::cuda(1));
         },
         std::invalid_argument);
+}
+
+TEST_F(
+    Test__MappedHostTransferRegion,
+    ProgressKernelUsesExactMappedAliasBoundsDeviceAndStreamWithoutSync)
+{
+    auto lifetime = std::make_shared<LifetimeProbe>(&lifetime_released_);
+    const std::array devices{DeviceId::cuda(0), DeviceId::rocm(0)};
+    auto region = engine_.registerExternalMappedHostRegion(
+        pages_.data(), pages_.size(), devices, lifetime);
+    alignas(64) std::array<std::byte, 512> source{};
+    void *const stream = reinterpret_cast<void *>(0xCAFE1234u);
+
+    engine_.enqueuePersistentDeviceRegionToMappedHostByKernel(
+        source.data(),
+        source.size(),
+        64u,
+        *region,
+        128u,
+        256u,
+        DeviceId::cuda(0),
+        stream);
+
+    ASSERT_EQ(cuda_->progress_calls.size(), 1u);
+    const auto &call = cuda_->progress_calls.front();
+    EXPECT_EQ(
+        call.destination_alias,
+        static_cast<void *>(
+            static_cast<std::byte *>(cuda_->aliasFor(pages_.data(), 0)) +
+            128u));
+    EXPECT_EQ(call.source, source.data() + 64u);
+    EXPECT_EQ(call.bytes, 256u);
+    EXPECT_EQ(call.device_ordinal, 0);
+    EXPECT_EQ(call.stream, stream);
+    EXPECT_TRUE(rocm_->progress_calls.empty());
+    EXPECT_EQ(cuda_->getSyncCount(), 0u);
+    EXPECT_EQ(cuda_->getStreamSyncCount(), 0u);
+
+    EXPECT_THROW(
+        engine_.enqueuePersistentDeviceRegionToMappedHostByKernel(
+            source.data(),
+            source.size(),
+            400u,
+            *region,
+            0u,
+            256u,
+            DeviceId::cuda(0),
+            stream),
+        std::out_of_range);
+    EXPECT_THROW(
+        engine_.enqueuePersistentDeviceRegionToMappedHostByKernel(
+            source.data(),
+            source.size(),
+            0u,
+            *region,
+            900u,
+            256u,
+            DeviceId::cuda(0),
+            stream),
+        std::out_of_range);
+    EXPECT_THROW(
+        engine_.enqueuePersistentDeviceRegionToMappedHostByKernel(
+            source.data(),
+            source.size(),
+            0u,
+            *region,
+            0u,
+            256u,
+            DeviceId::cuda(0),
+            nullptr),
+        std::invalid_argument);
+    EXPECT_EQ(cuda_->progress_calls.size(), 1u);
 }
 
 TEST_F(

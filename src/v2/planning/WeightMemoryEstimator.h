@@ -84,7 +84,11 @@ namespace llaminar2
     {
         size_t native_bytes = 0; // As stored in GGUF
         size_t device_bytes = 0; // After device-specific packing/repacking
+        /** Prepared embedding bytes owned by this exact TP view. */
         size_t prepared_embedding_bytes = 0;
+        /** LM-head bytes owned by this exact TP view, tied or explicit. */
+        size_t lm_head_bytes = 0;
+        /** Subset of @ref lm_head_bytes synthesized from a tied embedding. */
         size_t tied_lm_head_bytes = 0;
     };
 

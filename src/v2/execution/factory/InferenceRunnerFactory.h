@@ -88,6 +88,8 @@ namespace llaminar2
     class PreparedWeightStore;
     class MoEExpertOverlayRuntimePlan;
     class MoEOverlayNodeLocalRouteExchange;
+    class MoEOverlayRankBatchTransportRegistry;
+    class MoEOverlayNodeLocalDeviceControllerFabric;
     struct GraphConfig;
     struct MoEExpertOverlayExecutionPlan;
     struct MoERoutedExpertPlacementPlan;
@@ -242,9 +244,28 @@ namespace llaminar2
         /// Optional MPI context used by MoE overlay domain-worker commands.
         std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
 
+        /** Pre-rendezvoused node-local activation channels for graph capture. */
+        std::shared_ptr<MoEOverlayRankBatchTransportRegistry>
+            moe_rank_batch_transport_registry;
+
+        /**
+         * @brief Mapped device-controller pages shared by all local GPU graphs.
+         *
+         * This binding is present only for a node-local all-GPU topology that
+         * needs inter-group control. Homogeneous one-group LocalTP continues
+         * to use its native device collective and leaves this null.
+         */
+        std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric>
+            moe_device_controller_fabric;
+
         /** Shared sparse continuation-route fabric for sibling device graphs. */
         std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
             moe_node_local_route_exchange;
+
+        /** Typed continuation-local route transport chosen by the parent. */
+        MoEOverlayNodeLocalRouteTransport
+            moe_node_local_route_transport =
+                MoEOverlayNodeLocalRouteTransport::Unresolved;
 
         /// Optional graph-level cancellation hook. Queried before each stage,
         /// usually backed by a TP collective abort flag.

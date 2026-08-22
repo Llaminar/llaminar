@@ -9,18 +9,23 @@
  */
 
 #include "CUDABackend.h"
+#include "backends/GPUAllocationPolicy.h"
 #include "CUDAGraphCapture.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 #include "../../utils/VramBillOfMaterials.h"
 #include "../../execution/moe/DeviceMoERebalanceABI.h"
 #include "../../execution/mtp/MTPVerifierOutcomeGraph.h"
+#include "../../transfer/MappedTransferProgressABI.h"
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDARowSelectKernels.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
+#include <cuda/atomic>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <sstream>
 #include <cstdint>
@@ -30,6 +35,235 @@ namespace llaminar2
     namespace
     {
         constexpr std::uintptr_t kDeviceAllocationAlignment = 256;
+        constexpr unsigned int kMappedHostCopyThreads = 256u;
+        constexpr unsigned int kMappedHostCopyMaximumBlocks = 4096u;
+
+        /** @return System-scope acquire load from a node-local mapped word. */
+        __device__ __forceinline__ std::uint64_t mappedSystemAcquire64(
+            const std::uint64_t *value)
+        {
+            ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_system> reference(
+                *const_cast<std::uint64_t *>(value));
+            return reference.load(::cuda::memory_order_acquire);
+        }
+
+        /** @brief System-scope release store into a node-local mapped word. */
+        __device__ __forceinline__ void mappedSystemRelease64(
+            std::uint64_t *value,
+            std::uint64_t published)
+        {
+            ::cuda::atomic_ref<std::uint64_t, ::cuda::thread_scope_system> reference(
+                *value);
+            reference.store(published, ::cuda::memory_order_release);
+        }
+
+        /** @brief Vectorized VRAM-to-mapped-host progress copy. */
+        __global__ void mappedHostCopyVectorKernel(
+            uint4 *__restrict__ destination,
+            const uint4 *__restrict__ source,
+            std::size_t vector_count)
+        {
+            const std::size_t stride =
+                static_cast<std::size_t>(gridDim.x) * blockDim.x;
+            for (std::size_t index =
+                     static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                     threadIdx.x;
+                 index < vector_count;
+                 index += stride)
+            {
+                destination[index] = source[index];
+            }
+        }
+
+        /** @brief Byte-total tail path for an arbitrarily aligned region. */
+        __global__ void mappedHostCopyByteKernel(
+            std::uint8_t *__restrict__ destination,
+            const std::uint8_t *__restrict__ source,
+            std::size_t bytes)
+        {
+            const std::size_t stride =
+                static_cast<std::size_t>(gridDim.x) * blockDim.x;
+            for (std::size_t index =
+                     static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                     threadIdx.x;
+                 index < bytes;
+                 index += stride)
+            {
+                destination[index] = source[index];
+            }
+        }
+
+        /**
+         * @brief Snapshot every host-published transfer slot into device memory.
+         *
+         * One block owns one permanent slot. Thread zero reads the mapped cache
+         * line exactly once and publishes generation last into the claim; the
+         * following graph node consequently cannot observe a mixed command.
+         */
+        __global__ void mappedTransferProgressClaimKernel(
+            const MappedTransferProgressCommand *__restrict__ commands,
+            MappedTransferProgressClaim *__restrict__ claims,
+            std::size_t slot_capacity)
+        {
+            const std::size_t slot = blockIdx.x;
+            if (slot >= slot_capacity || threadIdx.x != 0u)
+                return;
+
+            const MappedTransferProgressCommand &command = commands[slot];
+            MappedTransferProgressClaim &claim = claims[slot];
+            /* The host release-stores generation after every other field. This
+             * system-scope acquire is the ABI edge; an ordinary volatile load
+             * is insufficient for host-mapped PCIe memory. */
+            const std::uint64_t generation =
+                mappedSystemAcquire64(&command.generation);
+            claim.generation_magic = command.generation_magic;
+            claim.generation_version = command.generation_version;
+            claim.source_address = command.source_address;
+            claim.destination_address = command.destination_address;
+            claim.bytes = command.bytes;
+            claim.source_complement = command.source_complement;
+            claim.destination_complement = command.destination_complement;
+            claim.bytes_complement = command.bytes_complement;
+            __threadfence();
+            claim.generation = generation;
+        }
+
+        /**
+         * @brief Copy every active claimed slot and publish its exact completion.
+         *
+         * A single block owns each command, eliminating any cross-block counter
+         * or order-dependent reduction. Aligned commands use 16-byte lanes;
+         * arbitrary tails retain byte totality. Thread zero performs the final
+         * system-release publication only after the whole block has joined.
+         */
+        __global__ void mappedTransferProgressCopyKernel(
+            const MappedTransferProgressClaim *__restrict__ claims,
+            MappedTransferProgressCompletion *__restrict__ completions,
+            std::size_t slot_capacity,
+            std::size_t maximum_bytes)
+        {
+            const std::size_t slot = blockIdx.x;
+            if (slot >= slot_capacity)
+                return;
+
+            const MappedTransferProgressClaim claim = claims[slot];
+            MappedTransferProgressCompletion &completion = completions[slot];
+            __shared__ std::uint32_t execute_claim;
+            if (threadIdx.x == 0u)
+            {
+                /* Completion is host-mapped system memory, so independent
+                 * per-lane reads need not observe the same coherence instant.
+                 * A mixed early-return decision would strand the remaining
+                 * lanes at the terminal __syncthreads(). Snapshot once and
+                 * broadcast the branch before any thread may leave. */
+                execute_claim =
+                    claim.generation != 0u &&
+                    claim.generation != mappedSystemAcquire64(
+                                            &completion.completed_generation)
+                        ? 1u
+                        : 0u;
+            }
+            __syncthreads();
+            if (execute_claim == 0u)
+                return;
+
+            MappedTransferProgressError error =
+                MappedTransferProgressError::None;
+            if (claim.generation_magic !=
+                    (kMappedTransferProgressMagic ^
+                     static_cast<std::uint32_t>(claim.generation)) ||
+                claim.generation_version !=
+                    (kMappedTransferProgressVersion ^
+                     static_cast<std::uint32_t>(claim.generation >> 32u)) ||
+                claim.source_complement != ~claim.source_address ||
+                claim.destination_complement != ~claim.destination_address ||
+                claim.bytes_complement != ~claim.bytes)
+            {
+                error = MappedTransferProgressError::InvalidIdentity;
+            }
+            else if (claim.source_address == 0u ||
+                     claim.destination_address == 0u)
+            {
+                error = MappedTransferProgressError::InvalidAddress;
+            }
+            else if (claim.bytes == 0u || claim.bytes > maximum_bytes)
+            {
+                error = MappedTransferProgressError::InvalidByteCount;
+            }
+
+            if (error == MappedTransferProgressError::None)
+            {
+                const auto source_address = static_cast<std::uintptr_t>(
+                    claim.source_address);
+                const auto destination_address = static_cast<std::uintptr_t>(
+                    claim.destination_address);
+                const bool vector_aligned =
+                    source_address % alignof(uint4) == 0u &&
+                    destination_address % alignof(uint4) == 0u;
+                if (vector_aligned)
+                {
+                    const auto *const source =
+                        reinterpret_cast<const uint4 *>(source_address);
+                    auto *const destination =
+                        reinterpret_cast<uint4 *>(destination_address);
+                    const std::size_t vector_count =
+                        static_cast<std::size_t>(claim.bytes) / sizeof(uint4);
+                    for (std::size_t index = threadIdx.x;
+                         index < vector_count;
+                         index += blockDim.x)
+                    {
+                        destination[index] = source[index];
+                    }
+                    const std::size_t vector_bytes =
+                        vector_count * sizeof(uint4);
+                    auto *const destination_tail =
+                        reinterpret_cast<std::uint8_t *>(destination_address);
+                    const auto *const source_tail =
+                        reinterpret_cast<const std::uint8_t *>(source_address);
+                    for (std::size_t index = vector_bytes + threadIdx.x;
+                         index < claim.bytes;
+                         index += blockDim.x)
+                    {
+                        destination_tail[index] = source_tail[index];
+                    }
+                }
+                else
+                {
+                    auto *const destination =
+                        reinterpret_cast<std::uint8_t *>(destination_address);
+                    const auto *const source =
+                        reinterpret_cast<const std::uint8_t *>(source_address);
+                    for (std::size_t index = threadIdx.x;
+                         index < claim.bytes;
+                         index += blockDim.x)
+                    {
+                        destination[index] = source[index];
+                    }
+                }
+            }
+
+            __syncthreads();
+            if (threadIdx.x == 0u)
+            {
+                completion.completed_bytes =
+                    error == MappedTransferProgressError::None
+                        ? claim.bytes
+                        : 0u;
+                completion.error = static_cast<std::uint32_t>(error);
+                __threadfence_system();
+                mappedSystemRelease64(
+                    &completion.completed_generation, claim.generation);
+            }
+        }
+
+        /** @return Bounded nonzero grid for one positive item count. */
+        unsigned int mappedHostCopyBlocks(std::size_t items) noexcept
+        {
+            return static_cast<unsigned int>(std::min<std::size_t>(
+                kMappedHostCopyMaximumBlocks,
+                (items + kMappedHostCopyThreads - 1u) /
+                    kMappedHostCopyThreads));
+        }
     }
 
     // ====================================================================
@@ -288,12 +522,20 @@ namespace llaminar2
     {
         if (!event || device_id >= device_count_ || device_id < 0)
         {
+            LOG_ERROR("[CUDABackend::recordEvent] Invalid event publication"
+                      << " event=" << event
+                      << " device_id=" << device_id
+                      << " device_count=" << device_count_
+                      << " stream=" << stream);
             return false;
         }
 
         cudaError_t err = cudaSetDevice(device_id);
         if (err != cudaSuccess)
         {
+            LOG_ERROR("[CUDABackend::recordEvent] cudaSetDevice("
+                      << device_id << ") failed: "
+                      << cudaGetErrorString(err));
             return false;
         }
 
@@ -460,9 +702,11 @@ namespace llaminar2
             cudaError_t mem_err = cudaMemGetInfo(&free_bytes, &total_bytes);
             if (mem_err == cudaSuccess)
             {
-                // Require at least 64MB headroom beyond the allocation itself
-                constexpr size_t HEADROOM = 64ULL * 1024 * 1024;
-                if (bytes + HEADROOM > free_bytes)
+                // Preserve the same terminal free-memory invariant priced by
+                // canonical capacity admission and model preflight.
+                if (bytes +
+                        gpu_allocation_policy::kMinimumFreeHeadroomBytes >
+                    free_bytes)
                 {
                     double req_mb = bytes / (1024.0 * 1024.0);
                     double free_mb = free_bytes / (1024.0 * 1024.0);
@@ -1506,6 +1750,10 @@ namespace llaminar2
         int *out_next_sidecar_condition_tokens,
         int *out_next_sidecar_position_ids,
         int *out_next_verifier_condition_tokens,
+        const int32_t *verifier_input_tokens,
+        int verifier_input_token_stride,
+        sampling_math::MTPCommittedVerifierIdentityRecord *
+            out_committed_verifier_identity,
         int device_idx,
         void *stream);
     extern "C" bool cudaOps_derive_speculative_publication_metadata(
@@ -3764,8 +4012,19 @@ namespace llaminar2
         void *out_stopped_flags_device,
         void *out_next_sidecar_condition_tokens_device,
         void *out_next_sidecar_position_ids_device,
-        void *out_next_verifier_condition_tokens_device)
+        void *out_next_verifier_condition_tokens_device,
+        const void *verifier_input_tokens_device,
+        int verifier_input_token_stride,
+        void *out_committed_verifier_identity_device)
     {
+        const bool has_verifier_identity_binding =
+            verifier_input_tokens_device != nullptr ||
+            verifier_input_token_stride != 0 ||
+            out_committed_verifier_identity_device != nullptr;
+        const bool has_complete_verifier_identity_binding =
+            verifier_input_tokens_device != nullptr &&
+            verifier_input_token_stride > 0 &&
+            out_committed_verifier_identity_device != nullptr;
         if (device_id < 0 || device_id >= device_count_ ||
             !output_tokens_device || output_token_stride <= 0 ||
             !meta_device || !base_cached_tokens_device ||
@@ -3782,6 +4041,8 @@ namespace llaminar2
               !out_next_sidecar_position_ids_device ||
               !out_next_condition_tokens_device)) ||
             !out_next_verifier_condition_tokens_device ||
+            (has_verifier_identity_binding &&
+             !has_complete_verifier_identity_binding) ||
             !stream)
         {
             return false;
@@ -3810,6 +4071,11 @@ namespace llaminar2
             static_cast<int *>(out_next_sidecar_condition_tokens_device),
             static_cast<int *>(out_next_sidecar_position_ids_device),
             static_cast<int *>(out_next_verifier_condition_tokens_device),
+            static_cast<const int32_t *>(verifier_input_tokens_device),
+            verifier_input_token_stride,
+            static_cast<
+                sampling_math::MTPCommittedVerifierIdentityRecord *>(
+                out_committed_verifier_identity_device),
             device_id,
             stream);
     }
@@ -4685,7 +4951,33 @@ namespace llaminar2
                                           cuda_stream);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[CUDABackend::hostToDeviceOnStream] failed: " << cudaGetErrorString(err));
+            cudaStreamCaptureStatus capture_status =
+                cudaStreamCaptureStatusInvalidated;
+            const cudaError_t capture_query =
+                cudaStreamIsCapturing(cuda_stream, &capture_status);
+            cudaPointerAttributes destination_attributes{};
+            const cudaError_t destination_query =
+                cudaPointerGetAttributes(&destination_attributes, dst);
+            LOG_ERROR(
+                "[CUDABackend::hostToDeviceOnStream] failed: "
+                << cudaGetErrorString(err)
+                << " device=" << device_id
+                << " bytes=" << bytes
+                << " dst=" << dst
+                << " src=" << src
+                << " stream=" << stream
+                << " capture_query=" << cudaGetErrorString(capture_query)
+                << " capture_status=" << static_cast<int>(capture_status)
+                << " destination_query="
+                << cudaGetErrorString(destination_query)
+                << " destination_type="
+                << (destination_query == cudaSuccess
+                        ? static_cast<int>(destination_attributes.type)
+                        : -1)
+                << " destination_device="
+                << (destination_query == cudaSuccess
+                        ? destination_attributes.device
+                        : -1));
             return false;
         }
         return true;
@@ -4706,6 +4998,132 @@ namespace llaminar2
         if (err != cudaSuccess)
         {
             LOG_ERROR("[CUDABackend::deviceToHostOnStream] failed: " << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::deviceToMappedHostByKernelOnStream(
+        void *dst,
+        const void *src,
+        size_t bytes,
+        int device_id,
+        void *stream)
+    {
+        cudaStream_t cuda_stream = requireExplicitStream(
+            stream,
+            "CUDABackend::deviceToMappedHostByKernelOnStream");
+        if (!dst || !src || bytes == 0u ||
+            device_id < 0 || device_id >= device_count_ ||
+            !setDevice(device_id))
+        {
+            return false;
+        }
+
+        const bool vector_aligned =
+            reinterpret_cast<std::uintptr_t>(dst) % alignof(uint4) == 0u &&
+            reinterpret_cast<std::uintptr_t>(src) % alignof(uint4) == 0u &&
+            bytes % sizeof(uint4) == 0u;
+        if (vector_aligned)
+        {
+            const std::size_t vector_count = bytes / sizeof(uint4);
+            mappedHostCopyVectorKernel<<<
+                mappedHostCopyBlocks(vector_count),
+                kMappedHostCopyThreads,
+                0u,
+                cuda_stream>>>(
+                static_cast<uint4 *>(dst),
+                static_cast<const uint4 *>(src),
+                vector_count);
+        }
+        else
+        {
+            mappedHostCopyByteKernel<<<
+                mappedHostCopyBlocks(bytes),
+                kMappedHostCopyThreads,
+                0u,
+                cuda_stream>>>(
+                static_cast<std::uint8_t *>(dst),
+                static_cast<const std::uint8_t *>(src),
+                bytes);
+        }
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::deviceToMappedHostByKernelOnStream] failed: "
+                      << cudaGetErrorString(error));
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::enqueueMappedTransferProgressClaims(
+        const MappedTransferProgressCommand *commands,
+        MappedTransferProgressClaim *claims,
+        size_t slot_capacity,
+        int device_id,
+        void *stream)
+    {
+        const cudaStream_t cuda_stream = requireExplicitStream(
+            stream,
+            "CUDABackend::enqueueMappedTransferProgressClaims");
+        if (!commands || !claims || slot_capacity == 0u ||
+            slot_capacity > std::numeric_limits<unsigned int>::max() ||
+            device_id < 0 || device_id >= device_count_ ||
+            !setDevice(device_id))
+        {
+            return false;
+        }
+
+        mappedTransferProgressClaimKernel<<<
+            static_cast<unsigned int>(slot_capacity),
+            1u,
+            0u,
+            cuda_stream>>>(commands, claims, slot_capacity);
+        cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::enqueueMappedTransferProgressClaims] "
+                      "claim launch failed: " << cudaGetErrorString(error));
+            return false;
+        }
+        return true;
+    }
+
+    bool CUDABackend::enqueueMappedTransferProgressCopies(
+        const MappedTransferProgressClaim *claims,
+        MappedTransferProgressCompletion *completions,
+        size_t slot_capacity,
+        size_t maximum_bytes,
+        int device_id,
+        void *stream)
+    {
+        const cudaStream_t cuda_stream = requireExplicitStream(
+            stream,
+            "CUDABackend::enqueueMappedTransferProgressCopies");
+        if (!claims || !completions || slot_capacity == 0u ||
+            maximum_bytes == 0u ||
+            slot_capacity > std::numeric_limits<unsigned int>::max() ||
+            device_id < 0 || device_id >= device_count_ ||
+            !setDevice(device_id))
+        {
+            return false;
+        }
+
+        mappedTransferProgressCopyKernel<<<
+            static_cast<unsigned int>(slot_capacity),
+            kMappedHostCopyThreads,
+            0u,
+            cuda_stream>>>(
+                claims,
+                completions,
+                slot_capacity,
+                maximum_bytes);
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::enqueueMappedTransferProgressCopies] "
+                      "copy launch failed: " << cudaGetErrorString(error));
             return false;
         }
         return true;

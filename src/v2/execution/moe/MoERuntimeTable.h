@@ -6,6 +6,7 @@
 #pragma once
 
 #include "DeviceMoEOverlayEpochABI.h"
+#include "DeviceMoEOverlayServiceTelemetry.h"
 #include "DeviceMoERuntimeABI.h"
 #include "LeastLoadedExpertAssignment.h"
 #include "MoEOverlayActivationPacketABI.h"
@@ -22,6 +23,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 
@@ -335,9 +337,18 @@ namespace llaminar2
         moe_runtime_abi::kDeferredVerifierParticipantIdsOffset);
     static_assert(offsetof(DeviceMoELayerRuntime, expert_counts) ==
                   moe_runtime_abi::kExpertCountsOffset);
+    static_assert(offsetof(DeviceMoELayerRuntime, decode_local_histogram) ==
+                  moe_runtime_abi::kDecodeLocalHistogramOffset);
+    static_assert(offsetof(DeviceMoELayerRuntime, prefill_local_histogram) ==
+                  moe_runtime_abi::kPrefillLocalHistogramOffset);
+    static_assert(
+        offsetof(DeviceMoELayerRuntime, grouped_verifier_local_histogram) ==
+        moe_runtime_abi::kGroupedVerifierLocalHistogramOffset);
     static_assert(
         offsetof(DeviceMoELayerRuntime, deferred_verifier_route_capacity) ==
         moe_runtime_abi::kDeferredVerifierRouteCapacityOffset);
+    static_assert(offsetof(DeviceMoELayerRuntime, participant_id) ==
+                  moe_runtime_abi::kParticipantIdOffset);
     static_assert(offsetof(DeviceMoELayerRuntime, participant_count) ==
                   moe_runtime_abi::kParticipantCountOffset);
     static_assert(
@@ -449,6 +460,32 @@ namespace llaminar2
          * apply derives it from the globally gathered transfer plan.
          */
         bool transient_placement_observed = false;
+    };
+
+    /**
+     * @brief Exact host recipe and stable GPU destinations for one inactive bank.
+     *
+     * The host pointers describe setup-owned publication recipes, not a mirror
+     * of mutable device execution state.  A maintenance publisher copies only
+     * @ref host_bank into @ref device_bank, then publishes the two scalar
+     * selector fields at the start of @ref device_runtime.  Copying the whole
+     * runtime record would overwrite live routing scratch and histograms.
+     */
+    struct DeviceMoERuntimeBankPublicationRecipe
+    {
+        uint32_t bank = 0;
+        uint32_t epoch = 0;
+        const DeviceMoEPlacementBank *host_bank = nullptr;
+        DeviceMoEPlacementBank *device_bank = nullptr;
+        DeviceMoELayerRuntime *device_runtime = nullptr;
+
+        /** @return Whether all identities name one publishable GPU bank. */
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return bank < kDeviceMoEOverlayEpochBankCount && epoch != 0u &&
+                   host_bank != nullptr && device_bank != nullptr &&
+                   device_runtime != nullptr && host_bank->epoch == epoch;
+        }
     };
 
     /**
@@ -669,6 +706,33 @@ namespace llaminar2
         virtual bool prepareInactiveBank(int layer_idx, const MoEPlacementUpdate &update) = 0;
         virtual bool flipActiveBank(int layer_idx, uint32_t epoch, void *stream) = 0;
         virtual bool hasPrefillRouteScratchCapacity(int layer_idx, int token_count) const = 0;
+        /**
+         * @brief Prepare one exact stream to write device runtime histograms.
+         *
+         * GPU tables allocate the stream's reusable arrival event and enqueue
+         * the one-time dependency on histogram-bank initialization here.  A
+         * graph owner must call this method before `beginCapture()`; captured
+         * stage execution may then record the producer identity without
+         * importing uncaptured setup work into the graph.
+         *
+         * CPU tables and tables without asynchronous draining retain the stream
+         * identity but require no backend resources.
+         *
+         * @param stream Exact non-null GPU producer stream, or the CPU producer
+         *        identity for a host-owned table.
+         */
+        virtual void prepareDecodeHistogramProducerStream(void *stream) = 0;
+        /**
+         * @brief Publish the exact stream that just enqueued histogram writes.
+         *
+         * When asynchronous GPU draining is enabled, @p stream must already
+         * have been admitted by @ref prepareDecodeHistogramProducerStream.
+         * This method deliberately performs no allocation, copy, event wait, or
+         * other backend operation, so it is safe to call while graph capture is
+         * active.
+         *
+         * @param stream Exact non-null producer stream for mirrored GPU tables.
+         */
         virtual void recordDecodeHistogramProducerStream(void *stream) = 0;
         virtual void *decodeHistogramProducerStream() const = 0;
         virtual bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
@@ -704,6 +768,78 @@ namespace llaminar2
         virtual void resetDecodeHistogramCounts(void *stream = nullptr) = 0;
         virtual void resetDecodeRuntimeState(void *stream = nullptr) = 0;
         /**
+         * @brief Return the first device-local ExpertOverlay service cell.
+         *
+         * A null result means this table was deliberately constructed without
+         * Dynamic economy telemetry.  Child MTP/LLEP tables return their
+         * canonical main table's allocation so every graph family contributes
+         * to one participant/layer/phase measurement authority.
+         */
+        virtual DeviceMoEOverlayServiceTelemetryCell *
+        deviceOverlayServiceTelemetry() const noexcept
+        {
+            return nullptr;
+        }
+        /**
+         * @brief Return the stable timing cursor for one serial graph layer.
+         * @param layer_idx Exact runtime layer index.
+         * @return Device pointer, or null when telemetry is disabled/invalid.
+         */
+        virtual DeviceMoEOverlayServiceTelemetrySample *
+        deviceOverlayServiceTelemetrySample(int layer_idx) const noexcept
+        {
+            (void)layer_idx;
+            return nullptr;
+        }
+        /**
+         * @brief Resolve the complete observation-only binding for one layer.
+         *
+         * Disabled telemetry returns an empty binding. A partial allocation is
+         * a model-lifetime invariant violation and throws instead of allowing a
+         * graph to silently omit evidence. This narrow view lets sparse child
+         * executors report service time without borrowing runtime placement
+         * authority from the table itself.
+         *
+         * @param layer_idx Exact model layer in this table.
+         * @return Empty or complete device-local telemetry capability.
+         * @throws std::out_of_range for an invalid layer.
+         * @throws std::logic_error for a partial telemetry allocation.
+         */
+        DeviceMoEOverlayServiceTelemetryBinding
+        deviceOverlayServiceTelemetryBinding(int layer_idx)
+        {
+            if (layer_idx < 0 || layer_idx >= layerCount())
+            {
+                throw std::out_of_range(
+                    "MoE service telemetry binding layer is outside the runtime table");
+            }
+
+            auto *const telemetry = deviceOverlayServiceTelemetry();
+            auto *const sample =
+                deviceOverlayServiceTelemetrySample(layer_idx);
+            if (!telemetry && !sample)
+                return {};
+            if (!telemetry || !sample)
+            {
+                throw std::logic_error(
+                    "MoE service telemetry allocation is partial");
+            }
+
+            DeviceMoEOverlayServiceTelemetryBinding binding{
+                .runtime_layer = deviceLayerState(layer_idx),
+                .layer_telemetry =
+                    telemetry + static_cast<std::size_t>(layer_idx) *
+                                    kDeviceMoEOverlayServicePhaseCount,
+                .sample = sample,
+            };
+            if (!binding.valid())
+            {
+                throw std::logic_error(
+                    "MoE service telemetry allocation is partial");
+            }
+            return binding;
+        }
+        /**
          * @brief Resolve one exact captured ExpertOverlay packet-placement input.
          *
          * Non-overlay implementations return an invalid binding. Implementations
@@ -728,6 +864,15 @@ namespace llaminar2
             int num_experts = 0;
             int top_k = 0;
             bool mirror_to_device = false;
+            /**
+             * @brief Allocate device-local service totals for Dynamic policy.
+             *
+             * This is valid only for a mirrored GPU table. Static overlays
+             * leave it false and therefore pay no timing-kernel or storage
+             * cost. A child table with @ref overlay_placement_source inherits
+             * the canonical source allocation and must use the same value.
+             */
+            bool collect_overlay_service_telemetry = false;
             int prefill_token_capacity = 0;
             /**
              * @brief Rows retained independently for deferred MTP publication.
@@ -791,6 +936,9 @@ namespace llaminar2
         const DeviceMoELayerRuntime &hostLayerState(int layer_idx) const override;
         bool decodeRuntimePublicationRequired(int layer_idx) const override;
         bool hasPrefillRouteScratchCapacity(int layer_idx, int token_count) const override;
+        /** @copydoc IMoERuntimeTable::prepareDecodeHistogramProducerStream */
+        void prepareDecodeHistogramProducerStream(void *stream) override;
+        /** @copydoc IMoERuntimeTable::recordDecodeHistogramProducerStream */
         void recordDecodeHistogramProducerStream(void *stream) override;
         void *decodeHistogramProducerStream() const override;
         bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
@@ -888,6 +1036,11 @@ namespace llaminar2
          * non-overlay table.
          */
         const DeviceMoEOverlayEpochTicket *overlayEpochTicket() const noexcept;
+        /**
+         * @return Status paired with @ref overlayEpochTicket, or null when
+         *         this table is not bound to an overlay epoch arena.
+         */
+        const DeviceMoEOverlayEpochStatus *overlayEpochStatus() const noexcept;
         /** @return Mutable canonical main table, or null when this table owns placement. */
         DeviceMoERuntimeTable *overlayPlacementSource() noexcept
         {
@@ -905,9 +1058,47 @@ namespace llaminar2
          */
         const DeviceMoEPlacementBank *devicePlacementBanks(
             int layer_idx) const;
+        /**
+         * @brief Resolve the prepared inactive bank without publishing it.
+         * @param layer_idx Model layer whose inactive recipe is required.
+         * @param epoch Exact prepared epoch expected by the maintenance wave.
+         * @return Stable host source and device destinations for bounded DMA.
+         * @throws std::logic_error When the table is not a mirrored GPU
+         *         authority or the requested bank was not prepared exactly.
+         *
+         * This method never allocates, transfers, or changes the active bank.
+         */
+        [[nodiscard]] DeviceMoERuntimeBankPublicationRecipe
+        preparedInactiveBankPublicationRecipe(
+            int layer_idx,
+            uint32_t epoch);
+
+        /**
+         * @brief Advance only the host publication recipe after GPU success.
+         * @param layer_idx Model layer whose device metadata was published.
+         * @param epoch Exact monotonically newer device epoch.
+         * @param bank Exact bank reported by the device epoch protocol.
+         * @throws std::logic_error When the acknowledgement does not match the
+         *         sole prepared inactive recipe.
+         *
+         * No device bytes are copied.  In particular, this method must never
+         * be treated as a coherence download or upload: device state remains
+         * authoritative and the host retains only the next publication recipe.
+         */
+        void acknowledgeDevicePublishedBank(
+            int layer_idx,
+            uint32_t epoch,
+            uint32_t bank);
         /** @copydoc IMoERuntimeTable::overlayRoutePlacementBinding */
         MoEOverlayRoutePlacementDeviceBinding
         overlayRoutePlacementBinding(int layer_idx) const override;
+        /** @copydoc IMoERuntimeTable::deviceOverlayServiceTelemetry */
+        DeviceMoEOverlayServiceTelemetryCell *
+        deviceOverlayServiceTelemetry() const noexcept override;
+        /** @copydoc IMoERuntimeTable::deviceOverlayServiceTelemetrySample */
+        DeviceMoEOverlayServiceTelemetrySample *
+        deviceOverlayServiceTelemetrySample(int layer_idx) const noexcept
+            override;
         bool hasDeferredVerifierRouteLedgerCapacity(int layer_idx,
                                                     int token_count) const;
 
@@ -917,6 +1108,7 @@ namespace llaminar2
         int num_experts_ = 0;
         int top_k_ = 0;
         bool mirror_to_device_ = false;
+        bool collect_overlay_service_telemetry_ = false;
         int prefill_token_capacity_ = 0;
         int deferred_verifier_token_capacity_ = 0;
         std::vector<DeviceMoELayerRuntime> host_layers_;
@@ -935,6 +1127,12 @@ namespace llaminar2
         DeviceMoELayerRuntime *device_layers_ = nullptr;
         DeviceMoELayerRuntime *device_initial_layers_ = nullptr;
         DeviceMoELayerRuntime *device_empty_layers_ = nullptr;
+        /** Canonical device-local `[layer][phase]` service accumulators. */
+        DeviceMoEOverlayServiceTelemetryCell
+            *device_overlay_service_telemetry_ = nullptr;
+        /** One zero-initialized cursor per layer across serial retained graphs. */
+        DeviceMoEOverlayServiceTelemetrySample
+            *device_overlay_service_samples_ = nullptr;
         void *decode_histogram_producer_stream_ = nullptr;
 
         /** Exact stream plus its reusable flip-arrival event. */
@@ -997,16 +1195,32 @@ namespace llaminar2
             const DeviceMoEPrefillRouteScratchBindings &allocation);
         void allocateDeviceMirror();
         void releaseDeviceMirror() noexcept;
+        /** Allocate and zero canonical Dynamic service accumulators. */
+        void allocateOverlayServiceTelemetry();
+        /** Release only a canonical table's service accumulators. */
+        void releaseOverlayServiceTelemetry() noexcept;
         /** Allocate and bind model-lifetime asynchronous histogram resources. */
         void allocateRuntimeHistogramDrainResources();
         /**
-         * @brief Register one producer and order it after bank initialization.
+         * @brief Admit one producer and order it after bank initialization.
          *
          * @param stream Exact non-null stream that writes runtime histograms.
          *
-         * The caller must hold @ref runtime_histogram_drain_mutex_.
+         * The caller must hold @ref runtime_histogram_drain_mutex_ and must run
+         * outside a CUDA/HIP capture interval. Event allocation and the wait on
+         * uncaptured model-setup work are intentionally confined to this method.
          */
         void registerRuntimeHistogramProducerStreamLocked(void *stream);
+        /**
+         * @brief Test whether an exact stream has completed producer admission.
+         *
+         * @param stream Stream identity to find.
+         * @return true when the stream owns a reusable flip-arrival event.
+         *
+         * The caller must hold @ref runtime_histogram_drain_mutex_.
+         */
+        [[nodiscard]] bool isRuntimeHistogramProducerStreamRegisteredLocked(
+            void *stream) const noexcept;
         /** Drain/destroy histogram resources during model teardown. */
         void releaseRuntimeHistogramDrainResources() noexcept;
         /** Merge one completed pinned generation into the host RCU histogram. */

@@ -8,7 +8,6 @@
 
 #include <gtest/gtest.h>
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -32,13 +31,6 @@ namespace llaminar2::test
                  .layer = 0},
             };
         }
-
-        /** @brief Every production phase that must independently prove overlap. */
-        constexpr std::array<ExpertHistogramSource, 3> kProductionPhases{
-            ExpertHistogramSource::DecodeToken,
-            ExpertHistogramSource::PrefillChunk,
-            ExpertHistogramSource::GroupedVerifier,
-        };
 
         /** @brief Construct one complete three-projection physical observation. */
         MoEOverlayCompletedMigrationMeasurement measurement(
@@ -73,11 +65,9 @@ namespace llaminar2::test
         /** @brief Feed one warmup and three deliberately unsorted samples. */
         void fillLedger(MoEOverlayMigrationMeasurementLedger &ledger)
         {
-            constexpr std::array<std::uint64_t, 4> timing{
+            constexpr std::uint64_t timing[]{
                 50, 300, 100, 200};
-            constexpr std::array<std::uint64_t, 4> interference{
-                50, 30, 10, 20};
-            for (std::size_t sample = 0; sample < timing.size(); ++sample)
+            for (std::size_t sample = 0; sample < std::size(timing); ++sample)
             {
                 std::vector<MoEOverlayCompletedMigrationMeasurement> wave;
                 /* Reverse input order to prove canonical coordinate lookup. */
@@ -86,21 +76,6 @@ namespace llaminar2::test
                 wave.push_back(measurement(
                     0, 1, sample + 1, timing[sample]));
                 ASSERT_TRUE(ledger.recordCompletedWave(wave, nullptr));
-
-                for (const auto &coordinate : coordinates())
-                {
-                    for (const auto phase : kProductionPhases)
-                    {
-                        const auto phase_penalty =
-                            static_cast<std::uint64_t>(phase) * 100u;
-                        ASSERT_TRUE(ledger.recordInterferenceSample(
-                            coordinate,
-                            phase,
-                            1'000,
-                            1'000 + interference[sample] + phase_penalty,
-                            nullptr));
-                    }
-                }
             }
         }
     } // namespace
@@ -155,8 +130,8 @@ namespace llaminar2::test
         EXPECT_EQ(sealed.rows[0].wave_wall_nanoseconds, 2'000u);
         EXPECT_EQ(
             sealed.rows[0].inference_interference_nanoseconds,
-            220u);
-        EXPECT_EQ(sealed.rows[0].interference_sample_count, 9u);
+            0u);
+        EXPECT_EQ(sealed.rows[0].interference_sample_count, 0u);
         EXPECT_EQ(sealed.rows[0].projections[0].wall_nanoseconds, 200u);
         EXPECT_EQ(sealed.rows[0].projections[2].wall_nanoseconds, 202u);
         EXPECT_EQ(sealed.rows[1].wave_wall_nanoseconds, 2'100u);
@@ -166,15 +141,15 @@ namespace llaminar2::test
                 sealed.rows);
         ASSERT_EQ(normalized.size(), 2u);
         EXPECT_EQ(normalized[0].transfer_and_repack_ns, 2'000u);
-        EXPECT_EQ(normalized[0].inference_interference_ns, 220u);
+        EXPECT_EQ(normalized[0].inference_interference_ns, 0u);
 
         const auto stats = ledger.stats();
         EXPECT_EQ(stats.completed_waves_observed, 4u);
         EXPECT_EQ(stats.migration_observations_seen, 8u);
         EXPECT_EQ(stats.warmup_migration_observations, 2u);
         EXPECT_EQ(stats.stored_migration_observations, 6u);
-        EXPECT_EQ(stats.warmup_interference_observations, 6u);
-        EXPECT_EQ(stats.stored_interference_observations, 18u);
+        EXPECT_EQ(stats.warmup_interference_observations, 0u);
+        EXPECT_EQ(stats.stored_interference_observations, 0u);
         EXPECT_EQ(stats.rejected_observations, 0u);
         EXPECT_FALSE(ledger.ready());
         EXPECT_THROW((void)ledger.seal(), std::logic_error);
@@ -204,14 +179,6 @@ namespace llaminar2::test
                 {measurement(0, 1, sample, 100 + sample),
                  measurement(1, 0, sample, 110 + sample)},
                 nullptr));
-            for (const auto &coordinate : coordinates())
-            {
-                for (const auto phase : kProductionPhases)
-                {
-                    ASSERT_TRUE(ledger.recordInterferenceSample(
-                        coordinate, phase, 1'000, 1'000, nullptr));
-                }
-            }
         }
         ASSERT_TRUE(ledger.ready());
         const auto sealed = ledger.seal();

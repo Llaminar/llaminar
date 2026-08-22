@@ -745,7 +745,18 @@ namespace
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
             bool, IDeviceContext *) const override
         {
-            return {};
+            DeviceGraphExecutor::DecodeCapturePolicy policy;
+            policy.allow_cached_graph_replay =
+                heterogeneous_segmented_prefill_;
+            policy.heterogeneous_segmented_enabled =
+                heterogeneous_segmented_prefill_;
+            if (heterogeneous_segmented_prefill_)
+            {
+                policy.graph_replay_plan_policy =
+                    DeviceGraphExecutor::GraphReplayPlanPolicy::
+                        AllowHeterogeneousBoundarySegmentation;
+            }
+            return policy;
         }
 
         PPCopyInfo resolvePPCopyInfo(const ForwardInput &) const override { return {}; }
@@ -787,6 +798,44 @@ namespace
 
         /// @brief Enable the row-select replay-param consumer for padded bucket tests.
         void setUseRowSelectProbe(bool enabled) { use_row_select_probe_ = enabled; }
+
+        /**
+         * @brief Route prefill through the production segmented graph authority.
+         *
+         * This exercises the lifecycle used by explicitly heterogeneous
+         * inference domains while retaining the same small real GPU kernel.
+         */
+        void setHeterogeneousSegmentedPrefill(bool enabled)
+        {
+            heterogeneous_segmented_prefill_ = enabled;
+        }
+
+        /**
+         * @brief Prepare immutable external inputs before segmented capture.
+         *
+         * Production arena admission establishes these device copies before
+         * capture preflight. This fixture normally lets monolithic warmup do
+         * that work implicitly, so the segmented regression performs the
+         * equivalent one-time setup explicitly and outside inference timing.
+         */
+        bool preparePersistentGraphInputsForTesting()
+        {
+            if (!device_.is_gpu() || !input_tensor_ || !residual_tensor_)
+                return false;
+
+            IWorkerGPUContext *gpu_ctx = getWorkerGPUContext(device_);
+            IBackend *backend = getBackendFor(device_);
+            if (!gpu_ctx || !backend)
+                return false;
+
+            void *stream = nullptr;
+            gpu_ctx->submitAndWait([&]() { stream = gpu_ctx->defaultStream(); });
+            return stream &&
+                   input_tensor_->ensureOnDevice(device_, stream) &&
+                   residual_tensor_->ensureOnDevice(device_, stream) &&
+                   backend->synchronizeStream(
+                       stream, device_.toKernelDeviceIndex());
+        }
 
         /// @brief Enable the real GPU KV append replay-param consumer.
         void setUseKVAppendProbe(bool enabled) { use_kv_append_probe_ = enabled; }
@@ -1096,6 +1145,7 @@ namespace
         IDeviceContext *ctx_ = nullptr;
         test::GraphArenaTestHarness *arena_harness_ = nullptr; ///< Borrowed stable arena/tensor owner.
         bool arena_bindings_ready_ = false;
+        bool heterogeneous_segmented_prefill_ = false; ///< Select the heterogeneous GraphSegmentCache prefill path.
         bool use_row_select_probe_ = false; ///< Whether to append HiddenStateRowSelectStage after residual add.
         bool use_kv_append_probe_ = false;  ///< Whether to append real GPU KVCacheAppendStage after residual add.
         bool use_rope_probe_ = false;       ///< Whether to append real GPU RoPEStage after residual add.
@@ -1466,6 +1516,87 @@ namespace
         ASSERT_NE(host_->stage(), nullptr);
         EXPECT_GE(host_->stage()->executeCount(), 2)
             << "Normal build/warmup and capture recording execute the stage directly.";
+    }
+
+    /**
+     * @brief The public prefill probe follows the executable that actually runs.
+     *
+     * Heterogeneous prefill bypasses the monolithic PrefillGraphCache and owns
+     * its native executable in GraphSegmentCache. The regression is complete
+     * only if the same backend-neutral snapshot consumed by server/benchmark
+     * readiness reports capture and each subsequent replay from that authority.
+     */
+    TEST_F(
+        PrefillGraphCacheExecutionTest,
+        HeterogeneousSegmentedLifecycleReportsAuthoritativeCaptureAndReplay)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+        });
+
+        host_->setHeterogeneousSegmentedPrefill(true);
+        ASSERT_TRUE(host_->preparePersistentGraphInputsForTesting());
+        auto tokens = makeSequentialInts(kExactBucketSeqLen, 1700);
+        ForwardInput base_input;
+        base_input.token_ids = tokens.data();
+        base_input.batch_size = 1;
+        base_input.seq_len = kExactBucketSeqLen;
+        base_input.device = device_;
+
+        const auto plan =
+            ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+                base_input,
+                debugEnv().execution.prefill_graph_bucket_sizes,
+                kPadTokenId,
+                /*allow_padded_execution=*/false);
+        ASSERT_TRUE(plan) << plan.error;
+
+        ForwardOutput output;
+        const auto signature = bucketedPrefillSignature(
+            device_, kExactBucketSeqLen, host_->placement_epoch);
+        const auto key = prefillGraphKey(
+            device_,
+            kExactBucketSeqLen,
+            host_->domain_id,
+            host_->participant_id,
+            host_->placement_epoch,
+            host_->topology_signature);
+
+        ASSERT_TRUE(engine_->runPrefillChunk(base_input, plan, output, *host_));
+        auto after_capture =
+            engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(after_capture.has_value());
+        EXPECT_EQ(after_capture->phase, PrefillGraphPhase::Ready);
+        EXPECT_EQ(after_capture->capture_count, 1u);
+        EXPECT_EQ(after_capture->replay_count, 1);
+        EXPECT_GT(after_capture->node_count, 0u);
+        EXPECT_EQ(after_capture->capture_phase, "capture");
+        EXPECT_EQ(
+            after_capture->recapture_reason,
+            "heterogeneous_boundary_segmentation");
+
+        ASSERT_TRUE(engine_->runPrefillChunk(base_input, plan, output, *host_));
+        auto after_replay =
+            engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(after_replay.has_value());
+        EXPECT_EQ(after_replay->phase, PrefillGraphPhase::Ready);
+        EXPECT_EQ(after_replay->capture_count, 1u);
+        EXPECT_EQ(after_replay->replay_count, 2);
+        EXPECT_GT(after_replay->node_count, 0u);
+        EXPECT_EQ(after_replay->capture_phase, "replay");
+
+        ASSERT_TRUE(engine_->runPrefillChunk(base_input, plan, output, *host_));
+        auto after_second_replay =
+            engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(after_second_replay.has_value());
+        EXPECT_EQ(after_second_replay->capture_count, 1u);
+        EXPECT_EQ(after_second_replay->replay_count, 3);
     }
 
     TEST_F(PrefillGraphCacheExecutionTest, SessionResetDropsCapturedPrefillExecutable)

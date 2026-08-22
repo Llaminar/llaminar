@@ -121,6 +121,7 @@ extern "C" bool cudaMoEOverlayActivationPackReturn(
         <<<1u, kThreads, 0u, cuda_stream>>>(*launch);
     const std::size_t output_elements =
         static_cast<std::size_t>(launch->physical_rows) *
+        static_cast<std::size_t>(launch->dispatch.top_k) *
         static_cast<std::size_t>(launch->returned.d_model);
     llaminar2::moe_activation_packet_device::packMappedReturnPayloadKernel
         <<<blocksFor(output_elements), kThreads, 0u, cuda_stream>>>(*launch);
@@ -142,8 +143,9 @@ extern "C" bool cudaMoEOverlayActivationConsumeReturn(
         <<<1u, kThreads, 0u, cuda_stream>>>(*launch);
     const std::size_t output_elements =
         static_cast<std::size_t>(launch->physical_rows) *
+        static_cast<std::size_t>(launch->dispatch.top_k) *
         static_cast<std::size_t>(launch->returned.d_model);
-    llaminar2::moe_activation_packet_device::accumulateMappedReturnKernel
+    llaminar2::moe_activation_packet_device::materializeMappedCanonicalReturnKernel
         <<<blocksFor(output_elements), kThreads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
@@ -239,10 +241,13 @@ extern "C" bool cudaMoEOverlayActivationConsumeSingleRowReturnBatch(
         return false;
     }
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    llaminar2::moe_activation_packet_device::gatherSingleRowReturnBatchKernel
+    llaminar2::moe_activation_packet_device::validateSingleRowReturnBatchKernel
         <<<launch->lane_count, kSingleRowThreads, 0u, cuda_stream>>>(*launch);
-    llaminar2::moe_activation_packet_device::foldSingleRowReturnBatchKernel
-        <<<blocksFor(static_cast<std::size_t>(launch->d_model)),
+    const std::size_t route_elements =
+        static_cast<std::size_t>(launch->top_k) *
+        static_cast<std::size_t>(launch->d_model);
+    llaminar2::moe_activation_packet_device::materializeSingleRowCanonicalReturnBatchKernel
+        <<<dim3(blocksFor(route_elements), launch->lane_count, 1u),
            kThreads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
@@ -263,9 +268,11 @@ extern "C" bool cudaMoEOverlayActivationConsumeMultiRowReturnBatch(
         <<<launch->lane_count, kThreads, 0u, cuda_stream>>>(*launch);
     const std::size_t output_elements =
         static_cast<std::size_t>(launch->physical_rows) *
+        static_cast<std::size_t>(launch->top_k) *
         static_cast<std::size_t>(launch->d_model);
-    llaminar2::moe_activation_packet_device::foldMultiRowReturnBatchKernel
-        <<<blocksFor(output_elements), kThreads, 0u, cuda_stream>>>(*launch);
+    llaminar2::moe_activation_packet_device::materializeMultiRowCanonicalReturnBatchKernel
+        <<<dim3(blocksFor(output_elements), launch->lane_count, 1u),
+           kThreads, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }
 
@@ -352,5 +359,69 @@ extern "C" bool cudaMoEOverlayFoldNodeLocalCanonicalRoutes(
         <<<fold_grid, kThreads, 0u, cuda_stream>>>(*launch);
     llaminar2::moe_node_local_route_device::finishRouteConsumeKernel
         <<<launch->peer_count, 1u, 0u, cuda_stream>>>(*launch);
+    return launchAccepted();
+}
+
+extern "C" bool cudaMoEOverlayBeginNodeLocalDensePublication(
+    const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() || !launch->binding.isRoot() ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    llaminar2::moe_node_local_route_device::beginDensePublicationKernel
+        <<<1u, 1u, 0u, cuda_stream>>>(*launch);
+    return launchAccepted();
+}
+
+extern "C" bool cudaMoEOverlayFinishNodeLocalDensePublication(
+    const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() || !launch->binding.isRoot() ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    llaminar2::moe_node_local_route_device::finishDensePublicationKernel
+        <<<1u, 1u, 0u, cuda_stream>>>(*launch);
+    return launchAccepted();
+}
+
+extern "C" bool cudaMoEOverlayBeginNodeLocalDensePublicationConsume(
+    const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() || launch->binding.isRoot() ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    llaminar2::moe_node_local_route_device::beginDensePublicationConsumeKernel
+        <<<1u, 1u, 0u, cuda_stream>>>(*launch);
+    return launchAccepted();
+}
+
+extern "C" bool cudaMoEOverlayFinishNodeLocalDensePublicationConsume(
+    const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+    int device_ordinal,
+    void *stream)
+{
+    if (!launch || !launch->valid() || launch->binding.isRoot() ||
+        !selectLaunchContext(device_ordinal, stream))
+    {
+        return false;
+    }
+    const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    llaminar2::moe_node_local_route_device::finishDensePublicationConsumeKernel
+        <<<1u, 1u, 0u, cuda_stream>>>(*launch);
     return launchAccepted();
 }

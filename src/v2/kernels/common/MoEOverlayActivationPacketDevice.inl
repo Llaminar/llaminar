@@ -147,6 +147,45 @@ namespace llaminar2::moe_activation_packet_device
         return left.low == right.low && left.high == right.high;
     }
 
+    /**
+     * @brief Pack the exact placement-acquire result into terminal evidence.
+     *
+     * Activation endpoint status already carries one 64-bit diagnostic word.
+     * On a stage-zero placement failure it records the last completed epoch
+     * operation, the request ticket visible to the failing packet, and the
+     * epoch currently published in that ticket's selected placement bank. The
+     * three 16-bit epoch lanes are diagnostic modulo counters; operation and
+     * result retain their full ABI widths. This remains entirely device-owned
+     * and lets the bounded host watchdog distinguish a missing acquire, a
+     * prematurely reused placement bank, and an ordinary semantic rejection
+     * without adding a synchronization or another mapped diagnostic field.
+     */
+    __device__ __forceinline__ std::uint64_t placementAcquireEvidence(
+        MoEOverlayRoutePlacementDeviceBinding placement) noexcept
+    {
+        if (!placement.status)
+            return 0u;
+        const DeviceMoEOverlayEpochStatus status = *placement.status;
+        const std::uint64_t ticket_epoch =
+            placement.ticket ? placement.ticket->epoch : 0u;
+        const std::uint32_t ticket_bank =
+            placement.ticket
+                ? static_cast<std::uint32_t>(
+                      placement.ticket->selector & 1u)
+                : kDeviceMoEOverlayInvalidBank;
+        const std::uint64_t selected_bank_epoch =
+            ticket_bank < kDeviceMoEOverlayEpochBankCount &&
+                    placement.banks[ticket_bank].epoch
+                ? static_cast<std::uint64_t>(
+                      *placement.banks[ticket_bank].epoch)
+                : 0u;
+        return ((status.epoch & 0xffffull) << 48u) |
+               ((ticket_epoch & 0xffffull) << 32u) |
+               ((selected_bank_epoch & 0xffffull) << 16u) |
+               (static_cast<std::uint64_t>(status.operation & 0xffu) << 8u) |
+               static_cast<std::uint64_t>(status.code & 0xffu);
+    }
+
     /** @return Expected physical rows encoded by the immutable admission ticket. */
     __device__ __forceinline__ std::uint64_t admittedPhysicalRows(
         const MoEOverlayActivationEpochIdentity &identity) noexcept
@@ -242,7 +281,9 @@ namespace llaminar2::moe_activation_packet_device
         MoEOverlayActivationStatusCode code,
         std::uint32_t stage_ordinal,
         std::int32_t model_layer_index,
-        std::uint64_t observed_timeline) noexcept
+        std::uint64_t observed_timeline,
+        std::uint32_t failure_diagnostic = 0u,
+        std::uint32_t failure_auxiliary = 0u) noexcept
     {
         /* A retained graph must drain after a terminal packet fault so its
          * unconditional timeline nodes can release the peer. Preserve the
@@ -267,6 +308,8 @@ namespace llaminar2::moe_activation_packet_device
         status->operation = raw(operation);
         status->code = raw(code);
         status->last_model_layer = model_layer_index;
+        status->failure_diagnostic = failure_diagnostic;
+        status->failure_auxiliary = failure_auxiliary;
         status->last_consumed_stage =
             grant ? grant->last_consumed_stage : -1;
         status->last_published_stage =
@@ -281,6 +324,121 @@ namespace llaminar2::moe_activation_packet_device
             grant ? grant->published_stage_count : 0u;
         __threadfence_system();
         status->state = raw(MoEOverlayActivationEndpointState::Aborted);
+    }
+
+    __device__ __forceinline__ bool validControl(
+        const MoEOverlayActivationEpochControl *control,
+        MoEOverlayActivationEndpoint endpoint,
+        std::uint32_t stage_ordinal,
+        std::int32_t physical_rows,
+        std::int32_t expected_target_participant) noexcept;
+
+    /**
+     * @brief Capture every stage-zero continuation admission predicate.
+     *
+     * A set bit means the named predicate succeeded.  The mask is emitted only
+     * after admission rejects the retained packet, so these redundant reads do
+     * not add traffic to successful inference.  Bits 0 through 16 cover the
+     * complete placement/grant expression in @ref prepareDispatchMetadata;
+     * bits 17 through 20 distinguish the mapped-control identity edge that is
+     * otherwise hidden inside @ref acquireOrValidateGrant.
+     */
+    __device__ __forceinline__ std::uint32_t dispatchAdmissionDiagnostic(
+        MoEOverlayActivationDispatchPackLaunch launch,
+        bool grant_acquired) noexcept
+    {
+        const DeviceMoEOverlayEpochTicket ticket = launch.placement.ticket
+            ? *launch.placement.ticket
+            : DeviceMoEOverlayEpochTicket{};
+        const std::uint32_t bank =
+            static_cast<std::uint32_t>(ticket.selector & 1u);
+        const std::uint64_t selector_generation = ticket.selector >> 1u;
+        const bool bank_valid =
+            bank < kDeviceMoEOverlayEpochBankCount;
+        const auto selected = bank_valid
+            ? launch.placement.banks[bank]
+            : MoEOverlayRoutePlacementBankDeviceView{};
+        const auto identity = launch.control
+            ? snapshotPeerPublished(&launch.control->identity)
+            : MoEOverlayActivationEpochIdentity{};
+        const auto endpoint_status = launch.control
+            ? snapshotPeerPublished(
+                  &launch.control->continuation_status)
+            : MoEOverlayActivationEndpointStatus{};
+        const auto endpoint_state =
+            static_cast<MoEOverlayActivationEndpointState>(
+                endpoint_status.state);
+
+        std::uint32_t mask = 0u;
+        const auto record = [&](std::uint32_t bit, bool passed)
+        {
+            if (passed)
+                mask |= std::uint32_t{1} << bit;
+        };
+        record(0u, grant_acquired);
+        record(1u, launch.placement.valid());
+        record(2u, launch.grant && launch.grant->digest.valid());
+        record(3u, launch.grant && launch.grant->generation != 0u);
+        record(4u, launch.grant && launch.grant->placement_epoch != 0u);
+        record(
+            5u,
+            launch.grant &&
+                launch.grant->state ==
+                    raw(MoEOverlayActivationEndpointState::Active));
+        record(
+            6u,
+            launch.grant &&
+                launch.grant->code ==
+                    raw(MoEOverlayActivationStatusCode::Success));
+        record(
+            7u,
+            launch.grant &&
+                launch.grant->stage_count > launch.stage_ordinal);
+        record(
+            8u,
+            launch.grant &&
+                launch.grant->physical_rows == launch.physical_rows);
+        record(
+            9u,
+            launch.grant &&
+                launch.grant->endpoint ==
+                    raw(MoEOverlayActivationEndpoint::Continuation));
+        record(
+            10u,
+            launch.grant &&
+                launch.grant->graph_role !=
+                    MoEOverlayInferenceGraphRole::None);
+        record(11u, ticket.epoch != 0u);
+        record(12u, selector_generation != 0u);
+        record(
+            13u,
+            launch.grant &&
+                ticket.epoch == launch.grant->placement_epoch);
+        record(14u, bank_valid);
+        record(15u, selected.valid());
+        record(
+            16u,
+            selected.valid() &&
+                static_cast<std::uint64_t>(*selected.epoch) == ticket.epoch);
+        record(
+            17u,
+            endpoint_state == MoEOverlayActivationEndpointState::Armed ||
+                endpoint_state == MoEOverlayActivationEndpointState::Active);
+        record(
+            18u,
+            sameDigest(endpoint_status.digest, identity.digest));
+        record(
+            19u,
+            endpoint_status.generation == identity.epoch_generation);
+        record(
+            20u,
+            validControl(
+                launch.control,
+                MoEOverlayActivationEndpoint::Continuation,
+                launch.stage_ordinal,
+                launch.physical_rows,
+                launch.target_participant_id));
+        return mask;
     }
 
     /** @return Whether immutable mapped control bytes authenticate this graph. */
@@ -360,37 +518,92 @@ namespace llaminar2::moe_activation_packet_device
         MoEOverlayActivationEpochControl *control,
         MoEOverlayActivationDeviceEpochGrant *grant,
         MoEOverlayActivationEndpoint endpoint,
+        MoEOverlayActivationOperation operation,
         std::uint32_t stage_ordinal,
         std::int32_t physical_rows,
-        std::int32_t expected_target_participant = -1) noexcept
+        std::int32_t expected_target_participant = -1,
+        MoEOverlayRoutePlacementDeviceBinding placement = {}) noexcept
     {
         if (!control || !grant || physical_rows <= 0)
             return false;
-        const bool active_stage_zero_grant =
-            stage_ordinal == 0u && grant->digest.valid() &&
-            grant->generation != 0u && grant->placement_epoch != 0u &&
-            grant->stage_count > 0u &&
-            grant->physical_rows == physical_rows &&
-            grant->endpoint == raw(endpoint) &&
-            grant->state ==
-                raw(MoEOverlayActivationEndpointState::Active) &&
-            grant->code == raw(MoEOverlayActivationStatusCode::Success);
-        if (stage_ordinal == 0u && !active_stage_zero_grant)
+        const bool begins_epoch =
+            operation == MoEOverlayActivationOperation::PublishDispatch ||
+            operation == MoEOverlayActivationOperation::ConsumeDispatch;
+        if (stage_ordinal == 0u && begins_epoch)
         {
-            if (!validControl(
-                    control,
-                    endpoint,
-                    stage_ordinal,
-                    physical_rows,
-                    expected_target_participant))
+            /*
+             * The capture-stable admission wait uses a reusable non-zero
+             * threshold. It can therefore pass on transaction N's still-live
+             * publication when transaction N+1 has already been submitted by
+             * the continuation host. The endpoint-private grant is the device
+             * anti-ABA authority: an epoch-opening operation must observe a
+             * fully authenticated scheduler identity strictly newer than the
+             * generation it last consumed. Later stage-zero operations reuse
+             * the active grant and never enter this loop.
+             *
+             * This wait is normally one iteration. Under intentional host
+             * submission overlap it suspends only this endpoint's graph block;
+             * the peer device retires N and publishes N+1 independently. No
+             * host fence, graph mutation, or mutable execution-state mirror is
+             * introduced.
+             */
+            const std::uint64_t previous_generation = grant->generation;
+            MoEOverlayActivationEpochIdentity identity{};
+            for (;;)
+            {
+                if (validControl(
+                        control,
+                        endpoint,
+                        stage_ordinal,
+                        physical_rows,
+                        expected_target_participant))
+                {
+                    identity = snapshotPeerPublished(&control->identity);
+                    if (identity.epoch_generation > previous_generation)
+                        break;
+                }
+#if defined(__CUDA_ARCH__)
+                __nanosleep(64u);
+#elif defined(__HIP_DEVICE_COMPILE__)
+                __builtin_amdgcn_s_sleep(1u);
+#endif
+            }
+            if (!placement.valid())
+                return false;
+
+            /*
+             * The host ticket carries only a lower bound because background
+             * device maintenance may publish after scheduler admission. Read
+             * the endpoint's request ticket on its exact graph stream and
+             * authenticate the selected durable bank before making that exact
+             * epoch part of the private grant. Continuation and follower use
+             * the same device-owned admission epoch, while the mapped packet
+             * descriptor proves cross-device equality without a host shadow.
+             */
+            const DeviceMoEOverlayEpochTicket placement_ticket{
+                .epoch = placement.ticket->epoch,
+                .selector = placement.ticket->selector,
+            };
+            const std::uint32_t placement_bank =
+                static_cast<std::uint32_t>(
+                    placement_ticket.selector & 1u);
+            const std::uint64_t placement_generation =
+                placement_ticket.selector >> 1u;
+            if (placement_ticket.epoch == 0u ||
+                placement_ticket.epoch < identity.placement_epoch_floor ||
+                placement_generation == 0u ||
+                placement_bank >= kDeviceMoEOverlayEpochBankCount ||
+                !placement.banks[placement_bank].valid() ||
+                static_cast<std::uint64_t>(
+                    *placement.banks[placement_bank].epoch) !=
+                    placement_ticket.epoch)
             {
                 return false;
             }
-            const auto identity = snapshotPeerPublished(&control->identity);
             *grant = MoEOverlayActivationDeviceEpochGrant{
                 .digest = identity.digest,
                 .generation = identity.epoch_generation,
-                .placement_epoch = identity.placement_epoch,
+                .placement_epoch = placement_ticket.epoch,
                 .published_payload_bytes = 0u,
                 .published_live_rows = 0u,
                 .published_live_entries = 0u,
@@ -405,6 +618,8 @@ namespace llaminar2::moe_activation_packet_device
                 .endpoint = raw(endpoint),
                 .state = raw(MoEOverlayActivationEndpointState::Active),
                 .code = raw(MoEOverlayActivationStatusCode::Success),
+                .graph_role = static_cast<MoEOverlayInferenceGraphRole>(
+                    identity.graph_role),
             };
         }
         return grant->digest.valid() && grant->generation != 0u &&
@@ -412,6 +627,7 @@ namespace llaminar2::moe_activation_packet_device
                grant->stage_count > stage_ordinal &&
                grant->physical_rows == physical_rows &&
                grant->endpoint == raw(endpoint) &&
+               grant->graph_role != MoEOverlayInferenceGraphRole::None &&
                grant->state ==
                    raw(MoEOverlayActivationEndpointState::Active) &&
                grant->code == raw(MoEOverlayActivationStatusCode::Success);
@@ -468,13 +684,16 @@ namespace llaminar2::moe_activation_packet_device
             placement_ticket.selector >> 1u;
         const auto selected_placement =
             launch.placement.banks[placement_bank];
-        if (!acquireOrValidateGrant(
+        const bool grant_acquired = acquireOrValidateGrant(
                 control,
                 launch.grant,
                 endpoint,
+                operation,
                 launch.stage_ordinal,
                 launch.physical_rows,
-                launch.target_participant_id) ||
+                launch.target_participant_id,
+                launch.placement);
+        if (!grant_acquired ||
             placement_ticket.epoch == 0u ||
             placement_generation == 0u ||
             placement_ticket.epoch != launch.grant->placement_epoch ||
@@ -491,7 +710,14 @@ namespace llaminar2::moe_activation_packet_device
                 MoEOverlayActivationStatusCode::InvalidControl,
                 launch.stage_ordinal,
                 launch.model_layer_index,
-                0u);
+                placementAcquireEvidence(launch.placement),
+                dispatchAdmissionDiagnostic(launch, grant_acquired),
+                launch.grant
+                    ? (static_cast<std::uint32_t>(
+                           launch.grant->generation & 0xffffu) << 16u) |
+                          static_cast<std::uint32_t>(
+                              launch.grant->placement_epoch & 0xffffu)
+                    : 0u);
             return {};
         }
         const std::int32_t *const overlay_route_participants =
@@ -697,6 +923,14 @@ namespace llaminar2::moe_activation_packet_device
                 }
                 launch.packet.expert_ids[compact_entries] = expert;
                 launch.packet.route_weights[compact_entries] = weight;
+                launch.packet.original_route_slots[compact_entries] =
+                    static_cast<std::int32_t>(route_slot);
+                launch.packet.compact_route_slots[compact_entries] =
+                    static_cast<std::int32_t>(
+                        compact_rows *
+                            static_cast<std::uint64_t>(
+                                launch.packet.top_k) +
+                        (compact_entries - row_begin));
                 ++compact_entries;
             }
             if (compact_entries == row_begin)
@@ -914,6 +1148,14 @@ namespace llaminar2::moe_activation_packet_device
                         entry_offset + row_match++;
                     launch.packet.expert_ids[output_entry] = expert;
                     launch.packet.route_weights[output_entry] = weight;
+                    launch.packet.original_route_slots[output_entry] =
+                        static_cast<std::int32_t>(route_slot);
+                    launch.packet.compact_route_slots[output_entry] =
+                        static_cast<std::int32_t>(
+                            row_offset *
+                                static_cast<std::uint64_t>(
+                                    launch.packet.top_k) +
+                            (row_match - 1u));
                 }
             }
             __syncthreads();
@@ -1030,8 +1272,11 @@ namespace llaminar2::moe_activation_packet_device
                 control,
                 launch.grant,
                 endpoint,
+                operation,
                 launch.stage_ordinal,
-                launch.physical_rows))
+                launch.physical_rows,
+                /*expected_target_participant=*/-1,
+                launch.placement))
         {
             publishFailure(
                 control,
@@ -1041,7 +1286,7 @@ namespace llaminar2::moe_activation_packet_device
                 MoEOverlayActivationStatusCode::InvalidControl,
                 launch.stage_ordinal,
                 launch.model_layer_index,
-                0u);
+                placementAcquireEvidence(launch.placement));
             return;
         }
         const std::int32_t expected_previous =
@@ -1114,10 +1359,35 @@ namespace llaminar2::moe_activation_packet_device
             }
             for (std::int32_t entry = begin; entry < end; ++entry)
             {
+                const std::int32_t original_slot = loadPeerPublished(
+                    launch.packet.original_route_slots + entry);
+                const std::int32_t compact_slot = loadPeerPublished(
+                    launch.packet.compact_route_slots + entry);
+                const std::int32_t expected_compact_slot =
+                    static_cast<std::int32_t>(row) * launch.packet.top_k +
+                    (entry - begin);
+                const std::int32_t original_row =
+                    original_slot >= 0
+                        ? original_slot / launch.packet.top_k
+                        : -1;
+                const std::int32_t original_route =
+                    original_slot >= 0
+                        ? original_slot % launch.packet.top_k
+                        : -1;
+                const std::int32_t prior_original_slot =
+                    entry == begin
+                        ? row_id * launch.packet.top_k - 1
+                        : loadPeerPublished(
+                              launch.packet.original_route_slots +
+                              entry - 1);
                 if (loadPeerPublished(
                         launch.packet.expert_ids + entry) < 0 ||
                     !isfinite(loadPeerPublished(
-                        launch.packet.route_weights + entry)))
+                        launch.packet.route_weights + entry)) ||
+                    original_row != row_id || original_route < 0 ||
+                    original_route >= launch.packet.top_k ||
+                    original_slot <= prior_original_slot ||
+                    compact_slot != expected_compact_slot)
                 {
                     valid = false;
                     break;
@@ -1210,8 +1480,11 @@ namespace llaminar2::moe_activation_packet_device
                     control,
                     launch.grant,
                     endpoint,
+                    operation,
                     launch.stage_ordinal,
-                    launch.physical_rows))
+                    launch.physical_rows,
+                    /*expected_target_participant=*/-1,
+                    launch.placement))
             {
                 publishFailure(
                     control,
@@ -1221,7 +1494,7 @@ namespace llaminar2::moe_activation_packet_device
                     MoEOverlayActivationStatusCode::InvalidControl,
                     launch.stage_ordinal,
                     launch.model_layer_index,
-                    0u);
+                    placementAcquireEvidence(launch.placement));
             }
             else
             {
@@ -1313,7 +1586,28 @@ namespace llaminar2::moe_activation_packet_device
                     (row + 1u != block_live_rows ||
                      end == static_cast<std::int32_t>(
                                 block_live_entries));
-                if (!row_valid)
+                bool route_slots_valid = row_valid;
+                std::int32_t prior_original_slot =
+                    row_id * launch.packet.top_k - 1;
+                for (std::int32_t entry = begin;
+                     route_slots_valid && entry < end;
+                     ++entry)
+                {
+                    const std::int32_t original_slot = loadPeerPublished(
+                        launch.packet.original_route_slots + entry);
+                    const std::int32_t compact_slot = loadPeerPublished(
+                        launch.packet.compact_route_slots + entry);
+                    route_slots_valid =
+                        original_slot / launch.packet.top_k == row_id &&
+                        original_slot % launch.packet.top_k >= 0 &&
+                        original_slot > prior_original_slot &&
+                        compact_slot ==
+                            static_cast<std::int32_t>(row) *
+                                launch.packet.top_k +
+                            (entry - begin);
+                    prior_original_slot = original_slot;
+                }
+                if (!route_slots_valid)
                     atomicExch(&block_valid, 0u);
             }
             for (std::uint64_t entry = threadIdx.x;
@@ -1457,9 +1751,9 @@ namespace llaminar2::moe_activation_packet_device
                                : row);
                 launch.hidden_rows_fp32[element] = loadPeerPublished(
                     launch.packet.hidden_rows_fp32 +
-                    payload_row *
-                        static_cast<std::size_t>(launch.packet.d_model) +
-                    column);
+                        payload_row *
+                            static_cast<std::size_t>(launch.packet.d_model) +
+                        column);
             }
             else
             {
@@ -1507,6 +1801,7 @@ namespace llaminar2::moe_activation_packet_device
                 control,
                 launch.grant,
                 endpoint,
+                operation,
                 launch.stage_ordinal,
                 launch.physical_rows))
         {
@@ -1548,7 +1843,11 @@ namespace llaminar2::moe_activation_packet_device
             moeOverlayActivationBufferIndex(launch.stage_ordinal);
         auto &buffer = control->buffers[bank];
         if (timeline == 0u ||
-            launch.grant->live_rows > launch.returned.row_capacity)
+            launch.grant->live_entries >
+                launch.returned.route_slot_capacity ||
+            launch.grant->live_entries >
+                launch.grant->live_rows *
+                    static_cast<std::uint64_t>(launch.dispatch.top_k))
         {
             publishFailure(
                 control,
@@ -1561,20 +1860,14 @@ namespace llaminar2::moe_activation_packet_device
                 0u);
             return;
         }
-        for (std::uint64_t row = 0u; row < launch.grant->live_rows; ++row)
-        {
-            const std::int32_t row_id =
-                loadPeerPublished(launch.dispatch.row_ids + row);
-            launch.returned.row_ids[row] = row_id;
-        }
         const MoEOverlayActivationPayloadDescriptor descriptor{
             .digest = launch.grant->digest,
             .timeline = timeline,
             .placement_epoch = launch.grant->placement_epoch,
             .live_rows = launch.grant->live_rows,
-            .live_entries = 0u,
+            .live_entries = launch.grant->live_entries,
             .payload_bytes = moeOverlayReturnPayloadBytes(
-                launch.grant->live_rows,
+                launch.grant->live_entries,
                 static_cast<std::uint32_t>(launch.returned.d_model)),
             .stage_ordinal = launch.stage_ordinal,
             .model_layer_index = launch.model_layer_index,
@@ -1592,7 +1885,7 @@ namespace llaminar2::moe_activation_packet_device
             /*published=*/true,
             descriptor.payload_bytes,
             descriptor.live_rows,
-            0u);
+            descriptor.live_entries);
     }
 
     /**
@@ -1625,6 +1918,7 @@ namespace llaminar2::moe_activation_packet_device
                     control,
                     launch.grant,
                     endpoint,
+                    operation,
                     launch.stage_ordinal,
                     launch.physical_rows))
             {
@@ -1662,8 +1956,12 @@ namespace llaminar2::moe_activation_packet_device
                         0u);
                 }
                 else if (block_timeline == 0u ||
-                         launch.grant->live_rows >
-                             launch.returned.row_capacity)
+                         launch.grant->live_entries >
+                             launch.returned.route_slot_capacity ||
+                         launch.grant->live_entries >
+                             launch.grant->live_rows *
+                                 static_cast<std::uint64_t>(
+                                     launch.dispatch.top_k))
                 {
                     publishFailure(
                         control,
@@ -1684,18 +1982,6 @@ namespace llaminar2::moe_activation_packet_device
         }
         __syncthreads();
 
-        if (block_ready != 0u)
-        {
-            for (std::uint64_t row = threadIdx.x;
-                 row < block_live_rows;
-                 row += blockDim.x)
-            {
-                launch.returned.row_ids[row] =
-                    loadPeerPublished(launch.dispatch.row_ids + row);
-            }
-        }
-        __syncthreads();
-
         if (threadIdx.x != 0u || block_ready == 0u)
             return;
         const std::uint32_t bank =
@@ -1706,9 +1992,9 @@ namespace llaminar2::moe_activation_packet_device
             .timeline = block_timeline,
             .placement_epoch = launch.grant->placement_epoch,
             .live_rows = block_live_rows,
-            .live_entries = 0u,
+            .live_entries = launch.grant->live_entries,
             .payload_bytes = moeOverlayReturnPayloadBytes(
-                block_live_rows,
+                launch.grant->live_entries,
                 static_cast<std::uint32_t>(
                     launch.returned.d_model)),
             .stage_ordinal = launch.stage_ordinal,
@@ -1727,7 +2013,7 @@ namespace llaminar2::moe_activation_packet_device
             /*published=*/true,
             descriptor.payload_bytes,
             descriptor.live_rows,
-            0u);
+            descriptor.live_entries);
     }
 
     /**
@@ -1745,13 +2031,13 @@ namespace llaminar2::moe_activation_packet_device
         __shared__ std::uint32_t block_endpoint_state;
         __shared__ std::uint32_t block_status_code;
         __shared__ std::int32_t block_last_published_stage;
-        __shared__ std::uint64_t block_live_rows;
+        __shared__ std::uint64_t block_live_entries;
         if (threadIdx.x == 0u)
         {
             block_endpoint_state = launch.grant->state;
             block_status_code = launch.grant->code;
             block_last_published_stage = launch.grant->last_published_stage;
-            block_live_rows = launch.grant->live_rows;
+            block_live_entries = launch.grant->live_entries;
         }
         __syncthreads();
 
@@ -1765,16 +2051,39 @@ namespace llaminar2::moe_activation_packet_device
                 raw(MoEOverlayActivationStatusCode::Success) ||
             block_last_published_stage !=
                 static_cast<std::int32_t>(launch.stage_ordinal) ||
-            block_live_rows >
-                static_cast<std::uint64_t>(launch.physical_rows) ||
-            element >= block_live_rows *
+            block_live_entries >
+                launch.returned.route_slot_capacity ||
+            element >= block_live_entries *
                            static_cast<std::uint64_t>(
                                launch.returned.d_model))
         {
             return;
         }
-        launch.returned.output_rows_fp32[element] =
-            launch.local_output_rows_fp32[element];
+        const std::size_t compact_entry =
+            element / static_cast<std::size_t>(launch.returned.d_model);
+        const std::size_t column =
+            element % static_cast<std::size_t>(launch.returned.d_model);
+        const std::int32_t original_slot = loadPeerPublished(
+            launch.dispatch.original_route_slots + compact_entry);
+        const std::int32_t compact_slot = loadPeerPublished(
+            launch.dispatch.compact_route_slots + compact_entry);
+        const std::size_t route_slot_limit =
+            static_cast<std::size_t>(launch.physical_rows) *
+            static_cast<std::size_t>(launch.dispatch.top_k);
+        if (original_slot < 0 || compact_slot < 0 ||
+            static_cast<std::size_t>(original_slot) >= route_slot_limit ||
+            static_cast<std::size_t>(compact_slot) >= route_slot_limit)
+        {
+            return;
+        }
+        launch.returned.canonical_route_contributions_fp32[
+            static_cast<std::size_t>(original_slot) *
+                static_cast<std::size_t>(launch.returned.d_model) +
+            column] =
+            launch.local_canonical_route_contributions_fp32[
+                static_cast<std::size_t>(compact_slot) *
+                    static_cast<std::size_t>(launch.returned.d_model) +
+                column];
     }
 
     /** @brief Validate one participant return before deterministic accumulation. */
@@ -1789,6 +2098,7 @@ namespace llaminar2::moe_activation_packet_device
                 control,
                 launch.grant,
                 endpoint,
+                operation,
                 launch.stage_ordinal,
                 launch.physical_rows))
         {
@@ -1839,27 +2149,42 @@ namespace llaminar2::moe_activation_packet_device
                          launch.stage_ordinal,
                          launch.model_layer_index,
                          timeline) &&
-                     descriptor.live_entries == 0u &&
+                     descriptor.live_entries ==
+                         launch.grant->live_entries &&
                      descriptor.live_rows == launch.grant->live_rows &&
-                     descriptor.live_rows <= launch.returned.row_capacity &&
+                     descriptor.live_entries <=
+                         launch.returned.route_slot_capacity &&
+                     descriptor.live_entries <=
+                         descriptor.live_rows *
+                             static_cast<std::uint64_t>(
+                                 launch.dispatch.top_k) &&
                      descriptor.payload_bytes ==
                          moeOverlayReturnPayloadBytes(
-                             descriptor.live_rows,
+                             descriptor.live_entries,
                              static_cast<std::uint32_t>(
                                  launch.returned.d_model));
-        std::int32_t prior_row = -1;
-        for (std::uint64_t row = 0u; valid && row < descriptor.live_rows; ++row)
+        std::int32_t prior_original_slot = -1;
+        const std::uint64_t route_slot_limit =
+            static_cast<std::uint64_t>(launch.physical_rows) *
+            static_cast<std::uint64_t>(launch.dispatch.top_k);
+        for (std::uint64_t entry = 0u;
+             valid && entry < descriptor.live_entries;
+             ++entry)
         {
-            const std::int32_t row_id =
-                loadPeerPublished(launch.returned.row_ids + row);
-            if (row_id <= prior_row || row_id < 0 ||
-                row_id >= launch.physical_rows ||
-                row_id != loadPeerPublished(
-                              launch.dispatch.row_ids + row))
+            const std::int32_t original_slot = loadPeerPublished(
+                launch.dispatch.original_route_slots + entry);
+            const std::int32_t compact_slot = loadPeerPublished(
+                launch.dispatch.compact_route_slots + entry);
+            if (original_slot <= prior_original_slot || original_slot < 0 ||
+                compact_slot < 0 ||
+                static_cast<std::uint64_t>(original_slot) >=
+                    route_slot_limit ||
+                static_cast<std::uint64_t>(compact_slot) >=
+                    route_slot_limit)
             {
                 valid = false;
             }
-            prior_row = row_id;
+            prior_original_slot = original_slot;
         }
         if (!valid)
         {
@@ -1875,10 +2200,10 @@ namespace llaminar2::moe_activation_packet_device
             return;
         }
         launch.grant->live_rows = descriptor.live_rows;
-        launch.grant->live_entries = 0u;
+        launch.grant->live_entries = descriptor.live_entries;
         launch.grant->single_row_id =
             descriptor.live_rows == 1u
-                ? loadPeerPublished(launch.returned.row_ids)
+                ? loadPeerPublished(launch.dispatch.row_ids)
                 : -1;
         publishSuccess(
             control,
@@ -1928,6 +2253,7 @@ namespace llaminar2::moe_activation_packet_device
                     control,
                     launch.grant,
                     endpoint,
+                    operation,
                     launch.stage_ordinal,
                     launch.physical_rows))
             {
@@ -1983,14 +2309,19 @@ namespace llaminar2::moe_activation_packet_device
                                     launch.stage_ordinal,
                                     launch.model_layer_index,
                                     block_timeline) &&
-                                descriptor.live_entries == 0u &&
+                                descriptor.live_entries ==
+                                    launch.grant->live_entries &&
                                 descriptor.live_rows ==
                                     launch.grant->live_rows &&
-                                descriptor.live_rows <=
-                                    launch.returned.row_capacity &&
+                                descriptor.live_entries <=
+                                    launch.returned.route_slot_capacity &&
+                                descriptor.live_entries <=
+                                    descriptor.live_rows *
+                                        static_cast<std::uint64_t>(
+                                            launch.dispatch.top_k) &&
                                 descriptor.payload_bytes ==
                                     moeOverlayReturnPayloadBytes(
-                                        descriptor.live_rows,
+                                        descriptor.live_entries,
                                         static_cast<std::uint32_t>(
                                             launch.returned.d_model))
                             ? 1u
@@ -2002,21 +2333,29 @@ namespace llaminar2::moe_activation_packet_device
 
         if (block_header_ready != 0u && block_valid != 0u)
         {
-            for (std::uint64_t row = threadIdx.x;
-                 row < block_live_rows;
-                 row += blockDim.x)
+            const std::uint64_t route_slot_limit =
+                static_cast<std::uint64_t>(launch.physical_rows) *
+                static_cast<std::uint64_t>(launch.dispatch.top_k);
+            for (std::uint64_t entry = threadIdx.x;
+                 entry < launch.grant->live_entries;
+                 entry += blockDim.x)
             {
-                const std::int32_t row_id =
-                    loadPeerPublished(launch.returned.row_ids + row);
-                const std::int32_t prior_row =
-                    row == 0u
+                const std::int32_t original_slot = loadPeerPublished(
+                    launch.dispatch.original_route_slots + entry);
+                const std::int32_t compact_slot = loadPeerPublished(
+                    launch.dispatch.compact_route_slots + entry);
+                const std::int32_t prior_original_slot =
+                    entry == 0u
                         ? -1
                         : loadPeerPublished(
-                              launch.returned.row_ids + row - 1u);
-                if (row_id <= prior_row || row_id < 0 ||
-                    row_id >= launch.physical_rows ||
-                    row_id != loadPeerPublished(
-                                  launch.dispatch.row_ids + row))
+                              launch.dispatch.original_route_slots +
+                              entry - 1u);
+                if (original_slot <= prior_original_slot ||
+                    original_slot < 0 || compact_slot < 0 ||
+                    static_cast<std::uint64_t>(original_slot) >=
+                        route_slot_limit ||
+                    static_cast<std::uint64_t>(compact_slot) >=
+                        route_slot_limit)
                 {
                     atomicExch(&block_valid, 0u);
                 }
@@ -2040,10 +2379,11 @@ namespace llaminar2::moe_activation_packet_device
             return;
         }
         launch.grant->live_rows = block_live_rows;
-        launch.grant->live_entries = 0u;
+        /* Descriptor equality above authenticated the already-admitted entry
+         * count; retain it as the payload extent for materialization. */
         launch.grant->single_row_id =
             block_live_rows == 1u
-                ? loadPeerPublished(launch.returned.row_ids)
+                ? loadPeerPublished(launch.dispatch.row_ids)
                 : -1;
         publishSuccess(
             control,
@@ -2058,58 +2398,27 @@ namespace llaminar2::moe_activation_packet_device
     }
 
     /**
-     * @brief Add one mapped participant return in canonical launch order.
+     * @brief Materialize one authenticated participant's original route rows.
      *
-     * Row identities and values are read only after the return timeline acquire.
-     * Each output element has one writer and parent lowering launches participant
-     * folds serially, preserving exact FP32 addition order independently of peer
-     * completion order.
+     * Each compact entry names one unique original route slot.  The follower
+     * already wrote that slot into the rank-pair shared matrix; this kernel
+     * copies it into continuation VRAM without performing an addition.  The
+     * later canonical reducer consequently sees the same slot tensor for every
+     * placement and owns the only floating-point fold.
      */
-    static __global__ void accumulateMappedReturnKernel(
+    static __global__ void materializeMappedCanonicalReturnKernel(
         MoEOverlayActivationReturnConsumeLaunch launch)
     {
         __shared__ std::uint32_t block_endpoint_state;
         __shared__ std::uint32_t block_status_code;
         __shared__ std::int32_t block_last_consumed_stage;
-        __shared__ std::uint64_t block_live_rows;
-        __shared__ std::uint32_t block_has_single_row;
-        __shared__ std::int32_t block_destination_row;
+        __shared__ std::uint64_t block_live_entries;
         if (threadIdx.x == 0u)
         {
             block_endpoint_state = launch.grant->state;
             block_status_code = launch.grant->code;
             block_last_consumed_stage = launch.grant->last_consumed_stage;
-            block_live_rows = launch.grant->live_rows;
-            block_has_single_row = 0u;
-
-            /* Return accumulation has the same compact-row reuse as dispatch.
-             * Cache the destination row for blocks wholly contained in one
-             * row and preserve the general lookup for adversarial widths. */
-            const std::uint64_t live_elements =
-                block_live_rows *
-                static_cast<std::uint64_t>(launch.returned.d_model);
-            const std::uint64_t block_begin =
-                static_cast<std::uint64_t>(blockIdx.x) * blockDim.x;
-            if (block_begin < live_elements)
-            {
-                const std::uint64_t block_end =
-                    min(block_begin + blockDim.x, live_elements) - 1u;
-                const std::uint64_t first_row =
-                    block_begin /
-                    static_cast<std::uint64_t>(launch.returned.d_model);
-                const std::uint64_t last_row =
-                    block_end /
-                    static_cast<std::uint64_t>(launch.returned.d_model);
-                if (first_row == last_row)
-                {
-                    block_destination_row =
-                        block_live_rows == 1u
-                            ? launch.grant->single_row_id
-                            : loadPeerPublished(
-                                  launch.returned.row_ids + first_row);
-                    block_has_single_row = 1u;
-                }
-            }
+            block_live_entries = launch.grant->live_entries;
         }
         __syncthreads();
 
@@ -2126,29 +2435,35 @@ namespace llaminar2::moe_activation_packet_device
         {
             return;
         }
-        if (block_live_rows >
-                static_cast<std::uint64_t>(launch.physical_rows) ||
-            element >= block_live_rows *
+        if (block_live_entries >
+                launch.returned.route_slot_capacity ||
+            element >= block_live_entries *
                            static_cast<std::uint64_t>(
                                launch.returned.d_model))
         {
             return;
         }
-        const std::size_t compact_row =
+        const std::size_t compact_entry =
             element / static_cast<std::size_t>(launch.returned.d_model);
         const std::size_t column =
             element % static_cast<std::size_t>(launch.returned.d_model);
-        const std::int32_t destination_row =
-            block_has_single_row != 0u
-                ? block_destination_row
-                : loadPeerPublished(launch.returned.row_ids + compact_row);
+        const std::int32_t original_slot = loadPeerPublished(
+            launch.dispatch.original_route_slots + compact_entry);
+        if (original_slot < 0 ||
+            static_cast<std::size_t>(original_slot) >=
+                launch.returned.route_slot_capacity)
+        {
+            return;
+        }
         const std::size_t destination =
-            static_cast<std::size_t>(destination_row) *
+            static_cast<std::size_t>(original_slot) *
                 static_cast<std::size_t>(launch.returned.d_model) +
             column;
         const float returned_value = loadPeerPublished(
-            launch.returned.output_rows_fp32 + element);
-        launch.dense_output_rows_fp32[destination] += returned_value;
+            launch.returned.canonical_route_contributions_fp32 +
+            destination);
+        launch.canonical_route_contributions_fp32[destination] =
+            returned_value;
     }
 
     /**
@@ -2168,20 +2483,11 @@ namespace llaminar2::moe_activation_packet_device
             return;
 
         const auto packet = launch.lanes[lane];
-        auto *const row_to_compact =
-            launch.lane_row_to_compact +
-            static_cast<std::size_t>(lane) *
-                static_cast<std::size_t>(launch.physical_rows);
-        for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x);
-             row < launch.physical_rows;
-             row += static_cast<std::int32_t>(blockDim.x))
-        {
-            row_to_compact[row] = -1;
-        }
 
         __shared__ std::uint32_t block_header_ready;
         __shared__ std::uint32_t block_valid;
         __shared__ std::uint64_t block_live_rows;
+        __shared__ std::uint64_t block_live_entries;
         __shared__ std::uint64_t block_timeline;
         __shared__ std::uint64_t block_return_timeline;
         auto *const control =
@@ -2196,6 +2502,7 @@ namespace llaminar2::moe_activation_packet_device
             block_header_ready = 0u;
             block_valid = 0u;
             block_live_rows = 0u;
+            block_live_entries = 0u;
             block_timeline = moeOverlayActivationLeasedTimelineValue(
                 moeOverlayActivationBufferVisit(packet.stage_ordinal));
             block_return_timeline = 0u;
@@ -2203,6 +2510,7 @@ namespace llaminar2::moe_activation_packet_device
                     control,
                     packet.grant,
                     endpoint,
+                    operation,
                     packet.stage_ordinal,
                     packet.physical_rows))
             {
@@ -2247,6 +2555,7 @@ namespace llaminar2::moe_activation_packet_device
                     const auto descriptor = snapshotPeerPublished(
                         &buffer.return_descriptor);
                     block_live_rows = descriptor.live_rows;
+                    block_live_entries = descriptor.live_entries;
                     block_header_ready = 1u;
                     block_valid =
                         block_return_timeline == block_timeline &&
@@ -2256,17 +2565,22 @@ namespace llaminar2::moe_activation_packet_device
                                     packet.stage_ordinal,
                                     packet.model_layer_index,
                                     block_timeline) &&
-                                descriptor.live_entries == 0u &&
+                                descriptor.live_entries ==
+                                    packet.grant->live_entries &&
                                 descriptor.live_rows ==
                                     packet.grant->live_rows &&
-                                descriptor.live_rows <=
-                                    packet.returned.row_capacity &&
+                                descriptor.live_entries <=
+                                    packet.returned.route_slot_capacity &&
+                                descriptor.live_entries <=
+                                    descriptor.live_rows *
+                                        static_cast<std::uint64_t>(
+                                            packet.dispatch.top_k) &&
                                 descriptor.live_rows <=
                                     static_cast<std::uint64_t>(
                                         launch.physical_rows) &&
                                 descriptor.payload_bytes ==
                                     moeOverlayReturnPayloadBytes(
-                                        descriptor.live_rows,
+                                        descriptor.live_entries,
                                         static_cast<std::uint32_t>(
                                             packet.returned.d_model))
                             ? 1u
@@ -2278,28 +2592,31 @@ namespace llaminar2::moe_activation_packet_device
 
         if (block_header_ready != 0u && block_valid != 0u)
         {
-            for (std::uint64_t compact_row = threadIdx.x;
-                 compact_row < block_live_rows;
-                 compact_row += blockDim.x)
+            const std::uint64_t route_slot_limit =
+                static_cast<std::uint64_t>(launch.physical_rows) *
+                static_cast<std::uint64_t>(packet.dispatch.top_k);
+            for (std::uint64_t entry = threadIdx.x;
+                 entry < block_live_entries;
+                 entry += blockDim.x)
             {
-                const std::int32_t row_id = loadPeerPublished(
-                    packet.returned.row_ids + compact_row);
-                const std::int32_t prior_row =
-                    compact_row == 0u
+                const std::int32_t original_slot = loadPeerPublished(
+                    packet.dispatch.original_route_slots + entry);
+                const std::int32_t compact_slot = loadPeerPublished(
+                    packet.dispatch.compact_route_slots + entry);
+                const std::int32_t prior_original_slot =
+                    entry == 0u
                         ? -1
                         : loadPeerPublished(
-                              packet.returned.row_ids + compact_row - 1u);
-                if (row_id <= prior_row || row_id < 0 ||
-                    row_id >= launch.physical_rows ||
-                    row_id != loadPeerPublished(
-                                  packet.dispatch.row_ids + compact_row))
+                              packet.dispatch.original_route_slots +
+                              entry - 1u);
+                if (original_slot <= prior_original_slot ||
+                    original_slot < 0 || compact_slot < 0 ||
+                    static_cast<std::uint64_t>(original_slot) >=
+                        route_slot_limit ||
+                    static_cast<std::uint64_t>(compact_slot) >=
+                        route_slot_limit)
                 {
                     atomicExch(&block_valid, 0u);
-                }
-                else
-                {
-                    row_to_compact[row_id] =
-                        static_cast<std::int32_t>(compact_row);
                 }
             }
         }
@@ -2321,10 +2638,10 @@ namespace llaminar2::moe_activation_packet_device
             return;
         }
         packet.grant->live_rows = block_live_rows;
-        packet.grant->live_entries = 0u;
+        packet.grant->live_entries = block_live_entries;
         packet.grant->single_row_id =
             block_live_rows == 1u
-                ? loadPeerPublished(packet.returned.row_ids)
+                ? loadPeerPublished(packet.dispatch.row_ids)
                 : -1;
         publishSuccess(
             control,
@@ -2340,18 +2657,22 @@ namespace llaminar2::moe_activation_packet_device
     }
 
     /**
-     * @brief Fold every authenticated multi-row lane in canonical order.
+     * @brief Copy authenticated lane contributions into original route slots.
      *
-     * Each output element has exactly one writer.  The explicit round-to-nearest
-     * addition after every present lane is byte-equivalent to the former series
-     * of one-lane accumulation kernels, while the output row is loaded and
-     * stored only once.
+     * Grid Y owns a participant lane and grid X stripes that lane's compact
+     * contribution payload. Dynamic placement guarantees one authoritative
+     * participant per original slot, so stores are disjoint and require no
+     * atomics or cross-lane ordering.
      */
-    static __global__ void foldMultiRowReturnBatchKernel(
+    static __global__ void materializeMultiRowCanonicalReturnBatchKernel(
         MoEOverlayActivationMultiRowReturnBatchLaunch launch)
     {
+        const std::uint32_t lane = blockIdx.y;
+        if (lane >= launch.lane_count || launch.lane_valid[lane] == 0)
+            return;
+        const auto packet = launch.lanes[lane];
         const std::size_t output_elements =
-            static_cast<std::size_t>(launch.physical_rows) *
+            static_cast<std::size_t>(packet.grant->live_entries) *
             static_cast<std::size_t>(launch.d_model);
         for (std::size_t element =
                  static_cast<std::size_t>(blockIdx.x) * blockDim.x +
@@ -2359,32 +2680,26 @@ namespace llaminar2::moe_activation_packet_device
              element < output_elements;
              element += static_cast<std::size_t>(gridDim.x) * blockDim.x)
         {
-            const std::int32_t row = static_cast<std::int32_t>(
-                element / static_cast<std::size_t>(launch.d_model));
+            const std::size_t compact_entry =
+                element / static_cast<std::size_t>(launch.d_model);
             const std::size_t column =
                 element % static_cast<std::size_t>(launch.d_model);
-            float accumulator = launch.dense_output_rows_fp32[element];
-            for (std::uint32_t lane = 0u; lane < launch.lane_count; ++lane)
+            const std::int32_t original_slot = loadPeerPublished(
+                packet.dispatch.original_route_slots + compact_entry);
+            if (original_slot >= 0 &&
+                static_cast<std::size_t>(original_slot) <
+                    packet.returned.route_slot_capacity)
             {
-                if (launch.lane_valid[lane] == 0)
-                    continue;
-                const std::int32_t compact_row =
-                    launch.lane_row_to_compact[
-                        static_cast<std::size_t>(lane) *
-                            static_cast<std::size_t>(launch.physical_rows) +
-                        static_cast<std::size_t>(row)];
-                if (compact_row < 0)
-                    continue;
-                const auto packet = launch.lanes[lane];
-                accumulator = __fadd_rn(
-                    accumulator,
+                const std::size_t destination =
+                    static_cast<std::size_t>(original_slot) *
+                        static_cast<std::size_t>(launch.d_model) +
+                    column;
+                launch.canonical_route_contributions_fp32[destination] =
                     loadPeerPublished(
-                        packet.returned.output_rows_fp32 +
-                        static_cast<std::size_t>(compact_row) *
-                            static_cast<std::size_t>(launch.d_model) +
-                        column));
+                        packet.returned
+                            .canonical_route_contributions_fp32 +
+                        destination);
             }
-            launch.dense_output_rows_fp32[element] = accumulator;
         }
     }
 
@@ -2539,7 +2854,7 @@ namespace llaminar2::moe_activation_packet_device
         MoEOverlayActivationSingleRowReturnPackLaunch launch)
     {
         auto &packet = launch.packet;
-        __shared__ std::int32_t live_rows;
+        __shared__ std::uint64_t live_entries;
         __shared__ std::uint32_t packet_valid;
         if (threadIdx.x == 0u)
         {
@@ -2555,21 +2870,42 @@ namespace llaminar2::moe_activation_packet_device
                         static_cast<std::int32_t>(packet.stage_ordinal)
                     ? 1u
                     : 0u;
-            live_rows = packet_valid != 0u
-                            ? static_cast<std::int32_t>(
-                                  packet.grant->live_rows)
-                            : 0;
+            live_entries = packet_valid != 0u
+                               ? packet.grant->live_entries
+                               : 0u;
         }
         __syncthreads();
 
-        if (live_rows == 1)
+        for (std::size_t element = threadIdx.x;
+             element <
+                 static_cast<std::size_t>(live_entries) *
+                     static_cast<std::size_t>(packet.returned.d_model);
+             element += blockDim.x)
         {
-            for (std::size_t column = threadIdx.x;
-                 column < static_cast<std::size_t>(packet.returned.d_model);
-                 column += blockDim.x)
+            const std::size_t compact_entry =
+                element /
+                static_cast<std::size_t>(packet.returned.d_model);
+            const std::size_t column =
+                element %
+                static_cast<std::size_t>(packet.returned.d_model);
+            const std::int32_t original_slot = loadPeerPublished(
+                packet.dispatch.original_route_slots + compact_entry);
+            const std::int32_t compact_slot = loadPeerPublished(
+                packet.dispatch.compact_route_slots + compact_entry);
+            if (original_slot >= 0 && compact_slot >= 0 &&
+                static_cast<std::size_t>(original_slot) <
+                    packet.returned.route_slot_capacity)
             {
-                packet.returned.output_rows_fp32[column] =
-                    packet.local_output_rows_fp32[column];
+                packet.returned.canonical_route_contributions_fp32[
+                    static_cast<std::size_t>(original_slot) *
+                        static_cast<std::size_t>(
+                            packet.returned.d_model) +
+                    column] =
+                    packet.local_canonical_route_contributions_fp32[
+                        static_cast<std::size_t>(compact_slot) *
+                            static_cast<std::size_t>(
+                                packet.returned.d_model) +
+                        column];
             }
         }
         __syncthreads();
@@ -2581,19 +2917,13 @@ namespace llaminar2::moe_activation_packet_device
     }
 
     /**
-     * @brief Acquire, validate, and fold one direct-mapped return in one node.
-     *
-     * The parent graph launches participant stages in canonical planner order.
-     * Each thread therefore owns a stable set of output columns and performs the
-     * same FP32 addition as the ordinary accumulator; completion timing cannot
-     * reorder arithmetic across participants.
+     * @brief Acquire, validate, and materialize one direct-mapped return.
      */
     static __global__ void consumeSingleRowReturnKernel(
         MoEOverlayActivationSingleRowReturnConsumeLaunch launch)
     {
         auto &packet = launch.packet;
-        __shared__ std::int32_t live_rows;
-        __shared__ std::int32_t destination_row;
+        __shared__ std::uint64_t live_entries;
         if (threadIdx.x == 0u)
         {
             waitSystemAcquire64(launch.acquire);
@@ -2607,40 +2937,50 @@ namespace llaminar2::moe_activation_packet_device
                     raw(MoEOverlayActivationStatusCode::Success) &&
                 packet.grant->last_consumed_stage ==
                     static_cast<std::int32_t>(packet.stage_ordinal);
-            live_rows = valid
-                            ? static_cast<std::int32_t>(
-                                  packet.grant->live_rows)
-                            : 0;
-            destination_row = valid ? packet.grant->single_row_id : -1;
+            live_entries = valid ? packet.grant->live_entries : 0u;
         }
         __syncthreads();
 
-        if (live_rows == 1 && destination_row >= 0)
+        for (std::size_t element = threadIdx.x;
+             element <
+                 static_cast<std::size_t>(live_entries) *
+                     static_cast<std::size_t>(packet.returned.d_model);
+             element += blockDim.x)
         {
-            for (std::size_t column = threadIdx.x;
-                 column < static_cast<std::size_t>(packet.returned.d_model);
-                 column += blockDim.x)
+            const std::size_t compact_entry =
+                element /
+                static_cast<std::size_t>(packet.returned.d_model);
+            const std::size_t column =
+                element %
+                static_cast<std::size_t>(packet.returned.d_model);
+            const std::int32_t original_slot = loadPeerPublished(
+                packet.dispatch.original_route_slots + compact_entry);
+            if (original_slot >= 0 &&
+                static_cast<std::size_t>(original_slot) <
+                    packet.returned.route_slot_capacity)
             {
                 const std::size_t destination =
-                    static_cast<std::size_t>(destination_row) *
+                    static_cast<std::size_t>(original_slot) *
                         static_cast<std::size_t>(packet.returned.d_model) +
                     column;
-                packet.dense_output_rows_fp32[destination] +=
+                packet.canonical_route_contributions_fp32[destination] =
                     loadPeerPublished(
-                        packet.returned.output_rows_fp32 + column);
+                        packet.returned
+                            .canonical_route_contributions_fp32 +
+                        destination);
             }
         }
     }
 
     /**
-     * @brief Wait for and snapshot independent one-row returns concurrently.
+     * @brief Wait for and authenticate independent one-row returns concurrently.
      *
      * Each block touches one mapped lane, its private grant, and one exclusive
      * row in device scratch. The kernel as a whole is the device-side join: the
      * following fold cannot begin until every lane has either validated or
      * published its terminal protocol failure.
      */
-    static __global__ void gatherSingleRowReturnBatchKernel(
+    static __global__ void validateSingleRowReturnBatchKernel(
         MoEOverlayActivationSingleRowReturnBatchLaunch launch)
     {
         const std::uint32_t lane = blockIdx.x;
@@ -2649,7 +2989,6 @@ namespace llaminar2::moe_activation_packet_device
 
         const auto lane_launch = launch.lanes[lane];
         auto packet = lane_launch.packet;
-        __shared__ std::int32_t live_rows;
         if (threadIdx.x == 0u)
         {
             waitSystemAcquire64(lane_launch.acquire);
@@ -2666,61 +3005,47 @@ namespace llaminar2::moe_activation_packet_device
                 packet.grant->live_rows <= 1u &&
                 (packet.grant->live_rows == 0u ||
                  packet.grant->single_row_id == 0);
-            live_rows = valid
-                            ? static_cast<std::int32_t>(
-                                  packet.grant->live_rows)
-                            : 0;
-            launch.lane_live_rows[lane] = live_rows;
-        }
-        __syncthreads();
-
-        if (live_rows == 1)
-        {
-            const std::size_t lane_offset =
-                static_cast<std::size_t>(lane) *
-                static_cast<std::size_t>(launch.d_model);
-            for (std::size_t column = threadIdx.x;
-                 column < static_cast<std::size_t>(launch.d_model);
-                 column += blockDim.x)
-            {
-                launch.gathered_rows_fp32[lane_offset + column] =
-                    loadPeerPublished(
-                        packet.returned.output_rows_fp32 + column);
-            }
+            launch.lane_valid[lane] = valid ? 1 : 0;
         }
     }
 
     /**
-     * @brief Fold gathered rows in planner-canonical participant order.
-     *
-     * Explicit `__fadd_rn` prevents fast-math reassociation and rounds after
-     * every participant exactly as the former sequence of individual kernels
-     * did. Empty lanes are skipped rather than adding zero, preserving signed
-     * zero and every other bit-level edge case.
+     * @brief Materialize authenticated one-row lane contributions in parallel.
      */
-    static __global__ void foldSingleRowReturnBatchKernel(
+    static __global__ void materializeSingleRowCanonicalReturnBatchKernel(
         MoEOverlayActivationSingleRowReturnBatchLaunch launch)
     {
-        for (std::size_t column =
+        const std::uint32_t lane = blockIdx.y;
+        if (lane >= launch.lane_count || launch.lane_valid[lane] == 0)
+            return;
+        const auto packet = launch.lanes[lane].packet;
+        const std::size_t live_elements =
+            static_cast<std::size_t>(packet.grant->live_entries) *
+            static_cast<std::size_t>(launch.d_model);
+        for (std::size_t element =
                  static_cast<std::size_t>(blockIdx.x) * blockDim.x +
                  threadIdx.x;
-             column < static_cast<std::size_t>(launch.d_model);
-             column += static_cast<std::size_t>(gridDim.x) * blockDim.x)
+             element < live_elements;
+             element += static_cast<std::size_t>(gridDim.x) * blockDim.x)
         {
-            float accumulator = launch.dense_output_rows_fp32[column];
-            for (std::uint32_t lane = 0u; lane < launch.lane_count; ++lane)
+            const std::size_t compact_entry =
+                element / static_cast<std::size_t>(launch.d_model);
+            const std::size_t column =
+                element % static_cast<std::size_t>(launch.d_model);
+            const std::int32_t original_slot = loadPeerPublished(
+                packet.dispatch.original_route_slots + compact_entry);
+            if (original_slot >= 0 && original_slot < launch.top_k)
             {
-                if (launch.lane_live_rows[lane] == 1)
-                {
-                    accumulator = __fadd_rn(
-                        accumulator,
-                        launch.gathered_rows_fp32[
-                            static_cast<std::size_t>(lane) *
-                                static_cast<std::size_t>(launch.d_model) +
-                            column]);
-                }
+                const std::size_t destination =
+                    static_cast<std::size_t>(original_slot) *
+                        static_cast<std::size_t>(launch.d_model) +
+                    column;
+                launch.canonical_route_contributions_fp32[destination] =
+                    loadPeerPublished(
+                        packet.returned
+                            .canonical_route_contributions_fp32 +
+                        destination);
             }
-            launch.dense_output_rows_fp32[column] = accumulator;
         }
     }
 } // namespace llaminar2::moe_activation_packet_device

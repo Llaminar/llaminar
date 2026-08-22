@@ -14,6 +14,8 @@
  */
 
 #include "RankOrchestrator.h"
+
+#include "transfer/MappedTransferProgressEpoch.h"
 #include "LogitsGatherer.h"
 #include "DeviceSampler.h"
 #include "DeviceGraphOrchestrator.h"
@@ -24,6 +26,8 @@
 #include "../../moe/MoEExpertOverlayRuntimePlan.h"
 #include "../../moe/MoEOverlayNodeLocalRouteExchange.h"
 #include "../../moe/MoEOverlayInferenceTransactionService.h"
+#include "../../moe/MoEOverlayInferenceInterferenceProbe.h"
+#include "../engine/PrefillBucketUtils.h"
 #include "../../prefix_cache/PrefixCacheCoordinator.h"
 #include "../../../kernels/common/SamplingMath.h"
 #include "../../../kernels/cpu/sampling/CPUSamplerPrimitives.h"
@@ -34,10 +38,12 @@
 #include "../../../loaders/ModelContext.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../loaders/WeightManager.h"
+#include "../../../planning/CollectiveMemoryEstimator.h"
 #include "../graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config access
 #include "../../../tensors/TensorClasses.h"
 #include "../../../tensors/TensorFactory.h"
 #include "../../../backends/BackendManager.h"       // getBackendFor() for partial D2H in gatherLogits
+#include "../../../backends/ComputeBackend.h"       // exact driver-backed P2P topology
 #include "../../../backends/GPUDeviceContextPool.h" // Compute stream registration for event-based collective sync
 #include "../../../utils/Logger.h"
 #include "../../../utils/Sampler.h"            // SamplingParams for sampleOnDevice()
@@ -806,6 +812,16 @@ namespace llaminar2
     {
         ParallelismMode effective = effectiveMode();
 
+        if (prepared_weight_admission ==
+                PreparedWeightAdmission::ReuseCertifiedCompleteSet &&
+            !prepared_weight_store)
+        {
+            LOG_ERROR(
+                "RankOrchestrator::Config: certified prepared-weight reuse "
+                "requires the exact model-owned PreparedWeightStore");
+            return false;
+        }
+
         if (effective == ParallelismMode::TP)
         {
             // TP mode validation
@@ -1270,12 +1286,15 @@ namespace llaminar2
 
         LOG_DEBUG("RankOrchestrator: Initializing " << devices.size() << " device runners");
         LOG_DEBUG(
-            "RankOrchestrator: sparse continuation fabric candidate"
+            "RankOrchestrator: continuation route transport candidate"
             << " overlay_plan="
             << (config_.moe_routed_expert_plan != nullptr)
             << " devices=" << devices.size()
             << " preinstalled="
             << (config_.moe_node_local_route_exchange != nullptr)
+            << " requested_transport="
+            << moeOverlayNodeLocalRouteTransportName(
+                   config_.moe_node_local_route_transport)
             << " dense_policy="
             << (config_.moe_routed_expert_plan
                     ? denseParallelPolicyToString(
@@ -1291,17 +1310,14 @@ namespace llaminar2
                         .effectiveDensePolicy())));
 
         /*
-         * A LocalTP continuation owns one mapped sparse-route fabric, not one
-         * fabric per child graph. Match the declared continuation domain to
-         * this exact device cell without assuming a vendor, ordinal, socket,
-         * rank number, or declaration order. Auxiliary expert-domain ranks do
-         * not match and therefore do not allocate continuation lanes.
+         * Routed-expert ownership is independent of dense tensor parallelism.
+         * Every multi-device continuation therefore resolves one explicit
+         * publication transport even when dense weights are replicated. Match
+         * the declaration by device identity rather than vendor, ordinal,
+         * socket, rank, or declaration order; auxiliary expert ranks do not
+         * match and consequently own no continuation-local transport.
          */
-        if (!config_.moe_node_local_route_exchange &&
-            config_.moe_routed_expert_plan && devices.size() > 1u &&
-            denseParallelPolicyEnablesTP(
-                config_.moe_routed_expert_plan->continuation_domain_spec
-                    .effectiveDensePolicy()))
+        if (config_.moe_routed_expert_plan && devices.size() > 1u)
         {
             const auto &overlay_plan = *config_.moe_routed_expert_plan;
             const auto continuation_domain = std::find_if(
@@ -1312,7 +1328,7 @@ namespace llaminar2
                            overlay_plan.continuation_domain_spec.domain;
                 });
             LOG_DEBUG(
-                "RankOrchestrator: sparse continuation domain lookup"
+                "RankOrchestrator: continuation route domain lookup"
                 << " requested="
                 << overlay_plan.continuation_domain_spec.domain
                 << " found="
@@ -1347,7 +1363,7 @@ namespace llaminar2
                     continuation_keys.begin(), continuation_keys.end());
 
                 LOG_DEBUG(
-                    "RankOrchestrator: sparse continuation topology match"
+                    "RankOrchestrator: continuation route topology match"
                     << " domain=" << continuation_domain->name
                     << " all_gpu=" << all_gpu
                     << " cell_devices=" << cell_keys.size()
@@ -1364,23 +1380,120 @@ namespace llaminar2
                     root_index < static_cast<int>(
                                      continuation_domain->participants.size()))
                 {
+                    const bool homogeneous = std::all_of(
+                        cell_devices.begin() + 1,
+                        cell_devices.end(),
+                        [&](const DeviceId &candidate)
+                        {
+                            return candidate.type ==
+                                   cell_devices.front().type;
+                        });
+                    std::optional<PeerAccessCoverage> peer_coverage;
+                    if (homogeneous)
+                    {
+                        peer_coverage =
+                            DeviceManager::instance().peerAccessCoverage(
+                                cell_devices);
+                    }
+
+                    MoEOverlayNodeLocalRouteTransport selected_transport =
+                        config_.moe_node_local_route_transport;
+                    if (selected_transport ==
+                        MoEOverlayNodeLocalRouteTransport::Unresolved)
+                    {
+                        selected_transport =
+                            selectMoEOverlayNodeLocalRouteTransport(
+                                cell_devices, peer_coverage);
+                    }
+                    else if (!homogeneous)
+                    {
+                        const auto measured =
+                            selectMoEOverlayNodeLocalRouteTransport(
+                                cell_devices, std::nullopt);
+                        if (selected_transport != measured)
+                        {
+                            throw std::runtime_error(
+                                "RankOrchestrator: preselected continuation route transport contradicts heterogeneous device topology");
+                        }
+                    }
+                    else if (peer_coverage)
+                    {
+                        const auto measured =
+                            selectMoEOverlayNodeLocalRouteTransport(
+                                cell_devices, peer_coverage);
+                        if (selected_transport != measured)
+                        {
+                            throw std::runtime_error(
+                                "RankOrchestrator: preselected continuation route transport contradicts driver-reported P2P topology");
+                        }
+                    }
+                    else if (!config_.moe_node_local_route_exchange)
+                    {
+                        throw std::runtime_error(
+                            "RankOrchestrator: homogeneous continuation route transport has no driver-backed P2P matrix");
+                    }
+                    config_.moe_node_local_route_transport =
+                        selected_transport;
+
                     const DeviceId root_device =
                         continuation_domain
                             ->participants[static_cast<std::size_t>(root_index)]
                             .toLocalDeviceId();
-                    config_.moe_node_local_route_exchange =
-                        std::make_shared<
-                            MoEOverlayNodeLocalRouteExchange>(
-                            MoEOverlayNodeLocalRouteExchange::Config{
-                                .devices = std::move(cell_devices),
-                                .root_device = root_device,
-                                .identity =
-                                    "continuation:" +
-                                    continuation_domain->name,
-                            });
+
+                    if (selected_transport ==
+                        MoEOverlayNodeLocalRouteTransport::MappedSparse)
+                    {
+                        if (!config_.moe_node_local_route_exchange)
+                        {
+                            config_.moe_node_local_route_exchange =
+                                std::make_shared<
+                                    MoEOverlayNodeLocalRouteExchange>(
+                                    MoEOverlayNodeLocalRouteExchange::Config{
+                                        .devices = cell_devices,
+                                        .root_device = root_device,
+                                        .identity =
+                                            "continuation:" +
+                                            continuation_domain->name,
+                                    });
+                        }
+                    }
+                    else if (config_.moe_node_local_route_exchange)
+                    {
+                        throw std::runtime_error(
+                            "RankOrchestrator: native continuation route transport cannot retain a mapped sparse exchange");
+                    }
+
+                    const std::string peer_access =
+                        homogeneous
+                            ? (peer_coverage
+                                   ? peerAccessCoverageName(*peer_coverage)
+                                   : "preselected")
+                            : "heterogeneous";
+                    const PerfStatsCollector::Tags transport_tags{
+                        {"domain", continuation_domain->name},
+                        {"transport",
+                         moeOverlayNodeLocalRouteTransportName(
+                             selected_transport)},
+                        {"peer_access", peer_access},
+                        {"backend",
+                         homogeneous
+                             ? (cell_devices.front().is_cuda() ? "cuda"
+                                                                : "rocm")
+                             : "heterogeneous"},
+                        {"participants", std::to_string(devices.size())}};
+                    PerfStatsCollector::addCounter(
+                        "moe_overlay_transport",
+                        "selection",
+                        1.0,
+                        {},
+                        root_device.toString(),
+                        transport_tags);
                     LOG_INFO(
-                        "RankOrchestrator: installed topology-generic "
-                        "device-owned sparse continuation route fabric for "
+                        "RankOrchestrator: selected continuation route "
+                        "transport="
+                        << moeOverlayNodeLocalRouteTransportName(
+                               selected_transport)
+                        << " peer_access=" << peer_access << " domain="
                         << continuation_domain->name
                         << " root=" << root_device.toString()
                         << " participants=" << devices.size());
@@ -1520,42 +1633,27 @@ namespace llaminar2
         // Buffer uses grow-only semantics (never shrinks during inference).
         // =====================================================================
         {
-            size_t hidden_size = model_ctx_->embeddingLength();
-            size_t max_elements = config_.max_seq_len * hidden_size;
-
-            // The graph can explicitly request an FP32 collective even when
-            // its resident activation format is FP16/BF16/quantized (embedding
-            // reduction is one such boundary). Reserve against both contracts;
-            // otherwise a valid lower-precision campaign can exceed the
-            // predeclared mixed-vendor bridge capacity in its first FP32 stage.
-            const size_t activation_buffer_bytes =
-                activationPrecisionBufferBytes(
-                    max_elements, config_.activation_precision);
-            const size_t fp32_collective_bytes =
-                max_elements * sizeof(float);
-            size_t buffer_bytes = std::max(
-                activation_buffer_bytes, fp32_collective_bytes);
-
-            // Add 10% margin for both independent reservation dimensions. The
-            // backend consumes storage bytes, while FP16 transport consumes a
-            // logical element count even when activations use a quantized format.
-            size_t buffer_with_margin = static_cast<size_t>(buffer_bytes * 1.1);
-            size_t elements_with_margin = static_cast<size_t>(max_elements * 1.1);
+            const size_t hidden_size = model_ctx_->embeddingLength();
+            const auto collective_bom =
+                CollectiveMemoryEstimator::localTP(
+                    config_.max_seq_len,
+                    static_cast<int>(hidden_size));
 
             const bool reserved = tp_ctx_->reserveCollectiveResources(
-                buffer_with_margin,
-                elements_with_margin);
+                collective_bom.backend_temp_bytes,
+                collective_bom.fp16_scratch_elements);
             logVramBomLine(
                 "collective_temp_reservation",
                 "source=RankOrchestrator backend=local_tp max_seq_len=" + std::to_string(config_.max_seq_len) +
                     " hidden_size=" + std::to_string(hidden_size) +
                     " precision=" + activationPrecisionToString(config_.activation_precision) +
                     " status=" + (reserved ? "pass" : "fail") +
-                    " " + vramBomBytes(buffer_with_margin));
+                    " " + vramBomBytes(
+                        collective_bom.perDeviceBytes()));
             if (reserved)
             {
                 LOG_DEBUG("RankOrchestrator: Reserved collective temp buffer: "
-                          << buffer_with_margin << " bytes ("
+                          << collective_bom.backend_temp_bytes << " bytes ("
                           << "max_seq_len=" << config_.max_seq_len
                           << ", hidden_size=" << hidden_size
                           << ", precision=" << activationPrecisionToString(config_.activation_precision) << ")");
@@ -1595,9 +1693,28 @@ namespace llaminar2
             {
                 if (auto concrete_weight_mgr = std::dynamic_pointer_cast<WeightManager>(weight_mgr))
                 {
+                    const auto installed_store =
+                        concrete_weight_mgr->preparedWeightStoreIfInitialized();
                     if (config_.prepared_weight_store)
                     {
+                        if (installed_store &&
+                            installed_store != config_.prepared_weight_store)
+                        {
+                            throw std::runtime_error(
+                                "RankOrchestrator cannot replace the model-owned "
+                                "PreparedWeightStore");
+                        }
                         concrete_weight_mgr->setPreparedWeightStore(config_.prepared_weight_store);
+                    }
+                    else if (installed_store)
+                    {
+                        /*
+                         * Prepared storage is additive and model-owned. A new
+                         * rank graph must never silently install a second store
+                         * and orphan handles whose raw sources may already have
+                         * been released.
+                         */
+                        config_.prepared_weight_store = installed_store;
                     }
                     else
                     {
@@ -1622,16 +1739,65 @@ namespace llaminar2
                         !(config_.moe_routed_expert_plan &&
                           config_.moe_routed_expert_plan
                               ->usesExpertOverlayAuthority());
-                    LOG_DEBUG("RankOrchestrator: Finalizing weights for "
-                              << device_ids.size() << " devices"
-                              << " (release_host_data=false, deferred until after graph build"
-                              << ", include_expert_jobs=" << include_expert_jobs << ")");
-                    if (!weight_mgr->finalizeForDevices(
-                            device_ids,
-                            /*release_host_data=*/false,
-                            include_expert_jobs))
+                    if (config_.prepared_weight_admission ==
+                        PreparedWeightAdmission::ReuseCertifiedCompleteSet)
                     {
-                        LOG_WARN("RankOrchestrator: Weight finalization failed; prepared kernels may be unavailable");
+                        auto concrete_weight_mgr =
+                            std::dynamic_pointer_cast<WeightManager>(weight_mgr);
+                        if (!concrete_weight_mgr ||
+                            !config_.prepared_weight_store)
+                        {
+                            throw std::runtime_error(
+                                "RankOrchestrator certified prepared-weight "
+                                "reuse lacks its concrete model authority");
+                        }
+                        for (const DeviceId device : device_ids)
+                        {
+                            if (concrete_weight_mgr
+                                    ->preparedRecordCountForDevice(device) == 0u)
+                            {
+                                throw std::runtime_error(
+                                    "RankOrchestrator certified prepared-weight "
+                                    "reuse has no records for " +
+                                    device.toString());
+                            }
+                        }
+
+                        /*
+                         * Non-GEMM device tensors live in WeightManager's
+                         * model-owned device cache rather than PreparedWeightStore.
+                         * Revisit that cache so a missing binding fails here,
+                         * while deliberately avoiding the broad GEMM pipeline
+                         * whose exact handles are already certified resident.
+                         */
+                        if (!weight_mgr->preloadForDevices(device_ids))
+                        {
+                            throw std::runtime_error(
+                                "RankOrchestrator failed to restore non-GEMM "
+                                "device bindings for certified weight reuse");
+                        }
+                        PerfStatsCollector::addCounter(
+                            "weight_loading",
+                            "rank_prepared_weight_materialization_reuses",
+                            1.0,
+                            "load",
+                            {},
+                            {{"devices", std::to_string(device_ids.size())}});
+                    }
+                    else
+                    {
+                        LOG_DEBUG("RankOrchestrator: Finalizing weights for "
+                                  << device_ids.size() << " devices"
+                                  << " (release_host_data=false, deferred until after graph build"
+                                  << ", include_expert_jobs=" << include_expert_jobs << ")");
+                        if (!weight_mgr->finalizeForDevices(
+                                device_ids,
+                                /*release_host_data=*/false,
+                                include_expert_jobs))
+                        {
+                            throw std::runtime_error(
+                                "RankOrchestrator required weight finalization failed");
+                        }
                     }
 
                     /**
@@ -1709,8 +1875,14 @@ namespace llaminar2
                                                  runner_config.moe_expert_overlay_decode_histogram =
                                                      config_.moe_expert_overlay_decode_histogram;
                                                  runner_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
+                                                 runner_config.moe_rank_batch_transport_registry =
+                                                     config_.moe_rank_batch_transport_registry;
+                                                 runner_config.moe_device_controller_fabric =
+                                                     config_.moe_device_controller_fabric;
                                                  runner_config.moe_node_local_route_exchange =
                                                      config_.moe_node_local_route_exchange;
+                                                 runner_config.moe_node_local_route_transport =
+                                                     config_.moe_node_local_route_transport;
                                                  runner_config.cancellation_requested = [this]()
                                                  {
                                                      return tp_ctx_ && tp_ctx_->isAbortRequested();
@@ -2006,8 +2178,14 @@ namespace llaminar2
             runner_config.moe_expert_overlay_decode_histogram =
                 config_.moe_expert_overlay_decode_histogram;
             runner_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
+            runner_config.moe_rank_batch_transport_registry =
+                config_.moe_rank_batch_transport_registry;
+            runner_config.moe_device_controller_fabric =
+                config_.moe_device_controller_fabric;
             runner_config.moe_node_local_route_exchange =
                 config_.moe_node_local_route_exchange;
+            runner_config.moe_node_local_route_transport =
+                config_.moe_node_local_route_transport;
             // =====================================================================
             // Build FactoryPPStageConfig for the createPPStageRunner factory
             // =====================================================================
@@ -2060,8 +2238,14 @@ namespace llaminar2
                 nested_config.moe_expert_overlay_decode_histogram =
                     config_.moe_expert_overlay_decode_histogram;
                 nested_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
+                nested_config.moe_rank_batch_transport_registry =
+                    config_.moe_rank_batch_transport_registry;
+                nested_config.moe_device_controller_fabric =
+                    config_.moe_device_controller_fabric;
                 nested_config.moe_node_local_route_exchange =
                     config_.moe_node_local_route_exchange;
+                nested_config.moe_node_local_route_transport =
+                    config_.moe_node_local_route_transport;
                 // CRITICAL: Pass PP stage config to nested TP MDO so its DeviceGraphOrchestrators
                 // build partial graphs instead of full graphs. Without this, the TP devices would
                 // build LM_HEAD stages even though this PP stage doesn't own LM_HEAD.
@@ -2396,6 +2580,39 @@ namespace llaminar2
         }
     }
 
+    ServingGraphPreparationKind
+    RankOrchestrator::servingGraphPreparationKind() const noexcept
+    {
+        if (mode_ != ParallelismMode::TP ||
+            !pp_stage_runners_.empty() || device_runners_.empty())
+        {
+            return ServingGraphPreparationKind::Unresolved;
+        }
+
+        const ServingGraphPreparationKind first =
+            device_runners_.front()
+                ? device_runners_.front()
+                      ->servingGraphPreparationKind()
+                : ServingGraphPreparationKind::Unresolved;
+        if (first == ServingGraphPreparationKind::Unresolved)
+            return first;
+
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner ||
+                runner->servingGraphPreparationKind() != first)
+            {
+                /*
+                 * One LocalTP graph family must enter setup symmetrically.
+                 * A mixed eager/native child set needs an explicit composite
+                 * protocol rather than silently choosing either lifecycle.
+                 */
+                return ServingGraphPreparationKind::Unresolved;
+            }
+        }
+        return first;
+    }
+
     bool RankOrchestrator::materializeServingGraphFamilyWithoutLaunch(
         const ServingGraphFamilyMaterializationPlan &plan)
     {
@@ -2593,6 +2810,26 @@ namespace llaminar2
             return false;
         }
 
+        if (moe_overlay_inference_transaction_coordinator_ &&
+            moe_overlay_inference_transaction_coordinator_ != coordinator)
+        {
+            LOG_ERROR(
+                "RankOrchestrator cannot replace its ExpertOverlay transaction authority");
+            return false;
+        }
+        if (moe_overlay_interference_probe_)
+        {
+            std::string probe_error;
+            if (!coordinator->bindPrefillInterferenceProbe(
+                    moe_overlay_interference_probe_, &probe_error))
+            {
+                LOG_ERROR(
+                    "RankOrchestrator could not bind chunk-level ExpertOverlay "
+                    "prefill calibration: " << probe_error);
+                return false;
+            }
+        }
+
         for (std::size_t index = 0; index < device_runners_.size(); ++index)
         {
             auto &child = device_runners_[index];
@@ -2605,6 +2842,42 @@ namespace llaminar2
                     "the rank-wide ExpertOverlay transaction authority");
                 return false;
             }
+        }
+        moe_overlay_inference_transaction_coordinator_ =
+            std::move(coordinator);
+        moe_overlay_coordinator_owns_prefill_probe_ =
+            static_cast<bool>(moe_overlay_interference_probe_);
+        return true;
+    }
+
+    bool RankOrchestrator::setMoEOverlayInferenceInterferenceProbe(
+        std::shared_ptr<MoEOverlayInferenceInterferenceProbe> probe)
+    {
+        if (!probe || mode_ != ParallelismMode::TP ||
+            device_runners_.empty() || !pp_stage_runners_.empty() ||
+            (moe_overlay_interference_probe_ &&
+             moe_overlay_interference_probe_ != probe))
+        {
+            LOG_ERROR(
+                "RankOrchestrator requires one flat LocalTP owner and one stable "
+                "ExpertOverlay interference probe");
+            return false;
+        }
+        moe_overlay_interference_probe_ = std::move(probe);
+        if (moe_overlay_inference_transaction_coordinator_)
+        {
+            std::string probe_error;
+            if (!moe_overlay_inference_transaction_coordinator_
+                     ->bindPrefillInterferenceProbe(
+                         moe_overlay_interference_probe_, &probe_error))
+            {
+                LOG_ERROR(
+                    "RankOrchestrator could not bind chunk-level ExpertOverlay "
+                    "prefill calibration: " << probe_error);
+                moe_overlay_interference_probe_.reset();
+                return false;
+            }
+            moe_overlay_coordinator_owns_prefill_probe_ = true;
         }
         return true;
     }
@@ -3178,6 +3451,103 @@ namespace llaminar2
                 ? LogitsForwardPhase::Prefill
                 : LogitsForwardPhase::Decode;
         last_logits_forward_phase_ = logits_phase;
+
+        /*
+         * The MPI root and every follower execute this exact rank-local
+         * boundary. Keeping the one-shot probe here gives distributed economy
+         * calibration symmetric evidence without putting timing or policy on
+         * the sparse device graph. Schedule geometry is planned only for an
+         * explicitly chunked prefill, where the production path already owns
+         * the same bounded host plan.
+         */
+        int probe_execution_rows = seq_len;
+        int probe_transaction_count = 1;
+        std::uint64_t probe_schedule_fingerprint = 0u;
+        if (moe_overlay_interference_probe_ && chunk_schedule_policy)
+        {
+            const auto schedule = planPrefillChunkSchedule(
+                *chunk_schedule_policy);
+            if (schedule)
+            {
+                probe_execution_rows = 0;
+                probe_transaction_count = static_cast<int>(
+                    schedule.chunks.size());
+                probe_schedule_fingerprint = 14695981039346656037ull;
+                for (const auto &chunk : schedule.chunks)
+                {
+                    probe_execution_rows += chunk.bucket_seq_len;
+                    for (const auto value : {
+                             static_cast<std::uint64_t>(chunk.real_count),
+                             static_cast<std::uint64_t>(chunk.bucket_seq_len)})
+                    {
+                        constexpr std::uint64_t kPrime = 1099511628211ull;
+                        std::uint64_t mixed = value;
+                        for (std::size_t byte = 0u;
+                             byte < sizeof(mixed);
+                             ++byte)
+                        {
+                            probe_schedule_fingerprint ^= mixed & 0xffu;
+                            probe_schedule_fingerprint *= kPrime;
+                            mixed >>= 8u;
+                        }
+                    }
+                }
+            }
+        }
+        if (probe_schedule_fingerprint == 0u)
+        {
+            probe_schedule_fingerprint = 14695981039346656037ull;
+            for (const auto value : {
+                     static_cast<std::uint64_t>(
+                         logits_phase == LogitsForwardPhase::Decode
+                             ? ExpertHistogramSource::DecodeToken
+                             : ExpertHistogramSource::PrefillChunk),
+                     static_cast<std::uint64_t>(seq_len),
+                     static_cast<std::uint64_t>(probe_execution_rows),
+                     static_cast<std::uint64_t>(probe_transaction_count),
+                     std::uint64_t{0}})
+            {
+                constexpr std::uint64_t kPrime = 1099511628211ull;
+                std::uint64_t mixed = value;
+                for (std::size_t byte = 0u; byte < sizeof(mixed); ++byte)
+                {
+                    probe_schedule_fingerprint ^= mixed & 0xffu;
+                    probe_schedule_fingerprint *= kPrime;
+                    mixed >>= 8u;
+                }
+            }
+        }
+        const MoEOverlayInferenceWorkloadIdentity probe_workload{
+            .source = logits_phase == LogitsForwardPhase::Decode
+                          ? ExpertHistogramSource::DecodeToken
+                          : ExpertHistogramSource::PrefillChunk,
+            .real_rows = seq_len,
+            .execution_rows = probe_execution_rows,
+            .transaction_count = probe_transaction_count,
+            .speculative_depth = 0,
+            .schedule_fingerprint = probe_schedule_fingerprint,
+        };
+        if (chunk_schedule_policy &&
+            moe_overlay_coordinator_owns_prefill_probe_)
+        {
+            std::string declaration_error;
+            if (!moe_overlay_inference_transaction_coordinator_ ||
+                !moe_overlay_inference_transaction_coordinator_
+                     ->declarePrefillInterferenceSchedule(
+                         probe_workload, &declaration_error))
+            {
+                LOG_ERROR(
+                    "RankOrchestrator could not declare its complete ExpertOverlay prefill calibration schedule: "
+                    << declaration_error);
+                return false;
+            }
+        }
+        MoEOverlayInferenceInterferenceScope interference_scope(
+            chunk_schedule_policy &&
+                    moe_overlay_coordinator_owns_prefill_probe_
+                ? nullptr
+                : moe_overlay_interference_probe_.get(),
+            probe_workload);
         if (logits_gatherer_)
         {
             logits_gatherer_->invalidate();
@@ -11593,34 +11963,6 @@ namespace llaminar2
             return false;
         }
 
-        std::vector<size_t> fragment_counts(participants.size(), 0);
-        for (size_t participant_index = 0;
-             participant_index < participants.size();
-             ++participant_index)
-        {
-            if (!participants[participant_index] ||
-                !participants[participant_index]
-                     ->beginHostScheduledDeviceGenerationAdvance(
-                         rank_hosted_device_generation_tickets_[
-                             participant_index],
-                         &fragment_counts[participant_index]))
-            {
-                LOG_ERROR("[RankOrchestrator] Hosted device-generation branch admission failed on participant "
-                          << participant_index);
-                return false;
-            }
-            if (participant_index > 0 &&
-                fragment_counts[participant_index] != fragment_counts.front())
-            {
-                LOG_ERROR("[RankOrchestrator] Hosted device-generation participants exposed divergent semantic fragment counts"
-                          << " authoritative=" << fragment_counts.front()
-                          << " participant=" << participant_index
-                          << " divergent="
-                          << fragment_counts[participant_index]);
-                std::terminate();
-            }
-        }
-
         const bool use_pp_participants = !pp_stage_runners_.empty();
         auto dispatch_to_all =
             [&](const char *operation,
@@ -11687,51 +12029,39 @@ namespace llaminar2
         };
 
         /*
-         * Each semantic ordinal is submitted to every participant before the
-         * next ordinal is admitted. Worker collection waits only for enqueue
-         * calls to return; device execution remains asynchronous and ordered by
-         * the participant streams/events. This is the required symmetry fence
-         * for transaction scopes around segmented sparse boundaries.
+         * Submit the complete authenticated transaction on every persistent
+         * participant worker in one rank-level fan-out. Each child walks the
+         * same immutable producer-ordered branch and its sparse graph scopes
+         * provide the only rendezvous required between participants. Keeping
+         * the worker alive for the whole transaction removes one host
+         * dispatch/collection barrier per semantic fragment without changing
+         * device stream order or allowing either the rank or host to inspect
+         * mutable generation state.
          */
-        for (size_t fragment_index = 0;
-             fragment_index < fragment_counts.front();
-             ++fragment_index)
-        {
-            if (!dispatch_to_all(
-                    "submitHostScheduledDeviceGenerationFragment",
-                    [this, fragment_index](
-                        IInferenceRunner *participant,
-                        size_t participant_index) -> bool
-                    {
-                        return participant &&
-                            participant
-                                ->submitHostScheduledDeviceGenerationFragment(
-                                    rank_hosted_device_generation_tickets_[
-                                        participant_index],
-                                    fragment_index);
-                    }))
-            {
-                LOG_ERROR("[RankOrchestrator] Hosted semantic fragment submission failed after distributed submission began index="
-                          << fragment_index);
-                std::terminate();
-            }
-        }
-
         if (!dispatch_to_all(
-                "finishHostScheduledDeviceGenerationAdvance",
+                "submitHostScheduledDeviceGenerationAdvance",
                 [this](IInferenceRunner *participant,
                        size_t participant_index) -> bool
                 {
                     return participant &&
                         participant
-                            ->finishHostScheduledDeviceGenerationAdvance(
+                            ->submitHostScheduledDeviceGenerationAdvance(
                                 rank_hosted_device_generation_tickets_[
                                     participant_index]);
                 }))
         {
-            LOG_ERROR("[RankOrchestrator] Hosted branch finish failed after distributed submission began");
+            LOG_ERROR("[RankOrchestrator] Hosted transaction-bundle submission failed after distributed submission began");
             std::terminate();
         }
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "rank_hosted_transaction_bundle_submissions",
+            1.0,
+            "decode",
+            "rank",
+            {{"participants", std::to_string(participants.size())},
+             {"worker_fanouts", "1"},
+             {"fragment_barriers", "0"}});
         return true;
     }
 
@@ -14117,7 +14447,7 @@ namespace llaminar2
             return;
         if (moeOverlayAuthorityExecution() ==
             MoEOverlayAuthorityExecutionKind::
-                HomogeneousDeviceResident)
+                DeviceResident)
         {
             LOG_DEBUG("RankOrchestrator: skipping host MoE runtime histogram bridge; "
                       "device-resident ExpertOverlay authority owns histogram allgather");
@@ -14483,7 +14813,7 @@ namespace llaminar2
             DeviceMoERebalanceDispatchTicket{});
         rank_hosted_device_moe_rebalance_ticket_count_ = 0;
         rank_hosted_device_moe_rebalance_observation_schedule_ = {};
-        rank_hosted_device_moe_boundaries_until_observation_ = 0u;
+        rank_hosted_device_moe_rounds_until_observation_ = 0u;
         rank_hosted_device_moe_observation_schedule_initialized_ = false;
         invalidateRankResidentLogicalStateAggregate(
             "request_reset",
@@ -14555,6 +14885,85 @@ namespace llaminar2
             }
         }
         return schedule;
+    }
+
+    std::vector<MoEOverlayDeviceControllerRuntimeBinding>
+    RankOrchestrator::moeOverlayDeviceControllerRuntimeBindings() const
+    {
+        std::vector<MoEOverlayDeviceControllerRuntimeBinding> result;
+        const auto append = [&result](const auto &runners)
+        {
+            for (const auto &runner : runners)
+            {
+                if (!runner)
+                    continue;
+                auto child =
+                    runner->moeOverlayDeviceControllerRuntimeBindings();
+                result.insert(
+                    result.end(), child.begin(), child.end());
+            }
+        };
+        append(device_runners_);
+        append(pp_stage_runners_);
+        std::sort(
+            result.begin(),
+            result.end(),
+            [](const auto &left, const auto &right)
+            {
+                return left.overlay_participant_id <
+                       right.overlay_participant_id;
+            });
+        for (std::size_t index = 0u; index < result.size(); ++index)
+        {
+            if (!result[index].valid() ||
+                (index != 0u &&
+                 result[index - 1u].overlay_participant_id ==
+                     result[index].overlay_participant_id))
+            {
+                throw std::logic_error(
+                    "RankOrchestrator collected invalid or duplicate ExpertOverlay controller runtime bindings");
+            }
+        }
+        return result;
+    }
+
+    bool RankOrchestrator::installMoEOverlayTransferProgressEpoch(
+        std::shared_ptr<MappedTransferProgressEpoch> epoch)
+    {
+        if (!epoch || !epoch->device().is_gpu())
+        {
+            LOG_ERROR(
+                "RankOrchestrator received an invalid ExpertOverlay transfer-progress epoch");
+            return false;
+        }
+
+        IInferenceRunner *owner = nullptr;
+        const auto find_owner = [&](auto &runners) -> bool
+        {
+            for (auto &runner : runners)
+            {
+                if (!runner || runner->primaryDeviceId() != epoch->device())
+                    continue;
+                if (owner)
+                {
+                    LOG_ERROR(
+                        "RankOrchestrator found duplicate device owners for ExpertOverlay transfer progress on "
+                        << epoch->device().toString());
+                    return false;
+                }
+                owner = runner.get();
+            }
+            return true;
+        };
+        if (!find_owner(device_runners_) || !find_owner(pp_stage_runners_) ||
+            !owner)
+        {
+            LOG_ERROR(
+                "RankOrchestrator could not resolve the exact child for ExpertOverlay transfer progress on "
+                << epoch->device().toString());
+            return false;
+        }
+        return owner->installMoEOverlayTransferProgressEpoch(std::move(epoch));
     }
 
     bool RankOrchestrator::
@@ -14899,8 +15308,14 @@ namespace llaminar2
         return true;
     }
 
-    bool RankOrchestrator::maybeApplyDecodeBoundaryMaintenance()
+    bool RankOrchestrator::maybeApplyDecodeBoundaryMaintenance(
+        uint64_t committed_tokens)
     {
+        if (committed_tokens == 0u)
+        {
+            LOG_ERROR("[RankOrchestrator] Device MoE maintenance cannot retire an empty decode transaction");
+            return false;
+        }
         const bool use_pp_participants = !pp_stage_runners_.empty();
         auto &participants =
             use_pp_participants ? pp_stage_runners_ : device_runners_;
@@ -14925,9 +15340,8 @@ namespace llaminar2
                 {
                     rank_hosted_device_moe_rebalance_observation_schedule_ =
                         schedule;
-                    rank_hosted_device_moe_boundaries_until_observation_ =
-                        schedule.boundariesUntilPotentiallyDue(
-                            schedule.initial_round_interval);
+                    rank_hosted_device_moe_rounds_until_observation_ =
+                        schedule.initial_round_interval;
                     rank_hosted_device_moe_observation_schedule_initialized_ =
                         true;
                     PerfStatsCollector::addCounter(
@@ -14952,19 +15366,23 @@ namespace llaminar2
                     LOG_ERROR("[RankOrchestrator] Hosted HIP Device MoE observation schedule changed inside one request");
                     return false;
                 }
-                if (rank_hosted_device_moe_boundaries_until_observation_ ==
+                if (rank_hosted_device_moe_rounds_until_observation_ ==
                     0u)
                 {
                     LOG_ERROR("[RankOrchestrator] Hosted HIP Device MoE observation countdown reached an invalid zero state");
                     return false;
                 }
 
-                --rank_hosted_device_moe_boundaries_until_observation_;
-                if (rank_hosted_device_moe_boundaries_until_observation_ >
-                    0u)
+                const uint64_t rounds_until_observation =
+                    rank_hosted_device_moe_rounds_until_observation_;
+                if (committed_tokens < rounds_until_observation)
                 {
+                    rank_hosted_device_moe_rounds_until_observation_ -=
+                        static_cast<uint32_t>(committed_tokens);
                     return submitHostScheduledDeviceMoERebalanceKnownNonDueBoundary();
                 }
+
+                rank_hosted_device_moe_rounds_until_observation_ = 0u;
 
                 DeviceMoERebalanceDispatchTicket ticket;
                 if (!observeDeviceMoERebalanceDispatchTicket(&ticket) ||
@@ -14977,10 +15395,9 @@ namespace llaminar2
                     ticket.maintenance_due != 0u
                         ? schedule.recurring_round_interval
                         : ticket.decode_rounds_until_maintenance;
-                rank_hosted_device_moe_boundaries_until_observation_ =
-                    schedule.boundariesUntilPotentiallyDue(
-                        next_remaining_rounds);
-                if (rank_hosted_device_moe_boundaries_until_observation_ ==
+                rank_hosted_device_moe_rounds_until_observation_ =
+                    next_remaining_rounds;
+                if (rank_hosted_device_moe_rounds_until_observation_ ==
                     0u)
                 {
                     LOG_ERROR("[RankOrchestrator] Authenticated HIP Device MoE ticket could not arm the next conservative observation interval");
@@ -14996,9 +15413,9 @@ namespace llaminar2
                       ticket.maintenance_due != 0u ? "true" : "false"},
                      {"remaining_rounds",
                       std::to_string(next_remaining_rounds)},
-                     {"boundaries_until_observation",
+                     {"rounds_until_observation",
                       std::to_string(
-                          rank_hosted_device_moe_boundaries_until_observation_)}});
+                          rank_hosted_device_moe_rounds_until_observation_)}});
                 return true;
             }
             if (policy ==
@@ -15011,7 +15428,8 @@ namespace llaminar2
         if (participants.size() == 1)
         {
             return participants.front() &&
-                   participants.front()->maybeApplyDecodeBoundaryMaintenance();
+                   participants.front()->maybeApplyDecodeBoundaryMaintenance(
+                       committed_tokens);
         }
 
         /*
@@ -15045,8 +15463,8 @@ namespace llaminar2
         const auto kv_phase = KVCacheProfiler::getCurrentPhase();
         const auto executor_phase = GraphExecutorStats::currentPhase();
         tp_worker_pool_->dispatch(
-            [this, use_pp_participants, kernel_phase, rocm_phase, cuda_phase,
-             kv_phase, executor_phase](size_t i) -> bool
+            [this, use_pp_participants, committed_tokens, kernel_phase,
+             rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
             {
                 KernelProfiler::setCurrentPhase(kernel_phase);
                 ROCmKernelProfiler::setCurrentPhase(rocm_phase);
@@ -15064,7 +15482,7 @@ namespace llaminar2
                 ROCmKernelProfiler::setCurrentDevice(device.ordinal);
                 CUDAKernelProfiler::setCurrentDevice(device.ordinal);
                 return worker_participants[i]
-                    ->maybeApplyDecodeBoundaryMaintenance();
+                    ->maybeApplyDecodeBoundaryMaintenance(committed_tokens);
             });
 
         const int collect_timeout_ms = effectiveTPWorkerJoinTimeoutMs();
@@ -15734,6 +16152,7 @@ namespace llaminar2
         std::optional<int> authoritative_child_position;
         std::vector<int> authoritative_child_positions;
         std::vector<int> authoritative_child_sequence_lengths;
+        std::optional<bool> authoritative_verifier_identity_present;
         auto adopt_authoritative_child_logical_state =
             [&](const PrefixRuntimeStateSnapshot &child)
         {
@@ -15770,7 +16189,11 @@ namespace llaminar2
             }
         };
 
-        auto merge_child = [&snapshot](const PrefixRuntimeStateSnapshot &child)
+        auto merge_child =
+            [&snapshot,
+             &authoritative_verifier_identity_present,
+             use_authoritative_child_logical_state](
+                const PrefixRuntimeStateSnapshot &child)
         {
             constexpr uint64_t kFnvOffsetBasis = 1469598103934665603ull;
             constexpr uint64_t kFnvPrime = 1099511628211ull;
@@ -15886,6 +16309,77 @@ namespace llaminar2
                     : std::min(
                           snapshot.mtp_last_transaction_emitted_token_count,
                           child.mtp_last_transaction_emitted_token_count);
+            const bool child_has_verifier_identity =
+                child.mtp_observed_verifier_transaction_count > 0 ||
+                child.mtp_observed_verifier_draft_depth > 0 ||
+                !child.mtp_observed_verifier_draft_tokens.empty();
+            if (!authoritative_verifier_identity_present.has_value())
+            {
+                authoritative_verifier_identity_present =
+                    child_has_verifier_identity;
+            }
+            else if (use_authoritative_child_logical_state &&
+                     *authoritative_verifier_identity_present !=
+                         child_has_verifier_identity)
+            {
+                throw std::runtime_error(
+                    "Rank prefix-state diagnostics observed committed MTP "
+                    "verifier identity on only a subset of mirrored "
+                    "participants");
+            }
+            if (child_has_verifier_identity)
+            {
+                if (child.mtp_observed_verifier_transaction_count <= 0 ||
+                    child.mtp_observed_verifier_draft_depth <= 0 ||
+                    child.mtp_observed_verifier_draft_tokens.size() !=
+                        static_cast<size_t>(
+                            child.mtp_observed_verifier_draft_depth))
+                {
+                    throw std::runtime_error(
+                        "Rank prefix-state diagnostics observed an incomplete "
+                        "committed MTP verifier identity");
+                }
+                if (snapshot.mtp_observed_verifier_draft_tokens.empty())
+                {
+                    snapshot.mtp_observed_verifier_transaction_count =
+                        child.mtp_observed_verifier_transaction_count;
+                    snapshot.mtp_observed_verifier_draft_depth =
+                        child.mtp_observed_verifier_draft_depth;
+                    snapshot.mtp_observed_verifier_draft_tokens =
+                        child.mtp_observed_verifier_draft_tokens;
+                }
+                else if (
+                    snapshot.mtp_observed_verifier_transaction_count !=
+                        child.mtp_observed_verifier_transaction_count ||
+                    snapshot.mtp_observed_verifier_draft_depth !=
+                        child.mtp_observed_verifier_draft_depth ||
+                    snapshot.mtp_observed_verifier_draft_tokens !=
+                        child.mtp_observed_verifier_draft_tokens)
+                {
+                    auto format_tokens = [](const std::vector<int32_t> &tokens)
+                    {
+                        std::ostringstream out;
+                        out << '[';
+                        for (size_t index = 0; index < tokens.size(); ++index)
+                        {
+                            if (index != 0)
+                                out << ',';
+                            out << tokens[index];
+                        }
+                        out << ']';
+                        return out.str();
+                    };
+                    throw std::runtime_error(
+                        "Rank prefix-state diagnostics observed divergent "
+                        "committed MTP verifier draft rows across mirrored "
+                        "participants: authoritative=" +
+                        format_tokens(
+                            snapshot.mtp_observed_verifier_draft_tokens) +
+                        " divergent=" +
+                        format_tokens(
+                            child.mtp_observed_verifier_draft_tokens));
+                }
+            }
             snapshot.mtp_depth_policy_windows += child.mtp_depth_policy_windows;
             snapshot.mtp_depth_policy_updates += child.mtp_depth_policy_updates;
             snapshot.mtp_depth_policy_promotions += child.mtp_depth_policy_promotions;
@@ -16970,7 +17464,7 @@ namespace llaminar2
         if (runners.empty() ||
             moeOverlayAuthorityExecution() !=
                 MoEOverlayAuthorityExecutionKind::
-                    HomogeneousDeviceResident)
+                    DeviceResident)
         {
             return false;
         }

@@ -12,6 +12,8 @@
 #include "execution/moe/MoEOverlayCapacityResolver.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
+#include "backends/GPUAllocationPolicy.h"
+#include "planning/CapturedGraphMemoryEstimator.h"
 #include "tensors/NativeVnniFormatInfo.h"
 
 #include <gtest/gtest.h>
@@ -27,6 +29,64 @@
 
 namespace llaminar2
 {
+    TEST(Test__MoEOverlayCapacityResolver,
+         RuntimeGPUObservationUpdatesCUDAAndROCmThroughOneAuthority)
+    {
+        RankInventory inventory;
+        inventory.rank = 7;
+        inventory.gpus = {
+            DeviceInfo{
+                .type = DeviceType::CUDA,
+                .local_device_id = 2,
+                .memory_bytes = 24'000,
+                .free_memory_bytes = 23'000,
+            },
+            DeviceInfo{
+                .type = DeviceType::ROCm,
+                .local_device_id = 5,
+                .memory_bytes = 32'000,
+                .free_memory_bytes = 31'000,
+            },
+        };
+
+        installMoEOverlayRuntimeGPUCapacityObservation(
+            inventory, DeviceId::cuda(2), 24'000, 21'500);
+        installMoEOverlayRuntimeGPUCapacityObservation(
+            inventory, DeviceId::rocm(5), 32'000, 27'250);
+
+        ASSERT_EQ(inventory.gpus.size(), 2u);
+        EXPECT_EQ(inventory.gpus[0].memory_bytes, 24'000u);
+        EXPECT_EQ(inventory.gpus[0].free_memory_bytes, 21'500u);
+        EXPECT_EQ(inventory.gpus[1].memory_bytes, 32'000u);
+        EXPECT_EQ(inventory.gpus[1].free_memory_bytes, 27'250u);
+    }
+
+    TEST(Test__MoEOverlayCapacityResolver,
+         RuntimeGPUObservationRejectsInvalidOrUnownedDevices)
+    {
+        RankInventory inventory;
+        inventory.rank = 3;
+        inventory.gpus = {DeviceInfo{
+            .type = DeviceType::CUDA,
+            .local_device_id = 0,
+            .memory_bytes = 24'000,
+            .free_memory_bytes = 23'000,
+        }};
+
+        EXPECT_THROW(
+            installMoEOverlayRuntimeGPUCapacityObservation(
+                inventory, DeviceId::cpu(), 64'000, 32'000),
+            std::invalid_argument);
+        EXPECT_THROW(
+            installMoEOverlayRuntimeGPUCapacityObservation(
+                inventory, DeviceId::cuda(0), 24'000, 24'001),
+            std::invalid_argument);
+        EXPECT_THROW(
+            installMoEOverlayRuntimeGPUCapacityObservation(
+                inventory, DeviceId::rocm(0), 32'000, 31'000),
+            std::invalid_argument);
+    }
+
     namespace
     {
         constexpr std::size_t kGpuAlignment = 256;
@@ -802,6 +862,472 @@ namespace llaminar2
         EXPECT_EQ(bytesFor(0, DeviceId::cpu()), 57u * kChunk);
         EXPECT_EQ(bytesFor(1, DeviceId::cpu()), 9u * kChunk);
         EXPECT_EQ(charges.size(), 4u);
+
+        auto underprovisioned_two_cycle_policy = policy;
+        underprovisioned_two_cycle_policy.maximum_concurrent_cycles = 2;
+        underprovisioned_two_cycle_policy.maximum_cycles_per_layer = 2;
+        EXPECT_THROW(
+            (void)MoEOverlayCapacityAdmission::transferStagingBOM(
+                plan, /*world_size=*/2,
+                underprovisioned_two_cycle_policy),
+            std::invalid_argument);
+
+        auto two_cycle_policy = underprovisioned_two_cycle_policy;
+        two_cycle_policy.shadow_slots_per_endpoint_layer =
+            MoEOverlayCapacityAdmissionPolicy::
+                requiredShadowSlotsPerEndpointLayer(
+                    two_cycle_policy.maximum_concurrent_cycles,
+                    two_cycle_policy.maximum_cycles_per_layer);
+        const auto two_cycle_charges =
+            MoEOverlayCapacityAdmission::transferStagingBOM(
+                plan, /*world_size=*/2, two_cycle_policy);
+        ASSERT_EQ(two_cycle_charges.size(), charges.size());
+        for (std::size_t index = 0; index < charges.size(); ++index)
+        {
+            EXPECT_EQ(
+                two_cycle_charges[index].world_rank,
+                charges[index].world_rank);
+            EXPECT_EQ(
+                two_cycle_charges[index].device,
+                charges[index].device);
+            EXPECT_EQ(two_cycle_charges[index].bytes, 2u * charges[index].bytes);
+        }
+
+        auto broad_one_cycle_per_layer_policy = two_cycle_policy;
+        broad_one_cycle_per_layer_policy.maximum_concurrent_cycles = 8;
+        broad_one_cycle_per_layer_policy.maximum_cycles_per_layer = 1;
+        broad_one_cycle_per_layer_policy.shadow_slots_per_endpoint_layer =
+            MoEOverlayCapacityAdmissionPolicy::
+                requiredShadowSlotsPerEndpointLayer(
+                    broad_one_cycle_per_layer_policy
+                        .maximum_concurrent_cycles,
+                    broad_one_cycle_per_layer_policy
+                        .maximum_cycles_per_layer);
+        EXPECT_EQ(
+            broad_one_cycle_per_layer_policy
+                .shadow_slots_per_endpoint_layer,
+            1u);
+        const auto broad_charges =
+            MoEOverlayCapacityAdmission::transferStagingBOM(
+                plan, /*world_size=*/2,
+                broad_one_cycle_per_layer_policy);
+        ASSERT_EQ(broad_charges.size(), charges.size());
+        for (std::size_t index = 0; index < charges.size(); ++index)
+        {
+            EXPECT_EQ(
+                broad_charges[index].bytes,
+                8u * charges[index].bytes);
+        }
+    }
+
+    TEST(MoEOverlayLocalCapacityPlanner,
+         NodeLocalActivationBOMPricesExactRootTargetAndMTPFamilyLanes)
+    {
+        MoERoutedExpertPlacementPlan overlay;
+        overlay.enabled = true;
+        overlay.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        overlay.continuation_domain = "opaque-primary";
+        overlay.base_model_domain = "opaque-primary";
+        overlay.shared_expert_domain = "opaque-primary";
+        overlay.continuation_domain_spec.domain = "opaque-primary";
+        overlay.continuation_domain_spec.logical_root_participant = 0;
+
+        RoutedExpertDomain primary;
+        primary.name = "opaque-primary";
+        primary.scope = ExecutionDomainScope::RANK_LOCAL;
+        primary.participants = {
+            GlobalDeviceAddress::cuda(0),
+            GlobalDeviceAddress::cuda(1),
+        };
+        primary.world_ranks = {0, 0};
+        primary.owner_rank = 0;
+        primary.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+
+        RoutedExpertDomain secondary;
+        secondary.name = "opaque-secondary";
+        secondary.scope = ExecutionDomainScope::RANK_LOCAL;
+        secondary.participants = {
+            GlobalDeviceAddress::rocm(0),
+            GlobalDeviceAddress::rocm(1),
+            GlobalDeviceAddress::rocm(2),
+            GlobalDeviceAddress::rocm(3),
+        };
+        secondary.world_ranks = {1, 1, 1, 1};
+        secondary.owner_rank = 1;
+        secondary.routed_compute_policy =
+            RoutedExpertComputePolicy::Apportioned;
+
+        RoutedExpertDomain inter_node;
+        inter_node.name = "opaque-inter-node";
+        inter_node.scope = ExecutionDomainScope::SINGLE;
+        inter_node.participants = {GlobalDeviceAddress::cuda(2)};
+        inter_node.world_ranks = {2};
+        inter_node.owner_rank = 2;
+        inter_node.routed_compute_policy =
+            RoutedExpertComputePolicy::Apportioned;
+        overlay.domains = {primary, secondary, inter_node};
+        overlay.routed_tiers = {
+            RoutedExpertTier{
+                .name = "priority-minus-seven",
+                .domain = primary.name,
+                .priority = -7,
+            },
+            RoutedExpertTier{
+                .name = "priority-eleven",
+                .domain = secondary.name,
+                .priority = 11,
+            },
+            RoutedExpertTier{
+                .name = "priority-ninety",
+                .domain = inter_node.name,
+                .priority = 90,
+                .fallback = true,
+            },
+        };
+
+        ClusterInventory cluster;
+        cluster.world_size = 3;
+        cluster.ranks.resize(3);
+        for (int rank = 0; rank < 3; ++rank)
+        {
+            cluster.ranks[static_cast<std::size_t>(rank)].rank = rank;
+            cluster.ranks[static_cast<std::size_t>(rank)].node_id =
+                rank == 2 ? 9 : 4;
+            cluster.ranks[static_cast<std::size_t>(rank)].hostname =
+                rank == 2 ? "other-node" : "shared-node";
+        }
+
+        constexpr std::size_t kRows = 8;
+        constexpr int kDModel = 16;
+        constexpr int kTopK = 2;
+        constexpr std::size_t kFamilies = 3;
+        constexpr std::size_t kMatrixBytes =
+            kRows * static_cast<std::size_t>(kDModel) * sizeof(float);
+        constexpr std::size_t kLaneBytes = kFamilies * kMatrixBytes;
+        constexpr std::size_t kCanonicalRouteBytes =
+            kRows * static_cast<std::size_t>(kTopK) *
+            static_cast<std::size_t>(kDModel) * sizeof(float);
+        const auto channel_plan =
+            MoEOverlayActivationChannelPlanner::plan({
+                .placement_plan = &overlay,
+                .cluster_inventory = &cluster,
+                .row_capacity = kRows,
+                .d_model = kDModel,
+                .top_k = kTopK,
+                .graph_family_count = kFamilies,
+            });
+
+        EXPECT_EQ(channel_plan.payload_matrix_bytes, kMatrixBytes);
+        EXPECT_EQ(
+            channel_plan.canonical_route_matrix_bytes,
+            kCanonicalRouteBytes);
+        ASSERT_EQ(channel_plan.channels.size(), 1u)
+            << "the different-node tier must remain on the MPI path";
+        const auto &channel = channel_plan.channels.front();
+        EXPECT_EQ(channel.tier_index, 1);
+        EXPECT_EQ(channel.domain_ordinal, 1);
+        EXPECT_EQ(channel.source_world_rank, 0);
+        EXPECT_EQ(channel.target_world_rank, 1);
+        EXPECT_EQ(channel.source_device, DeviceId::cuda(0));
+        EXPECT_EQ(
+            channel.targetParticipantIds(),
+            (std::vector<int>{2, 3, 4, 5}));
+        ASSERT_EQ(channel.source_lanes.size(), 4u);
+        ASSERT_EQ(channel.target_lanes.size(), 4u);
+        for (std::size_t lane = 0; lane < 4u; ++lane)
+        {
+            EXPECT_EQ(channel.source_lanes[lane].device, DeviceId::cuda(0));
+            EXPECT_EQ(
+                channel.target_lanes[lane].device,
+                DeviceId::rocm(static_cast<int>(lane)));
+        }
+        EXPECT_EQ(
+            channel_plan.stagingBytesFor(0, DeviceId::cuda(0)),
+            4u * kLaneBytes);
+        EXPECT_EQ(
+            channel_plan.stagingBytesFor(0, DeviceId::cuda(1)), 0u);
+        for (int device = 0; device < 4; ++device)
+        {
+            EXPECT_EQ(
+                channel_plan.stagingBytesFor(1, DeviceId::rocm(device)),
+                kLaneBytes + kCanonicalRouteBytes);
+        }
+        EXPECT_EQ(
+            channel_plan.stagingBytesFor(2, DeviceId::cuda(2)), 0u);
+
+        /* The rank-local capacity adapter must add the exact same charge to
+         * the continuation root only; the other TP shard retains only its
+         * independent model-upload ring. */
+        auto profile = smallModelProfile();
+        profile.d_model = kDModel;
+        RankExecutionPlan rank_plan;
+        rank_plan.rank = 0;
+        rank_plan.first_layer = 0;
+        rank_plan.last_layer = profile.n_layers - 1;
+        rank_plan.primary_device = GlobalDeviceAddress::cuda(0);
+        rank_plan.local_tp_devices = {
+            GlobalDeviceAddress::cuda(0),
+            GlobalDeviceAddress::cuda(1),
+        };
+        rank_plan.runtime.batch_size = 1;
+        rank_plan.runtime.max_seq_len = 32;
+        rank_plan.runtime.kv_cache_precision = KVCachePrecision::FP16;
+
+        constexpr std::size_t kLargeBudget =
+            64ULL * 1024ULL * 1024ULL * 1024ULL;
+        auto &rank_zero = cluster.ranks[0];
+        rank_zero.cpu_memory_bytes = kLargeBudget;
+        rank_zero.cpu.memory_bytes = kLargeBudget;
+        rank_zero.cpu.free_memory_bytes = kLargeBudget;
+        rank_zero.gpus = {
+            DeviceInfo{
+                .type = DeviceType::CUDA,
+                .local_device_id = 0,
+                .memory_bytes = kLargeBudget,
+                .free_memory_bytes = kLargeBudget,
+                .compute_units = 82,
+            },
+            DeviceInfo{
+                .type = DeviceType::CUDA,
+                .local_device_id = 1,
+                .memory_bytes = kLargeBudget,
+                .free_memory_bytes = kLargeBudget,
+                .compute_units = 82,
+            },
+        };
+        const auto gpu_load = testGPUWeightLoadCapacityInput();
+        const auto capacity = MoEOverlayLocalCapacityPlanner::plan({
+            .model_profile = &profile,
+            .rank_plan = &rank_plan,
+            .overlay_plan = &overlay,
+            .rank_inventory = &rank_zero,
+            .cluster_inventory = &cluster,
+            .rank_execution_kind =
+                OverlayRankExecutionKind::ContinuationAuthority,
+            .resident_graph_rows = static_cast<int>(kRows),
+            .activation_channel_row_capacity = static_cast<int>(kRows),
+            .activation_graph_family_count = kFamilies,
+            .captured_graph_executable_count = 11u,
+            .gpu_weight_load = gpu_load,
+        });
+        const auto budgetFor = [&](DeviceId device)
+            -> const MoEOverlayBoundPhysicalMemoryBudget &
+        {
+            const auto found = std::find_if(
+                capacity.physical_budgets.begin(),
+                capacity.physical_budgets.end(),
+                [&](const auto &budget)
+                { return budget.device == device; });
+            if (found == capacity.physical_budgets.end())
+                throw std::logic_error("test capacity device is absent");
+            return *found;
+        };
+        const auto upload = gpuWeightLoadMemoryBOM(
+            /*planned_weight_bytes=*/0,
+            gpu_load.maximum_source_bytes,
+            kLargeBudget,
+            kLargeBudget,
+            gpu_load.policy);
+        EXPECT_EQ(
+            budgetFor(DeviceId::cuda(0))
+                .additional_transfer_staging_bytes,
+            upload.staging_bytes + 4u * kLaneBytes);
+        EXPECT_EQ(
+            budgetFor(DeviceId::cuda(1))
+                .additional_transfer_staging_bytes,
+            upload.staging_bytes);
+        const std::size_t captured_graph_bytes =
+            estimateCapturedGraphExecutableBytes(
+                profile.n_layers, /*executable_count=*/11u);
+        EXPECT_GE(
+            budgetFor(DeviceId::cuda(0)).fixed_bytes,
+            captured_graph_bytes);
+        EXPECT_GE(
+            budgetFor(DeviceId::cuda(1)).fixed_bytes,
+            captured_graph_bytes);
+    }
+
+    /**
+     * @brief Prove tier identity never substitutes for rank locality.
+     *
+     * A one-tier NodeTP overlay still transports activations between its two
+     * MPI ranks. This is the production topology that previously reached graph
+     * construction with no preflight channel.
+     */
+    TEST(MoEOverlayLocalCapacityPlanner,
+         SingleTierRemoteRankCreatesNodeLocalActivationChannel)
+    {
+        MoERoutedExpertPlacementPlan overlay;
+        overlay.enabled = true;
+        overlay.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        overlay.continuation_domain = "single-priority-domain";
+        overlay.base_model_domain = "single-priority-domain";
+        overlay.shared_expert_domain = "single-priority-domain";
+        overlay.continuation_domain_spec.domain = "single-priority-domain";
+        overlay.continuation_domain_spec.logical_root_participant = 0;
+
+        RoutedExpertDomain domain;
+        domain.name = "single-priority-domain";
+        domain.scope = ExecutionDomainScope::RANK_LOCAL;
+        domain.participants = {
+            GlobalDeviceAddress::cpu(0),
+            GlobalDeviceAddress::cpu(0),
+        };
+        domain.world_ranks = {0, 1};
+        domain.owner_rank = 0;
+        domain.routed_compute_policy =
+            RoutedExpertComputePolicy::Apportioned;
+        overlay.domains = {domain};
+        overlay.routed_tiers = {RoutedExpertTier{
+            .name = "only-priority",
+            .domain = domain.name,
+            .priority = 17,
+        }};
+
+        ClusterInventory cluster;
+        cluster.world_size = 2;
+        cluster.ranks.resize(2);
+        for (int rank = 0; rank < 2; ++rank)
+        {
+            cluster.ranks[static_cast<std::size_t>(rank)].rank = rank;
+            cluster.ranks[static_cast<std::size_t>(rank)].node_id = 5;
+            cluster.ranks[static_cast<std::size_t>(rank)].hostname =
+                "shared-node";
+        }
+
+        EXPECT_TRUE(
+            MoEOverlayActivationChannelPlanner::hasRemoteRankParticipants(
+                overlay));
+        const auto plan = MoEOverlayActivationChannelPlanner::plan({
+            .placement_plan = &overlay,
+            .cluster_inventory = &cluster,
+            .row_capacity = 8u,
+            .d_model = 16,
+            .top_k = 2,
+            .graph_family_count = 3u,
+        });
+
+        ASSERT_EQ(plan.channels.size(), 1u);
+        const auto &channel = plan.channels.front();
+        EXPECT_EQ(channel.tier_index, 0);
+        EXPECT_EQ(channel.domain_ordinal, 0);
+        EXPECT_EQ(channel.source_world_rank, 0);
+        EXPECT_EQ(channel.target_world_rank, 1);
+        EXPECT_EQ(channel.source_device, DeviceId::cpu());
+        EXPECT_EQ(channel.targetParticipantIds(), (std::vector<int>{1}));
+        ASSERT_EQ(channel.source_lanes.size(), 1u);
+        ASSERT_EQ(channel.target_lanes.size(), 1u);
+        EXPECT_EQ(channel.source_lanes.front().device, DeviceId::cpu());
+        EXPECT_EQ(channel.target_lanes.front().device, DeviceId::cpu());
+        EXPECT_EQ(plan.stagingBytesFor(0, DeviceId::cpu()), 0u);
+        EXPECT_EQ(plan.stagingBytesFor(1, DeviceId::cpu()), 0u);
+    }
+
+    /**
+     * @brief Keep a colocated lower-priority participant on the local graph.
+     *
+     * A NodeTP CPU tier naturally has one socket participant on the same MPI
+     * rank as whichever GPU inventory binding selects as continuation. The
+     * activation-channel planner must create only the remote-rank lane: a
+     * same-rank self-channel is invalid and its compact arena is already part
+     * of the rank-local graph memory plan.
+     */
+    TEST(MoEOverlayLocalCapacityPlanner,
+         NodeLocalActivationPlanSkipsColocatedCrossTierParticipant)
+    {
+        MoERoutedExpertPlacementPlan overlay;
+        overlay.enabled = true;
+        overlay.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        overlay.continuation_domain = "priority-zero-domain";
+        overlay.base_model_domain = "priority-zero-domain";
+        overlay.shared_expert_domain = "priority-zero-domain";
+        overlay.continuation_domain_spec.domain = "priority-zero-domain";
+        overlay.continuation_domain_spec.logical_root_participant = 0;
+
+        RoutedExpertDomain continuation;
+        continuation.name = "priority-zero-domain";
+        continuation.scope = ExecutionDomainScope::SINGLE;
+        continuation.participants = {GlobalDeviceAddress::cuda(0)};
+        continuation.world_ranks = {0};
+        continuation.owner_rank = 0;
+
+        RoutedExpertDomain colocated;
+        colocated.name = "priority-seven-domain";
+        colocated.scope = ExecutionDomainScope::SINGLE;
+        colocated.participants = {GlobalDeviceAddress::cpu(0)};
+        colocated.world_ranks = {0};
+        colocated.owner_rank = 0;
+
+        RoutedExpertDomain remote;
+        remote.name = "priority-forty-one-domain";
+        remote.scope = ExecutionDomainScope::SINGLE;
+        remote.participants = {GlobalDeviceAddress::rocm(0)};
+        remote.world_ranks = {1};
+        remote.owner_rank = 1;
+
+        overlay.domains = {continuation, colocated, remote};
+        overlay.routed_tiers = {
+            RoutedExpertTier{
+                .name = "priority-zero",
+                .domain = continuation.name,
+                .priority = 0,
+            },
+            RoutedExpertTier{
+                .name = "priority-seven",
+                .domain = colocated.name,
+                .priority = 7,
+            },
+            RoutedExpertTier{
+                .name = "priority-forty-one",
+                .domain = remote.name,
+                .priority = 41,
+                .fallback = true,
+            },
+        };
+
+        ClusterInventory cluster;
+        cluster.world_size = 2;
+        cluster.ranks.resize(2);
+        for (int rank = 0; rank < 2; ++rank)
+        {
+            cluster.ranks[static_cast<std::size_t>(rank)].rank = rank;
+            cluster.ranks[static_cast<std::size_t>(rank)].node_id = 3;
+            cluster.ranks[static_cast<std::size_t>(rank)].hostname =
+                "shared-node";
+        }
+
+        constexpr std::size_t kRows = 4;
+        constexpr int kDModel = 8;
+        constexpr int kTopK = 2;
+        constexpr std::size_t kFamilies = 2;
+        constexpr std::size_t kLaneBytes =
+            kRows * static_cast<std::size_t>(kDModel) * sizeof(float) *
+            kFamilies;
+        constexpr std::size_t kCanonicalRouteBytes =
+            kRows * static_cast<std::size_t>(kTopK) *
+            static_cast<std::size_t>(kDModel) * sizeof(float);
+        const auto plan = MoEOverlayActivationChannelPlanner::plan({
+            .placement_plan = &overlay,
+            .cluster_inventory = &cluster,
+            .row_capacity = kRows,
+            .d_model = kDModel,
+            .top_k = kTopK,
+            .graph_family_count = kFamilies,
+        });
+
+        ASSERT_EQ(plan.channels.size(), 1u);
+        EXPECT_EQ(plan.channels.front().source_world_rank, 0);
+        EXPECT_EQ(plan.channels.front().target_world_rank, 1);
+        EXPECT_EQ(
+            plan.channels.front().targetParticipantIds(),
+            (std::vector<int>{2}));
+        EXPECT_EQ(
+            plan.stagingBytesFor(0, DeviceId::cuda(0)),
+            kLaneBytes);
+        EXPECT_EQ(plan.stagingBytesFor(0, DeviceId::cpu()), 0u);
+        EXPECT_EQ(
+            plan.stagingBytesFor(1, DeviceId::rocm(0)),
+            kLaneBytes + kCanonicalRouteBytes);
     }
 
     TEST(MoEOverlayLocalCapacityPlanner,
@@ -819,7 +1345,7 @@ namespace llaminar2
         const auto shards =
             MoEOverlayLocalCapacityPlanner::continuationShards(
                 rank_plan,
-                /*builds_root_graph=*/true);
+                OverlayRankExecutionKind::ContinuationAuthority);
         ASSERT_EQ(shards.size(), 2u);
         EXPECT_EQ(shards[0].device, DeviceId::cuda(0));
         EXPECT_EQ(shards[0].shard_index, 0);
@@ -832,7 +1358,7 @@ namespace llaminar2
         EXPECT_TRUE(
             MoEOverlayLocalCapacityPlanner::continuationShards(
                 rank_plan,
-                /*builds_root_graph=*/false)
+                OverlayRankExecutionKind::ExpertOnlyFollower)
                 .empty());
     }
 
@@ -897,7 +1423,8 @@ namespace llaminar2
             .rank_plan = &rank_plan,
             .overlay_plan = &overlay,
             .rank_inventory = &inventory,
-            .builds_root_graph = true,
+            .rank_execution_kind =
+                OverlayRankExecutionKind::ContinuationAuthority,
             .require_host_memory_authority = true,
             .max_gpu_memory_bytes = 1024u * 1024u * 1024u,
             .max_cpu_memory_bytes = 512u * 1024u * 1024u,
@@ -938,7 +1465,8 @@ namespace llaminar2
             expected_load_reserve.staging_bytes);
         EXPECT_EQ(
             cuda->safety_reserve_bytes,
-            expected_load_reserve.safety_margin_bytes);
+            expected_load_reserve.safety_margin_bytes +
+                gpu_allocation_policy::kMinimumFreeHeadroomBytes);
         /*
          * One serial participant owns the complete immutable route-family
          * ladder. Eight rows at top-k two retain capacities 1, 2, 4, 8, and
@@ -993,7 +1521,8 @@ namespace llaminar2
             .rank_plan = &rank_plan,
             .overlay_plan = &overlay,
             .rank_inventory = &inventory,
-            .builds_root_graph = false,
+            .rank_execution_kind =
+                OverlayRankExecutionKind::ExpertOnlyFollower,
             .require_host_memory_authority = true,
         });
         EXPECT_TRUE(result.fixed_memory_plan.devices.empty());
@@ -1163,7 +1692,8 @@ namespace llaminar2
                 .rank_plan = &rank_plan,
                 .overlay_plan = &overlay,
                 .rank_inventory = &inventory,
-                .builds_root_graph = true,
+                .rank_execution_kind =
+                    OverlayRankExecutionKind::ContinuationAuthority,
                 .require_host_memory_authority = true,
                 .resident_graph_rows = rows,
                 .gpu_weight_load = testGPUWeightLoadCapacityInput(),

@@ -104,6 +104,30 @@ namespace llaminar2
         {
         public:
             /**
+             * @brief Single lifecycle for transfer, bank, and retirement barriers.
+             *
+             * Per-operation readiness remains a vector because transfers
+             * genuinely progress independently.  The wave itself has exactly
+             * one phase, eliminating contradictory flag combinations at the
+             * publication and abort boundaries.
+             */
+            enum class Phase
+            {
+                Reserved,
+                Staging,
+                Staged,
+                Preparing,
+                Prepared,
+                Publishing,
+                Published,
+                RetirementFencing,
+                RetirementReady,
+                Aborting,
+                Aborted,
+                Retired,
+            };
+
+            /**
              * @brief Take ownership of every transfer and inactive bank.
              * @param transfers Already-enqueued projection operations.
              * @param inactive_bank Reserved candidate runtime bank.
@@ -120,12 +144,14 @@ namespace llaminar2
                     stats,
                 std::string perf_device,
                 std::size_t migration_count,
+                std::shared_ptr<IMoEOverlayTransferProgressAuthority>
+                    transfer_progress_authority,
                 std::vector<MoEOverlayCompletedMigrationMeasurement>
                     measurements = {},
                 std::shared_ptr<IMoEOverlayMigrationMeasurementSink>
                     measurement_sink = nullptr,
                 bool require_complete_local_measurements = false,
-                bool commit_allowed = true)
+                bool publication_allowed = true)
                 : transfers_(std::move(transfers)),
                   transfer_ready_(transfers_.size(), false),
                   transfer_abort_ready_(transfers_.size(), false),
@@ -133,11 +159,13 @@ namespace llaminar2
                   stats_(std::move(stats)),
                   perf_device_(std::move(perf_device)),
                   migration_count_(migration_count),
+                  transfer_progress_authority_(
+                      std::move(transfer_progress_authority)),
                   measurements_(std::move(measurements)),
                   measurement_sink_(std::move(measurement_sink)),
                   require_complete_local_measurements_(
                       require_complete_local_measurements),
-                  commit_allowed_(commit_allowed)
+                  publication_allowed_(publication_allowed)
             {
                 if ((!measurements_.empty() ||
                      require_complete_local_measurements_) &&
@@ -158,7 +186,7 @@ namespace llaminar2
             MoEOverlayResidencyWaveProgress pollStage(
                 std::string *error) noexcept override
             {
-                if (aborted_)
+                if (phase_ == Phase::Aborting || phase_ == Phase::Aborted)
                 {
                     assignTierTransportError(
                         error,
@@ -167,10 +195,17 @@ namespace llaminar2
                             : failure_);
                     return MoEOverlayResidencyWaveProgress::Failed;
                 }
-                if (stage_ready_)
+                if (phase_ == Phase::Staged)
                     return MoEOverlayResidencyWaveProgress::Ready;
+                if (phase_ != Phase::Reserved && phase_ != Phase::Staging)
+                {
+                    assignTierTransportError(
+                        error,
+                        "Composite residency stage was polled outside its staging lifecycle");
+                    return MoEOverlayResidencyWaveProgress::Failed;
+                }
 
-                if (!stage_dispatch_started_)
+                if (phase_ == Phase::Reserved)
                 {
                     /*
                      * Construction reserves and pins the complete wave, but its
@@ -179,7 +214,7 @@ namespace llaminar2
                      * prepared ownership while awaiting an inference ticket.
                      */
                     wave_started_at_ = std::chrono::steady_clock::now();
-                    stage_dispatch_started_ = true;
+                    phase_ = Phase::Staging;
                 }
 
                 bool any_pending = false;
@@ -241,11 +276,29 @@ namespace llaminar2
                     }
                 }
 
-                stage_ready_ = std::all_of(
+                /*
+                 * A lane may publish its first or next chunk while the
+                 * inference graph's captured command-claim branch is already
+                 * past graph entry. Kick the fabric-owned, device-deduplicated
+                 * retained epochs after visiting every lane. This waits only
+                 * for each worker to enqueue its independent graph; CUDA/ROCm
+                 * transfer streams then progress concurrently with inference
+                 * and with one another.
+                 */
+                if (!submitTransferProgress(error))
+                {
+                    failure_ = error && !error->empty()
+                                   ? *error
+                                   : "ExpertOverlay transfer-progress submission failed";
+                    abortStaged();
+                    return MoEOverlayResidencyWaveProgress::Failed;
+                }
+
+                const bool all_transfers_ready = std::all_of(
                     transfer_ready_.begin(),
                     transfer_ready_.end(),
                     [](bool ready) { return ready; });
-                if (!stage_ready_ || any_pending)
+                if (!all_transfers_ready || any_pending)
                 {
                     stats_->stage_pending_polls.fetch_add(
                         1,
@@ -274,7 +327,7 @@ namespace llaminar2
                     .end_steady_nanoseconds = end_nanoseconds,
                 };
 
-                if (!measurements_.empty() && !measurement_published_)
+                if (!measurements_.empty())
                 {
                     const auto elapsed =
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -306,9 +359,9 @@ namespace llaminar2
                         abortStaged();
                         return MoEOverlayResidencyWaveProgress::Failed;
                     }
-                    measurement_published_ = true;
                 }
 
+                phase_ = Phase::Staged;
                 PerfStatsCollector::addCounter(
                     "moe_overlay_residency",
                     "composite_transfer_operations_ready",
@@ -323,52 +376,45 @@ namespace llaminar2
             [[nodiscard]] std::optional<MoEOverlayResidencyWaveInterval>
             completedStageInterval() const noexcept override
             {
-                if (!stage_ready_ || !stage_interval_.valid())
+                if (!stage_interval_.valid())
                     return std::nullopt;
                 return stage_interval_;
             }
 
-            /** @brief Begin bank commit only after all transfer operations are ready. */
-            bool beginCommit(std::string *error) noexcept override
+            /** @brief Begin inactive-bank preparation after every transfer is ready. */
+            bool beginPrepare(std::string *error) noexcept override
             {
-                if (!commit_allowed_ || aborted_ || !stage_ready_ ||
-                    commit_started_)
+                if (!publication_allowed_ || phase_ != Phase::Staged)
                 {
                     assignTierTransportError(
                         error,
-                        !commit_allowed_
-                            ? "Economy calibration waves cannot commit an inactive residency bank"
-                        : aborted_
-                            ? "Cannot commit an aborted residency wave"
-                            : (!stage_ready_
-                                   ? "Cannot commit before every transfer is ready"
-                                   : "Residency wave commit was already started"));
+                        !publication_allowed_
+                            ? "Economy calibration waves cannot prepare a publishable residency bank"
+                            : "Residency wave can prepare only after staging completes");
                     return false;
                 }
-                if (!inactive_bank_->beginCommit(error))
+                if (!inactive_bank_->beginPrepare(error))
                     return false;
-                commit_started_ = true;
+                phase_ = Phase::Preparing;
                 stats_->commits_started.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
 
-            /** @brief Poll the one candidate-bank completion authority. */
-            MoEOverlayResidencyWaveProgress pollCommit(
+            /** @brief Poll the one candidate-bank preparation authority. */
+            MoEOverlayResidencyWaveProgress pollPrepare(
                 std::string *error) noexcept override
             {
-                if (aborted_ || !commit_started_)
+                if (phase_ == Phase::Prepared)
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                if (phase_ != Phase::Preparing)
                 {
                     assignTierTransportError(
                         error,
-                        aborted_
-                            ? "Cannot poll commit for an aborted residency wave"
-                            : "Residency wave commit was not started");
+                        "Residency wave preparation was not in flight");
                     return MoEOverlayResidencyWaveProgress::Failed;
                 }
-                if (commit_ready_)
-                    return MoEOverlayResidencyWaveProgress::Ready;
 
-                const auto progress = inactive_bank_->pollCommit(error);
+                const auto progress = inactive_bank_->pollPrepare(error);
                 if (progress == MoEOverlayResidencyWaveProgress::Pending)
                 {
                     stats_->commit_pending_polls.fetch_add(
@@ -380,12 +426,12 @@ namespace llaminar2
                 {
                     failure_ = error && !error->empty()
                                    ? *error
-                                   : "Inactive residency bank commit failed";
+                                   : "Inactive residency bank preparation failed";
                     abortStaged();
                     return progress;
                 }
 
-                commit_ready_ = true;
+                phase_ = Phase::Prepared;
                 stats_->commits_completed.fetch_add(
                     1,
                     std::memory_order_relaxed);
@@ -399,12 +445,67 @@ namespace llaminar2
                 return progress;
             }
 
+            /** @brief Begin the irreversible selector fan-out after preparation. */
+            bool beginPublication(std::string *error) noexcept override
+            {
+                if (phase_ != Phase::Prepared)
+                {
+                    assignTierTransportError(
+                        error,
+                        "Residency publication requires one prepared wave");
+                    return false;
+                }
+                /* Enter the irreversible phase before delegating the first
+                 * selector submission. A partial fan-out is never abortable. */
+                phase_ = Phase::Publishing;
+                if (!inactive_bank_->beginPublication(error))
+                    return false;
+                return true;
+            }
+
+            /** @brief Poll inference-visible selector publication without waiting. */
+            MoEOverlayResidencyWaveProgress pollPublication(
+                std::string *error) noexcept override
+            {
+                if (phase_ == Phase::Published)
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                if (phase_ != Phase::Publishing)
+                {
+                    assignTierTransportError(
+                        error,
+                        "Residency publication was not in flight");
+                    return MoEOverlayResidencyWaveProgress::Failed;
+                }
+
+                const auto progress = inactive_bank_->pollPublication(error);
+                if (progress == MoEOverlayResidencyWaveProgress::Ready)
+                {
+                    phase_ = Phase::Published;
+                    PerfStatsCollector::addCounter(
+                        "moe_overlay_residency",
+                        "runtime_banks_published",
+                        1.0,
+                        "maintenance",
+                        perf_device_,
+                        {{"migrations", std::to_string(migration_count_)}});
+                }
+                return progress;
+            }
+
             /** @brief Abort each transfer and the inactive-bank reservation once. */
             void abortStaged() noexcept override
             {
-                if (aborted_ || retired_)
+                if (phase_ == Phase::Aborting || phase_ == Phase::Aborted ||
+                    phase_ == Phase::Retired)
                     return;
-                aborted_ = true;
+                if (phase_ == Phase::Publishing ||
+                    phase_ == Phase::Published ||
+                    phase_ == Phase::RetirementFencing ||
+                    phase_ == Phase::RetirementReady)
+                {
+                    std::terminate();
+                }
+                phase_ = Phase::Aborting;
                 for (auto &transfer : transfers_)
                     transfer->abort();
                 if (inactive_bank_)
@@ -416,15 +517,15 @@ namespace llaminar2
             MoEOverlayResidencyWaveProgress pollAbort(
                 std::string *error) noexcept override
             {
-                if (!aborted_)
+                if (phase_ == Phase::Aborted)
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                if (phase_ != Phase::Aborting)
                 {
                     assignTierTransportError(
                         error,
                         "Cannot poll abort cleanup before abortStaged()");
                     return MoEOverlayResidencyWaveProgress::Failed;
                 }
-                if (abort_cleanup_ready_)
-                    return MoEOverlayResidencyWaveProgress::Ready;
 
                 bool any_pending = false;
                 for (std::size_t index = 0;
@@ -451,6 +552,12 @@ namespace llaminar2
                         any_pending = true;
                 }
 
+                /* Abort is a drain, not cancellation of already-published GPU
+                 * commands. Keep the same exact progress authority alive until
+                 * every lane releases its completion fence. */
+                if (!submitTransferProgress(error))
+                    return MoEOverlayResidencyWaveProgress::Failed;
+
                 if (!inactive_bank_)
                 {
                     inactive_bank_abort_ready_ = true;
@@ -475,13 +582,13 @@ namespace llaminar2
                         any_pending = true;
                 }
 
-                abort_cleanup_ready_ =
+                const bool abort_cleanup_ready =
                     inactive_bank_abort_ready_ &&
                     std::all_of(
                         transfer_abort_ready_.begin(),
                         transfer_abort_ready_.end(),
                         [](bool ready) { return ready; });
-                if (!abort_cleanup_ready_ || any_pending)
+                if (!abort_cleanup_ready || any_pending)
                 {
                     stats_->abort_pending_polls.fetch_add(
                         1,
@@ -492,6 +599,7 @@ namespace llaminar2
                 stats_->abort_cleanups_completed.fetch_add(
                     1,
                     std::memory_order_relaxed);
+                phase_ = Phase::Aborted;
                 PerfStatsCollector::addCounter(
                     "moe_overlay_residency",
                     "composite_abort_cleanup_ready",
@@ -502,19 +610,53 @@ namespace llaminar2
                 return MoEOverlayResidencyWaveProgress::Ready;
             }
 
+            /** @brief Poll device reader drainage before cross-rank retirement. */
+            MoEOverlayResidencyWaveProgress pollRetirementFence(
+                std::string *error) noexcept override
+            {
+                if (phase_ == Phase::RetirementReady)
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                if (phase_ != Phase::Published &&
+                    phase_ != Phase::RetirementFencing)
+                {
+                    assignTierTransportError(
+                        error,
+                        "Cannot retire a residency wave before publication completes");
+                    return MoEOverlayResidencyWaveProgress::Failed;
+                }
+                phase_ = Phase::RetirementFencing;
+                const auto progress =
+                    inactive_bank_->pollRetirementFence(error);
+                if (progress == MoEOverlayResidencyWaveProgress::Ready)
+                    phase_ = Phase::RetirementReady;
+                return progress;
+            }
+
             /** @brief Delegate old-bank retirement after the authority drains leases. */
             void retirePrevious() noexcept override
             {
-                if (retired_ || aborted_)
+                if (phase_ == Phase::Retired)
                     return;
+                if (phase_ != Phase::RetirementReady)
+                    std::terminate();
                 inactive_bank_->retirePrevious();
-                retired_ = true;
+                phase_ = Phase::Retired;
                 stats_->old_banks_retired.fetch_add(
                     1,
                     std::memory_order_relaxed);
             }
 
         private:
+            /** @brief Enqueue one device-deduplicated maintenance progress pass. */
+            [[nodiscard]] bool submitTransferProgress(
+                std::string *error) noexcept
+            {
+                if (!transfer_progress_authority_)
+                    return true;
+                return transfer_progress_authority_
+                    ->submitOutstandingTransferProgress(error);
+            }
+
             std::vector<std::unique_ptr<IMoEOverlayTierTransferOperation>>
                 transfers_;
             std::vector<bool> transfer_ready_;
@@ -523,6 +665,8 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayTierMigrationTransportSharedStats> stats_;
             std::string perf_device_;
             std::size_t migration_count_ = 0;
+            std::shared_ptr<IMoEOverlayTransferProgressAuthority>
+                transfer_progress_authority_;
             std::vector<MoEOverlayCompletedMigrationMeasurement>
                 measurements_;
             std::shared_ptr<IMoEOverlayMigrationMeasurementSink>
@@ -530,16 +674,9 @@ namespace llaminar2
             bool require_complete_local_measurements_ = false;
             std::chrono::steady_clock::time_point wave_started_at_{};
             MoEOverlayResidencyWaveInterval stage_interval_{};
-            bool measurement_published_ = false;
-            bool commit_allowed_ = true;
-            bool stage_dispatch_started_ = false;
-            bool stage_ready_ = false;
-            bool commit_started_ = false;
-            bool commit_ready_ = false;
-            bool aborted_ = false;
+            bool publication_allowed_ = true;
             bool inactive_bank_abort_ready_ = false;
-            bool abort_cleanup_ready_ = false;
-            bool retired_ = false;
+            Phase phase_ = Phase::Reserved;
             std::string failure_;
         };
     } // namespace
@@ -610,7 +747,8 @@ namespace llaminar2
                     std::move(prepared.inactive_bank),
                     stats_,
                     config_.perf_device,
-                    transaction.migrations.size());
+                    transaction.migrations.size(),
+                    config_.transfer_progress_authority);
             }
             return {
                 .status = MoEOverlayResidencyStageStartStatus::Failed,
@@ -643,7 +781,8 @@ namespace llaminar2
                     std::move(prepared.inactive_bank),
                     stats_,
                     config_.perf_device,
-                    transaction.migrations.size());
+                    transaction.migrations.size(),
+                    config_.transfer_progress_authority);
             }
             return {
                 .status = prepared.status,
@@ -700,6 +839,7 @@ namespace llaminar2
                 stats_,
                 config_.perf_device,
                 transaction.migrations.size(),
+                config_.transfer_progress_authority,
                 std::move(measurements),
                 collect_measurements ? config_.measurement_sink : nullptr,
                 collect_measurements &&

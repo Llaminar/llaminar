@@ -1,3 +1,12 @@
+/**
+ * @file IWorkerGPUContext.h
+ * @brief Backend-neutral ownership contract for one GPU worker context.
+ *
+ * The interface owns exact streams, events, library handles, and serialized
+ * setup work for one physical GPU. Execution callers retain explicit stream
+ * identities; no method may reinterpret a null stream as an ambient default.
+ */
+
 #pragma once
 
 #include "IGPUGraphCapture.h"
@@ -11,6 +20,22 @@
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Scheduling class for a persistent named auxiliary GPU stream.
+     *
+     * `LatencyCritical` is reserved for bounded control work that must become
+     * runnable between kernels in a long retained inference epoch.
+     * `BackgroundMaintenance` is the lowest-priority compute-stream class and
+     * is used for asynchronous residency DMA. Stream priority does not claim
+     * to control copy-engine arbitration, which remains backend-owned.
+     */
+    enum class GPUAuxiliaryStreamSchedulingClass : std::uint8_t
+    {
+        Normal = 0,
+        LatencyCritical = 1,
+        BackgroundMaintenance = 2,
+    };
 
     struct PointerValidationResult
     {
@@ -236,6 +261,34 @@ namespace llaminar2
         virtual void *getOrCreateAuxiliaryStream(const std::string &name, bool *created = nullptr) = 0;
 
         /**
+         * @brief Get or create a named stream with an exact scheduling class.
+         *
+         * The same name may never be rebound with a different class. Backends
+         * that cannot materialize a requested non-normal class return null;
+         * callers must fail the unsupported production configuration instead
+         * of silently substituting a normal stream.
+         *
+         * @param name Stable stream purpose/name.
+         * @param scheduling_class Immutable scheduling class for this name.
+         * @param created Optional output set true only for a new stream.
+         * @return Exact persistent stream or null when unsupported/invalid.
+         */
+        virtual void *getOrCreateAuxiliaryStream(
+            const std::string &name,
+            GPUAuxiliaryStreamSchedulingClass scheduling_class,
+            bool *created = nullptr)
+        {
+            if (scheduling_class !=
+                GPUAuxiliaryStreamSchedulingClass::Normal)
+            {
+                if (created)
+                    *created = false;
+                return nullptr;
+            }
+            return getOrCreateAuxiliaryStream(name, created);
+        }
+
+        /**
          * @brief Destroy all named auxiliary streams owned by this context.
          *
          * Primarily used during context cleanup and tests.
@@ -277,7 +330,14 @@ namespace llaminar2
          * This status-bearing companion is intended for graph-captured stream
          * dependencies where losing the event edge must fail the stage instead
          * of only logging. Implementations should not silently fall back to the
-         * default/null stream.
+         * default/null stream. Concrete GPU contexts must establish their exact
+         * device before recording so a persistent orchestration worker that owns
+         * @p stream can capture the edge without masquerading as the context's
+         * private resource-management worker.
+         *
+         * @thread_safety Concrete GPU implementations admit the exact stream's
+         * capture owner; the default adapter retains @ref recordEvent's worker
+         * restriction.
          */
         virtual bool recordEventChecked(void *event, void *stream)
         {
@@ -304,6 +364,9 @@ namespace llaminar2
          *
          * Use this for required graph-captured stream edges. A false result
          * means the dependency was not queued and callers should fail fast.
+         * Concrete GPU contexts establish their exact device and admit the
+         * persistent orchestration worker that owns @p stream; the default
+         * adapter retains @ref waitEvent's worker restriction.
          */
         virtual bool waitEventChecked(void *event, void *stream)
         {

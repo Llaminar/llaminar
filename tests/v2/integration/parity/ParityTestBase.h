@@ -90,6 +90,7 @@
 // Modern orchestration runner support (for incremental migration)
 #include "utils/TestOrchestrationHelper.h"
 #include "../../utils/ParityGDNHeadPermutation.h"
+#include "../../utils/ParityNumericalAggregation.h"
 #include "../../utils/ParitySnapshotSelection.h"
 #include "execution/runner/IOrchestrationRunner.h"
 #include "kernels/KernelFactory.h"
@@ -99,6 +100,7 @@
 #include "utils/PerfStatsCollector.h"
 #include "utils/Sha256.h"
 #include "utils/ProductionParityEvidence.h"
+#include "utils/ReferenceGenerationLease.h"
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -3365,6 +3367,14 @@ namespace llaminar2::test::parity
         // setupPipeline() to initialize runner_ (legacy path).
         std::unique_ptr<IOrchestrationRunner> orch_runner_;
 
+        /** @brief Observed serving contract for forced-token state advancement. */
+        enum class ParityForcedTokenCommitMode : std::uint8_t
+        {
+            Unknown = 0,
+            Deferred = 1,
+            Immediate = 2,
+        };
+
         /**
          * @brief Authenticated teacher-forced production decode trajectory.
          *
@@ -3373,13 +3383,14 @@ namespace llaminar2::test::parity
          * decode loop would then leave the Hugging Face trajectory and compare
          * unrelated later checkpoints. Production parity instead uses the
          * serving `forceDecodeToken()` protocol that also powers constrained
-         * continuations. The first token replaces the ready prefill sample;
-         * each following token forwards its predecessor through the ordinary
-         * captured decode graph and leaves those snapshots for comparison.
+         * continuations. Its typed result says whether a token remains pending
+         * or was committed immediately by a device-resident transaction, so
+         * the harness never guesses and never forwards one reference row twice.
          */
         std::vector<int32_t> orchestration_parity_decode_trajectory_;
         size_t orchestration_parity_decode_trajectory_index_ = 0;
-        bool orchestration_parity_forced_decode_armed_ = false;
+        ParityForcedTokenCommitMode orchestration_parity_force_mode_ =
+            ParityForcedTokenCommitMode::Unknown;
 
         IInferenceRunner *activeLegacyRunner() const
         {
@@ -3819,6 +3830,40 @@ namespace llaminar2::test::parity
                         }
                     }
 
+                    std::unique_ptr<ReferenceGenerationLease>
+                        generation_lease;
+                    if (need_regen)
+                    {
+                        /*
+                         * The backend scheduler can run CPU, CUDA, and ROCm
+                         * cells together, but all three generate references in
+                         * host RAM. Serialize only this heavyweight writer
+                         * phase, then validate again: a peer may have completed
+                         * the same immutable pack while this process waited.
+                         */
+                        generation_lease =
+                            std::make_unique<ReferenceGenerationLease>();
+                        const auto metadata_path =
+                            std::filesystem::path(config_.snapshot_dir) /
+                            "metadata.txt";
+                        if (std::filesystem::exists(metadata_path))
+                        {
+                            const auto validation =
+                                validateReferenceSnapshotMetadata(
+                                    metadata_path,
+                                    productionParityCampaignEnabled());
+                            if (validation.usable)
+                            {
+                                LOG_INFO("[" << getBackendName()
+                                             << " Parity] Reusing reference pack "
+                                                "published while waiting for the "
+                                                "generation lease: "
+                                             << config_.snapshot_dir);
+                                need_regen = false;
+                            }
+                        }
+                    }
+
                     if (need_regen)
                     {
                         if (!regeneratePyTorchSnapshots())
@@ -3991,6 +4036,20 @@ namespace llaminar2::test::parity
             printParityProfileSummary();
             Logger::getInstance().closeLogFile();
             restoreParityEnvOverrides();
+
+            /*
+             * The initial barrier protects objects owned by the test that is
+             * ending; it does not protect the communicator from a fast rank
+             * entering the next process-resident campaign cell while another
+             * rank is still synchronizing devices, clearing caches, or
+             * printing evidence. End teardown with a second rendezvous so the
+             * next SetUp's inventory broadcasts cannot alias a prior cell's
+             * teardown lifecycle.
+             */
+            {
+                auto scope = profileParityScope("tear_down.final_barrier");
+                mpiBarrier();
+            }
         }
 
         /**
@@ -4936,6 +4995,52 @@ namespace llaminar2::test::parity
             ParitySnapshotSetupMode snapshot_mode =
                 ParitySnapshotSetupMode::Enabled)
         {
+            return setupOrchestrationRunnerImpl(
+                orch_config,
+                std::move(preloaded_model_context),
+                std::nullopt,
+                snapshot_mode);
+        }
+
+        /**
+         * @brief Setup from a production-certified prepared-weight authority.
+         *
+         * Unlike the raw ModelContext overload, this path lets the production
+         * runner credit and adopt an existing PreparedWeightStore only after
+         * its newly resolved rank plan and routed-weight topology match the
+         * prior runner's exact certificate.
+         *
+         * @param orch_config Complete fresh runner configuration.
+         * @param reuse_contract Model-owned weights plus production certificate.
+         * @param snapshot_mode Initial diagnostic checkpoint policy.
+         * @return True after the fresh production runner initializes.
+         */
+        bool setupOrchestrationRunner(
+            const OrchestrationConfig &orch_config,
+            ModelContextReuseContract reuse_contract,
+            ParitySnapshotSetupMode snapshot_mode =
+                ParitySnapshotSetupMode::Enabled)
+        {
+            return setupOrchestrationRunnerImpl(
+                orch_config,
+                nullptr,
+                std::move(reuse_contract),
+                snapshot_mode);
+        }
+
+        /**
+         * @brief Install exactly one fresh production runner implementation.
+         *
+         * The two public overloads differ only at the model-authority boundary;
+         * all teardown, initialization, and snapshot lifecycle remains one
+         * implementation so campaign reuse cannot acquire special graph rules.
+         */
+        bool setupOrchestrationRunnerImpl(
+            const OrchestrationConfig &orch_config,
+            std::shared_ptr<ModelContext> preloaded_model_context,
+            std::optional<ModelContextReuseContract> reuse_contract,
+            ParitySnapshotSetupMode snapshot_mode)
+        {
             // Install one runner/model authority.  A stale legacy context must
             // never shadow the model owned by the modern production runner.
             runner_.reset();
@@ -4944,10 +5049,17 @@ namespace llaminar2::test::parity
             orch_runner_.reset();
             orchestration_parity_decode_trajectory_.clear();
             orchestration_parity_decode_trajectory_index_ = 0;
-            orchestration_parity_forced_decode_armed_ = false;
+            orchestration_parity_force_mode_ =
+                ParityForcedTokenCommitMode::Unknown;
 
             // Create runner via TestOrchestrationHelper
-            if (preloaded_model_context)
+            if (reuse_contract)
+            {
+                orch_runner_ = test::TestOrchestrationHelper::create(
+                    orch_config,
+                    std::move(*reuse_contract));
+            }
+            else if (preloaded_model_context)
             {
                 orch_runner_ = test::TestOrchestrationHelper::create(
                     orch_config,
@@ -5339,7 +5451,8 @@ namespace llaminar2::test::parity
         {
             orchestration_parity_decode_trajectory_.clear();
             orchestration_parity_decode_trajectory_index_ = 0;
-            orchestration_parity_forced_decode_armed_ = false;
+            orchestration_parity_force_mode_ =
+                ParityForcedTokenCommitMode::Unknown;
             if (orch_runner_)
             {
                 orch_runner_->clearCache();
@@ -5640,6 +5753,30 @@ namespace llaminar2::test::parity
             return true;
         }
 
+        /**
+         * @brief Observe one numerically compared set of live graph snapshots.
+         *
+         * The callback runs after every per-layer comparison and before the
+         * next request clears or replaces its snapshot bank.  Specialized
+         * production campaigns may retain compact provenance such as the
+         * identity of a routed expert, but must not mutate inference state or
+         * keep raw snapshot pointers beyond this call.  The ordinary parity
+         * harness has no additional observation contract.
+         *
+         * @param phase Production forward phase that published the snapshots.
+         * @param step Decode step, or `-1` for prefill.
+         * @param layers Completed numerical comparisons for this checkpoint.
+         */
+        virtual void observeComparedParityCheckpoint(
+            ParityForwardPhase phase,
+            int step,
+            const std::vector<LayerStats> &layers)
+        {
+            (void)phase;
+            (void)step;
+            (void)layers;
+        }
+
         std::vector<int> makeBoundedPrefillTokens(
             const std::vector<int> &seed_tokens,
             int max_seq_len = 0) const
@@ -5671,7 +5808,8 @@ namespace llaminar2::test::parity
                 {
                     orchestration_parity_decode_trajectory_.clear();
                     orchestration_parity_decode_trajectory_index_ = 0;
-                    orchestration_parity_forced_decode_armed_ = false;
+                    orchestration_parity_force_mode_ =
+                        ParityForcedTokenCommitMode::Unknown;
                     for (const int token : readDecodeTokensFromMetadata())
                     {
                         orchestration_parity_decode_trajectory_.push_back(
@@ -5722,25 +5860,63 @@ namespace llaminar2::test::parity
                     return false;
                 }
 
-                if (!orchestration_parity_forced_decode_armed_)
+                if (orchestration_parity_force_mode_ !=
+                    ParityForcedTokenCommitMode::Deferred)
                 {
                     /*
-                     * Replace the ready prefill sample without forwarding the
-                     * prompt tail. This is the same request-level constrained
-                     * continuation transaction used by production chat policy.
+                     * A deferred runner uses the successor call below to
+                     * forward this token. A device-resident MTP runner commits
+                     * it immediately and leaves the exact step snapshots ready
+                     * now. The typed result is the authority; backend names and
+                     * test configuration never decide this lifecycle edge.
                      */
-                    GenerationResult armed =
+                    GenerationResult forced =
                         orch_runner_->forceDecodeToken(reference_token);
-                    if (!armed.success() || armed.tokens.size() != 1 ||
-                        armed.tokens.front() != reference_token)
+                    if (!forced.success() || forced.tokens.size() != 1 ||
+                        forced.tokens.front() != reference_token)
                     {
                         LOG_ERROR(
-                            "[Parity] OrchestrationRunner could not arm the "
-                            "prefill-boundary reference token: "
-                            << armed.error);
+                            "[Parity] OrchestrationRunner could not force the "
+                            "authenticated reference token: "
+                            << forced.error);
                         return false;
                     }
-                    orchestration_parity_forced_decode_armed_ = true;
+
+                    if (forced.returned_token_commit ==
+                        ReturnedTokenCommitState::Committed)
+                    {
+                        if (orchestration_parity_force_mode_ ==
+                            ParityForcedTokenCommitMode::Deferred)
+                        {
+                            LOG_ERROR(
+                                "[Parity] Forced-token commit policy changed "
+                                "inside one request");
+                            return false;
+                        }
+                        orchestration_parity_force_mode_ =
+                            ParityForcedTokenCommitMode::Immediate;
+                        orchestration_parity_decode_trajectory_index_ =
+                            trajectory_index + 1u;
+                        return true;
+                    }
+                    if (forced.returned_token_commit !=
+                        ReturnedTokenCommitState::Pending)
+                    {
+                        LOG_ERROR(
+                            "[Parity] Forced-token result omitted its model-row "
+                            "commit contract");
+                        return false;
+                    }
+                    if (orchestration_parity_force_mode_ ==
+                        ParityForcedTokenCommitMode::Immediate)
+                    {
+                        LOG_ERROR(
+                            "[Parity] Forced-token commit policy changed "
+                            "inside one request");
+                        return false;
+                    }
+                    orchestration_parity_force_mode_ =
+                        ParityForcedTokenCommitMode::Deferred;
                 }
 
                 const size_t successor_index = trajectory_index + 1;
@@ -5771,6 +5947,14 @@ namespace llaminar2::test::parity
                     LOG_ERROR(
                         "[Parity] OrchestrationRunner returned a different "
                         "forced successor token");
+                    return false;
+                }
+                if (forwarded.returned_token_commit !=
+                    ReturnedTokenCommitState::Pending)
+                {
+                    LOG_ERROR(
+                        "[Parity] Deferred forced-token runner changed its "
+                        "commit policy while forwarding a predecessor");
                     return false;
                 }
                 orchestration_parity_decode_trajectory_index_ =
@@ -6011,6 +6195,7 @@ namespace llaminar2::test::parity
 
         bool driveParityMoERebalanceMaintenance(
             const std::string &phase,
+            uint64_t committed_tokens,
             int decode_step = -1)
         {
             const auto &exercise = config_.moe_rebalance_exercise;
@@ -6030,7 +6215,8 @@ namespace llaminar2::test::parity
 
             if (orch_runner_)
             {
-                if (!orch_runner_->maybeApplyMoERebalance())
+                if (!orch_runner_->maybeApplyMoERebalance(
+                        committed_tokens))
                 {
                     ADD_FAILURE() << "Parity MoE rebalance maintenance failed during "
                                   << phase
@@ -6252,11 +6438,9 @@ namespace llaminar2::test::parity
             if (!success)
                 return summary;
             exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1);
-            if (config_.moe_rebalance_exercise.request_after_prefill &&
-                !driveParityMoERebalanceMaintenance("prefill"))
-            {
-                return summary;
-            }
+            /* Production prefill retires its own exact prompt progress. The
+             * parity harness must not manufacture a decode boundary merely to
+             * wake ExpertOverlay after prefill. */
 
             /*
              * A segmented captured prefill is numerically meaningful only if
@@ -6688,6 +6872,11 @@ namespace llaminar2::test::parity
             // Overall pass
             summary.overall_passed = (summary.early_layers_passed >= config_.min_early_layers_passed) &&
                                      summary.lm_head_passed;
+
+            observeComparedParityCheckpoint(
+                ParityForwardPhase::Prefill,
+                -1,
+                summary.layer_stats);
 
             return summary;
         }
@@ -7125,11 +7314,7 @@ namespace llaminar2::test::parity
                 return summary;
             exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1);
             const uint64_t initial_moe_movement_epoch = activeMoERuntimeMovementEpoch();
-            if (config_.moe_rebalance_exercise.request_after_prefill &&
-                !driveParityMoERebalanceMaintenance("prefill"))
-            {
-                return summary;
-            }
+            /* Production prefill owns its maintenance progress publication. */
 
             size_t vocab_size = model_ctx_->model().vocab_size;
 
@@ -7185,6 +7370,7 @@ namespace llaminar2::test::parity
                 if (parityMoERebalanceMaintenanceDue(step + 1) &&
                     !driveParityMoERebalanceMaintenance(
                         "decode",
+                        1u,
                         static_cast<int>(step)))
                 {
                     continue;
@@ -7644,11 +7830,7 @@ namespace llaminar2::test::parity
                 return summary;
             exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1);
             const uint64_t initial_moe_movement_epoch = activeMoERuntimeMovementEpoch();
-            if (config_.moe_rebalance_exercise.request_after_prefill &&
-                !driveParityMoERebalanceMaintenance("prefill"))
-            {
-                return summary;
-            }
+            /* Production prefill owns its maintenance progress publication. */
 
             size_t vocab_size =
                 static_cast<size_t>(getActiveVocabSize());
@@ -7717,6 +7899,7 @@ namespace llaminar2::test::parity
                 if (parityMoERebalanceMaintenanceDue(step + 1) &&
                     !driveParityMoERebalanceMaintenance(
                         "decode",
+                        1u,
                         static_cast<int>(step)))
                 {
                     continue;
@@ -7768,6 +7951,7 @@ namespace llaminar2::test::parity
                         LayerStats stats;
                         stats.layer_idx = layer_idx;
                         float sum_cosine = 0.0f;
+                        bool routed_expert_set_exact = true;
 
                         for (const auto &stage : decode_per_layer_stages)
                         {
@@ -7876,6 +8060,14 @@ namespace llaminar2::test::parity
                             {
                                 result = compareRoutingIndices(decode_compare, pytorch_data, llaminar_size,
                                                                moe_cfg_decode.top_k, stage);
+                                /*
+                                 * Decode publishes one routing row. A complete
+                                 * set overlap means the raw expert sum follows
+                                 * the same discrete branch even if equal-weight
+                                 * experts appear in a different order.
+                                 */
+                                routed_expert_set_exact =
+                                    result.routing_overlap >= 1.0f - 1e-6f;
                             }
                             else if (stage == "MOE_ROUTING_WEIGHTS")
                             {
@@ -7897,14 +8089,18 @@ namespace llaminar2::test::parity
                             }
                             stats.stage_results.push_back(result);
 
-                            // Routing stages use set-overlap, not cosine — exclude from aggregation
-                            if (!isRoutingStage(stage))
+                            const bool contributes_to_layer_cosine =
+                                parityStageContributesToLayerCosine(
+                                    stage,
+                                    routed_expert_set_exact);
+                            if (contributes_to_layer_cosine)
                             {
                                 stats.stages_compared++;
                                 sum_cosine += result.cosine_similarity;
                             }
 
-                            if (!isRoutingStage(stage) && result.cosine_similarity < stats.min_cosine_sim)
+                            if (contributes_to_layer_cosine &&
+                                result.cosine_similarity < stats.min_cosine_sim)
                             {
                                 stats.min_cosine_sim = result.cosine_similarity;
                                 stats.worst_stage = stage;
@@ -7943,6 +8139,11 @@ namespace llaminar2::test::parity
                         step_stats.layer_stats.push_back(stats);
                     }
                 }
+
+                observeComparedParityCheckpoint(
+                    ParityForwardPhase::Decode,
+                    static_cast<int>(step),
+                    step_stats.layer_stats);
 
                 // A non-tail PP rank still owns mathematically relevant layer
                 // checkpoints even though it cannot publish LM-head logits.

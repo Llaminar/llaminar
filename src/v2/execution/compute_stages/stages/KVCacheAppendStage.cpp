@@ -85,6 +85,74 @@ namespace llaminar2
     {
     }
 
+    bool KVCacheAppendStage::bindCanonicalGraphAppendSources(
+        void *stream,
+        int runtime_seq_len)
+    {
+        if (!params_.kv_cache || !params_.kv_cache->isGraphCaptureReady() ||
+            !stream)
+        {
+            return false;
+        }
+
+        const int request_count = std::max(1, params_.batch_size);
+        const int physical_tokens =
+            runtime_seq_len > 0
+                ? runtime_seq_len
+                : (params_.seq_len > 0
+                       ? params_.seq_len
+                       : params_.num_tokens / request_count);
+        if (physical_tokens <= 0 || params_.num_tokens <= 0 ||
+            physical_tokens * request_count > params_.num_tokens)
+        {
+            LOG_ERROR("[KVCacheAppendStage] Invalid graph append capture geometry"
+                      << " physical_tokens=" << physical_tokens
+                      << " request_count=" << request_count
+                      << " total_tokens=" << params_.num_tokens
+                      << " layer=" << params_.layer_idx
+                      << " seq_idx=" << params_.seq_idx);
+            return false;
+        }
+
+        bool ready = true;
+        for (int request = 0; request < request_count; ++request)
+        {
+            const int32_t *const source =
+                params_.request_sequence_lengths_device
+                    ? params_.request_sequence_lengths_device + request
+                    : nullptr;
+            ready = params_.kv_cache->bindGraphAppendCountSource(
+                        params_.layer_idx,
+                        params_.seq_idx + request,
+                        source,
+                        physical_tokens,
+                        stream) &&
+                    ready;
+        }
+        return ready;
+    }
+
+    bool KVCacheAppendStage::prepareGraphLaunch(
+        IDeviceContext *ctx,
+        void *stream)
+    {
+        (void)ctx;
+        if (!params_.device_id.is_gpu() || !stream)
+        {
+            LOG_ERROR("[KVCacheAppendStage] Graph capture preparation requires an explicit GPU stream");
+            return false;
+        }
+        setGPUStream(stream);
+        if (!bindCanonicalGraphAppendSources(stream, /*runtime_seq_len=*/0))
+        {
+            LOG_ERROR("[KVCacheAppendStage] Could not bind canonical append-count sources before graph capture"
+                      << " layer=" << params_.layer_idx
+                      << " first_seq_idx=" << params_.seq_idx);
+            return false;
+        }
+        return true;
+    }
+
     bool KVCacheAppendStage::shouldUseDecodeEquivalentVerifierAppend(
         int request_rows) const
     {

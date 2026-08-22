@@ -540,37 +540,59 @@ size_t WorkspaceMemoryEstimator::estimate(
             profile, geometry, execution_rows, /*routed_only=*/false),
         "CUDA floating projection requirements");
 
-    if (!hasHybridRecurrentLayer(
+    if (hasHybridRecurrentLayer(
             profile, geometry.first_layer, geometry.last_layer))
-        return bytes;
+    {
+        const size_t gdn_qkv = shardColumns(
+            projectionOutputRows(
+                profile,
+                ".attn_qkv.weight",
+                geometry.first_layer,
+                geometry.last_layer),
+            geometry.total_shards);
+        const size_t gdn_gate = shardColumns(
+            projectionOutputRows(
+                profile,
+                ".attn_gate.weight",
+                geometry.first_layer,
+                geometry.last_layer),
+            geometry.total_shards);
+        if (gdn_qkv != 0 || gdn_gate != 0)
+        {
+            /*
+             * Hybrid GDN layers add one in-place short-convolution scratch
+             * row of QKV width and one three-way deinterleave scratch row of
+             * gate width.
+             */
+            const size_t hybrid_row_bytes =
+                (gdn_qkv + 3 * gdn_gate) * sizeof(float);
+            const size_t hybrid_bytes =
+                checkedMultiply(execution_rows, hybrid_row_bytes,
+                                "hybrid recurrent row scratch");
+            bytes = checkedAdd(
+                bytes, hybrid_bytes, "hybrid recurrent scratch");
+        }
+    }
 
-    const size_t gdn_qkv = shardColumns(
-        projectionOutputRows(
-            profile,
-            ".attn_qkv.weight",
-            geometry.first_layer,
-            geometry.last_layer),
-        geometry.total_shards);
-    const size_t gdn_gate = shardColumns(
-        projectionOutputRows(
-            profile,
-            ".attn_gate.weight",
-            geometry.first_layer,
-            geometry.last_layer),
-        geometry.total_shards);
-    if (gdn_qkv == 0 && gdn_gate == 0)
-        return bytes;
-
-    /*
-     * Hybrid GDN layers add one in-place short-convolution scratch row of QKV
-     * width and one three-way deinterleave scratch row of gate width.
-     */
-    const size_t hybrid_row_bytes =
-        (gdn_qkv + 3 * gdn_gate) * sizeof(float);
-    const size_t hybrid_bytes =
-        checkedMultiply(execution_rows, hybrid_row_bytes,
-                        "hybrid recurrent row scratch");
-    bytes = checkedAdd(bytes, hybrid_bytes, "hybrid recurrent scratch");
+    if (geometry.mtp_target_query_rows > 0)
+    {
+        /*
+         * The exact runtime interval planner can alias many scratch names
+         * across the main and compact MTP participants, but it must retain
+         * different namespaces and initialize-once publications together.
+         * Before graph construction, two independently complete envelopes are
+         * therefore the safe compositional bound. Clear the MTP dimension on
+         * the recursive call so the compact envelope is added exactly once.
+         */
+        WorkspaceMemoryGeometry mtp_geometry = geometry;
+        mtp_geometry.resident_graph_rows =
+            std::max(1, geometry.mtp_target_query_rows);
+        mtp_geometry.mtp_target_query_rows = 0;
+        bytes = checkedAdd(
+            bytes,
+            estimate(profile, mtp_geometry),
+            "retained compact MTP graph family");
+    }
 
     return bytes;
 }

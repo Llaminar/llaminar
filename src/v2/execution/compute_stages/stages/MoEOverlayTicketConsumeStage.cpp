@@ -16,6 +16,7 @@
 
 #include "../../../backends/BackendManager.h"
 #include "../../../backends/IBackend.h"
+#include "../../local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 
@@ -73,7 +74,16 @@ namespace llaminar2
         }
 
         const auto &ticket = params_.ticket_storage->ticket();
-        if (!ticket.returnPayloadReady())
+        /*
+         * Native capture records the fixed-address H2D node; it does not
+         * execute that copy. Setup-only materialization therefore has no live
+         * request and correctly presents an incomplete return header. The
+         * admitted transaction later executes its manual CPU segment before
+         * launching this captured consumer. Outside a recording window the
+         * readiness check remains mandatory, so direct/manual invocation can
+         * never ingest unpublished bytes.
+         */
+        if (!isGraphCaptureActive() && !ticket.returnPayloadReady())
         {
             LOG_ERROR("[MoEOverlayTicketConsumeStage] CPU return payload is not complete for the published logical prefix");
             return false;

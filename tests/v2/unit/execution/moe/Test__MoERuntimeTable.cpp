@@ -624,6 +624,23 @@ namespace llaminar2::test
     }
 
     TEST(Test__MoERuntimeTable,
+         DevicePublicationRecipeRejectsNonMirroredHostRuntime)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+
+        EXPECT_THROW(
+            (void)table.preparedInactiveBankPublicationRecipe(0, 1u),
+            std::logic_error)
+            << "A CPU host table must not masquerade as a GPU DMA recipe authority";
+        EXPECT_THROW(
+            table.acknowledgeDevicePublishedBank(0, 1u, 1u),
+            std::logic_error)
+            << "Only a mirrored GPU runtime can acknowledge device-owned publication";
+    }
+
+    TEST(Test__MoERuntimeTable,
          OverlayRouteParticipantsAreVersionedIndependentlyOfDomainLocalOwners)
     {
         MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);

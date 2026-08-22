@@ -155,6 +155,28 @@ namespace llaminar2
             return true;
         }
         /**
+         * @brief Bind the immutable device append-count source before capture.
+         *
+         * Setup-only graph materialization has no admitted request and therefore
+         * does not execute the ordinary dynamic-parameter prelude.  The pointer
+         * itself is nevertheless capture topology: padded prefill kernels must
+         * embed the resident live-row scalar rather than a null exact-shape
+         * source.  Values remain device-owned and are published by the captured
+         * prefill materializer on every replay.
+         *
+         * @param ctx Device context selected for native graph capture.
+         * @param stream Exact non-null capture stream.
+         * @return true when every request-local cache row accepted its source.
+         */
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        /** @return CaptureOnly because the stable pointer is embedded once. */
+        GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
+        {
+            return params_.kv_cache && params_.kv_cache->isGraphCaptureReady()
+                       ? GraphLaunchPreparationPolicy::CaptureOnly
+                       : GraphLaunchPreparationPolicy::None;
+        }
+        /**
          * @brief Mark this append replay as consuming device-owned sequence state.
          *
          * KV append stages do not read absolute position IDs directly.  The
@@ -314,6 +336,18 @@ namespace llaminar2
         bool producesVDequant() const { return params_.V_dequant_out != nullptr; }
 
     private:
+        /**
+         * @brief Bind resident append-count pointers for one graph geometry.
+         *
+         * @param stream Exact stream associated with the binding lifecycle.
+         * @param runtime_seq_len Current physical sequence width, or zero to
+         *        retain the immutable stage geometry.
+         * @return true when all request rows accepted the binding.
+         */
+        bool bindCanonicalGraphAppendSources(
+            void *stream,
+            int runtime_seq_len);
+
         /**
          * @brief Validate and select grouped decode-equivalent publication.
          *

@@ -52,9 +52,11 @@ namespace llaminar2
         void setDecodeStepTokenBudget(int max_tokens) override;
         DecodeStepOutput decodeStepForBenchmark() override;
         DecodeBatchStepOutput decodeBatchStepForBenchmark(int request_batch) override;
-        bool maybeApplyDecodeBoundaryMaintenance() override;
+        bool maybeApplyDecodeBoundaryMaintenance(
+            uint64_t committed_tokens) override;
         void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
         bool waitForLastForwardCompletionForBenchmark() override;
+        InferenceReadiness inferenceReadiness() const override;
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;
         void setSuppressTimeline(bool suppress) override;

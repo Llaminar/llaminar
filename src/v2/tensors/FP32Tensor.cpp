@@ -81,6 +81,24 @@ namespace llaminar2
         // GPU allocation is handled by TensorBase::ensureOnDevice() when needed
     }
 
+    FP32Tensor::FP32Tensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<float> host_data,
+        DeviceId device)
+        : shape_(shape), device_(device), is_view_(false),
+          host_data_(std::move(host_data)), parent_data_ptr_(nullptr),
+          view_offset_(0), parent_(nullptr)
+    {
+        if (shape.empty())
+            throw std::invalid_argument("FP32Tensor: shape cannot be empty");
+
+        size_t expected_elements = 1u;
+        for (const size_t dimension : shape)
+            expected_elements *= dimension;
+        if (host_data_.size() != expected_elements)
+            throw std::invalid_argument("FP32Tensor: data size mismatch");
+    }
+
     FP32Tensor::FP32Tensor(const std::vector<size_t> &shape,
                            DeviceId device,
                            AlignedVector<float> *parent_data,

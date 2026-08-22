@@ -285,6 +285,7 @@ TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutes)
         {"LLAMINAR_ROCM_MOE_ROUTER_FP16", "1"},
         {"LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "1"},
         {"LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "1"},
+        {"LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN", "1"},
     });
 
     const auto &env_snapshot = debugEnv();
@@ -292,16 +293,40 @@ TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicRoutes)
 
     EXPECT_FALSE(env_snapshot.gemm.cuda_concurrent_prefill);
     EXPECT_FALSE(env_snapshot.gemm.cuda_concurrent_decode);
-    EXPECT_FALSE(env_snapshot.gemm.cuda_moe_router_q8);
-    EXPECT_FALSE(env_snapshot.gemm.cuda_moe_reuse_router_q8_hidden);
+    EXPECT_TRUE(env_snapshot.gemm.cuda_moe_router_q8);
+    EXPECT_TRUE(env_snapshot.gemm.cuda_moe_reuse_router_q8_hidden);
 
     EXPECT_FALSE(env_snapshot.rocm.concurrent_prefill);
     EXPECT_FALSE(env_snapshot.rocm.concurrent_decode);
     EXPECT_FALSE(env_snapshot.rocm.gdn_concurrent_decode);
-    EXPECT_FALSE(env_snapshot.rocm.moe_router_q8);
+    EXPECT_TRUE(env_snapshot.rocm.moe_router_q8);
     EXPECT_FALSE(env_snapshot.rocm.moe_router_fp16);
     EXPECT_FALSE(env_snapshot.rocm.moe_router_kpart_decode);
     EXPECT_FALSE(env_snapshot.rocm.moe_router_wave_topk);
+    EXPECT_TRUE(env_snapshot.rocm.moe_reuse_router_q8_hidden);
+}
+
+/**
+ * @brief Deterministic Q8 reuse remains explicitly configurable per backend.
+ *
+ * Q8 publication is now part of the deterministic optimized path, but a
+ * caller diagnosing that path can still select standalone quantization. The
+ * two controls must move together or reuse would advertise a missing producer.
+ */
+TEST(Test__DeterministicMode, DeterministicRouterQ8ReuseHonorsExplicitDisable)
+{
+    ScopedEnv env({
+        {"LLAMINAR_DETERMINISTIC", "1"},
+        {"LLAMINAR_CUDA_MOE_ROUTER_Q8", "0"},
+        {"LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN", "0"},
+        {"LLAMINAR_ROCM_MOE_ROUTER_Q8", "0"},
+        {"LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN", "0"},
+    });
+
+    EXPECT_FALSE(debugEnv().gemm.cuda_moe_router_q8);
+    EXPECT_FALSE(debugEnv().gemm.cuda_moe_reuse_router_q8_hidden);
+    EXPECT_FALSE(debugEnv().rocm.moe_router_q8);
+    EXPECT_FALSE(debugEnv().rocm.moe_reuse_router_q8_hidden);
 }
 
 
@@ -319,8 +344,8 @@ TEST(Test__DeterministicMode, ConcurrentRoutesReturnToDefaultsWhenDeterminismIsC
         });
         EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_prefill);
         EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_decode);
-        EXPECT_FALSE(debugEnv().gemm.cuda_moe_router_q8);
-        EXPECT_FALSE(debugEnv().gemm.cuda_moe_reuse_router_q8_hidden);
+        EXPECT_TRUE(debugEnv().gemm.cuda_moe_router_q8);
+        EXPECT_TRUE(debugEnv().gemm.cuda_moe_reuse_router_q8_hidden);
         EXPECT_FALSE(debugEnv().rocm.concurrent_prefill);
         EXPECT_FALSE(debugEnv().rocm.concurrent_decode);
         EXPECT_FALSE(debugEnv().rocm.gdn_concurrent_decode);

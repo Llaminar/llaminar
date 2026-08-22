@@ -428,6 +428,8 @@ namespace llaminar2
         std::atomic<std::uint64_t> bytes_received{0};
         std::atomic<std::uint64_t> pending_mpi_polls{0};
         std::atomic<std::uint64_t> pending_endpoint_polls{0};
+        std::atomic<std::uint64_t> active_mpi_requests{0};
+        std::atomic<std::uint64_t> maximum_concurrent_mpi_requests{0};
         std::atomic<std::uint64_t> operations_completed{0};
         std::atomic<std::uint64_t> operations_aborted{0};
         std::atomic<std::uint64_t> mpi_failures{0};
@@ -590,7 +592,8 @@ namespace llaminar2
             /** @brief Enforce explicit quiescence and lane release. */
             ~NetworkOperation() override
             {
-                if (request_ != MPI_REQUEST_NULL || !lane_released_)
+                if (request_ != MPI_REQUEST_NULL || request_counted_ ||
+                    !lane_released_)
                 {
                     LOG_ERROR(
                         "[MoEOverlayMPIRemoteProjectionTransport] Operation destroyed before MPI/lane quiescence"
@@ -765,6 +768,7 @@ namespace llaminar2
                         return failMPI("MPI_Test(cancel)", mpi_result, error);
                     if (!complete)
                         return MoEOverlayResidencyWaveProgress::Pending;
+                    recordCompletedMPIRequest();
                 }
 
                 bool endpoint_pending = false;
@@ -864,7 +868,7 @@ namespace llaminar2
                         mpi_result,
                         error);
                 }
-                request_started_at_ = std::chrono::steady_clock::now();
+                recordStartedMPIRequest();
                 return MoEOverlayResidencyWaveProgress::Pending;
             }
 
@@ -910,7 +914,7 @@ namespace llaminar2
                     request_ == MPI_REQUEST_NULL)
                     return failMPI("MPI_Isend(chunk header)", mpi_result, error);
                 state_ = State::SendingHeader;
-                request_started_at_ = std::chrono::steady_clock::now();
+                recordStartedMPIRequest();
                 return MoEOverlayResidencyWaveProgress::Pending;
             }
 
@@ -938,7 +942,7 @@ namespace llaminar2
                     request_ == MPI_REQUEST_NULL)
                     return failMPI("MPI_Isend(chunk payload)", mpi_result, error);
                 state_ = State::SendingPayload;
-                request_started_at_ = std::chrono::steady_clock::now();
+                recordStartedMPIRequest();
                 return MoEOverlayResidencyWaveProgress::Pending;
             }
 
@@ -1032,7 +1036,7 @@ namespace llaminar2
                     request_ == MPI_REQUEST_NULL)
                     return failMPI("MPI_Irecv(chunk header)", mpi_result, error);
                 state_ = State::ReceivingHeader;
-                request_started_at_ = std::chrono::steady_clock::now();
+                recordStartedMPIRequest();
                 return MoEOverlayResidencyWaveProgress::Pending;
             }
 
@@ -1073,7 +1077,7 @@ namespace llaminar2
                     request_ == MPI_REQUEST_NULL)
                     return failMPI("MPI_Irecv(chunk payload)", mpi_result, error);
                 state_ = State::ReceivingPayload;
-                request_started_at_ = std::chrono::steady_clock::now();
+                recordStartedMPIRequest();
                 return MoEOverlayResidencyWaveProgress::Pending;
             }
 
@@ -1325,9 +1329,52 @@ namespace llaminar2
                         std::max<std::int64_t>(1, elapsed)));
             }
 
-            /** @brief Accumulate request latency through the observing MPI_Test. */
+            /** @brief Publish one newly outstanding request and update peak overlap. */
+            void recordStartedMPIRequest() noexcept
+            {
+                if (request_ == MPI_REQUEST_NULL || request_counted_)
+                    std::terminate();
+                request_counted_ = true;
+                request_started_at_ = std::chrono::steady_clock::now();
+                const std::uint64_t active =
+                    impl_->stats->active_mpi_requests.fetch_add(
+                        1, std::memory_order_acq_rel) +
+                    1;
+                auto peak = impl_->stats->maximum_concurrent_mpi_requests.load(
+                    std::memory_order_relaxed);
+                bool raised_peak = false;
+                while (peak < active &&
+                       !impl_->stats->maximum_concurrent_mpi_requests
+                            .compare_exchange_weak(
+                                peak,
+                                active,
+                                std::memory_order_relaxed,
+                                std::memory_order_relaxed))
+                {
+                }
+                raised_peak = peak < active;
+                if (raised_peak)
+                {
+                    impl_->recordCounter(
+                        "remote_projection_concurrent_mpi_request_peak",
+                        static_cast<double>(active),
+                        {{"candidate_epoch",
+                          std::to_string(identity_.candidate_epoch)},
+                         {"layer", std::to_string(identity_.layer_idx)}});
+                }
+            }
+
+            /** @brief Retire one request and accumulate observed MPI latency. */
             void recordCompletedMPIRequest() noexcept
             {
+                if (!request_counted_)
+                    std::terminate();
+                request_counted_ = false;
+                if (impl_->stats->active_mpi_requests.fetch_sub(
+                        1, std::memory_order_acq_rel) == 0)
+                {
+                    std::terminate();
+                }
                 const auto elapsed =
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - request_started_at_)
@@ -1350,6 +1397,8 @@ namespace llaminar2
                 destination_;
             State state_ = State::Bound;
             MPI_Request request_ = MPI_REQUEST_NULL;
+            /** True exactly while the shared active-request gauge owns this request. */
+            bool request_counted_ = false;
             std::chrono::steady_clock::time_point request_started_at_{};
             /** Lane ownership begins here but no payload may have been released. */
             std::chrono::steady_clock::time_point lane_admitted_at_{};
@@ -1726,6 +1775,11 @@ namespace llaminar2
                 stats.pending_mpi_polls.load(std::memory_order_relaxed),
             .pending_endpoint_polls =
                 stats.pending_endpoint_polls.load(std::memory_order_relaxed),
+            .maximum_concurrent_mpi_requests =
+                stats.maximum_concurrent_mpi_requests.load(
+                    std::memory_order_relaxed),
+            .active_mpi_requests =
+                stats.active_mpi_requests.load(std::memory_order_relaxed),
             .operations_completed =
                 stats.operations_completed.load(std::memory_order_relaxed),
             .operations_aborted =

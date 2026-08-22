@@ -101,6 +101,71 @@ namespace llaminar2
     };
 
     /**
+     * @brief One contiguous decode interval aligned to the maintenance cadence.
+     *
+     * Latencies are partitioned after inference from samples the benchmark
+     * already owns, so this evidence adds no work to the production token loop.
+     * A window is a timing coordinate, not a claim that asynchronous movement
+     * completed exactly on its final token.
+     */
+    struct BenchmarkDecodeWindowResult
+    {
+        int start_token = 0; ///< Zero-based emitted-token offset.
+        int token_count = 0; ///< Samples in this interval.
+        double time_ms = 0.0; ///< Sum of emitted-token wall latencies.
+        double tokens_per_sec = 0.0; ///< Interval-local generation rate.
+    };
+
+    /**
+     * @brief One measured request in a repeated production benchmark.
+     *
+     * Aggregate throughput is useful for a stable headline number, but it
+     * erases the trajectory of an adaptive placement policy.  These records
+     * retain exact request timings together with completed ExpertOverlay
+     * movement evidence delimited by the request boundaries. The
+     * counters come from PerfStats and therefore never download a device owner
+     * map or synchronize an inference stream.
+     */
+    struct BenchmarkIterationResult
+    {
+        int iteration = 0; ///< One-based measured iteration ordinal.
+        int prefill_tokens = 0; ///< Real prompt tokens processed this request.
+        double prefill_time_ms = 0.0; ///< Wall time for production prefill.
+        double prefill_tokens_per_sec = 0.0; ///< Request-local prefill rate.
+        int decode_tokens = 0; ///< Tokens emitted by production decode.
+        double decode_time_ms = 0.0; ///< Wall time for production decode.
+        double decode_tokens_per_sec = 0.0; ///< Request-local decode rate.
+        int decode_after_prefill_tokens = 0; ///< Emitted tokens excluding the terminal-prefill sample.
+        /**
+         * Request-local generation rate after excluding the one output per
+         * logical request already paid for by prefill. This prevents a short
+         * decode from presenting terminal-prefill sampling as decode compute.
+         */
+        double decode_after_prefill_tokens_per_sec = 0.0;
+
+        /** Completed movement epoch immediately before this request's prefill. */
+        std::uint64_t moe_runtime_movement_epoch_start = 0;
+        /** Completed movement epoch observed after this request's decode. */
+        std::uint64_t moe_runtime_movement_epoch = 0;
+
+        /** Completed durable movement transactions during this request. */
+        std::uint64_t dynamic_movement_transactions = 0;
+        /** Completed device-authored movement commands during this request. */
+        std::uint64_t dynamic_movement_commands = 0;
+        /** Physically transferred durable expert bytes during this request. */
+        std::uint64_t dynamic_physical_bytes = 0;
+        /** Cross-priority moves toward a smaller integer priority. */
+        std::uint64_t dynamic_promotions = 0;
+        /** Cross-priority moves toward a larger integer priority. */
+        std::uint64_t dynamic_demotions = 0;
+        /** Equal-priority moves that rebalance participant skew. */
+        std::uint64_t dynamic_same_priority_moves = 0;
+
+        /** Decode trajectory partitioned by the configured maintenance window. */
+        std::vector<BenchmarkDecodeWindowResult> decode_windows;
+    };
+
+    /**
      * @brief Results from a benchmark run
      */
     struct BenchmarkResult
@@ -124,6 +189,14 @@ namespace llaminar2
         int decode_tokens = 0;              ///< Number of tokens generated
         double decode_time_ms = 0.0;        ///< Time for decode phase (ms)
         double decode_tokens_per_sec = 0.0; ///< Decode throughput (tok/s)
+        /** Tokens whose logits were produced after the prefill boundary. */
+        int decode_after_prefill_tokens = 0;
+        /**
+         * Throughput after removing the terminal-prefill output from each
+         * logical request. This is the steady decode comparison metric; the
+         * ordinary decode rate remains end-user emitted-token throughput.
+         */
+        double decode_after_prefill_tokens_per_sec = 0.0;
         std::vector<double> decode_token_latencies_ms; ///< Per emitted token latency samples (ms/token)
         double decode_latency_mean_ms = 0.0;            ///< Mean per-token decode latency
         double decode_latency_p50_ms = 0.0;             ///< p50 per-token decode latency
@@ -141,6 +214,9 @@ namespace llaminar2
 
         // Prefix-cache / MTP observability captured after the benchmark loop.
         PrefixRuntimeStateSnapshot prefix_state;
+
+        /** Ordered measured-request trajectory for adaptive-policy analysis. */
+        std::vector<BenchmarkIterationResult> iterations;
     };
 
     /**

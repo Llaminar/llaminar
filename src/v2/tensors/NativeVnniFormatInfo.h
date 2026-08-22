@@ -397,6 +397,111 @@ namespace llaminar2
     }
 
     /**
+     * @brief Capture-stable NativeVNNI formats reachable by one descriptor table.
+     *
+     * Immutable grouped tables contain only the execution codebooks present at
+     * graph setup. A runtime-placement table may later receive the canonical
+     * compact GPU representation or the migration-stable representation of the
+     * same source tensor. Both launch masks must therefore be certified before
+     * capture; discovering a new codebook after publication would otherwise
+     * leave a valid runtime descriptor with no owning grouped kernel.
+     */
+    struct NativeVnniExecutionFormatEnvelope
+    {
+        uint32_t execution_codebook_mask = 0u; ///< Physical decoders reachable at replay.
+        uint32_t policy_codebook_mask = 0u; ///< Source arithmetic policies retained at replay.
+
+        /** @return Whether at least one complete source contract was added. */
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return execution_codebook_mask != 0u &&
+                   policy_codebook_mask != 0u;
+        }
+    };
+
+    /** @return One mask bit for an ABI codebook, or zero outside the ABI. */
+    [[nodiscard]] inline constexpr uint32_t nativeVnniCodebookMaskBit(
+        uint8_t codebook_id) noexcept
+    {
+        return codebook_id < 32u
+                   ? (uint32_t{1} << codebook_id)
+                   : 0u;
+    }
+
+    /**
+     * @brief Add one prepared projection to its capture-time format envelope.
+     *
+     * @param envelope Destination union for a gate, up, or down table.
+     * @param execution_codebook Codebook used by the currently prepared bytes.
+     * @param source Exact GGUF provenance carried by the prepared engine.
+     * @param runtime_mutable Whether future placement publication may replace
+     *        the descriptor without recapturing the graph.
+     * @return True when the current representation and every reachable runtime
+     *         representation have a complete, supported identity.
+     *
+     * Runtime-mutability requires source provenance. The canonical compact GPU
+     * codebook and the CPU-round-trip migration codebook are both included even
+     * when the current bytes use only one of them. This makes promotion,
+     * demotion, and GPU-to-GPU movement format-total without widening immutable
+     * static tables or consulting mutable host state during inference.
+     */
+    [[nodiscard]] inline constexpr bool addNativeVnniExecutionFormat(
+        NativeVnniExecutionFormatEnvelope &envelope,
+        uint8_t execution_codebook,
+        NativeVnniSourceIdentity source,
+        bool runtime_mutable) noexcept
+    {
+        const uint32_t execution_bit =
+            nativeVnniCodebookMaskBit(execution_codebook);
+        if (execution_bit == 0u)
+            return false;
+
+        if (!source.present)
+        {
+            if (runtime_mutable)
+                return false;
+            envelope.execution_codebook_mask |= execution_bit;
+            envelope.policy_codebook_mask |= execution_bit;
+            return true;
+        }
+
+        const NativeVnniFormatInfo *const source_format =
+            native_vnni_formats::forSourceIdentity(
+                source.codebook_id,
+                source.is_superblock);
+        if (!source_format ||
+            !deviceVnniExecutionCompatibleWithSource(
+                *source_format,
+                execution_codebook))
+        {
+            return false;
+        }
+
+        const uint8_t canonical_codebook =
+            canonicalDeviceVnniCodebookId(source.codebook_id);
+        const uint32_t canonical_bit =
+            nativeVnniCodebookMaskBit(canonical_codebook);
+        if (canonical_bit == 0u)
+            return false;
+
+        uint32_t reachable_execution = execution_bit;
+        if (runtime_mutable)
+        {
+            const auto migration =
+                migrationStableDeviceVnniFormat(*source_format);
+            const uint32_t migration_bit =
+                nativeVnniCodebookMaskBit(migration.codebook_id);
+            if (migration_bit == 0u)
+                return false;
+            reachable_execution |= canonical_bit | migration_bit;
+        }
+
+        envelope.execution_codebook_mask |= reachable_execution;
+        envelope.policy_codebook_mask |= canonical_bit;
+        return true;
+    }
+
+    /**
      * @brief Compute the exact logical pool regions for one packed matrix.
      *
      * Native-VNNI kernels require K to consist of complete 32-value execution

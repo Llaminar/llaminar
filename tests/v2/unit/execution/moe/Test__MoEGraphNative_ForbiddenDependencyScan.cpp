@@ -1984,7 +1984,8 @@ namespace llaminar2::test
             << "CUDA shared verifier grouping must publish the same identity map ROCm uses";
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, LocalExpertCompactRoutingUsesInvalidPadding)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
+         LocalExpertCompactRoutingBucketsRouteWidthAndUsesInvalidPadding)
     {
         const fs::path root = findRepoRoot();
         const fs::path local_path = root / "src/v2/execution/compute_stages/stages/MoELocalExpertStage.cpp";
@@ -1996,11 +1997,17 @@ namespace llaminar2::test
         ASSERT_FALSE(local_contents.empty()) << local_path;
         ASSERT_FALSE(compute_contents.empty()) << compute_path;
 
-        EXPECT_NE(local_contents.find("constexpr int kCompactTopK = 1;"),
+        EXPECT_EQ(local_contents.find("constexpr int kCompactTopK = 1;"),
+                  std::string::npos)
+            << "A participant may own several selected experts for one row; compact execution cannot assume width one";
+        EXPECT_NE(local_contents.find("maximum_local_routes_per_row"),
                   std::string::npos);
+        EXPECT_NE(local_contents.find("MoELocalExpertSerialBufferArena::routeWidthBucketFor("),
+                  std::string::npos)
+            << "Production sparse packets must select a retained route-width family from their actual local fan-out";
         EXPECT_NE(local_contents.find("std::fill_n(routing_indices, compact_routing_elements, -1.0f)"),
                   std::string::npos);
-        EXPECT_NE(local_contents.find("compute_params.top_k = 1;"),
+        EXPECT_NE(local_contents.find("compute_params.top_k = compact_top_k;"),
                   std::string::npos);
         EXPECT_NE(local_contents.find(".live_rows = static_cast<int>(compact_capacity_)"),
                   std::string::npos)
@@ -2159,7 +2166,7 @@ namespace llaminar2::test
         const size_t service_start =
             execute_body.find("const auto service_start =");
         const size_t compact_capacity = execute_body.find(
-            "ensureCompactCapacity(active_routes_.size(), kCompactTopK)",
+            "ensureCompactCapacity(compact_live_rows, params_.top_k)",
             service_start);
         const size_t pinned_input = execute_body.find(
             "compact_family->pinned_transfer->mutableData(", service_start);
@@ -2374,7 +2381,9 @@ namespace llaminar2::test
                   std::string::npos);
         EXPECT_NE(ffn_body.find(".mtp_depth = use_mtp_runtime_table ? mtp_depth_idx : -1"),
                   std::string::npos);
-        EXPECT_NE(ffn_body.find("register_runtime_histogram = !use_mtp_runtime_table"),
+        EXPECT_NE(ffn_body.find("collect_runtime_histogram =\n            !use_mtp_runtime_table"),
+                  std::string::npos);
+        EXPECT_NE(ffn_body.find("register_runtime_histogram = collect_runtime_histogram"),
                   std::string::npos);
         const size_t histogram_binding =
             ffn_body.find("route_params.decode_histogram =");
@@ -2484,11 +2493,11 @@ namespace llaminar2::test
                   std::string::npos)
             << "the topology-selected homogeneous device authority must not be forced off";
         EXPECT_NE(
-            ffn_body.find("homogeneous_device_resident_authority"),
+            ffn_body.find("device_resident_authority"),
             std::string::npos);
         EXPECT_NE(
             ffn_body.find(
-                "MoEOverlayAuthorityExecutionKind::\n                    HomogeneousDeviceResident"),
+                "MoEOverlayAuthorityExecutionKind::\n                    DeviceResident"),
             std::string::npos)
             << "graph lowering must consume the frozen typed authority backend";
         EXPECT_EQ(ffn_body.find("device_rebalance_graph_controller"),
@@ -2551,9 +2560,14 @@ namespace llaminar2::test
         ASSERT_NE(mutable_policy_end, std::string::npos);
         const std::string mutable_policy_body =
             ffn_body.substr(mutable_policy_start, mutable_policy_end - mutable_policy_start);
-        EXPECT_NE(ffn_body.find("expert_params.runtime_decode_uses_mutable_descriptors =\n                    graphRebalanceDecodeUsesMutableDescriptors()"),
-                  std::string::npos)
-            << "ResidentOnly graph rebalance should keep using immutable grouped descriptor tables.";
+        EXPECT_NE(
+            ffn_body.find("expert_params.weight_descriptor_source ="),
+            std::string::npos)
+            << "Distributed Dynamic movement must use the request-pinned runtime bank, while ResidentOnly homogeneous graph rebalance may retain immutable grouped descriptor tables.";
+        EXPECT_NE(
+            ffn_body.find("MoEDecodeDescriptorSource::RuntimePlacementTable"),
+            std::string::npos)
+            << "Mutable placement must be represented as a typed descriptor authority.";
         EXPECT_NE(ffn_body.find("ResidentOnly changes runtime top-k/local-compute masks"),
                   std::string::npos)
             << "The graph must document why ResidentOnly rebalance can use static descriptor tables.";
@@ -2575,7 +2589,7 @@ namespace llaminar2::test
             ffn_body.find("const bool masked_local_tp_apportioned_decode_runtime_table");
         ASSERT_NE(apportioned_table_start, std::string::npos);
         const size_t apportioned_table_end =
-            ffn_body.find("const bool decode_runtime_table_eligible", apportioned_table_start);
+            ffn_body.find("const bool runtime_table_eligible", apportioned_table_start);
         ASSERT_NE(apportioned_table_end, std::string::npos);
         const std::string apportioned_table_policy =
             ffn_body.substr(
@@ -3758,6 +3772,7 @@ namespace llaminar2::test
         const fs::path iface_path = root / "src/v2/execution/local_execution/orchestrators/IInferenceRunner.h";
         const fs::path chat_path = root / "src/v2/app/modes/ChatCompletionHandler.cpp";
         const fs::path benchmark_path = root / "src/v2/app/modes/BenchmarkMode.cpp";
+        const fs::path server_mode_path = root / "src/v2/app/modes/ServerMode.cpp";
         const fs::path benchmark_runner_path = root / "src/v2/utils/BenchmarkRunner.cpp";
         const fs::path adapter_path = root / "src/v2/app/InferenceRunnerAdapter.cpp";
         const fs::path adapter_header_path = root / "src/v2/app/InferenceRunnerAdapter.h";
@@ -3785,6 +3800,7 @@ namespace llaminar2::test
         ASSERT_TRUE(fs::exists(iface_path)) << iface_path;
         ASSERT_TRUE(fs::exists(chat_path)) << chat_path;
         ASSERT_TRUE(fs::exists(benchmark_path)) << benchmark_path;
+        ASSERT_TRUE(fs::exists(server_mode_path)) << server_mode_path;
         ASSERT_TRUE(fs::exists(benchmark_runner_path)) << benchmark_runner_path;
         ASSERT_TRUE(fs::exists(adapter_path)) << adapter_path;
         ASSERT_TRUE(fs::exists(adapter_header_path)) << adapter_header_path;
@@ -3808,6 +3824,7 @@ namespace llaminar2::test
         const std::string iface = readFile(iface_path);
         const std::string chat = readFile(chat_path);
         const std::string benchmark = readFile(benchmark_path);
+        const std::string server_mode = readFile(server_mode_path);
         const std::string benchmark_runner = readFile(benchmark_runner_path);
         const std::string adapter = readFile(adapter_path);
         const std::string adapter_header = readFile(adapter_header_path);
@@ -3830,7 +3847,24 @@ namespace llaminar2::test
         ASSERT_FALSE(iface.empty()) << iface_path;
         ASSERT_FALSE(chat.empty()) << chat_path;
         ASSERT_FALSE(benchmark.empty()) << benchmark_path;
+        ASSERT_FALSE(server_mode.empty()) << server_mode_path;
         ASSERT_FALSE(benchmark_runner.empty()) << benchmark_runner_path;
+        EXPECT_EQ(
+            benchmark_runner.find("InferenceMeasurement"),
+            std::string::npos)
+            << "BenchmarkRunner must not understand a subsystem calibration protocol";
+        EXPECT_EQ(
+            benchmark_runner.find("measurementReadiness"),
+            std::string::npos)
+            << "BenchmarkRunner may observe only the generic inference-readiness boundary";
+        EXPECT_NE(
+            benchmark.find("prepareForInference()"),
+            std::string::npos)
+            << "Benchmark startup must use the shared production-readiness lifecycle";
+        EXPECT_NE(
+            server_mode.find("prepareForInference()"),
+            std::string::npos)
+            << "HTTP startup must use the same production-readiness lifecycle as benchmark";
         ASSERT_FALSE(adapter.empty()) << adapter_path;
         ASSERT_FALSE(adapter_header.empty()) << adapter_header_path;
         ASSERT_FALSE(qwen36_parity.empty()) << qwen36_parity_path;
@@ -3844,7 +3878,8 @@ namespace llaminar2::test
                   std::string::npos)
             << "IInferenceRunner should expose a non-reset epilogue hook for completed async maintenance diagnostics.";
 
-        const size_t maybe_start = runner.find("bool OrchestrationRunner::maybeApplyMoERebalance()");
+        const size_t maybe_start = runner.find(
+            "bool OrchestrationRunner::maybeApplyMoERebalance(");
         ASSERT_NE(maybe_start, std::string::npos);
         const size_t maybe_end = runner.find("// =========================================================================", maybe_start);
         ASSERT_NE(maybe_end, std::string::npos);
@@ -3857,15 +3892,15 @@ namespace llaminar2::test
         EXPECT_NE(
             maybe_body.find("notifyMaintenanceProgress()"),
             std::string::npos)
-            << "Host-coordinated inference may only wake its non-blocking background worker.";
+            << "Host-resident inference may only wake its non-blocking background worker.";
         EXPECT_NE(
             maybe_body.find(
-                "runner_->maybeApplyDecodeBoundaryMaintenance()"),
+                "runner_->maybeApplyDecodeBoundaryMaintenance("),
             std::string::npos)
             << "The homogeneous device executor must enqueue its captured transaction at the same committed boundary.";
         EXPECT_NE(
             maybe_body.find(
-                "MoEOverlayAuthorityExecutionKind::\n                        HomogeneousDeviceResident"),
+                "MoEOverlayAuthorityExecutionKind::\n                        DeviceResident"),
             std::string::npos);
         EXPECT_NE(maybe_body.find("{\"blocking\", \"false\"}"),
                   std::string::npos)
@@ -4354,12 +4389,12 @@ namespace llaminar2::test
                 generic_assert_helper - generic_drive_helper);
         EXPECT_EQ(
             generic_drive_body.find(
-                "runner->maybeApplyDecodeBoundaryMaintenance()"),
+                "runner->maybeApplyDecodeBoundaryMaintenance("),
             std::string::npos)
             << "Direct test runners must not revive the retired per-device writer.";
         EXPECT_NE(
             generic_drive_body.find(
-                "orch_runner_->maybeApplyMoERebalance()"),
+                "orch_runner_->maybeApplyMoERebalance("),
             std::string::npos)
             << "Orchestration parity runners must enter the shared committed-boundary hook.";
         const auto expect_final_movement_publication =
@@ -4395,14 +4430,14 @@ namespace llaminar2::test
         expect_final_movement_publication(
             "DecodeParitySummary runDecodeParity()",
             "void renderDecodeParityTable(");
-        EXPECT_NE(dgo.find("DeviceGraphOrchestrator::maybeApplyDecodeBoundaryMaintenance()"),
+        EXPECT_NE(dgo.find("DeviceGraphOrchestrator::maybeApplyDecodeBoundaryMaintenance("),
                   std::string::npos)
             << "Device-owned rolling maintenance must remain explicit at the committed decode boundary.";
         EXPECT_EQ(dgo.find("maybeRunDeviceMoERebalanceMaintenanceGraph(effective_input)"),
                   std::string::npos)
             << "Raw grouped forward must not publish maintenance before verifier commit or rollback completes.";
         const size_t committed_maintenance_start =
-            dgo.find("bool DeviceGraphOrchestrator::maybeApplyDecodeBoundaryMaintenance()");
+            dgo.find("bool DeviceGraphOrchestrator::maybeApplyDecodeBoundaryMaintenance(");
         ASSERT_NE(committed_maintenance_start, std::string::npos);
         const size_t committed_maintenance_end =
             dgo.find("bool DeviceGraphOrchestrator::exportCompletedDeviceMoERebalanceMaintenanceStats",
@@ -4438,7 +4473,7 @@ namespace llaminar2::test
             "DeviceGraphOrchestrator::moeOverlayAuthorityExecution() const");
         ASSERT_NE(device_controller_start, std::string::npos);
         const size_t device_controller_end = dgo.find(
-            "DeviceGraphOrchestrator::\n        usesHomogeneousDeviceResidentMoEOverlayAuthority() const",
+            "DeviceGraphOrchestrator::\n        usesDeviceResidentMoEOverlayAuthority() const",
             device_controller_start);
         ASSERT_NE(device_controller_end, std::string::npos);
         const std::string device_controller_predicate = dgo.substr(
@@ -4483,7 +4518,8 @@ namespace llaminar2::test
         const size_t maintenance_device_gate =
             maintenance_body.find("!state_.device_id.is_gpu()");
         const size_t maintenance_controller_gate =
-            maintenance_body.find("usesHomogeneousDeviceResidentMoEOverlayAuthority()");
+            maintenance_body.find(
+                "usesParticipantLocalDeviceMoERebalanceController()");
         const size_t maintenance_boundary_timer =
             maintenance_body.find("\"device_maintenance_graph_boundary_enqueue\"");
         ASSERT_NE(maintenance_env_gate, std::string::npos);
@@ -4696,7 +4732,21 @@ namespace llaminar2::test
         EXPECT_NE(
             dgo.find("\"hosted_device_moe_rebalance_due_ticket\""),
             std::string::npos)
-            << "Only an authenticated due ticket may publish the overlay release edge";
+            << "Only an authenticated due ticket may claim the overlay writer boundary";
+        EXPECT_NE(
+            dgo.find("claimMoEOverlayEpochForPlacementMaintenance("),
+            std::string::npos)
+            << "A due ticket must distinguish closing an ambient reader from joining an already-published release";
+        EXPECT_NE(
+            dgo.find(
+                "MoEOverlayEpochMaintenanceBoundarySource::\n"
+                "                    AuthenticatedDispatchTicket"),
+            std::string::npos)
+            << "The retained maintenance graph must receive typed ownership of the preclaimed boundary";
+        EXPECT_EQ(
+            maintenance_scheduler.find("boundary_already_published"),
+            std::string::npos)
+            << "Maintenance boundary ownership must not regress to an ambiguous boolean";
         EXPECT_NE(dgo.find("ticket.dispatchAction()"), std::string::npos)
             << "HIP cadence bytes must decode through the shared typed ABI truth table";
         EXPECT_NE(
@@ -5007,13 +5057,13 @@ namespace llaminar2::test
         const size_t generate_start = runner.find("GenerationResult OrchestrationRunner::generate(");
         ASSERT_NE(generate_start, std::string::npos);
         const size_t generate_end = runner.find(
-            "bool OrchestrationRunner::maybeApplyMoERebalance()",
+            "bool OrchestrationRunner::maybeApplyMoERebalance(",
             generate_start);
         ASSERT_NE(generate_end, std::string::npos);
         const std::string generate_body = runner.substr(generate_start, generate_end - generate_start);
 
         const size_t maintenance_call =
-            generate_body.find("if (!maybeApplyMoERebalance())");
+            generate_body.find("if (!maybeApplyMoERebalance(step.tokens.size()))");
         ASSERT_NE(maintenance_call, std::string::npos)
             << "Every completed serial or MTP transaction must enter the shared decode-boundary maintenance hook.";
         EXPECT_EQ(generate_body.find("usesDeviceSideMoERebalanceController"),
@@ -5033,18 +5083,19 @@ namespace llaminar2::test
             chat.substr(chat_rebalance_helper,
                         chat_rebalance_helper_end - chat_rebalance_helper);
         const size_t chat_helper_host_maintenance =
-            chat_rebalance_helper_body.find("runner.maybeApplyMoERebalance()");
+            chat_rebalance_helper_body.find(
+                "runner.maybeApplyMoERebalance(committed_tokens)");
         ASSERT_NE(chat_helper_host_maintenance, std::string::npos);
         EXPECT_EQ(chat_rebalance_helper_body.find("device_side_moe_rebalance"),
                   std::string::npos)
             << "The shared boundary hook chooses captured-device versus host-prepared maintenance internally.";
-        EXPECT_NE(chat.find("last_decode_window_had_moe_maintenance"), std::string::npos)
-            << "Chat serving must not skip the final decode window's MoE maintenance.";
-        EXPECT_NE(chat.find("runChatMoERebalanceMaintenance(runner_)"),
+        EXPECT_EQ(chat.find("last_decode_window_had_moe_maintenance"), std::string::npos)
+            << "Chat serving should retire each complete transaction exactly once instead of repairing a tail flag.";
+        EXPECT_NE(chat.find("runChatMoERebalanceMaintenance("),
                   std::string::npos)
             << "Chat decode loops and epilogues must use the shared committed-boundary hook.";
         const size_t maintenance_boundary_start = runner.find(
-            "bool OrchestrationRunner::maybeApplyMoERebalance()",
+            "bool OrchestrationRunner::maybeApplyMoERebalance(",
             generate_end);
         ASSERT_NE(maintenance_boundary_start, std::string::npos);
         const size_t maintenance_boundary_end = runner.find(
@@ -5056,10 +5107,10 @@ namespace llaminar2::test
             maintenance_boundary_end - maintenance_boundary_start);
         const size_t device_authority_selection =
             maintenance_boundary_body.find(
-                "usesHomogeneousGpuDeviceResidentMoEOverlayAuthority()");
+                "usesSingleDomainNativeGpuDeviceResidentMoEOverlayAuthority()");
         const size_t device_maintenance_launch =
             maintenance_boundary_body.find(
-                "runner_->maybeApplyDecodeBoundaryMaintenance()");
+                "runner_->maybeApplyDecodeBoundaryMaintenance(");
         ASSERT_NE(device_authority_selection, std::string::npos);
         ASSERT_NE(device_maintenance_launch, std::string::npos)
             << "The topology-selected captured authority must own the ordinary "
@@ -5071,10 +5122,10 @@ namespace llaminar2::test
             std::string::npos)
             << "A resident MTP parent must acknowledge its embedded maintenance "
                "without replaying an outer graph.";
-        EXPECT_NE(dgo.find("DeviceGraphOrchestrator::maybeApplyDecodeBoundaryMaintenance()"),
+        EXPECT_NE(dgo.find("DeviceGraphOrchestrator::maybeApplyDecodeBoundaryMaintenance("),
                   std::string::npos)
             << "A device runner must launch maintenance only after the verifier transaction closes.";
-        EXPECT_NE(rank.find("RankOrchestrator::maybeApplyDecodeBoundaryMaintenance()"),
+        EXPECT_NE(rank.find("RankOrchestrator::maybeApplyDecodeBoundaryMaintenance("),
                   std::string::npos)
             << "LocalTP needs a rank-level maintenance fanout.";
         EXPECT_NE(rank.find("tp_worker_pool_->dispatch("), std::string::npos)
@@ -5084,7 +5135,7 @@ namespace llaminar2::test
             << "Benchmarks must exercise the same live background authority as serving.";
         EXPECT_EQ(benchmark.find("applyMoERebalanceWithReplicas"),
                   std::string::npos);
-        EXPECT_NE(benchmark.find("persistent ticketed"), std::string::npos)
+        EXPECT_NE(benchmark_runner.find("persistent ticketed"), std::string::npos)
             << "Bucket policy must document why dynamic placement no longer invalidates capture.";
         EXPECT_EQ(runner.find("drainPendingMoERebalanceBeforeCacheClear"), std::string::npos)
             << "Request reset cannot own a second durable placement publisher.";
@@ -5295,16 +5346,20 @@ namespace llaminar2::test
                       "waitForPendingDeviceMoERebalanceMaintenance(\n"
                       "                sidecar_dynamic_stream,\n"
                       "                DeviceTimelineRole::MTPSidecarGraph,\n"
-                      "                \"mtp_sidecar_graph\")"),
+                      "                \"mtp_sidecar_graph\",\n"
+                      "                /*acquire_overlay_epoch=*/"),
                   std::string::npos)
             << "The MTP sidecar bypasses ForwardExecutionEngine and must queue the same event handoff explicitly.";
         EXPECT_NE(live_prepare.find(
                       "waitForPendingDeviceMoERebalanceMaintenance(\n"
                       "                execution_stream,\n"
                       "                DeviceTimelineRole::MainForwardGraph,\n"
-                      "                \"forward_graph\")"),
+                      "                \"forward_graph\",\n"),
                   std::string::npos)
             << "The main graph must identify itself as an independent typed consumer.";
+        EXPECT_NE(live_prepare.find("/*acquire_overlay_epoch=*/"),
+                  std::string::npos)
+            << "The main graph must make topology-wide epoch acquisition an explicit typed policy.";
 
         EXPECT_EQ(dgo.find("synchronizeGraphStableMoERuntimeBeforeDecodeCapture"),
                   std::string::npos)
@@ -5571,7 +5626,7 @@ namespace llaminar2::test
             << "Portable prefix-restored dynamic banks may omit owner metadata for non-local entries.";
     }
 
-    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, Qwen35MoEDecodeUsesRuntimeDescriptorsForTransferSlots)
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, Qwen35MoESelectsTypedRuntimeDescriptorAuthorityForTransferSlots)
     {
         const fs::path root = findRepoRoot();
         const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
@@ -5581,7 +5636,7 @@ namespace llaminar2::test
         ASSERT_FALSE(contents.empty()) << graph_path;
 
         const size_t assignment =
-            contents.find("expert_params.runtime_decode_uses_mutable_descriptors =");
+            contents.find("expert_params.weight_descriptor_source =");
         ASSERT_NE(assignment, std::string::npos);
         const size_t assignment_end =
             contents.find("expert_params.runtime_decode_has_explicit_owner_metadata", assignment);
@@ -5591,6 +5646,13 @@ namespace llaminar2::test
 
         EXPECT_NE(assignment_body.find("graphRebalanceDecodeUsesMutableDescriptors()"),
                   std::string::npos);
+        EXPECT_NE(
+            assignment_body.find(
+                "dynamic_distributed_overlay_uses_mutable_descriptors"),
+            std::string::npos)
+            << "A heterogeneous Dynamic controller can install a newly moved "
+               "expert without using graph-local transfer slots; retained "
+               "decode must still consume its request-pinned runtime bank.";
         EXPECT_NE(assignment_body.find("activeRuntimeBankUsesTransientLocalPayload(layer_idx)"),
                   std::string::npos)
             << "Decode after LLEP prefill may use transfer-slot descriptors that are only present "

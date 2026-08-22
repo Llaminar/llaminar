@@ -1,10 +1,22 @@
+/**
+ * @file DeviceGraphCaptureController.h
+ * @brief Typed planning and execution of native GPU graph lifecycles.
+ *
+ * The controller turns one declarative compute graph into either one native
+ * executable, a retained composed parent, or an explicitly ticket-segmented
+ * heterogeneous transaction. It owns validation of every transition so a
+ * caller cannot silently weaken a production graph into eager execution.
+ */
+
 #pragma once
 
 #include "DeviceGraphExecutor.h"
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 
 namespace llaminar2
@@ -140,6 +152,12 @@ namespace llaminar2
             DeviceGraphExecutor::RetainedParentCompositionHook
                 retained_parent_composer;
             /**
+             * Optional cache-owned branch recorded in parallel with one full
+             * native graph. The pointer remains valid for the complete cache
+             * lifetime and is never used for segmented or retained-parent plans.
+             */
+            IGraphCaptureAuxiliaryBranch *auxiliary_branch = nullptr;
+            /**
              * @brief Build the immutable internal-edge ledger for one capture unit.
              *
              * Production executors resolve arena BufferIds to canonical tensor
@@ -207,6 +225,32 @@ namespace llaminar2
         static const char *phaseName(Phase phase);
 
         /**
+         * @brief Publish an opt-in inventory of one retained native graph.
+         *
+         * The inventory is collected only when
+         * `LLAMINAR_GPU_GRAPH_KERNEL_INVENTORY` is enabled. It inspects native
+         * graph metadata without launching, synchronizing, or transferring
+         * model state, and is shared by ordinary segmented capture and MTP
+         * parent composition so diagnostics cannot disagree about what a
+         * retained executable contains.
+         *
+         * @param capture Captured native graph to inspect.
+         * @param fragment Stable semantic identity of the retained unit.
+         * @param transaction_depth MTP transaction depth, or no value for an
+         *        ordinary prefill/decode executable.
+         * @param device Participant that owns the graph.
+         * @param error Receives a fatal inspection diagnostic.
+         * @return true when instrumentation is disabled or the complete
+         *         inventory was validated and published.
+         */
+        static bool publishKernelInventory(
+            const IGPUGraphCapture &capture,
+            std::string_view fragment,
+            std::optional<int> transaction_depth,
+            DeviceId device,
+            std::string &error);
+
+        /**
          * @brief Advance decode replay step and select capture or replay.
          * @param initialized Whether a complete executable has been launched.
          * @param needs_capture Legacy partial-state sentinel; true is fatal.
@@ -240,6 +284,26 @@ namespace llaminar2
          * captured units are segmented replay plans.
          */
         static const char *replayModeName(const DeviceGraphExecutor::GraphSegmentCache &segment_cache);
+
+        /**
+         * @brief Constrain a runtime replay policy to the graph-owned envelope.
+         *
+         * Ordinary graphs retain the topology-derived policy supplied by the
+         * caller. Device-owned timelines require one full native executable.
+         * Heterogeneous ticket transactions require the topology to have
+         * explicitly admitted segmented replay. Both non-ordinary envelopes
+         * disable retained-parent composition because their lifecycle is
+         * already fully declared by the graph.
+         *
+         * @param envelope Exact declarative capture lifecycle.
+         * @param policy In/out topology-derived replay policy.
+         * @param error Optional diagnostic populated on rejection.
+         * @return True when the policy represents @p envelope exactly.
+         */
+        static bool constrainReplayPolicyToNativeEnvelope(
+            GraphNativeCaptureEnvelope envelope,
+            DeviceGraphExecutor::DecodeCapturePolicy &policy,
+            std::string *error = nullptr);
 
         /**
          * @brief Allocate the bounded replay-timing event ring before graph capture.
@@ -347,6 +411,7 @@ namespace llaminar2
                 const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
             const std::function<bool(ComputeNode &)> &execute_node_cb,
             const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
+            IGraphCaptureAuxiliaryBranch *auxiliary_branch,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
@@ -473,6 +538,7 @@ namespace llaminar2
             const std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
                 const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
             const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
+            IGraphCaptureAuxiliaryBranch *auxiliary_branch,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
@@ -500,6 +566,7 @@ namespace llaminar2
             const std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
                 const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
             const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
+            IGraphCaptureAuxiliaryBranch *auxiliary_branch,
             const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);

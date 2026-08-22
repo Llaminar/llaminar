@@ -145,6 +145,11 @@ namespace llaminar2
         DeviceMoECurrentBatchLLEPEvidenceSource
         deviceMoECurrentBatchLLEPEvidenceSource(DeviceId device) const override;
 
+        /** @copydoc IGraphBuilder::deviceMoEOverlayControllerRuntimeBinding */
+        MoEOverlayDeviceControllerRuntimeBinding
+        deviceMoEOverlayControllerRuntimeBinding(
+            DeviceId device) const override;
+
         /**
          * @brief Describe device-retained main-graph layer checkpoints.
          *

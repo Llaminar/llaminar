@@ -232,7 +232,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
         )[1].split("refresh_cpu_decode() {", 1)[0]
 
         self.assertIn(
-            "for ((candidate_iteration = 0; ; ++candidate_iteration))",
+            "for ((iteration = first_iteration;",
             cpu_refinement,
         )
         self.assertIn(
@@ -244,6 +244,7 @@ class NativeVNNIDispatchRefreshTest(unittest.TestCase):
             "candidate_iteration < paired_max_iterations",
             cpu_refinement,
         )
+        self.assertNotIn("candidate_iteration", cpu_refinement)
 
     def test_cpu_shape_planning_resolves_dimensions_without_subprocesses(
         self,

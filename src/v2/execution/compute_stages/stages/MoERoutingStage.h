@@ -93,6 +93,17 @@ namespace llaminar2
              */
             int host_logical_row_count = 0;
             IMoERuntimeTable *moe_runtime_table = nullptr;
+            /**
+             * @brief Collect selected/local expert counts in the device runtime table.
+             *
+             * Observe and Dynamic execution consume these counters when they
+             * evaluate placement economy. Static execution has no such
+             * consumer, so enabling collection there would add two global
+             * atomics per selected route to every captured decode layer for no
+             * semantic benefit. Graph lowering owns this decision; callers
+             * must not infer it from whether a runtime table happens to exist.
+             */
+            bool collect_device_runtime_histogram = true;
             /** @brief Typed owner of single-row GPU decode route metadata. */
             MoEDecodeRoutePublicationPolicy decode_route_publication =
                 MoEDecodeRoutePublicationPolicy::DeviceRuntimeTable;
@@ -399,6 +410,12 @@ namespace llaminar2
         decodeRoutePublicationPolicyForTesting() const noexcept
         {
             return params_.decode_route_publication;
+        }
+
+        /** @brief Expose graph-lowered device evidence collection to tests. */
+        bool collectsDeviceRuntimeHistogramForTesting() const noexcept
+        {
+            return params_.collect_device_runtime_histogram;
         }
 
     private:

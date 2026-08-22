@@ -428,6 +428,53 @@ TEST(Test__ExpertGemmRegistry, SubsetCompletenessAndCountsAreDeviceScoped)
     EXPECT_EQ(reg.countEnginesForDevice(DeviceId::rocm(0)), 3u);
 }
 
+TEST(Test__ExpertGemmRegistry, ModelLifetimeAccountingIncludesOverlayScopes)
+{
+    ExpertGemmRegistry reg;
+    auto domain = std::make_shared<MockGemm>(10);
+    auto participant = std::make_shared<MockGemm>(20);
+    auto sibling = std::make_shared<MockGemm>(30);
+
+    reg.registerEngineForDomain(
+        "secondary",
+        DeviceId::rocm(0),
+        2,
+        7,
+        Role::GATE,
+        domain.get(),
+        domain);
+    reg.registerEngineForParticipant(
+        "secondary",
+        DeviceId::rocm(0),
+        1,
+        3,
+        2,
+        7,
+        Role::UP,
+        participant.get(),
+        participant);
+    reg.registerEngineForDomain(
+        "secondary",
+        DeviceId::rocm(1),
+        2,
+        7,
+        Role::DOWN,
+        sibling.get(),
+        sibling);
+
+    EXPECT_EQ(reg.countEnginesForDevice(DeviceId::rocm(0)), 0u)
+        << "Legacy unscoped lookup must remain scope-specific";
+    EXPECT_EQ(
+        reg.countOwnedEnginesForDeviceAcrossScopes(DeviceId::rocm(0)),
+        2u);
+    EXPECT_EQ(
+        reg.countOwnedEnginesForDeviceAcrossScopes(DeviceId::rocm(1)),
+        1u);
+    EXPECT_EQ(
+        reg.countOwnedEnginesForDeviceAcrossScopes(DeviceId::cuda(0)),
+        0u);
+}
+
 TEST(Test__ExpertGemmRegistry, RemovalAndReplacementUpdateCompleteness)
 {
     ExpertGemmRegistry reg;

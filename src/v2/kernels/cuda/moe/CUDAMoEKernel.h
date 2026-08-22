@@ -126,12 +126,66 @@ namespace llaminar2
             const MoEKernelLaunchContext &launch,
             const MoENodeLocalRouteConsumeLaunch &consumption) override;
 
+        /** @copydoc IMoEKernel::beginNodeLocalDensePublication */
+        bool beginNodeLocalDensePublication(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalDensePublicationLaunch &publication) override;
+
+        /** @copydoc IMoEKernel::finishNodeLocalDensePublication */
+        bool finishNodeLocalDensePublication(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalDensePublicationLaunch &publication) override;
+
+        /** @copydoc IMoEKernel::beginNodeLocalDensePublicationConsume */
+        bool beginNodeLocalDensePublicationConsume(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalDensePublicationLaunch &publication) override;
+
+        /** @copydoc IMoEKernel::finishNodeLocalDensePublicationConsume */
+        bool finishNodeLocalDensePublicationConsume(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalDensePublicationLaunch &publication) override;
+
+        /** @copydoc IMoEKernel::runMoEOverlayDeviceControllerAction */
+        bool runMoEOverlayDeviceControllerAction(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayDeviceControllerActionLaunch &action) override;
+
+        /** @copydoc IMoEKernel::beginMoEOverlayServiceTelemetry */
+        bool beginMoEOverlayServiceTelemetry(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayServiceTelemetrySample *sample) override;
+
+        /** @copydoc IMoEKernel::finishMoEOverlayServiceTelemetry */
+        bool finishMoEOverlayServiceTelemetry(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoELayerRuntime *runtime_layer,
+            DeviceMoEOverlayServiceTelemetryCell *layer_telemetry,
+            DeviceMoEOverlayServiceTelemetrySample *sample,
+            std::uint32_t num_experts,
+            MoEOverlayServicePhaseHint hint,
+            const MoEOverlayInferenceGraphRole *runtime_graph_role = nullptr)
+            override;
+
+        /** @copydoc IMoEKernel::publishMoEOverlayServiceTelemetry */
+        bool publishMoEOverlayServiceTelemetry(
+            const MoEKernelLaunchContext &launch,
+            const DeviceMoEOverlayServiceTelemetryCell *telemetry,
+            const DeviceMoEOverlayServiceTelemetrySample *samples,
+            std::uint32_t layer_count,
+            std::int32_t participant_id,
+            MoEOverlayDeviceServiceTelemetryPublicationHeader *publication)
+            override;
+
         /** @copydoc IMoEKernel::acquireMoEOverlayEpoch */
         bool acquireMoEOverlayEpoch(
             const MoEKernelLaunchContext &launch,
             DeviceMoEOverlayEpochControl *control,
             DeviceMoEOverlayEpochTicket *ticket,
-            DeviceMoEOverlayEpochStatus *status) override;
+            DeviceMoEOverlayEpochStatus *status,
+            const std::uint64_t *external_admission_epoch = nullptr,
+            DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier = {},
+            MoEOverlayPeerPlacementEpochBinding peer_placement_epoch = {}) override;
 
         /** @copydoc IMoEKernel::releaseMoEOverlayEpoch */
         bool releaseMoEOverlayEpoch(
@@ -433,7 +487,9 @@ namespace llaminar2
             const DeviceNativeVNNIMatrixDesc *down_descs,
             int num_experts,
             int d_model,
-            int intermediate) override;
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source =
+                MoEDecodeDescriptorSource::StaticDescriptorTable) override;
 
         /// @brief Upload persistent gate/up descriptor tables for grouped CUDA prefill.
         int uploadGroupedExpertGateUpDescriptorTables(
@@ -441,7 +497,9 @@ namespace llaminar2
             const DeviceNativeVNNIMatrixDesc *up_descs,
             int num_experts,
             int d_model,
-            int intermediate) override;
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source =
+                MoEDecodeDescriptorSource::StaticDescriptorTable) override;
 
         /** @copydoc IMoEKernel::uploadGroupedExpertFloatingDownDescriptorTable */
         int uploadGroupedExpertFloatingDownDescriptorTable(
@@ -605,7 +663,10 @@ namespace llaminar2
             int d_model,
             int intermediate,
             const uint8_t *expert_mask = nullptr,
-            ITensor *canonical_route_contributions = nullptr) override;
+            ITensor *canonical_route_contributions = nullptr,
+            DeviceMoELayerRuntime *runtime_layer = nullptr,
+            MoEDecodeDescriptorSource descriptor_source =
+                MoEDecodeDescriptorSource::StaticDescriptorTable) override;
 
         /// @brief Execute graph-capturable grouped SwiGLU/down decode from runtime-table ids and weights.
         bool groupedExpertDownDecodeFromRuntime(
@@ -709,7 +770,10 @@ namespace llaminar2
             const DeviceMoERebalanceConfig &config,
             const DeviceMoERebalanceWaveState *wave_state = nullptr,
             const DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
-            uint32_t command_buffer_count = 1) override;
+            uint32_t command_buffer_count = 1,
+            uint32_t histogram_source_mask =
+                moe_runtime_abi::kAllHistogramSourcesMask,
+            uint64_t *previous_activation_counts = nullptr) override;
 
         bool packDeviceRebalanceDirectory(
             const MoEKernelLaunchContext &launch,
@@ -1221,6 +1285,8 @@ namespace llaminar2
             uint8_t codebook_id = 0;
             uint32_t codebook_mask = 0;
             uint32_t policy_codebook_mask = 0;
+            MoEDecodeDescriptorSource descriptor_source =
+                MoEDecodeDescriptorSource::StaticDescriptorTable;
             DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
             bool valid = false;
 
@@ -1253,6 +1319,8 @@ namespace llaminar2
             uint8_t codebook_id = 0;
             uint32_t codebook_mask = 0;
             uint32_t policy_codebook_mask = 0;
+            MoEDecodeDescriptorSource descriptor_source =
+                MoEDecodeDescriptorSource::StaticDescriptorTable;
             DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeVNNI;
             bool valid = false;
 

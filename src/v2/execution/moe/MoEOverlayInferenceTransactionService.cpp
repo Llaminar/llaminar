@@ -36,6 +36,27 @@ namespace llaminar2
             const char *endpoint,
             const char *result)
         {
+            /*
+             * A ticket is the only host-visible edge in heterogeneous graph
+             * execution.  Keep its DEBUG witness beside the PerfStats record:
+             * if a device timeline stalls, this establishes whether control
+             * publication, remote receipt, or retained execution was the last
+             * completed edge without polling any device-owned model state.
+             */
+            LOG_DEBUG(
+                "[ExpertOverlay][Transaction] endpoint=" << endpoint
+                << " result=" << result
+                << " action="
+                << static_cast<std::uint32_t>(ticket.action)
+                << " role="
+                << static_cast<std::uint32_t>(ticket.graph_role)
+                << " command=" << ticket.command_id
+                << " ordinal=" << ticket.transaction_ordinal
+                << " logical_step=" << ticket.logical_step_id
+                << " rows=" << ticket.request_count << "x"
+                << ticket.logical_rows_per_request << "/"
+                << ticket.physical_rows_per_request
+                << " target_rank=" << ticket.target_world_rank);
             PerfStatsCollector::addCounter(
                 "moe_overlay_transaction",
                 "control_tickets",
@@ -86,6 +107,128 @@ namespace llaminar2
                   std::to_string(ticket.target_world_rank)}});
         }
     } // namespace
+
+    /**
+     * @brief Setup-sized poll-only conjunction of participant GPU events.
+     *
+     * The coordinator arms this object only after every configured local
+     * completion boundary has arrived. CPU participants contribute their
+     * synchronous return mark to that admission decision; only GPU events are
+     * retained here. The maintenance thread may poll a ready leaf repeatedly
+     * while another device remains pending, so leaf events deliberately retain
+     * their Ready state until the next independently admitted sample records
+     * them again.
+     */
+    class MoEOverlayInferenceTransactionCoordinator::CompletionFenceSet final
+        : public IMoEOverlayInferenceCompletionFence
+    {
+    public:
+        /** @brief Allocate the fixed participant slots during coordinator setup. */
+        explicit CompletionFenceSet(std::size_t participant_count)
+            : fences_(participant_count)
+        {
+            if (participant_count == 0)
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay completion fence set requires participants");
+            }
+        }
+
+        /**
+         * @brief Publish one complete immutable set of recorded GPU events.
+         * @param events Participant-indexed events; CPU participant slots are null.
+         * @param error Optional precise lifecycle diagnostic.
+         * @return True when at least one recorded GPU event now owns the set.
+         */
+        bool arm(
+            const std::vector<
+                std::shared_ptr<IMoEOverlayInferenceCompletionEvent>> &events,
+            std::string *error) noexcept
+        {
+            if (error)
+                error->clear();
+            if (events.size() != fences_.size() ||
+                active_.load(std::memory_order_acquire))
+            {
+                if (error)
+                {
+                    *error =
+                        "ExpertOverlay aggregate completion fence is active or has divergent participant geometry";
+                }
+                return false;
+            }
+
+            std::size_t event_count = 0;
+            for (std::size_t index = 0; index < events.size(); ++index)
+            {
+                fences_[index] = events[index];
+                event_count += events[index] ? 1u : 0u;
+            }
+            if (event_count == 0)
+            {
+                if (error)
+                    *error = "ExpertOverlay aggregate completion fence has no GPU events";
+                return false;
+            }
+
+            /*
+             * Every shared event reference and backend record is complete
+             * before this release. Probe publication supplies the matching
+             * cross-thread ownership edge to maintenance.
+             */
+            active_.store(true, std::memory_order_release);
+            return true;
+        }
+
+        /** @copydoc IMoEOverlayInferenceCompletionFence::poll */
+        [[nodiscard]] MoEOverlayInferenceCompletionFenceProgress poll(
+            std::string *error) noexcept override
+        {
+            if (error)
+                error->clear();
+            if (!active_.load(std::memory_order_acquire))
+            {
+                if (error)
+                    *error = "ExpertOverlay aggregate completion fence is not armed";
+                return MoEOverlayInferenceCompletionFenceProgress::Failed;
+            }
+
+            bool pending = false;
+            for (const auto &fence : fences_)
+            {
+                if (!fence)
+                    continue;
+                std::string participant_error;
+                const auto progress = fence->poll(&participant_error);
+                if (progress ==
+                    MoEOverlayInferenceCompletionFenceProgress::Failed)
+                {
+                    if (error)
+                    {
+                        *error = participant_error.empty()
+                                     ? "ExpertOverlay participant completion event query failed"
+                                     : std::move(participant_error);
+                    }
+                    return progress;
+                }
+                pending = pending ||
+                          progress ==
+                              MoEOverlayInferenceCompletionFenceProgress::Pending;
+            }
+            if (pending)
+                return MoEOverlayInferenceCompletionFenceProgress::Pending;
+
+            active_.store(false, std::memory_order_release);
+            return MoEOverlayInferenceCompletionFenceProgress::Ready;
+        }
+
+    private:
+        /** Participant-indexed, setup-sized event references. */
+        std::vector<std::shared_ptr<IMoEOverlayInferenceCompletionFence>>
+            fences_;
+        /** True from immutable publication until every leaf reports Ready. */
+        std::atomic<bool> active_{false};
+    };
 
     MoEOverlayMPIInferenceTransactionChannel::
         MoEOverlayMPIInferenceTransactionChannel(Config config)
@@ -447,7 +590,8 @@ namespace llaminar2
                 descriptor.logical_rows_per_request,
                 descriptor.physical_rows_per_request,
                 descriptor.draft_depth,
-                descriptor.sidecar_depth);
+                descriptor.sidecar_depth,
+                descriptor.prefill_schedule_workload);
         }
         catch (const std::exception &exception)
         {
@@ -590,6 +734,17 @@ namespace llaminar2
             config_.ticket_authority_participant_index < 0 ||
             config_.ticket_authority_participant_index >=
                 config_.continuation_participant_count ||
+            config_.participant_completion_boundaries.size() !=
+                static_cast<std::size_t>(
+                    config_.continuation_participant_count) ||
+            std::any_of(
+                config_.participant_completion_boundaries.begin(),
+                config_.participant_completion_boundaries.end(),
+                [](MoEOverlayInferenceCompletionBoundaryKind boundary)
+                {
+                    return boundary ==
+                           MoEOverlayInferenceCompletionBoundaryKind::Unspecified;
+                }) ||
             config_.max_transactions_per_command == 0 ||
             config_.max_mtp_draft_depth < 0)
         {
@@ -621,19 +776,148 @@ namespace llaminar2
             target_ranks.push_back(topology.target_world_rank);
         }
 
-        retained_transactions_.resize(
+        graph_group_slots_.resize(
             config_.max_transactions_per_command);
-        for (auto &transaction : retained_transactions_)
+        for (auto &transaction : graph_group_slots_)
         {
             transaction.target_transactions.resize(
                 config_.publishers.size());
+            transaction.entered_participants.resize(
+                static_cast<std::size_t>(
+                    config_.continuation_participant_count));
+            transaction.terminal_participants.resize(
+                static_cast<std::size_t>(
+                    config_.continuation_participant_count));
+            transaction.participant_completion_events.resize(
+                static_cast<std::size_t>(
+                    config_.continuation_participant_count));
+            transaction.participant_completion_recorded.resize(
+                static_cast<std::size_t>(
+                    config_.continuation_participant_count));
         }
-        entered_participants_.resize(
-            static_cast<std::size_t>(
-                config_.continuation_participant_count));
-        finished_participants_.resize(
-            static_cast<std::size_t>(
-                config_.continuation_participant_count));
+        prefill_completion_fence_set_ =
+            std::make_shared<CompletionFenceSet>(
+                static_cast<std::size_t>(
+                    config_.continuation_participant_count));
+    }
+
+    bool MoEOverlayInferenceTransactionCoordinator::
+        bindPrefillInterferenceProbe(
+            std::shared_ptr<MoEOverlayInferenceInterferenceProbe> probe,
+            std::string *error)
+    {
+        std::lock_guard lock(mutex_);
+        if (error)
+            error->clear();
+        if (!probe)
+        {
+            return fail(
+                "ExpertOverlay prefill calibration requires a non-null probe",
+                error);
+        }
+        if (state_ != MoEOverlayInferenceProtocolState::Idle ||
+            execution_sequence_.graphInFlight())
+        {
+            return fail(
+                "ExpertOverlay prefill calibration probe must bind before command admission",
+                error);
+        }
+        if (prefill_interference_probe_ &&
+            prefill_interference_probe_ != probe)
+        {
+            return fail(
+                "ExpertOverlay transaction coordinator cannot replace its prefill calibration probe",
+                error);
+        }
+        prefill_interference_probe_ = std::move(probe);
+        return true;
+    }
+
+    bool MoEOverlayInferenceTransactionCoordinator::
+        declarePrefillInterferenceSchedule(
+            MoEOverlayInferenceWorkloadIdentity workload,
+            std::string *error)
+    {
+        std::lock_guard lock(mutex_);
+        if (error)
+            error->clear();
+        if (!workload.valid() ||
+            workload.source != ExpertHistogramSource::PrefillChunk ||
+            workload.speculative_depth != 0)
+        {
+            return failLocked(
+                "ExpertOverlay aggregate prefill declaration requires one valid non-speculative prefill workload",
+                error);
+        }
+        if (state_ != MoEOverlayInferenceProtocolState::Active ||
+            execution_sequence_.graphInFlight())
+        {
+            return failLocked(
+                "ExpertOverlay aggregate prefill declaration requires an active command between graph groups",
+                error);
+        }
+
+        const std::size_t completed_transactions =
+            total_transaction_count_ + transaction_count_;
+        if (declared_prefill_schedule_)
+        {
+            if (completed_transactions <
+                    declared_prefill_schedule_end_ordinal_ ||
+                (declared_prefill_probe_ticket_.valid() &&
+                 !declared_prefill_probe_released_))
+            {
+                return failLocked(
+                    "ExpertOverlay cannot replace an incomplete aggregate prefill calibration schedule",
+                    error);
+            }
+            if (declared_prefill_probe_ticket_.valid() &&
+                !declared_prefill_terminal_published_)
+            {
+                return failLocked(
+                    "ExpertOverlay completed an aggregate prefill schedule without publishing its exact terminal fence",
+                    error);
+            }
+        }
+
+        const auto schedule_transactions = static_cast<std::size_t>(
+            workload.transaction_count);
+        if (schedule_transactions == 0 ||
+            completed_transactions >
+                std::numeric_limits<std::size_t>::max() -
+                    schedule_transactions)
+        {
+            return failLocked(
+                "ExpertOverlay aggregate prefill transaction cardinality overflowed",
+                error);
+        }
+
+        declared_prefill_schedule_ = workload;
+        declared_prefill_schedule_begin_ordinal_ =
+            completed_transactions + 1u;
+        declared_prefill_schedule_end_ordinal_ =
+            completed_transactions + schedule_transactions;
+        declared_prefill_probe_ticket_ =
+            prefill_interference_probe_
+                ? prefill_interference_probe_->beginSample(workload)
+                : MoEOverlayInterferenceProbeTicket{};
+        declared_prefill_probe_released_ =
+            !declared_prefill_probe_ticket_.valid();
+        declared_prefill_terminal_published_ = false;
+
+        PerfStatsCollector::addCounter(
+            "moe_overlay_residency",
+            "aggregate_prefill_calibration_schedules",
+            1.0,
+            "prefill",
+            "continuation_rank",
+            {{"real_rows", std::to_string(workload.real_rows)},
+             {"execution_rows",
+              std::to_string(workload.execution_rows)},
+             {"transactions",
+              std::to_string(workload.transaction_count)},
+             {"probe_claimed",
+              declared_prefill_probe_ticket_.valid() ? "true" : "false"}});
+        return true;
     }
 
     bool MoEOverlayInferenceTransactionCoordinator::failLocked(
@@ -643,6 +927,7 @@ namespace llaminar2
         if (failure_.empty())
             failure_ = std::move(message);
         state_ = MoEOverlayInferenceProtocolState::Failed;
+        execution_sequence_.state = ExecutionSequenceState::Failed;
         graph_group_completion_cv_.notify_all();
         if (error)
             *error = failure_;
@@ -655,6 +940,97 @@ namespace llaminar2
         return std::all_of(
             marks.begin(), marks.end(),
             [](std::uint8_t marked) { return marked != 0; });
+    }
+
+    bool MoEOverlayInferenceTransactionCoordinator::
+        tryPublishPrefillInterferenceCompletionLocked(
+            GraphGroupSlot &transaction,
+            std::string *error)
+    {
+        if (!transaction.interference_ticket.valid() ||
+            transaction.interference_completion_published ||
+            !allParticipantsMarked(
+                transaction.participant_completion_recorded))
+        {
+            return true;
+        }
+        if (!prefill_interference_probe_ ||
+            !prefill_completion_fence_set_)
+        {
+            return failLocked(
+                "ExpertOverlay prefill completion lost its setup-owned probe or aggregate fence",
+                error);
+        }
+
+        bool has_device_event = false;
+        for (std::size_t participant = 0;
+             participant <
+             config_.participant_completion_boundaries.size();
+             ++participant)
+        {
+            const auto boundary =
+                config_.participant_completion_boundaries[participant];
+            const bool has_event = static_cast<bool>(
+                transaction.participant_completion_events[participant]);
+            if (boundary ==
+                MoEOverlayInferenceCompletionBoundaryKind::DeviceEvent)
+            {
+                if (!has_event)
+                {
+                    return failLocked(
+                        "ExpertOverlay GPU participant terminal mark has no recorded event",
+                        error);
+                }
+                has_device_event = true;
+            }
+            else if (has_event)
+            {
+                return failLocked(
+                    "ExpertOverlay CPU participant published a GPU completion event",
+                    error);
+            }
+        }
+
+        bool published = false;
+        if (has_device_event)
+        {
+            std::string publication_error;
+            published = prefill_completion_fence_set_->arm(
+                            transaction.participant_completion_events,
+                            &publication_error) &&
+                        prefill_interference_probe_->deferSampleCompletion(
+                            transaction.interference_ticket,
+                            prefill_completion_fence_set_,
+                            &publication_error);
+            if (!published)
+            {
+                return failLocked(
+                    publication_error.empty()
+                        ? "ExpertOverlay could not publish its aggregate participant completion fence"
+                        : std::move(publication_error),
+                    error);
+            }
+        }
+        else
+        {
+            published = prefill_interference_probe_->finishSample(
+                transaction.interference_ticket);
+            if (!published)
+            {
+                return failLocked(
+                    "ExpertOverlay CPU participants could not publish their exact synchronous completion interval",
+                    error);
+            }
+        }
+        transaction.interference_completion_published = true;
+        LOG_DEBUG(
+            "[ExpertOverlay][Calibration] Published rank-wide prefill terminal sequence="
+            << transaction.interference_ticket.calibration_sequence
+            << " participants="
+            << transaction.participant_completion_recorded.size()
+            << " device_events=" << (has_device_event ? "true" : "false")
+            << " logical_step=" << transaction.descriptor.logical_step_id);
+        return true;
     }
 
     bool MoEOverlayInferenceTransactionCoordinator::beginCommand(
@@ -682,15 +1058,11 @@ namespace llaminar2
         }
 
         resetGraphSequenceLocked();
-        std::fill(
-            entered_participants_.begin(),
-            entered_participants_.end(), std::uint8_t{0});
-        std::fill(
-            finished_participants_.begin(),
-            finished_participants_.end(), std::uint8_t{0});
         active_command_ = command;
         total_transaction_count_ = 0;
         graph_sequence_count_ = 0;
+        last_hosted_sequence_transition_id_ = 0;
+        last_hosted_sequence_next_draft_depth_.reset();
         current_placement_epoch_ = command.initial_placement_epoch;
         failure_.clear();
 
@@ -752,24 +1124,25 @@ namespace llaminar2
         if (state_ != MoEOverlayInferenceProtocolState::Active)
             return failLocked(
                 "ExpertOverlay graph sequence requires an active command", error);
-        if (graph_group_active_ || transaction_count_ != 0 ||
-            mtp_depth_declared_)
+        if (execution_sequence_.active() || transaction_count_ != 0)
             return failLocked(
                 "ExpertOverlay graph sequence cannot overlap live graph slots",
                 error);
         if (draft_depth < 0 ||
-            draft_depth > config_.max_mtp_draft_depth)
+            draft_depth > config_.max_mtp_draft_depth ||
+            next_sequence_id_ == 0 ||
+            next_sequence_id_ ==
+                std::numeric_limits<std::uint64_t>::max())
         {
             return failLocked(
-                "ExpertOverlay MTP depth exceeds the retained graph family",
+                "ExpertOverlay MTP depth or sequence identity exceeds the retained graph family",
                 error);
         }
-        mtp_depth_declared_ = true;
-        active_mtp_draft_depth_ = draft_depth;
-        next_sidecar_ordinal_ = 0;
-        sequence_main_graph_count_ = 0;
-        sequence_sidecar_graph_count_ = 0;
-        sequence_verifier_graph_count_ = 0;
+        execution_sequence_.state = ExecutionSequenceState::Open;
+        execution_sequence_.draft_depth = draft_depth;
+        execution_sequence_.next_graph_ordinal = 0;
+        execution_sequence_.placement_epoch = 0;
+        execution_sequence_.sequence_id = next_sequence_id_++;
         ++graph_sequence_count_;
         return true;
     }
@@ -798,7 +1171,10 @@ namespace llaminar2
 
         const std::size_t participant =
             static_cast<std::size_t>(participant_index);
-        if (graph_group_active_ && entered_participants_[participant] != 0)
+        if (execution_sequence_.graphInFlight() &&
+            transaction_count_ < graph_group_slots_.size() &&
+            graph_group_slots_[transaction_count_]
+                    .entered_participants[participant] != 0)
         {
             /*
              * GPU graph submission is asynchronous, so one LocalTP worker may
@@ -817,8 +1193,10 @@ namespace llaminar2
                 {
                     return state_ !=
                                MoEOverlayInferenceProtocolState::Active ||
-                           !graph_group_active_ ||
-                           entered_participants_[participant] == 0;
+                           !execution_sequence_.graphInFlight() ||
+                           (transaction_count_ < graph_group_slots_.size() &&
+                            graph_group_slots_[transaction_count_]
+                                    .entered_participants[participant] == 0);
                 });
             if (!aligned)
             {
@@ -840,7 +1218,7 @@ namespace llaminar2
             }
         }
 
-        if (graph_group_active_)
+        if (execution_sequence_.graphInFlight())
         {
             /*
              * LocalTP siblings call this independently before joining the same
@@ -850,9 +1228,9 @@ namespace llaminar2
              * edge, and no sequence transition is needed until all siblings
              * finish.
              */
-            if (transaction_count_ >= retained_transactions_.size() ||
-                !retained_transactions_[transaction_count_].used ||
-                retained_transactions_[transaction_count_]
+            if (transaction_count_ >= graph_group_slots_.size() ||
+                !graph_group_slots_[transaction_count_].inFlight() ||
+                graph_group_slots_[transaction_count_]
                         .descriptor.graph_role !=
                     MoEOverlayInferenceGraphRole::MainPrefill)
             {
@@ -863,10 +1241,10 @@ namespace llaminar2
             return true;
         }
 
-        if (!mtp_depth_declared_)
+        if (!execution_sequence_.active())
             return beginGraphSequenceLocked(/*draft_depth=*/0, error);
 
-        if (active_mtp_draft_depth_ != 0)
+        if (execution_sequence_.draft_depth != 0)
         {
             return failLocked(
                 "ExpertOverlay serial prefill cannot enter an MTP graph sequence",
@@ -879,10 +1257,9 @@ namespace llaminar2
         }
 
         const bool complete_prefill_chunk =
-            transaction_count_ == 1 &&
-            sequence_main_graph_count_ == 1 &&
-            sequence_sidecar_graph_count_ == 0 &&
-            sequence_verifier_graph_count_ == 0;
+            execution_sequence_.state == ExecutionSequenceState::Open &&
+            execution_sequence_.next_graph_ordinal == 1 &&
+            transaction_count_ == 1;
         if (!complete_prefill_chunk)
         {
             return failLocked(
@@ -907,7 +1284,7 @@ namespace llaminar2
         MoEOverlayInferenceExecutionDescriptor descriptor,
         int participant_index)
     {
-        std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
         MoEOverlayInferenceParticipantGraphBinding result;
         result.participant_index = participant_index;
         if (state_ == MoEOverlayInferenceProtocolState::Idle ||
@@ -923,7 +1300,7 @@ namespace llaminar2
                                : failure_;
             return result;
         }
-        if (!mtp_depth_declared_)
+        if (!execution_sequence_.active())
         {
             failLocked(
                 "ExpertOverlay graph entered before graph-sequence admission",
@@ -945,32 +1322,109 @@ namespace llaminar2
             return result;
         }
 
+        const std::size_t participant =
+            static_cast<std::size_t>(participant_index);
+        if (execution_sequence_.graphInFlight() &&
+            transaction_count_ < graph_group_slots_.size() &&
+            graph_group_slots_[transaction_count_]
+                    .entered_participants[participant] != 0)
+        {
+            /*
+             * Retained graph launch is asynchronous. A faster LocalTP worker
+             * can therefore finish submitting graph N and request graph N+1
+             * while a sibling is still publishing N's completion boundary.
+             * Keep both workers alive and wait only on coordinator metadata;
+             * already-enqueued device work remains fully asynchronous. This is
+             * the same bounded heterogeneous-boundary admission used by serial
+             * prefill, generalized to every sparse graph role.
+             */
+            const auto timeout = std::chrono::milliseconds(
+                collective_timeout_policy::kDefaultCollectiveTimeoutMs);
+            const bool aligned = graph_group_completion_cv_.wait_for(
+                lock,
+                timeout,
+                [&]
+                {
+                    return state_ !=
+                               MoEOverlayInferenceProtocolState::Active ||
+                           !execution_sequence_.graphInFlight() ||
+                           (transaction_count_ < graph_group_slots_.size() &&
+                            graph_group_slots_[transaction_count_]
+                                    .entered_participants[participant] == 0);
+                });
+            if (!aligned)
+            {
+                failLocked(
+                    "ExpertOverlay participant timed out waiting for symmetric retained-graph submission alignment",
+                    &result.error);
+                return result;
+            }
+            if (state_ != MoEOverlayInferenceProtocolState::Active)
+            {
+                result.error = failure_.empty()
+                                   ? "ExpertOverlay participant alignment observed a terminal coordinator"
+                                   : failure_;
+                return result;
+            }
+        }
+
+        const bool joining_active_group =
+            execution_sequence_.graphInFlight();
+        if (!joining_active_group)
+        {
+            const int ordinal = execution_sequence_.next_graph_ordinal;
+            const int expected_count =
+                execution_sequence_.expectedGraphCount();
+            const bool serial_role =
+                descriptor.graph_role ==
+                    MoEOverlayInferenceGraphRole::MainPrefill ||
+                descriptor.graph_role ==
+                    MoEOverlayInferenceGraphRole::MainDecode;
+            const bool expected_role =
+                execution_sequence_.draft_depth == 0
+                    ? ordinal == 0 && serial_role
+                    : ordinal < execution_sequence_.draft_depth
+                          ? descriptor.graph_role ==
+                                MoEOverlayInferenceGraphRole::MTPDraft
+                          : ordinal == execution_sequence_.draft_depth &&
+                                descriptor.graph_role ==
+                                    MoEOverlayInferenceGraphRole::
+                                        MTPGroupedVerifier;
+            if (ordinal < 0 || ordinal >= expected_count || !expected_role)
+            {
+                failLocked(
+                    "ExpertOverlay graph role is out of order for its immutable execution-sequence plan",
+                    &result.error);
+                return result;
+            }
+        }
+
         switch (descriptor.graph_role)
         {
         case MoEOverlayInferenceGraphRole::MTPDraft:
         {
             const int group_sidecar_ordinal =
-                graph_group_active_ &&
-                        transaction_count_ < retained_transactions_.size()
-                    ? retained_transactions_[transaction_count_]
+                joining_active_group &&
+                        transaction_count_ < graph_group_slots_.size()
+                    ? graph_group_slots_[transaction_count_]
                           .descriptor.sidecar_depth
-                    : next_sidecar_ordinal_;
-            if (active_mtp_draft_depth_ <= 0 ||
+                    : execution_sequence_.next_graph_ordinal;
+            if (execution_sequence_.draft_depth <= 0 ||
                 group_sidecar_ordinal < 0 ||
-                group_sidecar_ordinal >= active_mtp_draft_depth_)
+                group_sidecar_ordinal >= execution_sequence_.draft_depth)
             {
                 failLocked(
                     "ExpertOverlay sidecar count exceeds the admitted MTP depth",
                     &result.error);
                 return result;
             }
-            descriptor.draft_depth = active_mtp_draft_depth_;
+            descriptor.draft_depth = execution_sequence_.draft_depth;
             descriptor.sidecar_depth = group_sidecar_ordinal;
             break;
         }
         case MoEOverlayInferenceGraphRole::MTPGroupedVerifier:
-            if (active_mtp_draft_depth_ <= 0 ||
-                descriptor.draft_depth != active_mtp_draft_depth_ ||
+            if (execution_sequence_.draft_depth <= 0 ||
+                descriptor.draft_depth != execution_sequence_.draft_depth ||
                 descriptor.sidecar_depth != -1)
             {
                 failLocked(
@@ -981,7 +1435,8 @@ namespace llaminar2
             break;
         case MoEOverlayInferenceGraphRole::MainPrefill:
         case MoEOverlayInferenceGraphRole::MainDecode:
-            if (descriptor.draft_depth != -1 ||
+            if (execution_sequence_.draft_depth != 0 ||
+                descriptor.draft_depth != -1 ||
                 descriptor.sidecar_depth != -1)
             {
                 failLocked(
@@ -994,20 +1449,49 @@ namespace llaminar2
             break;
         }
 
-        RetainedTransaction *transaction = nullptr;
-        if (graph_group_active_)
+        if (descriptor.prefill_schedule_workload.valid())
         {
-            if (transaction_count_ >= retained_transactions_.size())
+            failLocked(
+                "ExpertOverlay graph caller attempted to inject coordinator-owned aggregate prefill identity",
+                &result.error);
+            return result;
+        }
+        const std::size_t absolute_transaction_ordinal =
+            total_transaction_count_ + transaction_count_ + 1u;
+        const bool inside_declared_prefill_schedule =
+            declared_prefill_schedule_ &&
+            absolute_transaction_ordinal >=
+                declared_prefill_schedule_begin_ordinal_ &&
+            absolute_transaction_ordinal <=
+                declared_prefill_schedule_end_ordinal_;
+        if (inside_declared_prefill_schedule)
+        {
+            if (descriptor.graph_role !=
+                MoEOverlayInferenceGraphRole::MainPrefill)
+            {
+                failLocked(
+                    "ExpertOverlay aggregate prefill schedule encountered a non-prefill graph before its terminal ordinal",
+                    &result.error);
+                return result;
+            }
+            descriptor.prefill_schedule_workload =
+                *declared_prefill_schedule_;
+        }
+
+        GraphGroupSlot *transaction = nullptr;
+        if (joining_active_group)
+        {
+            if (transaction_count_ >= graph_group_slots_.size())
             {
                 failLocked(
                     "ExpertOverlay active graph group exceeds fixed transaction storage",
                     &result.error);
                 return result;
             }
-            transaction = &retained_transactions_[transaction_count_];
+            transaction = &graph_group_slots_[transaction_count_];
             descriptor.logical_step_id =
                 transaction->descriptor.logical_step_id;
-            if (!transaction->used ||
+            if (!transaction->inFlight() ||
                 transaction->descriptor != descriptor)
             {
                 failLocked(
@@ -1018,7 +1502,7 @@ namespace llaminar2
         }
         else
         {
-            if (transaction_count_ >= retained_transactions_.size() ||
+            if (transaction_count_ >= graph_group_slots_.size() ||
                 next_logical_step_id_ == 0 ||
                 next_logical_step_id_ ==
                     std::numeric_limits<std::uint64_t>::max())
@@ -1028,39 +1512,106 @@ namespace llaminar2
                     &result.error);
                 return result;
             }
-            transaction = &retained_transactions_[transaction_count_];
+            transaction = &graph_group_slots_[transaction_count_];
             descriptor.logical_step_id = next_logical_step_id_++;
-            transaction->used = true;
-            transaction->armed = false;
+            transaction->state = GraphGroupSlotState::Admitting;
             transaction->group_id = next_group_id_++;
+            transaction->sequence_id = execution_sequence_.sequence_id;
+            transaction->sequence_graph_ordinal =
+                execution_sequence_.next_graph_ordinal;
+            transaction->sequence_graph_count =
+                execution_sequence_.expectedGraphCount();
             transaction->descriptor = descriptor;
+            transaction->interference_ticket = {};
+            transaction->interference_completion_published = false;
             std::fill(
-                entered_participants_.begin(),
-                entered_participants_.end(), std::uint8_t{0});
+                transaction->participant_completion_events.begin(),
+                transaction->participant_completion_events.end(),
+                nullptr);
             std::fill(
-                finished_participants_.begin(),
-                finished_participants_.end(), std::uint8_t{0});
+                transaction->participant_completion_recorded.begin(),
+                transaction->participant_completion_recorded.end(),
+                std::uint8_t{0});
+            std::fill(
+                transaction->entered_participants.begin(),
+                transaction->entered_participants.end(), std::uint8_t{0});
+            std::fill(
+                transaction->terminal_participants.begin(),
+                transaction->terminal_participants.end(), std::uint8_t{0});
 
-            graph_group_active_ = true;
+            execution_sequence_.state =
+                ExecutionSequenceState::GraphInFlight;
+            if (execution_sequence_.placement_epoch == 0)
+            {
+                execution_sequence_.placement_epoch =
+                    descriptor.placement_epoch;
+            }
+            else if (execution_sequence_.placement_epoch !=
+                     descriptor.placement_epoch)
+            {
+                failLocked(
+                    "ExpertOverlay graph changed residency epoch inside one execution sequence",
+                    &result.error);
+                return result;
+            }
             current_placement_epoch_ = std::max(
                 current_placement_epoch_, descriptor.placement_epoch);
+
             if (descriptor.graph_role ==
-                MoEOverlayInferenceGraphRole::MTPDraft)
+                    MoEOverlayInferenceGraphRole::MainPrefill &&
+                inside_declared_prefill_schedule)
             {
-                ++next_sidecar_ordinal_;
+                /*
+                 * Earlier segments carry the authenticated aggregate identity
+                 * but no timing terminal.  The final segment alone inherits
+                 * the schedule ticket so its exact participant event set closes
+                 * the complete interval without a host synchronization.
+                 */
+                if (absolute_transaction_ordinal ==
+                    declared_prefill_schedule_end_ordinal_)
+                {
+                    transaction->interference_ticket =
+                        declared_prefill_probe_ticket_;
+                }
+            }
+            else if (descriptor.graph_role ==
+                         MoEOverlayInferenceGraphRole::MainPrefill &&
+                     prefill_interference_probe_)
+            {
+                const std::int64_t real_rows =
+                    static_cast<std::int64_t>(descriptor.request_count) *
+                    descriptor.logical_rows_per_request;
+                const std::int64_t execution_rows =
+                    static_cast<std::int64_t>(descriptor.request_count) *
+                    descriptor.physical_rows_per_request;
+                if (real_rows <= 0 || execution_rows < real_rows ||
+                    real_rows > std::numeric_limits<int>::max() ||
+                    execution_rows > std::numeric_limits<int>::max())
+                {
+                    failLocked(
+                        "ExpertOverlay prefill calibration workload geometry overflowed",
+                        &result.error);
+                    return result;
+                }
+                transaction->interference_ticket =
+                    prefill_interference_probe_->beginSample(
+                        makeMoEOverlayInferenceWorkloadIdentity(
+                            ExpertHistogramSource::PrefillChunk,
+                            static_cast<int>(real_rows),
+                            static_cast<int>(execution_rows),
+                            /*transaction_count=*/1,
+                            /*speculative_depth=*/0));
             }
         }
 
-        const std::size_t participant =
-            static_cast<std::size_t>(participant_index);
-        if (entered_participants_[participant] != 0)
+        if (transaction->entered_participants[participant] != 0)
         {
             failLocked(
                 "ExpertOverlay continuation participant entered one graph twice",
                 &result.error);
             return result;
         }
-        entered_participants_[participant] = 1;
+        transaction->entered_participants[participant] = 1;
         result.ok = true;
         result.active = true;
         result.owns_ticket_authority =
@@ -1068,6 +1619,10 @@ namespace llaminar2
             config_.ticket_authority_participant_index;
         result.group_id = transaction->group_id;
         result.request_generation = active_command_.request_generation;
+        result.sequence_id = transaction->sequence_id;
+        result.sequence_graph_ordinal =
+            transaction->sequence_graph_ordinal;
+        result.sequence_graph_count = transaction->sequence_graph_count;
         result.descriptor = transaction->descriptor;
         return result;
     }
@@ -1081,17 +1636,23 @@ namespace llaminar2
             error->clear();
         if (!binding.ok || !binding.active ||
             state_ != MoEOverlayInferenceProtocolState::Active ||
-            !graph_group_active_ ||
-            transaction_count_ >= retained_transactions_.size())
+            !execution_sequence_.graphInFlight() ||
+            transaction_count_ >= graph_group_slots_.size())
         {
             return failLocked(
                 "ExpertOverlay participant attempted to arm an inactive graph group",
                 error);
         }
 
-        RetainedTransaction &transaction =
-            retained_transactions_[transaction_count_];
-        if (!transaction.used || binding.group_id != transaction.group_id ||
+        GraphGroupSlot &transaction =
+            graph_group_slots_[transaction_count_];
+        if (!transaction.inFlight() || transaction.failed() ||
+            binding.group_id != transaction.group_id ||
+            binding.sequence_id != transaction.sequence_id ||
+            binding.sequence_graph_ordinal !=
+                transaction.sequence_graph_ordinal ||
+            binding.sequence_graph_count !=
+                transaction.sequence_graph_count ||
             binding.descriptor != transaction.descriptor ||
             binding.participant_index < 0 ||
             binding.participant_index >=
@@ -1106,14 +1667,14 @@ namespace llaminar2
         }
         const std::size_t participant =
             static_cast<std::size_t>(binding.participant_index);
-        if (entered_participants_[participant] == 0 ||
-            finished_participants_[participant] != 0)
+        if (transaction.entered_participants[participant] == 0 ||
+            transaction.terminal_participants[participant] != 0)
         {
             return failLocked(
                 "ExpertOverlay executable launch occurred outside its participant graph scope",
                 error);
         }
-        if (transaction.armed)
+        if (transaction.armed())
             return true;
 
         /*
@@ -1137,7 +1698,7 @@ namespace llaminar2
                     error);
             }
         }
-        transaction.armed = true;
+        transaction.state = GraphGroupSlotState::Armed;
         PerfStatsCollector::addCounter(
             "moe_overlay_transaction",
             "coordinator_graph_arms",
@@ -1152,6 +1713,76 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEOverlayInferenceTransactionCoordinator::
+        deferPrefillInterferenceCompletionAtDeviceTerminal(
+            std::uint64_t logical_step_id,
+            int participant_index,
+            std::shared_ptr<IMoEOverlayInferenceCompletionEvent> event,
+            void *producer_stream,
+            std::string *error)
+    {
+        std::lock_guard lock(mutex_);
+        if (error)
+            error->clear();
+        if (state_ != MoEOverlayInferenceProtocolState::Active ||
+            !execution_sequence_.graphInFlight() ||
+            transaction_count_ >= graph_group_slots_.size())
+        {
+            return failLocked(
+                "ExpertOverlay device terminal reached an inactive graph group",
+                error);
+        }
+
+        GraphGroupSlot &transaction =
+            graph_group_slots_[transaction_count_];
+        if (!transaction.inFlight() ||
+            transaction.descriptor.graph_role !=
+                MoEOverlayInferenceGraphRole::MainPrefill ||
+            transaction.descriptor.logical_step_id != logical_step_id ||
+            participant_index < 0 ||
+            participant_index >=
+                config_.continuation_participant_count ||
+            config_.participant_completion_boundaries[
+                static_cast<std::size_t>(participant_index)] !=
+                MoEOverlayInferenceCompletionBoundaryKind::DeviceEvent ||
+            !event || !producer_stream)
+        {
+            return failLocked(
+                "ExpertOverlay prefill device terminal disagrees with its active participant or completion policy",
+                error);
+        }
+
+        /*
+         * Most graphs run while no calibration request is armed. Avoid even
+         * recording the reusable event in that ordinary path. A claimed ticket
+         * is single-shot, so duplicate terminal publication is a protocol bug.
+         */
+        if (!transaction.interference_ticket.valid())
+            return true;
+        const std::size_t participant =
+            static_cast<std::size_t>(participant_index);
+        if (transaction.participant_completion_recorded[participant] != 0)
+        {
+            return failLocked(
+                "ExpertOverlay prefill participant published its device terminal twice",
+                error);
+        }
+        std::string record_error;
+        if (!event->record(producer_stream, &record_error))
+        {
+            return failLocked(
+                record_error.empty()
+                    ? "ExpertOverlay prefill participant could not record its device-terminal calibration event"
+                    : std::move(record_error),
+                error);
+        }
+        transaction.participant_completion_events[participant] =
+            std::move(event);
+        transaction.participant_completion_recorded[participant] = 1;
+        return tryPublishPrefillInterferenceCompletionLocked(
+            transaction, error);
+    }
+
     bool MoEOverlayInferenceTransactionCoordinator::finishParticipantGraph(
         const MoEOverlayInferenceParticipantGraphBinding &binding,
         bool execution_succeeded,
@@ -1162,16 +1793,21 @@ namespace llaminar2
             error->clear();
         if (!binding.ok || !binding.active ||
             state_ != MoEOverlayInferenceProtocolState::Active ||
-            !graph_group_active_ ||
-            transaction_count_ >= retained_transactions_.size())
+            !execution_sequence_.graphInFlight() ||
+            transaction_count_ >= graph_group_slots_.size())
         {
             return failLocked(
                 "ExpertOverlay participant attempted to finish an inactive graph group",
                 error);
         }
-        const RetainedTransaction &transaction =
-            retained_transactions_[transaction_count_];
+        GraphGroupSlot &transaction =
+            graph_group_slots_[transaction_count_];
         if (binding.group_id != transaction.group_id ||
+            binding.sequence_id != transaction.sequence_id ||
+            binding.sequence_graph_ordinal !=
+                transaction.sequence_graph_ordinal ||
+            binding.sequence_graph_count !=
+                transaction.sequence_graph_count ||
             binding.descriptor != transaction.descriptor ||
             binding.participant_index < 0 ||
             binding.participant_index >=
@@ -1183,8 +1819,9 @@ namespace llaminar2
         }
         const std::size_t participant =
             static_cast<std::size_t>(binding.participant_index);
-        if (entered_participants_[participant] == 0 ||
-            finished_participants_[participant] != 0)
+        if (!transaction.inFlight() ||
+            transaction.entered_participants[participant] == 0 ||
+            transaction.terminal_participants[participant] != 0)
         {
             return failLocked(
                 "ExpertOverlay participant graph finish lifecycle is out of order",
@@ -1193,48 +1830,110 @@ namespace llaminar2
         if (execution_succeeded &&
             binding.participant_index ==
                 config_.ticket_authority_participant_index &&
-            !transaction.armed)
+            !transaction.armed())
         {
             return failLocked(
                 "ExpertOverlay ticket authority reported successful graph execution before its launch ticket was armed",
                 error);
         }
-        finished_participants_[participant] = 1;
-        graph_execution_failed_ =
-            graph_execution_failed_ || !execution_succeeded;
 
-        if (allParticipantsMarked(finished_participants_))
+        if (execution_succeeded &&
+            transaction.interference_ticket.valid())
         {
-            if (!allParticipantsMarked(entered_participants_))
+            const auto boundary =
+                config_.participant_completion_boundaries[participant];
+            if (boundary ==
+                MoEOverlayInferenceCompletionBoundaryKind::HostSynchronous)
+            {
+                transaction.participant_completion_recorded[participant] = 1;
+            }
+            else if (
+                transaction.participant_completion_recorded[participant] == 0)
+            {
+                return failLocked(
+                    "ExpertOverlay GPU prefill participant returned before publishing its exact device-terminal event",
+                    error);
+            }
+            if (!tryPublishPrefillInterferenceCompletionLocked(
+                    transaction, error))
+            {
+                return false;
+            }
+        }
+        transaction.terminal_participants[participant] = 1;
+        if (!execution_succeeded)
+        {
+            transaction.state = transaction.armed()
+                                    ? GraphGroupSlotState::ArmedFailed
+                                    : GraphGroupSlotState::AdmittingFailed;
+        }
+
+        if (allParticipantsMarked(transaction.terminal_participants))
+        {
+            if (!allParticipantsMarked(transaction.entered_participants))
             {
                 return failLocked(
                     "ExpertOverlay graph group finished without every continuation participant",
                     error);
             }
-            if (!graph_execution_failed_ && !transaction.armed)
+            if (!transaction.failed() && !transaction.armed())
             {
                 return failLocked(
                     "ExpertOverlay graph group completed successfully without its ticket authority arming the remote transaction",
                     error);
             }
-            switch (transaction.descriptor.graph_role)
+            if (transaction.interference_ticket.valid())
             {
-            case MoEOverlayInferenceGraphRole::MainPrefill:
-            case MoEOverlayInferenceGraphRole::MainDecode:
-                ++sequence_main_graph_count_;
-                break;
-            case MoEOverlayInferenceGraphRole::MTPDraft:
-                ++sequence_sidecar_graph_count_;
-                break;
-            case MoEOverlayInferenceGraphRole::MTPGroupedVerifier:
-                ++sequence_verifier_graph_count_;
-                break;
-            case MoEOverlayInferenceGraphRole::None:
-                return failLocked(
-                    "ExpertOverlay execution sequence sealed a terminal graph role",
-                    error);
+                const bool aggregate_prefill_terminal =
+                    declared_prefill_schedule_ &&
+                    transaction.descriptor.prefill_schedule_workload ==
+                        *declared_prefill_schedule_ &&
+                    total_transaction_count_ + transaction_count_ + 1u ==
+                        declared_prefill_schedule_end_ordinal_ &&
+                    transaction.interference_ticket.probe_generation ==
+                        declared_prefill_probe_ticket_.probe_generation;
+                bool probe_ok = true;
+                if (transaction.failed())
+                {
+                    if (transaction.interference_completion_published)
+                    {
+                        return failLocked(
+                            "ExpertOverlay graph failed after publishing its aggregate calibration terminal",
+                            error);
+                    }
+                    probe_ok = prefill_interference_probe_->discardSample(
+                        transaction.interference_ticket);
+                }
+                else
+                {
+                    probe_ok =
+                        transaction.interference_completion_published;
+                }
+                transaction.interference_ticket = {};
+                if (aggregate_prefill_terminal)
+                {
+                    declared_prefill_probe_released_ = probe_ok;
+                    declared_prefill_terminal_published_ =
+                        probe_ok && !transaction.failed();
+                }
+                if (!probe_ok)
+                {
+                    return failLocked(
+                        "ExpertOverlay prefill graph group finished without every participant publishing its exact calibration terminal",
+                        error);
+                }
             }
-            graph_group_active_ = false;
+            if (transaction.failed())
+            {
+                transaction.state = GraphGroupSlotState::Failed;
+                execution_sequence_.state = ExecutionSequenceState::Failed;
+            }
+            else
+            {
+                transaction.state = GraphGroupSlotState::Terminal;
+                ++execution_sequence_.next_graph_ordinal;
+                execution_sequence_.state = ExecutionSequenceState::Open;
+            }
             ++transaction_count_;
             graph_group_completion_cv_.notify_all();
         }
@@ -1244,78 +1943,81 @@ namespace llaminar2
     void MoEOverlayInferenceTransactionCoordinator::resetGraphSequenceLocked()
         noexcept
     {
-        for (auto &transaction : retained_transactions_)
+        for (auto &transaction : graph_group_slots_)
         {
-            transaction.used = false;
-            transaction.armed = false;
+            transaction.state = GraphGroupSlotState::Available;
             transaction.group_id = 0;
+            transaction.sequence_id = 0;
+            transaction.sequence_graph_ordinal = -1;
+            transaction.sequence_graph_count = 0;
             transaction.descriptor = {};
+            transaction.interference_ticket = {};
+            transaction.interference_completion_published = false;
+            std::fill(
+                transaction.entered_participants.begin(),
+                transaction.entered_participants.end(),
+                std::uint8_t{0});
+            std::fill(
+                transaction.terminal_participants.begin(),
+                transaction.terminal_participants.end(),
+                std::uint8_t{0});
+            std::fill(
+                transaction.participant_completion_events.begin(),
+                transaction.participant_completion_events.end(),
+                nullptr);
+            std::fill(
+                transaction.participant_completion_recorded.begin(),
+                transaction.participant_completion_recorded.end(),
+                std::uint8_t{0});
             std::fill(
                 transaction.target_transactions.begin(),
                 transaction.target_transactions.end(),
                 MoEOverlayPublishedInferenceTransaction{});
         }
         transaction_count_ = 0;
-        graph_group_active_ = false;
-        graph_execution_failed_ = false;
-        mtp_depth_declared_ = false;
-        active_mtp_draft_depth_ = -1;
-        next_sidecar_ordinal_ = 0;
-        sequence_main_graph_count_ = 0;
-        sequence_sidecar_graph_count_ = 0;
-        sequence_verifier_graph_count_ = 0;
+        execution_sequence_.reset();
     }
 
     bool MoEOverlayInferenceTransactionCoordinator::
         retireCompletedGraphSequenceLocked(std::string *error)
     {
         if (state_ != MoEOverlayInferenceProtocolState::Active ||
-            !mtp_depth_declared_ || graph_group_active_ ||
-            graph_execution_failed_ || transaction_count_ == 0)
+            execution_sequence_.state != ExecutionSequenceState::Open ||
+            transaction_count_ == 0 ||
+            execution_sequence_.next_graph_ordinal !=
+                execution_sequence_.expectedGraphCount() ||
+            transaction_count_ != static_cast<std::size_t>(
+                                      execution_sequence_.expectedGraphCount()))
         {
             return failLocked(
                 "ExpertOverlay graph sequence cannot retire before every local graph and sparse return complete",
                 error);
         }
 
-        const bool serial_shape =
-            active_mtp_draft_depth_ == 0 &&
-            sequence_main_graph_count_ == 1 &&
-            sequence_sidecar_graph_count_ == 0 &&
-            sequence_verifier_graph_count_ == 0;
-        const bool speculative_shape =
-            active_mtp_draft_depth_ > 0 &&
-            sequence_main_graph_count_ <= 1 &&
-            sequence_sidecar_graph_count_ == active_mtp_draft_depth_ &&
-            sequence_verifier_graph_count_ == 1;
-        if (!serial_shape && !speculative_shape)
-        {
-            return failLocked(
-                "ExpertOverlay graph sequence does not contain one complete "
-                "serial or speculative transaction: admitted_draft_depth=" +
-                    std::to_string(active_mtp_draft_depth_) +
-                    " main_graphs=" +
-                    std::to_string(sequence_main_graph_count_) +
-                    " sidecar_graphs=" +
-                    std::to_string(sequence_sidecar_graph_count_) +
-                    " verifier_graphs=" +
-                    std::to_string(sequence_verifier_graph_count_) +
-                    " retained_transactions=" +
-                    std::to_string(transaction_count_),
-                error);
-        }
-
+        execution_sequence_.state = ExecutionSequenceState::Releasing;
+        const int retired_draft_depth = execution_sequence_.draft_depth;
         const std::size_t retired_count = transaction_count_;
+        std::uint64_t retired_prefill_tokens = 0u;
         for (std::size_t transaction_index = 0;
              transaction_index < retired_count;
              ++transaction_index)
         {
-            auto &transaction = retained_transactions_[transaction_index];
-            if (!transaction.used || !transaction.armed)
+            auto &transaction = graph_group_slots_[transaction_index];
+            if (transaction.state != GraphGroupSlotState::Terminal ||
+                !transaction.armed())
             {
                 return failLocked(
                     "ExpertOverlay graph sequence contains an uninitialized or unarmed retained transaction",
                     error);
+            }
+            if (transaction.descriptor.graph_role ==
+                MoEOverlayInferenceGraphRole::MainPrefill)
+            {
+                retired_prefill_tokens +=
+                    static_cast<std::uint64_t>(
+                        transaction.descriptor.request_count) *
+                    static_cast<std::uint64_t>(
+                        transaction.descriptor.logical_rows_per_request);
             }
             for (std::size_t target = 0;
                  target < config_.publishers.size(); ++target)
@@ -1333,6 +2035,20 @@ namespace llaminar2
                 }
             }
         }
+        if (retired_prefill_tokens != 0u &&
+            config_.retired_prefill_progress_sink)
+        {
+            std::string progress_error;
+            if (!config_.retired_prefill_progress_sink(
+                    retired_prefill_tokens, &progress_error))
+            {
+                return failLocked(
+                    progress_error.empty()
+                        ? "ExpertOverlay continuation prefill progress sideband rejected a retired transaction"
+                        : std::move(progress_error),
+                    error);
+            }
+        }
         total_transaction_count_ += retired_count;
         PerfStatsCollector::addCounter(
             "moe_overlay_transaction",
@@ -1342,7 +2058,7 @@ namespace llaminar2
             "continuation_rank",
             {{"action", "retire"},
              {"command", std::to_string(active_command_.command_id)},
-             {"draft_depth", std::to_string(active_mtp_draft_depth_)},
+             {"draft_depth", std::to_string(retired_draft_depth)},
              {"transactions", std::to_string(retired_count)}});
         resetGraphSequenceLocked();
         return true;
@@ -1357,6 +2073,81 @@ namespace llaminar2
         return retireCompletedGraphSequenceLocked(error);
     }
 
+    bool MoEOverlayInferenceTransactionCoordinator::
+        advanceHostedGraphSequence(
+            std::uint64_t transaction_id,
+            std::optional<int> next_draft_depth,
+            std::string *error)
+    {
+        std::lock_guard lock(mutex_);
+        if (error)
+            error->clear();
+
+        if (transaction_id == 0)
+        {
+            return failLocked(
+                "ExpertOverlay hosted graph transition requires a positive authenticated transaction id",
+                error);
+        }
+        if (next_draft_depth &&
+            (*next_draft_depth <= 0 ||
+             *next_draft_depth > config_.max_mtp_draft_depth))
+        {
+            return failLocked(
+                "ExpertOverlay hosted graph transition selected a depth outside the retained MTP family",
+                error);
+        }
+
+        /*
+         * Rank-local participants enter independently on persistent workers.
+         * Once one participant applies a ticket, every sibling must observe the
+         * exact same decision as an idempotent read. This replaces the former
+         * participant-zero mutation/sibling-sampling race.
+         */
+        if (transaction_id == last_hosted_sequence_transition_id_)
+        {
+            if (next_draft_depth !=
+                last_hosted_sequence_next_draft_depth_)
+            {
+                return failLocked(
+                    "ExpertOverlay symmetric participants presented divergent hosted graph transitions",
+                    error);
+            }
+            return true;
+        }
+        if (transaction_id < last_hosted_sequence_transition_id_)
+        {
+            return failLocked(
+                "ExpertOverlay hosted graph transition replayed a stale transaction id",
+                error);
+        }
+
+        if (!retireCompletedGraphSequenceLocked(error))
+            return false;
+        if (next_draft_depth &&
+            !beginGraphSequenceLocked(*next_draft_depth, error))
+        {
+            return false;
+        }
+
+        last_hosted_sequence_transition_id_ = transaction_id;
+        last_hosted_sequence_next_draft_depth_ = next_draft_depth;
+        PerfStatsCollector::addCounter(
+            "moe_overlay_transaction",
+            "hosted_sequence_transitions",
+            1.0,
+            "decode",
+            "continuation_rank",
+            {{"transaction", std::to_string(transaction_id)},
+             {"terminal", next_draft_depth ? "false" : "true"},
+             {"next_depth",
+              next_draft_depth
+                  ? std::to_string(*next_draft_depth)
+                  : "terminal"},
+             {"authority", "idempotent_ticket"}});
+        return true;
+    }
+
     bool MoEOverlayInferenceTransactionCoordinator::completeCommand(
         std::uint64_t placement_epoch,
         std::string *error)
@@ -1365,7 +2156,10 @@ namespace llaminar2
         if (error)
             error->clear();
         if (state_ != MoEOverlayInferenceProtocolState::Active ||
-            graph_group_active_ || graph_execution_failed_ ||
+            execution_sequence_.state ==
+                ExecutionSequenceState::GraphInFlight ||
+            execution_sequence_.state == ExecutionSequenceState::Releasing ||
+            execution_sequence_.state == ExecutionSequenceState::Failed ||
             placement_epoch < current_placement_epoch_)
         {
             return failLocked(
@@ -1373,10 +2167,29 @@ namespace llaminar2
                 error);
         }
 
-        if (mtp_depth_declared_ &&
+        if (execution_sequence_.active() &&
             !retireCompletedGraphSequenceLocked(error))
         {
             return false;
+        }
+
+        if (declared_prefill_schedule_)
+        {
+            if (total_transaction_count_ !=
+                declared_prefill_schedule_end_ordinal_)
+            {
+                return failLocked(
+                    "ExpertOverlay command completed before its declared aggregate prefill schedule cardinality",
+                    error);
+            }
+            if (declared_prefill_probe_ticket_.valid() &&
+                (!declared_prefill_probe_released_ ||
+                 !declared_prefill_terminal_published_))
+            {
+                return failLocked(
+                    "ExpertOverlay command completed before the aggregate prefill probe owned its exact final-device terminal",
+                    error);
+            }
         }
 
         for (const auto &publisher : config_.publishers)
@@ -1403,6 +2216,12 @@ namespace llaminar2
              {"command", std::to_string(active_command_.command_id)},
              {"transactions", std::to_string(total_transaction_count_)},
              {"graph_sequences", std::to_string(graph_sequence_count_)}});
+        declared_prefill_schedule_.reset();
+        declared_prefill_schedule_begin_ordinal_ = 0;
+        declared_prefill_schedule_end_ordinal_ = 0;
+        declared_prefill_probe_ticket_ = {};
+        declared_prefill_probe_released_ = false;
+        declared_prefill_terminal_published_ = false;
         return true;
     }
 
@@ -1426,6 +2245,22 @@ namespace llaminar2
                 current_placement_epoch_, placement_epoch);
             bool ok = true;
             std::string first_error;
+            if (declared_prefill_probe_ticket_.valid() &&
+                !declared_prefill_probe_released_ &&
+                prefill_interference_probe_)
+            {
+                if (!prefill_interference_probe_->discardSample(
+                        declared_prefill_probe_ticket_))
+                {
+                    ok = false;
+                    first_error =
+                        "ExpertOverlay abort could not release its aggregate prefill probe ticket";
+                }
+                else
+                {
+                    declared_prefill_probe_released_ = true;
+                }
+            }
             for (const auto &publisher : config_.publishers)
             {
                 std::string publisher_error;
@@ -1484,7 +2319,9 @@ namespace llaminar2
         noexcept
     {
         std::lock_guard lock(mutex_);
-        return active_mtp_draft_depth_;
+        return execution_sequence_.state == ExecutionSequenceState::Idle
+                   ? -1
+                   : execution_sequence_.draft_depth;
     }
 
     MoEOverlayInferenceParticipantGraphScope::
@@ -1631,7 +2468,10 @@ namespace llaminar2
         MoEOverlayInferenceTransactionFollower(Config config)
         : channel_(std::move(config.channel)),
           executor_(config.executor),
-          protocol_(std::move(config.protocol))
+          protocol_(std::move(config.protocol)),
+          interference_probe_(std::move(config.interference_probe)),
+          retired_prefill_progress_sink_(
+              std::move(config.retired_prefill_progress_sink))
     {
         validateConstruction();
     }
@@ -1658,11 +2498,25 @@ namespace llaminar2
     MoEOverlayInferenceTransactionFollower::runOneCommand()
     {
         MoEOverlayInferenceFollowerCommandResult result;
+        std::optional<MoEOverlayInferenceWorkloadIdentity>
+            active_prefill_schedule;
+        std::optional<MoEOverlayInferenceInterferenceScope>
+            active_prefill_scope;
+        int active_prefill_transactions = 0;
+        const auto discard_active_prefill = [&]() noexcept
+        {
+            if (active_prefill_scope)
+                active_prefill_scope->discard();
+            active_prefill_scope.reset();
+            active_prefill_schedule.reset();
+            active_prefill_transactions = 0;
+        };
         while (true)
         {
             const auto received = channel_->receive();
             if (!received.ok)
             {
+                discard_active_prefill();
                 result.error = received.error;
                 return result;
             }
@@ -1676,6 +2530,7 @@ namespace llaminar2
                 if (!protocol_.beginCommand(
                         ticket.commandIdentity(), &result.error))
                 {
+                    discard_active_prefill();
                     return result;
                 }
             }
@@ -1685,12 +2540,20 @@ namespace llaminar2
             if (admission.status ==
                 MoEOverlayInferenceAdmissionStatus::Complete)
             {
+                if (active_prefill_schedule)
+                {
+                    discard_active_prefill();
+                    result.error =
+                        "ExpertOverlay follower received Complete before its aggregate prefill schedule terminal";
+                    return result;
+                }
                 result.ok = true;
                 return result;
             }
             if (admission.status ==
                 MoEOverlayInferenceAdmissionStatus::Aborted)
             {
+                discard_active_prefill();
                 result.aborted = true;
                 result.error_code = ticket.error_code;
                 result.error = "Continuation authority aborted ExpertOverlay transaction command";
@@ -1698,6 +2561,7 @@ namespace llaminar2
             }
             if (!admission.accepted())
             {
+                discard_active_prefill();
                 result.error = admission.error.empty()
                                    ? "ExpertOverlay follower rejected a transaction ticket"
                                    : admission.error;
@@ -1707,6 +2571,7 @@ namespace llaminar2
             if (!protocol_.markSubmitted(
                     admission.slot_index, ticket, &result.error))
             {
+                discard_active_prefill();
                 return result;
             }
             const auto protocol_end = std::chrono::steady_clock::now();
@@ -1716,10 +2581,86 @@ namespace llaminar2
                 "follower",
                 protocol_begin,
                 protocol_end);
+
+            const auto prefill_schedule =
+                ticket.prefillScheduleWorkload();
+            if (prefill_schedule.valid())
+            {
+                if (!active_prefill_schedule)
+                {
+                    active_prefill_schedule = prefill_schedule;
+                    active_prefill_transactions = 0;
+                    active_prefill_scope.emplace(
+                        interference_probe_.get(), prefill_schedule);
+                }
+                else if (*active_prefill_schedule != prefill_schedule)
+                {
+                    discard_active_prefill();
+                    result.error =
+                        "ExpertOverlay follower observed a changing aggregate prefill workload before its declared terminal";
+                    return result;
+                }
+                if (active_prefill_transactions >=
+                    prefill_schedule.transaction_count)
+                {
+                    discard_active_prefill();
+                    result.error =
+                        "ExpertOverlay follower aggregate prefill schedule exceeded its authenticated transaction count";
+                    return result;
+                }
+            }
+            else if (active_prefill_schedule)
+            {
+                discard_active_prefill();
+                result.error =
+                    "ExpertOverlay follower aggregate prefill schedule was interrupted by an unscoped transaction";
+                return result;
+            }
+
+            std::optional<MoEOverlayInferenceInterferenceScope>
+                transaction_scope;
+            if (!prefill_schedule.valid())
+            {
+                ExpertHistogramSource source =
+                    ExpertHistogramSource::SyntheticTest;
+                int speculative_depth = 0;
+                if (ticket.graph_role ==
+                    MoEOverlayInferenceGraphRole::MainPrefill)
+                {
+                    source = ExpertHistogramSource::PrefillChunk;
+                }
+                else if (ticket.graph_role ==
+                         MoEOverlayInferenceGraphRole::MainDecode)
+                {
+                    source = ExpertHistogramSource::DecodeToken;
+                }
+                else if (ticket.graph_role ==
+                         MoEOverlayInferenceGraphRole::MTPGroupedVerifier)
+                {
+                    source = ExpertHistogramSource::GroupedVerifier;
+                    speculative_depth = ticket.draft_depth;
+                }
+                if (source != ExpertHistogramSource::SyntheticTest)
+                {
+                    transaction_scope.emplace(
+                        interference_probe_.get(),
+                        makeMoEOverlayInferenceWorkloadIdentity(
+                            source,
+                            ticket.request_count *
+                                ticket.logical_rows_per_request,
+                            ticket.request_count *
+                                ticket.physical_rows_per_request,
+                            /*transaction_count=*/1,
+                            speculative_depth));
+                }
+            }
             const auto execution_begin = protocol_end;
             if (!executor_->executeMoEOverlayInferenceTransaction(
                     ticket, &result.error))
             {
+                if (transaction_scope)
+                    transaction_scope->discard();
+                discard_active_prefill();
                 if (result.error.empty())
                 {
                     result.error =
@@ -1729,6 +2670,24 @@ namespace llaminar2
                 return result;
             }
             const auto execution_end = std::chrono::steady_clock::now();
+            transaction_scope.reset();
+            if (prefill_schedule.valid())
+            {
+                ++active_prefill_transactions;
+                if (active_prefill_transactions ==
+                    prefill_schedule.transaction_count)
+                {
+                    /*
+                     * executeMoEOverlayInferenceTransaction returns only after
+                     * the retained follower graph and sparse return handoff are
+                     * terminal, so the last graph closes the same complete
+                     * logical schedule carried by the continuation event set.
+                     */
+                    active_prefill_scope.reset();
+                    active_prefill_schedule.reset();
+                    active_prefill_transactions = 0;
+                }
+            }
             recordTicketTiming(
                 ticket,
                 "follower_graph_execution",
@@ -1740,7 +2699,28 @@ namespace llaminar2
                 !protocol_.retire(
                     admission.slot_index, ticket, &result.error))
             {
+                discard_active_prefill();
                 return result;
+            }
+            if (ticket.graph_role ==
+                    MoEOverlayInferenceGraphRole::MainPrefill &&
+                retired_prefill_progress_sink_)
+            {
+                const std::uint64_t completed_tokens =
+                    static_cast<std::uint64_t>(ticket.request_count) *
+                    static_cast<std::uint64_t>(
+                        ticket.logical_rows_per_request);
+                if (!retired_prefill_progress_sink_(
+                        completed_tokens, &result.error))
+                {
+                    discard_active_prefill();
+                    if (result.error.empty())
+                    {
+                        result.error =
+                            "ExpertOverlay follower prefill progress sideband rejected a retired transaction";
+                    }
+                    return result;
+                }
             }
             recordTicketTiming(
                 ticket,

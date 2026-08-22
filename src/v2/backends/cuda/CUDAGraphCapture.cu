@@ -1525,21 +1525,44 @@ namespace llaminar2
         }
 
         /*
-         * Graph composition errors are otherwise reported only as
-         * cudaErrorInvalidValue, which loses the structural reason and the
-         * offending node. Instantiation is a cold graph-publication operation,
-         * so a bounded stack log has no inference-path allocation or transfer
-         * cost. Keeping these outputs populated makes unsupported nodes inside
-         * nested conditional bodies diagnosable from an ordinary E2E log.
+         * CUDA normally assigns every graph kernel the launch stream's
+         * priority, discarding the priorities of streams that participated in
+         * capture. That would make a latency-critical transfer-progress branch
+         * sit behind the main inference wave again. Preserve each kernel node's
+         * captured stream priority for every production executable; ordinary
+         * single-stream graphs retain exactly their prior scheduling semantics.
+         *
+         * `cudaGraphInstantiateWithParams` currently accepts this flag on CUDA
+         * 13 but publishes an executable whose queried flags omit it. Use the
+         * dedicated flags entrypoint that the latency proof exercises. Older
+         * headers retain the bounded diagnostic buffer because they cannot
+         * express node-priority instantiation.
          */
         cudaGraphNode_t error_node = nullptr;
         std::array<char, 8192> instantiate_log{};
+        std::size_t free_bytes_before = 0u;
+        std::size_t total_bytes_before = 0u;
+        const cudaError_t memory_before_status = cudaMemGetInfo(
+            &free_bytes_before,
+            &total_bytes_before);
+        if (memory_before_status != cudaSuccess)
+        {
+            LOG_ERROR(
+                "[CUDAGraphCapture] Cannot account graph-executable VRAM before instantiation: "
+                << cudaGetErrorString(memory_before_status));
+            return false;
+        }
+#if CUDART_VERSION >= 11040
+        cudaError_t err = cudaGraphInstantiateWithFlags(
+            &exec_, graph_, cudaGraphInstantiateFlagUseNodePriority);
+#else
         cudaError_t err = cudaGraphInstantiate(
             &exec_,
             graph_,
             &error_node,
             instantiate_log.data(),
             instantiate_log.size());
+#endif
         if (err != cudaSuccess)
         {
             cudaGraphNodeType error_node_type = cudaGraphNodeTypeCount;
@@ -1558,7 +1581,47 @@ namespace llaminar2
             exec_ = nullptr;
             return false;
         }
-        LOG_DEBUG("[CUDAGraphCapture] Instantiated graph executable (" << node_count_ << " nodes)");
+        std::size_t free_bytes_after = 0u;
+        std::size_t total_bytes_after = 0u;
+        const cudaError_t memory_after_status = cudaMemGetInfo(
+            &free_bytes_after,
+            &total_bytes_after);
+        if (memory_after_status != cudaSuccess ||
+            total_bytes_after != total_bytes_before)
+        {
+            LOG_ERROR(
+                "[CUDAGraphCapture] Cannot account graph-executable VRAM after instantiation: status="
+                << cudaGetErrorString(memory_after_status)
+                << " total_before=" << total_bytes_before
+                << " total_after=" << total_bytes_after);
+            const cudaError_t destroy_error = cudaGraphExecDestroy(exec_);
+            if (destroy_error != cudaSuccess)
+            {
+                LOG_ERROR(
+                    "[CUDAGraphCapture] Failed to destroy an executable after its VRAM accounting failed: "
+                    << cudaGetErrorString(destroy_error));
+            }
+            exec_ = nullptr;
+            return false;
+        }
+        /*
+         * Native graph storage is opaque to Llaminar's allocators. Measuring
+         * the setup-only free-memory delta gives capacity admission a concrete
+         * device/node-count observation without adding any query to replay or
+         * inference. A positive delta is resident graph/driver storage; an
+         * increase is reported as zero because the CUDA allocator may retire
+         * unrelated deferred state at this exact setup boundary.
+         */
+        const std::size_t resident_delta_bytes =
+            free_bytes_before > free_bytes_after
+                ? free_bytes_before - free_bytes_after
+                : 0u;
+        LOG_DEBUG(
+            "[CUDAGraphCapture] Instantiated graph executable ("
+            << node_count_
+            << " nodes, captured node priorities requested, resident_delta_bytes="
+            << resident_delta_bytes
+            << ", free_bytes_after=" << free_bytes_after << ")");
         return true;
     }
 

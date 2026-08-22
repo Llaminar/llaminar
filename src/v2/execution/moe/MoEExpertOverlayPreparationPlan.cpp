@@ -240,7 +240,8 @@ namespace llaminar2
             const MoEExpertOverlayPreparationRequest &request,
             const OverlayRankPlan &rank_plan)
         {
-            if (request.fallback && request.device.is_cpu() && !rank_plan.builds_root_graph)
+            if (request.fallback && request.device.is_cpu() &&
+                rank_plan.usesExpertTransactionFollower())
                 return WeightResidencyCategory::WorkerFallbackExpert;
             return request.residency_category;
         }
@@ -582,12 +583,35 @@ namespace llaminar2
     MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::filteredForDevice(
         DeviceId device) const
     {
+        return filteredForDevices({device});
+    }
+
+    MoEExpertOverlayPreparationPlan MoEExpertOverlayPreparationPlan::filteredForDevices(
+        const std::vector<DeviceId> &devices) const
+    {
+        if (devices.empty() ||
+            std::any_of(
+                devices.begin(),
+                devices.end(),
+                [](DeviceId device)
+                { return !device.is_valid(); }))
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay preparation device set must be non-empty and valid");
+        }
+        std::set<DeviceId> device_set(devices.begin(), devices.end());
+        if (device_set.size() != devices.size())
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay preparation device set contains duplicates");
+        }
+
         MoEExpertOverlayPreparationPlan filtered;
         std::set<std::tuple<std::string, DeviceId, int, int, WeightResidencyCategory, int, int>> counted_experts;
 
         for (const auto &request : requests_)
         {
-            if (request.device != device)
+            if (!device_set.contains(request.device))
                 continue;
 
             filtered.requests_.push_back(request);

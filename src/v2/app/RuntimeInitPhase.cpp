@@ -503,6 +503,10 @@ namespace llaminar2
         if (config.dry_run)
         {
             runDryRunPreflight(config, *runner, mpi_ctx->rank(), std::cout);
+            // The runner may own duplicated communicators even when preflight
+            // builds no executable graph. Release them before finalizing the
+            // process-wide MPI session.
+            runner->shutdown();
             mpiShutdown();
             return std::nullopt;
         }
@@ -513,6 +517,10 @@ namespace llaminar2
             {
                 LOG_ERROR("Failed to initialize: " << runner->lastError());
             }
+            // Initialization is transactional but may already have created
+            // graph runners, mapped fabrics, and private MPI communicators.
+            // Their dependency DAG must be dismantled while MPI is live.
+            runner->shutdown();
             mpiShutdown();
             return std::nullopt;
         }
@@ -525,6 +533,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Failed to get tokenizer from runner");
             }
+            runner->shutdown();
             mpiShutdown();
             return std::nullopt;
         }

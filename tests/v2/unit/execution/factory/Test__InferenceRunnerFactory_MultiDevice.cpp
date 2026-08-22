@@ -797,12 +797,15 @@ namespace
                 "src/v2/execution/factory/InferenceRunnerFactory.cpp");
         ASSERT_FALSE(source.empty());
 
-        EXPECT_NE(
-            source.find(
-                "participant.world_rank == rank &&\n"
-                "                participant.device == graph_device"),
-            std::string::npos)
-            << "overlay slice selection must authenticate both MPI rank and exact graph device";
+        EXPECT_NE(source.find("participant.world_rank == rank &&"),
+                  std::string::npos)
+            << "overlay slice selection must authenticate the exact MPI rank";
+        EXPECT_NE(source.find("participant.device == graph_device ||"),
+                  std::string::npos)
+            << "ordinary LocalTP slices must authenticate the exact graph device";
+        EXPECT_NE(source.find("graph_owns_colocated_cpu_endpoints &&"),
+                  std::string::npos)
+            << "only the continuation-root graph may add colocated CPU sparse endpoints";
         EXPECT_GE(
             countFactorySourceOccurrences(
                 source,
@@ -882,7 +885,7 @@ namespace
         EXPECT_TRUE(resolved_plan->routed_tiers[1].fallback);
         EXPECT_EQ(
             resolved_plan->authority_execution,
-            MoEOverlayAuthorityExecutionKind::HostCoordinated);
+            MoEOverlayAuthorityExecutionKind::HostResident);
     }
 
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PreservesExplicitPlacements)
@@ -908,7 +911,7 @@ namespace
             MoEOverlayAuthorityExecutionKind::Unresolved);
         EXPECT_EQ(
             resolved_plan->authority_execution,
-            MoEOverlayAuthorityExecutionKind::HostCoordinated);
+            MoEOverlayAuthorityExecutionKind::HostResident);
         EXPECT_TRUE(explicit_plan->continuation_domain_spec.domain.empty());
         EXPECT_EQ(
             resolved_plan->continuation_domain_spec.domain,

@@ -16,6 +16,7 @@
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "execution/moe/ExpertTierWeightTransferLane.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
+#include "kernels/common/MoEProjectionNumericalContract.h"
 #include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
@@ -1416,22 +1417,33 @@ namespace llaminar2
             int source_kb = 0;
             int normalized_kb = 0;
             int ignored_waves = 0;
+            constexpr std::uint8_t normalized_default_policy =
+                native_vnni_formats::Q8_0.codebook_id;
+            ASSERT_NE(
+                compact.source_codebook_id,
+                normalized_default_policy)
+                << "The witness must distinguish source-policy provenance";
             ASSERT_TRUE(
                 rocmGemv_native_vnni_query_serial_m1_config_with_policy(
-                    compact.codebook_id,
+                    compact.source_codebook_id,
                     N,
                     K,
                     &source_kb,
                     &ignored_waves));
             ASSERT_TRUE(
                 rocmGemv_native_vnni_query_serial_m1_config_with_policy(
-                    19,
+                    normalized_default_policy,
                     N,
                     K,
                     &normalized_kb,
                     &ignored_waves));
-            ASSERT_NE(source_kb, normalized_kb)
-                << "The witness must distinguish source and normalized policies";
+            const int contract_kb =
+                MoEProjectionNumericalContract::orderedKPartitionsForWidth(K);
+            ASSERT_GT(contract_kb, 0);
+            EXPECT_EQ(source_kb, contract_kb)
+                << "The compact source must use the cross-backend reduction tree";
+            EXPECT_EQ(normalized_kb, contract_kb)
+                << "Expanded storage must not invent a placement-specific tree";
 
             for (const int rows : {1, verifier_rows, prefill_rows})
             {
@@ -1475,7 +1487,7 @@ namespace llaminar2
                     compact_scales.data(),
                     compact_mins.data(),
                     compact.codebook_id,
-                    compact.codebook_id,
+                    compact.source_codebook_id,
                     compact_output.data()));
                 ASSERT_TRUE(launch(
                     promoted_payload.data(),
@@ -1528,32 +1540,35 @@ namespace llaminar2
                     });
             };
             EXPECT_TRUE(has_policy_record(
-                small_m_records, 1, compact.codebook_id, compact.codebook_id));
+                small_m_records,
+                1,
+                compact.codebook_id,
+                compact.source_codebook_id));
             EXPECT_TRUE(has_policy_record(
                 small_m_records,
                 1,
                 layout.gpu_codebook_id,
-                compact.codebook_id));
+                compact.source_codebook_id));
             EXPECT_TRUE(has_policy_record(
                 small_m_records,
                 verifier_rows,
                 layout.gpu_codebook_id,
-                compact.codebook_id));
+                compact.source_codebook_id));
             EXPECT_TRUE(has_policy_record(
                 prefill_records,
                 prefill_rows,
                 layout.gpu_codebook_id,
-                compact.codebook_id));
+                compact.source_codebook_id));
             EXPECT_FALSE(has_policy_record(
                 small_m_records,
                 1,
                 layout.gpu_codebook_id,
-                19));
+                normalized_default_policy));
             EXPECT_FALSE(has_policy_record(
                 prefill_records,
                 prefill_rows,
                 layout.gpu_codebook_id,
-                19));
+                normalized_default_policy));
 
             const auto stats = lane.stats();
             EXPECT_EQ(stats.transfers_completed, 2u);

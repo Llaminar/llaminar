@@ -887,9 +887,11 @@ namespace llaminar2
 
             // Initialize tensor_views_ storage for get_k()/get_v() wrappers.
             tensor_views_.resize(n_layers_);
+            device_ring_views_.resize(n_layers_);
             for (int layer = 0; layer < n_layers_; ++layer)
             {
                 tensor_views_[layer].resize(batch_size_);
+                device_ring_views_[layer].resize(batch_size_);
             }
 
             initializeBatchedEntryPointerTables();
@@ -2076,6 +2078,106 @@ namespace llaminar2
             return -1;
 
         return actual_max_kv_len;
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::get_kv_device_ring_view(
+        int layer,
+        int seq_idx,
+        ITensor **out_k,
+        ITensor **out_v,
+        const int **device_head,
+        const int **device_count,
+        int *physical_capacity,
+        void *gpu_stream)
+    {
+        requireGPUExecutionStream(
+            gpu_stream,
+            "ROCmRingKVCache::get_kv_device_ring_view");
+        if (out_k)
+            *out_k = nullptr;
+        if (out_v)
+            *out_v = nullptr;
+        if (device_head)
+            *device_head = nullptr;
+        if (device_count)
+            *device_count = nullptr;
+        if (physical_capacity)
+            *physical_capacity = 0;
+
+        if constexpr (Precision == ActivationPrecision::Q8_1)
+        {
+            return false;
+        }
+        else
+        {
+            if (layer < 0 || layer >= n_layers_ || seq_idx < 0 ||
+                seq_idx >= batch_size_ || max_seq_len_ <= 0 ||
+                device_ring_views_.size() !=
+                    static_cast<std::size_t>(n_layers_) ||
+                !ROCmRingKVCacheBase::deviceRingHeadPtr(layer, seq_idx) ||
+                !ROCmRingKVCacheBase::deviceCachedTokenCountPtr(
+                    layer, seq_idx))
+            {
+                LOG_ERROR("[ROCmRingKVCache::get_kv_device_ring_view] Incomplete native ring contract"
+                          << " layer=" << layer
+                          << " seq=" << seq_idx
+                          << " capacity=" << max_seq_len_
+                          << " stream=" << gpu_stream);
+                return false;
+            }
+
+            auto &entry = entries_[layer][seq_idx];
+            if (!entry.d_K || !entry.d_V)
+            {
+                LOG_ERROR("[ROCmRingKVCache::get_kv_device_ring_view] Native ring storage is missing"
+                          << " layer=" << layer << " seq=" << seq_idx);
+                return false;
+            }
+
+            constexpr TensorType tensor_type = []() constexpr
+            {
+                if constexpr (Precision == ActivationPrecision::FP16)
+                    return TensorType::FP16;
+                if constexpr (Precision == ActivationPrecision::BF16)
+                    return TensorType::BF16;
+                return TensorType::FP32;
+            }();
+            auto &views = device_ring_views_[layer][seq_idx];
+            if (!views[0])
+            {
+                views[0] = std::make_unique<GpuTensorView>(
+                    entry.d_K,
+                    static_cast<std::size_t>(max_seq_len_),
+                    static_cast<std::size_t>(kv_dim_),
+                    tensor_type,
+                    DeviceId::rocm(device_id_));
+            }
+            if (!views[1])
+            {
+                views[1] = std::make_unique<GpuTensorView>(
+                    entry.d_V,
+                    static_cast<std::size_t>(max_seq_len_),
+                    static_cast<std::size_t>(kv_dim_),
+                    tensor_type,
+                    DeviceId::rocm(device_id_));
+            }
+
+            if (out_k)
+                *out_k = views[0].get();
+            if (out_v)
+                *out_v = views[1].get();
+            if (device_head)
+                *device_head =
+                    ROCmRingKVCacheBase::deviceRingHeadPtr(layer, seq_idx);
+            if (device_count)
+                *device_count =
+                    ROCmRingKVCacheBase::deviceCachedTokenCountPtr(
+                        layer, seq_idx);
+            if (physical_capacity)
+                *physical_capacity = max_seq_len_;
+            return true;
+        }
     }
 
     template <ActivationPrecision Precision>

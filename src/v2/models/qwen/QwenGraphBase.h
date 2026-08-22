@@ -838,11 +838,12 @@ namespace llaminar2
          * schedule. Explicit query/context requests remain isolated kernel
          * tournament controls rather than production graph policy.
          *
-         * CPU cache publication always stores post-RoPE native K so direct
-         * Q8/Q16/TurboQuant attention can consume persistent bytes without a
-         * conversion shadow. CUDA and ROCm may honor the model's
-         * @c rope_on_read preference only when a real KV cache is present; a
-         * cacheless graph must rotate its projected K before attention.
+         * CPU and native floating GPU caches publish post-RoPE K so attention
+         * can consume persistent ring bytes without a conversion shadow.
+         * CUDA and ROCm honor the model's @c rope_on_read preference for
+         * quantized caches whose established arithmetic transforms after
+         * dequantization. A cacheless graph always rotates projected K before
+         * attention.
          *
          * @param device Participant that will execute the attention node.
          * @param cache_backed True when the graph publishes and consumes a KV cache.

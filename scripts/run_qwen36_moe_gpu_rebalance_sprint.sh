@@ -699,7 +699,7 @@ run_one() {
     run_env+=("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS=${allreduce_fp16_min_elements}")
   fi
   if [[ "${perfstats}" != "0" && "${perfstats}" != "false" && "${perfstats}" != "off" ]]; then
-    local perf_filter="mtp,moe_rebalance,moe_runtime_decode,transfer,expert_transfer,tp_allreduce_bom,tp_allreduce_runtime,tp_allreduce_small_gpu,forward_graph"
+    local perf_filter="mtp,moe_rebalance,moe_overlay_controller,moe_runtime_decode,transfer,expert_transfer,tp_allreduce_bom,tp_allreduce_runtime,tp_allreduce_small_gpu,forward_graph"
     if [[ "${stage_gpu_stats}" != "0" && "${stage_gpu_stats}" != "false" && "${stage_gpu_stats}" != "off" ]]; then
       perf_filter+=",kernel,kernel_cuda,stage_gpu,forward_pass"
     fi

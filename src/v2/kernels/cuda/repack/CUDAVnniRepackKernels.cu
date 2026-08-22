@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 
+#include "kernels/common/DeviceHalfMetadataContract.h"
 #include "kernels/cuda/repack/CUDAVnniRepackKernels.h"
 #include "tensors/BlockStructures.h"
 
@@ -420,8 +421,10 @@ __global__ void cuda_repack_q4k_to_vnni(
     float d_f    = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     float dmin_f = __half2float(*reinterpret_cast<const __half*>(&blk.dmin));
 
-    d_scales[linear] = __half_as_ushort(__float2half_rn(d_f * static_cast<float>(sc)));
-    d_mins[linear]   = __half_as_ushort(__float2half_rn(-dmin_f * static_cast<float>(m_val)));
+    d_scales[linear] = canonicalPreparedHalfBits(
+        d_f * static_cast<float>(sc));
+    d_mins[linear] = canonicalPreparedHalfBits(
+        -dmin_f * static_cast<float>(m_val));
 }
 
 // ============================================================================
@@ -478,8 +481,10 @@ __global__ void cuda_repack_q5k_to_vnni(
     device_get_scale_min_k4(sub_idx, blk.scales, &sc, &m_val);
     float d_f    = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     float dmin_f = __half2float(*reinterpret_cast<const __half*>(&blk.dmin));
-    d_scales[linear] = __half_as_ushort(__float2half_rn(d_f * static_cast<float>(sc)));
-    d_mins[linear]   = __half_as_ushort(__float2half_rn(-dmin_f * static_cast<float>(m_val)));
+    d_scales[linear] = canonicalPreparedHalfBits(
+        d_f * static_cast<float>(sc));
+    d_mins[linear] = canonicalPreparedHalfBits(
+        -dmin_f * static_cast<float>(m_val));
 }
 
 // ============================================================================
@@ -539,8 +544,10 @@ __global__ void cuda_repack_q6k_to_vnni(
     const int sc_lo_idx = half * 8 + sub_in_half * 2;
     const int sc_hi_idx = sc_lo_idx + 1;
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
-    d_scales[linear] = __half_as_ushort(__float2half_rn(d_f * static_cast<float>(signed_scales[sc_lo_idx])));
-    d_mins[linear]   = __half_as_ushort(__float2half_rn(d_f * static_cast<float>(signed_scales[sc_hi_idx])));
+    d_scales[linear] = canonicalPreparedHalfBits(
+        d_f * static_cast<float>(signed_scales[sc_lo_idx]));
+    d_mins[linear] = canonicalPreparedHalfBits(
+        d_f * static_cast<float>(signed_scales[sc_hi_idx]));
 }
 
 // ============================================================================
@@ -620,8 +627,10 @@ __global__ void cuda_repack_q3k_to_vnni(
     const int sc_lo_idx = sub_idx * 2;
     const int sc_hi_idx = sub_idx * 2 + 1;
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
-    d_scales[linear] = __half_as_ushort(__float2half_rn(d_f * static_cast<float>(unpacked_scales[sc_lo_idx] - 32)));
-    d_mins[linear]   = __half_as_ushort(__float2half_rn(d_f * static_cast<float>(unpacked_scales[sc_hi_idx] - 32)));
+    d_scales[linear] = canonicalPreparedHalfBits(
+        d_f * static_cast<float>(unpacked_scales[sc_lo_idx] - 32));
+    d_mins[linear] = canonicalPreparedHalfBits(
+        d_f * static_cast<float>(unpacked_scales[sc_hi_idx] - 32));
 }
 
 // ============================================================================
@@ -678,11 +687,15 @@ __global__ void cuda_repack_q2k_to_vnni(
     const int sc_hi_idx = sub_idx * 2 + 1;
     float d_val  = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     float dmin_f = __half2float(*reinterpret_cast<const __half*>(&blk.dmin));
-    d_scales[linear] = __half_as_ushort(__float2half_rn(d_val * static_cast<float>(blk.scales[sc_lo_idx] & 0xF)));
-    d_mins[linear]   = __half_as_ushort(__float2half_rn(d_val * static_cast<float>(blk.scales[sc_hi_idx] & 0xF)));
+    d_scales[linear] = canonicalPreparedHalfBits(
+        d_val * static_cast<float>(blk.scales[sc_lo_idx] & 0xF));
+    d_mins[linear] = canonicalPreparedHalfBits(
+        d_val * static_cast<float>(blk.scales[sc_hi_idx] & 0xF));
 
-    uint16_t emb_min_lo = __half_as_ushort(__float2half_rn(-dmin_f * static_cast<float>(blk.scales[sc_lo_idx] >> 4)));
-    uint16_t emb_min_hi = __half_as_ushort(__float2half_rn(-dmin_f * static_cast<float>(blk.scales[sc_hi_idx] >> 4)));
+    uint16_t emb_min_lo = canonicalPreparedHalfBits(
+        -dmin_f * static_cast<float>(blk.scales[sc_lo_idx] >> 4));
+    uint16_t emb_min_hi = canonicalPreparedHalfBits(
+        -dmin_f * static_cast<float>(blk.scales[sc_hi_idx] >> 4));
     d_emins[linear] = static_cast<uint32_t>(emb_min_lo) | (static_cast<uint32_t>(emb_min_hi) << 16);
 }
 
@@ -715,7 +728,8 @@ __global__ void cuda_repack_iq4xs_to_vnni(
     const int ls = ((blk.scales_l[sub_idx / 2] >> (4 * (sub_idx % 2))) & 0xf)
                  | (((blk.scales_h >> (2 * sub_idx)) & 3) << 4);
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
-    d_scales[linear] = __half_as_ushort(__float2half_rn(d_f * static_cast<float>(ls - 32)));
+    d_scales[linear] = canonicalPreparedHalfBits(
+        d_f * static_cast<float>(ls - 32));
 }
 
 // ============================================================================
@@ -748,7 +762,8 @@ __global__ void cuda_repack_iq3s_to_vnni(
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     uint8_t sc_byte = blk.scales[sub_idx / 2];
     int nibble = (sub_idx & 1) ? (sc_byte >> 4) : (sc_byte & 0xF);
-    d_scales[linear] = __half_as_ushort(__float2half_rn(d_f * static_cast<float>(1 + 2 * nibble)));
+    d_scales[linear] = canonicalPreparedHalfBits(
+        d_f * static_cast<float>(1 + 2 * nibble));
 }
 
 // ============================================================================
@@ -791,7 +806,8 @@ __global__ void cuda_repack_iq3xxs_to_vnni(
 
     int nibble = static_cast<int>(aux32 >> 28);
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
-    d_scales[linear] = __half_as_ushort(__float2half_rn(d_f * (0.5f + static_cast<float>(nibble)) * 0.5f));
+    d_scales[linear] = canonicalPreparedHalfBits(
+        d_f * (0.5f + static_cast<float>(nibble)) * 0.5f);
 }
 
 // ============================================================================
@@ -824,8 +840,10 @@ __global__ void cuda_repack_iq2s_to_vnni(
 
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     uint8_t sc = blk.scales[sub_idx];
-    d_scales[linear] = __half_as_ushort(__float2half_rn(d_f * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f));
-    d_mins[linear]   = __half_as_ushort(__float2half_rn(d_f * (0.5f + static_cast<float>(sc >> 4)) * 0.25f));
+    d_scales[linear] = canonicalPreparedHalfBits(
+        d_f * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
+    d_mins[linear] = canonicalPreparedHalfBits(
+        d_f * (0.5f + static_cast<float>(sc >> 4)) * 0.25f);
 }
 
 // ============================================================================
@@ -866,8 +884,10 @@ __global__ void cuda_repack_iq2xs_to_vnni(
 
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
     uint8_t sc = blk.scales[sub_idx];
-    d_scales[linear] = __half_as_ushort(__float2half_rn(d_f * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f));
-    d_mins[linear]   = __half_as_ushort(__float2half_rn(d_f * (0.5f + static_cast<float>(sc >> 4)) * 0.25f));
+    d_scales[linear] = canonicalPreparedHalfBits(
+        d_f * (0.5f + static_cast<float>(sc & 0xF)) * 0.25f);
+    d_mins[linear] = canonicalPreparedHalfBits(
+        d_f * (0.5f + static_cast<float>(sc >> 4)) * 0.25f);
 }
 
 // ============================================================================
@@ -913,7 +933,8 @@ __global__ void cuda_repack_iq2xxs_to_vnni(
 
     int nibble = static_cast<int>(aux32_1 >> 28);
     float d_f = __half2float(*reinterpret_cast<const __half*>(&blk.d));
-    d_scales[linear] = __half_as_ushort(__float2half_rn(d_f * (0.5f + static_cast<float>(nibble)) * 0.25f));
+    d_scales[linear] = canonicalPreparedHalfBits(
+        d_f * (0.5f + static_cast<float>(nibble)) * 0.25f);
 }
 
 // ============================================================================
@@ -962,8 +983,8 @@ __global__ void cuda_repack_iq1s_to_vnni(
     constexpr float IQ1S_DELTA = 0.125f;
     float delta = (qh_word & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-    d_scales[linear] = __half_as_ushort(__float2half_rn(dl));
-    d_mins[linear]   = __half_as_ushort(__float2half_rn(dl * delta));
+    d_scales[linear] = canonicalPreparedHalfBits(dl);
+    d_mins[linear] = canonicalPreparedHalfBits(dl * delta);
 }
 
 // ============================================================================
@@ -1019,8 +1040,8 @@ __global__ void cuda_repack_iq1m_to_vnni(
         payload_buf,
         6);
 
-    d_scales[linear] = __half_as_ushort(__float2half_rn(dl1));
-    d_mins[linear]   = __half_as_ushort(__float2half_rn(dl2));
+    d_scales[linear] = canonicalPreparedHalfBits(dl1);
+    d_mins[linear] = canonicalPreparedHalfBits(dl2);
 }
 
 // ============================================================================

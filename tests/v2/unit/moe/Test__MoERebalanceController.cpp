@@ -960,30 +960,70 @@ TEST(Test__MoERebalanceController, SharedDynamicPolicyChoosesPairedOwnershipSwap
         expert_owner,
         /*num_experts=*/4,
         /*participant_count=*/2,
+        moe_rebalance_policy::DynamicOwnershipEvidenceWindow{
+            .routed_activations = 110,
+            .minimum_routed_activations = 64,
+        },
         /*imbalance_threshold_per_mille=*/1300,
-        /*min_improvement_per_mille=*/50,
-        /*min_window_activations=*/64);
+        /*min_improvement_per_mille=*/50);
 
     ASSERT_TRUE(choice.valid);
     EXPECT_EQ(choice.overloaded_participant, 0u);
     EXPECT_EQ(choice.underloaded_participant, 1u);
-    EXPECT_EQ(choice.heavy_expert, 0u);
+    EXPECT_EQ(choice.heavy_expert, 1u);
     EXPECT_EQ(choice.light_expert, 2u);
-    EXPECT_EQ(choice.heavy_count, 70u);
+    EXPECT_EQ(choice.heavy_count, 30u);
     EXPECT_EQ(choice.light_count, 1u);
     EXPECT_EQ(choice.old_min_load, 10u);
     EXPECT_EQ(choice.old_max_load, 100u);
-    EXPECT_EQ(choice.new_min_load, 31u);
-    EXPECT_EQ(choice.new_max_load, 79u);
+    EXPECT_EQ(choice.new_min_load, 39u);
+    EXPECT_EQ(choice.new_max_load, 71u);
 
     ASSERT_TRUE(moe_rebalance_policy::applyDynamicOwnershipSwap(
         participant_load,
         expert_owner,
         choice));
-    EXPECT_EQ(participant_load[0], 31u);
-    EXPECT_EQ(participant_load[1], 79u);
-    EXPECT_EQ(expert_owner[0], 1);
+    EXPECT_EQ(participant_load[0], 71u);
+    EXPECT_EQ(participant_load[1], 39u);
+    EXPECT_EQ(expert_owner[1], 1);
     EXPECT_EQ(expert_owner[2], 0);
+}
+
+TEST(Test__MoERebalanceController, SharedDynamicPolicySearchesPastExtremaOvershoot)
+{
+    uint64_t participant_load[2] = {18u, 12u};
+    uint64_t expert_counts[6] = {10u, 8u, 0u, 7u, 5u, 0u};
+    int32_t expert_owner[6] = {0, 0, 0, 1, 1, 1};
+
+    /*
+     * The old hottest-for-coldest heuristic tried 10 <-> 0, producing
+     * 8 versus 22, and then rejected the whole layer.  The exact selector must
+     * find 10 <-> 7 and reach the optimal 15/15 ownership instead.
+     */
+    const auto choice = moe_rebalance_policy::bestDynamicOwnershipSwap(
+        participant_load,
+        expert_counts,
+        expert_owner,
+        /*num_experts=*/6,
+        /*participant_count=*/2,
+        moe_rebalance_policy::DynamicOwnershipEvidenceWindow{
+            .routed_activations = 30,
+            .minimum_routed_activations = 1,
+        },
+        /*imbalance_threshold_per_mille=*/1300,
+        /*min_improvement_per_mille=*/50);
+
+    ASSERT_TRUE(choice.valid);
+    EXPECT_EQ(choice.heavy_expert, 0u);
+    EXPECT_EQ(choice.light_expert, 3u);
+    EXPECT_EQ(choice.new_min_load, 15u);
+    EXPECT_EQ(choice.new_max_load, 15u);
+    ASSERT_TRUE(moe_rebalance_policy::applyDynamicOwnershipSwap(
+        participant_load,
+        expert_owner,
+        choice));
+    EXPECT_EQ(participant_load[0], 15u);
+    EXPECT_EQ(participant_load[1], 15u);
 }
 
 TEST(Test__MoERebalanceController, SharedDynamicPolicyRejectsLayerSwapThatWorsensWaveLoad)
@@ -1076,9 +1116,12 @@ TEST(Test__MoERebalanceController, SharedDynamicPolicyChoosesCapacityReleasingSw
         expert_owner,
         /*num_experts=*/4,
         /*participant_count=*/2,
+        moe_rebalance_policy::DynamicOwnershipEvidenceWindow{
+            .routed_activations = 110,
+            .minimum_routed_activations = 64,
+        },
         /*imbalance_threshold_per_mille=*/1300,
         /*min_improvement_per_mille=*/50,
-        /*min_window_activations=*/64,
         transfer_backed_mask,
         active_transfer_slots,
         /*active_transfer_slot_capacity=*/1);

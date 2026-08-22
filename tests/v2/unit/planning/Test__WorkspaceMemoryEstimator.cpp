@@ -269,6 +269,40 @@ TEST(Test__WorkspaceMemoryEstimator,
 }
 
 TEST(Test__WorkspaceMemoryEstimator,
+     Qwen122TP2Depth15CoversRetainedMTPSerialFamily)
+{
+    auto profile = qwen35MoEProfile(true);
+    profile.architecture = "qwen35moe";
+    profile.d_model = 3072;
+    profile.d_ff = 1024;
+    profile.n_heads = 32;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 256;
+    profile.expert_feed_forward_length = 1024;
+    profile.full_attention_interval = 4;
+
+    TensorSizeInfo full_attention_q_gate;
+    full_attention_q_gate.name = "blk.3.attn_q.weight";
+    full_attention_q_gate.quant_type = "BF16";
+    full_attention_q_gate.elements = size_t{16384} * size_t{3072};
+    full_attention_q_gate.K = 3072;
+    full_attention_q_gate.layer_index = 3;
+    profile.tensors.push_back(std::move(full_attention_q_gate));
+
+    auto geometry = graphGeometry(
+        DeviceId::cuda(0), /*local_d_ff=*/512, /*total_shards=*/2);
+    geometry.resident_graph_rows = 16;
+    geometry.mtp_target_query_rows = 16;
+
+    const size_t bytes = WorkspaceMemoryEstimator::estimate(
+        profile, geometry);
+    constexpr size_t kObservedExactDepth15SerialFamilyBytes =
+        2288657668ULL;
+    EXPECT_GE(bytes, kObservedExactDepth15SerialFamilyBytes)
+        << "Depth-fifteen admission must price the retained main, grouped-verifier, and MTP namespaces before loading experts.";
+}
+
+TEST(Test__WorkspaceMemoryEstimator,
      CUDAFloatingProjectionRedirectUsesLocalOutputShard)
 {
     auto floating = qwen35MoEProfile(false);

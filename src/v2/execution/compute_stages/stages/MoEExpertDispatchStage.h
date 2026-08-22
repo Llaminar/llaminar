@@ -15,6 +15,7 @@
 #include "../../moe/CPUCurrentBatchLLEP.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <memory>
 #include <string>
@@ -23,6 +24,48 @@
 namespace llaminar2
 {
     class MoEOverlayDispatchTicketStorage;
+
+    /**
+     * @brief Sole owner responsible for closing one host dispatch epoch lease.
+     *
+     * The mapped GPU parent and the host sparse descriptor have independent
+     * residency readers. A mapped lane therefore cannot change who retires the
+     * host descriptor: ordinary dispatch closes at its final ordered sparse
+     * return, while current-batch LLEP closes at its typed restore boundary.
+     */
+    enum class MoEOverlayHostDispatchLeaseOwner : std::uint8_t
+    {
+        None = 0,          ///< Graph-frozen placement acquired no host lease.
+        FinalSparseReturn, ///< Final ordered host return owns lease retirement.
+        CurrentBatchLLEP,  ///< The current-batch LLEP restore owns retirement.
+    };
+
+    /**
+     * @brief Exact action assigned to one sparse return boundary.
+     */
+    enum class MoEOverlayHostDispatchLeaseTerminal : std::uint8_t
+    {
+        Retain = 0, ///< This boundary is not the descriptor's terminal owner.
+        Release,    ///< This is the final ordered host sparse return.
+    };
+
+    /**
+     * @brief Resolve lease action from typed ownership and return order.
+     * @param owner Unique request-lifecycle owner selected before graph wiring.
+     * @param final_ordered_return Whether this is the final host return edge.
+     * @return Release only for the exact final ordinary-dispatch boundary.
+     */
+    [[nodiscard]] constexpr MoEOverlayHostDispatchLeaseTerminal
+    moeOverlayHostDispatchLeaseTerminal(
+        MoEOverlayHostDispatchLeaseOwner owner,
+        bool final_ordered_return) noexcept
+    {
+        return owner ==
+                       MoEOverlayHostDispatchLeaseOwner::FinalSparseReturn &&
+                   final_ordered_return
+                   ? MoEOverlayHostDispatchLeaseTerminal::Release
+                   : MoEOverlayHostDispatchLeaseTerminal::Retain;
+    }
 
     struct MoEExpertDispatchEntry
     {

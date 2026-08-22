@@ -302,7 +302,19 @@ namespace llaminar2
         // =====================================================================
 
         GlobalDeviceAddress primary_device;
-        bool primary_device_numa_explicit = false;
+
+        /**
+         * @brief Whether the canonical primary address has an exact NUMA node.
+         *
+         * The address is the sole placement authority.  User-pinned and
+         * topology-resolved devices both carry a non-negative NUMA node;
+         * unresolved shorthand carries @ref NUMA_NODE_UNKNOWN.  Keeping a
+         * second "explicit" boolean allowed those two values to disagree.
+         */
+        bool hasResolvedPrimaryDeviceNuma() const noexcept
+        {
+            return primary_device.hasValidNuma();
+        }
 
         // =====================================================================
         // Convenience Methods
@@ -492,7 +504,9 @@ namespace llaminar2
             ss << "    hostname: " << hostname << "\n";
             ss << "    numa_node: " << numa_node << "\n";
             ss << "    primary_device: " << primary_device.toString() << "\n";
-            ss << "    primary_device_numa_explicit: " << (primary_device_numa_explicit ? "true" : "false") << "\n";
+            ss << "    primary_device_numa_resolved: "
+               << (hasResolvedPrimaryDeviceNuma() ? "true" : "false")
+               << "\n";
 
             ss << "  Pipeline Parallelism:\n";
             ss << "    pp_stage_id: " << pp_stage_id << "\n";

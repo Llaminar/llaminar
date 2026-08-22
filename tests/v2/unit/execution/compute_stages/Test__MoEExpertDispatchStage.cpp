@@ -28,6 +28,34 @@ namespace llaminar2::test
 namespace
 {
 
+    TEST(Test__MoEExpertDispatchLeaseLifecycle,
+         MappedParentCannotStealHostLeaseTerminalOwnership)
+    {
+        using Owner = MoEOverlayHostDispatchLeaseOwner;
+        using Terminal = MoEOverlayHostDispatchLeaseTerminal;
+
+        EXPECT_EQ(
+            moeOverlayHostDispatchLeaseTerminal(
+                Owner::FinalSparseReturn,
+                /*final_ordered_return=*/true),
+            Terminal::Release);
+        EXPECT_EQ(
+            moeOverlayHostDispatchLeaseTerminal(
+                Owner::FinalSparseReturn,
+                /*final_ordered_return=*/false),
+            Terminal::Retain);
+        EXPECT_EQ(
+            moeOverlayHostDispatchLeaseTerminal(
+                Owner::CurrentBatchLLEP,
+                /*final_ordered_return=*/true),
+            Terminal::Retain);
+        EXPECT_EQ(
+            moeOverlayHostDispatchLeaseTerminal(
+                Owner::None,
+                /*final_ordered_return=*/true),
+            Terminal::Retain);
+    }
+
     RoutedExpertTier tier(const std::string &name, const std::string &domain, bool fallback = false)
     {
         RoutedExpertTier result;
@@ -176,13 +204,25 @@ namespace
                 return MoEOverlayResidencyWaveProgress::Ready;
             }
 
-            bool beginCommit(std::string *) noexcept override
+            bool beginPrepare(std::string *) noexcept override
             {
-                ++owner_->commit_calls;
+                ++owner_->prepare_calls;
                 return true;
             }
 
-            MoEOverlayResidencyWaveProgress pollCommit(
+            MoEOverlayResidencyWaveProgress pollPrepare(
+                std::string *) noexcept override
+            {
+                return MoEOverlayResidencyWaveProgress::Ready;
+            }
+
+            bool beginPublication(std::string *) noexcept override
+            {
+                ++owner_->publication_calls;
+                return true;
+            }
+
+            MoEOverlayResidencyWaveProgress pollPublication(
                 std::string *) noexcept override
             {
                 return MoEOverlayResidencyWaveProgress::Ready;
@@ -210,7 +250,8 @@ namespace
         }
 
         int stage_calls = 0;
-        int commit_calls = 0;
+        int prepare_calls = 0;
+        int publication_calls = 0;
         int retire_calls = 0;
     };
 
@@ -397,24 +438,32 @@ TEST_F(
     EXPECT_EQ(authority->activeTicketCount(), 1u);
     EXPECT_EQ(output.residency_epoch, 1u);
 
-    const auto committing = authority->advanceBackground();
+    const auto preparing = authority->advanceBackground();
     EXPECT_EQ(
-        committing.status,
-        MoEOverlayResidencyApplyStatus::Committing);
+        preparing.status,
+        MoEOverlayResidencyApplyStatus::Preparing);
     EXPECT_EQ(authority->snapshot()->epoch, 1u);
 
-    const auto committed = authority->advanceBackground();
+    const auto publishing = authority->advanceBackground();
     ASSERT_EQ(
-        committed.status,
-        MoEOverlayResidencyApplyStatus::Committed)
-        << committed.error;
+        publishing.status,
+        MoEOverlayResidencyApplyStatus::Publishing)
+        << publishing.error;
+    EXPECT_EQ(authority->snapshot()->epoch, 1u);
+
+    const auto published = authority->advanceBackground();
+    ASSERT_EQ(
+        published.status,
+        MoEOverlayResidencyApplyStatus::Published)
+        << published.error;
     EXPECT_EQ(authority->snapshot()->epoch, 2u);
     EXPECT_EQ(output.residency_epoch, 1u)
         << "The in-flight dispatch keeps its exact immutable owner map";
     EXPECT_EQ(ticket.header->residency_epoch, 1u);
     EXPECT_EQ(authority->activeTicketCount(), 1u);
     EXPECT_EQ(transport.stage_calls, 1);
-    EXPECT_EQ(transport.commit_calls, 1);
+    EXPECT_EQ(transport.prepare_calls, 1);
+    EXPECT_EQ(transport.publication_calls, 1);
     EXPECT_EQ(transport.retire_calls, 0);
 
     output.residency_lease.reset();

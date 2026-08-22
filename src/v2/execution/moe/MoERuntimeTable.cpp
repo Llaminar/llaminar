@@ -856,6 +856,8 @@ namespace llaminar2
           num_experts_(config.num_experts),
           top_k_(config.top_k),
           mirror_to_device_(config.mirror_to_device),
+          collect_overlay_service_telemetry_(
+              config.collect_overlay_service_telemetry),
           prefill_token_capacity_(config.prefill_token_capacity),
           deferred_verifier_token_capacity_(
               config.deferred_verifier_token_capacity),
@@ -877,6 +879,11 @@ namespace llaminar2
                                         std::to_string(kDeviceMoEMaxTopK) + "]");
         if (mirror_to_device_ && !device_id_.is_gpu())
             throw std::runtime_error("[MoERuntimeTable] device mirroring requires a GPU device");
+        if (collect_overlay_service_telemetry_ && !mirror_to_device_)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] ExpertOverlay service telemetry requires a mirrored GPU table");
+        }
         if (prefill_token_capacity_ < 0)
             throw std::invalid_argument("[MoERuntimeTable] prefill_token_capacity must be non-negative");
         if (prefill_token_capacity_ > 0 && !mirror_to_device_)
@@ -981,6 +988,13 @@ namespace llaminar2
                     "canonical mirrored main table on the same device, cover "
                     "every target layer, and share the exact epoch ticket");
             }
+            if (collect_overlay_service_telemetry_ !=
+                (overlay_placement_source_
+                     ->deviceOverlayServiceTelemetry() != nullptr))
+            {
+                throw std::invalid_argument(
+                    "[MoERuntimeTable] child and canonical ExpertOverlay tables must agree on service telemetry collection");
+            }
         }
         (void)checkedRouteCapacity(prefill_token_capacity_, top_k_);
         (void)checkedRouteCapacity(deferred_verifier_token_capacity_, top_k_);
@@ -1006,6 +1020,11 @@ namespace llaminar2
             try
             {
                 allocateDeviceMirror();
+                if (collect_overlay_service_telemetry_ &&
+                    !overlay_placement_source_)
+                {
+                    allocateOverlayServiceTelemetry();
+                }
                 if (serial_route_scratch_arena_)
                 {
                     for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
@@ -1027,6 +1046,7 @@ namespace llaminar2
             }
             catch (...)
             {
+                releaseOverlayServiceTelemetry();
                 releaseDeferredVerifierRouteLedger();
                 releasePrefillRouteScratch();
                 releaseDeviceMirror();
@@ -1051,6 +1071,7 @@ namespace llaminar2
     DeviceMoERuntimeTable::~DeviceMoERuntimeTable()
     {
         releaseRuntimeHistogramDrainResources();
+        releaseOverlayServiceTelemetry();
         releaseDeferredVerifierRouteLedger();
         releasePrefillRouteScratch();
         releaseDeviceMirror();
@@ -1062,6 +1083,31 @@ namespace llaminar2
         if (mirror_to_device_)
             return device_layers_ + layer_idx;
         return host_layers_.data() + layer_idx;
+    }
+
+    DeviceMoEOverlayServiceTelemetryCell *
+    DeviceMoERuntimeTable::deviceOverlayServiceTelemetry() const noexcept
+    {
+        return overlay_placement_source_
+                   ? overlay_placement_source_
+                         ->deviceOverlayServiceTelemetry()
+                   : device_overlay_service_telemetry_;
+    }
+
+    DeviceMoEOverlayServiceTelemetrySample *
+    DeviceMoERuntimeTable::deviceOverlayServiceTelemetrySample(
+        int layer_idx) const noexcept
+    {
+        if (layer_idx < 0 || layer_idx >= num_layers_)
+            return nullptr;
+        if (overlay_placement_source_)
+        {
+            return overlay_placement_source_
+                ->deviceOverlayServiceTelemetrySample(layer_idx);
+        }
+        return device_overlay_service_samples_
+                   ? device_overlay_service_samples_ + layer_idx
+                   : nullptr;
     }
 
     DeviceMoELayerRuntime &DeviceMoERuntimeTable::hostLayerState(int layer_idx)
@@ -1085,6 +1131,15 @@ namespace llaminar2
                    : nullptr;
     }
 
+    const DeviceMoEOverlayEpochStatus *
+    DeviceMoERuntimeTable::overlayEpochStatus() const noexcept
+    {
+        return overlay_epoch_arena_
+                   ? overlay_epoch_arena_->requestStatus(
+                         overlay_epoch_ticket_slot_)
+                   : nullptr;
+    }
+
     const DeviceMoEPlacementBank *
     DeviceMoERuntimeTable::devicePlacementBanks(int layer_idx) const
     {
@@ -1096,6 +1151,83 @@ namespace llaminar2
         return reinterpret_cast<const DeviceMoEPlacementBank *>(
             reinterpret_cast<const std::byte *>(layer) +
             offsetof(DeviceMoELayerRuntime, banks));
+    }
+
+    DeviceMoERuntimeBankPublicationRecipe
+    DeviceMoERuntimeTable::preparedInactiveBankPublicationRecipe(
+        int layer_idx,
+        uint32_t epoch)
+    {
+        validateLayerIndex(layer_idx);
+        if (!mirror_to_device_ || !device_id_.is_gpu() || !device_layers_)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] inactive-bank publication recipe requires a mirrored GPU table");
+        }
+
+        auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+        const uint32_t inactive_bank = 1u - state.active_bank;
+        auto &prepared = state.banks[inactive_bank];
+        if (epoch == 0u || prepared.epoch != epoch ||
+            prepared.expert_count != static_cast<uint32_t>(num_experts_) ||
+            epoch <= state.active_epoch)
+        {
+            throw std::logic_error(
+                layerPrefix(layer_idx) +
+                "requested GPU publication does not match the prepared inactive bank");
+        }
+
+        auto *const device_runtime = device_layers_ + layer_idx;
+        DeviceMoERuntimeBankPublicationRecipe recipe{
+            .bank = inactive_bank,
+            .epoch = epoch,
+            .host_bank = &prepared,
+            .device_bank = &device_runtime->banks[inactive_bank],
+            .device_runtime = device_runtime,
+        };
+        if (!recipe.valid())
+        {
+            throw std::logic_error(
+                layerPrefix(layer_idx) +
+                "constructed an invalid GPU inactive-bank publication recipe");
+        }
+        return recipe;
+    }
+
+    void DeviceMoERuntimeTable::acknowledgeDevicePublishedBank(
+        int layer_idx,
+        uint32_t epoch,
+        uint32_t bank)
+    {
+        validateLayerIndex(layer_idx);
+        if (!mirror_to_device_ || !device_id_.is_gpu() || !device_layers_)
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] device publication acknowledgement requires a mirrored GPU table");
+        }
+
+        const size_t layer = static_cast<size_t>(layer_idx);
+        auto &state = host_layers_[layer];
+        const uint32_t inactive_bank = 1u - state.active_bank;
+        if (bank != inactive_bank || bank >= kDeviceMoEOverlayEpochBankCount ||
+            epoch == 0u || epoch <= state.active_epoch ||
+            state.banks[bank].epoch != epoch ||
+            state.banks[bank].expert_count !=
+                static_cast<uint32_t>(num_experts_))
+        {
+            throw std::logic_error(
+                layerPrefix(layer_idx) +
+                "device publication acknowledgement disagrees with the prepared inactive bank");
+        }
+
+        /*
+         * This is deliberately a host-only recipe transition.  Uploading the
+         * entire DeviceMoELayerRuntime here would race and overwrite live
+         * routing, histogram, and scratch fields owned solely by the GPU.
+         */
+        state.active_bank = bank;
+        state.active_epoch = epoch;
+        decode_runtime_publication_required_[layer] = 0u;
     }
 
     MoEOverlayRoutePlacementDeviceBinding
@@ -1132,6 +1264,7 @@ namespace llaminar2
                 },
             },
             .ticket = overlayEpochTicket(),
+            .status = overlayEpochStatus(),
             .expert_count = static_cast<uint32_t>(num_experts_),
         };
     }
@@ -1181,6 +1314,20 @@ namespace llaminar2
                state.deferred_verifier_route_participant_ids;
     }
 
+    void DeviceMoERuntimeTable::prepareDecodeHistogramProducerStream(void *stream)
+    {
+        if (mirror_to_device_ && !stream)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] mirrored decode histogram producer preparation requires an explicit stream");
+        }
+
+        std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
+        if (mirror_to_device_ && runtime_histogram_drain_enabled_)
+            registerRuntimeHistogramProducerStreamLocked(stream);
+        decode_histogram_producer_stream_ = stream;
+    }
+
     void DeviceMoERuntimeTable::recordDecodeHistogramProducerStream(void *stream)
     {
         if (mirror_to_device_ && !stream)
@@ -1188,9 +1335,17 @@ namespace llaminar2
             throw std::invalid_argument(
                 "[MoERuntimeTable] mirrored decode histogram producer stream must be explicit");
         }
+
         std::lock_guard<std::mutex> lock(runtime_histogram_drain_mutex_);
-        if (mirror_to_device_ && runtime_histogram_drain_enabled_)
-            registerRuntimeHistogramProducerStreamLocked(stream);
+        if (mirror_to_device_ && runtime_histogram_drain_enabled_ &&
+            !isRuntimeHistogramProducerStreamRegisteredLocked(stream))
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] decode histogram producer stream was not prepared before graph/eager execution");
+        }
+        /* This assignment is deliberately the only operation on the captured
+         * path. Backend event allocation and initialization ordering belong to
+         * prepareDecodeHistogramProducerStream(), before beginCapture(). */
         decode_histogram_producer_stream_ = stream;
     }
 
@@ -3131,6 +3286,119 @@ namespace llaminar2
         }
     }
 
+    void DeviceMoERuntimeTable::allocateOverlayServiceTelemetry()
+    {
+        if (!collect_overlay_service_telemetry_ ||
+            overlay_placement_source_ ||
+            device_overlay_service_telemetry_)
+        {
+            return;
+        }
+        if (!mirror_to_device_ || !device_id_.is_gpu())
+        {
+            throw std::logic_error(
+                "[MoERuntimeTable] service telemetry allocation requires the canonical mirrored GPU table");
+        }
+
+        const std::size_t cell_count =
+            deviceMoEOverlayServiceTelemetryCellCount(
+                static_cast<std::size_t>(num_layers_));
+        const std::size_t bytes =
+            cell_count * sizeof(DeviceMoEOverlayServiceTelemetryCell);
+        const std::size_t sample_bytes =
+            static_cast<std::size_t>(num_layers_) *
+            sizeof(DeviceMoEOverlayServiceTelemetrySample);
+        void *setup_stream = nullptr;
+        try
+        {
+            device_overlay_service_telemetry_ = static_cast<
+                DeviceMoEOverlayServiceTelemetryCell *>(
+                    allocateMirror(
+                        device_id_,
+                        bytes,
+                        "[MoERuntimeTable] ExpertOverlay service telemetry allocation"));
+            device_overlay_service_samples_ = static_cast<
+                DeviceMoEOverlayServiceTelemetrySample *>(
+                    allocateMirror(
+                        device_id_,
+                        sample_bytes,
+                        "[MoERuntimeTable] ExpertOverlay service sample allocation"));
+            setup_stream = createMirrorStream(
+                device_id_,
+                "[MoERuntimeTable] ExpertOverlay service telemetry setup");
+            memsetMirror(
+                device_id_,
+                device_overlay_service_telemetry_,
+                0,
+                bytes,
+                setup_stream,
+                "[MoERuntimeTable] zero ExpertOverlay service telemetry");
+            memsetMirror(
+                device_id_,
+                device_overlay_service_samples_,
+                0,
+                sample_bytes,
+                setup_stream,
+                "[MoERuntimeTable] zero ExpertOverlay service samples");
+            /*
+             * This one synchronization closes model-setup initialization
+             * before any graph can capture the stable accumulator address. It
+             * is not a request/inference operation and never orders a live
+             * producer. Subsequent timing and snapshot work uses stream/event
+             * edges only.
+             */
+            synchronizeMirror(
+                device_id_,
+                setup_stream,
+                "[MoERuntimeTable] initialize ExpertOverlay service telemetry");
+            destroyMirrorStream(
+                device_id_,
+                setup_stream,
+                "[MoERuntimeTable] ExpertOverlay service telemetry setup");
+            setup_stream = nullptr;
+            PerfStatsCollector::addCounter(
+                "memory",
+                "moe_overlay_service_telemetry_bytes",
+                static_cast<double>(bytes),
+                "model_setup",
+                device_id_.toString(),
+                {{"layers", std::to_string(num_layers_)},
+                 {"phases", std::to_string(
+                      kDeviceMoEOverlayServicePhaseCount)},
+                 {"authority", "device_local"}});
+        }
+        catch (...)
+        {
+            destroyMirrorStream(
+                device_id_,
+                setup_stream,
+                "[MoERuntimeTable] failed ExpertOverlay service telemetry setup");
+            releaseOverlayServiceTelemetry();
+            throw;
+        }
+    }
+
+    void DeviceMoERuntimeTable::releaseOverlayServiceTelemetry() noexcept
+    {
+        if (overlay_placement_source_)
+        {
+            /* The canonical table owns the shared main/MTP allocation. */
+            device_overlay_service_telemetry_ = nullptr;
+            device_overlay_service_samples_ = nullptr;
+            return;
+        }
+        freeMirror(
+            device_id_,
+            device_overlay_service_samples_,
+            "[MoERuntimeTable] free ExpertOverlay service samples");
+        freeMirror(
+            device_id_,
+            device_overlay_service_telemetry_,
+            "[MoERuntimeTable] free ExpertOverlay service telemetry");
+        device_overlay_service_telemetry_ = nullptr;
+        device_overlay_service_samples_ = nullptr;
+    }
+
     void DeviceMoERuntimeTable::allocateRuntimeHistogramDrainResources()
     {
         if (!mirror_to_device_ ||
@@ -3311,6 +3579,16 @@ namespace llaminar2
         }
         runtime_histogram_producer_streams_.push_back(
             {.stream = stream, .flip_arrival_event = event});
+    }
+
+    bool DeviceMoERuntimeTable::isRuntimeHistogramProducerStreamRegisteredLocked(
+        void *stream) const noexcept
+    {
+        return std::any_of(
+            runtime_histogram_producer_streams_.begin(),
+            runtime_histogram_producer_streams_.end(),
+            [stream](const RuntimeHistogramProducerStream &producer)
+            { return producer.stream == stream; });
     }
 
     void DeviceMoERuntimeTable::releaseRuntimeHistogramDrainResources() noexcept

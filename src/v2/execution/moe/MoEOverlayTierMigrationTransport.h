@@ -29,6 +29,28 @@ namespace llaminar2
     struct MoEOverlayTierMigrationTransportSharedStats;
 
     /**
+     * @brief Device-progress authority shared by every operation in one wave.
+     *
+     * Heterogeneous GPU relay lanes publish commands into topology-sized mapped
+     * epochs. The physical fabric implements this interface so a composite wave
+     * can advance each unique device epoch once per maintenance poll, rather
+     * than giving every projection lane a duplicate submission authority.
+     */
+    class IMoEOverlayTransferProgressAuthority
+    {
+    public:
+        virtual ~IMoEOverlayTransferProgressAuthority() = default;
+
+        /**
+         * @brief Enqueue all outstanding device progress without a device wait.
+         * @param error Optional exact worker/launch failure diagnostic.
+         * @return True after every required graph enqueue or idle no-op.
+         */
+        [[nodiscard]] virtual bool submitOutstandingTransferProgress(
+            std::string *error = nullptr) noexcept = 0;
+    };
+
+    /**
      * @brief Completed physical evidence for one expert in a migration wave.
      *
      * A rank may own none, some, or all projection observations for a
@@ -136,8 +158,9 @@ namespace llaminar2
      * @brief Inactive runtime-bank transaction associated with a transfer wave.
      *
      * Endpoint reservations, prepared-engine handles, and candidate descriptor
-     * banks remain owned here until abort or old-epoch retirement. Commit may be
-     * enqueued only after all transfer operations report Ready.
+     * banks remain owned here until abort or old-epoch retirement. Preparation
+     * may be enqueued only after all transfer operations report Ready; selector
+     * publication is a separate irreversible phase.
      */
     class IMoEOverlayInactiveBankTransaction
     {
@@ -147,16 +170,31 @@ namespace llaminar2
         /**
          * @brief Validate all candidate engines and enqueue inactive-bank build.
          * @param error Exact enqueue or completeness failure.
-         * @return Whether commit work was enqueued without blocking.
+         * @return Whether preparation work was enqueued without blocking.
          */
-        virtual bool beginCommit(std::string *error) noexcept = 0;
+        virtual bool beginPrepare(std::string *error) noexcept = 0;
 
         /**
-         * @brief Query candidate-bank readiness without waiting.
+         * @brief Query candidate-bank preparation readiness without waiting.
          * @param error Exact failure diagnostic when `Failed` is returned.
          * @return Pending, Ready, or Failed for bank construction.
          */
-        virtual MoEOverlayResidencyWaveProgress pollCommit(
+        virtual MoEOverlayResidencyWaveProgress pollPrepare(
+            std::string *error) noexcept = 0;
+
+        /**
+         * @brief Enqueue process-local inference-visible selector publication.
+         * @param error Exact enqueue or lifecycle failure.
+         * @return Whether publication was submitted without blocking.
+         */
+        virtual bool beginPublication(std::string *error) noexcept = 0;
+
+        /**
+         * @brief Query process-local selector publication without waiting.
+         * @param error Exact failure diagnostic when `Failed` is returned.
+         * @return Pending, Ready, or Failed for selector publication.
+         */
+        virtual MoEOverlayResidencyWaveProgress pollPublication(
             std::string *error) noexcept = 0;
 
         /** @brief Abort and recycle every unpublished destination reservation. */
@@ -171,6 +209,25 @@ namespace llaminar2
             std::string *error) noexcept
         {
             (void)error;
+            return MoEOverlayResidencyWaveProgress::Ready;
+        }
+
+        /**
+         * @brief Poll participant-local device readers for the prior epoch.
+         * @param error Exact grace-period failure diagnostic.
+         * @return Pending while a device reader remains, Ready when local
+         *         runtime storage may enter the distributed retirement vote,
+         *         or Failed for a broken publication lifecycle.
+         *
+         * Host-only banks have no second reader domain and therefore complete
+         * immediately. GPU-backed implementations override this method and
+         * drive their exact device RCU retirement kernels by events.
+         */
+        virtual MoEOverlayResidencyWaveProgress pollRetirementFence(
+            std::string *error) noexcept
+        {
+            if (error)
+                error->clear();
             return MoEOverlayResidencyWaveProgress::Ready;
         }
 
@@ -262,6 +319,9 @@ namespace llaminar2
         struct Config
         {
             IMoEOverlayTierPreparedWaveFactory *factory = nullptr;
+            /** Optional physical authority for mapped GPU relay progress. */
+            std::shared_ptr<IMoEOverlayTransferProgressAuthority>
+                transfer_progress_authority;
             std::size_t projections_per_expert = 3;
             /** Optional setup/runtime owner for exact movement observations. */
             std::shared_ptr<IMoEOverlayMigrationMeasurementSink>

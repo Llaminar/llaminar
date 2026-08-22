@@ -368,10 +368,10 @@ TEST(Test__HybridAllreducePrecision, Qwen36ExpertOverlayParityCasesPreserveSchem
     ASSERT_FALSE(parity_base.empty());
 
     EXPECT_NE(
-        math_fixture.find("inf_config.tp_allreduce_precision_override = \"schema\";"),
+        math_fixture.find("config.tp_allreduce_precision_override = \"schema\";"),
         std::string::npos);
     EXPECT_EQ(
-        math_fixture.find("inf_config.tp_allreduce_precision_override = \"fp16\";"),
+        math_fixture.find("config.tp_allreduce_precision_override = \"fp16\";"),
         std::string::npos);
 
     const size_t case_builder = parity_base.find(

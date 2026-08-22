@@ -32,6 +32,24 @@
 
 namespace llaminar2
 {
+    /**
+     * @brief Already-built graph family selected by an inference ticket.
+     *
+     * This enum lives in the device-friendly activation ABI because an
+     * authenticated mapped epoch carries the role from the scheduler ticket
+     * into an endpoint-private GPU grant.  Device-side consumers such as
+     * service telemetry may inspect that immutable grant without consulting a
+     * mutable host shadow or capturing one executable per semantic phase.
+     */
+    enum class MoEOverlayInferenceGraphRole : std::uint32_t
+    {
+        None = 0, ///< Required for Complete and Abort terminal tickets.
+        MainPrefill = 1, ///< Main-model prompt or bounded prefill segment.
+        MainDecode = 2, ///< Main-model one-row decode per logical request.
+        MTPDraft = 3, ///< One NextN/MTP sidecar depth per logical request.
+        MTPGroupedVerifier = 4, ///< Main-model grouped verifier transaction.
+    };
+
     /** Number of alternating payload banks in one activation transaction slot. */
     inline constexpr std::uint32_t kMoEOverlayActivationBufferCount = 2u;
 
@@ -59,8 +77,8 @@ namespace llaminar2
     /** Fixed activation-channel header magic (`MOEA`). */
     inline constexpr std::uint32_t kMoEOverlayActivationMagic = 0x41454f4du;
 
-    /** Current binary layout version. */
-    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 3u;
+    /** Current binary layout and semantic-contract version. */
+    inline constexpr std::uint32_t kMoEOverlayActivationABIVersion = 4u;
 
     /** Device endpoint participating in one sparse activation round trip. */
     enum class MoEOverlayActivationEndpoint : std::uint32_t
@@ -210,7 +228,16 @@ namespace llaminar2
         std::uint64_t transaction_ordinal = 0u;
         std::uint64_t logical_step_id = 0u;
         std::uint64_t workspace_generation = 0u;
-        std::uint64_t placement_epoch = 0u;
+        /**
+         * Oldest placement epoch this host-scheduled transaction may admit.
+         *
+         * Device-resident ExpertOverlay maintenance can publish a newer epoch
+         * after the immutable scheduler ticket is sent.  Each endpoint must
+         * therefore bind its exact device-acquired placement ticket at stage
+         * zero and prove that it is no older than this floor.  This field is
+         * authentication evidence, never a host mirror of live placement.
+         */
+        std::uint64_t placement_epoch_floor = 0u;
         std::uint64_t topology_fingerprint_low = 0u;
         std::uint64_t topology_fingerprint_high = 0u;
         std::uint64_t channel_nonce = 0u;
@@ -294,7 +321,7 @@ namespace llaminar2
         LLAMINAR_MOE_ACTIVATION_MIX(transaction_ordinal);
         LLAMINAR_MOE_ACTIVATION_MIX(logical_step_id);
         LLAMINAR_MOE_ACTIVATION_MIX(workspace_generation);
-        LLAMINAR_MOE_ACTIVATION_MIX(placement_epoch);
+        LLAMINAR_MOE_ACTIVATION_MIX(placement_epoch_floor);
         LLAMINAR_MOE_ACTIVATION_MIX(topology_fingerprint_low);
         LLAMINAR_MOE_ACTIVATION_MIX(topology_fingerprint_high);
         LLAMINAR_MOE_ACTIVATION_MIX(channel_nonce);
@@ -385,7 +412,23 @@ namespace llaminar2
         std::int32_t last_published_stage = -1;
         std::int32_t last_consumed_stage = -1;
         std::int32_t last_model_layer = -1;
-        std::uint32_t reserved[2] = {};
+        /**
+         * Predicate bits captured at the first terminal device-side failure.
+         *
+         * Packet kernels populate this word only on failure.  Each operation
+         * defines its own documented bit layout; zero remains the ordinary
+         * value for success and for failures that need no additional detail.
+         * Keeping the witness in endpoint-owned mapped status lets a watchdog
+         * explain a retained-graph rejection without a diagnostic D2H copy.
+         */
+        std::uint32_t failure_diagnostic = 0u;
+
+        /**
+         * Operation-specific compact values accompanying @ref failure_diagnostic.
+         * Packet admission currently stores the low 16 bits of the private
+         * grant generation and placement epoch here.
+         */
+        std::uint32_t failure_auxiliary = 0u;
 
         /** Bytes published by this endpoint during the active epoch. */
         std::uint64_t published_payload_bytes = 0u;

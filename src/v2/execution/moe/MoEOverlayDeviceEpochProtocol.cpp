@@ -105,6 +105,13 @@ namespace llaminar2
     std::optional<DeviceMoEOverlayEpochTicket>
     MoEOverlayDeviceEpochProtocol::tryAcquirePublished() noexcept
     {
+        return tryAcquireAdmitted(/*admission_epoch=*/0u);
+    }
+
+    std::optional<DeviceMoEOverlayEpochTicket>
+    MoEOverlayDeviceEpochProtocol::tryAcquireAdmitted(
+        std::uint64_t admission_epoch) noexcept
+    {
         if (!control_)
             return std::nullopt;
 
@@ -119,20 +126,34 @@ namespace llaminar2
         const std::uint64_t selector =
             atomic64(control_->published_selector).load(
                 std::memory_order_seq_cst);
-        const std::uint32_t bank =
+        const std::uint32_t published_bank =
             deviceMoEOverlayEpochSelectorBank(selector);
         const std::uint64_t generation =
             deviceMoEOverlayEpochSelectorGeneration(selector);
-        if (generation == 0u || bank >= kDeviceMoEOverlayEpochBankCount)
+        if (generation == 0u ||
+            published_bank >= kDeviceMoEOverlayEpochBankCount)
         {
             atomic64(control_->acquisitions_in_flight).fetch_sub(
                 1u, std::memory_order_seq_cst);
             return std::nullopt;
         }
 
+        const std::uint64_t required_epoch =
+            admission_epoch == 0u
+                ? bankEpoch(published_bank)
+                : admission_epoch;
+        const auto admitted_bank = bankForEpoch(required_epoch);
+        if (!admitted_bank.has_value())
+        {
+            atomic64(control_->acquisitions_in_flight).fetch_sub(
+                1u, std::memory_order_seq_cst);
+            return std::nullopt;
+        }
+        const std::uint32_t bank = *admitted_bank;
+
         const auto state = bankState(bank);
         const std::uint64_t epoch = bankEpoch(bank);
-        if (epoch == 0u ||
+        if (epoch == 0u || epoch != required_epoch ||
             (state != DeviceMoEOverlayEpochBankState::Published &&
              state != DeviceMoEOverlayEpochBankState::Retiring))
         {
@@ -145,9 +166,20 @@ namespace llaminar2
             1u, std::memory_order_seq_cst);
         atomic64(control_->acquisitions_in_flight).fetch_sub(
             1u, std::memory_order_seq_cst);
+        const std::uint64_t ticket_generation =
+            bank == published_bank
+                ? generation
+                : (generation > 1u ? generation - 1u : 0u);
+        if (ticket_generation == 0u)
+        {
+            atomic64(control_->bank_readers[bank]).fetch_sub(
+                1u, std::memory_order_seq_cst);
+            return std::nullopt;
+        }
         return DeviceMoEOverlayEpochTicket{
             .epoch = epoch,
-            .selector = selector,
+            .selector = deviceMoEOverlayEpochSelector(
+                ticket_generation, bank),
         };
     }
 

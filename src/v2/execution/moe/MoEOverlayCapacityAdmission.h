@@ -14,6 +14,7 @@
 
 #include "MoEOverlayCapacityResolver.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -61,8 +62,9 @@ namespace llaminar2
     /** @brief Immutable materialization policy shared by admission and fabric setup. */
     struct MoEOverlayCapacityAdmissionPolicy
     {
-        /** Canonical bounded transaction admits one incoming expert per endpoint/layer. */
-        static constexpr std::size_t kProductionShadowSlots = 1;
+        /** One closed cycle can deliver at most one expert to an endpoint/layer. */
+        static constexpr std::size_t
+            kProductionShadowSlotsPerConcurrentCycle = 1;
         /** Canonical streaming chunk used by local and remote transfer lanes. */
         static constexpr std::size_t kProductionStagingBytes =
             4u * 1024u * 1024u;
@@ -76,10 +78,49 @@ namespace llaminar2
         std::size_t shadow_slots_per_endpoint_layer = 1;
         /** Bounded bytes in each persistent conversion/transport staging chunk. */
         std::size_t staging_capacity_bytes = 0;
+        /**
+         * Maximum closed migration cycles admitted in one publication wave.
+         *
+         * Admission and physical-fabric construction use this same value to
+         * price and materialize every independently runnable transfer lane.
+         * Raising the scheduling cap therefore cannot silently create a
+         * software queue behind a one-lane physical edge.
+         */
+        std::size_t maximum_concurrent_cycles = 1;
+        /**
+         * Maximum cycles from one wave that may target the same model layer.
+         *
+         * Transport lanes are sized by @ref maximum_concurrent_cycles because
+         * cycles from different layers still execute in parallel.  An
+         * endpoint/layer shadow bank only receives at most this many arrivals,
+         * so charging it for the global wave width would evict live experts
+         * without providing usable concurrency.
+         */
+        std::size_t maximum_cycles_per_layer = 1;
         /** Whether the fabric also materializes cross-rank MPI projection lanes. */
         bool distributed_transport = false;
         /** Exact overlay communicator size, including relay-only ranks. */
         int overlay_world_size = 1;
+
+        /**
+         * @brief Return the worst-case inactive-slot demand of the cycle BOM.
+         *
+         * A valid closed migration cycle visits a participant at most once.
+         * Cycles in different layers use different endpoint/layer banks, so
+         * their global transport concurrency does not add to one bank's slot
+         * demand.  Setup therefore charges the smaller of the global wave cap
+         * and the per-layer scheduling cap. Keeping this equation beside the
+         * lane budget prevents scheduling, preflight, and materialization from
+         * drifting apart when either public tuning changes.
+         */
+        [[nodiscard]] static constexpr std::size_t
+        requiredShadowSlotsPerEndpointLayer(
+            std::size_t concurrent_cycles,
+            std::size_t cycles_per_layer) noexcept
+        {
+            return std::min(concurrent_cycles, cycles_per_layer) *
+                kProductionShadowSlotsPerConcurrentCycle;
+        }
     };
 
     /**

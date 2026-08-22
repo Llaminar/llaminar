@@ -19,9 +19,12 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <thread>
 #include <vector>
 #include <numeric>
+
+#include <sched.h>
 
 using namespace llaminar2;
 
@@ -184,7 +187,7 @@ TEST(Test__NUMAAllocator, AllocateAndTouchZeroInit)
     allocator.free(ptr, size);
 }
 
-TEST(Test__NUMAAllocator, BindUntouchedExternalRangeControlsFirstTouch)
+TEST(Test__NUMAAllocator, PrepareExternalReceiveRangeUsesCertifiedFirstTouch)
 {
     NUMAAllocator &allocator = NUMAAllocator::instance();
     if (!allocator.isNUMAAvailable())
@@ -192,27 +195,43 @@ TEST(Test__NUMAAllocator, BindUntouchedExternalRangeControlsFirstTouch)
 
     constexpr size_t page_size = 4096;
     constexpr size_t bytes = 3 * page_size;
-    void *ptr = std::aligned_alloc(page_size, bytes);
-    ASSERT_NE(ptr, nullptr);
+    std::unique_ptr<void, decltype(&std::free)> storage(
+        std::aligned_alloc(page_size, bytes), &std::free);
+    ASSERT_NE(storage, nullptr);
 
-    const int target_node = allocator.getCurrentNUMANode();
-    ASSERT_GE(target_node, 0);
-    ASSERT_TRUE(allocator.bindUntouchedExternalRangeToNode(
-        ptr, bytes, target_node));
+    cpu_set_t incoming_affinity{};
+    ASSERT_EQ(sched_getaffinity(
+                  0, sizeof(incoming_affinity), &incoming_affinity),
+              0);
 
-    // Simulate a transport overwriting the final receive allocation only after
-    // its policy has been installed.
-    std::memset(ptr, 0xA5, bytes);
-    const auto *data = static_cast<const uint8_t *>(ptr);
-    for (size_t offset = 0; offset < bytes; offset += page_size)
+    // Repeatedly alternate nodes so recycled resident pages cannot make a
+    // policy-only implementation appear correct. Each preparation must also
+    // restore the exact launcher/container affinity before returning.
+    const int rounds = allocator.numNUMANodes() > 1 ? 32 : 1;
+    for (int round = 0; round < rounds; ++round)
     {
-        EXPECT_EQ(
-            allocator.getNUMANodeForAddress(data + offset),
-            target_node)
-            << "page offset " << offset << " ignored the receive policy";
-    }
+        const int target_node = round % allocator.numNUMANodes();
+        ASSERT_TRUE(allocator.prepareExternalReceiveRangeOnNode(
+            storage.get(), bytes, target_node));
 
-    std::free(ptr);
+        cpu_set_t restored_affinity{};
+        ASSERT_EQ(sched_getaffinity(
+                      0, sizeof(restored_affinity), &restored_affinity),
+                  0);
+        EXPECT_TRUE(CPU_EQUAL(&incoming_affinity, &restored_affinity));
+
+        // Simulate the transport's full overwrite after preparation.
+        std::memset(storage.get(), 0xA5, bytes);
+        const auto *data = static_cast<const uint8_t *>(storage.get());
+        for (size_t offset = 0; offset < bytes; offset += page_size)
+        {
+            EXPECT_EQ(
+                allocator.getNUMANodeForAddress(data + offset),
+                target_node)
+                << "round " << round << " page offset " << offset
+                << " ignored certified first touch";
+        }
+    }
 }
 
 // ============================================================================

@@ -52,6 +52,7 @@
 #include "execution/moe/DeviceMoERuntimeABI.h"
 #include "kernels/common/NativeVNNIDispatchCache.h"
 #include "kernels/common/NativeVNNIGroupedDecodePolicy.h"
+#include "kernels/common/MoEProjectionNumericalContract.h"
 #include "kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc"
 #include "tensors/NativeVnniFormatInfo.h"
 #include "ROCmNativeVNNIDecodeEquivalentMath.h"
@@ -502,33 +503,52 @@ struct NVNNIGroupedMoESupported {
 };
 
 /**
- * @brief Resolve the split-K policy used by the normal serial M=1 decode path.
+ * @brief Resolve serial-M1 policy from an exact source arithmetic codebook.
  *
- * MTP verifier publication compares grouped runtime-M rows against committed
- * serial decode state. The grouped kernels may execute several rows at once,
- * but they must use the same split-K count as serial M=1 so the FP32 reduction
- * order is bitwise-identical. Generated policy is the sole production source
- * of that arithmetic identity. Returning an empty result on a miss forces the
- * caller to fail instead of silently reconstructing an obsolete heuristic.
+ * Generated dispatch remains the economy authority for target wave count and
+ * for codebooks without a heterogeneous arithmetic contract.  A certified
+ * movable policy instead replaces only the K-partition count: launch tuning
+ * must not change the FP32 expression tree when an expert moves between CUDA
+ * and ROCm.
  */
-static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNISerialM1RuntimeConfig(
-    uint8_t codebook_id,
-    int N,
-    int K)
-{
-    return resolveNativeVNNIDecodeGeneratedRuntimeConfig(
-        codebook_id, 1, N, K);
-}
-
-/** @brief Resolve serial-M1 policy from an exact source arithmetic codebook. */
 static NativeVNNIDecodeGeneratedRuntimeConfig
 resolveNativeVNNISerialM1RuntimeConfigForPolicy(
     uint8_t arithmetic_policy_codebook_id,
     int N,
     int K)
 {
-    return resolveNativeVNNIDecodeGeneratedRuntimeConfigForPolicy(
-        arithmetic_policy_codebook_id, 1, N, K);
+    NativeVNNIDecodeGeneratedRuntimeConfig resolved =
+        resolveNativeVNNIDecodeGeneratedRuntimeConfigForPolicy(
+            arithmetic_policy_codebook_id, 1, N, K);
+    if (!resolved.has_generated)
+        return resolved;
+
+    if (llaminar2::MoEProjectionNumericalContract::
+            ownsOrderedKPartitionTree(arithmetic_policy_codebook_id))
+    {
+        resolved.kb = llaminar2::MoEProjectionNumericalContract::
+            orderedKPartitionsForWidth(K);
+    }
+    return resolved;
+}
+
+/**
+ * @brief Resolve the split-K policy used by normal serial M=1 decode.
+ *
+ * MTP verifier publication compares grouped runtime-M rows against committed
+ * serial decode state. The grouped kernels may execute several rows at once,
+ * but they must consume this same typed policy so their FP32 reduction order is
+ * bitwise-identical. Returning an empty result on a generated-policy miss
+ * forces the caller to fail rather than reconstruct an obsolete heuristic.
+ */
+static NativeVNNIDecodeGeneratedRuntimeConfig
+resolveNativeVNNISerialM1RuntimeConfig(
+    uint8_t codebook_id,
+    int N,
+    int K)
+{
+    return resolveNativeVNNISerialM1RuntimeConfigForPolicy(
+        defaultNativeVNNIArithmeticPolicyCodebook(codebook_id), N, K);
 }
 
 static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNICommonSerialM1RuntimeConfig(
@@ -1249,14 +1269,6 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
                 const uint16_t hi_bits = d_block_mins[linear];
                 const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
-                f_acc[c] = rocm_native_vnni_commit_dual_scale_block(
-                    f_acc[c],
-                    acc_lo,
-                    acc_hi,
-                    scale_lo,
-                    scale_hi,
-                    scale_ab);
-
                 if constexpr (Traits::is_dual_scale_asym)
                 {
                     constexpr int32_t ones = 0x01010101;
@@ -1271,8 +1283,18 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     // Q2_K: per-sub-block emin correction
                     constexpr float min_lo = 0.0f;
                     constexpr float min_hi = 0.0f;
-                    f_acc[c] = rocm_native_vnni_commit_dual_scale_correction(
-                        f_acc[c], sum_a_lo, sum_a_hi, min_lo, min_hi, scale_ab);
+                    f_acc[c] =
+                        rocm_native_vnni_commit_corrected_dual_scale_block(
+                            f_acc[c],
+                            acc_lo,
+                            acc_hi,
+                            scale_lo,
+                            scale_hi,
+                            sum_a_lo,
+                            sum_a_hi,
+                            min_lo,
+                            min_hi,
+                            scale_ab);
                 }
 
                 // IQ1_M: ±IQ1S_DELTA per 8-element group correction.
@@ -1281,7 +1303,7 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                 // dl * delta * sum_a_per_group for each of the 4 groups.
                 // Delta signs: qh0 bit 3 (group 0), qh0 bit 7 (group 1),
                 //              qh1 bit 3 (group 2), qh1 bit 7 (group 3).
-                if constexpr (FMT == NVNNI_IQ1_M)
+                else if constexpr (FMT == NVNNI_IQ1_M)
                 {
                     constexpr float IQ1S_DELTA = 0.125f;
                     constexpr int32_t ones = 0x01010101;
@@ -1302,8 +1324,10 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
                     const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-                    f_acc[c] = rocm_native_vnni_commit_iq1_m_delta_correction(
+                    f_acc[c] = rocm_native_vnni_commit_iq1_m_block(
                         f_acc[c],
+                        acc_lo,
+                        acc_hi,
                         sa_g0,
                         sa_g1,
                         sa_g2,
@@ -1312,6 +1336,16 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                         d1,
                         d2,
                         d3,
+                        scale_lo,
+                        scale_hi,
+                        scale_ab);
+                }
+                else
+                {
+                    f_acc[c] = rocm_native_vnni_commit_dual_scale_block(
+                        f_acc[c],
+                        acc_lo,
+                        acc_hi,
                         scale_lo,
                         scale_hi,
                         scale_ab);
@@ -1325,15 +1359,23 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
                     block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
 
                 const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                f_acc[c] = rocm_native_vnni_commit_single_scale_block(
-                    f_acc[c], block_acc, block_d, scale_ab);
-
                 if constexpr (Traits::is_asymmetric)
                 {
                     const uint16_t min_bits = d_block_mins[linear];
                     const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                    f_acc[c] = rocm_native_vnni_commit_single_scale_correction(
-                        f_acc[c], sum_a, block_m, scale_ab);
+                    f_acc[c] =
+                        rocm_native_vnni_commit_corrected_single_scale_block(
+                            f_acc[c],
+                            block_acc,
+                            block_d,
+                            sum_a,
+                            block_m,
+                            scale_ab);
+                }
+                else
+                {
+                    f_acc[c] = rocm_native_vnni_commit_single_scale_block(
+                        f_acc[c], block_acc, block_d, scale_ab);
                 }
             }
         }
@@ -1924,14 +1966,6 @@ __global__ void gemv_native_vnni_kernel_t(
                         const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
                         const uint16_t hi_bits = d_block_mins[linear];
                         const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&hi_bits));
-                        f_acc[c] = rocm_native_vnni_commit_dual_scale_block(
-                            f_acc[c],
-                            acc_lo,
-                            acc_hi,
-                            scale_lo,
-                            scale_hi,
-                            scale_ab);
-
                         // Q2_K/IQ1_M: dual-scale + emin/delta correction
                         // Q2_K: emins from separate d_block_emins array
                         // IQ1_M: has ±IQ1S_DELTA per-group correction (handled below)
@@ -1957,15 +1991,25 @@ __global__ void gemv_native_vnni_kernel_t(
                                 min_lo = 0.0f;
                                 min_hi = 0.0f;
                             }
-                            f_acc[c] = rocm_native_vnni_commit_dual_scale_correction(
-                                f_acc[c], sum_a_lo, sum_a_hi, min_lo, min_hi, scale_ab);
+                            f_acc[c] =
+                                rocm_native_vnni_commit_corrected_dual_scale_block(
+                                    f_acc[c],
+                                    acc_lo,
+                                    acc_hi,
+                                    scale_lo,
+                                    scale_hi,
+                                    sum_a_lo,
+                                    sum_a_hi,
+                                    min_lo,
+                                    min_hi,
+                                    scale_ab);
                         }
 
                         // IQ1_M: ±IQ1S_DELTA per 8-element group correction.
                         // True weight[j] = dl * (grid[j] + delta), but the sdot4 above
                         // only accumulates dl * dot(a, grid).  We add the missing
                         // dl * delta * sum_a_per_group for each of the 4 groups.
-                        if constexpr (FMT == NVNNI_IQ1_M)
+                        else if constexpr (FMT == NVNNI_IQ1_M)
                         {
                             constexpr float IQ1S_DELTA = 0.125f;
                             constexpr int32_t ones = 0x01010101;
@@ -1985,8 +2029,10 @@ __global__ void gemv_native_vnni_kernel_t(
                             const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
                             const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-                            f_acc[c] = rocm_native_vnni_commit_iq1_m_delta_correction(
+                            f_acc[c] = rocm_native_vnni_commit_iq1_m_block(
                                 f_acc[c],
+                                acc_lo,
+                                acc_hi,
                                 sa_g0,
                                 sa_g1,
                                 sa_g2,
@@ -1995,6 +2041,16 @@ __global__ void gemv_native_vnni_kernel_t(
                                 d1,
                                 d2,
                                 d3,
+                                scale_lo,
+                                scale_hi,
+                                scale_ab);
+                        }
+                        else
+                        {
+                            f_acc[c] = rocm_native_vnni_commit_dual_scale_block(
+                                f_acc[c],
+                                acc_lo,
+                                acc_hi,
                                 scale_lo,
                                 scale_hi,
                                 scale_ab);
@@ -2009,17 +2065,25 @@ __global__ void gemv_native_vnni_kernel_t(
                             block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
 
                         const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-                        f_acc[c] = rocm_native_vnni_commit_single_scale_block(
-                            f_acc[c], block_acc, block_d, scale_ab);
-
                         // Asymmetric min correction: f_acc += sum_a * block_m
                         // Derives from: value = d*q + m  →  Σ a_i*value_i = d*Σ(a_i*q_i) + m*Σ(a_i)
                         if constexpr (Traits::is_asymmetric)
                         {
                             const uint16_t min_bits = d_block_mins[linear];
                             const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                            f_acc[c] = rocm_native_vnni_commit_single_scale_correction(
-                                f_acc[c], sum_a, block_m, scale_ab);
+                            f_acc[c] =
+                                rocm_native_vnni_commit_corrected_single_scale_block(
+                                    f_acc[c],
+                                    block_acc,
+                                    block_d,
+                                    sum_a,
+                                    block_m,
+                                    scale_ab);
+                        }
+                        else
+                        {
+                            f_acc[c] = rocm_native_vnni_commit_single_scale_block(
+                                f_acc[c], block_acc, block_d, scale_ab);
                         }
                     }
                 }
@@ -2350,14 +2414,13 @@ __global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
 
         const float scale =
             llaminar2::rocm::decode_equivalent::q8Scale(abs_val);
-        const float inv_scale = 1.0f / scale;
 
         if (lane == 0)
             row_scales[b] = scale;
 
         row_int8[k_start + lane] = static_cast<int8_t>(
-            llaminar2::rocm::decode_equivalent::quantizeQ8(
-                val, inv_scale));
+            llaminar2::rocm::decode_equivalent::quantizeQ8FromScale(
+                val, scale));
     }
 }
 
@@ -2772,14 +2835,14 @@ __global__ void moe_grouped_hidden_quantize_blockwise_kernel(
     for (int mask = 16; mask > 0; mask >>= 1)
         abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
 
-    const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
-    const float inv_scale = 1.0f / scale;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(abs_val);
     if (lane == 0)
         scales_A_blockwise[block_idx] = scale;
 
-    const float qval = val * inv_scale;
     A_int8[k] = static_cast<int8_t>(
-        rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+        llaminar2::rocm::decode_equivalent::quantizeQ8FromScale(
+            val, scale));
 }
 
 /*
@@ -3935,7 +3998,6 @@ moe_grouped_native_vnni_gate_up_descriptor_reduce_swiglu_q8_kernel(
 
     const float scale =
         llaminar2::rocm::decode_equivalent::q8Scale(block_abs_max);
-    const float inv_scale = 1.0f / scale;
     const int q8_block = n / Q8_BLOCK;
     const int lane = threadIdx.x & (Q8_BLOCK - 1);
     if (lane == 0)
@@ -3947,8 +4009,8 @@ moe_grouped_native_vnni_gate_up_descriptor_reduce_swiglu_q8_kernel(
     swiglu_int8[
         static_cast<size_t>(route) * static_cast<size_t>(N) +
         static_cast<size_t>(n)] = static_cast<int8_t>(
-            llaminar2::rocm::decode_equivalent::quantizeQ8(
-                swiglu, inv_scale));
+            llaminar2::rocm::decode_equivalent::quantizeQ8FromScale(
+                swiglu, scale));
 }
 
 /**
@@ -4279,24 +4341,9 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
         const uint16_t scale_hi_bits = min_base[linear];
         const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
         const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
-        f_acc = rocm_native_vnni_commit_dual_scale_block(
-            f_acc,
-            acc_lo,
-            acc_hi,
-            scale_lo,
-            scale_hi,
-            scale_ab);
-
-        /*
-         * Keep the decode-equivalent small-M path in lockstep with the serial
-         * M=1 GEMV kernel.  The shared MoE correction helper intentionally
-         * returns a float correction because the grouped MoE kernels use that
-         * expression tree as their serial contract.  Plain GEMV serial decode,
-         * however, applies each correction directly to f_acc.  Returning the
-         * IQ1_M delta through a helper is enough for HIP to round one ULP
-         * differently on some rows, so the verifier-row implementation spells
-         * out the same updates as the serial GEMV loop.
-         */
+        // Corrected formats form one complete block contribution before the
+        // row update. This is the same publication boundary used by CUDA and
+        // prevents a backend-specific extra rounding against the running row.
         if constexpr (Traits::is_dual_scale_asym)
         {
             constexpr int32_t ones = 0x01010101;
@@ -4324,11 +4371,20 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
                 min_lo = 0.0f;
                 min_hi = 0.0f;
             }
-            f_acc = rocm_native_vnni_commit_dual_scale_correction(
-                f_acc, sum_a_lo, sum_a_hi, min_lo, min_hi, scale_ab);
+            f_acc = rocm_native_vnni_commit_corrected_dual_scale_block(
+                f_acc,
+                acc_lo,
+                acc_hi,
+                scale_lo,
+                scale_hi,
+                sum_a_lo,
+                sum_a_hi,
+                min_lo,
+                min_hi,
+                scale_ab);
         }
 
-        if constexpr (FMT == NVNNI_IQ1_M)
+        else if constexpr (FMT == NVNNI_IQ1_M)
         {
             constexpr float IQ1S_DELTA = 0.125f;
             constexpr int32_t ones = 0x01010101;
@@ -4349,8 +4405,10 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
             const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
             const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-            f_acc = rocm_native_vnni_commit_iq1_m_delta_correction(
+            f_acc = rocm_native_vnni_commit_iq1_m_block(
                 f_acc,
+                acc_lo,
+                acc_hi,
                 sa_g0,
                 sa_g1,
                 sa_g2,
@@ -4359,6 +4417,16 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
                 d1,
                 d2,
                 d3,
+                scale_lo,
+                scale_hi,
+                scale_ab);
+        }
+        else
+        {
+            f_acc = rocm_native_vnni_commit_dual_scale_block(
+                f_acc,
+                acc_lo,
+                acc_hi,
                 scale_lo,
                 scale_hi,
                 scale_ab);
@@ -4373,15 +4441,22 @@ __device__ __forceinline__ void native_vnni_small_m_accumulate_decoded_block(
 
         const uint16_t scale_bits = scale_base[linear];
         const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-        f_acc = rocm_native_vnni_commit_single_scale_block(
-            f_acc, block_acc, block_d, scale_ab);
-
         if constexpr (Traits::is_asymmetric)
         {
             const uint16_t min_bits = min_base[linear];
             const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-            f_acc = rocm_native_vnni_commit_single_scale_correction(
-                f_acc, sum_a, block_m, scale_ab);
+            f_acc = rocm_native_vnni_commit_corrected_single_scale_block(
+                f_acc,
+                block_acc,
+                block_d,
+                sum_a,
+                block_m,
+                scale_ab);
+        }
+        else
+        {
+            f_acc = rocm_native_vnni_commit_single_scale_block(
+                f_acc, block_acc, block_d, scale_ab);
         }
     }
 }
@@ -7066,8 +7141,8 @@ bool rocmGemv_native_vnni_fp32_with_policy(
     const bool has_explicit_tuning =
         explicit_kb_override > 0 || explicit_waves_override > 0;
     const NativeVNNIDecodeGeneratedRuntimeConfig generated_cfg =
-        resolveNativeVNNIDecodeGeneratedRuntimeConfigForPolicy(
-            arithmetic_policy_codebook_id, 1, N, K);
+        resolveNativeVNNISerialM1RuntimeConfigForPolicy(
+            arithmetic_policy_codebook_id, N, K);
     if (!has_explicit_tuning && !generated_cfg.has_generated)
     {
         fprintf(

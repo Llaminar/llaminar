@@ -124,6 +124,29 @@ namespace llaminar2::routed_expert_ownership
     }
 
     /**
+     * @brief Return whether sorted expert IDs form one contiguous span.
+     *
+     * Physical weight packing and published-bank evidence use this common
+     * predicate so ordinal and deterministic-random ownership cannot acquire
+     * different diagnostic semantics at the two lifecycle boundaries.
+     * Empty and single-expert selections are contiguous by definition.
+     *
+     * @param expert_ids Expert IDs in canonical ascending source-tensor order.
+     * @return True when every adjacent ID differs by exactly one.
+     */
+    inline bool expertIdsFormContiguousSpan(
+        const std::vector<int> &expert_ids) noexcept
+    {
+        return std::adjacent_find(
+                   expert_ids.begin(),
+                   expert_ids.end(),
+                   [](int left, int right)
+                   {
+                       return right != left + 1;
+                   }) == expert_ids.end();
+    }
+
+    /**
      * @brief Build one participant's sorted immutable expert-id set.
      *
      * Ownership is selected from a policy-ordered sequence, but the returned

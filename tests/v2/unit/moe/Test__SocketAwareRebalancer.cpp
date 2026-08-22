@@ -293,18 +293,20 @@ TEST(Test__SocketAwareRebalancer, ProposeUsesUpdatedHistogramPlacement)
     auto proposal = proposeCurrent(rebalancer, hist);
     ASSERT_FALSE(proposal.empty());
 
-    bool saw_hot_expert = false;
+    bool saw_updated_hot_socket_to_cold = false;
+    bool saw_updated_cold_socket_to_hot = false;
     for (const auto &swap : proposal.swaps)
     {
         EXPECT_EQ(swap.from_socket, updated_placement[swap.expert_id]);
-        if (swap.expert_id == 0)
-        {
-            saw_hot_expert = true;
-            EXPECT_EQ(swap.from_socket, 1);
-            EXPECT_EQ(swap.to_socket, 0);
-        }
+        saw_updated_hot_socket_to_cold =
+            saw_updated_hot_socket_to_cold ||
+            (swap.from_socket == 1 && swap.to_socket == 0);
+        saw_updated_cold_socket_to_hot =
+            saw_updated_cold_socket_to_hot ||
+            (swap.from_socket == 0 && swap.to_socket == 1);
     }
-    EXPECT_TRUE(saw_hot_expert);
+    EXPECT_TRUE(saw_updated_hot_socket_to_cold);
+    EXPECT_TRUE(saw_updated_cold_socket_to_hot);
 }
 
 TEST(Test__SocketAwareRebalancer, MultiLayerSwaps)

@@ -612,6 +612,13 @@ namespace
         input.token_ids = token_ids;
         input.position_ids = position_ids;
         input.position_offset = 0;
+        input.execution_phase = resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MainInference,
+            .seq_len = seq_len,
+            .batch_size = batch_size,
+            .decode_max_seq_len = 4,
+            .logical_position = position_ids ? position_ids[0] : 0,
+        });
         return input;
     }
 
@@ -1970,6 +1977,7 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawBucketedPrefillPadsBeforeBuild)
     const std::vector<int> positions = {200, 201, 202};
     auto input = makeTestInput(3, 1, DeviceId::cuda(0), tokens.data(), positions.data());
     input.position_offset = 200;
+    input.execution_phase = ForwardExecutionPhase::Prefill;
 
     ForwardOutput output{};
     EXPECT_TRUE(engine.execute(input, output, host));
@@ -2348,6 +2356,7 @@ TEST_F(Test__ForwardExecutionEngine, Execute_GroupedVerifierPublishesExactWorksp
         positions.data());
     input.execution_role =
         ForwardExecutionRole::GroupedMTPVerifier;
+    input.execution_phase = ForwardExecutionPhase::Decode;
 
     ForwardOutput output{};
     ASSERT_TRUE(engine.execute(input, output, host));
@@ -2397,6 +2406,7 @@ TEST_F(
         verifier_positions.data());
     verifier_input.execution_role =
         ForwardExecutionRole::GroupedMTPVerifier;
+    verifier_input.execution_phase = ForwardExecutionPhase::Decode;
 
     ForwardOutput verifier_output{};
     ASSERT_TRUE(engine.execute(verifier_input, verifier_output, host));
@@ -2417,6 +2427,7 @@ TEST_F(
         condition_positions.data());
     condition_input.execution_role =
         ForwardExecutionRole::MTPCondition;
+    condition_input.execution_phase = ForwardExecutionPhase::Decode;
 
     ForwardOutput condition_output{};
     ASSERT_TRUE(engine.execute(condition_input, condition_output, host));
@@ -2462,6 +2473,7 @@ TEST_F(Test__ForwardExecutionEngine, Execute_MTPConditionPublishesExactWorkspace
         positions.data());
     input.execution_role =
         ForwardExecutionRole::MTPCondition;
+    input.execution_phase = ForwardExecutionPhase::Decode;
 
     ForwardOutput output{};
     ASSERT_TRUE(engine.execute(input, output, host));
@@ -2514,6 +2526,7 @@ TEST_F(
     input.token_ids_device = tokens.data();
     input.position_ids_device = positions.data();
     input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+    input.execution_phase = ForwardExecutionPhase::Decode;
 
     ForwardOutput output{};
     ASSERT_TRUE(engine.execute(input, output, host));
@@ -2580,6 +2593,7 @@ TEST_F(
         input.token_ids_device = tokens.data();
         input.position_ids_device = positions.data();
         input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+        input.execution_phase = ForwardExecutionPhase::Decode;
 
         ForwardOutput output{};
         ASSERT_TRUE(engine.execute(input, output, host));
@@ -2646,6 +2660,7 @@ TEST_F(
         tokens.data(),
         positions.data());
     input.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+    input.execution_phase = ForwardExecutionPhase::Decode;
 
     ForwardOutput output{};
     EXPECT_FALSE(engine.execute(input, output, host));
@@ -3454,6 +3469,8 @@ TEST_F(Test__ForwardExecutionEngine, CapturedCollectiveOptInRequestsDeferredMain
         {"defer_final_sync", "true"},
         {"has_collectives", "true"},
         {"retained_sparse_parent", "false"},
+        {"device_timeline_transaction", "false"},
+        {"heterogeneous_ticket_transaction", "false"},
         {"replay_plan_policy", "require_full_graph"}};
     EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "decode_capture_policy", tags), 2.0)
         << "First-use materialization and steady-state replay must both ask the "

@@ -11,9 +11,11 @@
 
 #include "MoEOverlayParticipantMigration.h"
 
+#include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <stdexcept>
 #include <utility>
@@ -55,6 +57,7 @@ namespace llaminar2
             int participant_id = -1;
             std::shared_ptr<MoEOverlayParticipantResidency> endpoint;
             MoEOverlayParticipantResidencyBank bank;
+            std::optional<MoEOverlayPreparedParticipantBank> prepared_bank;
             bool installed_by_this_transaction = false;
         };
 
@@ -185,11 +188,38 @@ namespace llaminar2
             : public IMoEOverlayInactiveBankTransaction
         {
         public:
+            /**
+             * @brief Exact participant-bank lifecycle owned by this adapter.
+             *
+             * The phase is deliberately singular: combinations such as
+             * "published and aborted" or "retired while preparation is still
+             * pending" cannot be represented.  Per-device fan-out has its own
+             * typed endpoint phases inside the device publisher.
+             */
+            enum class Phase
+            {
+                Created,
+                Preparing,
+                Prepared,
+                Publishing,
+                Published,
+                RetirementFencing,
+                RetirementReady,
+                Aborting,
+                Aborted,
+                Retired,
+                FailedBeforePublication,
+                FailedAfterPublication,
+            };
+
             /** @brief Take candidate clones and transfer-arrival lifetimes. */
             ParticipantInactiveBankTransaction(
                 std::shared_ptr<MoEOverlayParticipantResidencyRegistry> registry,
                 std::shared_ptr<IMoEOverlayParticipantTransferProvider>
                     transfer_provider,
+                std::shared_ptr<
+                    IMoEOverlayHostAuthorityDeviceBankPublisher>
+                    device_bank_publisher,
                 std::shared_ptr<const MoEOverlayResidencySnapshot> previous,
                 std::shared_ptr<const MoEOverlayResidencySnapshot> candidate,
                 std::vector<MoEOverlayTierMigration> migrations,
@@ -199,6 +229,8 @@ namespace llaminar2
                 std::string perf_device)
                 : registry_(std::move(registry)),
                   transfer_provider_(std::move(transfer_provider)),
+                  device_bank_publisher_(
+                      std::move(device_bank_publisher)),
                   previous_(std::move(previous)),
                   candidate_(std::move(candidate)),
                   migrations_(std::move(migrations)),
@@ -209,17 +241,17 @@ namespace llaminar2
             }
 
             /** @brief Complete, validate, and install every local candidate bank. */
-            bool beginCommit(std::string *error) noexcept override
+            bool beginPrepare(std::string *error) noexcept override
             {
                 if (error)
                     error->clear();
-                if (commit_attempted_ || aborted_ || retired_)
+                if (phase_ != Phase::Created)
                 {
                     if (error)
-                        *error = "ExpertOverlay participant bank has invalid commit lifecycle";
+                        *error = "ExpertOverlay participant bank has invalid preparation lifecycle";
                     return false;
                 }
-                commit_attempted_ = true;
+                phase_ = Phase::Preparing;
 
                 try
                 {
@@ -229,6 +261,20 @@ namespace llaminar2
                     {
                         throw std::logic_error(
                             "ExpertOverlay participant bank lost its transaction authorities");
+                    }
+
+                    const bool owns_gpu_endpoint = std::any_of(
+                        local_candidates_.begin(),
+                        local_candidates_.end(),
+                        [](const LocalCandidateBank &local)
+                        {
+                            return local.endpoint &&
+                                   local.endpoint->device().is_gpu();
+                        });
+                    if (owns_gpu_endpoint && !device_bank_publisher_)
+                    {
+                        throw std::logic_error(
+                            "ExpertOverlay GPU candidate has no host-authority device-bank publisher");
                     }
 
                     for (std::size_t index = 0;
@@ -303,11 +349,34 @@ namespace llaminar2
                         }
                     }
 
+                    /*
+                     * Seal and allocate every immutable node before publishing
+                     * the first endpoint. This is maintenance-side work and can
+                     * be arbitrarily heavier than the fixed-slot pointer stores
+                     * below without extending a partially visible commit.
+                     */
+                    for (auto &local : local_candidates_)
+                    {
+                        std::string prepare_error;
+                        local.prepared_bank =
+                            local.endpoint->prepareReadyBank(
+                                std::move(local.bank), &prepare_error);
+                        if (!local.prepared_bank)
+                        {
+                            throw std::runtime_error(
+                                prepare_error.empty()
+                                    ? "ExpertOverlay local candidate bank preparation failed"
+                                    : prepare_error);
+                        }
+                    }
+
+                    const auto publication_start =
+                        std::chrono::steady_clock::now();
                     for (auto &local : local_candidates_)
                     {
                         std::string install_error;
                         const auto status = local.endpoint->installReadyBank(
-                            local.bank, &install_error);
+                            std::move(*local.prepared_bank), &install_error);
                         if (status !=
                             MoEOverlayParticipantBankInstallStatus::Installed)
                         {
@@ -318,8 +387,36 @@ namespace llaminar2
                         }
                         local.installed_by_this_transaction = true;
                     }
+                    const auto publication_elapsed =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() -
+                            publication_start)
+                            .count();
 
-                    committed_ = true;
+                    if (owns_gpu_endpoint)
+                    {
+                        std::string device_error;
+                        device_bank_transaction_ =
+                            device_bank_publisher_->createTransaction(
+                                previous_,
+                                candidate_,
+                                &device_error);
+                        if (!device_bank_transaction_ ||
+                            !device_bank_transaction_->beginPrepare(
+                                &device_error))
+                        {
+                            throw std::runtime_error(
+                                device_error.empty()
+                                    ? "ExpertOverlay GPU inactive-bank preparation could not start"
+                                    : device_error);
+                        }
+                    }
+                    else
+                    {
+                        /* CPU banks are already immutable and exact-addressable
+                         * once installed; there is no second device bank build. */
+                        phase_ = Phase::Prepared;
+                    }
                     PerfStatsCollector::addCounter(
                         "moe_overlay_residency",
                         "participant_candidate_banks_installed",
@@ -328,18 +425,32 @@ namespace llaminar2
                         perf_device_,
                         {{"previous_epoch", std::to_string(previous_->epoch)},
                          {"candidate_epoch", std::to_string(candidate_->epoch)}});
+                    PerfStatsCollector::recordTimingNs(
+                        "moe_overlay_residency",
+                        "participant_candidate_bank_preparation",
+                        static_cast<uint64_t>(publication_elapsed),
+                        "maintenance",
+                        perf_device_,
+                        {{"previous_epoch", std::to_string(previous_->epoch)},
+                         {"candidate_epoch", std::to_string(candidate_->epoch)},
+                         {"host_installation", "fixed_slot_atomic"},
+                         {"device_publication", owns_gpu_endpoint
+                                                    ? "event_driven"
+                                                    : "not_applicable"}});
                     return true;
                 }
                 catch (const std::exception &exception)
                 {
                     rollbackInstalledCandidates();
                     failure_ = exception.what();
+                    phase_ = Phase::FailedBeforePublication;
                 }
                 catch (...)
                 {
                     rollbackInstalledCandidates();
                     failure_ =
-                        "ExpertOverlay participant bank commit failed with a non-standard exception";
+                        "ExpertOverlay participant bank preparation failed with a non-standard exception";
+                    phase_ = Phase::FailedBeforePublication;
                 }
 
                 if (error)
@@ -347,17 +458,88 @@ namespace llaminar2
                 return false;
             }
 
-            /** @brief Metadata publication is ready immediately after installation. */
-            MoEOverlayResidencyWaveProgress pollCommit(
+            /** @brief Host candidate preparation is ready after installation. */
+            MoEOverlayResidencyWaveProgress pollPrepare(
                 std::string *error) noexcept override
             {
-                if (committed_ && !aborted_)
+                if (phase_ == Phase::Prepared)
+                {
+                    if (error)
+                        error->clear();
                     return MoEOverlayResidencyWaveProgress::Ready;
+                }
+                if (phase_ == Phase::Preparing && device_bank_transaction_)
+                {
+                    const auto progress =
+                        device_bank_transaction_->pollPrepare(error);
+                    if (progress == MoEOverlayResidencyWaveProgress::Ready)
+                        phase_ = Phase::Prepared;
+                    else if (progress == MoEOverlayResidencyWaveProgress::Failed)
+                        phase_ = Phase::FailedBeforePublication;
+                    return progress;
+                }
                 if (error)
                 {
                     *error = failure_.empty()
-                                 ? "ExpertOverlay participant bank was not committed"
+                                 ? "ExpertOverlay participant bank was not prepared"
                                  : failure_;
+                }
+                return MoEOverlayResidencyWaveProgress::Failed;
+            }
+
+            /** @brief Publish a host-only candidate after all banks are installed. */
+            bool beginPublication(std::string *error) noexcept override
+            {
+                if (error)
+                    error->clear();
+                if (phase_ != Phase::Prepared)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay participant bank has invalid publication lifecycle";
+                    }
+                    return false;
+                }
+
+                /* Publication is the irreversible edge. Record it before the
+                 * first endpoint submit so a partial fan-out cannot be aborted. */
+                phase_ = Phase::Publishing;
+                if (device_bank_transaction_ &&
+                    !device_bank_transaction_->beginPublication(error))
+                {
+                    phase_ = Phase::FailedAfterPublication;
+                    return false;
+                }
+                if (!device_bank_transaction_)
+                    phase_ = Phase::Published;
+                return true;
+            }
+
+            /** @brief Return the explicit host-only publication terminal. */
+            MoEOverlayResidencyWaveProgress pollPublication(
+                std::string *error) noexcept override
+            {
+                if (phase_ == Phase::Published)
+                {
+                    if (error)
+                        error->clear();
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                }
+                if (phase_ == Phase::Publishing && device_bank_transaction_)
+                {
+                    const auto progress =
+                        device_bank_transaction_->pollPublication(error);
+                    if (progress == MoEOverlayResidencyWaveProgress::Ready)
+                        phase_ = Phase::Published;
+                    else if (progress == MoEOverlayResidencyWaveProgress::Failed)
+                        phase_ = Phase::FailedAfterPublication;
+                    return progress;
+                }
+                if (error)
+                {
+                    *error =
+                        "ExpertOverlay participant publication was not completed";
                 }
                 return MoEOverlayResidencyWaveProgress::Failed;
             }
@@ -365,11 +547,23 @@ namespace llaminar2
             /** @brief Remove only candidate banks installed by this transaction. */
             void abort() noexcept override
             {
-                if (aborted_ || retired_)
+                if (phase_ == Phase::Aborting || phase_ == Phase::Aborted ||
+                    phase_ == Phase::Retired)
                     return;
+                if (phase_ == Phase::Publishing ||
+                    phase_ == Phase::Published ||
+                    phase_ == Phase::RetirementFencing ||
+                    phase_ == Phase::RetirementReady ||
+                    phase_ == Phase::FailedAfterPublication)
+                {
+                    LOG_ERROR(
+                        "[ExpertOverlay] Attempted to abort participant banks after publication began");
+                    std::terminate();
+                }
+                if (device_bank_transaction_)
+                    device_bank_transaction_->abort();
                 rollbackInstalledCandidates();
-                aborted_ = true;
-                committed_ = false;
+                phase_ = Phase::Aborting;
                 PerfStatsCollector::addCounter(
                     "moe_overlay_residency",
                     "participant_candidate_bank_aborts",
@@ -384,20 +578,71 @@ namespace llaminar2
             MoEOverlayResidencyWaveProgress pollAbort(
                 std::string *error) noexcept override
             {
-                if (aborted_)
+                if (phase_ == Phase::Aborted)
+                {
+                    if (error)
+                        error->clear();
                     return MoEOverlayResidencyWaveProgress::Ready;
+                }
+                if (phase_ == Phase::Aborting)
+                {
+                    if (!device_bank_transaction_)
+                    {
+                        phase_ = Phase::Aborted;
+                        return MoEOverlayResidencyWaveProgress::Ready;
+                    }
+                    const auto progress =
+                        device_bank_transaction_->pollAbort(error);
+                    if (progress == MoEOverlayResidencyWaveProgress::Ready)
+                        phase_ = Phase::Aborted;
+                    return progress;
+                }
                 if (error)
                     *error = "ExpertOverlay participant abort was not requested";
                 return MoEOverlayResidencyWaveProgress::Failed;
             }
 
+            /** @brief Poll every local GPU reader before distributed retirement. */
+            MoEOverlayResidencyWaveProgress pollRetirementFence(
+                std::string *error) noexcept override
+            {
+                if (error)
+                    error->clear();
+                if (phase_ == Phase::RetirementReady)
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                if (phase_ != Phase::Published &&
+                    phase_ != Phase::RetirementFencing)
+                {
+                    if (error)
+                    {
+                        *error =
+                            "ExpertOverlay participant retirement fence has an invalid lifecycle";
+                    }
+                    return MoEOverlayResidencyWaveProgress::Failed;
+                }
+                phase_ = Phase::RetirementFencing;
+                const auto progress = device_bank_transaction_
+                                          ? device_bank_transaction_
+                                                ->pollRetirementFence(error)
+                                          : MoEOverlayResidencyWaveProgress::Ready;
+                if (progress == MoEOverlayResidencyWaveProgress::Ready)
+                    phase_ = Phase::RetirementReady;
+                else if (progress == MoEOverlayResidencyWaveProgress::Failed)
+                    phase_ = Phase::FailedAfterPublication;
+                return progress;
+            }
+
             /** @brief Remove old endpoint banks after the global lease barrier. */
             void retirePrevious() noexcept override
             {
-                if (retired_ || aborted_)
+                if (phase_ == Phase::Retired)
                     return;
-                if (!committed_ || !previous_ || !candidate_)
+                if (phase_ != Phase::RetirementReady || !previous_ ||
+                    !candidate_)
                     std::terminate();
+
+                if (device_bank_transaction_)
+                    device_bank_transaction_->retirePrevious();
 
                 for (auto &local : local_candidates_)
                 {
@@ -422,7 +667,7 @@ namespace llaminar2
                  */
                 transfer_provider_->retirePreviousSources(
                     previous_->epoch, migrations_);
-                retired_ = true;
+                phase_ = Phase::Retired;
                 PerfStatsCollector::addCounter(
                     "moe_overlay_residency",
                     "participant_old_banks_retired",
@@ -451,18 +696,19 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayParticipantResidencyRegistry> registry_;
             std::shared_ptr<IMoEOverlayParticipantTransferProvider>
                 transfer_provider_;
+            std::shared_ptr<IMoEOverlayHostAuthorityDeviceBankPublisher>
+                device_bank_publisher_;
             std::shared_ptr<const MoEOverlayResidencySnapshot> previous_;
             std::shared_ptr<const MoEOverlayResidencySnapshot> candidate_;
             std::vector<MoEOverlayTierMigration> migrations_;
             std::vector<LocalCandidateBank> local_candidates_;
             std::vector<std::shared_ptr<MoEOverlayPreparedExpertArrival>>
                 arrivals_;
+            std::unique_ptr<IMoEOverlayInactiveBankTransaction>
+                device_bank_transaction_;
             std::string perf_device_;
             std::string failure_;
-            bool commit_attempted_ = false;
-            bool committed_ = false;
-            bool aborted_ = false;
-            bool retired_ = false;
+            Phase phase_ = Phase::Created;
         };
 
         /** @brief Move every non-null physical operation into composite order. */
@@ -728,6 +974,7 @@ namespace llaminar2
         auto inactive_bank = std::make_unique<ParticipantInactiveBankTransaction>(
             config_.registry,
             config_.transfer_provider,
+            config_.device_bank_publisher,
             transaction.previous,
             transaction.candidate,
             transaction.migrations,

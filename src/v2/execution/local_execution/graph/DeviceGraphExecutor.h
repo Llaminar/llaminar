@@ -30,6 +30,7 @@
 
 #include "ComputeGraph.h"
 #include "GraphCaptureGuard.h"
+#include "IGraphCaptureAuxiliaryBranch.h"
 #include "IGraphExecutor.h"
 #include "../device/DeviceContext.h"
 #include "StageTimeline.h"
@@ -1300,6 +1301,8 @@ namespace llaminar2
             ExecutableSubmissionState executable_submission_state =
                 ExecutableSubmissionState::Empty;     ///< Whether the sealed executable has ever been submitted.
             uint64_t decode_step = 0;                 ///< Monotonic segmented-execution step counter
+            uint64_t successful_capture_count = 0;   ///< Lifetime native materializations completed by this cache.
+            uint64_t successful_submission_count = 0; ///< Lifetime inference transactions submitted through captured executables.
             uint64_t capture_variant_signature = 0;   ///< Stage-reported launch-topology variant for this cache
             uint64_t variant_recapture_count = 0;     ///< Resets caused by launch-topology variant changes
             uint64_t snapshot_configuration_epoch = 0; ///< Executor snapshot topology represented by this cache
@@ -1308,7 +1311,13 @@ namespace llaminar2
             void *capture_stream = nullptr;           ///< Exact non-null stream for capture/replay
             CaptureStreamOwnership capture_stream_ownership =
                 CaptureStreamOwnership::None;         ///< Typed stream lifetime contract
-            void *sync_event = nullptr;               ///< Cached event for GPU-side inter-stream sync
+            /** Capture-stream output -> external-consumer handoff/fence. */
+            void *sync_event = nullptr;
+            /** External producer -> capture-stream handoff event. */
+            void *capture_input_event = nullptr;
+            void *terminal_event = nullptr;           ///< Dedicated event for one exact deferred host terminal
+            uint64_t terminal_fence_published_generation = 0; ///< Latest exact terminal recorded after submission
+            uint64_t terminal_fence_observed_generation = 0; ///< Latest exact terminal acquired by its host owner
             IWorkerGPUContext *gpu_ctx_ref = nullptr; ///< GPU context for stream lifecycle (not owned)
             DeviceId capture_device = DeviceId::invalid(); ///< Device used to resolve the stream owner at teardown
             bool capture_context_from_pool = false; ///< True when the stream was created by the pool context
@@ -1323,6 +1332,8 @@ namespace llaminar2
             RetainedFullGraphReplayPlan retained_full_graph_replay; ///< Optional prevalidated steady replay plan.
             std::unique_ptr<IGPUGraphCapture> retained_parent_capture; ///< Sole executable for a topology-composed transaction.
             RetainedComposedParentReplayPlan retained_composed_parent_replay; ///< Frozen identity/publication plan for @ref retained_parent_capture.
+            const void *auxiliary_branch_authority = nullptr; ///< Stable owner identity embedded in every captured branch node.
+            std::unique_ptr<IGraphCaptureAuxiliaryBranch> auxiliary_branch; ///< Cache-private parallel branch and event lifetime.
 
             GraphSegmentCache() = default;
             ~GraphSegmentCache()
@@ -1339,6 +1350,8 @@ namespace llaminar2
                   executable_submission_state(
                       other.executable_submission_state),
                   decode_step(other.decode_step),
+                  successful_capture_count(other.successful_capture_count),
+                  successful_submission_count(other.successful_submission_count),
                   capture_variant_signature(other.capture_variant_signature),
                   variant_recapture_count(other.variant_recapture_count),
                   snapshot_configuration_epoch(other.snapshot_configuration_epoch),
@@ -1347,6 +1360,12 @@ namespace llaminar2
                   capture_stream(other.capture_stream),
                   capture_stream_ownership(other.capture_stream_ownership),
                   sync_event(other.sync_event),
+                  capture_input_event(other.capture_input_event),
+                  terminal_event(other.terminal_event),
+                  terminal_fence_published_generation(
+                      other.terminal_fence_published_generation),
+                  terminal_fence_observed_generation(
+                      other.terminal_fence_observed_generation),
                   gpu_ctx_ref(other.gpu_ctx_ref),
                   capture_device(other.capture_device),
                   capture_context_from_pool(other.capture_context_from_pool),
@@ -1361,15 +1380,24 @@ namespace llaminar2
                   retained_parent_capture(
                       std::move(other.retained_parent_capture)),
                   retained_composed_parent_replay(
-                      std::move(other.retained_composed_parent_replay))
+                      std::move(other.retained_composed_parent_replay)),
+                  auxiliary_branch_authority(
+                      other.auxiliary_branch_authority),
+                  auxiliary_branch(std::move(other.auxiliary_branch))
             {
                 other.capture_stream = nullptr;
                 other.capture_stream_ownership = CaptureStreamOwnership::None;
                 other.sync_event = nullptr;
+                other.capture_input_event = nullptr;
+                other.terminal_event = nullptr;
+                other.terminal_fence_published_generation = 0;
+                other.terminal_fence_observed_generation = 0;
                 other.gpu_ctx_ref = nullptr;
                 other.capture_device = DeviceId::invalid();
                 other.capture_context_from_pool = false;
                 other.capture_variant_signature = 0;
+                other.successful_capture_count = 0;
+                other.successful_submission_count = 0;
                 other.executable_submission_state =
                     ExecutableSubmissionState::Empty;
                 other.variant_recapture_count = 0;
@@ -1384,6 +1412,7 @@ namespace llaminar2
                     SteadyReplayHostPolicy::GeneralController;
                 other.retained_full_graph_replay.clear();
                 other.retained_composed_parent_replay.clear();
+                other.auxiliary_branch_authority = nullptr;
             }
             GraphSegmentCache &operator=(GraphSegmentCache &&other) noexcept
             {
@@ -1397,6 +1426,10 @@ namespace llaminar2
                     executable_submission_state =
                         other.executable_submission_state;
                     decode_step = other.decode_step;
+                    successful_capture_count =
+                        other.successful_capture_count;
+                    successful_submission_count =
+                        other.successful_submission_count;
                     capture_variant_signature = other.capture_variant_signature;
                     variant_recapture_count = other.variant_recapture_count;
                     snapshot_configuration_epoch = other.snapshot_configuration_epoch;
@@ -1405,6 +1438,12 @@ namespace llaminar2
                     capture_stream = other.capture_stream;
                     capture_stream_ownership = other.capture_stream_ownership;
                     sync_event = other.sync_event;
+                    capture_input_event = other.capture_input_event;
+                    terminal_event = other.terminal_event;
+                    terminal_fence_published_generation =
+                        other.terminal_fence_published_generation;
+                    terminal_fence_observed_generation =
+                        other.terminal_fence_observed_generation;
                     gpu_ctx_ref = other.gpu_ctx_ref;
                     capture_device = other.capture_device;
                     capture_context_from_pool = other.capture_context_from_pool;
@@ -1421,13 +1460,22 @@ namespace llaminar2
                         std::move(other.retained_parent_capture);
                     retained_composed_parent_replay =
                         std::move(other.retained_composed_parent_replay);
+                    auxiliary_branch_authority =
+                        other.auxiliary_branch_authority;
+                    auxiliary_branch = std::move(other.auxiliary_branch);
                     other.capture_stream = nullptr;
                     other.capture_stream_ownership = CaptureStreamOwnership::None;
                     other.sync_event = nullptr;
+                    other.capture_input_event = nullptr;
+                    other.terminal_event = nullptr;
+                    other.terminal_fence_published_generation = 0;
+                    other.terminal_fence_observed_generation = 0;
                     other.gpu_ctx_ref = nullptr;
                     other.capture_device = DeviceId::invalid();
                     other.capture_context_from_pool = false;
                     other.capture_variant_signature = 0;
+                    other.successful_capture_count = 0;
+                    other.successful_submission_count = 0;
                     other.executable_submission_state =
                         ExecutableSubmissionState::Empty;
                     other.variant_recapture_count = 0;
@@ -1442,11 +1490,91 @@ namespace llaminar2
                         SteadyReplayHostPolicy::GeneralController;
                     other.retained_full_graph_replay.clear();
                     other.retained_composed_parent_replay.clear();
+                    other.auxiliary_branch_authority = nullptr;
                 }
                 return *this;
             }
             GraphSegmentCache(const GraphSegmentCache &) = delete;
             GraphSegmentCache &operator=(const GraphSegmentCache &) = delete;
+
+            /**
+             * @brief Record one successfully materialized native executable.
+             *
+             * A capture may be sealed during setup without submitting inference.
+             * Keeping materialization and submission counts separate lets the
+             * public graph probe distinguish that valid state from transaction
+             * zero and from every steady replay.
+             *
+             * @param submitted_transaction_zero True only when the newly
+             *        materialized executable was also launched for inference.
+             */
+            void recordSuccessfulCapture(
+                bool submitted_transaction_zero) noexcept
+            {
+                ++successful_capture_count;
+                if (submitted_transaction_zero)
+                    ++successful_submission_count;
+            }
+
+            /**
+             * @brief Record one successful launch of an existing executable.
+             *
+             * Call this only after every launch/publication edge for the
+             * transaction has succeeded. Failed attempts must never advance the
+             * diagnostic proof consumed by benchmark and server readiness gates.
+             */
+            void recordSuccessfulReplay() noexcept
+            {
+                ++successful_submission_count;
+            }
+
+            /**
+             * @brief Adopt snapshot topology identity before the first capture.
+             *
+             * The execution prelude may establish an exact capture stream and
+             * enqueue request-state publication before the executor compares
+             * snapshot topology identity.  A brand-new cache has no executable,
+             * capture unit, or snapshot allocation to retire, so routing that
+             * first identity assignment through @ref reset would publish a host
+             * event fence behind those request operations and synchronously wait
+             * for it.  Device-owned overlay transactions can deliberately keep
+             * that stream pending until transaction zero is launched, making the
+             * unnecessary reset a lifecycle deadlock.
+             *
+             * This operation succeeds only for the complete pristine executable
+             * state.  Any evidence of an earlier capture/materialization attempt
+             * rejects adoption so the caller must use the ordinary fenced reset
+             * before destroying backend resources.
+             *
+             * @param epoch Non-zero executor-owned snapshot topology generation.
+             * @return true when the identity was adopted without touching the
+             *         stream; false when retirement is required.
+             */
+            [[nodiscard]] bool adoptSnapshotConfigurationEpochIfPristine(
+                uint64_t epoch) noexcept
+            {
+                const bool pristine =
+                    epoch != 0 && !initialized && !needs_capture &&
+                    executable_submission_state ==
+                        ExecutableSubmissionState::Empty &&
+                    segments.empty() &&
+                    snapshot_manifest.stage_copies.empty() &&
+                    snapshot_manifest.outputless_stages.empty() &&
+                    snapshot_manifest.filtered_stages.empty() &&
+                    decode_step == 0 && capture_variant_signature == 0 &&
+                    replay_gpu_timing_slots.empty() &&
+                    host_ticket_fence_count == 0 &&
+                    !retained_parent_capture &&
+                    !auxiliary_branch &&
+                    auxiliary_branch_authority == nullptr &&
+                    !retained_full_graph_replay.valid() &&
+                    !retained_composed_parent_replay.valid();
+                if (!pristine)
+                    return false;
+
+                snapshot_configuration_epoch = epoch;
+                return true;
+            }
 
             /**
              * @brief Export a strict monolithic template for device-loop composition.
@@ -1509,13 +1637,43 @@ namespace llaminar2
                 const ComputeGraph &graph,
                 std::string *error = nullptr) const;
 
+            /**
+             * @brief Immutable identity of one exactly published stream terminal.
+             *
+             * The generation is cache-local and strictly serial. It prevents a
+             * host observer from accidentally waiting on an event recorded for
+             * an older or newer graph submission.
+             */
+            struct CaptureStreamTerminalTicket
+            {
+                uint64_t generation = 0;
+
+                /** @return Whether this ticket names a real publication. */
+                [[nodiscard]] constexpr bool valid() const noexcept
+                {
+                    return generation != 0;
+                }
+            };
+
             void reset(StreamResetPolicy stream_policy = StreamResetPolicy::Destroy)
             {
-                waitForCaptureStreamFence();
+                if (terminal_fence_published_generation >
+                    terminal_fence_observed_generation)
+                {
+                    waitForPublishedCaptureStreamTerminal(
+                        CaptureStreamTerminalTicket{
+                            terminal_fence_published_generation});
+                }
+                else
+                {
+                    waitForCaptureStreamFence();
+                }
                 // The parent owns clones of every child graph. Destroy it first
                 // so no backend child-node lifetime can outlive its source cache.
                 retained_parent_capture.reset();
                 segments.clear();
+                auxiliary_branch.reset();
+                auxiliary_branch_authority = nullptr;
                 initialized = false;
                 needs_capture = false;
                 executable_submission_state =
@@ -1523,6 +1681,8 @@ namespace llaminar2
                 decode_step = 0;
                 capture_variant_signature = 0;
                 host_ticket_fence_count = 0;
+                terminal_fence_published_generation = 0;
+                terminal_fence_observed_generation = 0;
                 graph_replay_plan_policy =
                     GraphReplayPlanPolicy::RequireFullGraph;
                 retained_full_graph_replay.clear();
@@ -1533,6 +1693,7 @@ namespace llaminar2
                 {
                     snapshot_manifest.clear();
                     snapshot_configuration_epoch = 0;
+                    destroyTerminalEvent();
                     destroyCaptureStream();
                 }
             }
@@ -1573,6 +1734,51 @@ namespace llaminar2
                 bool context_from_process_pool = false);
 
             /**
+             * @brief Allocate the dedicated exact-terminal event during setup.
+             *
+             * The event is separate from both directional handoff events
+             * because ordinary producer/consumer publication may legally
+             * overwrite them. Production callers must invoke this before request
+             * admission; @ref publishCaptureStreamTerminal never allocates.
+             *
+             * @param ctx Worker context owning the bound capture stream.
+             * @return True when the event already exists or was created.
+             */
+            [[nodiscard]] bool prepareCaptureStreamTerminal(
+                IWorkerGPUContext *ctx);
+
+            /**
+             * @brief Record the exact terminal immediately after graph launch.
+             *
+             * Invoke this in the same worker-owned submission closure as the
+             * retained graph launch. No unrelated stream work can then slip
+             * between the executable and its terminal. A second publication is
+             * rejected until the first ticket is observed because one event
+             * cannot represent two concurrently live generations.
+             *
+             * @return Non-zero serial ticket naming the recorded terminal.
+             */
+            [[nodiscard]] CaptureStreamTerminalTicket
+            publishCaptureStreamTerminal();
+
+            /**
+             * @brief Observe a terminal that was already recorded at launch.
+             *
+             * This method never records an event. It therefore cannot attach
+             * the transaction boundary to newer maintenance or inference work
+             * queued after the retained executable.
+             *
+             * @param ticket Exact ticket returned by the publication call.
+             * @param wait_policy Blocking teardown wait or bounded active poll.
+             * @param active_timeout_diagnostic Optional read-only timeout state.
+             */
+            void waitForPublishedCaptureStreamTerminal(
+                CaptureStreamTerminalTicket ticket,
+                HostFenceWaitPolicy wait_policy =
+                    HostFenceWaitPolicy::Blocking,
+                std::function<std::string()> active_timeout_diagnostic = {});
+
+            /**
              * @brief Wait on one event representing all prior capture-stream work.
              *
              * This is a host ownership fence, not an ordering primitive between
@@ -1585,10 +1791,14 @@ namespace llaminar2
              *
              * @param wait_policy Blocking teardown wait or bounded active
              *        progress for a latency-critical heterogeneous boundary.
+             * @param active_timeout_diagnostic Optional acquire-safe snapshot
+             *        appended only if bounded active progress expires. It must
+             *        not mutate graph, stream, or event ownership.
              */
             void waitForCaptureStreamFence(
                 HostFenceWaitPolicy wait_policy =
-                    HostFenceWaitPolicy::Blocking);
+                    HostFenceWaitPolicy::Blocking,
+                std::function<std::string()> active_timeout_diagnostic = {});
 
             /**
              * @brief Publish and await one declared captured-device ticket.
@@ -1603,13 +1813,37 @@ namespace llaminar2
             /// Destroy the capture stream if it exists
             void destroyCaptureStream();
 
-            /// Create or get the cached sync event for inter-stream dependencies
-            bool ensureSyncEvent(IWorkerGPUContext *ctx);
+            /**
+             * @brief Prepare the producer-to-capture handoff event.
+             *
+             * The event retains this direction for its whole lifetime. It is
+             * allocated only when an external producer stream exists, so a
+             * cache that already executes on its producer stream carries no
+             * unused input-edge resource.
+             *
+             * @param ctx Exact context that owns the producer and capture streams.
+             * @return True when the dedicated input event is ready for use.
+             */
+            bool ensureCaptureInputEvent(IWorkerGPUContext *ctx);
+
+            /**
+             * @brief Prepare the capture-to-consumer handoff/fence event.
+             *
+             * The output-direction event may also serve a terminal host fence
+             * during teardown, but it is never re-recorded as an input edge.
+             * Keeping the two preparations independent preserves directional
+             * ownership without eagerly allocating an event that a topology
+             * does not use.
+             *
+             * @param ctx Exact context that owns the capture and consumer streams.
+             * @return True when the dedicated output event is ready for use.
+             */
+            bool ensureCaptureOutputEvent(IWorkerGPUContext *ctx);
 
             /**
              * @brief Order the capture stream after work queued on another stream.
              *
-             * The method records the cache-owned event on `producer_stream` and
+             * The method records the input-direction event on `producer_stream` and
              * queues a wait on `capture_stream`. Both operations stay on the
              * device; no host wait or device-wide synchronization is permitted.
              *
@@ -1625,7 +1859,7 @@ namespace llaminar2
              * @brief Order an external consumer after the capture stream.
              *
              * This is the reverse half of @ref orderCaptureStreamAfter. It
-             * records the cache-owned handoff event on the exact stream that
+             * records the output-direction handoff event on the exact stream that
              * launched the captured graph, then queues a wait on the caller's
              * explicit consumer stream. The operation is entirely device-side;
              * it never synchronizes the host or changes graph ownership.
@@ -1638,8 +1872,11 @@ namespace llaminar2
                 IWorkerGPUContext *ctx,
                 void *consumer_stream);
 
-            /// Destroy the cached sync event if it exists
+            /** Destroy both directional handoff events if they exist. */
             void destroySyncEvent();
+
+            /** Destroy the dedicated exact-terminal event, if prepared. */
+            void destroyTerminalEvent();
 
             /**
              * @brief Destroy every cache-owned replay timing event after its stream fence.
@@ -1710,6 +1947,9 @@ namespace llaminar2
          *        native unit, including an optional retained parent, but neither
          *        launches an executable nor executes manual boundaries, invokes
          *        the launch dependency, or publishes arena writes.
+         * @param auxiliary_branch_factory Optional cache-private parallel branch
+         *        factory. It is legal only for one complete native graph and
+         *        becomes part of immutable graph-cache identity.
          * @return true on success
          */
         bool executeWithCachedGraphReplay(ComputeGraph &graph, IDeviceContext *ctx,
@@ -1731,7 +1971,9 @@ namespace llaminar2
                                               GraphInitialSubmissionPolicy
                                                   initial_submission =
                                                       GraphInitialSubmissionPolicy::
-                                                          CaptureInstantiateAndLaunch);
+                                                          CaptureInstantiateAndLaunch,
+                                              GraphCaptureAuxiliaryBranchFactory
+                                                  auxiliary_branch_factory = {});
 
         /**
          * @brief Policy object for decode capture/replay execution mode selection
@@ -1768,6 +2010,12 @@ namespace llaminar2
              * graph_replay_plan_policy is RequireRetainedParentComposition.
              */
             RetainedParentCompositionHook retained_parent_composer;
+            /**
+             * Optional bounded work captured as a parallel root-to-terminal
+             * branch of this exact production executable. The graph cache owns
+             * the constructed branch and validates its authority on replay.
+             */
+            GraphCaptureAuxiliaryBranchFactory auxiliary_branch_factory;
         };
 
         /**

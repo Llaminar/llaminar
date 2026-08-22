@@ -298,6 +298,52 @@ namespace llaminar2::test
             return plan;
         }
 
+        /**
+         * @brief One accelerator above three independently apportioned CPUs.
+         *
+         * Four participants let a tier exchange and a disjoint within-tier
+         * ownership swap form separate closed cycles. That geometry is needed
+         * to prove bounded scheduling fairness between the two Dynamic axes.
+         */
+        MoERoutedExpertPlacementPlan twoTierThreeCpuParticipantPlan()
+        {
+            MoERoutedExpertPlacementPlan plan;
+            plan.enabled = true;
+            plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+            plan.continuation_domain = "accelerator";
+            plan.shared_expert_domain = "accelerator";
+            plan.residency_policy =
+                RoutedExpertResidencyPolicy::RoutedTierRebalanced;
+            plan.owner_order = RoutedExpertOwnerOrder::Ordinal;
+            plan.domains = {
+                domain(
+                    "accelerator",
+                    GlobalDeviceAddress::cuda(0, 0),
+                    0,
+                    CollectiveBackendType::NCCL),
+            };
+
+            RoutedExpertDomain cpu;
+            cpu.name = "cpu_nodelocal";
+            cpu.scope = ExecutionDomainScope::NODE_LOCAL;
+            cpu.backend = CollectiveBackendType::UPI;
+            cpu.participants = {
+                GlobalDeviceAddress::cpu(0),
+                GlobalDeviceAddress::cpu(1),
+                GlobalDeviceAddress::cpu(2),
+            };
+            cpu.world_ranks = {0, 1, 2};
+            cpu.owner_rank = 0;
+            cpu.routed_compute_policy =
+                RoutedExpertComputePolicy::Apportioned;
+            plan.domains.push_back(std::move(cpu));
+            plan.routed_tiers = {
+                tier("priority_0", "accelerator", 0, 2),
+                tier("priority_1", "cpu_nodelocal", 1, 0, true),
+            };
+            return plan;
+        }
+
         /** @brief Geometry used to force two independently bounded swaps. */
         MoERoutedExpertModelMetadata eightExpertMetadata()
         {
@@ -384,6 +430,27 @@ namespace llaminar2::test
                 static_cast<int>(counts.size()),
                 false);
             return histogram;
+        }
+
+        /** @brief Histogram ownership matching the four-participant test plan. */
+        std::unique_ptr<DecodeExpertHistogram> fourParticipantHistogram()
+        {
+            DecodeExpertHistogramConfig config;
+            config.num_layers = 1;
+            config.num_experts = 8;
+            config.top_k = 2;
+            config.window_size = 4;
+            config.sockets = {
+                DeviceId::cuda(0),
+                DeviceId::cpu(),
+                DeviceId::cpu(),
+                DeviceId::cpu(),
+            };
+            config.ownership = MoELayeredExpertOwnership::uniform(
+                1,
+                4,
+                {0, 0, 1, 1, 2, 2, 3, 3});
+            return std::make_unique<DecodeExpertHistogram>(config);
         }
 
         /** @brief Build one immutable decode-only evidence generation. */
@@ -496,6 +563,34 @@ namespace llaminar2::test
             return profile;
         }
 
+        /** @brief Complete directed movement costs for four test endpoints. */
+        std::shared_ptr<const MoEOverlayMigrationCostProfile>
+        fourParticipantMigrationProfile(
+            uint64_t transfer_and_repack_ns,
+            uint64_t inference_interference_ns)
+        {
+            auto profile =
+                std::make_shared<MoEOverlayMigrationCostProfile>();
+            profile->identity = "four-participant-migration-v1";
+            for (int source = 0; source < 4; ++source)
+            {
+                for (int destination = 0; destination < 4; ++destination)
+                {
+                    if (source == destination)
+                        continue;
+                    profile->costs.push_back({
+                        .source_participant = source,
+                        .destination_participant = destination,
+                        .layer = 0,
+                        .transfer_and_repack_ns = transfer_and_repack_ns,
+                        .inference_interference_ns =
+                            inference_interference_ns,
+                    });
+                }
+            }
+            return profile;
+        }
+
         /** @brief Complete directed movement costs for two same-domain GPUs. */
         std::shared_ptr<const MoEOverlayMigrationCostProfile>
         twoParticipantMigrationProfile()
@@ -543,22 +638,57 @@ namespace llaminar2::test
                     return MoEOverlayResidencyWaveProgress::Ready;
                 }
 
-                bool beginCommit(std::string *error) noexcept override
+                bool beginPrepare(std::string *error) noexcept override
                 {
-                    owner_->calls.push_back("commit");
-                    owner_->epoch_seen_during_commit =
+                    owner_->calls.push_back("prepare");
+                    owner_->epoch_seen_during_prepare =
                         owner_->authority_->snapshot()->epoch;
-                    if (!owner_->commit_ok && error)
-                        *error = "injected commit failure";
-                    return owner_->commit_ok;
+                    if (!owner_->prepare_ok && error)
+                        *error = "injected preparation failure";
+                    return owner_->prepare_ok;
                 }
 
-                MoEOverlayResidencyWaveProgress pollCommit(
+                MoEOverlayResidencyWaveProgress pollPrepare(
                     std::string *) noexcept override
                 {
-                    if (owner_->commit_pending_polls > 0)
+                    if (owner_->prepare_pending_polls > 0)
                     {
-                        --owner_->commit_pending_polls;
+                        --owner_->prepare_pending_polls;
+                        return MoEOverlayResidencyWaveProgress::Pending;
+                    }
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                }
+
+                bool beginPublication(std::string *error) noexcept override
+                {
+                    owner_->calls.push_back("publish");
+                    owner_->epoch_seen_during_publication =
+                        owner_->authority_->snapshot()->epoch;
+
+                    /*
+                     * Selector publication may expose E+1 before public host
+                     * admission advances. The exact-addressed candidate must
+                     * therefore already be live at this irreversible edge.
+                     */
+                    const auto candidate_epoch =
+                        owner_->epoch_seen_during_publication + 1u;
+                    auto candidate = owner_->authority_->tryAcquireTicketSnapshot(
+                        candidate_epoch);
+                    owner_->candidate_was_exact_addressable =
+                        candidate.has_value() &&
+                        (*candidate)->epoch == candidate_epoch;
+
+                    if (!owner_->publication_ok && error)
+                        *error = "injected publication failure";
+                    return owner_->publication_ok;
+                }
+
+                MoEOverlayResidencyWaveProgress pollPublication(
+                    std::string *) noexcept override
+                {
+                    if (owner_->publication_pending_polls > 0)
+                    {
+                        --owner_->publication_pending_polls;
                         return MoEOverlayResidencyWaveProgress::Pending;
                     }
                     return MoEOverlayResidencyWaveProgress::Ready;
@@ -574,6 +704,11 @@ namespace llaminar2::test
                     owner_->calls.push_back("retire");
                     owner_->epoch_seen_during_retire =
                         owner_->authority_->snapshot()->epoch;
+                }
+
+                void markAuthorityPublished() noexcept override
+                {
+                    owner_->calls.push_back("authority-published");
                 }
 
             private:
@@ -606,13 +741,17 @@ namespace llaminar2::test
 
             MoEOverlayResidencyAuthority *authority_ = nullptr;
             bool stage_ok = true;
-            bool commit_ok = true;
+            bool prepare_ok = true;
+            bool publication_ok = true;
             bool defer_start = false;
             int stage_pending_polls = 0;
-            int commit_pending_polls = 0;
+            int prepare_pending_polls = 0;
+            int publication_pending_polls = 0;
             uint64_t epoch_seen_during_stage = 0;
-            uint64_t epoch_seen_during_commit = 0;
+            uint64_t epoch_seen_during_prepare = 0;
+            uint64_t epoch_seen_during_publication = 0;
             uint64_t epoch_seen_during_retire = 0;
+            bool candidate_was_exact_addressable = false;
             std::vector<std::string> calls;
             std::vector<MoEOverlayTierMigration> staged_migrations;
         };
@@ -640,12 +779,108 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayResidencyAuthority,
+        ThreeTierCapacityUsesClosedSlotFlowNotDirectionCountEquality)
+    {
+        const auto owner = [](int expert,
+                              int tier,
+                              int participant,
+                              DeviceId device)
+        {
+            return MoEExpertOwner{
+                .layer_idx = 0,
+                .expert_id = expert,
+                .tier_idx = tier,
+                .owner_participant = participant,
+                .device = device,
+                .resident = true,
+            };
+        };
+        const auto edge = [&](int expert,
+                              int source_tier,
+                              int source_participant,
+                              DeviceId source_device,
+                              int destination_tier,
+                              int destination_participant,
+                              DeviceId destination_device,
+                              MoEOverlayTierMigrationDirection direction)
+        {
+            return MoEOverlayTierMigration{
+                .layer_idx = 0,
+                .expert_id = expert,
+                .estimated_weight_bytes = 4096u,
+                .direction = direction,
+                .source = owner(
+                    expert,
+                    source_tier,
+                    source_participant,
+                    source_device),
+                .destination = owner(
+                    expert,
+                    destination_tier,
+                    destination_participant,
+                    destination_device),
+            };
+        };
+
+        /*
+         * CPU-1 -> CUDA -> ROCm -> CPU-0 -> CPU-1 is one closed
+         * participant cycle. Its thermal labels are intentionally asymmetric:
+         * one direct promotion, two demotions, and one same-tier handoff.
+         */
+        const std::vector<MoEOverlayTierMigration> closed_cycle{
+            edge(0, 2, 2, DeviceId::cpu(), 0, 0, DeviceId::cuda(0),
+                 MoEOverlayTierMigrationDirection::Promotion),
+            edge(1, 0, 0, DeviceId::cuda(0), 1, 1, DeviceId::rocm(0),
+                 MoEOverlayTierMigrationDirection::Demotion),
+            edge(2, 1, 1, DeviceId::rocm(0), 2, 3, DeviceId::cpu(),
+                 MoEOverlayTierMigrationDirection::Demotion),
+            edge(3, 2, 3, DeviceId::cpu(), 2, 2, DeviceId::cpu(),
+                 MoEOverlayTierMigrationDirection::SamePriority),
+        };
+
+        const auto evidence =
+            analyzeMoEOverlayMigrationCapacity(closed_cycle);
+        EXPECT_TRUE(evidence.capacityPreserved());
+        EXPECT_EQ(evidence.edges_checked, 4u);
+        EXPECT_EQ(evidence.participant_flow_violations, 0u);
+        EXPECT_EQ(evidence.tier_flow_violations, 0u);
+        EXPECT_EQ(
+            std::count_if(
+                closed_cycle.begin(),
+                closed_cycle.end(),
+                [](const auto &migration)
+                {
+                    return migration.direction ==
+                           MoEOverlayTierMigrationDirection::Promotion;
+                }),
+            1);
+        EXPECT_EQ(
+            std::count_if(
+                closed_cycle.begin(),
+                closed_cycle.end(),
+                [](const auto &migration)
+                {
+                    return migration.direction ==
+                           MoEOverlayTierMigrationDirection::Demotion;
+                }),
+            2);
+
+        auto open_path = closed_cycle;
+        open_path.pop_back();
+        const auto broken_evidence =
+            analyzeMoEOverlayMigrationCapacity(open_path);
+        EXPECT_FALSE(broken_evidence.capacityPreserved());
+        EXPECT_GT(broken_evidence.participant_flow_violations, 0u);
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
         DeviceResidentDynamicAuthorityRejectsEveryHostPublicationPath)
     {
         auto plan = oneTierTwoParticipantPlan(
             RoutedExpertResidencyPolicy::RoutedTierRebalanced);
         plan.authority_execution =
-            MoEOverlayAuthorityExecutionKind::HomogeneousDeviceResident;
+            MoEOverlayAuthorityExecutionKind::DeviceResident;
         auto histogram = oneTierHistogram();
         MoEOverlayResidencyAuthority authority({
             .initial_plan = std::move(plan),
@@ -706,7 +941,7 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayResidencyAuthority,
-        HomogeneousCpuAuthorityKeepsItsLiveWriterOnTheHostParticipants)
+        CpuAuthorityKeepsItsSoleLiveWriterOnTheHost)
     {
         auto plan = oneTierTwoParticipantPlan(
             RoutedExpertResidencyPolicy::RoutedTierRebalanced);
@@ -718,11 +953,11 @@ namespace llaminar2::test
         };
         plan.domains.front().world_ranks = {0, 1};
         plan.authority_execution =
-            MoEOverlayAuthorityExecutionKind::HomogeneousDeviceResident;
+            MoEOverlayAuthorityExecutionKind::HostResident;
         ASSERT_EQ(
             resolveMoEOverlayAuthorityExecutionKind(plan),
             MoEOverlayAuthorityExecutionKind::
-                HomogeneousDeviceResident);
+                HostResident);
 
         auto histogram = oneTierCpuHistogram();
         MoEOverlayResidencyAuthority authority({
@@ -761,10 +996,13 @@ namespace llaminar2::test
             MoEOverlayResidencyApplyStatus::Started);
         EXPECT_EQ(
             authority.advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committing);
+            MoEOverlayResidencyApplyStatus::Preparing);
         EXPECT_EQ(
             authority.advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committed);
+            MoEOverlayResidencyApplyStatus::Publishing);
+        EXPECT_EQ(
+            authority.advanceBackground().status,
+            MoEOverlayResidencyApplyStatus::Published);
     }
 
     TEST(
@@ -860,11 +1098,14 @@ namespace llaminar2::test
         ASSERT_EQ(started.status, MoEOverlayResidencyApplyStatus::Started);
         EXPECT_EQ(
             authority.advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committing);
-        const auto committed = authority.advanceBackground();
+            MoEOverlayResidencyApplyStatus::Preparing);
+        EXPECT_EQ(
+            authority.advanceBackground().status,
+            MoEOverlayResidencyApplyStatus::Publishing);
+        const auto published = authority.advanceBackground();
         ASSERT_EQ(
-            committed.status,
-            MoEOverlayResidencyApplyStatus::Committed);
+            published.status,
+            MoEOverlayResidencyApplyStatus::Published);
 
         stats = authority.stats();
         EXPECT_EQ(stats.committed_migrations, 2u);
@@ -887,6 +1128,52 @@ namespace llaminar2::test
         EXPECT_DOUBLE_EQ(
             findRecord(records, "same_priority_moves")->value,
             2.0);
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        ParticipantPlannerSearchesPastHottestColdestOvershoot)
+    {
+        auto histogram = oneTierHistogram();
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = oneTierTwoParticipantPlan(
+                RoutedExpertResidencyPolicy::RoutedTierRebalanced),
+            .model_metadata = modelMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .participant_rebalance_policy = {
+                .enabled = true,
+                .imbalance_threshold_per_mille = 1300,
+                .minimum_improvement_per_mille = 50,
+                .maximum_swaps_per_layer = 4,
+                .maximum_plan_entries_per_wave = 16,
+                .minimum_window_activations = 1,
+            },
+            .shadow_slots_per_endpoint_layer = 1,
+            .max_concurrent_cycles = 1,
+            .perf_device = "one-tier-extrema-overshoot",
+        });
+
+        const auto evidence = frozenWindow(
+            1, {10, 8, 0, 7, 5, 0});
+        const auto transaction =
+            authority.proposeFromFrozenHistogramWindow(evidence);
+
+        ASSERT_TRUE(transaction.valid());
+        ASSERT_EQ(transaction.migrations.size(), 2u);
+        EXPECT_EQ(authority.stats().participant_rebalance_owner_changes, 2u);
+
+        std::array<uint64_t, 2> resulting_load{};
+        for (int expert = 0; expert < 6; ++expert)
+        {
+            resulting_load[static_cast<std::size_t>(
+                transaction.candidate->layered_ownership.owner(
+                    0, expert))] += evidence->activationCount(0, expert);
+        }
+        EXPECT_EQ(resulting_load[0], 15u);
+        EXPECT_EQ(resulting_load[1], 15u)
+            << "the planner must consider a non-coldest exchange when the "
+               "hottest/coldest pair overshoots";
     }
 
     TEST(
@@ -1034,10 +1321,13 @@ namespace llaminar2::test
             MoEOverlayResidencyApplyStatus::Started);
         ASSERT_EQ(
             authority.advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committing);
+            MoEOverlayResidencyApplyStatus::Preparing);
         ASSERT_EQ(
             authority.advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committed);
+            MoEOverlayResidencyApplyStatus::Publishing);
+        ASSERT_EQ(
+            authority.advanceBackground().status,
+            MoEOverlayResidencyApplyStatus::Published);
         EXPECT_EQ(authority.snapshot()->epoch, 2u);
         EXPECT_EQ(authority.pendingRetirementCount(), 1u)
             << "epoch one must remain alive while its LLEP child borrows sources";
@@ -1217,22 +1507,38 @@ namespace llaminar2::test
         EXPECT_EQ(started.published_epoch, 1u);
         EXPECT_EQ(authority.snapshot()->epoch, 1u);
 
-        const auto committing = authority.advanceBackground();
-        ASSERT_TRUE(committing.ok()) << committing.error;
+        const auto preparing = authority.advanceBackground();
+        ASSERT_TRUE(preparing.ok()) << preparing.error;
         EXPECT_EQ(
-            committing.status,
-            MoEOverlayResidencyApplyStatus::Committing);
+            preparing.status,
+            MoEOverlayResidencyApplyStatus::Preparing);
         EXPECT_EQ(authority.snapshot()->epoch, 1u)
-            << "The candidate must remain private until commit readiness";
+            << "The candidate must remain private until preparation readiness";
+
+        const auto publishing = authority.advanceBackground();
+        ASSERT_TRUE(publishing.ok()) << publishing.error;
+        EXPECT_EQ(
+            publishing.status,
+            MoEOverlayResidencyApplyStatus::Publishing);
+        EXPECT_EQ(authority.snapshot()->epoch, 1u)
+            << "Ordinary admission must remain on E while selectors fan out";
+        EXPECT_TRUE(transport.candidate_was_exact_addressable)
+            << "Device-selected E+1 tickets require an exact host snapshot";
 
         const auto result = authority.advanceBackground();
         ASSERT_TRUE(result.ok()) << result.error;
-        EXPECT_EQ(result.status, MoEOverlayResidencyApplyStatus::Committed);
+        EXPECT_EQ(result.status, MoEOverlayResidencyApplyStatus::Published);
         EXPECT_EQ(result.published_epoch, 2u);
         EXPECT_EQ(transport.calls,
-                  (std::vector<std::string>{"stage", "commit", "retire"}));
+                  (std::vector<std::string>{
+                      "stage",
+                      "prepare",
+                      "publish",
+                      "authority-published",
+                      "retire"}));
         EXPECT_EQ(transport.epoch_seen_during_stage, 1u);
-        EXPECT_EQ(transport.epoch_seen_during_commit, 1u);
+        EXPECT_EQ(transport.epoch_seen_during_prepare, 1u);
+        EXPECT_EQ(transport.epoch_seen_during_publication, 1u);
         EXPECT_EQ(transport.epoch_seen_during_retire, 2u)
             << "Old residency may retire only after atomic owner publication";
 
@@ -1607,10 +1913,13 @@ namespace llaminar2::test
             MoEOverlayResidencyApplyStatus::Started);
         ASSERT_EQ(
             authority.advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committing);
+            MoEOverlayResidencyApplyStatus::Preparing);
         ASSERT_EQ(
             authority.advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committed);
+            MoEOverlayResidencyApplyStatus::Publishing);
+        ASSERT_EQ(
+            authority.advanceBackground().status,
+            MoEOverlayResidencyApplyStatus::Published);
         ASSERT_EQ(authority.snapshot()->epoch, 2u);
 
         const auto immediate_reverse =
@@ -1669,10 +1978,13 @@ namespace llaminar2::test
             MoEOverlayResidencyApplyStatus::Started);
         ASSERT_EQ(
             authority.advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committing);
+            MoEOverlayResidencyApplyStatus::Preparing);
         ASSERT_EQ(
             authority.advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committed);
+            MoEOverlayResidencyApplyStatus::Publishing);
+        ASSERT_EQ(
+            authority.advanceBackground().status,
+            MoEOverlayResidencyApplyStatus::Published);
 
         const std::vector<uint64_t> reversed{
             20, 100, 10, 90, 70, 80};
@@ -1863,27 +2175,217 @@ namespace llaminar2::test
             ASSERT_TRUE(transaction.valid());
             ASSERT_FALSE(transaction.empty());
             ASSERT_EQ(transaction.migration_cycles.size(), 1u);
-            ASSERT_EQ(transaction.migrations.size(), 2u);
+            ASSERT_GE(transaction.migrations.size(), 2u);
+            ASSERT_LE(transaction.migrations.size(), 3u)
+                << "A two-tier NodeLocal exchange may close through one "
+                   "same-priority participant edge";
+            ASSERT_TRUE(
+                transaction.migration_cycles.front().valid(
+                    transaction.migrations));
             EXPECT_TRUE(transaction.economy.enabled);
             EXPECT_GT(
                 transaction.economy.projected_net_benefit_ns,
                 0u);
-            EXPECT_EQ(
-                std::count_if(
+            const auto direction_count = [&](const auto direction)
+            {
+                return std::count_if(
                     transaction.migrations.begin(),
                     transaction.migrations.end(),
-                    [](const auto &migration)
-                    {
-                        return migration.direction ==
-                               MoEOverlayTierMigrationDirection::SamePriority;
-                    }),
-                0);
+                    [&](const auto &migration)
+                    { return migration.direction == direction; });
+            };
+            EXPECT_EQ(
+                direction_count(
+                    MoEOverlayTierMigrationDirection::Promotion),
+                1);
+            EXPECT_EQ(
+                direction_count(
+                    MoEOverlayTierMigrationDirection::Demotion),
+                1);
+            EXPECT_LE(
+                direction_count(
+                    MoEOverlayTierMigrationDirection::SamePriority),
+                1)
+                << "A bounded combined cycle may advance participant "
+                   "placement without changing its tier-selected hot expert";
             EXPECT_EQ(
                 transaction.candidate->owner_map.ownerFor(0, 6)->tier_idx,
                 0);
             EXPECT_EQ(authority.stats().capacity_bounded_proposals, 1u);
             EXPECT_EQ(authority.stats().target_cycles_omitted, 1u);
         }
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        WholeLayerEvidenceFloorSurvivesMultiTierPartition)
+    {
+        ScopedPerfStats perf;
+        auto histogram = fourParticipantHistogram();
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = twoTierThreeCpuParticipantPlan(),
+            .model_metadata = eightExpertMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .phase_service_profile = twoTierServiceProfile(),
+            .migration_cost_profile =
+                fourParticipantMigrationProfile(
+                    /*transfer_and_repack_ns=*/1,
+                    /*inference_interference_ns=*/1),
+            .migration_economy_policy =
+                MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 370,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                },
+            .participant_rebalance_policy = {
+                .enabled = true,
+                .imbalance_threshold_per_mille = 1001,
+                .minimum_improvement_per_mille = 1,
+                .maximum_swaps_per_layer = 4,
+                .maximum_plan_entries_per_wave = 16,
+                .minimum_window_activations = 64,
+            },
+            .shadow_slots_per_endpoint_layer = 1,
+            .max_concurrent_cycles = 1,
+            .perf_device = "whole-layer-evidence-floor",
+        });
+
+        /*
+         * The complete routed layer has 240 observations and therefore clears
+         * the configured 64-observation evidence floor.  Its apportioned CPU
+         * tier contains only 50 of those observations.  Partitioning by tier
+         * is an ownership optimization detail and must not silently redefine
+         * the production window that the shared Dynamic knob qualifies.
+         */
+        const auto transaction =
+            authority.proposeFromFrozenHistogramWindow(
+                frozenWindow(
+                    1,
+                    {100, 90, 30, 15, 2, 1, 1, 1}));
+        ASSERT_TRUE(transaction.valid());
+        ASSERT_EQ(transaction.migration_cycles.size(), 1u);
+        ASSERT_EQ(transaction.migrations.size(), 2u);
+        EXPECT_TRUE(std::all_of(
+            transaction.migrations.begin(),
+            transaction.migrations.end(),
+            [](const auto &migration)
+            {
+                return !migration.crossesTier() &&
+                       migration.direction ==
+                           MoEOverlayTierMigrationDirection::SamePriority;
+            }));
+        EXPECT_EQ(
+            authority.stats().participant_rebalance_owner_changes,
+            2u);
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        BoundedDynamicWaveAdmitsBothTierAndParticipantAxes)
+    {
+        ScopedPerfStats perf;
+        auto histogram = fourParticipantHistogram();
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = twoTierThreeCpuParticipantPlan(),
+            .model_metadata = eightExpertMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .phase_service_profile = twoTierServiceProfile(),
+            .migration_cost_profile =
+                fourParticipantMigrationProfile(
+                    /*transfer_and_repack_ns=*/1,
+                    /*inference_interference_ns=*/1),
+            .migration_economy_policy =
+                MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 370,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                },
+            .participant_rebalance_policy = {
+                .enabled = true,
+                .imbalance_threshold_per_mille = 1001,
+                .minimum_improvement_per_mille = 1,
+                .maximum_swaps_per_layer = 4,
+                .maximum_plan_entries_per_wave = 16,
+                .minimum_window_activations = 1,
+            },
+            .shadow_slots_per_endpoint_layer = 2,
+            .max_concurrent_cycles = 2,
+            .perf_device = "bounded-two-axis-dynamic",
+        });
+
+        /*
+         * The two hottest experts both begin on CPU participant 1, so the two
+         * tier exchanges use only participants 0 and 1. Participants 2 and 3
+         * are independently and deliberately skewed, making their profitable
+         * same-tier swap a disjoint closed cycle. A two-cycle wave must not let
+         * the larger tier-residency scores consume both slots forever.
+         */
+        const auto transaction =
+            authority.proposeFromFrozenHistogramWindow(
+                frozenWindow(
+                    1,
+                    {10, 9, 100, 90, 80, 70, 1, 1}));
+        ASSERT_TRUE(transaction.valid());
+        ASSERT_EQ(transaction.migration_cycles.size(), 2u);
+        const auto proposal_stats = authority.stats();
+        EXPECT_GT(proposal_stats.participant_rebalance_owner_changes, 0u)
+            << "the adversarial CPU ownership must reach cycle admission";
+        EXPECT_EQ(proposal_stats.payoff_rejected_cycles, 0u)
+            << "both placement axes are deliberately profitable";
+        EXPECT_EQ(transaction.economy.projected_service_gain_ns, 13'425u)
+            << "the transaction must combine one tier delta with the joint "
+               "post-tier participant makespan delta";
+        EXPECT_EQ(
+            transaction.economy.projected_transfer_and_repack_ns,
+            2u);
+        EXPECT_EQ(
+            transaction.economy.projected_inference_interference_ns,
+            2u);
+        EXPECT_EQ(transaction.economy.projected_net_benefit_ns, 13'421u);
+
+        bool admitted_tier_placement = false;
+        bool admitted_participant_rebalance = false;
+        for (const auto &cycle : transaction.migration_cycles)
+        {
+            const bool pure_same_tier = std::all_of(
+                cycle.migration_indices.begin(),
+                cycle.migration_indices.end(),
+                [&](const std::size_t migration_index)
+                {
+                    return !transaction.migrations[migration_index]
+                                .crossesTier();
+                });
+            admitted_participant_rebalance |= pure_same_tier;
+            admitted_tier_placement |= !pure_same_tier;
+        }
+        EXPECT_TRUE(admitted_tier_placement);
+        EXPECT_TRUE(admitted_participant_rebalance)
+            << "bounded Dynamic scheduling must make progress on both "
+               "independent placement axes";
+
+        const auto records = PerfStatsCollector::snapshot(
+            {"moe_overlay_residency"});
+        const auto *axis_admission = findRecord(
+            records, "cycle_axis_admission");
+        ASSERT_NE(axis_admission, nullptr);
+        EXPECT_NE(
+            axis_admission->tags.at(
+                "eligible_participant_placement_cycles"),
+            "0");
+        EXPECT_NE(
+            axis_admission->tags.at(
+                "admitted_participant_placement_cycles"),
+            "0");
+        EXPECT_EQ(
+            axis_admission->tags.at(
+                "independent_axis_reservation_active"),
+            "true");
     }
 
     TEST(
@@ -1930,20 +2432,28 @@ namespace llaminar2::test
             << "Ticket admission remains open while background work runs";
         EXPECT_EQ(authority.activeTicketCount(), 2u);
 
-        const auto committing = authority.advanceBackground();
+        const auto preparing = authority.advanceBackground();
         EXPECT_EQ(
-            committing.status,
-            MoEOverlayResidencyApplyStatus::Committing);
+            preparing.status,
+            MoEOverlayResidencyApplyStatus::Preparing);
         EXPECT_EQ(authority.snapshot()->epoch, 1u);
 
-        const auto committed = authority.advanceBackground();
-        EXPECT_EQ(committed.status, MoEOverlayResidencyApplyStatus::Committed);
+        const auto publishing = authority.advanceBackground();
+        EXPECT_EQ(
+            publishing.status,
+            MoEOverlayResidencyApplyStatus::Publishing);
+        EXPECT_EQ(authority.snapshot()->epoch, 1u);
+        EXPECT_TRUE(transport.candidate_was_exact_addressable);
+
+        const auto published = authority.advanceBackground();
+        EXPECT_EQ(published.status, MoEOverlayResidencyApplyStatus::Published);
         EXPECT_EQ(authority.snapshot()->epoch, 2u);
         EXPECT_EQ(histogram->activationCount(0, 4), 7u)
             << "Asynchronous commit must not reset routes collected in flight";
         EXPECT_EQ(authority.pendingRetirementCount(), 1u);
         EXPECT_EQ(transport.calls,
-                  (std::vector<std::string>{"stage", "commit"}));
+                  (std::vector<std::string>{
+                      "stage", "prepare", "publish", "authority-published"}));
 
         auto exact_old_lease = authority.tryAcquireTicketSnapshot(1u);
         ASSERT_TRUE(exact_old_lease.has_value());
@@ -1960,7 +2470,8 @@ namespace llaminar2::test
         second_old_lease.reset();
         EXPECT_EQ(authority.activeTicketCount(), 2u);
         EXPECT_EQ(transport.calls,
-                  (std::vector<std::string>{"stage", "commit"}))
+                  (std::vector<std::string>{
+                      "stage", "prepare", "publish", "authority-published"}))
             << "Final return only drops a lease; it never performs cleanup";
 
         exact_old_lease.reset();
@@ -1970,7 +2481,12 @@ namespace llaminar2::test
         EXPECT_EQ(idle.status, MoEOverlayResidencyApplyStatus::Idle);
         EXPECT_EQ(authority.pendingRetirementCount(), 0u);
         EXPECT_EQ(transport.calls,
-                  (std::vector<std::string>{"stage", "commit", "retire"}));
+                  (std::vector<std::string>{
+                      "stage",
+                      "prepare",
+                      "publish",
+                      "authority-published",
+                      "retire"}));
         EXPECT_EQ(authority.stats().published_with_old_tickets, 1u);
         EXPECT_FALSE(authority.tryAcquireTicketSnapshot(1u).has_value())
             << "A retired epoch must no longer admit delayed tickets";

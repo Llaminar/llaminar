@@ -12,7 +12,9 @@
 
 #include "execution/moe/ExpertTierWeightStream.h"
 #include "execution/moe/ExpertTierWeightTransferLane.h"
+#include "execution/moe/GpuExpertSlotPool.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
+#include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
@@ -1338,17 +1340,33 @@ namespace llaminar2
             EXPECT_EQ(stats.published_bank_sources, demotion_chunks);
         }
 
-        TEST_F(
-            CUDAExpertTierWeightKernelsTest,
-            PromotedAsymmetricWeightsExecuteDecodeAndVerifierByteExactly)
+        /**
+         * @brief Prove one real asymmetric source format across promotion and
+         *        every production row regime.
+         * @param format_name Quantized verifier format used to create real
+         *                    source bytes.
+         * @param N Logical projection output width.
+         * @param K Logical projection reduction width.
+         * @param seed Deterministic source-weight seed.
+         *
+         * Superblock formats cannot be represented by arbitrary separated GPU
+         * bytes.  Starting from the real tensor packer is therefore part of the
+         * proof: the source arithmetic identity must survive CPU preparation,
+         * streamed expansion, redemotion, and promoted execution.
+         */
+        void provePromotedAsymmetricWeightsExecuteByteExactly(
+            const char *format_name,
+            int N,
+            int K,
+            std::uint32_t seed)
         {
             ScopedPerfStats perf_stats;
-            constexpr int N = 512;
-            constexpr int K = 2048;
             constexpr int verifier_rows = 4;
             constexpr int prefill_rows = 32;
-            const auto &format = test::quantizedVerifierFormat("Q5_1");
-            auto tensor = format.create({N, K}, 99173u);
+            const auto &format = test::quantizedVerifierFormat(format_name);
+            auto tensor = format.create(
+                {static_cast<std::size_t>(N), static_cast<std::size_t>(K)},
+                seed);
             ASSERT_NE(tensor, nullptr);
             const HostGpuExpertPackedProjection compact =
                 packProductionGpuProjection(*tensor);
@@ -1361,13 +1379,32 @@ namespace llaminar2
             ASSERT_TRUE(cpu_weights.usesExpandedInt8());
             ASSERT_TRUE(cpu_weights.is_asymmetric);
 
-            const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
+            const auto probe_manifest =
+                makeCpuToGpuExpertTierWeightStreamManifest(
                 cpu_weights,
                 7301,
                 2,
                 19,
                 ExpertTierWeightProjection::Down,
                 1);
+            const auto probe_layout = probe_manifest.deviceLayout();
+            ASSERT_TRUE(probe_layout.valid());
+            const std::size_t production_staging_bytes =
+                MoEOverlayPhysicalResidencyFabric::Config{}
+                    .staging_capacity_bytes;
+            const auto production_units_per_chunk =
+                static_cast<std::uint32_t>(std::min<std::size_t>(
+                    probe_layout.unit_count,
+                    production_staging_bytes /
+                        probe_layout.cpu_block_stride));
+            ASSERT_GT(production_units_per_chunk, 1u);
+            const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
+                cpu_weights,
+                7301,
+                2,
+                19,
+                ExpertTierWeightProjection::Down,
+                production_units_per_chunk);
             const auto layout = manifest.deviceLayout();
             ASSERT_TRUE(layout.valid());
             ASSERT_EQ(
@@ -1395,7 +1432,7 @@ namespace llaminar2
             std::string error;
             ExpertTierWeightTransferLane lane({
                 .device = DeviceId::cuda(0),
-                .staging_capacity_bytes = layout.chunkBytes(1),
+                .staging_capacity_bytes = production_staging_bytes,
                 .lane_name = "cuda_asymmetric_promotion_execution",
                 .perf_device = "cuda:0",
             });
@@ -1444,6 +1481,55 @@ namespace llaminar2
                 .emins_bytes = 0,
             };
             ASSERT_TRUE(promoted_descriptor.valid());
+
+            /*
+             * Production does not publish the transfer view directly.  It
+             * retains an ITensorGemm alias over the inactive slot and later
+             * exports that alias into the immutable runtime bank.  Exercise
+             * that exact handoff here so a wrapper that reallocates, drops
+             * provenance, or silently rebinds a pointer cannot pass the raw
+             * repack proof while poisoning live sparse execution.
+             */
+            auto slot_lifetime = std::make_shared<int>(1);
+            auto promoted_engine = std::make_shared<
+                cuda::CUDAQuantisedGemmKernel>(
+                N,
+                K,
+                0,
+                promoted_payload.data(),
+                promoted_scales.data(),
+                promoted_mins.data(),
+                nullptr,
+                layout.gpu_codebook_id,
+                static_cast<std::uint32_t>(K / 32),
+                slot_lifetime,
+                NativeVnniSourceIdentity{
+                    .codebook_id = compact.source_codebook_id,
+                    .is_superblock = compact.is_superblock,
+                    .present = true,
+                },
+                NativeVnniReusableDeviceAllocationFormat{
+                    .payload_bytes_per_block =
+                        layout.gpu_payload_bytes_per_block,
+                    .has_mins = layout.gpu_is_asymmetric != 0,
+                    .has_emins = layout.gpu_has_emins != 0,
+                });
+            DeviceNativeVNNIMatrixDesc published_descriptor;
+            ASSERT_TRUE(promoted_engine->exportNativeVNNIMatrixDesc(
+                published_descriptor));
+            ASSERT_TRUE(published_descriptor.valid());
+            EXPECT_EQ(published_descriptor.payload, promoted_payload.data());
+            EXPECT_EQ(published_descriptor.scales, promoted_scales.data());
+            EXPECT_EQ(published_descriptor.mins, promoted_mins.data());
+            EXPECT_EQ(published_descriptor.emins, nullptr);
+            EXPECT_EQ(published_descriptor.n, N);
+            EXPECT_EQ(published_descriptor.k, K);
+            EXPECT_EQ(
+                published_descriptor.codebook_id,
+                layout.gpu_codebook_id);
+            EXPECT_EQ(
+                published_descriptor.arithmeticPolicyCodebookId(),
+                compact.source_codebook_id);
             const auto redemotion_manifest =
                 makeGpuToCpuExpertTierWeightStreamManifest(
                     *source_format,
@@ -1497,7 +1583,7 @@ namespace llaminar2
             ASSERT_EQ(compact_scales.upload(compact.scales), cudaSuccess);
             ASSERT_EQ(compact_mins.upload(compact.mins), cudaSuccess);
 
-            constexpr std::size_t activation_elements =
+            const std::size_t activation_elements =
                 static_cast<std::size_t>(prefill_rows) * K;
             std::vector<std::int8_t> host_activation(activation_elements);
             std::vector<std::int32_t> host_activation_sums(prefill_rows, 0);
@@ -1618,11 +1704,13 @@ namespace llaminar2
                     compact.source_codebook_id,
                     compact_output.data()));
                 ASSERT_TRUE(launch(
-                    promoted_payload.data(),
-                    promoted_scales.data(),
-                    promoted_mins.data(),
-                    layout.gpu_codebook_id,
-                    layout.gpu_source_codebook_id,
+                    published_descriptor.payload,
+                    static_cast<const std::uint16_t *>(
+                        published_descriptor.scales),
+                    static_cast<const std::uint16_t *>(
+                        published_descriptor.mins),
+                    published_descriptor.codebook_id,
+                    published_descriptor.arithmeticPolicyCodebookId(),
                     promoted_output.data()));
                 ASSERT_EQ(stream.synchronize(), cudaSuccess);
 
@@ -1695,6 +1783,202 @@ namespace llaminar2
             EXPECT_EQ(stats.inference_stream_waits, 0u);
             cudaPrefillContext_destroy(prefill_context);
             cudaGemvContext_destroy(gemv_context);
+        }
+
+        /**
+         * @test Promoted Q5 asymmetric formats preserve exact production math.
+         *
+         * Q5_1 retains the original gate/up-oriented regression. Q5_K uses the
+         * Qwen down-projection orientation implicated by the real-model
+         * Dynamic failure, where a broken down projection zeros the complete
+         * expert contribution even when gate and up are valid.
+         */
+        TEST_F(
+            CUDAExpertTierWeightKernelsTest,
+            PromotedAsymmetricWeightsExecuteDecodeAndVerifierByteExactly)
+        {
+            ASSERT_NO_FATAL_FAILURE(
+                provePromotedAsymmetricWeightsExecuteByteExactly(
+                    "Q5_1", 512, 2048, 99173u));
+            ASSERT_NO_FATAL_FAILURE(
+                provePromotedAsymmetricWeightsExecuteByteExactly(
+                    "Q5_K", 2048, 512, 99179u));
+        }
+
+        /**
+         * @test A real shadow-slot allocation receives every promoted Q5_K byte.
+         *
+         * The lower-level repack proof owns tightly sized test allocations. The
+         * production physical fabric instead writes into a model-lifetime
+         * `GpuExpertSlotPool`: each NativeVNNI projection reserves the largest
+         * supported payload/min/emins family and exposes only the arriving
+         * format's logical regions. This regression closes that allocation
+         * boundary so offset aliasing, capacity accounting, or slot-pool layout
+         * changes cannot turn a successfully completed promotion into an
+         * all-zero executable expert.
+         */
+        TEST_F(
+            CUDAExpertTierWeightKernelsTest,
+            ProductionShadowSlotReceivesPromotedQ5KBytesExactly)
+        {
+            constexpr int N = 512;
+            constexpr int K = 2048;
+            constexpr std::uint64_t candidate_epoch = 81u;
+            const auto &format = test::quantizedVerifierFormat("Q5_K");
+            auto tensor = format.create({N, K}, 0xc0da5b1u);
+            ASSERT_NE(tensor, nullptr);
+
+            cpu::native_vnni::CPUNativeVNNIPackedWeights cpu_weights;
+            ASSERT_TRUE(cpu::native_vnni::packWeightsCPUNativeVNNI(
+                tensor.get(), cpu_weights));
+            ASSERT_TRUE(cpu_weights.usesExpandedInt8());
+            ASSERT_TRUE(cpu_weights.is_asymmetric);
+
+            HostGpuExpertPackedProjection expected;
+            std::string error;
+            ASSERT_TRUE(cpuToGpuExpertPackedReference(
+                cpu_weights, expected, &error))
+                << error;
+            ASSERT_EQ(
+                expected.codebook_id,
+                kNativeVnniExpandedInt8MinCodebook);
+
+            const NativeVnniSourceIdentity source_identity{
+                .codebook_id = cpu_weights.codebook_id,
+                .is_superblock = cpu_weights.is_superblock,
+                .present = true,
+            };
+            IBackend *backend = getCUDABackend();
+            ASSERT_NE(backend, nullptr);
+            auto pool = GpuExpertSlotPool::create(
+                backend,
+                DeviceId::cuda(0),
+                /*device_ordinal=*/0,
+                /*layer_idx=*/7,
+                /*active_capacity=*/1,
+                {GpuExpertSlotPool::ProjectionSpec{
+                    .label = "gate",
+                    .N = N,
+                    .K = K,
+                    .payload_bytes_per_block = 32,
+                    .is_asymmetric = true,
+                    .has_emins = true,
+                    .codebook_id = expected.codebook_id,
+                    .format = ExpertWeightFormat::nativeVnni(
+                        source_identity),
+                }},
+                /*vram_safety_margin_bytes=*/0,
+                /*transfer_capacity=*/0);
+            ASSERT_NE(pool, nullptr);
+            auto lease = pool->acquire(/*expert_id=*/123, candidate_epoch);
+            ASSERT_TRUE(lease.has_value());
+            ASSERT_EQ(lease->projections.size(), 1u);
+            const auto &slot = lease->projections.front().slot;
+
+            const auto probe = makeCpuToGpuExpertTierWeightStreamManifest(
+                cpu_weights,
+                candidate_epoch,
+                /*layer_idx=*/7,
+                /*expert_id=*/123,
+                ExpertTierWeightProjection::Gate,
+                /*maximum_units_per_chunk=*/1);
+            const auto probe_layout = probe.deviceLayout();
+            const std::size_t staging_bytes =
+                MoEOverlayPhysicalResidencyFabric::Config{}
+                    .staging_capacity_bytes;
+            const auto maximum_units = static_cast<std::uint32_t>(
+                std::min<std::size_t>(
+                    probe_layout.unit_count,
+                    staging_bytes / probe_layout.cpu_block_stride));
+            ASSERT_GT(maximum_units, 0u);
+            const auto manifest = makeCpuToGpuExpertTierWeightStreamManifest(
+                cpu_weights,
+                candidate_epoch,
+                /*layer_idx=*/7,
+                /*expert_id=*/123,
+                ExpertTierWeightProjection::Gate,
+                maximum_units);
+            const auto layout = manifest.deviceLayout();
+            ASSERT_TRUE(layout.valid());
+
+            const std::size_t logical_blocks =
+                static_cast<std::size_t>(N) * (K / 32);
+            const std::size_t logical_payload_bytes =
+                logical_blocks * layout.gpu_payload_bytes_per_block;
+            const std::size_t logical_scales_bytes =
+                logical_blocks * sizeof(std::uint16_t);
+            const std::size_t logical_mins_bytes =
+                logical_blocks * sizeof(std::uint16_t);
+            ASSERT_GE(slot.payload_bytes, logical_payload_bytes);
+            ASSERT_GE(slot.scales_bytes, logical_scales_bytes);
+            ASSERT_GE(slot.mins_bytes, logical_mins_bytes);
+
+            ExpertTierGpuMutableProjectionView destination{
+                .payload = slot.d_native_vnni_payload,
+                .scales = static_cast<std::uint16_t *>(
+                    slot.d_native_vnni_scales),
+                .mins = static_cast<std::uint16_t *>(
+                    slot.d_native_vnni_mins),
+                .emins = static_cast<std::uint32_t *>(
+                    slot.d_native_vnni_emins),
+                // The production descriptor exposes exact logical regions
+                // over the deliberately larger reusable slot allocation.
+                .payload_bytes = logical_payload_bytes,
+                .scales_bytes = logical_scales_bytes,
+                .mins_bytes = logical_mins_bytes,
+                .emins_bytes = 0u,
+            };
+            ASSERT_TRUE(destination.validFor(layout));
+
+            ExpertTierWeightTransferLane lane({
+                .device = DeviceId::cuda(0),
+                .staging_capacity_bytes = staging_bytes,
+                .lane_name = "cuda_production_shadow_slot_q5k",
+                .perf_device = "cuda:0",
+            });
+            ASSERT_TRUE(lane.materialize(&error)) << error;
+            ASSERT_TRUE(lane.startCpuToGpu(
+                layout,
+                cpu_weights.native_interleaved,
+                destination,
+                &error)) << error;
+            ASSERT_EQ(
+                pollLaneToCompletion(lane),
+                ExpertTierWeightTransferProgress::Ready);
+
+            std::vector<std::uint8_t> observed_payload(
+                expected.payload.size());
+            std::vector<std::uint16_t> observed_scales(
+                expected.scales.size());
+            std::vector<std::uint16_t> observed_mins(
+                expected.mins.size());
+            ASSERT_EQ(
+                cudaMemcpy(
+                    observed_payload.data(),
+                    slot.d_native_vnni_payload,
+                    observed_payload.size(),
+                    cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            ASSERT_EQ(
+                cudaMemcpy(
+                    observed_scales.data(),
+                    slot.d_native_vnni_scales,
+                    observed_scales.size() * sizeof(std::uint16_t),
+                    cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            ASSERT_EQ(
+                cudaMemcpy(
+                    observed_mins.data(),
+                    slot.d_native_vnni_mins,
+                    observed_mins.size() * sizeof(std::uint16_t),
+                    cudaMemcpyDeviceToHost),
+                cudaSuccess);
+            EXPECT_EQ(observed_payload, expected.payload);
+            EXPECT_EQ(observed_scales, expected.scales);
+            EXPECT_EQ(observed_mins, expected.mins);
+            EXPECT_EQ(pool->slotForExpert(123, candidate_epoch), 0);
+            EXPECT_EQ(lane.stats().blocking_synchronizations, 0u);
+            EXPECT_EQ(lane.stats().inference_stream_waits, 0u);
         }
 
         /**

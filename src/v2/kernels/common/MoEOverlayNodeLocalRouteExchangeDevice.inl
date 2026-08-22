@@ -29,6 +29,20 @@ namespace llaminar2::moe_node_local_route_device
         return static_cast<std::uint32_t>(value);
     }
 
+    /**
+     * @brief Read one original route slot from the final assignment ledger.
+     *
+     * The upstream route transaction has already resolved Static, Dynamic, or
+     * LLEP policy against its pinned residency epoch. Transport is deliberately
+     * policy-blind and consumes that exact assignment without reconstruction.
+     */
+    __device__ __forceinline__ std::int32_t routeParticipantForSlot(
+        const MoEDomainRouteAssignmentLedger &assignment,
+        std::uint32_t slot) noexcept
+    {
+        return assignment.participant_ids[slot];
+    }
+
     /** @brief System-release store for a dynamically selected epoch value. */
     __device__ __forceinline__ void storeSystemRelease64(
         std::uint64_t *address,
@@ -124,8 +138,7 @@ namespace llaminar2::moe_node_local_route_device
             const std::uint64_t consumed =
                 loadSystemAcquire64(&lane.control->consumed_epoch);
             if (produced == kMoENodeLocalRouteExchangeAbortEpoch ||
-                consumed == kMoENodeLocalRouteExchangeAbortEpoch ||
-                laneAborted(lane))
+                consumed == kMoENodeLocalRouteExchangeAbortEpoch)
             {
                 abortLane(
                     lane, MoENodeLocalRouteExchangeCode::PeerAborted,
@@ -141,7 +154,22 @@ namespace llaminar2::moe_node_local_route_device
                         lane,
                         MoENodeLocalRouteExchangeCode::EpochOverflow,
                         produced);
+                    return;
                 }
+                return;
+            }
+            /* Immutable identity was authenticated before entering the loop.
+             * Read mutable state only while genuinely waiting; the common
+             * consumed epoch needs no extra mapped PCIe transactions. */
+            if (loadPeerPublished(&lane.control->state) !=
+                    raw(MoENodeLocalRouteExchangeState::Ready) ||
+                loadPeerPublished(&lane.control->code) !=
+                    raw(MoENodeLocalRouteExchangeCode::Success))
+            {
+                abortLane(
+                    lane,
+                    MoENodeLocalRouteExchangeCode::PeerAborted,
+                    produced);
                 return;
             }
 #if defined(__CUDA_ARCH__)
@@ -169,24 +197,19 @@ namespace llaminar2::moe_node_local_route_device
         if (threadIdx.x == 0u)
         {
             /*
-             * Mapped control reads are PCIe transactions. Performing the full
-             * validation and epoch load in every payload thread turns a small
-             * control ticket into hundreds of thousands of serialized remote
-             * reads. The preceding one-thread begin kernel authenticated the
-             * immutable lane; one thread per block now checks only the mutable
-             * terminal state and broadcasts the epoch through shared memory.
+             * The preceding stream-ordered begin kernel authenticated the lane
+             * and waited for reuse. Re-reading state and code from every block
+             * would multiply mapped PCIe control traffic by the payload grid.
+             * Each block needs only the stable prior epoch; the finalizer owns
+             * the single mutable terminal-state check before publication.
              */
+            const std::uint64_t produced = launch.valid()
+                ? loadSystemAcquire64(
+                      &launch.lane.control->produced_epoch)
+                : kMoENodeLocalRouteExchangeAbortEpoch;
             lane_ready =
-                launch.valid() &&
-                loadPeerPublished(&launch.lane.control->state) ==
-                    raw(MoENodeLocalRouteExchangeState::Ready) &&
-                loadPeerPublished(&launch.lane.control->code) ==
-                    raw(MoENodeLocalRouteExchangeCode::Success);
-            next_epoch = lane_ready
-                             ? loadSystemAcquire64(
-                                   &launch.lane.control->produced_epoch) +
-                                   1u
-                             : 0u;
+                produced != kMoENodeLocalRouteExchangeAbortEpoch;
+            next_epoch = lane_ready ? produced + 1u : 0u;
         }
         __syncthreads();
         if (lane_ready == 0u)
@@ -195,7 +218,7 @@ namespace llaminar2::moe_node_local_route_device
              slot < launch.live_route_slots;
              slot += gridDim.x)
         {
-            if (launch.route_participant_ids[slot] !=
+            if (routeParticipantForSlot(launch.domain_assignment, slot) !=
                 launch.lane.producer_participant)
             {
                 continue;
@@ -228,13 +251,24 @@ namespace llaminar2::moe_node_local_route_device
     static __global__ void finishRoutePublishKernel(
         MoENodeLocalRoutePublishLaunch launch)
     {
-        if (blockIdx.x != 0u || threadIdx.x != 0u ||
-            !launch.valid() || laneAborted(launch.lane))
+        if (blockIdx.x != 0u || threadIdx.x != 0u || !launch.valid())
         {
             return;
         }
-        const std::uint64_t next_epoch =
-            loadSystemAcquire64(&launch.lane.control->produced_epoch) + 1u;
+        /* `beginRoutePublishKernel` already authenticated immutable identity
+         * on this exact stream. Only state/code can change before release. */
+        if (loadPeerPublished(&launch.lane.control->state) !=
+                raw(MoENodeLocalRouteExchangeState::Ready) ||
+            loadPeerPublished(&launch.lane.control->code) !=
+                raw(MoENodeLocalRouteExchangeCode::Success))
+        {
+            return;
+        }
+        const std::uint64_t produced =
+            loadSystemAcquire64(&launch.lane.control->produced_epoch);
+        if (produced == kMoENodeLocalRouteExchangeAbortEpoch)
+            return;
+        const std::uint64_t next_epoch = produced + 1u;
         __threadfence_system();
         storeSystemRelease64(
             &launch.lane.control->produced_epoch, next_epoch);
@@ -340,7 +374,7 @@ namespace llaminar2::moe_node_local_route_device
              slot < live_slots;
              slot += gridDim.x)
         {
-            if (launch.route_participant_ids[slot] !=
+            if (routeParticipantForSlot(launch.domain_assignment, slot) !=
                 lane.producer_participant)
             {
                 continue;
@@ -380,7 +414,8 @@ namespace llaminar2::moe_node_local_route_device
         {
             return;
         }
-        const std::int32_t participant = launch.route_participant_ids[slot];
+        const std::int32_t participant =
+            routeParticipantForSlot(launch.domain_assignment, slot);
         if (participant < 0 || participant == launch.root_participant)
             return;
         const auto *peer = peerForParticipant(launch, participant);
@@ -439,9 +474,13 @@ namespace llaminar2::moe_node_local_route_device
         {
             const std::uint32_t slot = row * launch.top_k + route;
             const std::int32_t participant =
-                launch.route_participant_ids[slot];
+                routeParticipantForSlot(launch.domain_assignment, slot);
             float contribution = 0.0f;
-            if (participant == launch.root_participant)
+            if (participant == launch.root_participant ||
+                (participant < 0 &&
+                 launch.external_route_source ==
+                     MoEExternalCanonicalRouteSource::
+                         RootCanonicalRouteBank))
             {
                 contribution = launch.root_canonical_route_contributions[
                     static_cast<std::size_t>(slot) * launch.d_model + column];
@@ -489,5 +528,249 @@ namespace llaminar2::moe_node_local_route_device
             loadSystemAcquire64(&lane.control->produced_epoch);
         __threadfence_system();
         storeSystemRelease64(&lane.control->consumed_epoch, produced);
+    }
+
+    /** @return Whether dense publication control matches one endpoint binding. */
+    __device__ __forceinline__ bool validDensePublicationControl(
+        const MoENodeLocalDensePublicationDeviceBinding &binding) noexcept
+    {
+        if (!binding.valid())
+            return false;
+        const auto *const control = binding.control;
+        return loadPeerPublished(&control->magic) ==
+                   kMoENodeLocalDensePublicationMagic &&
+               loadPeerPublished(&control->version) ==
+                   kMoENodeLocalDensePublicationVersion &&
+               loadPeerPublished(&control->peer_count) ==
+                   binding.peer_count &&
+               loadPeerPublished(&control->element_capacity) ==
+                   binding.element_capacity;
+    }
+
+    /** @brief Publish a terminal dense-channel fault and release every waiter. */
+    __device__ __forceinline__ void abortDensePublication(
+        MoENodeLocalDensePublicationDeviceBinding binding,
+        MoENodeLocalDensePublicationCode code,
+        std::uint64_t failed_epoch) noexcept
+    {
+        if (!binding.control)
+            return;
+        binding.control->code = raw(code);
+        binding.control->failed_epoch = failed_epoch;
+        binding.control->state =
+            raw(MoENodeLocalDensePublicationState::Aborted);
+        __threadfence_system();
+        storeSystemRelease64(
+            &binding.control->produced_epoch,
+            kMoENodeLocalRouteExchangeAbortEpoch);
+        if (binding.local_peer)
+        {
+            binding.local_peer->state =
+                raw(MoENodeLocalDensePublicationState::Aborted);
+            storeSystemRelease64(
+                &binding.local_peer->consumed_epoch,
+                kMoENodeLocalRouteExchangeAbortEpoch);
+        }
+    }
+
+    /** @return Whether root or peer state makes the channel terminal. */
+    __device__ __forceinline__ bool densePublicationAborted(
+        const MoENodeLocalDensePublicationDeviceBinding &binding) noexcept
+    {
+        if (!validDensePublicationControl(binding) ||
+            loadPeerPublished(&binding.control->state) !=
+                raw(MoENodeLocalDensePublicationState::Ready) ||
+            loadPeerPublished(&binding.control->code) !=
+                raw(MoENodeLocalDensePublicationCode::Success))
+        {
+            return true;
+        }
+        return binding.local_peer &&
+               loadPeerPublished(&binding.local_peer->state) !=
+                   raw(MoENodeLocalDensePublicationState::Ready);
+    }
+
+    /**
+     * @brief Wait until every peer has finished reading the prior dense bank.
+     *
+     * The root submits this one-thread node before its captured D2H payload
+     * copy. It examines only cache-line-isolated progress words, so payload
+     * movement remains a single copy-engine transaction rather than a mapped
+     * scalar-store kernel.
+     */
+    static __global__ void beginDensePublicationKernel(
+        MoENodeLocalDensePublicationLaunch launch)
+    {
+        if (blockIdx.x != 0u || threadIdx.x != 0u)
+            return;
+        auto binding = launch.binding;
+        if (!launch.valid() || !binding.isRoot() ||
+            !validDensePublicationControl(binding))
+        {
+            abortDensePublication(
+                binding,
+                MoENodeLocalDensePublicationCode::InvalidControl,
+                0u);
+            return;
+        }
+
+        while (true)
+        {
+            const std::uint64_t produced =
+                loadSystemAcquire64(&binding.control->produced_epoch);
+            if (produced == kMoENodeLocalRouteExchangeAbortEpoch ||
+                densePublicationAborted(binding))
+            {
+                abortDensePublication(
+                    binding,
+                    MoENodeLocalDensePublicationCode::PeerAborted,
+                    produced);
+                return;
+            }
+
+            bool all_consumed = true;
+            for (std::uint32_t peer_index = 0u;
+                 peer_index < binding.peer_count;
+                 ++peer_index)
+            {
+                const auto *const peer = binding.peers + peer_index;
+                const std::uint64_t consumed =
+                    loadSystemAcquire64(&peer->consumed_epoch);
+                if (loadPeerPublished(&peer->participant_id) < 0 ||
+                    loadPeerPublished(&peer->state) !=
+                        raw(MoENodeLocalDensePublicationState::Ready) ||
+                    consumed == kMoENodeLocalRouteExchangeAbortEpoch)
+                {
+                    abortDensePublication(
+                        binding,
+                        MoENodeLocalDensePublicationCode::PeerAborted,
+                        produced);
+                    return;
+                }
+                all_consumed = all_consumed && consumed == produced;
+            }
+            if (all_consumed)
+            {
+                if (produced + 1u ==
+                    kMoENodeLocalRouteExchangeAbortEpoch)
+                {
+                    abortDensePublication(
+                        binding,
+                        MoENodeLocalDensePublicationCode::EpochOverflow,
+                        produced);
+                }
+                return;
+            }
+#if defined(__CUDA_ARCH__)
+            __nanosleep(64u);
+#elif defined(__HIP_DEVICE_COMPILE__)
+            __builtin_amdgcn_s_sleep(1u);
+#endif
+        }
+    }
+
+    /** @brief Release the D2H-complete dense payload as the next root epoch. */
+    static __global__ void finishDensePublicationKernel(
+        MoENodeLocalDensePublicationLaunch launch)
+    {
+        if (blockIdx.x != 0u || threadIdx.x != 0u)
+            return;
+        auto binding = launch.binding;
+        if (!launch.valid() || !binding.isRoot() ||
+            densePublicationAborted(binding))
+        {
+            abortDensePublication(
+                binding,
+                MoENodeLocalDensePublicationCode::InvalidControl,
+                0u);
+            return;
+        }
+        const std::uint64_t produced =
+            loadSystemAcquire64(&binding.control->produced_epoch);
+        __threadfence_system();
+        storeSystemRelease64(
+            &binding.control->produced_epoch, produced + 1u);
+    }
+
+    /**
+     * @brief Acquire the next root epoch before a peer's captured H2D copy.
+     *
+     * A peer may submit before the root. The wait remains device resident and
+     * consumes no host progress thread; stream order prevents the following
+     * copy-engine node from reading a partially published matrix.
+     */
+    static __global__ void beginDensePublicationConsumeKernel(
+        MoENodeLocalDensePublicationLaunch launch)
+    {
+        if (blockIdx.x != 0u || threadIdx.x != 0u)
+            return;
+        auto binding = launch.binding;
+        if (!launch.valid() || binding.isRoot() || !binding.local_peer ||
+            !validDensePublicationControl(binding) ||
+            loadPeerPublished(&binding.local_peer->participant_id) !=
+                binding.participant_id)
+        {
+            abortDensePublication(
+                binding,
+                MoENodeLocalDensePublicationCode::InvalidControl,
+                0u);
+            return;
+        }
+
+        while (true)
+        {
+            const std::uint64_t produced =
+                loadSystemAcquire64(&binding.control->produced_epoch);
+            const std::uint64_t consumed =
+                loadSystemAcquire64(&binding.local_peer->consumed_epoch);
+            if (produced == kMoENodeLocalRouteExchangeAbortEpoch ||
+                consumed == kMoENodeLocalRouteExchangeAbortEpoch ||
+                densePublicationAborted(binding))
+            {
+                abortDensePublication(
+                    binding,
+                    MoENodeLocalDensePublicationCode::PeerAborted,
+                    produced);
+                return;
+            }
+            if (produced == consumed + 1u)
+                return;
+            if (produced < consumed || produced > consumed + 1u)
+            {
+                abortDensePublication(
+                    binding,
+                    MoENodeLocalDensePublicationCode::InvalidControl,
+                    produced);
+                return;
+            }
+#if defined(__CUDA_ARCH__)
+            __nanosleep(64u);
+#elif defined(__HIP_DEVICE_COMPILE__)
+            __builtin_amdgcn_s_sleep(1u);
+#endif
+        }
+    }
+
+    /** @brief Acknowledge that the peer's H2D copy consumed the current epoch. */
+    static __global__ void finishDensePublicationConsumeKernel(
+        MoENodeLocalDensePublicationLaunch launch)
+    {
+        if (blockIdx.x != 0u || threadIdx.x != 0u)
+            return;
+        auto binding = launch.binding;
+        if (!launch.valid() || binding.isRoot() || !binding.local_peer ||
+            densePublicationAborted(binding))
+        {
+            abortDensePublication(
+                binding,
+                MoENodeLocalDensePublicationCode::InvalidControl,
+                0u);
+            return;
+        }
+        const std::uint64_t produced =
+            loadSystemAcquire64(&binding.control->produced_epoch);
+        __threadfence_system();
+        storeSystemRelease64(
+            &binding.local_peer->consumed_epoch, produced);
     }
 } // namespace llaminar2::moe_node_local_route_device

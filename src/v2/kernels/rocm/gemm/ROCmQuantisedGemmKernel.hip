@@ -339,9 +339,10 @@ __global__ void quantizeActivationsQ8_blockwise_kernel(
     }
     __syncthreads();
 
-    float max_abs = s_absmax;
-    float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-    float inv_scale = 1.0f / scale;
+    const float max_abs = s_absmax;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(max_abs);
+    const float inv_scale = 1.0f / scale;
 
     // Step 2: Write scale for this block
     if (tid == 0)
@@ -352,8 +353,8 @@ __global__ void quantizeActivationsQ8_blockwise_kernel(
     // Step 3: Quantize elements in this block
     if (tid < block_len)
     {
-        int q = static_cast<int>(rintf(src[tid] * inv_scale));
-        q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+        const int q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+            src[tid], inv_scale);
         dst[tid] = static_cast<int8_t>(q);
     }
 }
@@ -447,8 +448,8 @@ void quantizeActivationsQ8_blockwise_v2_kernel(
     // Step 3: Quantize
     if (sub_tid < block_len)
     {
-        int q = static_cast<int>(rintf(val * inv_scale));
-        q = max(-127, min(127, q));
+        const int q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+            val, inv_scale);
         dst[sub_tid] = static_cast<int8_t>(q);
     }
 }
@@ -508,8 +509,8 @@ void quantizeActivationsQ8_blockwise_v2_with_sums_kernel(
     int q = 0;
     if (sub_tid < block_len)
     {
-        q = static_cast<int>(rintf(val * inv_scale));
-        q = max(-127, min(127, q));
+        q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+            val, inv_scale);
         dst[sub_tid] = static_cast<int8_t>(q);
     }
 
@@ -586,7 +587,8 @@ void quantizeActivationsQ8_blockwise_v3_kernel(
     for (int b = tid; b < blocks_per_row; b += WG_SIZE)
     {
         const float max_abs = s_block_max[b];
-        const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        const float scale =
+            llaminar2::rocm::decode_equivalent::q8Scale(max_abs);
         const float inv_scale = 1.0f / scale;
 
         row_scales[b] = scale;
@@ -605,10 +607,10 @@ void quantizeActivationsQ8_blockwise_v3_kernel(
             for (int k4 = k_start; k4 < vec_end; k4 += 4)
             {
                 const float4 v = *reinterpret_cast<const float4 *>(row_in + k4);
-                int q0 = max(-127, min(127, static_cast<int>(rintf(v.x * inv_scale))));
-                int q1 = max(-127, min(127, static_cast<int>(rintf(v.y * inv_scale))));
-                int q2 = max(-127, min(127, static_cast<int>(rintf(v.z * inv_scale))));
-                int q3 = max(-127, min(127, static_cast<int>(rintf(v.w * inv_scale))));
+                const int q0 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.x, inv_scale);
+                const int q1 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.y, inv_scale);
+                const int q2 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.z, inv_scale);
+                const int q3 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.w, inv_scale);
                 const uint32_t packed =
                     static_cast<uint32_t>(static_cast<uint8_t>(q0)) |
                     (static_cast<uint32_t>(static_cast<uint8_t>(q1)) << 8) |
@@ -621,7 +623,8 @@ void quantizeActivationsQ8_blockwise_v3_kernel(
         {
             for (int k = k_start; k < k_end; ++k)
             {
-                int q = max(-127, min(127, static_cast<int>(rintf(row_in[k] * inv_scale))));
+                const int q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+                    row_in[k], inv_scale);
                 row_out[k] = static_cast<int8_t>(q);
             }
         }
@@ -680,8 +683,9 @@ void quantizeActivationsQ8_blockwise_v4_kernel(
     }
     local_max = __shfl(local_max, 0);
 
-    float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
-    float inv_scale = 1.0f / scale;
+    const float scale =
+        llaminar2::rocm::decode_equivalent::q8Scale(local_max);
+    const float inv_scale = 1.0f / scale;
 
     if (tid == 0)
     {
@@ -953,8 +957,9 @@ void quantizeActivationsQ8_blockwise_v5_kernel(
     // Write scales to global memory
     for (int b = tid; b < blocks_per_row; b += WG_SIZE)
     {
-        float max_abs = s_block_max[b];
-        float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+        const float max_abs = s_block_max[b];
+        const float scale =
+            llaminar2::rocm::decode_equivalent::q8Scale(max_abs);
         row_scales[b] = scale;
         // Overwrite s_block_max with inv_scale for pass 2
         s_block_max[b] = 1.0f / scale;
@@ -970,10 +975,10 @@ void quantizeActivationsQ8_blockwise_v5_kernel(
         const int b = k / QUANT_BLOCK;
         const float inv_scale = s_block_max[b];
 
-        int q0 = max(-127, min(127, static_cast<int>(rintf(v.x * inv_scale))));
-        int q1 = max(-127, min(127, static_cast<int>(rintf(v.y * inv_scale))));
-        int q2 = max(-127, min(127, static_cast<int>(rintf(v.z * inv_scale))));
-        int q3 = max(-127, min(127, static_cast<int>(rintf(v.w * inv_scale))));
+        const int q0 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.x, inv_scale);
+        const int q1 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.y, inv_scale);
+        const int q2 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.z, inv_scale);
+        const int q3 = llaminar2::rocm::decode_equivalent::quantizeQ8(v.w, inv_scale);
 
         const uint32_t packed =
             static_cast<uint32_t>(static_cast<uint8_t>(q0)) |
@@ -988,7 +993,8 @@ void quantizeActivationsQ8_blockwise_v5_kernel(
     {
         const int b = k / QUANT_BLOCK;
         const float inv_scale = s_block_max[b];
-        int q = max(-127, min(127, static_cast<int>(rintf(row_in[k] * inv_scale))));
+        const int q = llaminar2::rocm::decode_equivalent::quantizeQ8(
+            row_in[k], inv_scale);
         row_out[k] = static_cast<int8_t>(q);
     }
 }

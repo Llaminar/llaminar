@@ -31,6 +31,10 @@ namespace llaminar2
     class IBackend;
     class IKVCache;
     class IMoEGroupedVerifierHistogramPublisher;
+    namespace sampling_math
+    {
+        struct MTPCommittedVerifierIdentityRecord;
+    }
 
     /**
      * @brief Publish compact verifier acceptance into every mutable model state.
@@ -109,6 +113,14 @@ namespace llaminar2
             int generation_response_token_stride = 0;
             int *generation_control_device = nullptr;
             int generation_control_stride = 0;
+
+            /** Reusable verifier row consumed by the transaction being committed. */
+            const int32_t *verifier_input_tokens_device = nullptr;
+            /** Physical request-row capacity of @ref verifier_input_tokens_device. */
+            int verifier_input_token_stride = 0;
+            /** Durable identity written atomically with controller/response commit. */
+            sampling_math::MTPCommittedVerifierIdentityRecord *
+                committed_verifier_identity_device = nullptr;
 
             int request_count = 0;
             int verifier_rows_per_request = 0;

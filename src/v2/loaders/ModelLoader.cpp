@@ -5,6 +5,7 @@
  */
 
 #include "../utils/Logger.h"
+#include "../utils/WeightLoadingProfiler.h"
 #include "ModelLoader.h"
 #include "../tensors/Tensors.h"
 #include "../tensors/TensorFactory.h"
@@ -18,91 +19,72 @@ namespace llaminar2
 {
     namespace
     {
+        /** Minimum selected payload that repays one OpenMP team launch. */
+        constexpr size_t kParallelExpertSelectionCopyBytes =
+            8u * 1024u * 1024u;
+
         /**
-         * @brief Materialize one owned tensor from native GGUF bytes.
+         * @brief Adopt one aligned native-codebook expert selection.
          *
          * Explicit expert selections cannot generally borrow one contiguous mmap
          * interval. This helper preserves the original tensor format while
          * placing the packed bytes through the loader's NUMA-aware factory when
-         * available. It performs no dequantization or format substitution.
+         * available. The already populated allocation becomes final tensor
+         * storage; this function performs no byte copy, dequantization, or
+         * format substitution.
          */
-        std::shared_ptr<TensorBase> createOwnedNativeTensor(
+        std::shared_ptr<TensorBase> createOwnedNativeQuantizedTensor(
             TensorFactory *factory,
             TensorType type,
             const std::vector<size_t> &shape,
-            const std::vector<uint8_t> &raw,
-            DeviceId device)
+            AlignedVector<uint8_t> raw)
         {
-            if (type == TensorType::FP32)
-            {
-                std::shared_ptr<FP32Tensor> tensor = factory
-                                                        ? std::shared_ptr<FP32Tensor>(factory->createFP32(shape, device))
-                                                        : std::make_shared<FP32Tensor>(shape);
-                TensorFactory::numaMemcpy(
-                    tensor->mutable_data(), raw.data(), raw.size());
-                return tensor;
-            }
-            if (type == TensorType::FP16 || type == TensorType::BF16)
-            {
-                std::vector<uint16_t> words(raw.size() / sizeof(uint16_t));
-                std::memcpy(words.data(), raw.data(), raw.size());
-                if (type == TensorType::FP16)
-                {
-                    return factory
-                               ? std::shared_ptr<TensorBase>(factory->createFP16(shape, words))
-                               : std::make_shared<FP16Tensor>(shape, words);
-                }
-                return factory
-                           ? std::shared_ptr<TensorBase>(factory->createBF16(shape, words))
-                           : std::make_shared<BF16Tensor>(shape, words);
-            }
-
             if (factory)
                 return std::shared_ptr<TensorBase>(
-                    factory->createQuantized(type, shape, raw));
+                    factory->createQuantizedOwned(type, shape, std::move(raw)));
 
             switch (type)
             {
             case TensorType::Q4_0:
-                return std::make_shared<Q4_0Tensor>(shape, raw);
+                return std::make_shared<Q4_0Tensor>(shape, std::move(raw));
             case TensorType::Q4_1:
-                return std::make_shared<Q4_1Tensor>(shape, raw);
+                return std::make_shared<Q4_1Tensor>(shape, std::move(raw));
             case TensorType::Q5_0:
-                return std::make_shared<Q5_0Tensor>(shape, raw);
+                return std::make_shared<Q5_0Tensor>(shape, std::move(raw));
             case TensorType::Q5_1:
-                return std::make_shared<Q5_1Tensor>(shape, raw);
+                return std::make_shared<Q5_1Tensor>(shape, std::move(raw));
             case TensorType::Q8_0:
-                return std::make_shared<Q8_0Tensor>(shape, raw);
+                return std::make_shared<Q8_0Tensor>(shape, std::move(raw));
             case TensorType::Q2_K:
-                return std::make_shared<Q2_KTensor>(shape, raw);
+                return std::make_shared<Q2_KTensor>(shape, std::move(raw));
             case TensorType::Q3_K:
-                return std::make_shared<Q3_KTensor>(shape, raw);
+                return std::make_shared<Q3_KTensor>(shape, std::move(raw));
             case TensorType::Q4_K:
-                return std::make_shared<Q4_KTensor>(shape, raw);
+                return std::make_shared<Q4_KTensor>(shape, std::move(raw));
             case TensorType::Q5_K:
-                return std::make_shared<Q5_KTensor>(shape, raw);
+                return std::make_shared<Q5_KTensor>(shape, std::move(raw));
             case TensorType::Q6_K:
-                return std::make_shared<Q6_KTensor>(shape, raw);
+                return std::make_shared<Q6_KTensor>(shape, std::move(raw));
             case TensorType::Q8_K:
-                return std::make_shared<Q8_KTensor>(shape, raw);
+                return std::make_shared<Q8_KTensor>(shape, std::move(raw));
             case TensorType::IQ4_NL:
-                return std::make_shared<IQ4_NLTensor>(shape, raw);
+                return std::make_shared<IQ4_NLTensor>(shape, std::move(raw));
             case TensorType::IQ4_XS:
-                return std::make_shared<IQ4_XSTensor>(shape, raw);
+                return std::make_shared<IQ4_XSTensor>(shape, std::move(raw));
             case TensorType::IQ3_S:
-                return std::make_shared<IQ3_STensor>(shape, raw);
+                return std::make_shared<IQ3_STensor>(shape, std::move(raw));
             case TensorType::IQ3_XXS:
-                return std::make_shared<IQ3_XXSTensor>(shape, raw);
+                return std::make_shared<IQ3_XXSTensor>(shape, std::move(raw));
             case TensorType::IQ2_S:
-                return std::make_shared<IQ2_STensor>(shape, raw);
+                return std::make_shared<IQ2_STensor>(shape, std::move(raw));
             case TensorType::IQ2_XS:
-                return std::make_shared<IQ2_XSTensor>(shape, raw);
+                return std::make_shared<IQ2_XSTensor>(shape, std::move(raw));
             case TensorType::IQ2_XXS:
-                return std::make_shared<IQ2_XXSTensor>(shape, raw);
+                return std::make_shared<IQ2_XXSTensor>(shape, std::move(raw));
             case TensorType::IQ1_S:
-                return std::make_shared<IQ1_STensor>(shape, raw);
+                return std::make_shared<IQ1_STensor>(shape, std::move(raw));
             case TensorType::IQ1_M:
-                return std::make_shared<IQ1_MTensor>(shape, raw);
+                return std::make_shared<IQ1_MTensor>(shape, std::move(raw));
             default:
                 throw std::runtime_error(
                     "ModelLoader cannot materialize selected experts for tensor type " +
@@ -1986,9 +1968,72 @@ namespace llaminar2
 
         if (factory_)
             factory_->ensureNumaBinding();
-        std::vector<uint8_t> raw(expert_ids.size() * bytes_per_expert);
+        const size_t packed_byte_count = expert_ids.size() * bytes_per_expert;
+        std::vector<uint8_t> raw;
+        AlignedVector<uint8_t> quantized_storage;
+        AlignedVector<float> fp32_storage;
+        AlignedVector<uint16_t> fp16_storage;
+        AlignedVector<uint16_t> bf16_storage;
+        uint8_t *packed_destination = nullptr;
+        {
+            ScopedWeightLoadDetailTimer timer(
+                "weights.expert_selection.allocate");
+            switch (info->type)
+            {
+            case GGUFTensorType::F32:
+                if (packed_byte_count % sizeof(float) != 0u)
+                    throw std::runtime_error(
+                        "[ModelLoader] Invalid FP32 expert-selection byte count for " + tensor_name);
+                fp32_storage.resize_uninitialized(
+                    packed_byte_count / sizeof(float));
+                packed_destination = reinterpret_cast<uint8_t *>(
+                    fp32_storage.data());
+                break;
+            case GGUFTensorType::F16:
+                if (packed_byte_count % sizeof(uint16_t) != 0u)
+                    throw std::runtime_error(
+                        "[ModelLoader] Invalid FP16 expert-selection byte count for " + tensor_name);
+                fp16_storage.resize_uninitialized(
+                    packed_byte_count / sizeof(uint16_t));
+                packed_destination = reinterpret_cast<uint8_t *>(
+                    fp16_storage.data());
+                break;
+            case GGUFTensorType::BF16:
+                if (packed_byte_count % sizeof(uint16_t) != 0u)
+                    throw std::runtime_error(
+                        "[ModelLoader] Invalid BF16 expert-selection byte count for " + tensor_name);
+                bf16_storage.resize_uninitialized(
+                    packed_byte_count / sizeof(uint16_t));
+                packed_destination = reinterpret_cast<uint8_t *>(
+                    bf16_storage.data());
+                break;
+            default:
+                if (info->isQuantized() &&
+                    weight_precision == WeightPrecision::NATIVE)
+                {
+                    // The GGUF copy first-touches the exact final tensor pages.
+                    // Avoid zeroing tens of gigabytes that are immediately
+                    // overwritten, and retain the allocation through packing.
+                    quantized_storage.resize_uninitialized(packed_byte_count);
+                    packed_destination = quantized_storage.data();
+                }
+                else
+                {
+                    raw.resize(packed_byte_count);
+                    packed_destination = raw.data();
+                }
+                break;
+            }
+        }
 
-        auto for_each_run = [&](auto &&copy_run)
+        struct ExpertCopyRun
+        {
+            size_t source_offset;
+            size_t destination_offset;
+            size_t byte_count;
+        };
+        std::vector<ExpertCopyRun> copy_runs;
+        copy_runs.reserve(expert_ids.size());
         {
             size_t packed_begin = 0u;
             while (packed_begin < expert_ids.size())
@@ -1999,12 +2044,24 @@ namespace llaminar2
                 {
                     ++packed_end;
                 }
-                copy_run(
-                    expert_ids[packed_begin] * bytes_per_expert,
-                    packed_begin * bytes_per_expert,
-                    (packed_end - packed_begin) * bytes_per_expert);
+                copy_runs.push_back(ExpertCopyRun{
+                    .source_offset =
+                        expert_ids[packed_begin] * bytes_per_expert,
+                    .destination_offset =
+                        packed_begin * bytes_per_expert,
+                    .byte_count =
+                        (packed_end - packed_begin) * bytes_per_expert});
                 packed_begin = packed_end;
             }
+        }
+
+        auto for_each_run = [&](auto &&copy_run)
+        {
+            for (const ExpertCopyRun &run : copy_runs)
+                copy_run(
+                    run.source_offset,
+                    run.destination_offset,
+                    run.byte_count);
         };
 
         if (mmap_region_)
@@ -2013,14 +2070,30 @@ namespace llaminar2
             if (!tensor_base)
                 throw std::runtime_error(
                     "[ModelLoader] Missing mmap base for explicit expert selection: " + tensor_name);
-            for_each_run(
-                [&](size_t source_offset, size_t destination_offset, size_t byte_count)
+            {
+                ScopedWeightLoadDetailTimer timer(
+                    "weights.expert_selection.source_copy");
+                /*
+                 * The selected placement is intentionally noncontiguous (the
+                 * contiguous case returned through loadTensorExpertSlice()).
+                 * Copy all disjoint runs in one OpenMP region. Besides using
+                 * the socket's memory bandwidth, these worker writes are the
+                 * authoritative NUMA first touch for the final tensor pages.
+                 * A serial memcpy here makes page-fault latency dominate model
+                 * startup once the redundant zero-fill pass is removed.
+                 */
+#pragma omp parallel for schedule(static) if (packed_byte_count >= kParallelExpertSelectionCopyBytes)
+                for (size_t run_index = 0u;
+                     run_index < copy_runs.size();
+                     ++run_index)
                 {
+                    const ExpertCopyRun &run = copy_runs[run_index];
                     std::memcpy(
-                        raw.data() + destination_offset,
-                        tensor_base + source_offset,
-                        byte_count);
-                });
+                        packed_destination + run.destination_offset,
+                        tensor_base + run.source_offset,
+                        run.byte_count);
+                }
+            }
         }
         else
         {
@@ -2045,22 +2118,26 @@ namespace llaminar2
                 }
             }
 
-            for_each_run(
-                [&](size_t source_offset, size_t destination_offset, size_t byte_count)
-                {
-                    stream->clear();
-                    stream->seekg(
-                        data_offset + info->offset + source_offset,
-                        std::ios::beg);
-                    if (!(*stream) ||
-                        !stream->read(
-                            reinterpret_cast<char *>(raw.data() + destination_offset),
-                            static_cast<std::streamsize>(byte_count)))
+            {
+                ScopedWeightLoadDetailTimer timer(
+                    "weights.expert_selection.source_copy");
+                for_each_run(
+                    [&](size_t source_offset, size_t destination_offset, size_t byte_count)
                     {
-                        throw std::runtime_error(
-                            "[ModelLoader] Failed reading explicit expert selection for " + tensor_name);
-                    }
-                });
+                        stream->clear();
+                        stream->seekg(
+                            data_offset + info->offset + source_offset,
+                            std::ios::beg);
+                        if (!(*stream) ||
+                            !stream->read(
+                                reinterpret_cast<char *>(packed_destination + destination_offset),
+                                static_cast<std::streamsize>(byte_count)))
+                        {
+                            throw std::runtime_error(
+                                "[ModelLoader] Failed reading explicit expert selection for " + tensor_name);
+                        }
+                    });
+            }
         }
 
         const std::vector<size_t> packed_shape = {
@@ -2079,13 +2156,38 @@ namespace llaminar2
         LOG_TRACE("[ModelLoader] Packed " << expert_ids.size()
                                            << "/" << ne2
                                            << " explicit experts for " << tensor_name
-                                           << " into " << raw.size() << " bytes");
-        return createOwnedNativeTensor(
+                                           << " into " << packed_byte_count << " bytes");
+        ScopedWeightLoadDetailTimer tensor_timer(
+            "weights.expert_selection.create_owned_tensor");
+        if (info->type == GGUFTensorType::F32)
+        {
+            return factory_
+                       ? std::shared_ptr<TensorBase>(factory_->createFP32Owned(
+                             packed_shape, std::move(fp32_storage), device))
+                       : std::make_shared<FP32Tensor>(
+                             packed_shape, std::move(fp32_storage), device);
+        }
+        if (info->type == GGUFTensorType::F16)
+        {
+            return factory_
+                       ? std::shared_ptr<TensorBase>(factory_->createFP16Owned(
+                             packed_shape, std::move(fp16_storage)))
+                       : std::make_shared<FP16Tensor>(
+                             packed_shape, std::move(fp16_storage));
+        }
+        if (info->type == GGUFTensorType::BF16)
+        {
+            return factory_
+                       ? std::shared_ptr<TensorBase>(factory_->createBF16Owned(
+                             packed_shape, std::move(bf16_storage)))
+                       : std::make_shared<BF16Tensor>(
+                             packed_shape, std::move(bf16_storage));
+        }
+        return createOwnedNativeQuantizedTensor(
             factory_,
             ggufToTensorType(info->type),
             packed_shape,
-            raw,
-            device);
+            std::move(quantized_storage));
     }
 
     std::shared_ptr<TensorBase> ModelLoader::loadTensorColumnSlice(

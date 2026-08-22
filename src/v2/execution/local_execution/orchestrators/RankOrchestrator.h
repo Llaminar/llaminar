@@ -52,11 +52,13 @@
 #include "../../../collective/ILocalPPContext.h"
 #include "../../moe/MoERebalanceController.h"
 #include "../../moe/ExpertWeightTransfer.h"
+#include "../../moe/MoEOverlayNodeLocalRouteTransport.h"
 #include "../../config/RuntimeConfig.h"
 #include "../../debug/TPSnapshot.h"
 #include "../../factory/FactoryPPStageConfig.h" // For FactoryPPStageConfig (circular-dependency-safe)
 #include "../../mtp/MTPSpecStateContract.h"
 #include "../../../kernels/common/SamplingMath.h"
+#include "../../../planning/MemoryPlanner.h"
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -88,6 +90,9 @@ namespace llaminar2
     class DecodeExpertHistogram;
     class MoEOverlayResidencyAuthority;
     class MoEOverlayParticipantResidencyRegistry;
+    class MoEOverlayRankBatchTransportRegistry;
+    class MoEOverlayNodeLocalDeviceControllerFabric;
+    class MoEOverlayInferenceInterferenceProbe;
     struct GraphExecutorStats;
     struct MoERoutedExpertPlacementPlan;
     struct PlacementPlan;
@@ -294,6 +299,17 @@ namespace llaminar2
             /// and its per-device runners.
             std::shared_ptr<PreparedWeightStore> prepared_weight_store;
 
+            /**
+             * @brief Whether rank setup allocates or adopts its complete weight set.
+             *
+             * ReuseCertifiedCompleteSet may only be selected by an upstream
+             * production reuse contract after exact plan and lifecycle
+             * validation. It suppresses redundant packing, not graph, arena,
+             * stream, or request-state construction.
+             */
+            PreparedWeightAdmission prepared_weight_admission =
+                PreparedWeightAdmission::AllocateCompleteSet;
+
             /// Optional same-layer MoE expert overlay plan propagated to child graph runners.
             std::shared_ptr<MoERoutedExpertPlacementPlan> moe_routed_expert_plan;
 
@@ -312,6 +328,14 @@ namespace llaminar2
             /// Optional MPI context used by MoE overlay domain-worker commands.
             std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
 
+            /** Pre-rendezvoused node-local activation channels for child graphs. */
+            std::shared_ptr<MoEOverlayRankBatchTransportRegistry>
+                moe_rank_batch_transport_registry;
+
+            /** Mapped all-GPU controller pages retained by every child graph. */
+            std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric>
+                moe_device_controller_fabric;
+
             /**
              * One process-local sparse route fabric shared by continuation
              * device graphs. RankOrchestrator creates it from declared
@@ -319,6 +343,15 @@ namespace llaminar2
              */
             std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
                 moe_node_local_route_exchange;
+
+            /**
+             * Immutable physical lowering for continuation-local route
+             * publication. Resolved from exact peer topology before any child
+             * graph is built.
+             */
+            MoEOverlayNodeLocalRouteTransport
+                moe_node_local_route_transport =
+                    MoEOverlayNodeLocalRouteTransport::Unresolved;
 
             // =================================================================
             // Helper Methods
@@ -486,6 +519,9 @@ namespace llaminar2
          */
         bool forward(const int *tokens, int seq_len) override;
         bool forwardPrefill(const int *tokens, int seq_len) override;
+        /** @copydoc IInferenceRunner::servingGraphPreparationKind */
+        ServingGraphPreparationKind
+        servingGraphPreparationKind() const noexcept override;
         /** @copydoc IInferenceRunner::materializeServingGraphFamilyWithoutLaunch */
         bool materializeServingGraphFamilyWithoutLaunch(
             const ServingGraphFamilyMaterializationPlan &plan) override;
@@ -504,6 +540,9 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayInferenceTransactionCoordinator>
                 coordinator,
             int continuation_participant_index) override;
+        /** @copydoc IInferenceRunner::setMoEOverlayInferenceInterferenceProbe */
+        bool setMoEOverlayInferenceInterferenceProbe(
+            std::shared_ptr<MoEOverlayInferenceInterferenceProbe> probe) override;
         bool forwardGroupedMTPVerifierWithHostTokenIds(
             const std::vector<std::vector<int>> &token_batches) override;
         /**
@@ -1181,7 +1220,8 @@ namespace llaminar2
          */
         void resetInferenceState(const InferenceStateResetRequest &request) override;
         void clear_cache() override;
-        bool maybeApplyDecodeBoundaryMaintenance() override;
+        bool maybeApplyDecodeBoundaryMaintenance(
+            uint64_t committed_tokens) override;
 
         /**
          * @brief Resolve one scheduling policy across the LocalTP domain.
@@ -1195,6 +1235,14 @@ namespace llaminar2
         DeviceMoERebalanceHostedObservationSchedule
         deviceMoERebalanceHostedObservationSchedule()
             const noexcept override;
+
+        /** @brief Concatenate exact controller runtime bindings from all children. */
+        std::vector<MoEOverlayDeviceControllerRuntimeBinding>
+        moeOverlayDeviceControllerRuntimeBindings() const override;
+
+        /** @copydoc IInferenceRunner::installMoEOverlayTransferProgressEpoch */
+        bool installMoEOverlayTransferProgressEpoch(
+            std::shared_ptr<MappedTransferProgressEpoch> epoch) override;
 
         /**
          * @brief Validate a graph-embedded known-non-due boundary on every participant.
@@ -1791,9 +1839,9 @@ namespace llaminar2
         /** Immutable hosted cadence retained for the current request. */
         DeviceMoERebalanceHostedObservationSchedule
             rank_hosted_device_moe_rebalance_observation_schedule_{};
-        /** Conservative decode-boundary countdown, never live device state. */
+        /** Exact logical-round countdown derived from immutable policy/tickets. */
         uint32_t
-            rank_hosted_device_moe_boundaries_until_observation_ = 0;
+            rank_hosted_device_moe_rounds_until_observation_ = 0;
         bool rank_hosted_device_moe_observation_schedule_initialized_ = false;
         int admitted_device_generation_max_new_tokens_ = 0;
 
@@ -1820,6 +1868,24 @@ namespace llaminar2
          * inherit decode's host-observation policy.
          */
         std::optional<LogitsForwardPhase> last_logits_forward_phase_;
+
+        /**
+         * Rank-local wall interval sampled only when asynchronous economy
+         * calibration arms it. The scope surrounds every local device, so an
+         * MPI follower observes the same semantic transaction as the root.
+         */
+        std::shared_ptr<MoEOverlayInferenceInterferenceProbe>
+            moe_overlay_interference_probe_;
+        /**
+         * Rank-wide heterogeneous transaction authority, retained so probe
+         * binding is order-independent during setup. It remains policy-free:
+         * only each complete prefill graph group's timing interval is owned
+         * here, while the economy controller consumes the evidence elsewhere.
+         */
+        std::shared_ptr<MoEOverlayInferenceTransactionCoordinator>
+            moe_overlay_inference_transaction_coordinator_;
+        /** True when chunk scopes, rather than the outer schedule, own prefill timing. */
+        bool moe_overlay_coordinator_owns_prefill_probe_ = false;
 
         /// Aggregated executor stats (mutable for lazy computation)
         mutable std::unique_ptr<GraphExecutorStats> aggregated_stats_;

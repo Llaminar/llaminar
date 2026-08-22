@@ -69,12 +69,44 @@ namespace llaminar2
      * endpoint stream capture. Splitting such a graph would reintroduce host
      * dispatch between those edges, so all participants must record one native
      * executable and legacy per-wave annotations become documentation only.
+     *
+     * A heterogeneous ticket transaction is the deliberately segmented case:
+     * captured device work publishes one fixed immutable ticket, an explicitly
+     * manual participant consumes and completes it, and a following captured
+     * device segment imports the result. This is not permission for generic
+     * eager replay; the capture controller validates the ticket fence and every
+     * manual boundary before accepting the graph.
      */
     enum class GraphNativeCaptureEnvelope : uint8_t
     {
         Ordinary = 0, ///< Per-node capture-wave and segment contracts apply.
         DeviceOwnedTimelineTransaction, ///< One indivisible native executable owns all ordering edges.
+        HeterogeneousTicketTransaction, ///< Captured device units surround one or more declared host-ticket boundaries.
     };
+
+    /**
+     * @brief Return whether an envelope requires exactly one native executable.
+     * @param envelope Declarative graph-wide capture lifecycle.
+     * @return True only for an indivisible device-owned timeline.
+     */
+    [[nodiscard]] constexpr bool requiresSingleNativeExecutable(
+        GraphNativeCaptureEnvelope envelope) noexcept
+    {
+        return envelope ==
+               GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction;
+    }
+
+    /**
+     * @brief Return whether an envelope requires an explicit ticketed boundary.
+     * @param envelope Declarative graph-wide capture lifecycle.
+     * @return True only for the typed heterogeneous ticket transaction.
+     */
+    [[nodiscard]] constexpr bool requiresHeterogeneousTicketSegmentation(
+        GraphNativeCaptureEnvelope envelope) noexcept
+    {
+        return envelope ==
+               GraphNativeCaptureEnvelope::HeterogeneousTicketTransaction;
+    }
 
     /**
      * @brief Represents a node in the compute graph

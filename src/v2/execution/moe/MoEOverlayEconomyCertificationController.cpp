@@ -51,6 +51,48 @@ namespace llaminar2
                 names{"decode", "prefill", "grouped_verifier"};
             return source < names.size() ? names[source] : "invalid";
         }
+
+        /** @return Stable diagnostic name for one certification lifecycle state. */
+        const char *certificationStateName(
+            MoEOverlayEconomyCertificationState state) noexcept
+        {
+            switch (state)
+            {
+            case MoEOverlayEconomyCertificationState::CalibratingMovement:
+                return "calibrating_movement";
+            case MoEOverlayEconomyCertificationState::AwaitingServiceEvidence:
+                return "awaiting_service_evidence";
+            case MoEOverlayEconomyCertificationState::ExchangingServiceReadiness:
+                return "exchanging_service_readiness";
+            case MoEOverlayEconomyCertificationState::ExchangingServiceEvidence:
+                return "exchanging_service_evidence";
+            case MoEOverlayEconomyCertificationState::Complete:
+                return "complete";
+            case MoEOverlayEconomyCertificationState::Failed:
+                return "failed";
+            case MoEOverlayEconomyCertificationState::Stopped:
+                return "stopped";
+            }
+            return "invalid";
+        }
+
+        /** @return Generic production workload corresponding to one MoE phase. */
+        InferenceMeasurementWorkloadKind measurementWorkloadKind(
+            ExpertHistogramSource source) noexcept
+        {
+            switch (source)
+            {
+            case ExpertHistogramSource::PrefillChunk:
+                return InferenceMeasurementWorkloadKind::Prefill;
+            case ExpertHistogramSource::DecodeToken:
+                return InferenceMeasurementWorkloadKind::Decode;
+            case ExpertHistogramSource::GroupedVerifier:
+                return InferenceMeasurementWorkloadKind::GroupedVerifier;
+            case ExpertHistogramSource::SyntheticTest:
+                return InferenceMeasurementWorkloadKind::None;
+            }
+            return InferenceMeasurementWorkloadKind::None;
+        }
     } // namespace
 
     MoEOverlayEconomyCertificationController::
@@ -61,14 +103,23 @@ namespace llaminar2
             !config_.layer_catalog || !config_.authority ||
             !config_.economy_policy.valid() ||
             !config_.authority->migrationEnabled() ||
-            config_.authority->hasEconomyCertification() ||
+            (config_.target ==
+                 MoEOverlayEconomyCertificationTarget::ResidencyAuthority &&
+             config_.authority->hasEconomyCertification()) ||
+            (config_.target !=
+                 MoEOverlayEconomyCertificationTarget::ResidencyAuthority &&
+             config_.target !=
+                 MoEOverlayEconomyCertificationTarget::
+                     DetachedDeviceAuthority) ||
             !validExpertHistogramProductionSourceMask(
                 config_.active_sources) ||
             config_.active_sources !=
-                config_.calibration->requiredSources())
+                config_.calibration->requiredSources() ||
+            config_.service_readiness_retry_interval <
+                std::chrono::milliseconds::zero())
         {
             throw std::invalid_argument(
-                "ExpertOverlay economy certification requires complete uncertified dynamic dependencies with one consistent runtime phase mask");
+                "ExpertOverlay economy certification requires complete dynamic dependencies, a valid typed target, and one consistent runtime phase mask");
         }
         if (config_.perf_device.empty())
             config_.perf_device = "expert_overlay";
@@ -122,6 +173,40 @@ namespace llaminar2
         }
     }
 
+    void MoEOverlayEconomyCertificationController::
+        beginServiceReadinessRound(
+            MoEOverlayServiceEvidenceReadiness local_readiness)
+    {
+        if (!config_.evidence_exchange ||
+            state() !=
+                MoEOverlayEconomyCertificationState::AwaitingServiceEvidence ||
+            !config_.evidence_exchange->idle())
+        {
+            throw std::logic_error(
+                "ExpertOverlay service-readiness round requires an idle distributed lane in AwaitingServiceEvidence");
+        }
+        if (local_readiness ==
+                MoEOverlayServiceEvidenceReadiness::Ready &&
+            !ready_local_service_evidence_)
+        {
+            throw std::logic_error(
+                "ExpertOverlay ready service round requires a retained local snapshot");
+        }
+
+        std::string error;
+        if (!config_.evidence_exchange->beginServiceReadiness(
+                local_readiness, &error))
+        {
+            throw std::runtime_error(
+                error.empty()
+                    ? "ExpertOverlay could not begin its typed service-readiness round"
+                    : std::move(error));
+        }
+        state_.store(
+            MoEOverlayEconomyCertificationState::ExchangingServiceReadiness,
+            std::memory_order_release);
+    }
+
     void MoEOverlayEconomyCertificationController::poll() noexcept
     {
         polls_.fetch_add(1, std::memory_order_relaxed);
@@ -134,60 +219,21 @@ namespace llaminar2
 
         try
         {
-            if (stop_requested_.load(std::memory_order_acquire))
+            auto current = state();
+            if (current ==
+                MoEOverlayEconomyCertificationState::CalibratingMovement)
             {
-                if (state() ==
-                        MoEOverlayEconomyCertificationState::
-                            ExchangingServiceReadiness &&
-                    config_.evidence_exchange &&
-                    !config_.evidence_exchange->idle())
-                {
-                    bool discarded = false;
-                    std::string error;
-                    const auto progress =
-                        config_.evidence_exchange->pollServiceReadiness(
-                            &discarded, &error);
-                    if (progress ==
-                        MoEOverlayResidencyWaveProgress::Pending)
-                    {
-                        return;
-                    }
-                    if (progress != MoEOverlayResidencyWaveProgress::Ready)
-                    {
-                        fail(
-                            error.empty()
-                                ? "ExpertOverlay certification could not drain its service readiness exchange"
-                                : std::move(error));
-                        return;
-                    }
-                }
-                if (state() ==
-                        MoEOverlayEconomyCertificationState::
-                            ExchangingServiceEvidence &&
-                    config_.evidence_exchange &&
-                    !config_.evidence_exchange->idle())
-                {
-                    std::vector<MoEOverlayParticipantLayerServiceTotals>
-                        discarded;
-                    std::string error;
-                    const auto progress =
-                        config_.evidence_exchange->pollService(
-                            &discarded, &error);
-                    if (progress ==
-                        MoEOverlayResidencyWaveProgress::Pending)
-                    {
-                        return;
-                    }
-                    if (progress != MoEOverlayResidencyWaveProgress::Ready)
-                    {
-                        fail(
-                            error.empty()
-                                ? "ExpertOverlay certification could not drain its service evidence exchange"
-                                : std::move(error));
-                        return;
-                    }
-                }
-                config_.calibration->requestStop();
+                /*
+                 * Movement calibration and service rounds share one private
+                 * lane. Finish or stop calibration before the certification
+                 * state machine is allowed to own that lane.
+                 */
+                const bool stopping =
+                    stop_requested_.load(std::memory_order_acquire);
+                if (stopping)
+                    config_.calibration->requestStop();
+                movement_calibration_polls_.fetch_add(
+                    1, std::memory_order_relaxed);
                 config_.calibration->poll();
                 if (!config_.calibration->healthy())
                 {
@@ -195,51 +241,108 @@ namespace llaminar2
                     return;
                 }
                 const auto calibration_state = config_.calibration->state();
-                if (calibration_state ==
-                        MoEOverlayEconomyCalibrationState::Stopped ||
-                    calibration_state ==
-                        MoEOverlayEconomyCalibrationState::Complete)
+                if (stopping)
                 {
+                    if (calibration_state !=
+                            MoEOverlayEconomyCalibrationState::Stopped &&
+                        calibration_state !=
+                            MoEOverlayEconomyCalibrationState::Complete)
+                    {
+                        return;
+                    }
                     expanded_migration_measurements_.reset();
                     ready_local_service_evidence_.reset();
                     state_.store(
-                        MoEOverlayEconomyCertificationState::Stopped,
+                        MoEOverlayEconomyCertificationState::
+                            AwaitingServiceEvidence,
                         std::memory_order_release);
+                    if (config_.evidence_exchange)
+                    {
+                        beginServiceReadinessRound(
+                            MoEOverlayServiceEvidenceReadiness::Stopping);
+                    }
+                    else
+                    {
+                        state_.store(
+                            MoEOverlayEconomyCertificationState::Stopped,
+                            std::memory_order_release);
+                    }
+                    return;
                 }
+
+                if (calibration_state !=
+                    MoEOverlayEconomyCalibrationState::Complete)
+                {
+                    return;
+                }
+                const auto *representatives =
+                    config_.calibration->sealedMeasurements();
+                if (!representatives)
+                {
+                    throw std::logic_error(
+                        "Completed ExpertOverlay calibration omitted its sealed evidence");
+                }
+                expanded_migration_measurements_ =
+                    config_.layer_catalog->expand(*representatives);
+                next_service_readiness_attempt_ = {};
+                state_.store(
+                    MoEOverlayEconomyCertificationState::
+                        AwaitingServiceEvidence,
+                    std::memory_order_release);
                 return;
             }
 
-            if (state() ==
+            if (current ==
                 MoEOverlayEconomyCertificationState::
                     ExchangingServiceReadiness)
             {
-                bool all_ranks_ready = false;
+                MoEOverlayServiceEvidenceReadiness global_readiness =
+                    MoEOverlayServiceEvidenceReadiness::AwaitingEvidence;
                 std::string error;
                 const auto progress =
                     config_.evidence_exchange->pollServiceReadiness(
-                        &all_ranks_ready, &error);
+                        &global_readiness, &error);
                 if (progress == MoEOverlayResidencyWaveProgress::Pending)
                     return;
                 if (progress != MoEOverlayResidencyWaveProgress::Ready)
                 {
                     throw std::runtime_error(
                         error.empty()
-                            ? "ExpertOverlay service readiness exchange failed"
+                            ? "ExpertOverlay service-readiness round failed"
                             : std::move(error));
                 }
-                if (!all_ranks_ready)
+
+                if (global_readiness ==
+                    MoEOverlayServiceEvidenceReadiness::Stopping)
+                {
+                    stop_requested_.store(true, std::memory_order_release);
+                    config_.calibration->requestStop();
+                    ready_local_service_evidence_.reset();
+                    expanded_migration_measurements_.reset();
+                    state_.store(
+                        MoEOverlayEconomyCertificationState::Stopped,
+                        std::memory_order_release);
+                    return;
+                }
+                if (global_readiness ==
+                    MoEOverlayServiceEvidenceReadiness::AwaitingEvidence)
                 {
                     ready_local_service_evidence_.reset();
+                    next_service_readiness_attempt_ =
+                        std::chrono::steady_clock::now() +
+                        config_.service_readiness_retry_interval;
                     state_.store(
                         MoEOverlayEconomyCertificationState::
                             AwaitingServiceEvidence,
                         std::memory_order_release);
                     return;
                 }
-                if (!ready_local_service_evidence_)
+                if (global_readiness !=
+                    MoEOverlayServiceEvidenceReadiness::Ready ||
+                    !ready_local_service_evidence_)
                 {
                     throw std::logic_error(
-                        "ExpertOverlay all-rank service readiness succeeded without a retained local snapshot");
+                        "ExpertOverlay ready service round omitted its retained local snapshot");
                 }
                 if (!config_.evidence_exchange->beginService(
                         *ready_local_service_evidence_, &error))
@@ -256,7 +359,7 @@ namespace llaminar2
                 return;
             }
 
-            if (state() ==
+            if (current ==
                 MoEOverlayEconomyCertificationState::
                     ExchangingServiceEvidence)
             {
@@ -301,40 +404,44 @@ namespace llaminar2
                         "ExpertOverlay all-rank readiness produced incomplete global service evidence");
                 }
                 ready_local_service_evidence_.reset();
+                /*
+                 * A successful Ready round commits the finite all-gather. A
+                 * stop request arriving after that point cannot roll one rank
+                 * back while its peers install the same immutable certificate.
+                 */
                 installCompleteEvidence(std::move(complete_service));
                 return;
             }
-            if (state() ==
-                MoEOverlayEconomyCertificationState::CalibratingMovement)
+
+            if (current !=
+                MoEOverlayEconomyCertificationState::AwaitingServiceEvidence)
             {
-                movement_calibration_polls_.fetch_add(
-                    1, std::memory_order_relaxed);
-                config_.calibration->poll();
-                if (!config_.calibration->healthy())
+                throw std::logic_error(
+                    "ExpertOverlay economy certification reached an invalid lifecycle state");
+            }
+
+            if (stop_requested_.load(std::memory_order_acquire))
+            {
+                config_.calibration->requestStop();
+                ready_local_service_evidence_.reset();
+                expanded_migration_measurements_.reset();
+                if (config_.evidence_exchange)
                 {
-                    fail(config_.calibration->failureMessage());
-                    return;
+                    beginServiceReadinessRound(
+                        MoEOverlayServiceEvidenceReadiness::Stopping);
                 }
-                if (config_.calibration->state() !=
-                    MoEOverlayEconomyCalibrationState::Complete)
+                else
                 {
-                    return;
+                    state_.store(
+                        MoEOverlayEconomyCertificationState::Stopped,
+                        std::memory_order_release);
                 }
-                const auto *representatives =
-                    config_.calibration->sealedMeasurements();
-                if (!representatives)
-                {
-                    throw std::logic_error(
-                        "Completed ExpertOverlay calibration omitted its sealed evidence");
-                }
-                expanded_migration_measurements_ =
-                    config_.layer_catalog->expand(*representatives);
-                state_.store(
-                    MoEOverlayEconomyCertificationState::
-                        AwaitingServiceEvidence,
-                    std::memory_order_release);
                 return;
             }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now < next_service_readiness_attempt_)
+                return;
 
             service_snapshot_attempts_.fetch_add(
                 1, std::memory_order_relaxed);
@@ -366,10 +473,69 @@ namespace llaminar2
                         local_coverage.representative_layer,
                         static_cast<int>(local_coverage.source_index),
                     };
+                    std::ostringstream observed_layers_builder;
+                    bool first_observed_layer = true;
+                    std::array<std::uint64_t,
+                               kExpertHistogramProductionSourceCount>
+                        participant_samples{};
+                    std::array<std::uint64_t,
+                               kExpertHistogramProductionSourceCount>
+                        participant_activations{};
+                    for (const auto &row : raw_service)
+                    {
+                        if (row.participant_id !=
+                            local_coverage.participant_id)
+                        {
+                            continue;
+                        }
+                        for (std::size_t source = 0u;
+                             source <
+                                 kExpertHistogramProductionSourceCount;
+                             ++source)
+                        {
+                            participant_samples[source] +=
+                                row.sample_count[source];
+                            participant_activations[source] +=
+                                row.activation_count[source];
+                        }
+                        if (row.sample_count[
+                                local_coverage.source_index] == 0)
+                        {
+                            continue;
+                        }
+                        if (!first_observed_layer)
+                            observed_layers_builder << ',';
+                        observed_layers_builder << row.layer;
+                        first_observed_layer = false;
+                    }
+                    const std::string observed_layers =
+                        first_observed_layer
+                            ? std::string("none")
+                            : observed_layers_builder.str();
+                    std::ostringstream phase_totals_builder;
+                    for (std::size_t source = 0u;
+                         source < kExpertHistogramProductionSourceCount;
+                         ++source)
+                    {
+                        if (source != 0u)
+                            phase_totals_builder << ';';
+                        phase_totals_builder
+                            << serviceSourceName(source)
+                            << "{samples="
+                            << participant_samples[source]
+                            << ",activations="
+                            << participant_activations[source] << '}';
+                    }
+                    const std::string phase_totals =
+                        phase_totals_builder.str();
                     if (!last_reported_service_deficit_ ||
-                        *last_reported_service_deficit_ != deficit)
+                        *last_reported_service_deficit_ != deficit ||
+                        last_reported_service_observed_layers_ !=
+                            observed_layers)
                     {
                         last_reported_service_deficit_ = deficit;
+                        last_reported_service_observed_layers_ =
+                            observed_layers;
                         LOG_INFO(
                             "[ExpertOverlay][Economy] Awaiting live service "
                             "evidence participant="
@@ -378,7 +544,11 @@ namespace llaminar2
                             << local_coverage.representative_layer
                             << " source="
                             << serviceSourceName(
-                                   local_coverage.source_index));
+                                   local_coverage.source_index)
+                            << " observed_layers="
+                            << observed_layers
+                            << " participant_phase_totals="
+                            << phase_totals);
                         PerfStatsCollector::addCounter(
                             "moe_overlay_residency",
                             "economy_service_coverage_pending",
@@ -400,35 +570,34 @@ namespace llaminar2
             else
             {
                 last_reported_service_deficit_.reset();
+                last_reported_service_observed_layers_.clear();
             }
             if (config_.evidence_exchange)
             {
+                /*
+                 * Every rank enters the same bounded round even when its local
+                 * sparse routes have not covered the whole service matrix.
+                 * The prior collective completion orders the next round; the
+                 * retry interval limits control-plane traffic without putting
+                 * ExpertOverlay policy into the inference or benchmark runner.
+                 */
                 if (local_ready)
-                {
-                    ready_local_service_evidence_ =
-                        std::move(raw_service);
-                }
+                    ready_local_service_evidence_ = std::move(raw_service);
                 else
-                {
                     ready_local_service_evidence_.reset();
-                }
-                std::string error;
-                if (!config_.evidence_exchange->beginServiceReadiness(
-                        local_ready, &error))
-                {
-                    throw std::runtime_error(
-                        error.empty()
-                            ? "ExpertOverlay could not begin its service readiness exchange"
-                            : std::move(error));
-                }
-                state_.store(
-                    MoEOverlayEconomyCertificationState::
-                        ExchangingServiceReadiness,
-                    std::memory_order_release);
+                beginServiceReadinessRound(
+                    local_ready
+                        ? MoEOverlayServiceEvidenceReadiness::Ready
+                        : MoEOverlayServiceEvidenceReadiness::
+                              AwaitingEvidence);
                 return;
             }
             if (!local_ready)
+            {
+                next_service_readiness_attempt_ =
+                    now + config_.service_readiness_retry_interval;
                 return;
+            }
             installCompleteEvidence(std::move(raw_service));
         }
         catch (const std::exception &error)
@@ -489,12 +658,35 @@ namespace llaminar2
         recordServicePriorityCrossovers(
             *profiles.service,
             *snapshot->placement_plan);
-        config_.authority->installEconomyCertification(
-            std::move(profiles.service),
-            std::move(profiles.migration),
-            profiles.policy);
-        certifications_installed_.fetch_add(
-            1, std::memory_order_relaxed);
+        if (config_.target ==
+            MoEOverlayEconomyCertificationTarget::ResidencyAuthority)
+        {
+            config_.authority->installEconomyCertification(
+                std::move(profiles.service),
+                std::move(profiles.migration),
+                profiles.policy);
+            certifications_installed_.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        else
+        {
+            /* The host owns measurement evidence, not placement. Publish one
+             * immutable bundle for the mapped-fabric writer before Complete is
+             * release-stored; the device controller remains the only policy
+             * and durable-epoch authority. */
+            {
+                std::lock_guard<std::mutex> lock(
+                    detached_profiles_mutex_);
+                if (detached_profiles_)
+                {
+                    throw std::logic_error(
+                        "ExpertOverlay detached economy profiles were published more than once");
+                }
+                detached_profiles_ = std::move(profiles);
+            }
+            detached_profiles_completed_.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         state_.store(
             MoEOverlayEconomyCertificationState::Complete,
             std::memory_order_release);
@@ -510,7 +702,12 @@ namespace llaminar2
              {"service_source", "live_prepared_experts"},
              {"movement_source", "real_non_publishable_waves"},
              {"distributed",
-              config_.evidence_exchange ? "true" : "false"}});
+              config_.evidence_exchange ? "true" : "false"},
+             {"target",
+              config_.target ==
+                      MoEOverlayEconomyCertificationTarget::ResidencyAuthority
+                  ? "host_authority"
+                  : "device_authority"}});
     }
 
     void MoEOverlayEconomyCertificationController::
@@ -630,6 +827,29 @@ namespace llaminar2
     {
         stop_requested_.store(true, std::memory_order_release);
         config_.calibration->requestStop();
+    }
+
+    bool MoEOverlayEconomyCertificationController::
+        importDeviceServiceMeasurements(
+            int participant_id,
+            const std::vector<MoEOverlayParticipantLayerServiceTotals> &rows,
+            std::string *error)
+    {
+        if (error)
+            error->clear();
+        const auto current = state();
+        if (!healthy() ||
+            (current !=
+                 MoEOverlayEconomyCertificationState::CalibratingMovement &&
+             current !=
+                 MoEOverlayEconomyCertificationState::AwaitingServiceEvidence))
+        {
+            if (error)
+                *error = "device service evidence arrived after certification exchange began";
+            return false;
+        }
+        return config_.registry->importDeviceServiceMeasurements(
+            participant_id, rows, error);
     }
 
     MoEOverlayEconomyCertificationController::ServiceEvidenceCoverage
@@ -796,6 +1016,25 @@ namespace llaminar2
         return failure_message_;
     }
 
+    std::optional<MoEOverlayCertifiedEconomyProfiles>
+    MoEOverlayEconomyCertificationController::detachedProfiles() const
+    {
+        if (config_.target !=
+                MoEOverlayEconomyCertificationTarget::
+                    DetachedDeviceAuthority ||
+            state() != MoEOverlayEconomyCertificationState::Complete)
+        {
+            return std::nullopt;
+        }
+        std::lock_guard<std::mutex> lock(detached_profiles_mutex_);
+        if (!detached_profiles_ || !detached_profiles_->valid())
+        {
+            throw std::logic_error(
+                "Completed detached ExpertOverlay certification omitted its immutable profiles");
+        }
+        return detached_profiles_;
+    }
+
     MoEOverlayEconomyCertificationStats
     MoEOverlayEconomyCertificationController::stats() const noexcept
     {
@@ -814,8 +1053,62 @@ namespace llaminar2
                 profiles_composed_.load(std::memory_order_relaxed),
             .certifications_installed =
                 certifications_installed_.load(std::memory_order_relaxed),
+            .detached_profiles_completed =
+                detached_profiles_completed_.load(
+                    std::memory_order_relaxed),
             .fatal_failures =
                 fatal_failures_.load(std::memory_order_relaxed),
         };
+    }
+
+    InferenceMeasurementReadiness
+    MoEOverlayEconomyCertificationController::measurementReadiness() const
+    {
+        const auto observed_state = state();
+        const auto calibration_stats = config_.calibration->stats();
+        InferenceMeasurementReadiness readiness{
+            .state = InferenceMeasurementReadinessState::Calibrating,
+            .completed_work_units = calibration_stats.accepted_pairs,
+            .required_work_units =
+                config_.calibration->expectedAcceptedPairs(),
+            .inference_requested = false,
+            .inference_request_generation = 0u,
+            .requested_workload = InferenceMeasurementWorkloadKind::None,
+            .owner = "expert_overlay_economy",
+            .phase = certificationStateName(observed_state),
+        };
+
+        if (observed_state !=
+                MoEOverlayEconomyCertificationState::CalibratingMovement &&
+            observed_state != MoEOverlayEconomyCertificationState::Failed &&
+            observed_state != MoEOverlayEconomyCertificationState::Stopped)
+        {
+            /*
+             * Physical topology profiling is the only setup gate. Prepared
+             * expert service telemetry is accumulated by ordinary requests;
+             * until it is complete the movement authority remains dormant,
+             * but inference is fully valid and must not be delayed.
+             */
+            readiness.state = InferenceMeasurementReadinessState::Ready;
+            return readiness;
+        }
+        if (observed_state ==
+                MoEOverlayEconomyCertificationState::Failed ||
+            observed_state ==
+                MoEOverlayEconomyCertificationState::Stopped ||
+            !healthy())
+        {
+            readiness.state = InferenceMeasurementReadinessState::Failed;
+            readiness.diagnostic = failureMessage();
+            if (readiness.diagnostic.empty())
+            {
+                readiness.diagnostic =
+                    observed_state ==
+                            MoEOverlayEconomyCertificationState::Stopped
+                        ? "ExpertOverlay economy certification stopped before completion"
+                        : "ExpertOverlay economy certification failed";
+            }
+        }
+        return readiness;
     }
 } // namespace llaminar2

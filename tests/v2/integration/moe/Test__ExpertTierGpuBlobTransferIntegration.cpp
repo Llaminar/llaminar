@@ -3,20 +3,24 @@
  * @brief Real-device CUDA/ROCm packed and floating expert relay proof.
  *
  * The test transfers a production-shaped separated NativeVNNI projection in
- * both CUDA-to-ROCm and ROCm-to-CUDA directions, then repeats the production
- * lane for contiguous FP16, BF16, and FP32 payloads. It validates every byte,
- * exercises the double-buffered event-polled state machine, and proves
- * independent work on both devices completes while migration remains a
- * background transaction.
+ * CUDA-to-ROCm, ROCm-to-CUDA, and same-backend/no-P2P directions, then repeats
+ * the cross-backend production lane for contiguous FP16, BF16, and FP32
+ * payloads. It validates every byte, exercises the double-buffered async-DMA
+ * epoch state machine, and proves independent work on both devices completes
+ * while migration remains a background transaction.
  */
 
 #include "backends/BackendManager.h"
+#include "backends/ComputeBackend.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
+#include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
 #include "execution/moe/ExpertTierGpuBlobTransferLane.h"
 #include "execution/moe/MoEOverlayGpuRemoteProjectionEndpoint.h"
+#include "kernels/cuda/gemm/CUDAFloatingPointGemmKernel.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
+#include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
@@ -379,16 +383,232 @@ namespace llaminar2
             void *destination_ = nullptr;
         };
 
+        /** @brief Shared source/destination epochs used by one relay fixture. */
+        struct RetainedRelayEpochPair
+        {
+            std::shared_ptr<MappedTransferProgressEpoch> source;
+            std::shared_ptr<MappedTransferProgressEpoch> destination;
+        };
+
+        /** @brief Materialize the exact four permanent slots owned by one lane. */
+        RetainedRelayEpochPair makeRetainedRelayEpochs(
+            DeviceId source_device,
+            DeviceId destination_device,
+            std::size_t staging_bytes,
+            const std::string &identity)
+        {
+            return {
+                .source = MappedTransferProgressEpoch::create({
+                    .device = source_device,
+                    .slot_capacity = 2u,
+                    .maximum_bytes = staging_bytes,
+                    .name = "blob_source:" + identity,
+                    .perf_device = identity,
+                }),
+                .destination = MappedTransferProgressEpoch::create({
+                    .device = destination_device,
+                    .slot_capacity = 2u,
+                    .maximum_bytes = staging_bytes,
+                    .name = "blob_destination:" + identity,
+                    .perf_device = identity,
+                }),
+            };
+        }
+
         /**
-         * @brief Run one direction of the real-device heterogeneous transfer.
-         * @param source_device CUDA or ROCm source.
-         * @param destination_device Opposite-backend destination.
+         * @brief Independent captured work plus an explicit maintenance pump.
+         *
+         * The one-node graph models an operation with its own concurrent stream
+         * pool. Progress is submitted separately after the graph launch, so the
+         * fixture proves neither side captures or waits for the other's events.
+         */
+        class CapturedProgressReplay final
+        {
+        public:
+            /** @brief Capture exactly one inference-like primary node. */
+            CapturedProgressReplay(
+                IWorkerGPUContext &context,
+                std::shared_ptr<MappedTransferProgressEpoch> epoch,
+                std::string identity)
+                : context_(context),
+                  epoch_(std::move(epoch)),
+                  device_(epoch_ ? epoch_->device() : DeviceId::invalid()),
+                  backend_(getBackendFor(device_))
+            {
+                if (!epoch_ || !device_.is_gpu() || !backend_)
+                    throw std::invalid_argument(
+                        "Captured progress replay requires one live GPU epoch");
+
+                context_.submitAndWait(
+                    [this, identity = std::move(identity)]
+                    {
+                        primary_stream_ =
+                            context_.getOrCreateAuxiliaryStream(
+                                "captured_blob_progress:" + identity);
+                        terminal_event_ = context_.createEvent();
+                        witness_ = backend_->allocate(
+                            kWitnessBytes, device_.gpu_ordinal());
+                        graph_ = context_.createGraphCapture(primary_stream_);
+                        if (!primary_stream_ || !terminal_event_ || !witness_ ||
+                            !graph_ || !graph_->beginCapture())
+                        {
+                            throw std::runtime_error(
+                                "Could not materialize captured blob progress replay");
+                        }
+
+                        bool capture_open = true;
+                        try
+                        {
+                            if (!backend_->memset(
+                                    witness_,
+                                    0x5a,
+                                    kWitnessBytes,
+                                    device_.gpu_ordinal(),
+                                    primary_stream_) ||
+                                !graph_->endCapture())
+                            {
+                                throw std::runtime_error(
+                                    "Could not record captured blob progress replay");
+                            }
+                            capture_open = false;
+                            if (graph_->nodeCount() != 1u ||
+                                !graph_->instantiate())
+                            {
+                                throw std::runtime_error(
+                                    "Captured blob progress replay has no complete executable");
+                            }
+                        }
+                        catch (...)
+                        {
+                            if (capture_open)
+                                (void)graph_->endCapture();
+                            throw;
+                        }
+                    });
+            }
+
+            /** @brief Drain the final replay, then retire graph-owned handles. */
+            ~CapturedProgressReplay()
+            {
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::seconds(10);
+                if (!awaitIdle(deadline))
+                    std::terminate();
+                try
+                {
+                    context_.submitAndWait(
+                        [this]
+                        {
+                            graph_.reset();
+                            if (terminal_event_)
+                            {
+                                context_.destroyEvent(terminal_event_);
+                                terminal_event_ = nullptr;
+                            }
+                            if (witness_)
+                            {
+                                backend_->free(
+                                    witness_, device_.gpu_ordinal());
+                                witness_ = nullptr;
+                            }
+                        });
+                }
+                catch (...)
+                {
+                    std::terminate();
+                }
+            }
+
+            CapturedProgressReplay(const CapturedProgressReplay &) = delete;
+            CapturedProgressReplay &operator=(
+                const CapturedProgressReplay &) = delete;
+
+            /** @brief Enqueue one complete native graph without waiting. */
+            [[nodiscard]] bool launch() noexcept
+            {
+                bool launched = false;
+                try
+                {
+                    context_.submitAndWait(
+                        [this, &launched]
+                        {
+                            launched = graph_ && graph_->launch() &&
+                                context_.recordEventChecked(
+                                    terminal_event_, primary_stream_) &&
+                                epoch_->submitOutstandingProgress();
+                            if (launched)
+                                launch_pending_ = true;
+                        });
+                }
+                catch (...)
+                {
+                    return false;
+                }
+                return launched;
+            }
+
+            /** @brief Poll the exact terminal event without synchronizing. */
+            [[nodiscard]] bool awaitIdle(
+                std::chrono::steady_clock::time_point deadline) noexcept
+            {
+                if (!launch_pending_)
+                    return true;
+                bool ready = false;
+                while (!ready && std::chrono::steady_clock::now() < deadline)
+                {
+                    if (!context_.queryEventChecked(terminal_event_, ready))
+                        return false;
+                    if (!ready)
+                        std::this_thread::yield();
+                }
+                if (ready)
+                    launch_pending_ = false;
+                return ready;
+            }
+
+        private:
+            static constexpr std::size_t kWitnessBytes = 4096u;
+            IWorkerGPUContext &context_;
+            std::shared_ptr<MappedTransferProgressEpoch> epoch_;
+            DeviceId device_ = DeviceId::invalid();
+            IBackend *backend_ = nullptr;
+            std::unique_ptr<IGPUGraphCapture> graph_;
+            void *primary_stream_ = nullptr;
+            void *terminal_event_ = nullptr;
+            void *witness_ = nullptr;
+            bool launch_pending_ = false;
+        };
+
+        /** @brief Non-blockingly close an upload event before bank publication. */
+        bool awaitSetupEvent(
+            IWorkerGPUContext &context,
+            void *event,
+            std::chrono::steady_clock::time_point deadline)
+        {
+            bool ready = false;
+            while (!ready && std::chrono::steady_clock::now() < deadline)
+            {
+                if (!context.queryEventChecked(event, ready))
+                    return false;
+                if (!ready)
+                    std::this_thread::yield();
+            }
+            return ready;
+        }
+
+        /**
+         * @brief Run one direction of the real-device GPU host relay.
+         * @param source_device Exact CUDA or ROCm source.
+         * @param destination_device Exact CUDA or ROCm destination.
          * @param seed Deterministic byte-pattern seed.
+         * @param relay_kind Topology fact requiring the explicit host relay.
          */
         void runHeterogeneousBlobDirection(
             DeviceId source_device,
             DeviceId destination_device,
-            std::uint32_t seed)
+            std::uint32_t seed,
+            ExpertTierGpuBlobRelayKind relay_kind =
+                ExpertTierGpuBlobRelayKind::CrossBackend)
         {
             IBackend *source_backend = getBackendFor(source_device);
             IBackend *destination_backend = getBackendFor(destination_device);
@@ -458,11 +678,25 @@ namespace llaminar2
                 source_ready_event,
                 source_device.gpu_ordinal(),
                 source_producer_stream));
+            const auto setup_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            ASSERT_TRUE(awaitSetupEvent(
+                source_context, source_ready_event, setup_deadline));
+
+            constexpr std::size_t staging_bytes = 4096u;
+            auto progress_epochs = makeRetainedRelayEpochs(
+                source_device,
+                destination_device,
+                staging_bytes,
+                identity + ":" + std::to_string(seed));
 
             ExpertTierGpuBlobTransferLane lane({
                 .source_device = source_device,
                 .destination_device = destination_device,
-                .staging_capacity_bytes = 4096,
+                .relay_kind = relay_kind,
+                .staging_capacity_bytes = staging_bytes,
+                .source_progress_epoch = progress_epochs.source,
+                .destination_progress_epoch = progress_epochs.destination,
                 .lane_name = "integration:" + identity,
                 .perf_device = identity,
                 .collect_timing_measurements = true,
@@ -472,13 +706,20 @@ namespace llaminar2
             ASSERT_TRUE(lane.start(
                 source.descriptor(),
                 destination.descriptor(),
-                ExpertTierSourceReadiness::producerEvent(
-                    source_ready_event),
+                ExpertTierSourceReadiness::publishedResidencyBank(seed + 1u),
                 &error))
                 << error;
             ASSERT_EQ(
                 lane.progress(),
                 ExpertTierGpuBlobTransferProgress::Pending);
+            CapturedProgressReplay source_progress_replay(
+                source_context,
+                progress_epochs.source,
+                identity + ":source");
+            CapturedProgressReplay destination_progress_replay(
+                destination_context,
+                progress_epochs.destination,
+                identity + ":destination");
 
             DeviceCopyWitness source_witness(
                 *source_backend,
@@ -530,6 +771,8 @@ namespace llaminar2
                        ExpertTierGpuBlobTransferProgress::Pending &&
                    std::chrono::steady_clock::now() < deadline)
             {
+                ASSERT_TRUE(source_progress_replay.launch());
+                ASSERT_TRUE(destination_progress_replay.launch());
                 ASSERT_NE(
                     lane.poll(&error),
                     ExpertTierGpuBlobTransferProgress::Failed)
@@ -540,7 +783,8 @@ namespace llaminar2
                 lane.progress(),
                 ExpertTierGpuBlobTransferProgress::Ready)
                 << error;
-            ASSERT_NE(lane.destinationReadyEvent(), nullptr);
+            ASSERT_TRUE(source_progress_replay.awaitIdle(deadline));
+            ASSERT_TRUE(destination_progress_replay.awaitIdle(deadline));
 
             const auto stats = lane.stats();
             EXPECT_EQ(stats.transfers_started, 1u);
@@ -549,7 +793,13 @@ namespace llaminar2
             EXPECT_EQ(stats.host_relay_bytes, source.totalBytes());
             EXPECT_EQ(stats.source_d2h_submissions, stats.chunks_submitted);
             EXPECT_EQ(
+                stats.source_progress_kernel_submissions,
+                stats.chunks_submitted);
+            EXPECT_EQ(
                 stats.destination_h2d_submissions,
+                stats.chunks_submitted);
+            EXPECT_EQ(
+                stats.destination_progress_kernel_submissions,
                 stats.chunks_submitted);
             EXPECT_EQ(stats.chunks_completed, stats.chunks_submitted);
             EXPECT_EQ(stats.maximum_in_flight_chunks, 2u);
@@ -557,8 +807,17 @@ namespace llaminar2
             EXPECT_EQ(stats.timing_measurement_failures, 0u);
             EXPECT_TRUE(stats.last_measurement.valid());
             EXPECT_EQ(stats.last_measurement.bytes, source.totalBytes());
-            EXPECT_GT(stats.last_measurement.device_nanoseconds, 0u);
+            EXPECT_EQ(stats.last_measurement.device_nanoseconds, 0u);
             EXPECT_GT(stats.last_measurement.host_nanoseconds, 0u);
+            EXPECT_GT(
+                stats.last_max_source_dma_residence_nanoseconds,
+                0u);
+            EXPECT_GT(
+                stats.last_max_destination_dma_residence_nanoseconds,
+                0u);
+            EXPECT_GT(
+                stats.last_max_maintenance_poll_gap_nanoseconds,
+                0u);
             EXPECT_EQ(stats.inference_stream_waits, 0u);
             EXPECT_EQ(stats.blocking_synchronizations, 0u);
 
@@ -654,12 +913,24 @@ namespace llaminar2
                 source_ready_event,
                 source_device.gpu_ordinal(),
                 producer_stream));
+            const auto setup_deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            ASSERT_TRUE(awaitSetupEvent(
+                source_context, source_ready_event, setup_deadline));
+            auto progress_epochs = makeRetainedRelayEpochs(
+                source_device,
+                destination_device,
+                staging_bytes,
+                identity + ":" + std::to_string(seed));
 
             {
                 ExpertTierGpuBlobTransferLane lane({
                     .source_device = source_device,
                     .destination_device = destination_device,
                     .staging_capacity_bytes = staging_bytes,
+                    .source_progress_epoch = progress_epochs.source,
+                    .destination_progress_epoch =
+                        progress_epochs.destination,
                     .lane_name = "integration_float:" + identity,
                     .perf_device = identity,
                     .collect_timing_measurements = true,
@@ -670,13 +941,21 @@ namespace llaminar2
                     source.data(),
                     destination.data(),
                     source.bytes(),
-                    ExpertTierSourceReadiness::producerEvent(
-                        source_ready_event),
+                    ExpertTierSourceReadiness::publishedResidencyBank(
+                        seed + 1u),
                     &error))
                     << error;
                 ASSERT_EQ(
                     lane.progress(),
                     ExpertTierGpuBlobTransferProgress::Pending);
+                CapturedProgressReplay source_progress_replay(
+                    source_context,
+                    progress_epochs.source,
+                    identity + ":source");
+                CapturedProgressReplay destination_progress_replay(
+                    destination_context,
+                    progress_epochs.destination,
+                    identity + ":destination");
 
                 /*
                  * These copies represent unrelated captured inference work.
@@ -731,6 +1010,8 @@ namespace llaminar2
                            ExpertTierGpuBlobTransferProgress::Pending &&
                        std::chrono::steady_clock::now() < deadline)
                 {
+                    ASSERT_TRUE(source_progress_replay.launch());
+                    ASSERT_TRUE(destination_progress_replay.launch());
                     ASSERT_NE(
                         lane.poll(&error),
                         ExpertTierGpuBlobTransferProgress::Failed)
@@ -741,6 +1022,8 @@ namespace llaminar2
                     lane.progress(),
                     ExpertTierGpuBlobTransferProgress::Ready)
                     << error;
+                ASSERT_TRUE(source_progress_replay.awaitIdle(deadline));
+                ASSERT_TRUE(destination_progress_replay.awaitIdle(deadline));
 
                 const std::size_t expected_chunks =
                     (projection_bytes + staging_bytes - 1) / staging_bytes;
@@ -752,13 +1035,19 @@ namespace llaminar2
                 EXPECT_EQ(stats.bytes_submitted, projection_bytes);
                 EXPECT_EQ(stats.host_relay_bytes, projection_bytes);
                 EXPECT_EQ(stats.source_d2h_submissions, expected_chunks);
+                EXPECT_EQ(
+                    stats.source_progress_kernel_submissions,
+                    expected_chunks);
                 EXPECT_EQ(stats.destination_h2d_submissions, expected_chunks);
+                EXPECT_EQ(
+                    stats.destination_progress_kernel_submissions,
+                    expected_chunks);
                 EXPECT_EQ(stats.maximum_in_flight_chunks, 2u);
                 EXPECT_EQ(stats.failed_transfers, 0u);
                 EXPECT_EQ(stats.timing_measurement_failures, 0u);
                 EXPECT_TRUE(stats.last_measurement.valid());
                 EXPECT_EQ(stats.last_measurement.bytes, projection_bytes);
-                EXPECT_GT(stats.last_measurement.device_nanoseconds, 0u);
+                EXPECT_EQ(stats.last_measurement.device_nanoseconds, 0u);
                 EXPECT_GT(stats.last_measurement.host_nanoseconds, 0u);
                 EXPECT_EQ(stats.inference_stream_waits, 0u);
                 EXPECT_EQ(stats.blocking_synchronizations, 0u);
@@ -1061,6 +1350,308 @@ namespace llaminar2
                 source_device.gpu_ordinal());
         }
 
+        /**
+         * @brief Construct the real backend floating GEMM alias for a test slot.
+         * @param device Exact CUDA or ROCm destination.
+         * @param descriptor Complete raw floating weight view.
+         * @param lifetime Slot lifetime retained by the alias.
+         * @return Executable destination engine, or null for an invalid backend.
+         */
+        std::shared_ptr<ITensorGemm> makeFloatingDestinationEngine(
+            DeviceId device,
+            const ContiguousFloatingPointWeightDescriptor &descriptor,
+            std::shared_ptr<void> lifetime)
+        {
+            if (device.is_cuda())
+            {
+                cuda::CUDAFloatingPointGemmKernel::Precision precision;
+                switch (descriptor.type)
+                {
+                case TensorType::FP16:
+                    precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP16;
+                    break;
+                case TensorType::BF16:
+                    precision = cuda::CUDAFloatingPointGemmKernel::Precision::BF16;
+                    break;
+                case TensorType::FP32:
+                    precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP32;
+                    break;
+                default:
+                    return nullptr;
+                }
+                return std::make_shared<cuda::CUDAFloatingPointGemmKernel>(
+                    descriptor.data,
+                    descriptor.n,
+                    descriptor.k,
+                    device.cuda_ordinal(),
+                    precision,
+                    std::move(lifetime));
+            }
+            if (device.is_rocm())
+            {
+                rocm::ROCmFloatingPointGemmKernel::Precision precision;
+                switch (descriptor.type)
+                {
+                case TensorType::FP16:
+                    precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP16;
+                    break;
+                case TensorType::BF16:
+                    precision = rocm::ROCmFloatingPointGemmKernel::Precision::BF16;
+                    break;
+                case TensorType::FP32:
+                    precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP32;
+                    break;
+                default:
+                    return nullptr;
+                }
+                return std::make_shared<rocm::ROCmFloatingPointGemmKernel>(
+                    descriptor.data,
+                    descriptor.n,
+                    descriptor.k,
+                    device.rocm_ordinal(),
+                    precision,
+                    std::move(lifetime));
+            }
+            return nullptr;
+        }
+
+        /**
+         * @brief Drive one raw floating projection through both remote endpoints.
+         * @param source_device CUDA or ROCm source endpoint.
+         * @param destination_device Opposite-backend destination endpoint.
+         * @param type FP16, BF16, or FP32 storage precision.
+         * @param seed Deterministic byte-pattern and transaction seed.
+         */
+        void runRemoteFloatingEndpointDirection(
+            DeviceId source_device,
+            DeviceId destination_device,
+            TensorType type,
+            std::uint32_t seed)
+        {
+            IBackend *source_backend = getBackendFor(source_device);
+            IBackend *destination_backend = getBackendFor(destination_device);
+            ASSERT_NE(source_backend, nullptr);
+            ASSERT_NE(destination_backend, nullptr);
+
+            constexpr int n = 131;
+            constexpr int k = 97;
+            const auto format = ExpertWeightFormat::floating(type);
+            ASSERT_TRUE(format.valid());
+            const std::size_t projection_bytes =
+                static_cast<std::size_t>(n) * k *
+                format.floatingElementBytes();
+            std::vector<std::uint8_t> expected(projection_bytes);
+            for (std::size_t index = 0; index < expected.size(); ++index)
+            {
+                expected[index] = static_cast<std::uint8_t>(
+                    (index * 61u + seed * 19u + (index >> 3u)) & 0xffu);
+            }
+
+            DeviceContiguousProjection source(
+                *source_backend, source_device, projection_bytes);
+            DeviceContiguousProjection destination(
+                *destination_backend,
+                destination_device,
+                projection_bytes);
+            auto &source_context =
+                GPUDeviceContextPool::instance().getContext(source_device);
+            auto &destination_context =
+                GPUDeviceContextPool::instance().getContext(
+                    destination_device);
+            const std::string direction =
+                source_device.to_string() + "_remote_float_to_" +
+                destination_device.to_string() + "_" +
+                tensorTypeName(type);
+            void *producer_stream =
+                source_context.getOrCreateAuxiliaryStream(
+                    "remote_float_test_producer:" + direction);
+            void *observation_stream =
+                destination_context.getOrCreateAuxiliaryStream(
+                    "remote_float_test_observer:" + direction);
+            ASSERT_NE(producer_stream, nullptr);
+            ASSERT_NE(observation_stream, nullptr);
+            ASSERT_TRUE(source.upload(expected, producer_stream));
+            void *source_ready_event =
+                source_backend->createEvent(source_device.gpu_ordinal());
+            ASSERT_NE(source_ready_event, nullptr);
+            ASSERT_TRUE(source_backend->recordEvent(
+                source_ready_event,
+                source_device.gpu_ordinal(),
+                producer_stream));
+
+            const MoEOverlayRemoteProjectionIdentity identity{
+                .expected_epoch = 2000u + seed,
+                .candidate_epoch = 2001u + seed,
+                .transaction_fingerprint = {
+                    .low = 0xf1000000u + seed,
+                    .high = 0xf2000000u + seed,
+                },
+                .migration_index = seed,
+                .layer_idx = 41,
+                .expert_id = 17,
+                .projection = ExpertTierWeightProjection::Down,
+                .source_participant = 0,
+                .destination_participant = 1,
+                .source_world_rank = 0,
+                .destination_world_rank = 1,
+                .source_device = source_device,
+                .destination_device = destination_device,
+            };
+            const ContiguousFloatingPointWeightDescriptor source_descriptor{
+                .data = source.data(),
+                .type = type,
+                .n = n,
+                .k = k,
+                .bytes = projection_bytes,
+            };
+            const ContiguousFloatingPointWeightDescriptor
+                destination_descriptor{
+                    .data = destination.data(),
+                    .type = type,
+                    .n = n,
+                    .k = k,
+                    .bytes = projection_bytes,
+                };
+            const auto manifest =
+                makeMoEOverlayRemoteGpuFloatingProjectionManifest(
+                    identity,
+                    source_descriptor,
+                    /*maximum_chunk_bytes=*/1024u);
+            ASSERT_TRUE(manifest.valid());
+
+            auto source_lane = std::make_shared<
+                MoEOverlayGpuRemoteProjectionLane>(
+                    MoEOverlayGpuRemoteProjectionLane::Config{
+                        .device = source_device,
+                        .staging_capacity_bytes =
+                            manifest.maximum_chunk_bytes,
+                        .lane_name = "remote_float_source:" + direction,
+                        .perf_device = source_device.to_string(),
+                    });
+            auto destination_lane = std::make_shared<
+                MoEOverlayGpuRemoteProjectionLane>(
+                    MoEOverlayGpuRemoteProjectionLane::Config{
+                        .device = destination_device,
+                        .staging_capacity_bytes =
+                            manifest.maximum_chunk_bytes,
+                        .lane_name = "remote_float_destination:" + direction,
+                        .perf_device = destination_device.to_string(),
+                    });
+            std::string error;
+            ASSERT_TRUE(source_lane->materialize(&error)) << error;
+            ASSERT_TRUE(destination_lane->materialize(&error)) << error;
+
+            auto source_lifetime = std::make_shared<int>(3);
+            auto destination_lifetime = std::make_shared<int>(4);
+            {
+                MoEOverlayGpuRemoteProjectionSource source_endpoint(
+                    manifest,
+                    source_lane,
+                    source_descriptor,
+                    ExpertTierSourceReadiness::producerEvent(
+                        source_ready_event),
+                    source_lifetime);
+                MoEOverlayGpuRemoteProjectionDestination
+                    destination_endpoint(
+                        identity,
+                        destination_lane,
+                        [=](
+                            const MoEOverlayRemoteProjectionManifest &received,
+                            MoEOverlayGpuRemoteProjectionDestinationBinding *binding,
+                            std::string *factory_error) -> bool
+                        {
+                            if (!binding || received != manifest)
+                            {
+                                if (factory_error)
+                                    *factory_error =
+                                        "Remote floating factory received a different manifest";
+                                return false;
+                            }
+                            auto engine = makeFloatingDestinationEngine(
+                                destination_device,
+                                destination_descriptor,
+                                destination_lifetime);
+                            if (!engine)
+                            {
+                                if (factory_error)
+                                    *factory_error =
+                                        "Remote floating factory has no destination backend";
+                                return false;
+                            }
+                            *binding = {
+                                .floating_descriptor =
+                                    destination_descriptor,
+                                .engine = std::move(engine),
+                            };
+                            if (factory_error)
+                                factory_error->clear();
+                            return true;
+                        },
+                        destination_lifetime);
+                ASSERT_TRUE(destination_endpoint.beginManifest(
+                    manifest, &error)) << error;
+
+                std::uint64_t chunks = 0;
+                while (!destination_endpoint.complete())
+                {
+                    MoEOverlayRemoteProjectionChunkView chunk;
+                    auto source_progress = source_endpoint.pollNextChunk(
+                        &chunk, &error);
+                    const auto deadline = std::chrono::steady_clock::now() +
+                                          std::chrono::seconds(10);
+                    while (source_progress ==
+                               MoEOverlayResidencyWaveProgress::Pending &&
+                           std::chrono::steady_clock::now() < deadline)
+                    {
+                        source_progress = source_endpoint.pollNextChunk(
+                            &chunk, &error);
+                        std::this_thread::yield();
+                    }
+                    ASSERT_EQ(
+                        source_progress,
+                        MoEOverlayResidencyWaveProgress::Ready) << error;
+
+                    auto destination_progress =
+                        destination_endpoint.beginChunk(
+                            chunk.header, chunk.payload, &error);
+                    while (destination_progress ==
+                               MoEOverlayResidencyWaveProgress::Pending &&
+                           std::chrono::steady_clock::now() < deadline)
+                    {
+                        destination_progress =
+                            destination_endpoint.pollChunk(&error);
+                        std::this_thread::yield();
+                    }
+                    ASSERT_EQ(
+                        destination_progress,
+                        MoEOverlayResidencyWaveProgress::Ready) << error;
+                    ASSERT_TRUE(source_endpoint.acknowledgeChunkSent(
+                        chunk.header, &error)) << error;
+                    ++chunks;
+                }
+                ASSERT_TRUE(destination_endpoint.publishFinal(&error))
+                    << error;
+                ASSERT_NE(destination_endpoint.preparedEngine(), nullptr);
+                EXPECT_GT(chunks, 8u);
+
+                const auto source_stats = source_lane->stats();
+                const auto destination_stats = destination_lane->stats();
+                EXPECT_EQ(source_stats.gpu_blob_read_chunks, chunks);
+                EXPECT_EQ(destination_stats.gpu_blob_write_chunks, chunks);
+                EXPECT_EQ(source_stats.inference_stream_waits, 0u);
+                EXPECT_EQ(destination_stats.inference_stream_waits, 0u);
+                EXPECT_EQ(source_stats.blocking_synchronizations, 0u);
+                EXPECT_EQ(destination_stats.blocking_synchronizations, 0u);
+            }
+
+            std::vector<std::uint8_t> actual;
+            ASSERT_TRUE(destination.download(observation_stream, actual));
+            EXPECT_EQ(actual, expected);
+            source_backend->destroyEvent(
+                source_ready_event,
+                source_device.gpu_ordinal());
+        }
+
         TEST(
             ExpertTierGpuBlobTransferIntegration,
             CUDAAndROCmRelayBothDirectionsByteExactlyWithoutInferenceWaits)
@@ -1092,13 +1683,94 @@ namespace llaminar2
             {
                 if (record.kind == PerfStatRecord::Kind::Counter &&
                     record.name ==
-                        "heterogeneous_gpu_blob_transfers_completed")
+                        "gpu_host_relay_transfers_completed")
                 {
+                    EXPECT_EQ(
+                        record.tags.at("source_transport"),
+                        "retained_mapped_progress_epoch");
+                    EXPECT_EQ(
+                        record.tags.at("stream_class"),
+                        "latency_critical");
                     completed += record.value;
                 }
             }
             EXPECT_EQ(completed, 2.0)
                 << "PerfStats must prove both cross-vendor movements occurred";
+#endif
+        }
+
+        TEST(
+            ExpertTierGpuBlobTransferIntegration,
+            CUDAWithoutPeerAccessRelaysBothDirectionsByteExactlyInBackground)
+        {
+#if !defined(HAVE_CUDA)
+            GTEST_SKIP() << "CUDA is required";
+#else
+            IBackend *cuda = getCUDABackend();
+            if (!cuda || cuda->deviceCount() < 2)
+                GTEST_SKIP() << "Two CUDA devices are required";
+
+            DeviceManager &devices = DeviceManager::instance();
+            devices.initialize(-1, false);
+            const auto zero_reads_one = devices.peerAccessAvailable(
+                DeviceId::cuda(0), DeviceId::cuda(1));
+            const auto one_reads_zero = devices.peerAccessAvailable(
+                DeviceId::cuda(1), DeviceId::cuda(0));
+            ASSERT_TRUE(zero_reads_one.has_value());
+            ASSERT_TRUE(one_reads_zero.has_value());
+            if (*zero_reads_one || *one_reads_zero)
+            {
+                GTEST_SKIP()
+                    << "This certificate requires a CUDA pair with no directed "
+                       "peer access; native peer lanes are authoritative here";
+            }
+
+            ScopedHeterogeneousBlobPerfStats perf_stats;
+            runHeterogeneousBlobDirection(
+                DeviceId::cuda(0),
+                DeviceId::cuda(1),
+                1009u,
+                ExpertTierGpuBlobRelayKind::SameBackendWithoutPeerAccess);
+            runHeterogeneousBlobDirection(
+                DeviceId::cuda(1),
+                DeviceId::cuda(0),
+                1013u,
+                ExpertTierGpuBlobRelayKind::SameBackendWithoutPeerAccess);
+
+            double completed = 0.0;
+            for (const auto &record :
+                 PerfStatsCollector::snapshot({"moe_overlay_residency"}))
+            {
+                if (record.kind != PerfStatRecord::Kind::Counter ||
+                    record.name != "gpu_host_relay_transfers_completed")
+                {
+                    continue;
+                }
+                const auto relay_kind = record.tags.find("relay_kind");
+                const auto background = record.tags.find("background");
+                const auto blocking = record.tags.find("blocking");
+                const auto source_transport =
+                    record.tags.find("source_transport");
+                const auto stream_class =
+                    record.tags.find("stream_class");
+                if (relay_kind != record.tags.end() &&
+                    relay_kind->second == "same_backend_no_peer" &&
+                    background != record.tags.end() &&
+                    background->second == "true" &&
+                    blocking != record.tags.end() &&
+                    blocking->second == "false" &&
+                    source_transport != record.tags.end() &&
+                    source_transport->second ==
+                        "retained_mapped_progress_epoch" &&
+                    stream_class != record.tags.end() &&
+                    stream_class->second == "latency_critical")
+                {
+                    completed += record.value;
+                }
+            }
+            EXPECT_EQ(completed, 2.0)
+                << "PerfStats must prove both no-P2P CUDA movements used the "
+                   "non-blocking background host relay";
 #endif
         }
 
@@ -1151,10 +1823,16 @@ namespace llaminar2
             {
                 if (record.kind == PerfStatRecord::Kind::Counter &&
                     record.name ==
-                        "heterogeneous_gpu_blob_transfers_completed")
+                        "gpu_host_relay_transfers_completed")
                 {
                     EXPECT_EQ(record.tags.at("background"), "true");
                     EXPECT_EQ(record.tags.at("blocking"), "false");
+                    EXPECT_EQ(
+                        record.tags.at("source_transport"),
+                        "retained_mapped_progress_epoch");
+                    EXPECT_EQ(
+                        record.tags.at("stream_class"),
+                        "latency_critical");
                     completed += record.value;
                 }
             }
@@ -1198,6 +1876,53 @@ namespace llaminar2
             }
             EXPECT_GT(completed_chunks, 16.0)
                 << "PerfStats must prove both remote cross-vendor blob paths ran";
+#endif
+        }
+
+        TEST(
+            ExpertTierGpuBlobTransferIntegration,
+            RemoteEndpointsPreserveEveryFloatingPrecisionBothDirections)
+        {
+#if !defined(HAVE_CUDA) || !defined(HAVE_ROCM)
+            GTEST_SKIP() << "CUDA and ROCm are both required";
+#else
+            IBackend *cuda = getCUDABackend();
+            IBackend *rocm = getROCmBackend();
+            if (!cuda || !rocm || cuda->deviceCount() < 1 ||
+                rocm->deviceCount() < 1)
+            {
+                GTEST_SKIP() << "One CUDA and one ROCm device are required";
+            }
+
+            ScopedHeterogeneousBlobPerfStats perf_stats;
+            constexpr std::array<TensorType, 3> types{
+                TensorType::FP16,
+                TensorType::BF16,
+                TensorType::FP32,
+            };
+            std::uint32_t seed = 2201u;
+            for (const auto type : types)
+            {
+                runRemoteFloatingEndpointDirection(
+                    DeviceId::cuda(0), DeviceId::rocm(0), type, seed++);
+                runRemoteFloatingEndpointDirection(
+                    DeviceId::rocm(0), DeviceId::cuda(0), type, seed++);
+            }
+
+            double completed_chunks = 0.0;
+            for (const auto &record :
+                 PerfStatsCollector::snapshot({"moe_overlay_residency"}))
+            {
+                if (record.kind == PerfStatRecord::Kind::Counter &&
+                    record.name == "remote_gpu_chunks_completed")
+                {
+                    EXPECT_EQ(record.tags.at("background"), "true");
+                    EXPECT_EQ(record.tags.at("blocking"), "false");
+                    completed_chunks += record.value;
+                }
+            }
+            EXPECT_GT(completed_chunks, 100.0)
+                << "PerfStats must prove every floating precision moved both ways";
 #endif
         }
     } // namespace

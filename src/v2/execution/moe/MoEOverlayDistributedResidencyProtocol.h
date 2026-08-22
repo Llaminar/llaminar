@@ -179,8 +179,9 @@ namespace llaminar2
     {
         Reserved = 1, ///< All local slots, pins, and lane admission are owned.
         Staged = 2,   ///< Physical arrivals are complete and authenticated.
-        InactiveCommitted = 3, ///< Candidate banks are locally installed.
-        LeaseDrained = 4, ///< Every rank released all old-epoch dispatches.
+        InactivePrepared = 3, ///< Candidate banks are locally installed and ready.
+        RuntimePublished = 4, ///< Every local device selector names the candidate.
+        LeaseDrained = 5, ///< Every rank released all old-epoch dispatches.
     };
 
     /** @brief Rank-local outcome contributed to one global barrier. */
@@ -202,7 +203,7 @@ namespace llaminar2
     struct MoEOverlayDistributedResidencyVote
     {
         static constexpr std::uint32_t kMagic = 0x56574F4Du; // "MOWV"
-        static constexpr std::uint32_t kABIVersion = 3u;
+        static constexpr std::uint32_t kABIVersion = 4u;
 
         std::uint32_t magic = kMagic;
         std::uint32_t abi_version = kABIVersion;
@@ -279,9 +280,11 @@ namespace llaminar2
         AwaitingReservationConsensus,
         AwaitingLocalStage,
         AwaitingStageConsensus,
-        AwaitingLocalCommit,
-        AwaitingCommitConsensus,
-        ReadyToPublish,
+        AwaitingLocalPrepare,
+        AwaitingPrepareConsensus,
+        AwaitingLocalPublication,
+        AwaitingPublicationConsensus,
+        ReadyForAuthorityPublication,
         Deferred,
         Failed,
         Published,
@@ -349,20 +352,21 @@ namespace llaminar2
          * @return True only for unanimous readiness of the expected phase.
          *
          * Unanimous reservation permits physical staging, unanimous staging
-         * permits inactive-bank commit, unanimous commit becomes
-         * ReadyToPublish, and the post-publication lease-drain vote makes the
-         * previous epoch ReadyToRetire. Any malformed or failed generation is
-         * terminal.
+         * permits inactive-bank preparation, unanimous preparation permits
+         * selector publication, unanimous selector publication becomes
+         * ReadyForAuthorityPublication, and the later lease-drain vote makes
+         * the previous epoch ReadyToRetire. Any malformed or failed generation
+         * is terminal.
          */
         bool acceptConsensus(
             const std::vector<MoEOverlayDistributedResidencyVote> &votes,
             std::string *error = nullptr);
 
         /**
-         * @brief Mark the already globally-ready candidate locally published.
-         * @throws std::logic_error Unless state is ReadyToPublish.
+         * @brief Mark the globally selector-published candidate authoritative.
+         * @throws std::logic_error Unless state is ReadyForAuthorityPublication.
          */
-        void markPublished();
+        void markAuthorityPublished();
 
         /**
          * @brief Mark the globally lease-drained old epoch physically retired.

@@ -188,6 +188,8 @@ namespace
         int query_rows,
         int kv_stride,
         const int *__restrict__ active_query_rows_device,
+        const int *__restrict__ ring_head_device,
+        int ring_capacity,
         unsigned long long prefill_branch_condition,
         int direct_kv_limit)
     {
@@ -201,6 +203,13 @@ namespace
                                         ? max(1, min(launch_seq_len,
                                                      *active_query_rows_device))
                                         : launch_seq_len;
+        int ring_row_origin = 0;
+        if (ring_head_device && ring_capacity > 0)
+        {
+            ring_row_origin = (*ring_head_device - kv_len) % ring_capacity;
+            if (ring_row_origin < 0)
+                ring_row_origin += ring_capacity;
+        }
 
         /*
          * A single parameter record describes an entire ordinary prefill or an
@@ -216,6 +225,8 @@ namespace
             out[0].kv_stride = max(kv_len, kv_stride);
             out[0].position_offset = max(0, kv_len - logical_seq_len);
             out[0].mask_stride = kv_len;
+            out[0].ring_row_origin = ring_row_origin;
+            out[0].ring_row_capacity = ring_head_device ? ring_capacity : 0;
 #if CUDART_VERSION >= 12030
             if (row == 0)
                 publish_context_condition_if_non_default(
@@ -233,6 +244,8 @@ namespace
             out[row].kv_stride = max(kv_len, kv_stride);
             out[row].position_offset = 0;
             out[row].mask_stride = 1;
+            out[row].ring_row_origin = ring_row_origin;
+            out[row].ring_row_capacity = ring_head_device ? ring_capacity : 0;
             return;
         }
         const int base_position = max(0, kv_len - grouped_logical_seq_len);
@@ -242,6 +255,8 @@ namespace
         out[row].kv_stride = max(kv_len, kv_stride);
         out[row].position_offset = base_position + row;
         out[row].mask_stride = kv_len;
+        out[row].ring_row_origin = ring_row_origin;
+        out[row].ring_row_capacity = ring_head_device ? ring_capacity : 0;
 #if CUDART_VERSION >= 12030
         if (row == 0)
             publish_context_condition_if_non_default(
@@ -282,6 +297,8 @@ namespace
         out[row].kv_stride = max(kv_len, kv_stride);
         out[row].position_offset = position_offset + row;
         out[row].mask_stride = kv_len;
+        out[row].ring_row_origin = 0;
+        out[row].ring_row_capacity = 0;
 #if CUDART_VERSION >= 12030
         if (row == 0)
             publish_context_condition_if_non_default(
@@ -323,6 +340,8 @@ namespace
         out[flat_row].kv_stride = max(post_append_kv_len, kv_stride);
         out[flat_row].position_offset = base_position + query_row;
         out[flat_row].mask_stride = post_append_kv_len;
+        out[flat_row].ring_row_origin = 0;
+        out[flat_row].ring_row_capacity = 0;
     }
 
     /**
@@ -536,6 +555,8 @@ namespace
         int kv_len_runtime = kv_len;
         int position_offset_runtime = position_offset;
         int mask_stride = kv_len;
+        int ring_row_origin = 0;
+        int ring_row_capacity = 0;
 
         if (device_params)
         {
@@ -543,6 +564,8 @@ namespace
             kv_stride = device_params->kv_stride;
             position_offset_runtime = device_params->position_offset;
             mask_stride = device_params->mask_stride;
+            ring_row_origin = device_params->ring_row_origin;
+            ring_row_capacity = device_params->ring_row_capacity;
         }
 
         if constexpr (!WRITE_CONTEXT_PARTIAL)
@@ -807,8 +830,12 @@ namespace
                 {
                     int local_row = i / head_dim;
                     int d = i % head_dim;
-                    int global_row = kv_start_0 + local_row;
-                    int kv_offset = global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
+                    const int logical_row = kv_start_0 + local_row;
+                    const int physical_row = ring_row_capacity > 0
+                                                 ? (ring_row_origin + logical_row) %
+                                                       ring_row_capacity
+                                                 : logical_row;
+                    int kv_offset = physical_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
                     K_dst_0[local_row * smem_stride + d] = K_batch_fp16[kv_offset];
                     V_dst_0[local_row * smem_stride + d] = V_batch_fp16[kv_offset];
                 }
@@ -822,8 +849,12 @@ namespace
                 {
                     int local_row = i / head_dim;
                     int d = i % head_dim;
-                    int global_row = kv_start_0 + local_row;
-                    int kv_offset = global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
+                    const int logical_row = kv_start_0 + local_row;
+                    const int physical_row = ring_row_capacity > 0
+                                                 ? (ring_row_origin + logical_row) %
+                                                       ring_row_capacity
+                                                 : logical_row;
+                    int kv_offset = physical_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
                     K_dst_0[local_row * smem_stride + d] = __float2half(K_batch_fp32[kv_offset]);
                     V_dst_0[local_row * smem_stride + d] = __float2half(V_batch_fp32[kv_offset]);
                 }
@@ -886,8 +917,12 @@ namespace
                     {
                         int local_row = i / head_dim;
                         int d = i % head_dim;
-                        int global_row = next_kv_start + local_row;
-                        int kv_offset = global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
+                        const int logical_row = next_kv_start + local_row;
+                        const int physical_row = ring_row_capacity > 0
+                                                     ? (ring_row_origin + logical_row) %
+                                                           ring_row_capacity
+                                                     : logical_row;
+                        int kv_offset = physical_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
                         K_dst[local_row * smem_stride + d] = K_batch_fp16[kv_offset];
                         V_dst[local_row * smem_stride + d] = V_batch_fp16[kv_offset];
                     }
@@ -901,8 +936,12 @@ namespace
                     {
                         int local_row = i / head_dim;
                         int d = i % head_dim;
-                        int global_row = next_kv_start + local_row;
-                        int kv_offset = global_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
+                        const int logical_row = next_kv_start + local_row;
+                        const int physical_row = ring_row_capacity > 0
+                                                     ? (ring_row_origin + logical_row) %
+                                                           ring_row_capacity
+                                                     : logical_row;
+                        int kv_offset = physical_row * n_kv_heads * head_dim + kv_head_idx * head_dim + d;
                         K_dst[local_row * smem_stride + d] = __float2half(K_batch_fp32[kv_offset]);
                         V_dst[local_row * smem_stride + d] = __float2half(V_batch_fp32[kv_offset]);
                     }
@@ -1545,10 +1584,14 @@ namespace
     {
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
+        int ring_row_origin = 0;
+        int ring_row_capacity = 0;
         if (device_params)
         {
             kv_len_runtime = device_params->kv_len;
             kv_stride = device_params->kv_stride;
+            ring_row_origin = device_params->ring_row_origin;
+            ring_row_capacity = device_params->ring_row_capacity;
         }
 
         const int head_idx = blockIdx.x;
@@ -1624,7 +1667,13 @@ namespace
         // =================================================================
         for (int kv_pos = kv_start + warp_id; kv_pos < kv_end; kv_pos += num_warps)
         {
-            const float *K_ptr = K_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
+            const int physical_kv_pos = ring_row_capacity > 0
+                                            ? (ring_row_origin + kv_pos) %
+                                                  ring_row_capacity
+                                            : kv_pos;
+            const float *K_ptr =
+                K_batch + physical_kv_pos * n_kv_heads * head_dim +
+                kv_head_idx * head_dim;
 
             // Cooperative dot product: each lane handles head_dim/32 elements
             float partial_dot = 0.0f;
@@ -1645,7 +1694,9 @@ namespace
             l_local = l_local * scale_old + p;
 
             // V accumulation: each lane updates only its own output dims
-            const float *V_ptr = V_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
+            const float *V_ptr =
+                V_batch + physical_kv_pos * n_kv_heads * head_dim +
+                kv_head_idx * head_dim;
             int o_idx = 0;
             for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
             {
@@ -1857,11 +1908,15 @@ namespace
 
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
+        int ring_row_origin = 0;
+        int ring_row_capacity = 0;
         if (device_params)
         {
             const int param_row = ROW_LOCAL_PARAMS ? blockIdx.z : 0;
             kv_len_runtime = device_params[param_row].kv_len;
             kv_stride = device_params[param_row].kv_stride;
+            ring_row_origin = device_params[param_row].ring_row_origin;
+            ring_row_capacity = device_params[param_row].ring_row_capacity;
         }
 
         const int head_idx = blockIdx.x;
@@ -1946,8 +2001,12 @@ namespace
 
         for (int kv_pos = kv_start + warp_id; kv_pos < kv_end; kv_pos += num_warps)
         {
+            const int physical_kv_pos = ring_row_capacity > 0
+                                            ? (ring_row_origin + kv_pos) %
+                                                  ring_row_capacity
+                                            : kv_pos;
             const half *K_ptr =
-                K_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
+                K_batch + physical_kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
 
             // Cooperative dot product across head_dim
             float partial_dot = 0.0f;
@@ -1965,7 +2024,7 @@ namespace
             l_local = l_local * scale_old + p;
 
             const half *V_ptr =
-                V_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
+                V_batch + physical_kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
             int o_idx = 0;
             for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
             {
@@ -4487,6 +4546,8 @@ extern "C"
         int query_rows,
         int kv_stride,
         const int *active_query_rows_device,
+        const int *ring_head_device,
+        int ring_capacity,
         unsigned long long prefill_branch_condition,
         int direct_kv_limit,
         void *stream)
@@ -4494,6 +4555,8 @@ extern "C"
         if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
             query_rows <= 0 || kv_stride <= 0 ||
             query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream ||
+            ((ring_head_device == nullptr) != (ring_capacity == 0)) ||
+            (ring_capacity > 0 && ring_capacity != kv_stride) ||
             ((prefill_branch_condition == 0) != (direct_kv_limit == 0)))
         {
             return -1;
@@ -4511,6 +4574,8 @@ extern "C"
             query_rows,
             kv_stride,
             active_query_rows_device,
+            ring_head_device,
+            ring_capacity,
             prefill_branch_condition,
             direct_kv_limit);
         const cudaError_t err = cudaGetLastError();

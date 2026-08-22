@@ -16,8 +16,12 @@
 #include <chrono>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
+
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -696,6 +700,66 @@ namespace llaminar2
         return region;
     }
 
+    std::shared_ptr<MappedHostTransferRegion>
+    TransferEngine::allocateMappedHostRegion(
+        size_t bytes,
+        std::span<const DeviceId> devices) const
+    {
+        if (bytes == 0u || devices.empty() ||
+            std::any_of(
+                devices.begin(),
+                devices.end(),
+                [](DeviceId device) { return !device.is_gpu(); }))
+        {
+            throw std::invalid_argument(
+                "TransferEngine::allocateMappedHostRegion requires positive bytes and local GPU endpoints");
+        }
+        const long page_size_value = ::sysconf(_SC_PAGESIZE);
+        if (page_size_value <= 0)
+        {
+            throw std::runtime_error(
+                "TransferEngine could not resolve the host page size");
+        }
+        const size_t page_size = static_cast<size_t>(page_size_value);
+        if (bytes > std::numeric_limits<size_t>::max() - (page_size - 1u))
+        {
+            throw std::overflow_error(
+                "TransferEngine mapped-host capacity alignment overflow");
+        }
+        const size_t mapping_bytes =
+            ((bytes + page_size - 1u) / page_size) * page_size;
+        void *const mapping = ::mmap(
+            nullptr,
+            mapping_bytes,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_ANONYMOUS,
+            -1,
+            0);
+        if (mapping == MAP_FAILED)
+        {
+            throw std::runtime_error(
+                "TransferEngine anonymous mapped-host allocation failed");
+        }
+        auto lifetime = std::shared_ptr<void>(
+            mapping,
+            [mapping_bytes](void *address)
+            {
+                if (address && address != MAP_FAILED)
+                    (void)::munmap(address, mapping_bytes);
+            });
+#if defined(MADV_HUGEPAGE)
+        (void)::madvise(mapping, mapping_bytes, MADV_HUGEPAGE);
+#endif
+        /* Current-thread first touch is the only reliable placement authority
+         * on the production NUMA host; callers establish setup affinity first. */
+        std::memset(mapping, 0, mapping_bytes);
+        return registerExternalMappedHostRegion(
+            mapping,
+            mapping_bytes,
+            devices,
+            std::move(lifetime));
+    }
+
     void *TransferEngine::resolveMappedTimelineKernelSignal64(
         const MappedHostTransferRegion &region,
         size_t signal_offset,
@@ -1167,6 +1231,249 @@ namespace llaminar2
         }
     }
 
+    void TransferEngine::enqueuePersistentDeviceRegionToMappedHost(
+        const void *source,
+        size_t source_capacity,
+        size_t source_offset,
+        const MappedHostTransferRegion &destination,
+        size_t destination_offset,
+        size_t bytes,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!source || !destination.isBound() || !device.is_gpu() ||
+            !stream || bytes == 0u ||
+            source_offset > source_capacity ||
+            bytes > source_capacity - source_offset ||
+            !destination.contains(destination_offset, bytes))
+        {
+            throw std::invalid_argument(
+                "TransferEngine::enqueuePersistentDeviceRegionToMappedHost requires bounded storage, mapped pages, a GPU, and an exact stream");
+        }
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != destination.backendFor(device))
+        {
+            throw std::runtime_error(
+                "TransferEngine persistent D2H backend identity mismatch");
+        }
+        const auto *const source_bytes =
+            static_cast<const unsigned char *>(source) + source_offset;
+        if (!backend->deviceToHostOnStream(
+                destination.mutableHostData(destination_offset),
+                source_bytes,
+                bytes,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine persistent D2H DMA enqueue failed");
+        }
+    }
+
+    void TransferEngine::enqueueMappedHostToPersistentDeviceRegion(
+        const MappedHostTransferRegion &source,
+        size_t source_offset,
+        void *destination,
+        size_t destination_capacity,
+        size_t destination_offset,
+        size_t bytes,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!source.isBound() || !destination || !device.is_gpu() ||
+            !stream || bytes == 0u ||
+            !source.contains(source_offset, bytes) ||
+            destination_offset > destination_capacity ||
+            bytes > destination_capacity - destination_offset)
+        {
+            throw std::invalid_argument(
+                "TransferEngine::enqueueMappedHostToPersistentDeviceRegion requires mapped pages, bounded storage, a GPU, and an exact stream");
+        }
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != source.backendFor(device))
+        {
+            throw std::runtime_error(
+                "TransferEngine persistent H2D backend identity mismatch");
+        }
+        auto *const destination_bytes =
+            static_cast<unsigned char *>(destination) + destination_offset;
+        if (!backend->hostToDeviceOnStream(
+                destination_bytes,
+                source.mutableHostData(source_offset),
+                bytes,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine persistent H2D DMA enqueue failed");
+        }
+    }
+
+    void TransferEngine::enqueuePersistentDeviceRegionToMappedHostByKernel(
+        const void *source,
+        size_t source_capacity,
+        size_t source_offset,
+        const MappedHostTransferRegion &destination,
+        size_t destination_offset,
+        size_t bytes,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!source || source_capacity == 0u || !destination.isBound() ||
+            bytes == 0u || !device.is_gpu() || !stream)
+        {
+            throw std::invalid_argument(
+                "TransferEngine progress-kernel transfer requires persistent source bytes, a bound mapped destination, GPU, and exact stream");
+        }
+        if (source_offset > source_capacity ||
+            bytes > source_capacity - source_offset ||
+            !destination.contains(destination_offset, bytes))
+        {
+            throw std::out_of_range(
+                "TransferEngine progress-kernel transfer exceeds a persistent region");
+        }
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != destination.backendFor(device))
+        {
+            throw std::runtime_error(
+                "TransferEngine progress-kernel backend identity does not match mapped registration");
+        }
+        const auto *const source_bytes =
+            static_cast<const std::uint8_t *>(source) + source_offset;
+        if (!backend->deviceToMappedHostByKernelOnStream(
+                destination.deviceAlias(device, destination_offset),
+                source_bytes,
+                bytes,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine progress-kernel launch was rejected");
+        }
+    }
+
+    void TransferEngine::enqueueMappedTransferProgressClaims(
+        const MappedHostTransferRegion &mapped_region,
+        size_t command_offset,
+        DeviceTransferBuffer &claims,
+        size_t slot_capacity,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!mapped_region.isBound() || !claims.isBound() ||
+            slot_capacity == 0u ||
+            !device.is_gpu() || !stream || claims.device() != device)
+        {
+            throw std::invalid_argument(
+                "TransferEngine mapped progress claims require bound arrays, positive geometry, one GPU, and an exact stream");
+        }
+        if (slot_capacity >
+            std::numeric_limits<size_t>::max() /
+                sizeof(MappedTransferProgressCommand) ||
+            slot_capacity >
+                std::numeric_limits<size_t>::max() /
+                    sizeof(MappedTransferProgressClaim))
+        {
+            throw std::overflow_error(
+                "TransferEngine mapped progress claim geometry overflowed");
+        }
+        const size_t command_bytes =
+            slot_capacity * sizeof(MappedTransferProgressCommand);
+        const size_t claim_bytes =
+            slot_capacity * sizeof(MappedTransferProgressClaim);
+        if (!mapped_region.contains(command_offset, command_bytes) ||
+            !claims.contains(0u, claim_bytes))
+        {
+            throw std::out_of_range(
+                "TransferEngine mapped progress claims exceed fixed array storage");
+        }
+
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != mapped_region.backendFor(device))
+        {
+            throw std::runtime_error(
+                "TransferEngine mapped progress claim backend identity does not match its registered pages");
+        }
+        const auto *const commands =
+            static_cast<const MappedTransferProgressCommand *>(
+                mapped_region.deviceAlias(device, command_offset));
+        auto *const claim_array =
+            static_cast<MappedTransferProgressClaim *>(
+                claims.mutableDeviceData());
+        if (!backend->enqueueMappedTransferProgressClaims(
+                commands,
+                claim_array,
+                slot_capacity,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine mapped progress claim launch was rejected");
+        }
+    }
+
+    void TransferEngine::enqueueMappedTransferProgressCopies(
+        const DeviceTransferBuffer &claims,
+        const MappedHostTransferRegion &mapped_region,
+        size_t completion_offset,
+        size_t slot_capacity,
+        size_t maximum_bytes,
+        DeviceId device,
+        void *stream) const
+    {
+        if (!mapped_region.isBound() || !claims.isBound() ||
+            slot_capacity == 0u || maximum_bytes == 0u ||
+            !device.is_gpu() || !stream || claims.device() != device)
+        {
+            throw std::invalid_argument(
+                "TransferEngine mapped progress copies require bound arrays, positive geometry, one GPU, and an exact stream");
+        }
+        if (slot_capacity >
+                std::numeric_limits<size_t>::max() /
+                    sizeof(MappedTransferProgressCompletion) ||
+            slot_capacity >
+                std::numeric_limits<size_t>::max() /
+                    sizeof(MappedTransferProgressClaim))
+        {
+            throw std::overflow_error(
+                "TransferEngine mapped progress copy geometry overflowed");
+        }
+        const size_t completion_bytes =
+            slot_capacity * sizeof(MappedTransferProgressCompletion);
+        const size_t claim_bytes =
+            slot_capacity * sizeof(MappedTransferProgressClaim);
+        if (!mapped_region.contains(completion_offset, completion_bytes) ||
+            !claims.contains(0u, claim_bytes))
+        {
+            throw std::out_of_range(
+                "TransferEngine mapped progress copies exceed fixed array storage");
+        }
+
+        IBackend *const backend = resolveBackend(device);
+        if (!backend || backend != mapped_region.backendFor(device))
+        {
+            throw std::runtime_error(
+                "TransferEngine mapped progress copy backend identity does not match its registered pages");
+        }
+        const auto *const claim_array =
+            static_cast<const MappedTransferProgressClaim *>(
+                claims.deviceData());
+        auto *const completions =
+            static_cast<MappedTransferProgressCompletion *>(
+                mapped_region.deviceAlias(device, completion_offset));
+        if (!backend->enqueueMappedTransferProgressCopies(
+                claim_array,
+                completions,
+                slot_capacity,
+                maximum_bytes,
+                device.gpu_ordinal(),
+                stream))
+        {
+            throw std::runtime_error(
+                "TransferEngine mapped progress copy launch was rejected");
+        }
+    }
+
     void TransferEngine::buildMappedTimelineTransaction(
         IGPUGraphCapture &destination,
         std::span<const MappedTimelineTransactionStep> ordered_steps,
@@ -1521,7 +1828,8 @@ namespace llaminar2
                 target_device.toString() + tensorTransferState(*base));
         }
 
-        if (!base->device_completion_event_)
+        if (!base->device_completion_event_ ||
+            !base->completionEventProtectsDeviceValue_())
             return;
 
         /*
@@ -2537,8 +2845,7 @@ namespace llaminar2
     void TransferEngine::waitForPendingHostSourceUseLocked(TensorBase *tensor)
     {
         if (!tensor ||
-            tensor->device_completion_purpose_ !=
-                TensorBase::CompletionEventPurpose::HOST_TO_DEVICE_SOURCE_USE)
+            !tensor->completionEventProtectsHostSource_())
         {
             return;
         }
@@ -2575,6 +2882,15 @@ namespace llaminar2
          * event no longer carries an outstanding lifetime, so retire it rather
          * than letting a later generation accidentally reuse its identity.
          */
+        if (tensor->completion_event_protection_ ==
+            TensorBase::CompletionEventProtection::DeviceValueAndHostSource)
+        {
+            tensor->completion_event_protection_ =
+                TensorBase::CompletionEventProtection::DeviceValue;
+            return;
+        }
+        tensor->completion_event_protection_ =
+            TensorBase::CompletionEventProtection::None;
         tensor->retireCompletionEvent_();
     }
 
@@ -2628,7 +2944,8 @@ namespace llaminar2
         if (tensor->gpu_data_ptr_ && tensor->gpu_device_.has_value() &&
             *tensor->gpu_device_ == target_device && ::llaminar2::isDeviceValid(tensor->coherence_state_))
         {
-            if (tensor->device_completion_event_)
+            if (tensor->device_completion_event_ &&
+                tensor->completionEventProtectsDeviceValue_())
             {
                 IBackend *backend = tensor->resolveBackend(target_device);
                 if (backend)
@@ -2705,16 +3022,7 @@ namespace llaminar2
 
                 if (tensor->device_completion_event_)
                 {
-                    IBackend *old_backend = tensor->resolveBackend(old_device);
-                    int old_backend_device_id = old_device.gpu_ordinal();
-                    if (old_backend)
-                    {
-                        old_backend->destroyEvent(tensor->device_completion_event_, old_backend_device_id);
-                    }
-                    tensor->device_completion_event_ = nullptr;
-                    tensor->event_device_.reset();
-                    tensor->device_completion_purpose_ =
-                        TensorBase::CompletionEventPurpose::NONE;
+                    tensor->retireCompletionEvent_();
                 }
 
                 LOG_TRACE("[TransferEngine::uploadFull] Promoted secondary buffer to primary for "
@@ -2731,18 +3039,9 @@ namespace llaminar2
 
                 if (tensor->device_completion_event_)
                 {
-                    IBackend *old_backend = tensor->resolveBackend(*tensor->gpu_device_);
-                    int old_backend_device_id = tensor->gpu_device_->gpu_ordinal();
-                    if (old_backend)
-                    {
-                        LOG_TRACE("[TransferEngine::uploadFull] Destroying old completion event on device "
-                                  << tensor->gpu_device_->toString() << " before migrating to " << target_device.toString());
-                        old_backend->destroyEvent(tensor->device_completion_event_, old_backend_device_id);
-                    }
-                    tensor->device_completion_event_ = nullptr;
-                    tensor->event_device_.reset();
-                    tensor->device_completion_purpose_ =
-                        TensorBase::CompletionEventPurpose::NONE;
+                    LOG_TRACE("[TransferEngine::uploadFull] Retiring old completion event on device "
+                              << tensor->gpu_device_->toString() << " before migrating to " << target_device.toString());
+                    tensor->retireCompletionEvent_();
                 }
 
                 tensor->gpu_data_ptr_ = nullptr;
@@ -2850,7 +3149,8 @@ namespace llaminar2
              * allocation. This is a device-side edge; the submitting CPU never
              * waits for the prior generation.
              */
-            if (tensor->device_completion_event_)
+            if (tensor->device_completion_event_ &&
+                tensor->completionEventProtectsDeviceValue_())
             {
                 if (!tensor->event_device_.has_value() ||
                     *tensor->event_device_ != target_device)
@@ -2940,8 +3240,9 @@ namespace llaminar2
 
             tensor->last_joined_completion_event_ = nullptr;
             tensor->last_joined_consumer_stream_ = nullptr;
-            tensor->device_completion_purpose_ =
-                TensorBase::CompletionEventPurpose::HOST_TO_DEVICE_SOURCE_USE;
+            tensor->completion_event_protection_ =
+                TensorBase::CompletionEventProtection::
+                    DeviceValueAndHostSource;
             tensor->applyCoherenceOp_(CoherenceOp::UPLOAD);
             tensor->authoritative_device_.reset();
             TransferProfiler::recordH2D(bytes);
@@ -3066,7 +3367,9 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::DEVICE_TO_HOST, "Host data pointer is null");
             }
 
-            if (!stream && !tensor->device_completion_event_)
+            if (!stream &&
+                (!tensor->device_completion_event_ ||
+                 !tensor->completionEventProtectsDeviceValue_()))
             {
                 return TransferResult::fail(
                     TransferMethod::DEVICE_TO_HOST,
@@ -3122,7 +3425,8 @@ namespace llaminar2
              */
             if (!stream)
             {
-                if (!tensor->event_device_.has_value() ||
+                if (!tensor->completionEventProtectsDeviceValue_() ||
+                    !tensor->event_device_.has_value() ||
                     *tensor->event_device_ != *tensor->gpu_device_ ||
                     !backend->streamWaitEvent(
                         download_stream,
@@ -3193,6 +3497,8 @@ namespace llaminar2
                     "D2H host-publication event wait failed; completion event "
                     "is invalid or could not be observed");
             }
+            tensor->completion_event_protection_ =
+                TensorBase::CompletionEventProtection::DeviceValue;
             auto d2h_end = std::chrono::high_resolution_clock::now();
             auto d2h_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(d2h_end - d2h_start).count();
 

@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -173,6 +174,142 @@ namespace llaminar2
             const MoEOverlayParticipantResidencyBank &other) const noexcept;
     };
 
+    /** @brief Opaque retained-bank node owned only by the residency authority. */
+    struct MoEOverlayParticipantPublishedBank;
+
+    /** @brief Opaque lock-free reader and maintenance-side slot state. */
+    class MoEOverlayParticipantResidencyState;
+
+    /**
+     * @brief Fully validated immutable bank prepared away from publication.
+     *
+     * Construction performs the allocation and complete geometry validation.
+     * The maintenance transaction can therefore prepare every endpoint before
+     * publishing its first one.  Installing this move-only value transfers one
+     * already-built node into a fixed slot; it never copies an expert table or
+     * allocates storage at the inference-visible publication boundary.
+     */
+    class MoEOverlayPreparedParticipantBank final
+    {
+    public:
+        /** @brief Construct an empty, non-publishable value. */
+        MoEOverlayPreparedParticipantBank() noexcept;
+
+        /** @brief Destroy an unpublished prepared node, if one remains. */
+        ~MoEOverlayPreparedParticipantBank();
+
+        /** @brief Transfer the sole unpublished-node ownership. */
+        MoEOverlayPreparedParticipantBank(
+            MoEOverlayPreparedParticipantBank &&other) noexcept;
+
+        /** @brief Replace this value with another unpublished node. */
+        MoEOverlayPreparedParticipantBank &operator=(
+            MoEOverlayPreparedParticipantBank &&other) noexcept;
+
+        MoEOverlayPreparedParticipantBank(
+            const MoEOverlayPreparedParticipantBank &) = delete;
+        MoEOverlayPreparedParticipantBank &operator=(
+            const MoEOverlayPreparedParticipantBank &) = delete;
+
+        /** @return Whether this value still owns a publishable node. */
+        [[nodiscard]] bool valid() const noexcept;
+
+        /** @return Prepared residency epoch, or zero for an empty value. */
+        [[nodiscard]] uint64_t epoch() const noexcept;
+
+    private:
+        friend class MoEOverlayParticipantResidency;
+
+        /** @brief Adopt one validated, fully allocated unpublished node. */
+        explicit MoEOverlayPreparedParticipantBank(
+            std::unique_ptr<MoEOverlayParticipantPublishedBank> node) noexcept;
+
+        std::unique_ptr<MoEOverlayParticipantPublishedBank> node_;
+    };
+
+    /**
+     * @brief Allocation-free inference lease over one immutable epoch bank.
+     *
+     * Acquisition first enters a short lock-free hazard window, then increments
+     * the selected bank's reader count. Retirement removes the raw publication
+     * pointer immediately but reclaims the node only after both the hazard
+     * window and every returned lease have drained. Copies retain the same node
+     * with one atomic increment; no maintenance mutex participates.
+     */
+    class MoEOverlayParticipantBankLease final
+    {
+    public:
+        /** @brief Construct an empty lease. */
+        MoEOverlayParticipantBankLease() noexcept;
+
+        /** @brief Release one reader from the retained immutable bank. */
+        ~MoEOverlayParticipantBankLease();
+
+        /** @brief Retain the same immutable bank for another local consumer. */
+        MoEOverlayParticipantBankLease(
+            const MoEOverlayParticipantBankLease &other) noexcept;
+
+        /** @brief Release the old bank and retain @p other. */
+        MoEOverlayParticipantBankLease &operator=(
+            const MoEOverlayParticipantBankLease &other) noexcept;
+
+        /** @brief Transfer one retained reader without changing its count. */
+        MoEOverlayParticipantBankLease(
+            MoEOverlayParticipantBankLease &&other) noexcept;
+
+        /** @brief Release the old bank and transfer @p other. */
+        MoEOverlayParticipantBankLease &operator=(
+            MoEOverlayParticipantBankLease &&other) noexcept;
+
+        /** @return Immutable bank pointer, or null for an empty lease. */
+        [[nodiscard]] const MoEOverlayParticipantResidencyBank *get()
+            const noexcept;
+
+        /** @return Immutable bank referenced by this non-empty lease. */
+        [[nodiscard]] const MoEOverlayParticipantResidencyBank &operator*()
+            const noexcept;
+
+        /** @return Immutable bank pointer for member access. */
+        [[nodiscard]] const MoEOverlayParticipantResidencyBank *operator->()
+            const noexcept;
+
+        /** @return Whether this lease names a retained bank. */
+        [[nodiscard]] explicit operator bool() const noexcept;
+
+        /** @brief Release the retained reader and become empty. */
+        void reset() noexcept;
+
+        /** @return Whether @p lease is empty. */
+        friend bool operator==(
+            const MoEOverlayParticipantBankLease &lease,
+            std::nullptr_t) noexcept
+        {
+            return lease.get() == nullptr;
+        }
+
+        /** @return Whether @p lease is empty. */
+        friend bool operator==(
+            std::nullptr_t,
+            const MoEOverlayParticipantBankLease &lease) noexcept
+        {
+            return lease.get() == nullptr;
+        }
+
+    private:
+        friend class MoEOverlayParticipantResidency;
+
+        /** @brief Adopt one reader already counted by lock-free acquisition. */
+        MoEOverlayParticipantBankLease(
+            std::shared_ptr<MoEOverlayParticipantResidencyState> state,
+            MoEOverlayParticipantPublishedBank *node) noexcept;
+
+        /** @brief Increment the current node reader count for a copy. */
+        void retain() noexcept;
+
+        std::shared_ptr<MoEOverlayParticipantResidencyState> state_;
+        MoEOverlayParticipantPublishedBank *node_ = nullptr;
+    };
+
     /** @brief Typed result of installing one publication-ready epoch bank. */
     enum class MoEOverlayParticipantBankInstallStatus
     {
@@ -281,6 +418,23 @@ namespace llaminar2
             uint64_t activations) noexcept;
 
         /**
+         * @brief Install one complete device-produced cumulative snapshot.
+         *
+         * The maintenance thread uses this once after a participant graph has
+         * release-published device-local timing totals into its mapped page.
+         * Every cell is try-owned before any value changes. Existing identical
+         * totals make the operation idempotent; different nonempty totals are
+         * rejected so host and device evidence can never be silently mixed.
+         *
+         * @param rows Exact layer-ordered rows for this participant.
+         * @param error Optional rejection diagnostic.
+         * @return True when the full snapshot is installed or already present.
+         */
+        [[nodiscard]] bool importServiceMeasurements(
+            const std::vector<MoEOverlayParticipantLayerServiceTotals> &rows,
+            std::string *error = nullptr);
+
+        /**
          * @brief Try to copy a coherent maintenance-side service snapshot.
          *
          * Each phase/layer cell is acquired at most once. If inference owns any
@@ -313,24 +467,49 @@ namespace llaminar2
             uint64_t candidate_epoch) const;
 
         /**
-         * @brief Install a complete ready bank without changing global routing.
+         * @brief Validate and allocate an immutable bank on maintenance work.
          *
-         * This method copies @p bank while holding the endpoint publication
-         * lock.  CapacityUnavailable is a backpressure signal: the caller must
-         * defer the entire closed migration cycle, never evict a live bank.
-         * Repeating an identical installed bank is idempotent; a different bank
-         * under the same epoch is an EpochConflict.
+         * This is the deliberately heavy half of publication. It validates all
+         * layers and triplets, moves the supplied value into an independently
+         * owned node, and returns that node without changing inference-visible
+         * state. A transaction prepares every local endpoint before installing
+         * any endpoint, so allocation can never lengthen a partial publication.
+         *
+         * @param bank Mutable candidate value consumed into immutable storage.
+         * @param error Optional exact validation/allocation diagnostic.
+         * @return Prepared move-only node, or nullopt on invalid input/failure.
+         */
+        [[nodiscard]] std::optional<MoEOverlayPreparedParticipantBank>
+        prepareReadyBank(
+            MoEOverlayParticipantResidencyBank bank,
+            std::string *error = nullptr) const noexcept;
+
+        /**
+         * @brief Atomically install one prebuilt bank without changing routing.
+         *
+         * The endpoint maintenance mutex serializes only writer lifecycle. The
+         * operation itself scans fixed slots, transfers one unique pointer, and
+         * release-publishes one raw pointer. It performs no allocation, expert
+         * table copy, device work, or inference-reader synchronization.
+         * CapacityUnavailable is backpressure: defer the complete closed cycle;
+         * never evict a live bank. An identical epoch is idempotent and a
+         * different identity under the same epoch is an EpochConflict.
          */
         [[nodiscard]] MoEOverlayParticipantBankInstallStatus installReadyBank(
-            const MoEOverlayParticipantResidencyBank &bank,
+            MoEOverlayPreparedParticipantBank &&bank,
             std::string *error = nullptr);
 
         /**
          * @brief Acquire one exact immutable bank for packet execution.
-         * @return Shared lifetime, or null when the epoch is absent/retired.
+         *
+         * This hot-path operation takes no mutex, allocates no storage, and
+         * cannot wait for maintenance. The returned lease keeps the exact node
+         * alive even when maintenance concurrently removes its publication.
+         *
+         * @return Reader lease, or an empty lease when the epoch is absent.
          */
-        [[nodiscard]] std::shared_ptr<const MoEOverlayParticipantResidencyBank>
-        acquire(uint64_t epoch) const noexcept;
+        [[nodiscard]] MoEOverlayParticipantBankLease acquire(
+            uint64_t epoch) const noexcept;
 
         /**
          * @brief Remove an unpublished candidate during asynchronous abort.
@@ -371,13 +550,11 @@ namespace llaminar2
             ExpertHistogramSource source) const noexcept;
 
         Config config_;
-        mutable std::shared_mutex mutex_;
-        std::unordered_map<
-            uint64_t,
-            std::shared_ptr<const MoEOverlayParticipantResidencyBank>>
-            banks_;
+        std::shared_ptr<MoEOverlayParticipantResidencyState> state_;
         std::unique_ptr<ServiceMeasurementCell[]> service_measurements_;
         std::atomic<uint64_t> dropped_service_measurements_{0};
+        /** True after device snapshots become this endpoint's sole evidence. */
+        std::atomic<bool> device_service_measurements_imported_{false};
     };
 
     /**
@@ -393,6 +570,22 @@ namespace llaminar2
     class MoEOverlayParticipantResidencyRegistry final
     {
     public:
+        /**
+         * @brief One layer selection read from an installed initial bank.
+         *
+         * This value is setup-only evidence of physical prepared-weight
+         * publication. It is deliberately derived from the immutable bank,
+         * not reconstructed from the desired owner map, so parity campaigns
+         * can distinguish a correct plan from a correctly materialized plan.
+         */
+        struct InitialBankExpertSelection
+        {
+            int participant_id = -1;
+            DeviceId device = DeviceId::invalid();
+            int layer_idx = -1;
+            std::vector<int> expert_ids;
+        };
+
         /**
          * @brief Exact process-local initial-bank publication deficit.
          *
@@ -468,6 +661,22 @@ namespace llaminar2
         [[nodiscard]] bool allInitialBanksReady() const noexcept;
 
         /**
+         * @brief Snapshot expert selections from every installed initial bank.
+         *
+         * Results are ordered by participant and then layer. The method is a
+         * setup/diagnostic boundary and may allocate; inference never calls it.
+         * Each returned selection comes from a retained immutable bank lease,
+         * proving that graph construction published complete prepared engines
+         * for the corresponding resident mask.
+         *
+         * @return Process-local physical selections in deterministic order.
+         * @throws std::logic_error If any initial bank is not yet installed or
+         *         an installed bank no longer has the configured geometry.
+         */
+        [[nodiscard]] std::vector<InitialBankExpertSelection>
+        initialBankExpertSelections() const;
+
+        /**
          * @brief Describe every process-local initial bank that is not ready.
          *
          * The result is sorted by participant id so startup failures remain
@@ -479,6 +688,18 @@ namespace llaminar2
          */
         [[nodiscard]] std::vector<IncompleteInitialBank>
         incompleteInitialBanks() const;
+
+        /**
+         * @brief Install one local participant's immutable device snapshot.
+         * @param participant_id Exact process-local participant identity.
+         * @param rows Complete layer-ordered cumulative service totals.
+         * @param error Optional rejection diagnostic.
+         * @return True when the endpoint accepted the complete snapshot.
+         */
+        [[nodiscard]] bool importDeviceServiceMeasurements(
+            int participant_id,
+            const std::vector<MoEOverlayParticipantLayerServiceTotals> &rows,
+            std::string *error = nullptr);
 
         /**
          * @brief Try to gather coherent service totals from all local endpoints.

@@ -9,7 +9,7 @@
 
 #pragma once
 
-#include "execution/moe/DeviceMoEOverlayEpochABI.h"
+#include "execution/moe/MoEOverlayActivationPacketABI.h"
 
 #include <cstdint>
 
@@ -20,6 +20,9 @@ extern "C"
         llaminar2::DeviceMoEOverlayEpochControl *control,
         llaminar2::DeviceMoEOverlayEpochTicket *ticket,
         llaminar2::DeviceMoEOverlayEpochStatus *status,
+        const std::uint64_t *external_admission_epoch,
+        llaminar2::DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier,
+        llaminar2::MoEOverlayPeerPlacementEpochBinding peer_placement_epoch,
         int device_ordinal,
         void *stream);
 

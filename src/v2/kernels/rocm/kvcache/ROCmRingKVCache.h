@@ -457,6 +457,17 @@ namespace llaminar2
             ITensor **out_v,
             void *gpu_stream) override;
 
+        /** @copydoc IKVCache::get_kv_device_ring_view */
+        bool get_kv_device_ring_view(
+            int layer,
+            int seq_idx,
+            ITensor **out_k,
+            ITensor **out_v,
+            const int **device_head,
+            const int **device_count,
+            int *physical_capacity,
+            void *gpu_stream) override;
+
         bool get_kv_batched_converted_device_view(
             int layer,
             int first_seq_idx,
@@ -646,6 +657,8 @@ namespace llaminar2
         // Mutable because views are lazily created in const methods
         mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> tensor_views_;
         mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> snapshot_tensor_views_;
+        /// Stable wrappers over complete physical rings used by direct attention.
+        mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> device_ring_views_;
 
         /// Cache-owned tensor wrappers over workspace-backed grouped payloads.
         std::unique_ptr<ITensor> batched_k_view_;

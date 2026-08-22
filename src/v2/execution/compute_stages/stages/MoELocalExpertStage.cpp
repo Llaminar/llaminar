@@ -94,6 +94,14 @@ namespace llaminar2
                 LOG_ERROR("[MoELocalExpertStage] Sparse live counts exceed capacity");
                 return false;
             }
+            if (rows.hidden_row_capacity == 0u ||
+                !isValidMoEOverlayActivationHiddenPayloadLayout(
+                    rows.hidden_payload_layout))
+            {
+                LOG_ERROR(
+                    "[MoELocalExpertStage] Sparse input has no valid hidden-row address contract");
+                return false;
+            }
             if ((rows.live_row_count != 0 || rows.live_entry_count != 0) &&
                 rows.residency_epoch == 0)
             {
@@ -116,6 +124,23 @@ namespace llaminar2
                 p.up_slab_ref.has_value() && p.down_slab_ref.has_value())
                 return true;
             return false;
+        }
+
+        /** @brief Stable diagnostic spelling for one authenticated traffic phase. */
+        const char *serviceSourceName(ExpertHistogramSource source) noexcept
+        {
+            switch (source)
+            {
+            case ExpertHistogramSource::DecodeToken:
+                return "decode";
+            case ExpertHistogramSource::PrefillChunk:
+                return "prefill";
+            case ExpertHistogramSource::GroupedVerifier:
+                return "grouped_verifier";
+            case ExpertHistogramSource::SyntheticTest:
+                return "synthetic_test";
+            }
+            return "invalid";
         }
 
         /**
@@ -920,6 +945,22 @@ namespace llaminar2
         return deferred_lifecycle_ != DeferredLifecycle::Idle;
     }
 
+    bool MoELocalExpertStage::
+        allDeferredReplayFamiliesUseServiceTelemetryForTesting() const
+        noexcept
+    {
+        return !deferred_replay_families_.empty() &&
+               std::all_of(
+                   deferred_replay_families_.begin(),
+                   deferred_replay_families_.end(),
+                   [](const auto &replay)
+                   {
+                       return replay && replay->compute_stage &&
+                              replay->compute_stage
+                                  ->hasOverlayServiceTelemetryForTesting();
+                   });
+    }
+
     void MoELocalExpertStage::createDeferredReplayFamilies()
     {
         const size_t expert_count = static_cast<size_t>(params_.num_experts);
@@ -1041,6 +1082,8 @@ namespace llaminar2
             compute_params.prepared_down_gemm = invocation_down_engines_;
             compute_params.prepared_store = params_.prepared_store;
             compute_params.expert_registry = params_.expert_registry;
+            compute_params.overlay_service_telemetry =
+                params_.overlay_service_telemetry;
             compute_params.gate_slab_ref = params_.gate_slab_ref;
             compute_params.up_slab_ref = params_.up_slab_ref;
             compute_params.down_slab_ref = params_.down_slab_ref;
@@ -1292,7 +1335,7 @@ namespace llaminar2
             params_.overlay_participant_residency
                 ? params_.overlay_participant_residency->acquire(
                       state.durable_parent_epoch)
-                : nullptr;
+                : MoEOverlayParticipantBankLease{};
         if (!parent ||
             static_cast<size_t>(params_.layer_idx) >= parent->layers.size())
         {
@@ -2176,8 +2219,7 @@ namespace llaminar2
                                        ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
 
-        std::shared_ptr<const MoEOverlayParticipantResidencyBank>
-            execution_residency_bank;
+        MoEOverlayParticipantBankLease execution_residency_bank;
         const MoEOverlayParticipantLayerBank *execution_layer_bank = nullptr;
         const auto *cpu_llep_state =
             params_.cpu_current_batch_llep_state.get();
@@ -2255,8 +2297,8 @@ namespace llaminar2
                 &execution_residency_bank->layers[
                     static_cast<size_t>(params_.layer_idx)];
             /*
-             * installReadyBank() validates every layer, mask bit, and expert
-             * triplet before copying the bank into immutable shared storage.
+             * prepareReadyBank() validates every layer, mask bit, and expert
+             * triplet before installReadyBank() publishes the prebuilt node.
              * Repeating that O(num_experts) proof on every routed packet adds
              * no safety: callers cannot mutate the acquired const bank. The
              * exact epoch/endpoint/layer checks above are the complete runtime
@@ -2400,7 +2442,23 @@ namespace llaminar2
                 if (validate_finite_values && !validated_input_rows_[row])
                 {
                     const float *hidden_row =
-                        input.hidden_rows_fp32 + row * static_cast<size_t>(params_.d_model);
+                        input.hiddenRowForCompactIndex(row);
+                    if (!hidden_row)
+                    {
+                        LOG_ERROR(
+                            "[MoELocalExpertStage] Sparse hidden-row address exceeds the selected payload matrix"
+                            << " layer=" << params_.layer_idx
+                            << " participant="
+                            << params_.runtime_participant_index
+                            << " compact_row=" << row
+                            << " row_id=" << row_id
+                            << " hidden_row_capacity="
+                            << input.hidden_row_capacity
+                            << " layout="
+                            << static_cast<int>(
+                                   input.hidden_payload_layout));
+                        return false;
+                    }
                     for (int col = 0; col < params_.d_model; ++col)
                     {
                         if (!std::isfinite(hidden_row[col]))
@@ -2619,10 +2677,23 @@ namespace llaminar2
         for (size_t compact_row = 0; compact_row < compact_live_rows; ++compact_row)
         {
             const size_t input_row = output_input_rows_[compact_row];
+            const float *const source_hidden =
+                input.hiddenRowForCompactIndex(input_row);
+            if (!source_hidden)
+            {
+                LOG_ERROR(
+                    "[MoELocalExpertStage] Active sparse row has no address in its selected hidden payload"
+                    << " compact_row=" << input_row
+                    << " row_id=" << input.row_ids_host[input_row]
+                    << " hidden_row_capacity="
+                    << input.hidden_row_capacity
+                    << " layout="
+                    << static_cast<int>(input.hidden_payload_layout));
+                return false;
+            }
             std::memcpy(
                 hidden + compact_row * static_cast<size_t>(params_.d_model),
-                input.hidden_rows_fp32 +
-                    input_row * static_cast<size_t>(params_.d_model),
+                source_hidden,
                 static_cast<size_t>(params_.d_model) * sizeof(float));
         }
         for (const auto &route : active_routes_)
@@ -2840,6 +2911,8 @@ namespace llaminar2
             compute_params.moe_runtime_table = execution_layer_bank
                                                    ? nullptr
                                                    : params_.moe_runtime_table;
+            compute_params.overlay_service_telemetry =
+                params_.overlay_service_telemetry;
             compute_params.gate_slab_ref = params_.gate_slab_ref;
             compute_params.up_slab_ref = params_.up_slab_ref;
             compute_params.down_slab_ref = params_.down_slab_ref;
@@ -2995,6 +3068,7 @@ namespace llaminar2
                 << " participant=" << params_.runtime_participant_index);
             return false;
         }
+        const auto &input = *params_.input_rows;
         if (deferred_lifecycle_ == DeferredLifecycle::ReadyNoWork)
         {
             resetDeferredInvocation();
@@ -3008,12 +3082,13 @@ namespace llaminar2
                     params_.device_id.to_string(),
                     {{"active_routes", "0"},
                      {"layer", std::to_string(params_.layer_idx)},
-                     {"participant", std::to_string(params_.runtime_participant_index)}});
+                     {"participant", std::to_string(params_.runtime_participant_index)},
+                     {"service_source",
+                      serviceSourceName(input.key.histogram_source)}});
             }
             return true;
         }
 
-        const auto &input = *params_.input_rows;
         auto &output = *params_.output_rows;
         const bool economy_timing_enabled =
             pending_economy_timing_enabled_;
@@ -3198,22 +3273,6 @@ namespace llaminar2
                         .count();
                 return value > 0 ? static_cast<uint64_t>(value) : 1u;
             };
-            const auto sourceName = [](ExpertHistogramSource source)
-            {
-                switch (source)
-                {
-                case ExpertHistogramSource::DecodeToken:
-                    return "decode";
-                case ExpertHistogramSource::PrefillChunk:
-                    return "prefill";
-                case ExpertHistogramSource::GroupedVerifier:
-                    return "grouped_verifier";
-                case ExpertHistogramSource::SyntheticTest:
-                    return "synthetic_test";
-                }
-                return "invalid";
-            };
-
             std::set<int> traced_experts;
             for (const auto &route : active_routes_)
                 traced_experts.insert(route.expert_id);
@@ -3242,7 +3301,8 @@ namespace llaminar2
                 {"residency_epoch", std::to_string(input.residency_epoch)},
                 {"route_width", std::to_string(compact_execution_top_k_)},
                 {"tier", std::to_string(input.key.tier_idx)}};
-            const std::string phase = sourceName(input.key.histogram_source);
+            const std::string phase =
+                serviceSourceName(input.key.histogram_source);
             const std::string device = params_.device_id.to_string();
             const auto record = [&](const char *name, auto begin, auto end)
             {
@@ -3314,6 +3374,8 @@ namespace llaminar2
                  {"logical_step", std::to_string(input.key.step_id)},
                  {"output_rows", std::to_string(output.live_row_count)},
                  {"participant", std::to_string(params_.runtime_participant_index)},
+                 {"service_source",
+                  serviceSourceName(input.key.histogram_source)},
                  {"tier", std::to_string(input.key.tier_idx)}});
             PerfStatsCollector::addCounter(
                 "forward_graph",
@@ -3327,7 +3389,9 @@ namespace llaminar2
                  {"host_execution",
                   "rank_graph_submit_completion_wave"},
                  {"layer", std::to_string(params_.layer_idx)},
-                 {"participant", std::to_string(params_.runtime_participant_index)}});
+                 {"participant", std::to_string(params_.runtime_participant_index)},
+                 {"service_source",
+                  serviceSourceName(input.key.histogram_source)}});
         }
         resetDeferredInvocation();
         return true;

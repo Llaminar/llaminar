@@ -20,6 +20,10 @@
 
 #include <hip/hip_runtime.h>
 
+#include "kernels/common/DeviceSwiGLUNumericalContract.h"
+#include "kernels/common/DeviceQ8ActivationNumericalContract.h"
+#include "kernels/common/MoEProjectionNumericalContract.h"
+
 #include <cmath>
 #include <cstdint>
 
@@ -29,11 +33,11 @@ namespace llaminar2::rocm::decode_equivalent
 /**
  * @brief Evaluate one FP32 SwiGLU element using serial-decode arithmetic.
  *
- * gfx906 serial decode deliberately uses the fast hardware exponential and
- * reciprocal instructions. Besides being substantially cheaper than a full
- * IEEE division, this sequence is part of the model's established decode
- * byte stream. Grouped kernels must call this helper instead of using
- * `expf()` or `/`, even though those expressions are mathematically similar.
+ * CUDA and ROCm must publish the same block scale when an expert changes
+ * placement. The shared device contract therefore owns sigmoid range
+ * reduction and its polynomial instead of delegating to vendor `expf()`
+ * implementations. Grouped and serial kernels call this wrapper so neither
+ * backend grows an alternative expression tree.
  *
  * @param gate One gate-projection value.
  * @param up The corresponding up-projection value.
@@ -41,10 +45,7 @@ namespace llaminar2::rocm::decode_equivalent
  */
 __device__ __forceinline__ float swigluValue(float gate, float up)
 {
-    const float exponential = __expf(-gate);
-    const float reciprocal =
-        __builtin_amdgcn_rcpf(1.0f + exponential);
-    return (gate * reciprocal) * up;
+    return llaminar2::device_swiglu_contract::swigluValue(gate, up);
 }
 
 /**
@@ -55,9 +56,22 @@ __device__ __forceinline__ float swigluValue(float gate, float up)
  */
 __device__ __forceinline__ float q8Scale(float maximum_absolute_value)
 {
-    return maximum_absolute_value > 0.0f
-        ? maximum_absolute_value / 127.0f
-        : 1.0f;
+    return llaminar2::device_q8_activation_contract::scale(
+        maximum_absolute_value);
+}
+
+/**
+ * @brief Quantize one value from its published Q8 block scale.
+ * @param value FP32 activation value to quantize.
+ * @param block_scale Positive scale returned by q8Scale().
+ * @return Signed integer in the inclusive [-127, 127] range.
+ */
+__device__ __forceinline__ int32_t quantizeQ8FromScale(
+    float value,
+    float block_scale)
+{
+    return llaminar2::device_q8_activation_contract::quantize(
+        value, block_scale);
 }
 
 /**

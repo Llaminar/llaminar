@@ -1191,6 +1191,11 @@ namespace llaminar2
             {
                 errors.push_back("MTP max request batch must be > 0");
             }
+            if (mtp.graph_capacity_draft_tokens < 0)
+            {
+                errors.push_back(
+                    "MTP graph capacity draft tokens must be >= 0");
+            }
 
             const auto &depth_policy = mtp.depth_policy;
             if (depth_policy.min_depth < 0)
@@ -1257,6 +1262,15 @@ namespace llaminar2
                 {
                     errors.push_back("MTP depth policy thresholds must be in [0, 1]");
                 }
+            }
+            const int execution_maximum =
+                resolveMTPMaximumExecutionDraftDepth(mtp);
+            if (mtp.graph_capacity_draft_tokens > 0 &&
+                mtp.graph_capacity_draft_tokens < execution_maximum)
+            {
+                errors.push_back(
+                    "MTP graph capacity draft tokens must cover the maximum "
+                    "execution-policy depth");
             }
         }
 
@@ -1419,6 +1433,8 @@ namespace llaminar2
         oss << "  mtp:\n";
         oss << "    enabled: " << (mtp.enabled ? "true" : "false") << "\n";
         oss << "    draft_tokens: " << mtp.draft_tokens << "\n";
+        oss << "    graph_capacity_draft_tokens: "
+            << mtp.graph_capacity_draft_tokens << "\n";
         oss << "    max_request_batch: " << mtp.max_request_batch << "\n";
         oss << "    verify_mode: " << mtpVerifyModeToString(mtp.verify_mode) << "\n";
         oss << "    terminal_head_policy: "

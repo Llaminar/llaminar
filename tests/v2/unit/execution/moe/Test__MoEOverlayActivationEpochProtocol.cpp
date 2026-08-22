@@ -144,7 +144,7 @@ namespace llaminar2::test
     TEST(Test__MoEOverlayActivationEpochProtocol,
          FixedABIAndTwoBanksPreservePipelinedRoundTripsAcrossReset)
     {
-        EXPECT_EQ(kMoEOverlayActivationABIVersion, 3u);
+        EXPECT_EQ(kMoEOverlayActivationABIVersion, 4u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEndpointStatus), 128u);
         EXPECT_EQ(sizeof(MoEOverlayActivationEpochControl), 1152u);
         EXPECT_EQ(alignof(MoEOverlayActivationEpochControl), 64u);
@@ -203,7 +203,9 @@ namespace llaminar2::test
 
         ASSERT_TRUE(protocol.consumeDispatch(*armed, 0u, &error).has_value())
             << error;
-        ASSERT_TRUE(protocol.publishReturn(*armed, 0u, 384u, &error)) << error;
+        ASSERT_TRUE(protocol.publishReturn(
+            *armed, 0u, 384u, &error))
+            << error;
         ASSERT_TRUE(protocol.consumeReturn(*armed, 0u, &error).has_value())
             << error;
         ASSERT_TRUE(protocol.publishDispatch(
@@ -212,12 +214,16 @@ namespace llaminar2::test
 
         ASSERT_TRUE(protocol.consumeDispatch(*armed, 1u, &error).has_value())
             << error;
-        ASSERT_TRUE(protocol.publishReturn(*armed, 1u, 512u, &error)) << error;
+        ASSERT_TRUE(protocol.publishReturn(
+            *armed, 1u, 512u, &error))
+            << error;
         ASSERT_TRUE(protocol.consumeReturn(*armed, 1u, &error).has_value())
             << error;
         ASSERT_TRUE(protocol.consumeDispatch(*armed, 2u, &error).has_value())
             << error;
-        ASSERT_TRUE(protocol.publishReturn(*armed, 2u, 256u, &error)) << error;
+        ASSERT_TRUE(protocol.publishReturn(
+            *armed, 2u, 256u, &error))
+            << error;
         ASSERT_TRUE(protocol.consumeReturn(*armed, 2u, &error).has_value())
             << error;
         runOneStage(protocol, *armed, 3u);
@@ -232,6 +238,7 @@ namespace llaminar2::test
         EXPECT_EQ(traffic->dispatch_live_rows, 12u);
         EXPECT_EQ(traffic->return_live_rows, 12u);
         EXPECT_EQ(traffic->dispatch_live_entries, 24u);
+        EXPECT_EQ(traffic->return_live_entries, 0u);
         EXPECT_EQ(traffic->dispatch_stage_count, 4u);
         EXPECT_EQ(traffic->return_stage_count, 4u);
 
@@ -294,6 +301,78 @@ namespace llaminar2::test
         ASSERT_TRUE(returned.has_value()) << error;
         EXPECT_EQ(returned->live_rows, 0u);
         EXPECT_EQ(returned->payload_bytes, 0u);
+        completeBoth(protocol, *identity);
+    }
+
+    /**
+     * @brief Preserve the device failure witness in an acquired host snapshot.
+     *
+     * A watchdog diagnoses retained-graph admission without a diagnostic D2H
+     * copy.  The endpoint accessor must therefore carry both compact witness
+     * words after acquiring the endpoint-owned publication state.
+     */
+    TEST(Test__MoEOverlayActivationEpochProtocol,
+         EndpointSnapshotPreservesDeviceFailureWitness)
+    {
+        const auto config = makeConfig();
+        MoEOverlayActivationEpochControl control;
+        MoEOverlayActivationEpochProtocol::initialize(control, config);
+        MoEOverlayActivationEpochProtocol protocol(control, config);
+
+        control.follower_status.failure_diagnostic = 0x0015a55au;
+        control.follower_status.failure_auxiliary = 0x003f0004u;
+        control.follower_status.code = static_cast<std::uint32_t>(
+            MoEOverlayActivationStatusCode::InvalidControl);
+        control.follower_status.state = static_cast<std::uint32_t>(
+            MoEOverlayActivationEndpointState::Aborted);
+
+        const auto snapshot = protocol.endpointStatus(
+            MoEOverlayActivationEndpoint::Follower);
+        EXPECT_EQ(snapshot.typedState(),
+                  MoEOverlayActivationEndpointState::Aborted);
+        EXPECT_EQ(snapshot.typedCode(),
+                  MoEOverlayActivationStatusCode::InvalidControl);
+        EXPECT_EQ(snapshot.failure_diagnostic, 0x0015a55au);
+        EXPECT_EQ(snapshot.failure_auxiliary, 0x003f0004u);
+    }
+
+    TEST(Test__MoEOverlayActivationEpochProtocol,
+         DevicePublishedPlacementEpochMayAdvancePastImmutableSchedulerFloor)
+    {
+        const auto config = makeConfig({6});
+        MoEOverlayActivationEpochControl control;
+        MoEOverlayActivationEpochProtocol::initialize(control, config);
+        MoEOverlayActivationEpochProtocol protocol(control, config);
+        std::string error;
+        const auto identity = protocol.arm(
+            makeTicket(config), 1u, 10'000u, &error);
+        ASSERT_TRUE(identity.has_value()) << error;
+        ASSERT_EQ(identity->placement_epoch_floor, 41u);
+        activateBoth(protocol, *identity);
+
+        ASSERT_TRUE(protocol.publishDispatch(
+            *identity, 0u, 2u, 4u, 512u, &error))
+            << error;
+        /* A device-resident controller published epoch 42 after the host sent
+         * its immutable floor. The real packet kernel writes this exact value
+         * before its release timeline; this sequential oracle isolates the
+         * corresponding protocol validation rule. */
+        control.buffers[0].dispatch_descriptor.placement_epoch = 42u;
+        const auto dispatch = protocol.consumeDispatch(
+            *identity, 0u, &error);
+        ASSERT_TRUE(dispatch.has_value()) << error;
+        EXPECT_EQ(dispatch->placement_epoch, 42u);
+
+        ASSERT_TRUE(protocol.publishReturn(
+            *identity, 0u, 256u, &error))
+            << error;
+        EXPECT_EQ(
+            control.buffers[0].return_descriptor.placement_epoch,
+            42u);
+        const auto returned = protocol.consumeReturn(
+            *identity, 0u, &error);
+        ASSERT_TRUE(returned.has_value()) << error;
+        EXPECT_EQ(returned->placement_epoch, 42u);
         completeBoth(protocol, *identity);
     }
 

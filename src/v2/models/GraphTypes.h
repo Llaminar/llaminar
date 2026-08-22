@@ -25,6 +25,7 @@
 #include "../execution/mtp/MTPRequestTerminalPublicationGraph.h"
 #include "../execution/mtp/MTPVerifierOutcomeGraph.h"
 #include "../execution/moe/MoEOverlayAuthorityExecution.h"
+#include "../execution/moe/MoEOverlayNodeLocalRouteTransport.h"
 #include "../backends/DeviceId.h"
 #include "../memory/BufferId.h"
 #include "../config/TensorParallelConfig.h"
@@ -65,6 +66,8 @@ namespace llaminar2
     struct MoEExpertOverlayExecutionPlan;
     class MoEExpertOverlayRuntimePlan;
     class MoEOverlayNodeLocalRouteExchange;
+    class MoEOverlayRankBatchTransportRegistry;
+    class MoEOverlayNodeLocalDeviceControllerFabric;
     struct PipelineConfig;
 
     /**
@@ -720,7 +723,7 @@ namespace llaminar2
             MoERebalanceRuntimeConfig rebalance_config;
 
             /// Optional host-visible histogram for decode expert tracking.
-            /// Host-coordinated ExpertOverlay owns this object; a captured
+            /// Host-resident ExpertOverlay owns this object; a captured
             /// accelerator authority deliberately leaves the pointer null and
             /// publishes its routing evidence into device-resident banks.
             DecodeExpertHistogram *decode_histogram = nullptr;
@@ -759,6 +762,14 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
                 node_local_route_exchange = nullptr;
 
+            /**
+             * Physical continuation-local route publication selected before
+             * graph construction. Multi-GPU distributed continuation graphs
+             * reject `Unresolved` rather than inferring policy from a pointer.
+             */
+            MoEOverlayNodeLocalRouteTransport node_local_route_transport =
+                MoEOverlayNodeLocalRouteTransport::Unresolved;
+
             /// Versioned, transactional authority for live overlay residency.
             std::shared_ptr<MoEOverlayResidencyAuthority>
                 expert_overlay_residency_authority = nullptr;
@@ -781,6 +792,26 @@ namespace llaminar2
             /// It is intentionally separate from the graph-builder MPI context so
             /// continuation-root graphs can avoid unrelated world collectives.
             std::shared_ptr<IMPIContext> overlay_mpi_ctx = nullptr;
+
+            /**
+             * Setup-owned node-local activation channels after bilateral NUMA
+             * first-touch. Captured graph builders resolve these immutable
+             * objects and must never create a replacement lazily.
+             */
+            std::shared_ptr<MoEOverlayRankBatchTransportRegistry>
+                rank_batch_transport_registry = nullptr;
+
+            /**
+             * Node-local mapped control pages for a heterogeneous or
+             * multi-group all-GPU ExpertOverlay authority.
+             *
+             * The object exposes process-local device aliases only. Policy
+             * and lifecycle mutations are performed by captured CUDA/HIP
+             * kernels; graph builders must never treat its POSIX mapping as a
+             * host-side placement mirror.
+             */
+            std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric>
+                device_controller_fabric = nullptr;
 
             /// Returns true if MoE is enabled
             bool enabled() const { return num_experts > 0 && top_k > 0; }

@@ -14,6 +14,7 @@
 #include "planning/KVCacheMemoryEstimator.h"
 #include "planning/PersistentStateMemoryEstimator.h"
 #include "planning/ActivationMemoryEstimator.h"
+#include "planning/CollectiveMemoryEstimator.h"
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "utils/Logger.h"
@@ -422,6 +423,46 @@ MemoryPlan MemoryPlanner::plan(
                     "additional replicated dense decode weights");
                 break;
             }
+            case AdditionalPersistentWeightSet::MirroredDecodeEmbedding:
+            case AdditionalPersistentWeightSet::MirroredMTPTerminalHead:
+            {
+                DeviceWeightResidency mirrored_residency;
+                if (profile.expert_count > 0)
+                {
+                    mirrored_residency =
+                        DeviceWeightResidency::
+                            continuationWithSelectedRoutedExperts(
+                                profile.expert_count,
+                                std::vector<int>(
+                                    static_cast<std::size_t>(
+                                        profile.n_layers),
+                                    0));
+                }
+                const auto mirrored_estimate =
+                    WeightMemoryEstimator::estimate(
+                        profile,
+                        cfg.device,
+                        /*shard_index=*/0,
+                        /*total_shards=*/1,
+                        cfg.first_layer,
+                        weight_last_layer,
+                        mirrored_residency);
+                const std::size_t component_bytes =
+                    additional_set ==
+                            AdditionalPersistentWeightSet::
+                                MirroredDecodeEmbedding
+                        ? mirrored_estimate.prepared_embedding_bytes
+                        : mirrored_estimate.lm_head_bytes;
+                dev_plan.additional_weight_bytes = checkedAdd(
+                    dev_plan.additional_weight_bytes,
+                    component_bytes,
+                    additional_set ==
+                            AdditionalPersistentWeightSet::
+                                MirroredDecodeEmbedding
+                        ? "additional mirrored decode embedding"
+                        : "additional mirrored MTP terminal head");
+                break;
+            }
             }
         }
         if (cfg.prepared_weight_admission ==
@@ -465,6 +506,14 @@ MemoryPlan MemoryPlanner::plan(
                 persistent_state.checkpoint_state_bytes;
             dev_plan.persistent_state_bytes =
                 persistent_state.stateBytes();
+            if (cfg.total_shards > 1)
+            {
+                dev_plan.collective_bytes =
+                    CollectiveMemoryEstimator::localTP(
+                        max_seq,
+                        profile.d_model)
+                        .perDeviceBytes();
+            }
         }
 
         // Activation estimation
@@ -535,6 +584,10 @@ MemoryPlan MemoryPlanner::plan(
                     .total_shards = cfg.total_shards,
                     .apportioned_routed_experts =
                         cfg.weight_residency.selectsRoutedExperts(),
+                    .mtp_target_query_rows =
+                        cfg.mtp_enabled
+                            ? cfg.mtp_target_query_rows
+                            : 0,
                 });
         }
         else
@@ -675,17 +728,17 @@ std::string MemoryPlan::renderTable() const
     // Header
     table << fort::header
           << "Device" << "Context" << "Act.Seq" << "Weights" << "Retained"
-          << "KV Cache" << "State" << "Activ." << "Wkspace" << "Total"
+          << "KV Cache" << "State" << "Collect." << "Activ." << "Wkspace" << "Total"
           << "New" << "Avail." << "OK"
           << fort::endr;
 
     // Column alignments
     table.column(0).set_cell_text_align(fort::text_align::left);
-    for (int c = 1; c <= 11; ++c)
+    for (int c = 1; c <= 12; ++c)
     {
         table.column(c).set_cell_text_align(fort::text_align::right);
     }
-    table.column(12).set_cell_text_align(fort::text_align::center);
+    table.column(13).set_cell_text_align(fort::text_align::center);
 
     // Data rows
     for (const auto& d : devices)
@@ -697,6 +750,7 @@ std::string MemoryPlan::renderTable() const
               << formatMB(d.retained_weight_bytes)
               << formatMB(d.kv_cache_bytes)
               << formatMB(d.persistent_state_bytes)
+              << formatMB(d.collective_bytes)
               << formatMB(d.activation_bytes)
               << formatMB(d.workspace_bytes)
               << formatMB(d.total_bytes())

@@ -812,6 +812,18 @@ namespace llaminar2
         void setPreparedWeightStore(std::shared_ptr<PreparedWeightStore> store);
 
         /**
+         * @brief Count model-owned prepared records for one exact device.
+         *
+         * Dense GEMMs, embeddings, and explicit slabs live in
+         * PreparedWeightStore; routed ExpertOverlay GEMMs live in the
+         * model-owned ExpertGemmRegistry. This is the single existence query
+         * used by reuse certification and memory admission. It is not a byte
+         * estimate because scoped expert aliases may share one allocation.
+         */
+        [[nodiscard]] size_t preparedRecordCountForDevice(
+            DeviceId device) const;
+
+        /**
          * @brief Get the current lifecycle state (derived from gates)
          */
         WeightLifecycleState lifecycleState() const { return lifecycle_gates_.currentState(); }

@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include "MappedTransferProgressABI.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -662,6 +664,23 @@ namespace llaminar2
             std::shared_ptr<void> lifetime) const;
 
         /**
+         * @brief Allocate and register first-touched mapped pages for local GPUs.
+         *
+         * The setup thread zeroes the anonymous mapping before registration, so
+         * Linux NUMA first-touch follows the caller's established CPU affinity.
+         * Capacity is rounded to a system page. No allocation or registration
+         * occurs after this method returns.
+         *
+         * @param bytes Positive minimum capacity.
+         * @param devices Non-empty exact local GPU endpoint set.
+         * @return Immutable model-lifetime mapped-region authority.
+         */
+        [[nodiscard]] std::shared_ptr<MappedHostTransferRegion>
+        allocateMappedHostRegion(
+            size_t bytes,
+            std::span<const DeviceId> devices) const;
+
+        /**
          * @brief Bind one mapped acquire edge for a fused packet kernel.
          *
          * This setup-only method resolves an exact stable device alias without
@@ -871,6 +890,122 @@ namespace llaminar2
             const MappedHostTransferRegion &region,
             size_t destination_offset,
             size_t bytes,
+            DeviceId device,
+            void *stream) const;
+
+        /**
+         * @brief Enqueue immutable infrastructure bytes into mapped host pages.
+         *
+         * Expert residency banks are model-lifetime device allocations rather
+         * than tensors. This narrow infrastructure boundary validates their
+         * explicit capacity and routes the copy through backend asynchronous
+         * DMA on the exact caller-owned stream. It never allocates, waits,
+         * synchronizes, or launches a compute kernel that can occupy inference
+         * compute units.
+         */
+        void enqueuePersistentDeviceRegionToMappedHost(
+            const void *source,
+            size_t source_capacity,
+            size_t source_offset,
+            const MappedHostTransferRegion &destination,
+            size_t destination_offset,
+            size_t bytes,
+            DeviceId device,
+            void *stream) const;
+
+        /**
+         * @brief Enqueue mapped host pages into immutable infrastructure storage.
+         *
+         * The destination is a setup-owned inactive residency bank with an
+         * explicit byte capacity. Publication remains the caller's separate
+         * event-ordered RCU operation; this method performs only one bounded
+         * asynchronous H2D DMA on @p stream.
+         */
+        void enqueueMappedHostToPersistentDeviceRegion(
+            const MappedHostTransferRegion &source,
+            size_t source_offset,
+            void *destination,
+            size_t destination_capacity,
+            size_t destination_offset,
+            size_t bytes,
+            DeviceId device,
+            void *stream) const;
+
+        /**
+         * @brief Copy persistent infrastructure bytes through a progress kernel.
+         *
+         * Expert residency banks are immutable for their published RCU epoch
+         * but are not tensors or DeviceTransferBuffers. This narrow overload is
+         * their explicit infrastructure boundary: @p source_capacity provides
+         * bounds, the caller retains the bank until the completion event, and
+         * TransferEngine validates the mapped registration/device identity
+         * before asking the backend to launch on the exact stream. The method
+         * never allocates, waits, synchronizes, or substitutes copy-engine DMA.
+         *
+         * @param source Stable base address of an immutable device region.
+         * @param source_capacity Complete byte capacity of that region.
+         * @param source_offset Byte offset of the copied subregion.
+         * @param destination Registered mapped-host destination authority.
+         * @param destination_offset Byte offset within @p destination.
+         * @param bytes Positive byte count contained by both regions.
+         * @param device Exact source GPU and mapped alias address space.
+         * @param stream Exact non-null latency-critical compute stream.
+         */
+        void enqueuePersistentDeviceRegionToMappedHostByKernel(
+            const void *source,
+            size_t source_capacity,
+            size_t source_offset,
+            const MappedHostTransferRegion &destination,
+            size_t destination_offset,
+            size_t bytes,
+            DeviceId device,
+            void *stream) const;
+
+        /**
+         * @brief Record the claim half of a mapped transfer progress branch.
+         *
+         * The mapped command array, device claim storage, geometry, and exact
+         * primary stream are setup-stable capture identity. No command is
+         * inspected on the host; the kernel snapshots every slot into ordinary
+         * device memory before the graph forks to its auxiliary branch.
+         *
+         * @param mapped_region Owner of the command host pages.
+         * @param command_offset First command byte in @p mapped_region.
+         * @param claims Persistent device array with @p slot_capacity entries.
+         * @param slot_capacity Positive immutable number of parallel slots.
+         * @param device Exact local GPU interpreting every embedded address.
+         * @param stream Exact non-null primary capture stream.
+         */
+        void enqueueMappedTransferProgressClaims(
+            const MappedHostTransferRegion &mapped_region,
+            size_t command_offset,
+            DeviceTransferBuffer &claims,
+            size_t slot_capacity,
+            DeviceId device,
+            void *stream) const;
+
+        /**
+         * @brief Record the copy half of a mapped transfer progress branch.
+         *
+         * The copy kernel consumes the already-snapshotted claim array on the
+         * exact auxiliary capture stream, skips idle generations, and publishes
+         * completions through system-visible mapped pages. The operation never
+         * allocates, waits, synchronizes, or substitutes a host/DMA transfer.
+         *
+         * @param claims Persistent device claims produced by the primary stream.
+         * @param mapped_region Owner of the completion host pages.
+         * @param completion_offset First completion byte in @p mapped_region.
+         * @param slot_capacity Positive immutable number of parallel slots.
+         * @param maximum_bytes Positive per-slot payload limit.
+         * @param device Exact local GPU interpreting every embedded address.
+         * @param stream Exact non-null auxiliary capture stream.
+         */
+        void enqueueMappedTransferProgressCopies(
+            const DeviceTransferBuffer &claims,
+            const MappedHostTransferRegion &mapped_region,
+            size_t completion_offset,
+            size_t slot_capacity,
+            size_t maximum_bytes,
             DeviceId device,
             void *stream) const;
 

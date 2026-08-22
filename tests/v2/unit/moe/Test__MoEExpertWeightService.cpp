@@ -1103,7 +1103,12 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_ReusesReleasedPhysicalSlot)
         spec.payload_bytes_per_block = 16;
         spec.is_asymmetric = true;
         spec.has_emins = false;
-        spec.codebook_id = 7;
+        spec.codebook_id = native_vnni_formats::Q4_1.codebook_id;
+        spec.format = ExpertWeightFormat::nativeVnni({
+            .codebook_id = native_vnni_formats::Q4_1.codebook_id,
+            .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+            .present = true,
+        });
         specs.push_back(std::move(spec));
     }
 
@@ -1150,7 +1155,12 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_RetainsSameExpertAcrossRcuE
             .payload_bytes_per_block = 16,
             .is_asymmetric = true,
             .has_emins = false,
-            .codebook_id = 7,
+            .codebook_id = native_vnni_formats::Q4_1.codebook_id,
+            .format = ExpertWeightFormat::nativeVnni({
+                .codebook_id = native_vnni_formats::Q4_1.codebook_id,
+                .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+                .present = true,
+            }),
         });
     }
 
@@ -1198,7 +1208,12 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_TransferSlotsAreSurplusAndR
         spec.payload_bytes_per_block = 16;
         spec.is_asymmetric = true;
         spec.has_emins = false;
-        spec.codebook_id = 7;
+        spec.codebook_id = native_vnni_formats::Q4_1.codebook_id;
+        spec.format = ExpertWeightFormat::nativeVnni({
+            .codebook_id = native_vnni_formats::Q4_1.codebook_id,
+            .is_superblock = native_vnni_formats::Q4_1.is_superblock,
+            .present = true,
+        });
         specs.push_back(std::move(spec));
     }
 

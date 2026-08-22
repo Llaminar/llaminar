@@ -3,20 +3,23 @@
  * @brief Pollable installation of measured ExpertOverlay economics.
  *
  * Dynamic residency must not consume a histogram until both prepared-expert
- * service cost and real transfer/interference cost are measured. This
- * controller joins those independent evidence streams, expands only exact
- * manifest-equivalent layer representatives, composes the complete immutable
- * profiles, and installs them into the residency authority. Every operation is
- * maintenance-owned and non-blocking with respect to inference.
+ * service cost and real transfer cost are measured. This controller joins the
+ * bounded startup transfer profile with service telemetry accumulated by
+ * ordinary requests, expands only exact manifest-equivalent layer
+ * representatives, composes the complete immutable profiles, and installs
+ * them into the residency authority. Every operation is maintenance-owned and
+ * non-blocking with respect to inference.
  */
 
 #pragma once
 
 #include "MoEOverlayEconomyCalibrationController.h"
 #include "MoEOverlayEconomyProfileComposer.h"
+#include "../InferenceMeasurementReadiness.h"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -26,6 +29,15 @@
 
 namespace llaminar2
 {
+    /** Destination that receives one complete immutable economy certificate. */
+    enum class MoEOverlayEconomyCertificationTarget : std::uint8_t
+    {
+        /** Install into the legacy host-owned residency authority. */
+        ResidencyAuthority,
+        /** Retain profiles for publication to the sole device authority. */
+        DetachedDeviceAuthority,
+    };
+
     /** @brief Observable lifecycle of rank-local economy certification. */
     enum class MoEOverlayEconomyCertificationState : std::uint8_t
     {
@@ -48,6 +60,7 @@ namespace llaminar2
         std::uint64_t incomplete_service_snapshots = 0;
         std::uint64_t profiles_composed = 0;
         std::uint64_t certifications_installed = 0;
+        std::uint64_t detached_profiles_completed = 0;
         std::uint64_t fatal_failures = 0;
     };
 
@@ -72,6 +85,9 @@ namespace llaminar2
             std::shared_ptr<const MoEOverlayEconomyCalibrationLayerCatalog>
                 layer_catalog;
             std::shared_ptr<MoEOverlayResidencyAuthority> authority;
+            /** Typed destination; detached mode never mutates host policy. */
+            MoEOverlayEconomyCertificationTarget target =
+                MoEOverlayEconomyCertificationTarget::ResidencyAuthority;
             MoERoutedExpertModelMetadata model_metadata;
             MoEOverlayMigrationEconomyPolicy economy_policy;
             /** Immutable phases reachable under this instance's MTP policy. */
@@ -80,6 +96,8 @@ namespace llaminar2
             /** Optional all-rank service and attempt evidence lane. */
             std::shared_ptr<IMoEOverlayEconomyEvidenceExchange>
                 evidence_exchange;
+            /** Minimum delay between incomplete distributed readiness rounds. */
+            std::chrono::milliseconds service_readiness_retry_interval{100};
             std::string perf_device;
         };
 
@@ -115,6 +133,46 @@ namespace llaminar2
         [[nodiscard]] MoEOverlayEconomyCertificationStats stats()
             const noexcept;
 
+        /**
+         * @brief Snapshot whether the complete measured economy is installed.
+         *
+         * This accessor is passive and allocation-only diagnostic work.  It
+         * never polls calibration, snapshots service counters, or publishes
+         * policy state; the maintenance owner remains the sole progressor.
+         */
+        [[nodiscard]] InferenceMeasurementReadiness
+        measurementReadiness() const;
+
+        /**
+         * @brief Import one immutable device-local service snapshot.
+         *
+         * All-GPU production graphs accumulate timing without touching host
+         * endpoint cells. The maintenance worker calls this only after the
+         * participant's mapped snapshot graph has completed. Certification
+         * remains the sole evidence owner and rejects imports after distributed
+         * readiness exchange has begun.
+         *
+         * @param participant_id Exact process-local participant identity.
+         * @param rows Complete layer-ordered cumulative timing totals.
+         * @param error Optional rejection diagnostic.
+         * @return True when the registry accepted the immutable snapshot.
+         */
+        [[nodiscard]] bool importDeviceServiceMeasurements(
+            int participant_id,
+            const std::vector<MoEOverlayParticipantLayerServiceTotals> &rows,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Acquire the complete immutable profiles for a device publisher.
+         *
+         * The returned shared profile objects remain valid for the model
+         * lifetime. Before @ref MoEOverlayEconomyCertificationState::Complete,
+         * or when configured for host-authority installation, this method
+         * returns no value. It never exposes partially composed evidence.
+         */
+        [[nodiscard]] std::optional<MoEOverlayCertifiedEconomyProfiles>
+        detachedProfiles() const;
+
     private:
         /** @brief First missing measured coordinate in a coherent snapshot. */
         struct ServiceEvidenceCoverage
@@ -135,6 +193,20 @@ namespace llaminar2
         [[nodiscard]] ServiceEvidenceCoverage serviceEvidenceCoverage(
             const std::vector<MoEOverlayParticipantLayerServiceTotals> &rows,
             const std::vector<int> &participant_ids) const;
+
+        /**
+         * @brief Enter one topology-wide typed service-readiness round.
+         *
+         * The private evidence lane is the round authority. Every rank submits
+         * exactly one disposition in collective order; no rank-local coverage
+         * decision may create or omit a round.
+         *
+         * @param local_readiness Complete, incomplete, or stopping disposition.
+         * @throws std::logic_error For invalid state or lane ownership.
+         * @throws std::runtime_error When the exchange cannot be started.
+         */
+        void beginServiceReadinessRound(
+            MoEOverlayServiceEvidenceReadiness local_readiness);
 
         /** @brief Compose and install one complete canonical service matrix. */
         void installCompleteEvidence(
@@ -164,6 +236,10 @@ namespace llaminar2
         std::atomic<bool> stop_requested_{false};
         mutable std::mutex failure_mutex_;
         std::string failure_message_;
+        /** Protects the one release-before-Complete detached publication. */
+        mutable std::mutex detached_profiles_mutex_;
+        std::optional<MoEOverlayCertifiedEconomyProfiles>
+            detached_profiles_;
         std::optional<MoEOverlaySealedMigrationMeasurements>
             expanded_migration_measurements_;
         /** Snapshot retained across the readiness vote and service all-gather. */
@@ -171,6 +247,11 @@ namespace llaminar2
             ready_local_service_evidence_;
         /** Last reported missing coordinate, suppressing maintenance-loop spam. */
         std::optional<std::array<int, 3>> last_reported_service_deficit_;
+        /** Non-empty layer mask last printed for that missing coordinate. */
+        std::string last_reported_service_observed_layers_;
+        /** Earliest maintenance poll allowed to open the next evidence round. */
+        std::chrono::steady_clock::time_point
+            next_service_readiness_attempt_{};
 
         std::atomic<std::uint64_t> polls_{0};
         std::atomic<std::uint64_t> movement_calibration_polls_{0};
@@ -179,6 +260,7 @@ namespace llaminar2
         std::atomic<std::uint64_t> incomplete_service_snapshots_{0};
         std::atomic<std::uint64_t> profiles_composed_{0};
         std::atomic<std::uint64_t> certifications_installed_{0};
+        std::atomic<std::uint64_t> detached_profiles_completed_{0};
         std::atomic<std::uint64_t> fatal_failures_{0};
     };
 } // namespace llaminar2

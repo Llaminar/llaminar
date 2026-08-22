@@ -1,3 +1,15 @@
+/**
+ * @file HIPGraphCapture.cpp
+ * @brief HIP graph capture, replay, composition, and resident-memory accounting.
+ *
+ * Retained HIP executables keep opaque driver-owned state outside BufferArena.
+ * Instantiation therefore records its setup-only free-VRAM delta alongside the
+ * exact native node count. Capacity planning consumes the same graph-family
+ * model as CUDA, while these observations prove that the backend-specific
+ * driver remains inside the admitted envelope. No memory query occurs during
+ * graph replay or inference.
+ */
+
 #ifdef HAVE_ROCM
 
 #include "HIPGraphCapture.h"
@@ -786,6 +798,19 @@ namespace llaminar2
             exec_ = nullptr;
         }
 
+        std::size_t free_bytes_before = 0u;
+        std::size_t total_bytes_before = 0u;
+        const hipError_t memory_before_status = hipMemGetInfo(
+            &free_bytes_before,
+            &total_bytes_before);
+        if (memory_before_status != hipSuccess)
+        {
+            LOG_ERROR(
+                "[HIPGraphCapture] Cannot account graph-executable VRAM before instantiation: "
+                << hipGetErrorString(memory_before_status));
+            return false;
+        }
+
         hipError_t err = hipGraphInstantiate(&exec_, graph_, nullptr, nullptr, 0);
         if (err != hipSuccess)
         {
@@ -793,7 +818,44 @@ namespace llaminar2
             exec_ = nullptr;
             return false;
         }
-        LOG_DEBUG("[HIPGraphCapture] Instantiated graph executable (" << node_count_ << " nodes)");
+        std::size_t free_bytes_after = 0u;
+        std::size_t total_bytes_after = 0u;
+        const hipError_t memory_after_status = hipMemGetInfo(
+            &free_bytes_after,
+            &total_bytes_after);
+        if (memory_after_status != hipSuccess ||
+            total_bytes_after != total_bytes_before)
+        {
+            LOG_ERROR(
+                "[HIPGraphCapture] Cannot account graph-executable VRAM after instantiation: status="
+                << hipGetErrorString(memory_after_status)
+                << " total_before=" << total_bytes_before
+                << " total_after=" << total_bytes_after);
+            const hipError_t destroy_error = hipGraphExecDestroy(exec_);
+            if (destroy_error != hipSuccess)
+            {
+                LOG_ERROR(
+                    "[HIPGraphCapture] Failed to destroy an executable after its VRAM accounting failed: "
+                    << hipGetErrorString(destroy_error));
+            }
+            exec_ = nullptr;
+            return false;
+        }
+        /*
+         * HIP owns this storage and exposes no allocation handle. The positive
+         * free-memory delta is the concrete setup observation. Clamp an
+         * apparent increase to zero because unrelated deferred driver state
+         * may be retired at the same boundary.
+         */
+        const std::size_t resident_delta_bytes =
+            free_bytes_before > free_bytes_after
+                ? free_bytes_before - free_bytes_after
+                : 0u;
+        LOG_DEBUG(
+            "[HIPGraphCapture] Instantiated graph executable ("
+            << node_count_
+            << " nodes, resident_delta_bytes=" << resident_delta_bytes
+            << ", free_bytes_after=" << free_bytes_after << ")");
         return true;
     }
 

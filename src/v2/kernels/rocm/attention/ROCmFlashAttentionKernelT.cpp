@@ -284,6 +284,8 @@ extern "C"
         int query_rows,
         int kv_stride,
         const int *active_query_rows_device,
+        const int *ring_head_device,
+        int ring_capacity,
         void *stream);
 
     int hipFlashAttn_prepare_device_params_from_geometry(
@@ -1125,14 +1127,18 @@ namespace llaminar2
             void *stream,
             int kv_stride,
             const int *active_query_rows_device,
-            const attention::AttentionPrefillCaptureGeometry &prefill_capture)
+            const attention::AttentionPrefillCaptureGeometry &prefill_capture,
+            const int *device_ring_head,
+            int ring_capacity)
         {
             const int sanitized_query_rows =
                 (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
             if (!post_append_cached_tokens_device || seq_len <= 0 ||
-                kv_stride <= 0 || !stream)
+                kv_stride <= 0 || !stream ||
+                ((device_ring_head == nullptr) != (ring_capacity == 0)) ||
+                (ring_capacity > 0 && ring_capacity != kv_stride))
             {
-                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, positive seq_len/cache capacity, and explicit stream");
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, coherent ring geometry, positive seq_len/cache capacity, and explicit stream");
                 dynamic_attn_device_valid_ = false;
                 dynamic_attn_device_derived_ = false;
                 return false;
@@ -1200,6 +1206,8 @@ namespace llaminar2
                 sanitized_query_rows,
                 kv_stride,
                 active_query_rows_device,
+                device_ring_head,
+                ring_capacity,
                 stream);
             if (rc != 0)
             {
@@ -1416,6 +1424,19 @@ namespace llaminar2
             const attention::AttentionDeviceParams *d_attn_params = nullptr;
             if (stream_ && workspace_)
             {
+                /*
+                 * A short suffix is not necessarily an MTP verifier. Padded
+                 * or explicitly bucketed prefill uses one shared parameter
+                 * row and lets FA2 apply causal bounds per query. Enter the
+                 * row-local decode contract only when its complete device
+                 * parameter block was deliberately published. This mirrors
+                 * CUDA and makes launch ownership explicit instead of
+                 * inferring it from a coincidentally small row count.
+                 */
+                const bool row_local_decode_params_ready =
+                    dynamic_attn_device_valid_ &&
+                    dynamic_attn_query_rows_ == seq_len &&
+                    dynamic_attn_param_rows_ >= seq_len;
                 const bool small_native_decode =
                     use_native_kv &&
                     batch_size == 1 &&
@@ -1423,7 +1444,8 @@ namespace llaminar2
                     !decode_via_prefill &&
                     seq_len > 1 &&
                     seq_len <= MAX_SMALL_DECODE_ROWS &&
-                    kv_len > seq_len;
+                    kv_len > seq_len &&
+                    row_local_decode_params_ready;
                 const int query_rows_for_params = small_native_decode ? seq_len : 1;
                 const int dynamic_position_offset =
                     (causal && kv_len > seq_len) ? (kv_len - seq_len) : 0;

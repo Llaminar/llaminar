@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -85,6 +86,18 @@ namespace
         return bank;
     }
 
+    /** @brief Exercise the production prepare-then-publish bank lifecycle. */
+    MoEOverlayParticipantBankInstallStatus prepareAndInstall(
+        MoEOverlayParticipantResidency &residency,
+        const MoEOverlayParticipantResidencyBank &bank,
+        std::string *error)
+    {
+        auto prepared = residency.prepareReadyBank(bank, error);
+        if (!prepared)
+            return MoEOverlayParticipantBankInstallStatus::Invalid;
+        return residency.installReadyBank(std::move(*prepared), error);
+    }
+
     MoEExpertOwnerMap twoParticipantOwnerMap()
     {
         RoutedExpertDomain first_domain;
@@ -131,13 +144,16 @@ namespace
     }
 
     /** @brief Construct a dynamic two-tier plan with one expert in each tier. */
-    MoERoutedExpertPlacementPlan dynamicTwoParticipantPlan()
+    MoERoutedExpertPlacementPlan dynamicTwoParticipantPlan(
+        bool cuda_continuation = false)
     {
         RoutedExpertDomain hot;
         hot.name = "hot_domain";
         hot.scope = ExecutionDomainScope::SINGLE;
         hot.backend = CollectiveBackendType::HOST;
-        hot.participants = {GlobalDeviceAddress::cpu(0)};
+        hot.participants = {
+            cuda_continuation ? GlobalDeviceAddress::cuda(0, 0)
+                              : GlobalDeviceAddress::cpu(0)};
         hot.world_ranks = {0};
         hot.owner_rank = 0;
         hot.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
@@ -282,6 +298,271 @@ namespace
         bool omit_down_ = false;
     };
 
+    /** @brief Script shared by a device-free GPU publication transaction. */
+    struct ScriptedDeviceBankPublication
+    {
+        enum class Phase
+        {
+            Created,
+            Preparing,
+            Prepared,
+            Publishing,
+            Published,
+            Aborting,
+            Aborted,
+            RetirementFencing,
+            RetirementReady,
+            Retired,
+        };
+
+        MoEOverlayResidencyWaveProgress prepare_progress =
+            MoEOverlayResidencyWaveProgress::Pending;
+        MoEOverlayResidencyWaveProgress publication_progress =
+            MoEOverlayResidencyWaveProgress::Pending;
+        MoEOverlayResidencyWaveProgress abort_progress =
+            MoEOverlayResidencyWaveProgress::Pending;
+        MoEOverlayResidencyWaveProgress retirement_progress =
+            MoEOverlayResidencyWaveProgress::Pending;
+        Phase phase = Phase::Created;
+        std::uint64_t previous_epoch = 0;
+        std::uint64_t candidate_epoch = 0;
+        int create_calls = 0;
+        int begin_prepare_calls = 0;
+        int poll_prepare_calls = 0;
+        int begin_publication_calls = 0;
+        int poll_publication_calls = 0;
+        int abort_calls = 0;
+        int poll_abort_calls = 0;
+        int poll_retirement_calls = 0;
+        int retire_calls = 0;
+    };
+
+    /**
+     * @brief Device-free implementation of the production inactive-bank ABI.
+     *
+     * Tests mutate only the four progress terminals. The fake otherwise
+     * enforces the same irreversible publication and retirement ordering as
+     * the CUDA/ROCm publisher, making lifecycle regressions deterministic.
+     */
+    class ScriptedDeviceBankTransaction final
+        : public IMoEOverlayInactiveBankTransaction
+    {
+    public:
+        explicit ScriptedDeviceBankTransaction(
+            std::shared_ptr<ScriptedDeviceBankPublication> script)
+            : script_(std::move(script))
+        {
+        }
+
+        bool beginPrepare(std::string *error) noexcept override
+        {
+            if (error)
+                error->clear();
+            if (!script_ || script_->phase !=
+                                ScriptedDeviceBankPublication::Phase::Created)
+            {
+                if (error)
+                    *error = "scripted device preparation has invalid phase";
+                return false;
+            }
+            ++script_->begin_prepare_calls;
+            script_->phase =
+                ScriptedDeviceBankPublication::Phase::Preparing;
+            return true;
+        }
+
+        MoEOverlayResidencyWaveProgress pollPrepare(
+            std::string *error) noexcept override
+        {
+            ++script_->poll_prepare_calls;
+            if (script_->phase ==
+                ScriptedDeviceBankPublication::Phase::Prepared)
+                return MoEOverlayResidencyWaveProgress::Ready;
+            if (script_->phase !=
+                ScriptedDeviceBankPublication::Phase::Preparing)
+            {
+                if (error)
+                    *error = "scripted device preparation is not in flight";
+                return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            if (script_->prepare_progress ==
+                MoEOverlayResidencyWaveProgress::Ready)
+            {
+                script_->phase =
+                    ScriptedDeviceBankPublication::Phase::Prepared;
+            }
+            else if (script_->prepare_progress ==
+                     MoEOverlayResidencyWaveProgress::Failed)
+            {
+                if (error)
+                    *error = "scripted device preparation failed";
+            }
+            return script_->prepare_progress;
+        }
+
+        bool beginPublication(std::string *error) noexcept override
+        {
+            if (error)
+                error->clear();
+            if (script_->phase !=
+                ScriptedDeviceBankPublication::Phase::Prepared)
+            {
+                if (error)
+                    *error = "scripted device publication has invalid phase";
+                return false;
+            }
+            ++script_->begin_publication_calls;
+            script_->phase =
+                ScriptedDeviceBankPublication::Phase::Publishing;
+            return true;
+        }
+
+        MoEOverlayResidencyWaveProgress pollPublication(
+            std::string *error) noexcept override
+        {
+            ++script_->poll_publication_calls;
+            if (script_->phase ==
+                ScriptedDeviceBankPublication::Phase::Published)
+                return MoEOverlayResidencyWaveProgress::Ready;
+            if (script_->phase !=
+                ScriptedDeviceBankPublication::Phase::Publishing)
+            {
+                if (error)
+                    *error = "scripted device publication is not in flight";
+                return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            if (script_->publication_progress ==
+                MoEOverlayResidencyWaveProgress::Ready)
+            {
+                script_->phase =
+                    ScriptedDeviceBankPublication::Phase::Published;
+            }
+            else if (script_->publication_progress ==
+                     MoEOverlayResidencyWaveProgress::Failed)
+            {
+                if (error)
+                    *error = "scripted device publication failed";
+            }
+            return script_->publication_progress;
+        }
+
+        void abort() noexcept override
+        {
+            ++script_->abort_calls;
+            if (script_->phase ==
+                    ScriptedDeviceBankPublication::Phase::Publishing ||
+                script_->phase ==
+                    ScriptedDeviceBankPublication::Phase::Published)
+            {
+                std::terminate();
+            }
+            script_->phase =
+                ScriptedDeviceBankPublication::Phase::Aborting;
+        }
+
+        MoEOverlayResidencyWaveProgress pollAbort(
+            std::string *error) noexcept override
+        {
+            ++script_->poll_abort_calls;
+            if (script_->phase ==
+                ScriptedDeviceBankPublication::Phase::Aborted)
+                return MoEOverlayResidencyWaveProgress::Ready;
+            if (script_->phase !=
+                ScriptedDeviceBankPublication::Phase::Aborting)
+            {
+                if (error)
+                    *error = "scripted device abort is not in flight";
+                return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            if (script_->abort_progress ==
+                MoEOverlayResidencyWaveProgress::Ready)
+            {
+                script_->phase =
+                    ScriptedDeviceBankPublication::Phase::Aborted;
+            }
+            return script_->abort_progress;
+        }
+
+        MoEOverlayResidencyWaveProgress pollRetirementFence(
+            std::string *error) noexcept override
+        {
+            ++script_->poll_retirement_calls;
+            if (script_->phase ==
+                ScriptedDeviceBankPublication::Phase::RetirementReady)
+                return MoEOverlayResidencyWaveProgress::Ready;
+            if (script_->phase ==
+                ScriptedDeviceBankPublication::Phase::Published)
+            {
+                script_->phase = ScriptedDeviceBankPublication::Phase::
+                    RetirementFencing;
+            }
+            if (script_->phase != ScriptedDeviceBankPublication::Phase::
+                                      RetirementFencing)
+            {
+                if (error)
+                    *error = "scripted device retirement has invalid phase";
+                return MoEOverlayResidencyWaveProgress::Failed;
+            }
+            if (script_->retirement_progress ==
+                MoEOverlayResidencyWaveProgress::Ready)
+            {
+                script_->phase = ScriptedDeviceBankPublication::Phase::
+                    RetirementReady;
+            }
+            return script_->retirement_progress;
+        }
+
+        void retirePrevious() noexcept override
+        {
+            if (script_->phase != ScriptedDeviceBankPublication::Phase::
+                                      RetirementReady)
+                std::terminate();
+            ++script_->retire_calls;
+            script_->phase =
+                ScriptedDeviceBankPublication::Phase::Retired;
+        }
+
+    private:
+        std::shared_ptr<ScriptedDeviceBankPublication> script_;
+    };
+
+    /** @brief Factory fake that captures exact epoch identities. */
+    class ScriptedDeviceBankPublisher final
+        : public IMoEOverlayHostAuthorityDeviceBankPublisher
+    {
+    public:
+        explicit ScriptedDeviceBankPublisher(
+            std::shared_ptr<ScriptedDeviceBankPublication> script)
+            : script_(std::move(script))
+        {
+        }
+
+        std::unique_ptr<IMoEOverlayInactiveBankTransaction>
+        createTransaction(
+            std::shared_ptr<const MoEOverlayResidencySnapshot> previous,
+            std::shared_ptr<const MoEOverlayResidencySnapshot> candidate,
+            std::string *error) noexcept override
+        {
+            if (error)
+                error->clear();
+            if (!script_ || !previous || !candidate ||
+                candidate->epoch != previous->epoch + 1u ||
+                script_->create_calls != 0)
+            {
+                if (error)
+                    *error = "scripted device publisher rejected transaction";
+                return nullptr;
+            }
+            ++script_->create_calls;
+            script_->previous_epoch = previous->epoch;
+            script_->candidate_epoch = candidate->epoch;
+            return std::make_unique<ScriptedDeviceBankTransaction>(script_);
+        }
+
+    private:
+        std::shared_ptr<ScriptedDeviceBankPublication> script_;
+    };
+
     /** @brief Authority, histogram, banks, and expected swap transaction. */
     struct ParticipantMigrationFixture
     {
@@ -292,10 +573,11 @@ namespace
     };
 
     /** @brief Create initial p0:e0 / p1:e1 banks and a hotter-e1 swap proposal. */
-    ParticipantMigrationFixture participantMigrationFixture()
+    ParticipantMigrationFixture participantMigrationFixture(
+        bool cuda_continuation = false)
     {
         ParticipantMigrationFixture fixture;
-        const auto plan = dynamicTwoParticipantPlan();
+        const auto plan = dynamicTwoParticipantPlan(cuda_continuation);
         const auto owner_map = MoEExpertOwnerMap::build(plan);
 
         DecodeExpertHistogramConfig histogram_config;
@@ -303,7 +585,9 @@ namespace
         histogram_config.num_experts = 2;
         histogram_config.top_k = 1;
         histogram_config.window_size = 2;
-        histogram_config.sockets = {DeviceId::cpu(), DeviceId::cpu()};
+        histogram_config.sockets = {
+            cuda_continuation ? DeviceId::cuda(0) : DeviceId::cpu(),
+            DeviceId::cpu()};
         histogram_config.ownership = owner_map.layeredOwnership(1, 2);
         fixture.histogram =
             std::make_shared<DecodeExpertHistogram>(histogram_config);
@@ -322,7 +606,8 @@ namespace
                 },
                 .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
                 .histogram = fixture.histogram.get(),
-                .perf_device = "cpu-hot/cpu-cold",
+                .perf_device = cuda_continuation ? "cuda/cpu" :
+                                                   "cpu/cpu",
             });
         fixture.registry =
             std::make_shared<MoEOverlayParticipantResidencyRegistry>(
@@ -381,7 +666,7 @@ TEST(Test__MoEOverlayParticipantResidency,
     auto epoch_one = initialBank(old_expert);
     std::string error;
     EXPECT_EQ(
-        residency.installReadyBank(epoch_one, &error),
+        prepareAndInstall(residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::Installed)
         << error;
 
@@ -390,7 +675,7 @@ TEST(Test__MoEOverlayParticipantResidency,
     const auto new_expert = triplet(200);
     epoch_two.layers[0].setResidentExpert(1, new_expert);
     EXPECT_EQ(
-        residency.installReadyBank(epoch_two, &error),
+        prepareAndInstall(residency, epoch_two, &error),
         MoEOverlayParticipantBankInstallStatus::Installed)
         << error;
 
@@ -423,24 +708,24 @@ TEST(Test__MoEOverlayParticipantResidency,
     std::string error;
     auto epoch_one = initialBank(triplet(300));
     ASSERT_EQ(
-        residency.installReadyBank(epoch_one, &error),
+        prepareAndInstall(residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
     auto epoch_two = residency.cloneCandidate(1, 2);
     ASSERT_EQ(
-        residency.installReadyBank(epoch_two, &error),
+        prepareAndInstall(residency, epoch_two, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
 
     auto epoch_three = residency.cloneCandidate(2, 3);
     EXPECT_FALSE(residency.hasCandidateCapacity());
     EXPECT_EQ(
-        residency.installReadyBank(epoch_three, &error),
+        prepareAndInstall(residency, epoch_three, &error),
         MoEOverlayParticipantBankInstallStatus::CapacityUnavailable);
     EXPECT_EQ(residency.retainedEpochCount(), 2u);
 
     EXPECT_TRUE(residency.retire(1));
     EXPECT_TRUE(residency.hasCandidateCapacity());
     EXPECT_EQ(
-        residency.installReadyBank(epoch_three, &error),
+        prepareAndInstall(residency, epoch_three, &error),
         MoEOverlayParticipantBankInstallStatus::Installed)
         << error;
     EXPECT_EQ(residency.acquire(1), nullptr);
@@ -463,13 +748,13 @@ TEST(Test__MoEOverlayParticipantResidency,
     std::weak_ptr<ITensorGemm> old_gate = old_expert.gate;
     auto epoch_one = initialBank(old_expert);
     ASSERT_EQ(
-        residency.installReadyBank(epoch_one, &error),
+        prepareAndInstall(residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
     auto epoch_two = residency.cloneCandidate(1, 2);
     epoch_two.layers[0].clearExpert(0);
     epoch_two.layers[0].setResidentExpert(1, triplet(500));
     ASSERT_EQ(
-        residency.installReadyBank(epoch_two, &error),
+        prepareAndInstall(residency, epoch_two, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
 
     /* Drop every construction-time copy; epoch one is now the only owner. */
@@ -479,6 +764,135 @@ TEST(Test__MoEOverlayParticipantResidency,
 
     EXPECT_TRUE(residency.retire(1));
     EXPECT_TRUE(old_gate.expired());
+}
+
+TEST(Test__MoEOverlayParticipantResidency,
+     AcquiredLeaseSurvivesConcurrentRetirementUntilReaderReleases)
+{
+    MoEOverlayParticipantResidency residency({
+        .participant_id = 4,
+        .device = DeviceId::cpu(),
+        .num_layers = 1,
+        .num_experts = 2,
+        .retained_epoch_capacity = 2,
+    });
+    std::string error;
+    auto old_expert = triplet(550);
+    std::weak_ptr<ITensorGemm> old_gate = old_expert.gate;
+    auto epoch_one = initialBank(old_expert);
+    ASSERT_EQ(
+        prepareAndInstall(residency, epoch_one, &error),
+        MoEOverlayParticipantBankInstallStatus::Installed)
+        << error;
+
+    auto inference_lease = residency.acquire(1);
+    ASSERT_NE(inference_lease, nullptr);
+    old_expert = {};
+    epoch_one = {};
+
+    /* Unlink is immediate, but reclamation must respect the live reader. */
+    ASSERT_TRUE(residency.retire(1));
+    EXPECT_EQ(residency.acquire(1), nullptr);
+    EXPECT_FALSE(old_gate.expired());
+    EXPECT_EQ(inference_lease->epoch, 1u);
+    EXPECT_TRUE(inference_lease->layers[0].resident_mask[0]);
+
+    inference_lease.reset();
+    /* Any later maintenance visit performs deferred destruction off-path. */
+    EXPECT_FALSE(residency.retire(999));
+    EXPECT_TRUE(old_gate.expired());
+}
+
+TEST(Test__MoEOverlayParticipantResidency,
+     InferenceReadersProgressWhileMaintenanceCyclesCandidateSlots)
+{
+    MoEOverlayParticipantResidency residency({
+        .participant_id = 4,
+        .device = DeviceId::cpu(),
+        .num_layers = 1,
+        .num_experts = 2,
+        .retained_epoch_capacity = 2,
+    });
+    std::string error;
+    const auto epoch_one = initialBank(triplet(575));
+    ASSERT_EQ(
+        prepareAndInstall(residency, epoch_one, &error),
+        MoEOverlayParticipantBankInstallStatus::Installed)
+        << error;
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> reader_failed{false};
+    std::atomic<uint64_t> reader_acquisitions{0};
+    constexpr int kReaderCount = 4;
+    constexpr uint64_t kMinimumMaintenanceCycles = 500;
+    constexpr uint64_t kMaximumMaintenanceCycles = 10000;
+    constexpr uint64_t kRequiredReaderAcquisitions = 1001;
+    std::barrier start_gate(kReaderCount + 1);
+    std::vector<std::thread> readers;
+    readers.reserve(kReaderCount);
+    for (int reader = 0; reader < kReaderCount; ++reader)
+    {
+        readers.emplace_back(
+            [&]
+            {
+                /* Begin all lock-free readers with the maintenance writer. */
+                start_gate.arrive_and_wait();
+                while (!stop.load(std::memory_order_acquire))
+                {
+                    auto lease = residency.acquire(1);
+                    if (!lease || lease->epoch != 1 ||
+                        !lease->layers[0].resident_mask[0])
+                    {
+                        reader_failed.store(true, std::memory_order_release);
+                        break;
+                    }
+                    reader_acquisitions.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+            });
+    }
+
+    start_gate.arrive_and_wait();
+    bool writer_failed = false;
+    uint64_t maintenance_cycles = 0;
+    while (maintenance_cycles < kMaximumMaintenanceCycles &&
+           (maintenance_cycles < kMinimumMaintenanceCycles ||
+            reader_acquisitions.load(std::memory_order_relaxed) <
+                kRequiredReaderAcquisitions))
+    {
+        const uint64_t epoch = maintenance_cycles + 2;
+        auto candidate = residency.cloneCandidate(1, epoch);
+        auto prepared = residency.prepareReadyBank(
+            std::move(candidate), &error);
+        if (!prepared ||
+            residency.installReadyBank(std::move(*prepared), &error) !=
+                MoEOverlayParticipantBankInstallStatus::Installed ||
+            !residency.retire(epoch))
+        {
+            writer_failed = true;
+            break;
+        }
+        ++maintenance_cycles;
+
+        /* Yield only in this adversarial unit test so a saturated test runner
+         * cannot finish every tiny maintenance cycle before scheduling a
+         * reader. Production publication itself remains lock-free and wait-free
+         * with respect to the maintenance mutex. */
+        std::this_thread::yield();
+    }
+
+    stop.store(true, std::memory_order_release);
+    for (auto &reader : readers)
+        reader.join();
+
+    EXPECT_FALSE(writer_failed) << error;
+    EXPECT_FALSE(reader_failed.load(std::memory_order_acquire));
+    EXPECT_GE(maintenance_cycles, kMinimumMaintenanceCycles);
+    EXPECT_GE(
+        reader_acquisitions.load(std::memory_order_relaxed),
+        kRequiredReaderAcquisitions);
+    EXPECT_NE(residency.acquire(1), nullptr);
+    EXPECT_EQ(residency.retainedEpochCount(), 1u);
 }
 
 TEST(Test__MoEOverlayParticipantResidency,
@@ -494,17 +908,17 @@ TEST(Test__MoEOverlayParticipantResidency,
     std::string error;
     const auto epoch_one = initialBank(triplet(600));
     ASSERT_EQ(
-        residency.installReadyBank(epoch_one, &error),
+        prepareAndInstall(residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
     EXPECT_EQ(
-        residency.installReadyBank(epoch_one, &error),
+        prepareAndInstall(residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::AlreadyInstalled);
 
     auto conflicting = epoch_one;
     conflicting.layers[0].clearExpert(0);
     conflicting.layers[0].setResidentExpert(1, triplet(700));
     EXPECT_EQ(
-        residency.installReadyBank(conflicting, &error),
+        prepareAndInstall(residency, conflicting, &error),
         MoEOverlayParticipantBankInstallStatus::EpochConflict);
     EXPECT_FALSE(error.empty());
 }
@@ -526,7 +940,7 @@ TEST(Test__MoEOverlayParticipantResidency,
 
     std::string error;
     EXPECT_EQ(
-        residency.installReadyBank(invalid, &error),
+        prepareAndInstall(residency, invalid, &error),
         MoEOverlayParticipantBankInstallStatus::Invalid);
     EXPECT_EQ(residency.retainedEpochCount(), 0u);
     EXPECT_FALSE(error.empty());
@@ -545,11 +959,11 @@ TEST(Test__MoEOverlayParticipantResidency,
     std::string error;
     const auto epoch_one = initialBank(triplet(1000));
     ASSERT_EQ(
-        residency.installReadyBank(epoch_one, &error),
+        prepareAndInstall(residency, epoch_one, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
     const auto epoch_two = residency.cloneCandidate(1, 2);
     ASSERT_EQ(
-        residency.installReadyBank(epoch_two, &error),
+        prepareAndInstall(residency, epoch_two, &error),
         MoEOverlayParticipantBankInstallStatus::Installed);
 
     EXPECT_TRUE(residency.abortUnpublished(2));
@@ -570,6 +984,9 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
     });
     EXPECT_EQ(registry.localParticipantIds(), (std::vector<int>{0, 1}));
     EXPECT_FALSE(registry.allInitialBanksReady());
+    EXPECT_THROW(
+        (void)registry.initialBankExpertSelections(),
+        std::logic_error);
     {
         const auto deficits = registry.incompleteInitialBanks();
         ASSERT_EQ(deficits.size(), 2u);
@@ -610,6 +1027,16 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
         << error;
     EXPECT_TRUE(registry.allInitialBanksReady());
     EXPECT_TRUE(registry.incompleteInitialBanks().empty());
+
+    const auto selections = registry.initialBankExpertSelections();
+    ASSERT_EQ(selections.size(), 2u);
+    EXPECT_EQ(selections[0].participant_id, 0);
+    EXPECT_EQ(selections[0].device, DeviceId::cpu());
+    EXPECT_EQ(selections[0].layer_idx, 0);
+    EXPECT_EQ(selections[0].expert_ids, (std::vector<int>{0}));
+    EXPECT_EQ(selections[1].participant_id, 1);
+    EXPECT_EQ(selections[1].layer_idx, 0);
+    EXPECT_EQ(selections[1].expert_ids, (std::vector<int>{1}));
 
     const auto first = registry.endpoint(0);
     const auto second = registry.endpoint(1);
@@ -806,18 +1233,24 @@ TEST(Test__MoEOverlayParticipantMigration,
     EXPECT_EQ(provider->prepare_calls, 1);
     EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
 
-    const auto committing = fixture.authority->advanceBackground();
+    const auto preparing = fixture.authority->advanceBackground();
     ASSERT_EQ(
-        committing.status, MoEOverlayResidencyApplyStatus::Committing)
-        << committing.error;
+        preparing.status, MoEOverlayResidencyApplyStatus::Preparing)
+        << preparing.error;
     /* Candidate banks are complete before, but never visible to, epoch one. */
     EXPECT_NE(fixture.registry->endpoint(0)->acquire(2), nullptr);
     EXPECT_NE(fixture.registry->endpoint(1)->acquire(2), nullptr);
     EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
 
-    const auto committed = fixture.authority->advanceBackground();
-    ASSERT_EQ(committed.status, MoEOverlayResidencyApplyStatus::Committed)
-        << committed.error;
+    const auto publishing = fixture.authority->advanceBackground();
+    ASSERT_EQ(
+        publishing.status, MoEOverlayResidencyApplyStatus::Publishing)
+        << publishing.error;
+    EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
+
+    const auto published = fixture.authority->advanceBackground();
+    ASSERT_EQ(published.status, MoEOverlayResidencyApplyStatus::Published)
+        << published.error;
     EXPECT_EQ(fixture.authority->snapshot()->epoch, 2u);
     EXPECT_EQ(fixture.authority->pendingRetirementCount(), 1u);
 
@@ -859,7 +1292,193 @@ TEST(Test__MoEOverlayParticipantMigration,
 }
 
 TEST(Test__MoEOverlayParticipantMigration,
-     IncompleteArrivalFailsCommitAndNeverExposesCandidateEpoch)
+     GpuCandidateWithoutDevicePublisherFailsBeforeEpochPublication)
+{
+    auto fixture = participantMigrationFixture(/*cuda_continuation=*/true);
+    auto provider = std::make_shared<IdentityTransferProvider>();
+    MoEOverlayParticipantPreparedWaveFactory factory({
+        .registry = fixture.registry,
+        .transfer_provider = provider,
+        .perf_device = "cuda/cpu",
+    });
+    MoEOverlayTierMigrationTransport transport({
+        .factory = &factory,
+        .projections_per_expert = kMoEOverlayExpertProjectionCount,
+        .perf_device = "cuda/cpu",
+    });
+
+    ASSERT_EQ(
+        fixture.authority
+            ->beginApply(fixture.transaction, transport)
+            .status,
+        MoEOverlayResidencyApplyStatus::Started);
+    const auto failed = fixture.authority->advanceBackground();
+    EXPECT_EQ(
+        failed.status,
+        MoEOverlayResidencyApplyStatus::PreparationFailed);
+    EXPECT_NE(failed.error.find("device-bank publisher"), std::string::npos);
+    EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
+    EXPECT_EQ(fixture.registry->endpoint(0)->acquire(2), nullptr);
+    EXPECT_EQ(fixture.registry->endpoint(1)->acquire(2), nullptr);
+    EXPECT_NE(fixture.registry->endpoint(0)->acquire(1), nullptr);
+    EXPECT_NE(fixture.registry->endpoint(1)->acquire(1), nullptr);
+}
+
+TEST(Test__MoEOverlayParticipantMigration,
+     GpuPreparationAndPublicationGateThePublicEpochAndOldBankRetirement)
+{
+    auto fixture = participantMigrationFixture(/*cuda_continuation=*/true);
+    auto old_ticket = fixture.authority->tryAcquireTicketSnapshot();
+    ASSERT_TRUE(old_ticket.has_value());
+    auto provider = std::make_shared<IdentityTransferProvider>();
+    auto script = std::make_shared<ScriptedDeviceBankPublication>();
+    auto publisher = std::make_shared<ScriptedDeviceBankPublisher>(script);
+    MoEOverlayParticipantPreparedWaveFactory factory({
+        .registry = fixture.registry,
+        .transfer_provider = provider,
+        .device_bank_publisher = publisher,
+        .perf_device = "cuda/cpu",
+    });
+    MoEOverlayTierMigrationTransport transport({
+        .factory = &factory,
+        .projections_per_expert = kMoEOverlayExpertProjectionCount,
+        .perf_device = "cuda/cpu",
+    });
+
+    ASSERT_EQ(
+        fixture.authority
+            ->beginApply(fixture.transaction, transport)
+            .status,
+        MoEOverlayResidencyApplyStatus::Started);
+
+    /* Host candidates become exact-addressable while device preparation is
+     * pending, but ordinary admission remains pinned to public epoch one. */
+    const auto preparing = fixture.authority->advanceBackground();
+    ASSERT_EQ(
+        preparing.status, MoEOverlayResidencyApplyStatus::Preparing)
+        << preparing.error;
+    EXPECT_EQ(script->create_calls, 1);
+    EXPECT_EQ(script->begin_prepare_calls, 1);
+    EXPECT_EQ(script->previous_epoch, 1u);
+    EXPECT_EQ(script->candidate_epoch, 2u);
+    EXPECT_NE(fixture.registry->endpoint(0)->acquire(2), nullptr);
+    EXPECT_NE(fixture.registry->endpoint(1)->acquire(2), nullptr);
+    EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
+    EXPECT_EQ(
+        fixture.authority->advanceBackground().status,
+        MoEOverlayResidencyApplyStatus::Preparing);
+    EXPECT_GT(script->poll_prepare_calls, 0);
+
+    script->prepare_progress = MoEOverlayResidencyWaveProgress::Ready;
+    const auto publishing = fixture.authority->advanceBackground();
+    ASSERT_EQ(
+        publishing.status, MoEOverlayResidencyApplyStatus::Publishing)
+        << publishing.error;
+    EXPECT_EQ(script->begin_publication_calls, 1);
+    EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
+    auto candidate_ticket = fixture.authority->tryAcquireTicketSnapshot(2u);
+    ASSERT_TRUE(candidate_ticket.has_value());
+    EXPECT_EQ((*candidate_ticket)->epoch, 2u);
+    candidate_ticket.reset();
+
+    EXPECT_EQ(
+        fixture.authority->advanceBackground().status,
+        MoEOverlayResidencyApplyStatus::Publishing);
+    EXPECT_GT(script->poll_publication_calls, 0);
+    EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
+
+    script->publication_progress = MoEOverlayResidencyWaveProgress::Ready;
+    const auto published = fixture.authority->advanceBackground();
+    ASSERT_EQ(
+        published.status, MoEOverlayResidencyApplyStatus::Published)
+        << published.error;
+    EXPECT_EQ(fixture.authority->snapshot()->epoch, 2u);
+    EXPECT_EQ(script->retire_calls, 0);
+    EXPECT_EQ(script->poll_retirement_calls, 0)
+        << "The live epoch-one ticket must gate both host and device retirement";
+
+    old_ticket.reset();
+    EXPECT_EQ(
+        fixture.authority->advanceBackground().status,
+        MoEOverlayResidencyApplyStatus::Idle);
+    EXPECT_GT(script->poll_retirement_calls, 0);
+    EXPECT_EQ(script->retire_calls, 0);
+    EXPECT_NE(fixture.registry->endpoint(0)->acquire(1), nullptr);
+
+    script->retirement_progress = MoEOverlayResidencyWaveProgress::Ready;
+    EXPECT_EQ(
+        fixture.authority->advanceBackground().status,
+        MoEOverlayResidencyApplyStatus::Idle);
+    EXPECT_EQ(script->retire_calls, 1);
+    EXPECT_EQ(
+        script->phase, ScriptedDeviceBankPublication::Phase::Retired);
+    EXPECT_EQ(fixture.registry->endpoint(0)->acquire(1), nullptr);
+    EXPECT_EQ(fixture.registry->endpoint(1)->acquire(1), nullptr);
+    EXPECT_NE(fixture.registry->endpoint(0)->acquire(2), nullptr);
+}
+
+TEST(Test__MoEOverlayParticipantMigration,
+     FailedGpuPreparationDrainsAbortBeforeReleasingWaveOwnership)
+{
+    auto fixture = participantMigrationFixture(/*cuda_continuation=*/true);
+    auto provider = std::make_shared<IdentityTransferProvider>();
+    auto script = std::make_shared<ScriptedDeviceBankPublication>();
+    auto publisher = std::make_shared<ScriptedDeviceBankPublisher>(script);
+    MoEOverlayParticipantPreparedWaveFactory factory({
+        .registry = fixture.registry,
+        .transfer_provider = provider,
+        .device_bank_publisher = publisher,
+        .perf_device = "cuda/cpu",
+    });
+    MoEOverlayTierMigrationTransport transport({
+        .factory = &factory,
+        .projections_per_expert = kMoEOverlayExpertProjectionCount,
+        .perf_device = "cuda/cpu",
+    });
+
+    ASSERT_EQ(
+        fixture.authority
+            ->beginApply(fixture.transaction, transport)
+            .status,
+        MoEOverlayResidencyApplyStatus::Started);
+    ASSERT_EQ(
+        fixture.authority->advanceBackground().status,
+        MoEOverlayResidencyApplyStatus::Preparing);
+    ASSERT_NE(fixture.registry->endpoint(0)->acquire(2), nullptr);
+
+    script->prepare_progress = MoEOverlayResidencyWaveProgress::Failed;
+    const auto failed = fixture.authority->advanceBackground();
+    EXPECT_EQ(
+        failed.status,
+        MoEOverlayResidencyApplyStatus::PreparationFailed);
+    EXPECT_NE(failed.error.find("scripted device preparation failed"),
+              std::string::npos);
+    EXPECT_EQ(script->abort_calls, 1);
+    EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
+    EXPECT_EQ(fixture.registry->endpoint(0)->acquire(2), nullptr);
+    EXPECT_EQ(fixture.registry->endpoint(1)->acquire(2), nullptr);
+
+    /* The wave remains owned by the authority until the exact asynchronous
+     * device abort edge reaches Ready. */
+    EXPECT_EQ(
+        fixture.authority->advanceBackground().status,
+        MoEOverlayResidencyApplyStatus::Idle);
+    EXPECT_GT(script->poll_abort_calls, 0);
+    EXPECT_NE(
+        script->phase, ScriptedDeviceBankPublication::Phase::Aborted);
+
+    script->abort_progress = MoEOverlayResidencyWaveProgress::Ready;
+    EXPECT_EQ(
+        fixture.authority->advanceBackground().status,
+        MoEOverlayResidencyApplyStatus::Idle);
+    EXPECT_EQ(
+        script->phase, ScriptedDeviceBankPublication::Phase::Aborted);
+    EXPECT_NE(fixture.registry->endpoint(0)->acquire(1), nullptr);
+    EXPECT_NE(fixture.registry->endpoint(1)->acquire(1), nullptr);
+}
+
+TEST(Test__MoEOverlayParticipantMigration,
+     IncompleteArrivalFailsPreparationAndNeverExposesCandidateEpoch)
 {
     auto fixture = participantMigrationFixture();
     auto provider = std::make_shared<IdentityTransferProvider>(
@@ -881,7 +1500,9 @@ TEST(Test__MoEOverlayParticipantMigration,
             .status,
         MoEOverlayResidencyApplyStatus::Started);
     const auto failed = fixture.authority->advanceBackground();
-    EXPECT_EQ(failed.status, MoEOverlayResidencyApplyStatus::CommitFailed);
+    EXPECT_EQ(
+        failed.status,
+        MoEOverlayResidencyApplyStatus::PreparationFailed);
     EXPECT_NE(failed.error.find("gate/up/down"), std::string::npos);
     EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
     EXPECT_EQ(fixture.registry->endpoint(0)->acquire(2), nullptr);
@@ -900,7 +1521,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     auto unrelated_candidate = endpoint->cloneCandidate(1, 99);
     std::string error;
     ASSERT_EQ(
-        endpoint->installReadyBank(unrelated_candidate, &error),
+        prepareAndInstall(*endpoint, unrelated_candidate, &error),
         MoEOverlayParticipantBankInstallStatus::Installed)
         << error;
 
@@ -947,7 +1568,7 @@ TEST(Test__MoEOverlayParticipantMigration,
     external.layers[0].setResidentExpert(0, triplet(4000));
     std::string error;
     ASSERT_EQ(
-        p1->installReadyBank(external, &error),
+        prepareAndInstall(*p1, external, &error),
         MoEOverlayParticipantBankInstallStatus::Installed)
         << error;
 
@@ -959,7 +1580,7 @@ TEST(Test__MoEOverlayParticipantMigration,
             MoEOverlayResidencyWaveProgress::Ready)
             << error;
     }
-    EXPECT_FALSE(prepared.inactive_bank->beginCommit(&error));
+    EXPECT_FALSE(prepared.inactive_bank->beginPrepare(&error));
     EXPECT_FALSE(error.empty());
     EXPECT_EQ(fixture.registry->endpoint(0)->acquire(2), nullptr);
     EXPECT_NE(fixture.registry->endpoint(1)->acquire(2), nullptr);
@@ -1000,9 +1621,16 @@ TEST(Test__MoEOverlayParticipantMigration,
             operation->poll(nullptr),
             MoEOverlayResidencyWaveProgress::Ready);
     }
-    ASSERT_TRUE(prepared.inactive_bank->beginCommit(nullptr));
+    ASSERT_TRUE(prepared.inactive_bank->beginPrepare(nullptr));
     EXPECT_EQ(
-        prepared.inactive_bank->pollCommit(nullptr),
+        prepared.inactive_bank->pollPrepare(nullptr),
+        MoEOverlayResidencyWaveProgress::Ready);
+    ASSERT_TRUE(prepared.inactive_bank->beginPublication(nullptr));
+    EXPECT_EQ(
+        prepared.inactive_bank->pollPublication(nullptr),
+        MoEOverlayResidencyWaveProgress::Ready);
+    EXPECT_EQ(
+        prepared.inactive_bank->pollRetirementFence(nullptr),
         MoEOverlayResidencyWaveProgress::Ready);
     prepared.inactive_bank->retirePrevious();
     EXPECT_TRUE(relay_registry->localParticipantIds().empty());
@@ -1155,4 +1783,77 @@ TEST(Test__MoEOverlayParticipantResidency,
             0, ExpertHistogramSource::DecodeToken, 1, 1),
         MoEOverlayServiceMeasurementRecordStatus::Disabled);
     EXPECT_FALSE(static_endpoint.trySnapshotServiceMeasurements(&rows));
+}
+
+TEST(Test__MoEOverlayParticipantResidency,
+     DeviceServiceSnapshotsReplaceOnlyMonotonicCumulativeEvidence)
+{
+    MoEOverlayParticipantResidency endpoint({
+        .participant_id = 3,
+        .device = DeviceId::cuda(0),
+        .num_layers = 2,
+        .num_experts = 4,
+        .collect_economy_service_measurements = true,
+    });
+    std::vector<MoEOverlayParticipantLayerServiceTotals> imported(2);
+    for (int layer = 0; layer < 2; ++layer)
+    {
+        imported[static_cast<std::size_t>(layer)].participant_id = 3;
+        imported[static_cast<std::size_t>(layer)].layer = layer;
+        for (std::size_t phase = 0;
+             phase < kExpertHistogramProductionSourceCount;
+             ++phase)
+        {
+            imported[static_cast<std::size_t>(layer)]
+                .total_nanoseconds[phase] = 100u + layer * 10u + phase;
+            imported[static_cast<std::size_t>(layer)]
+                .activation_count[phase] = 10u + phase;
+            imported[static_cast<std::size_t>(layer)]
+                .sample_count[phase] = 1u;
+        }
+    }
+
+    std::string error;
+    ASSERT_TRUE(endpoint.importServiceMeasurements(imported, &error))
+        << error;
+    EXPECT_TRUE(endpoint.importServiceMeasurements(imported, &error))
+        << error;
+    EXPECT_EQ(
+        endpoint.recordServiceMeasurement(
+            0, ExpertHistogramSource::DecodeToken, 1u, 1u),
+        MoEOverlayServiceMeasurementRecordStatus::Invalid);
+
+    auto newer = imported;
+    for (auto &row : newer)
+    {
+        for (std::size_t phase = 0;
+             phase < kExpertHistogramProductionSourceCount;
+             ++phase)
+        {
+            row.total_nanoseconds[phase] += 50u;
+            row.activation_count[phase] += 5u;
+            row.sample_count[phase] += 1u;
+        }
+    }
+    ASSERT_TRUE(endpoint.importServiceMeasurements(newer, &error))
+        << error;
+
+    std::vector<MoEOverlayParticipantLayerServiceTotals> observed;
+    ASSERT_TRUE(endpoint.trySnapshotServiceMeasurements(&observed));
+    EXPECT_EQ(observed.size(), newer.size());
+    for (std::size_t layer = 0; layer < newer.size(); ++layer)
+    {
+        EXPECT_EQ(
+            observed[layer].total_nanoseconds,
+            newer[layer].total_nanoseconds);
+        EXPECT_EQ(
+            observed[layer].activation_count,
+            newer[layer].activation_count);
+        EXPECT_EQ(observed[layer].sample_count, newer[layer].sample_count);
+    }
+
+    auto regressed = newer;
+    --regressed[1].sample_count[2];
+    EXPECT_FALSE(endpoint.importServiceMeasurements(regressed, &error));
+    EXPECT_NE(error.find("conflicts"), std::string::npos);
 }

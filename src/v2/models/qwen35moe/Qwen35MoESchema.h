@@ -241,6 +241,24 @@ namespace llaminar2
                 SnapshotShardingMode::ROOT_ONLY;
             config["MOE_CANONICAL_ROUTES_REDUCE_TO_ROOT"] =
                 SnapshotShardingMode::ROOT_ONLY;
+            /*
+             * The continuation root publishes both typed views of the pinned
+             * route epoch beside the rooted expert output: the domain-local
+             * per-slot schedule and both global placement banks plus their
+             * request selector. They are transaction evidence, not tensor
+             * shards, and no participant may reconstruct them from setup-time
+             * host topology.
+             */
+            config["MOE_DOMAIN_ROUTE_PARTICIPANT_IDS"] =
+                SnapshotShardingMode::ROOT_ONLY;
+            config["MOE_RUNTIME_ROUTE_WEIGHTS"] =
+                SnapshotShardingMode::ROOT_ONLY;
+            config["MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0"] =
+                SnapshotShardingMode::ROOT_ONLY;
+            config["MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1"] =
+                SnapshotShardingMode::ROOT_ONLY;
+            config["MOE_OVERLAY_ROUTE_SELECTED_BANK"] =
+                SnapshotShardingMode::ROOT_ONLY;
             config["MOE_CANONICAL_PUBLICATION_BROADCAST"] =
                 SnapshotShardingMode::REPLICATED;
 

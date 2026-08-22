@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
@@ -521,8 +522,146 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphExecutor::GraphSegmentCache::prepareCaptureStreamTerminal(
+        IWorkerGPUContext *ctx)
+    {
+        if (!ctx || !capture_stream)
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Exact terminal preparation requires one "
+                "bound capture stream and its live worker context");
+            return false;
+        }
+        if (gpu_ctx_ref && gpu_ctx_ref != ctx && !capture_context_from_pool)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "exact terminal event context differs from the capture stream owner");
+        }
+        if (terminal_event)
+            return true;
+
+        terminal_event = ctx->createEvent();
+        if (!terminal_event)
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Failed to create the exact terminal event");
+            return false;
+        }
+        if (!gpu_ctx_ref)
+            gpu_ctx_ref = ctx;
+        return true;
+    }
+
+    DeviceGraphExecutor::GraphSegmentCache::CaptureStreamTerminalTicket
+    DeviceGraphExecutor::GraphSegmentCache::publishCaptureStreamTerminal()
+    {
+        if (!capture_stream || !terminal_event)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "exact terminal publication was not prepared before inference");
+        }
+        if (terminal_fence_published_generation !=
+            terminal_fence_observed_generation)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "exact terminal event would overwrite an unobserved submission");
+        }
+        if (terminal_fence_published_generation ==
+            std::numeric_limits<uint64_t>::max())
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "exact terminal generation namespace was exhausted");
+        }
+
+        IWorkerGPUContext *ctx =
+            requireLifecycleContext("exact terminal event publication");
+        if (!ctx->recordEventChecked(terminal_event, capture_stream))
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "exact terminal event publication was rejected by the backend");
+        }
+        ++terminal_fence_published_generation;
+        return CaptureStreamTerminalTicket{
+            terminal_fence_published_generation};
+    }
+
+    void DeviceGraphExecutor::GraphSegmentCache::
+        waitForPublishedCaptureStreamTerminal(
+            CaptureStreamTerminalTicket ticket,
+            HostFenceWaitPolicy wait_policy,
+            std::function<std::string()> active_timeout_diagnostic)
+    {
+        if (!ticket.valid() || !terminal_event || !capture_stream ||
+            ticket.generation != terminal_fence_published_generation ||
+            ticket.generation <= terminal_fence_observed_generation)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "exact terminal observation received a missing, stale, or out-of-order ticket");
+        }
+
+        IWorkerGPUContext *ctx =
+            requireLifecycleContext("exact terminal event observation");
+        try
+        {
+            if (wait_policy == HostFenceWaitPolicy::ActiveProgress)
+            {
+                const auto deadline =
+                    std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(
+                        collective_timeout_policy::kDefaultCollectiveTimeoutMs);
+                std::size_t poll_count = 0;
+                for (;;)
+                {
+                    bool ready = false;
+                    if (!ctx->queryEventChecked(terminal_event, ready))
+                    {
+                        terminateGraphSegmentCacheLifecycle(
+                            "exact terminal active query was rejected by the backend");
+                    }
+                    if (ready)
+                        break;
+
+                    ++poll_count;
+                    if (std::chrono::steady_clock::now() >= deadline)
+                    {
+                        std::string diagnostic;
+                        if (active_timeout_diagnostic)
+                            diagnostic = active_timeout_diagnostic();
+                        terminateGraphSegmentCacheLifecycle(
+                            "exact capture-stream terminal exceeded the canonical "
+                            "30-second deadline" +
+                            (diagnostic.empty()
+                                 ? std::string{}
+                                 : ": " + diagnostic));
+                    }
+                    if ((poll_count & 1023u) == 0u)
+                        std::this_thread::yield();
+                }
+            }
+            else if (!ctx->synchronizeEventChecked(terminal_event))
+            {
+                terminateGraphSegmentCacheLifecycle(
+                    "exact terminal event wait was rejected by the backend");
+            }
+        }
+        catch (const std::exception &e)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                std::string("exact terminal event observation threw: ") +
+                e.what());
+        }
+        catch (...)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "exact terminal event observation threw an unknown exception");
+        }
+
+        terminal_fence_observed_generation = ticket.generation;
+    }
+
     void DeviceGraphExecutor::GraphSegmentCache::waitForCaptureStreamFence(
-        HostFenceWaitPolicy wait_policy)
+        HostFenceWaitPolicy wait_policy,
+        std::function<std::string()> active_timeout_diagnostic)
     {
         if (!capture_stream)
             return;
@@ -532,7 +671,7 @@ namespace llaminar2
 
         try
         {
-            if (!ensureSyncEvent(ctx))
+            if (!ensureCaptureOutputEvent(ctx))
             {
                 terminateGraphSegmentCacheLifecycle(
                     "capture stream event fence allocation was rejected by the backend");
@@ -561,11 +700,26 @@ namespace llaminar2
                         break;
 
                     ++poll_count;
-                    if ((poll_count & 63u) == 0u &&
-                        std::chrono::steady_clock::now() >= deadline)
+                    /*
+                     * A backend event query is not guaranteed to be cheap
+                     * while another queue has a resident wait kernel. Check
+                     * wall time after every returned query: batching the check
+                     * by poll count allowed 64 slow HIP queries to inflate the
+                     * canonical 30-second deadline by several minutes.
+                     */
+                    if (std::chrono::steady_clock::now() >= deadline)
                     {
+                        std::string diagnostic;
+                        if (active_timeout_diagnostic)
+                        {
+                            diagnostic = active_timeout_diagnostic();
+                        }
                         terminateGraphSegmentCacheLifecycle(
-                            "capture stream active event fence exceeded the canonical 30-second deadline");
+                            "capture stream active event fence exceeded the "
+                            "canonical 30-second deadline" +
+                            (diagnostic.empty()
+                                 ? std::string{}
+                                 : ": " + diagnostic));
                     }
                     /*
                      * Backend event queries already provide progress. Yield
@@ -644,15 +798,16 @@ namespace llaminar2
         capture_context_from_pool = false;
     }
 
-    bool DeviceGraphExecutor::GraphSegmentCache::ensureSyncEvent(IWorkerGPUContext *ctx)
+    bool DeviceGraphExecutor::GraphSegmentCache::ensureCaptureInputEvent(
+        IWorkerGPUContext *ctx)
     {
-        if (sync_event)
+        if (capture_input_event)
         {
             if (!gpu_ctx_ref &&
                 !(capture_device.is_gpu() && capture_context_from_pool))
             {
                 terminateGraphSegmentCacheLifecycle(
-                    "existing capture-stream handoff event has no resolvable owner");
+                    "existing capture-stream input event has no resolvable owner");
             }
             return true;
         }
@@ -664,10 +819,43 @@ namespace llaminar2
                 "capture-stream handoff event context differs from the capture "
                 "stream owner");
         }
+        capture_input_event = ctx->createEvent();
+        if (!capture_input_event)
+        {
+            LOG_ERROR(
+                "[GraphSegmentCache] Failed to create the capture-stream input event");
+            return false;
+        }
+        if (!gpu_ctx_ref)
+            gpu_ctx_ref = ctx;
+        return true;
+    }
+
+    bool DeviceGraphExecutor::GraphSegmentCache::ensureCaptureOutputEvent(
+        IWorkerGPUContext *ctx)
+    {
+        if (sync_event)
+        {
+            if (!gpu_ctx_ref &&
+                !(capture_device.is_gpu() && capture_context_from_pool))
+            {
+                terminateGraphSegmentCacheLifecycle(
+                    "existing capture-stream output event has no resolvable owner");
+            }
+            return true;
+        }
+        if (!ctx)
+            return false;
+        if (gpu_ctx_ref && gpu_ctx_ref != ctx && !capture_context_from_pool)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "capture-stream output event context differs from the capture stream owner");
+        }
         sync_event = ctx->createEvent();
         if (!sync_event)
         {
-            LOG_ERROR("[GraphSegmentCache] Failed to create sync event");
+            LOG_ERROR(
+                "[GraphSegmentCache] Failed to create the capture-stream output event");
             return false;
         }
         if (!gpu_ctx_ref)
@@ -688,16 +876,16 @@ namespace llaminar2
         }
         if (producer_stream == capture_stream)
             return true;
-        if (!ensureSyncEvent(ctx))
+        if (!ensureCaptureInputEvent(ctx))
             return false;
-        if (!ctx->recordEventChecked(sync_event, producer_stream))
+        if (!ctx->recordEventChecked(capture_input_event, producer_stream))
         {
             LOG_ERROR(
                 "[GraphSegmentCache] Failed to record capture-stream handoff "
                 "event on the producer stream");
             return false;
         }
-        if (!ctx->waitEventChecked(sync_event, capture_stream))
+        if (!ctx->waitEventChecked(capture_input_event, capture_stream))
         {
             LOG_ERROR(
                 "[GraphSegmentCache] Failed to queue capture-stream wait for "
@@ -720,7 +908,7 @@ namespace llaminar2
         }
         if (consumer_stream == capture_stream)
             return true;
-        if (!ensureSyncEvent(ctx))
+        if (!ensureCaptureOutputEvent(ctx))
             return false;
         if (!ctx->recordEventChecked(sync_event, capture_stream))
         {
@@ -741,13 +929,16 @@ namespace llaminar2
 
     void DeviceGraphExecutor::GraphSegmentCache::destroySyncEvent()
     {
-        if (!sync_event)
+        if (!sync_event && !capture_input_event)
             return;
         IWorkerGPUContext *ctx =
             requireLifecycleContext("sync event destruction");
         try
         {
-            ctx->destroyEvent(sync_event);
+            if (sync_event)
+                ctx->destroyEvent(sync_event);
+            if (capture_input_event)
+                ctx->destroyEvent(capture_input_event);
         }
         catch (const std::exception &e)
         {
@@ -762,6 +953,38 @@ namespace llaminar2
                 "exception");
         }
         sync_event = nullptr;
+        capture_input_event = nullptr;
+    }
+
+    void DeviceGraphExecutor::GraphSegmentCache::destroyTerminalEvent()
+    {
+        if (!terminal_event)
+            return;
+        if (terminal_fence_published_generation !=
+            terminal_fence_observed_generation)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "exact terminal event destruction found an unobserved submission");
+        }
+
+        IWorkerGPUContext *ctx =
+            requireLifecycleContext("exact terminal event destruction");
+        try
+        {
+            ctx->destroyEvent(terminal_event);
+        }
+        catch (const std::exception &e)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                std::string("exact terminal event destruction threw: ") +
+                e.what());
+        }
+        catch (...)
+        {
+            terminateGraphSegmentCacheLifecycle(
+                "exact terminal event destruction threw an unknown exception");
+        }
+        terminal_event = nullptr;
     }
 
     void DeviceGraphExecutor::GraphSegmentCache::destroyReplayGpuTimingEvents()
@@ -1464,7 +1687,8 @@ namespace llaminar2
                 policy.launch_dependency,
                 {},
                 policy.retained_parent_composer,
-                initial_submission);
+                initial_submission,
+                policy.auxiliary_branch_factory);
 
             if (success)
             {
@@ -1530,11 +1754,13 @@ namespace llaminar2
                                                                RetainedParentCompositionHook
                                                                    retained_parent_composer,
                                                                GraphInitialSubmissionPolicy
-                                                                   initial_submission)
+                                                                   initial_submission,
+                                                               GraphCaptureAuxiliaryBranchFactory
+                                                                   auxiliary_branch_factory)
     {
-        if (!gpu_stream || !gpu_ctx)
+        if (!ctx || !gpu_stream || !gpu_ctx)
         {
-            LOG_ERROR("[DeviceGraphExecutor] GPU graph capture/replay requires an explicit stream and live GPU context");
+            LOG_ERROR("[DeviceGraphExecutor] GPU graph capture/replay requires an exact device context, explicit stream, and live GPU worker context");
             return false;
         }
 
@@ -1548,6 +1774,27 @@ namespace llaminar2
         const bool materialize_without_launch =
             initial_submission ==
             GraphInitialSubmissionPolicy::MaterializeWithoutLaunch;
+
+        if (!auxiliary_branch_factory.empty() &&
+            !auxiliary_branch_factory.valid())
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Graph auxiliary-branch factory has partial identity");
+            return false;
+        }
+        if (auxiliary_branch_factory.valid() &&
+            (auxiliary_branch_factory.device != ctx->deviceId() ||
+             plan_policy != GraphReplayPlanPolicy::RequireFullGraph ||
+             retained_parent_requested))
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] A graph-owned auxiliary branch requires one full native executable on its exact device"
+                << " branch_device="
+                << auxiliary_branch_factory.device.toString()
+                << " graph_device=" << ctx->deviceId().toString()
+                << " plan_policy=" << static_cast<int>(plan_policy));
+            return false;
+        }
 
         const bool cache_state_consistent =
             (!segment_cache.initialized &&
@@ -1592,6 +1839,27 @@ namespace llaminar2
         {
             LOG_ERROR(
                 "[DeviceGraphExecutor] Graph replay plan policy changed behind an initialized executable");
+            return false;
+        }
+        if (segment_cache.initialized &&
+            (static_cast<bool>(segment_cache.auxiliary_branch) !=
+                 auxiliary_branch_factory.valid() ||
+             (auxiliary_branch_factory.valid() &&
+              (segment_cache.auxiliary_branch_authority !=
+                   auxiliary_branch_factory.authority_identity ||
+               segment_cache.auxiliary_branch->device() !=
+                   auxiliary_branch_factory.device))))
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Graph auxiliary-branch presence or authority changed behind an initialized executable");
+            return false;
+        }
+        if (!segment_cache.initialized &&
+            (segment_cache.auxiliary_branch ||
+             segment_cache.auxiliary_branch_authority != nullptr))
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Pristine graph cache already owns an auxiliary branch");
             return false;
         }
 
@@ -1937,6 +2205,7 @@ namespace llaminar2
                          {"materialized_during_setup",
                           initial_launch_pending ? "true" : "false"}});
                 }
+                segment_cache.recordSuccessfulReplay();
                 return true;
             }
         }
@@ -2105,6 +2374,7 @@ namespace llaminar2
                     arena_->markWrittenFlagsOnly(write.id, write.device);
             }
             segment.last_executed_step = transition.decode_step;
+            segment_cache.recordSuccessfulReplay();
             return true;
         }
 
@@ -2123,19 +2393,31 @@ namespace llaminar2
         if (segment_cache.snapshot_configuration_epoch !=
             snapshot_configuration_epoch_)
         {
-            segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
-            segment_cache.snapshot_manifest.clear();
-            segment_cache.snapshot_configuration_epoch =
-                snapshot_configuration_epoch_;
-            PerfStatsCollector::addCounter(
-                "forward_graph",
-                "decode_snapshot_configuration_rewarm",
-                1.0,
-                "decode",
-                ctx ? ctx->deviceId().toString() : std::string{},
-                {{"snapshot_epoch",
-                  std::to_string(snapshot_configuration_epoch_)},
-                 {"context", segment_cache.perf_context}});
+            const bool pristine_identity_adopted =
+                segment_cache.adoptSnapshotConfigurationEpochIfPristine(
+                    snapshot_configuration_epoch_);
+            if (!pristine_identity_adopted)
+            {
+                /*
+                 * A non-pristine cache may own native graph resources or
+                 * snapshot destinations.  Retire those resources behind their
+                 * exact completion event before rebuilding the changed topology.
+                 */
+                segment_cache.reset(
+                    GraphSegmentCache::StreamResetPolicy::Preserve);
+                segment_cache.snapshot_manifest.clear();
+                segment_cache.snapshot_configuration_epoch =
+                    snapshot_configuration_epoch_;
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "decode_snapshot_configuration_rewarm",
+                    1.0,
+                    "decode",
+                    ctx ? ctx->deviceId().toString() : std::string{},
+                    {{"snapshot_epoch",
+                      std::to_string(snapshot_configuration_epoch_)},
+                     {"context", segment_cache.perf_context}});
+            }
         }
 
         const uint64_t current_variant_signature =
@@ -2306,6 +2588,7 @@ namespace llaminar2
                 .capture_boundary = nullptr,
                 .launch_dependency = std::move(fast_launch_dependency),
                 .retained_parent_composer = retained_parent_composer,
+                .auxiliary_branch = segment_cache.auxiliary_branch.get(),
             };
 
             const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
@@ -2334,6 +2617,7 @@ namespace llaminar2
                       std::to_string(segment_cache.segments.size())}});
             }
 
+            segment_cache.recordSuccessfulReplay();
             return true;
         }
 
@@ -2522,6 +2806,7 @@ namespace llaminar2
             .capture_boundary = capture_boundary,
             .launch_dependency = launch_dependency,
             .retained_parent_composer = retained_parent_composer,
+            .auxiliary_branch = segment_cache.auxiliary_branch.get(),
             .plan_capture_dependencies = plan_capture_dependencies,
         };
 
@@ -2556,6 +2841,7 @@ namespace llaminar2
             .capture_boundary = capture_boundary,
             .launch_dependency = launch_dependency,
             .retained_parent_composer = retained_parent_composer,
+            .auxiliary_branch = segment_cache.auxiliary_branch.get(),
             .plan_capture_dependencies = plan_capture_dependencies,
         };
 
@@ -2609,6 +2895,7 @@ namespace llaminar2
                      {"segments",
                       std::to_string(segment_cache.segments.size())}});
             }
+            segment_cache.recordSuccessfulReplay();
             return true;
         }
 
@@ -2678,6 +2965,59 @@ namespace llaminar2
                     {{"context", segment_cache.perf_context}});
             }
 
+            /*
+             * Materialize branch-private events only after every ordinary
+             * stream/timing precondition has succeeded. From this point the
+             * capture controller owns reset-on-failure, so a partial first-use
+             * attempt cannot strand branch identity in an uninitialized cache.
+             */
+            if (auxiliary_branch_factory.valid())
+            {
+                try
+                {
+                    auto branch = auxiliary_branch_factory.create();
+                    if (!branch ||
+                        branch->authorityIdentity() !=
+                            auxiliary_branch_factory.authority_identity ||
+                        branch->device() != ctx->deviceId() ||
+                        branch->name().empty())
+                    {
+                        LOG_ERROR(
+                            "[DeviceGraphExecutor] Auxiliary-branch factory produced incomplete or mismatched capture identity");
+                        return false;
+                    }
+                    segment_cache.auxiliary_branch_authority =
+                        auxiliary_branch_factory.authority_identity;
+                    segment_cache.auxiliary_branch = std::move(branch);
+
+                    /*
+                     * Hook objects are assembled before the cold-path factory
+                     * is invoked so ordinary capture preconditions can fail
+                     * without allocating branch-private events.  Refresh both
+                     * hook views now that the cache owns its final branch;
+                     * otherwise transaction zero captures the model alone and
+                     * every later replay permanently omits maintenance work.
+                     */
+                    replay_hooks.auxiliary_branch =
+                        segment_cache.auxiliary_branch.get();
+                    capture_hooks.auxiliary_branch =
+                        segment_cache.auxiliary_branch.get();
+                }
+                catch (const std::exception &exception)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Could not materialize graph-owned auxiliary branch: "
+                        << exception.what());
+                    return false;
+                }
+                catch (...)
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphExecutor] Graph-owned auxiliary branch factory threw a non-standard exception");
+                    return false;
+                }
+            }
+
             graph.reset();
             segment_cache.needs_capture = true;
             const auto capture_result =
@@ -2720,6 +3060,8 @@ namespace llaminar2
                 return false;
             if (!seal_retained_parent_plan())
                 return false;
+            segment_cache.recordSuccessfulCapture(
+                !materialize_without_launch);
             return true;
         }
 

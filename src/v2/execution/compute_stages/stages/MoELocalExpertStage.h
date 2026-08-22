@@ -431,6 +431,16 @@ namespace llaminar2
             /// Stable graph-facing MoE runtime placement state for this overlay/local participant.
             /// Owned by the graph/model layer; stages only cache the per-layer pointer.
             IMoERuntimeTable *moe_runtime_table = nullptr;
+            /**
+             * Observation-only device pointers for one Dynamic service sample.
+             *
+             * A retained sparse GPU child executes from
+             * @ref overlay_participant_residency and must not borrow the whole
+             * runtime table as a second placement authority. The graph builder
+             * therefore passes this narrow canonical-table view explicitly.
+             */
+            DeviceMoEOverlayServiceTelemetryBinding
+                overlay_service_telemetry;
             /// Optional logical participant id recorded in runtime placement descriptors.
             int runtime_participant_index = -1;
             /**
@@ -495,13 +505,22 @@ namespace llaminar2
         }
         /** @return Whether submit has produced work not yet consumed by completion. */
         bool hasPendingDeferredOutput() const noexcept;
+        /**
+         * @brief Prove every retained sparse replay inherited service telemetry.
+         *
+         * This read-only construction diagnostic exists for focused graph
+         * lowering tests. It never reads device memory and is false for an
+         * inline stage or an empty retained family.
+         */
+        bool allDeferredReplayFamiliesUseServiceTelemetryForTesting()
+            const noexcept;
         /** @brief Validate that every locally active expert has prepared weights. */
         bool validatePreparedWeights(std::string *error) const override;
         /**
          * @brief Retain setup validation when an immutable residency authority owns engines.
          *
-         * installReadyBank() exhaustively validates each expert triplet before
-         * publishing an immutable shared bank. Live packets then acquire and
+         * prepareReadyBank() exhaustively validates each expert triplet before
+         * installReadyBank() atomically publishes the immutable bank. Packets acquire and
          * validate the exact epoch/device/layer bank before touching an engine,
          * so rescanning the construction vectors cannot strengthen that proof.
          */
@@ -794,8 +813,7 @@ namespace llaminar2
         /** Exact retained family whose captured publication is currently in flight. */
         DeferredGPUReplayFamily *pending_deferred_replay_ = nullptr;
         DeferredLifecycle deferred_lifecycle_ = DeferredLifecycle::Idle;
-        std::shared_ptr<const MoEOverlayParticipantResidencyBank>
-            deferred_residency_bank_;
+        MoEOverlayParticipantBankLease deferred_residency_bank_;
         bool pending_economy_timing_enabled_ = false;
         bool pending_endpoint_detail_enabled_ = false;
         bool pending_profiling_enabled_ = false;

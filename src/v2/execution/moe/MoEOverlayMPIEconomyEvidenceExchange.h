@@ -23,11 +23,18 @@ namespace llaminar2
     /** @brief Race-safe process-local proof for the private evidence lane. */
     struct MoEOverlayMPIEconomyEvidenceExchangeStats
     {
+        std::uint64_t migration_profile_exchanges_started = 0;
+        std::uint64_t migration_profile_exchanges_completed = 0;
         std::uint64_t attempt_exchanges_started = 0;
         std::uint64_t attempt_exchanges_completed = 0;
+        std::uint64_t calibration_readiness_exchanges_started = 0;
+        std::uint64_t calibration_readiness_exchanges_completed = 0;
+        /** Valid samples that named different live workload geometries. */
+        std::uint64_t calibration_readiness_retries = 0;
         std::uint64_t service_readiness_exchanges_started = 0;
         std::uint64_t service_readiness_exchanges_completed = 0;
         std::uint64_t service_readiness_incomplete = 0;
+        std::uint64_t service_readiness_stops = 0;
         std::uint64_t service_exchanges_started = 0;
         std::uint64_t service_exchanges_completed = 0;
         std::uint64_t progress_polls = 0;
@@ -68,6 +75,14 @@ namespace llaminar2
         MoEOverlayMPIEconomyEvidenceExchange &operator=(
             const MoEOverlayMPIEconomyEvidenceExchange &) = delete;
 
+        bool beginMigrationProfile(
+            const MoEOverlayMigrationProfileEvidence &local,
+            std::string *error = nullptr) override;
+
+        MoEOverlayResidencyWaveProgress pollMigrationProfile(
+            MoEOverlayMigrationProfileResult *result,
+            std::string *error = nullptr) override;
+
         bool beginAttempt(
             const MoEOverlayCalibrationAttemptEvidence &local,
             std::string *error = nullptr) override;
@@ -76,12 +91,19 @@ namespace llaminar2
             MoEOverlayCalibrationAttemptResult *result,
             std::string *error = nullptr) override;
 
+        bool beginCalibrationReadiness(
+            const MoEOverlayCalibrationReadiness &local,
+            std::string *error = nullptr) override;
+
+        MoEOverlayResidencyWaveProgress pollCalibrationReadiness(
+            std::string *error = nullptr) override;
+
         bool beginServiceReadiness(
-            bool local_ready,
+            MoEOverlayServiceEvidenceReadiness local_readiness,
             std::string *error = nullptr) override;
 
         MoEOverlayResidencyWaveProgress pollServiceReadiness(
-            bool *all_ranks_ready,
+            MoEOverlayServiceEvidenceReadiness *global_readiness,
             std::string *error = nullptr) override;
 
         bool beginService(

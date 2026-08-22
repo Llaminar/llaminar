@@ -99,4 +99,28 @@ extern "C"
         const llaminar2::MoENodeLocalRouteConsumeLaunch *launch,
         int device_ordinal,
         void *stream);
+
+    /** @brief Wait until every peer has released the prior dense payload bank. */
+    bool cudaMoEOverlayBeginNodeLocalDensePublication(
+        const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+        int device_ordinal,
+        void *stream);
+
+    /** @brief Publish the D2H-complete dense payload epoch from the root. */
+    bool cudaMoEOverlayFinishNodeLocalDensePublication(
+        const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+        int device_ordinal,
+        void *stream);
+
+    /** @brief Acquire the next dense payload epoch on one peer stream. */
+    bool cudaMoEOverlayBeginNodeLocalDensePublicationConsume(
+        const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+        int device_ordinal,
+        void *stream);
+
+    /** @brief Acknowledge completion of one peer's dense H2D import. */
+    bool cudaMoEOverlayFinishNodeLocalDensePublicationConsume(
+        const llaminar2::MoENodeLocalDensePublicationLaunch *launch,
+        int device_ordinal,
+        void *stream);
 }

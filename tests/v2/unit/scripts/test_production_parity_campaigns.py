@@ -490,7 +490,13 @@ class ProductionParityCampaignTest(unittest.TestCase):
             0,
             msg=completed.stderr or completed.stdout,
         )
-        self.assertIn("100% tests passed, 0 tests failed out of 1", completed.stdout)
+        # CTest 4.x removed the redundant `0 tests failed` clause while
+        # retaining the same success/count semantics. Accept both renderings;
+        # the return code and exact total are the contract under test.
+        self.assertRegex(
+            completed.stdout,
+            r"100% tests passed(?:, 0 tests failed)? out of 1",
+        )
 
     def test_duration_rejects_non_finite_values(self) -> None:
         for value in ("nan", "inf", "-inf", "0"):
@@ -708,6 +714,84 @@ class ProductionParityCampaignTest(unittest.TestCase):
         )
         self.assertIn("ProductionParity/NodeTP_2xMPI_CPU", registration)
         self.assertIn("ProductionParity/NodeTP_4xMPI_CPU", registration)
+
+    def test_cmake_discovery_isolates_current_batch_llep_policy(self) -> None:
+        """Unfinished LLEP can be omitted without bypassing canonical campaigns."""
+
+        discovery = (
+            REPO_ROOT / "tests" / "v2" / "cmake" /
+            "V2ParityTestDiscovery.cmake"
+        )
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            executable = directory / "fake_gtest"
+            executable.write_text(
+                "#!/bin/sh\n"
+                "cat <<'EOF'\n"
+                "MatrixSuite.\n"
+                "  ProductionParity/CPU_Static_Ordinal\n"
+                "  ProductionParity/CPU_DynamicMaintenance_Ordinal\n"
+                "  ProductionParity/CPU_CurrentBatchLLEP_Ordinal\n"
+                "EOF\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            model = directory / "test.gguf"
+            model.write_bytes(b"gguf")
+            generated = directory / "discovered.cmake"
+
+            completed = subprocess.run(
+                [
+                    "cmake",
+                    f"-DTEST_EXECUTABLE={executable}",
+                    f"-DCTEST_FILE={generated}",
+                    "-DTEST_PREFIX=V2_Integration_Parity_FakePolicy",
+                    "-DLABELS=V2;Integration;Parity;CPU;Static;Dynamic;LLEP",
+                    "-DMPI_PROCS=1",
+                    "-DNUM_SOCKETS=1",
+                    "-DCORES_PER_SOCKET=4",
+                    f"-DWORKING_DIR={directory}",
+                    f"-DMODEL_FILES_SERIALIZED={model}",
+                    "-P",
+                    str(discovery),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=completed.stderr or completed.stdout,
+            )
+            registration = generated.read_text(encoding="utf-8")
+
+        main_name = (
+            "V2_Integration_Parity_FakePolicy_"
+            "ProductionCampaign_CPU_ALL_PRECISIONS"
+        )
+        llep_name = (
+            "V2_Integration_Parity_FakePolicy_LLEP_"
+            "ProductionCampaign_CPU_ALL_PRECISIONS"
+        )
+        self.assertIn(f'add_test("{main_name}"', registration)
+        self.assertIn(f'add_test("{llep_name}"', registration)
+        main_command = registration.split(
+            f'add_test("{main_name}"', 1
+        )[1].split("\n", 1)[0]
+        llep_command = registration.split(
+            f'add_test("{llep_name}"', 1
+        )[1].split("\n", 1)[0]
+        self.assertIn("ProductionParity/CPU_Static_Ordinal", main_command)
+        self.assertIn(
+            "ProductionParity/CPU_DynamicMaintenance_Ordinal",
+            main_command,
+        )
+        self.assertNotIn("CurrentBatchLLEP", main_command)
+        self.assertIn(
+            "ProductionParity/CPU_CurrentBatchLLEP_Ordinal",
+            llep_command,
+        )
 
     def test_cmake_discovery_isolates_declared_application_lifetimes(self) -> None:
         discovery = (

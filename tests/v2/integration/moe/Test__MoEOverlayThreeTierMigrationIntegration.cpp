@@ -396,8 +396,10 @@ namespace llaminar2
         /** @brief Shared bank observations retained after retirement. */
         struct PhysicalBankObservations
         {
-            std::size_t commits_started = 0;
-            std::size_t commit_polls = 0;
+            std::size_t preparations_started = 0;
+            std::size_t preparation_polls = 0;
+            std::size_t publications_started = 0;
+            std::size_t publication_polls = 0;
             std::size_t aborts = 0;
             std::size_t retires = 0;
         };
@@ -414,45 +416,83 @@ namespace llaminar2
             {
             }
 
-            /** @brief Accept commit only after the composite transfer barrier. */
-            bool beginCommit(std::string *error) noexcept override
+            /** @brief Begin candidate-bank preparation after transfer staging. */
+            bool beginPrepare(std::string *error) noexcept override
             {
-                if (aborted_ || begun_)
+                if (state_ != State::Reserved)
                 {
                     if (error)
-                        *error = "Physical inactive bank has invalid commit lifecycle";
+                        *error =
+                            "Physical inactive bank preparation requires a reserved bank";
                     return false;
                 }
-                begun_ = true;
-                ++observations_->commits_started;
+                state_ = State::Preparing;
+                ++observations_->preparations_started;
                 return true;
             }
 
-            /** @brief Preserve one asynchronous maintenance poll before Ready. */
-            MoEOverlayResidencyWaveProgress pollCommit(
+            /** @brief Preserve one asynchronous preparation poll before Ready. */
+            MoEOverlayResidencyWaveProgress pollPrepare(
                 std::string *error) noexcept override
             {
-                ++observations_->commit_polls;
-                if (!begun_ || aborted_)
+                ++observations_->preparation_polls;
+                if (state_ == State::Prepared)
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                if (state_ != State::Preparing)
                 {
                     if (error)
-                        *error = "Physical inactive bank commit was not active";
+                        *error =
+                            "Physical inactive bank preparation was not active";
                     return MoEOverlayResidencyWaveProgress::Failed;
                 }
-                if (!pending_observed_)
+                if (!preparation_pending_observed_)
                 {
-                    pending_observed_ = true;
+                    preparation_pending_observed_ = true;
                     return MoEOverlayResidencyWaveProgress::Pending;
                 }
+                state_ = State::Prepared;
+                return MoEOverlayResidencyWaveProgress::Ready;
+            }
+
+            /** @brief Begin the distinct inference-visible publication phase. */
+            bool beginPublication(std::string *error) noexcept override
+            {
+                if (state_ != State::Prepared)
+                {
+                    if (error)
+                        *error =
+                            "Physical inactive bank publication requires a prepared bank";
+                    return false;
+                }
+                state_ = State::Publishing;
+                ++observations_->publications_started;
+                return true;
+            }
+
+            /** @brief Publish the prepared selector without a blocking wait. */
+            MoEOverlayResidencyWaveProgress pollPublication(
+                std::string *error) noexcept override
+            {
+                ++observations_->publication_polls;
+                if (state_ == State::Published)
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                if (state_ != State::Publishing)
+                {
+                    if (error)
+                        *error =
+                            "Physical inactive bank publication was not active";
+                    return MoEOverlayResidencyWaveProgress::Failed;
+                }
+                state_ = State::Published;
                 return MoEOverlayResidencyWaveProgress::Ready;
             }
 
             /** @brief Mark every unpublished destination reservation discarded. */
             void abort() noexcept override
             {
-                if (!aborted_)
+                if (state_ != State::Aborted)
                 {
-                    aborted_ = true;
+                    state_ = State::Aborted;
                     ++observations_->aborts;
                 }
             }
@@ -461,21 +501,34 @@ namespace llaminar2
             MoEOverlayResidencyWaveProgress pollAbort(
                 std::string *) noexcept override
             {
-                return aborted_ ? MoEOverlayResidencyWaveProgress::Ready
-                                : MoEOverlayResidencyWaveProgress::Failed;
+                return state_ == State::Aborted
+                           ? MoEOverlayResidencyWaveProgress::Ready
+                           : MoEOverlayResidencyWaveProgress::Failed;
             }
 
             /** @brief Record old-bank retirement after the ticket lease drains. */
             void retirePrevious() noexcept override
             {
+                state_ = State::Retired;
                 ++observations_->retires;
             }
 
         private:
+            /** @brief Exact test-double lifecycle; invalid phase skips are impossible. */
+            enum class State
+            {
+                Reserved,
+                Preparing,
+                Prepared,
+                Publishing,
+                Published,
+                Aborted,
+                Retired,
+            };
+
             std::shared_ptr<PhysicalBankObservations> observations_;
-            bool begun_ = false;
-            bool pending_observed_ = false;
-            bool aborted_ = false;
+            State state_ = State::Reserved;
+            bool preparation_pending_observed_ = false;
         };
 
         /** @brief Physical storage and lane for one expert/projection edge. */
@@ -557,6 +610,27 @@ namespace llaminar2
                         throw std::runtime_error(
                             "Could not create all explicit three-tier streams");
                     }
+                    constexpr std::size_t blob_staging_bytes = 1024u;
+                    constexpr std::size_t blob_slots_per_device =
+                        kProjectionCount * 2u;
+                    cuda_progress_epoch_ =
+                        MappedTransferProgressEpoch::create({
+                            .device = DeviceId::cuda(0),
+                            .slot_capacity = blob_slots_per_device,
+                            .maximum_bytes = blob_staging_bytes,
+                            .name = "three_tier_cuda_relay",
+                            .perf_device =
+                                "cuda-priority0/rocm-priority1/cpu-priority2",
+                        });
+                    rocm_progress_epoch_ =
+                        MappedTransferProgressEpoch::create({
+                            .device = DeviceId::rocm(0),
+                            .slot_capacity = blob_slots_per_device,
+                            .maximum_bytes = blob_staging_bytes,
+                            .name = "three_tier_rocm_relay",
+                            .perf_device =
+                                "cuda-priority0/rocm-priority1/cpu-priority2",
+                        });
 
                     const auto *source_format =
                         native_vnni_formats::forSourceIdentity(5, true);
@@ -634,7 +708,12 @@ namespace llaminar2
                                     ExpertTierGpuBlobTransferLane::Config{
                                         .source_device = DeviceId::cuda(0),
                                         .destination_device = DeviceId::rocm(0),
-                                        .staging_capacity_bytes = 1024,
+                                        .staging_capacity_bytes =
+                                            blob_staging_bytes,
+                                        .source_progress_epoch =
+                                            cuda_progress_epoch_,
+                                        .destination_progress_epoch =
+                                            rocm_progress_epoch_,
                                         .lane_name = "three_tier:" + identity,
                                         .perf_device = "cuda-hot/rocm-warm/cpu-cold",
                                         .collect_timing_measurements = true,
@@ -710,6 +789,30 @@ namespace llaminar2
                         throw std::runtime_error(
                             "Could not publish exact source-ready events");
                     }
+                    bool cuda_ready = false;
+                    bool rocm_ready = false;
+                    const auto setup_deadline =
+                        std::chrono::steady_clock::now() +
+                        std::chrono::seconds(10);
+                    while ((!cuda_ready || !rocm_ready) &&
+                           std::chrono::steady_clock::now() < setup_deadline)
+                    {
+                        if (!cuda_context.queryEventChecked(
+                                cuda_source_ready_, cuda_ready) ||
+                            !rocm_context.queryEventChecked(
+                                rocm_source_ready_, rocm_ready))
+                        {
+                            throw std::runtime_error(
+                                "Could not observe three-tier source publication events");
+                        }
+                        if (!cuda_ready || !rocm_ready)
+                            std::this_thread::yield();
+                    }
+                    if (!cuda_ready || !rocm_ready)
+                    {
+                        throw std::runtime_error(
+                            "Three-tier source publication exceeded its setup deadline");
+                    }
                     initialized_ = true;
                     return true;
                 }
@@ -767,8 +870,8 @@ namespace llaminar2
                             started = flow.blob_lane->start(
                                 flow.gpu_source->descriptor(),
                                 flow.gpu_destination->descriptor(),
-                                ExpertTierSourceReadiness::producerEvent(
-                                    cuda_source_ready_),
+                                ExpertTierSourceReadiness::publishedResidencyBank(
+                                    transaction.expected_epoch),
                                 &start_error);
                             if (started ||
                                 flow.blob_lane->progress() ==
@@ -853,6 +956,80 @@ namespace llaminar2
                     }
                 }
                 return false;
+            }
+
+            /** @brief Submit both finite relay epochs ahead of simulated inference. */
+            [[nodiscard]] bool launchBlobProgress() noexcept
+            {
+                if (!cuda_progress_epoch_ || !rocm_progress_epoch_)
+                    return false;
+                try
+                {
+                    bool cuda_submitted = false;
+                    bool rocm_submitted = false;
+                    auto &cuda_context =
+                        GPUDeviceContextPool::instance().getContext(
+                            DeviceId::cuda(0));
+                    auto &rocm_context =
+                        GPUDeviceContextPool::instance().getContext(
+                            DeviceId::rocm(0));
+                    cuda_context.submitAndWait(
+                        [&]
+                        {
+                            cuda_submitted = cuda_progress_epoch_
+                                ->launchOutstandingProgress();
+                        });
+                    rocm_context.submitAndWait(
+                        [&]
+                        {
+                            rocm_submitted = rocm_progress_epoch_
+                                ->launchOutstandingProgress();
+                        });
+                    return cuda_submitted && rocm_submitted;
+                }
+                catch (...)
+                {
+                    return false;
+                }
+            }
+
+            /** @brief Observe both retained graph terminals without synchronizing. */
+            [[nodiscard]] bool drainBlobProgress(
+                std::chrono::steady_clock::time_point deadline) noexcept
+            {
+                bool cuda_idle = false;
+                bool rocm_idle = false;
+                while ((!cuda_idle || !rocm_idle) &&
+                       std::chrono::steady_clock::now() < deadline)
+                {
+                    const auto cuda_before =
+                        cuda_progress_epoch_->stats().idle_submission_skips;
+                    const auto rocm_before =
+                        rocm_progress_epoch_->stats().idle_submission_skips;
+                    if (!launchBlobProgress())
+                        return false;
+                    cuda_idle = cuda_idle ||
+                        cuda_progress_epoch_->stats().idle_submission_skips >
+                            cuda_before;
+                    rocm_idle = rocm_idle ||
+                        rocm_progress_epoch_->stats().idle_submission_skips >
+                            rocm_before;
+                    if (!cuda_idle || !rocm_idle)
+                        std::this_thread::yield();
+                }
+                return cuda_idle && rocm_idle;
+            }
+
+            /** @return Source/destination retained-epoch proof counters. */
+            [[nodiscard]] std::pair<
+                MappedTransferProgressEpochStats,
+                MappedTransferProgressEpochStats>
+            blobProgressStats() const noexcept
+            {
+                return {
+                    cuda_progress_epoch_->stats(),
+                    rocm_progress_epoch_->stats(),
+                };
             }
 
             /** @brief Verify all nine final projection representations exactly. */
@@ -956,8 +1133,12 @@ namespace llaminar2
                     total.bytes_submitted += stats.bytes_submitted;
                     total.source_d2h_submissions +=
                         stats.source_d2h_submissions;
+                    total.source_progress_kernel_submissions +=
+                        stats.source_progress_kernel_submissions;
                     total.destination_h2d_submissions +=
                         stats.destination_h2d_submissions;
+                    total.destination_progress_kernel_submissions +=
+                        stats.destination_progress_kernel_submissions;
                     total.host_relay_copies += stats.host_relay_copies;
                     total.host_relay_bytes += stats.host_relay_bytes;
                     total.pending_event_polls += stats.pending_event_polls;
@@ -983,7 +1164,7 @@ namespace llaminar2
                         continue;
                     const auto stats = flow->blob_lane->stats();
                     if (!stats.last_measurement.valid() ||
-                        stats.last_measurement.device_nanoseconds == 0u ||
+                        stats.last_measurement.device_nanoseconds != 0u ||
                         stats.last_measurement.host_nanoseconds == 0u)
                         return false;
                 }
@@ -1023,6 +1204,10 @@ namespace llaminar2
             void *rocm_observation_stream_ = nullptr;
             void *cuda_source_ready_ = nullptr;
             void *rocm_source_ready_ = nullptr;
+            std::shared_ptr<MappedTransferProgressEpoch>
+                cuda_progress_epoch_;
+            std::shared_ptr<MappedTransferProgressEpoch>
+                rocm_progress_epoch_;
             bool initialized_ = false;
             bool started_ = false;
         };
@@ -1703,7 +1888,7 @@ namespace llaminar2
                 std::chrono::steady_clock::now() + std::chrono::seconds(30);
             while (std::chrono::steady_clock::now() < deadline &&
                    progress.status !=
-                       MoEOverlayResidencyApplyStatus::Committed &&
+                       MoEOverlayResidencyApplyStatus::Published &&
                    progress.ok())
             {
                 if (cuda_event_recorded)
@@ -1732,7 +1917,7 @@ namespace llaminar2
                 << "Independent CUDA work did not finish during the two-tier wave";
             ASSERT_EQ(
                 progress.status,
-                MoEOverlayResidencyApplyStatus::Committed)
+                MoEOverlayResidencyApplyStatus::Published)
                 << progress.error;
             ASSERT_EQ(authority.snapshot()->epoch, 2u);
             ASSERT_TRUE(old_ticket.has_value());
@@ -1780,7 +1965,10 @@ namespace llaminar2
                 authority.advanceBackground().status,
                 MoEOverlayResidencyApplyStatus::Idle);
             EXPECT_EQ(authority.pendingRetirementCount(), 0u);
-            EXPECT_EQ(factory.bank_observations->commits_started, 1u);
+            EXPECT_EQ(factory.bank_observations->preparations_started, 1u);
+            EXPECT_EQ(factory.bank_observations->preparation_polls, 2u);
+            EXPECT_EQ(factory.bank_observations->publications_started, 1u);
+            EXPECT_EQ(factory.bank_observations->publication_polls, 1u);
             EXPECT_EQ(factory.bank_observations->retires, 1u);
 
             cuda->destroyEvent(cuda_done, 0);
@@ -1865,6 +2053,7 @@ namespace llaminar2
                 return;
             }
 
+            bool progress_launches_ok = factory.launchBlobProgress();
             const bool cuda_work_enqueued =
                 cuda_witness.enqueue(cuda_inference_stream);
             const bool rocm_work_enqueued =
@@ -1881,7 +2070,7 @@ namespace llaminar2
             const auto deadline =
                 std::chrono::steady_clock::now() + std::chrono::seconds(30);
             while (std::chrono::steady_clock::now() < deadline &&
-                   progress.status != MoEOverlayResidencyApplyStatus::Committed &&
+                   progress.status != MoEOverlayResidencyApplyStatus::Published &&
                    progress.ok())
             {
                 if (cuda_event_recorded)
@@ -1893,6 +2082,8 @@ namespace llaminar2
                 {
                     both_devices_ready_during_migration = true;
                 }
+                progress_launches_ok = factory.launchBlobProgress() &&
+                                       progress_launches_ok;
                 progress = authority.advanceBackground();
                 std::this_thread::yield();
             }
@@ -1904,10 +2095,16 @@ namespace llaminar2
             while (authority.pendingAbortCount() != 0 &&
                    std::chrono::steady_clock::now() < deadline)
             {
+                progress_launches_ok = factory.launchBlobProgress() &&
+                                       progress_launches_ok;
                 (void)authority.advanceBackground();
                 std::this_thread::yield();
             }
+            const bool progress_epochs_quiescent =
+                factory.drainBlobProgress(deadline);
 
+            EXPECT_TRUE(progress_launches_ok);
+            EXPECT_TRUE(progress_epochs_quiescent);
             EXPECT_TRUE(cuda_work_enqueued);
             EXPECT_TRUE(rocm_work_enqueued);
             EXPECT_TRUE(cuda_event_recorded);
@@ -1918,7 +2115,7 @@ namespace llaminar2
                 << "Independent CUDA/ROCm work did not finish while migration remained pending";
             ASSERT_EQ(
                 progress.status,
-                MoEOverlayResidencyApplyStatus::Committed)
+                MoEOverlayResidencyApplyStatus::Published)
                 << progress.error;
             ASSERT_EQ(authority.snapshot()->epoch, 2u);
             ASSERT_TRUE(old_ticket.has_value());
@@ -1957,12 +2154,30 @@ namespace llaminar2
             EXPECT_EQ(blob_stats.transfers_started, 3u);
             EXPECT_EQ(blob_stats.transfers_completed, 3u);
             EXPECT_EQ(blob_stats.chunks_submitted, blob_stats.chunks_completed);
+            EXPECT_EQ(
+                blob_stats.source_progress_kernel_submissions,
+                blob_stats.chunks_submitted);
+            EXPECT_EQ(
+                blob_stats.destination_progress_kernel_submissions,
+                blob_stats.chunks_submitted);
             EXPECT_GT(blob_stats.host_relay_bytes, 0u);
             EXPECT_EQ(blob_stats.failed_transfers, 0u);
             EXPECT_EQ(blob_stats.timing_measurement_failures, 0u);
             EXPECT_TRUE(factory.allBlobMeasurementsValid());
             EXPECT_EQ(blob_stats.inference_stream_waits, 0u);
             EXPECT_EQ(blob_stats.blocking_synchronizations, 0u);
+            const auto [cuda_progress_stats, rocm_progress_stats] =
+                factory.blobProgressStats();
+            EXPECT_EQ(
+                cuda_progress_stats.commands_completed,
+                blob_stats.chunks_submitted);
+            EXPECT_EQ(
+                rocm_progress_stats.commands_completed,
+                blob_stats.chunks_submitted);
+            EXPECT_GT(cuda_progress_stats.dma_submissions, 0u);
+            EXPECT_GT(rocm_progress_stats.dma_submissions, 0u);
+            EXPECT_EQ(cuda_progress_stats.command_failures, 0u);
+            EXPECT_EQ(rocm_progress_stats.command_failures, 0u);
 
             EXPECT_EQ(movementCounter("committed_expert_migrations"), 3.0);
             EXPECT_EQ(movementCounter("promotions"), 1.0);
@@ -1971,7 +2186,7 @@ namespace llaminar2
             EXPECT_EQ(movementCounter("tier_transfers_completed"), 6.0);
             EXPECT_EQ(
                 movementCounter(
-                    "heterogeneous_gpu_blob_transfers_completed"),
+                    "gpu_host_relay_transfers_completed"),
                 3.0);
 
             old_ticket.reset();
@@ -1979,7 +2194,10 @@ namespace llaminar2
                 authority.advanceBackground().status,
                 MoEOverlayResidencyApplyStatus::Idle);
             EXPECT_EQ(authority.pendingRetirementCount(), 0u);
-            EXPECT_EQ(factory.bank_observations->commits_started, 1u);
+            EXPECT_EQ(factory.bank_observations->preparations_started, 1u);
+            EXPECT_EQ(factory.bank_observations->preparation_polls, 2u);
+            EXPECT_EQ(factory.bank_observations->publications_started, 1u);
+            EXPECT_EQ(factory.bank_observations->publication_polls, 1u);
             EXPECT_EQ(factory.bank_observations->retires, 1u);
 
             cuda->destroyEvent(cuda_done, 0);

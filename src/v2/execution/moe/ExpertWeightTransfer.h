@@ -515,7 +515,7 @@ namespace llaminar2
                         if (bytes == 0)
                             continue;
                         if (!NUMAAllocator::instance().
-                                bindUntouchedExternalRangeToNode(
+                                prepareExternalReceiveRangeOnNode(
                                     entry.targets[projection].data[section],
                                     bytes,
                                     target_numa_node))

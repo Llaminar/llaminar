@@ -432,28 +432,26 @@ namespace
         // Verify ROCm devices are correctly preserved
         RankExecutionPlan plan = createSimplePlan();
         plan.primary_device = GlobalDeviceAddress::parse("0:rocm:0");
-        plan.primary_device_numa_explicit = true;
 
         OrchestrationRunner runner(OrchestrationConfig{}, plan);
 
         const auto &returned = runner.executionPlan();
         EXPECT_EQ(returned.primary_device.device_type, DeviceType::ROCm);
-        EXPECT_TRUE(returned.primary_device_numa_explicit)
+        EXPECT_TRUE(returned.hasResolvedPrimaryDeviceNuma())
             << "Strict NUMA intent should be preserved in runner-facing execution plan";
     }
 
-    TEST_F(Test__OrchestrationRunner, ExecutionPlanAmbiguousDevice_HasNumaExplicitFalse)
+    TEST_F(Test__OrchestrationRunner, ExecutionPlanUnresolvedDeviceLeavesNumaUnconstrained)
     {
         RankExecutionPlan plan = createSimplePlan();
         plan.primary_device = GlobalDeviceAddress::parse("rocm:0");
-        plan.primary_device_numa_explicit = false;
 
         OrchestrationRunner runner(OrchestrationConfig{}, plan);
 
         const auto &returned = runner.executionPlan();
         EXPECT_EQ(returned.primary_device.device_type, DeviceType::ROCm);
-        EXPECT_FALSE(returned.primary_device_numa_explicit)
-            << "Ambiguous device intent should remain non-explicit in runner-facing execution plan";
+        EXPECT_FALSE(returned.hasResolvedPrimaryDeviceNuma())
+            << "Unresolved shorthand must remain unconstrained in the runner-facing execution plan";
     }
 
     TEST_F(Test__OrchestrationRunner, CpuShorthandMappedPlan_ExposesGlobalTPFields)
@@ -464,7 +462,6 @@ namespace
         plan.hostname = "localhost";
         plan.numa_node = 1;
         plan.primary_device = GlobalDeviceAddress::cpu(1, "localhost");
-        plan.primary_device_numa_explicit = true;
 
         plan.tp_scope = TPScope::GLOBAL;
         plan.global_tp_domain_id = 0;
@@ -481,7 +478,7 @@ namespace
         const auto &returned = runner.executionPlan();
         EXPECT_TRUE(returned.primary_device.isCPU());
         EXPECT_EQ(returned.primary_device.numa_node, 1);
-        EXPECT_TRUE(returned.primary_device_numa_explicit);
+        EXPECT_TRUE(returned.hasResolvedPrimaryDeviceNuma());
 
         EXPECT_EQ(returned.tp_scope, TPScope::GLOBAL);
         EXPECT_TRUE(returned.usesGlobalTP());

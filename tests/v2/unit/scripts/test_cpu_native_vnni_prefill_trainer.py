@@ -1288,7 +1288,7 @@ class CPUNativeVNNIPrefillTrainerTest(unittest.TestCase):
         self.assertTrue(manifest.include_all_production_shapes)
         self.assertEqual(
             manifest.digest(),
-            "sha256:c00d62aaf41adca2b3a5f12e92e57e0263c2eaf547154fb5b5faf7c51e4d2e58",
+            "sha256:f66ec74e78387098e0f77a2a1e4a2898d8d72be88393de4dff51663f991626fe",
         )
         self.assertEqual(manifest.sealed_m_values, (64, 128, 256, 512))
 

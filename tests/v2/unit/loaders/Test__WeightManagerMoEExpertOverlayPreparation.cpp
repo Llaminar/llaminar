@@ -22,6 +22,7 @@
 #include <cstring>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2::test
@@ -188,6 +189,8 @@ namespace
         plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan->continuation_domain = "cpu_cold";
         plan->shared_expert_domain = "cpu_cold";
+        plan->continuation_domain_spec.setDensePolicy(
+            DenseParallelPolicy::TensorParallel);
         plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan->domains = {
             domainWith("cpu_cold", ExecutionDomainScope::NODE_LOCAL,
@@ -220,6 +223,8 @@ namespace
         plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
         plan->continuation_domain = "cpu_cold";
         plan->shared_expert_domain = "cpu_cold";
+        plan->continuation_domain_spec.setDensePolicy(
+            DenseParallelPolicy::TensorParallel);
         plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
         plan->domains = {
             domainWith(
@@ -358,8 +363,11 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation,
     const auto *worker_request = worker_filtered.requestForParticipant(
         "cpu_cold", DeviceId::cpu(), 1, 1, 0, 4, Role::GATE);
     ASSERT_NE(worker_request, nullptr);
-    EXPECT_EQ(worker_request->residency_category, WeightResidencyCategory::WorkerFallbackExpert);
-    EXPECT_NE(worker_filtered.diagnostics().render().find("worker="), std::string::npos);
+    EXPECT_TRUE(rank1->hasRole(OverlayRankRole::ContinuationParticipant));
+    EXPECT_EQ(worker_request->residency_category,
+              WeightResidencyCategory::CpuFallbackExpert);
+    EXPECT_NE(worker_filtered.diagnostics().render().find("fallback="),
+              std::string::npos);
     EXPECT_EQ(worker_filtered.diagnostics().render().find("AcceleratorRoutedExpert"), std::string::npos);
 }
 
@@ -448,6 +456,27 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, FiltersRequestsToOneGraphPa
     EXPECT_TRUE(cpu.hasCpuRoutedAssignments());
     EXPECT_TRUE(cpu.shouldPrepare(DeviceId::cpu(), 0, 2, Role::DOWN));
     EXPECT_FALSE(cpu.shouldPrepare(DeviceId::rocm(0), 0, 1, Role::DOWN));
+
+    const auto heterogeneous_root = rank_wide.filteredForDevices(
+        {DeviceId::cuda(0), DeviceId::cpu()});
+    EXPECT_TRUE(heterogeneous_root.hasAcceleratorRequests());
+    EXPECT_TRUE(heterogeneous_root.hasCpuRoutedAssignments());
+    EXPECT_EQ(
+        heterogeneous_root.acceleratorDevices(),
+        (std::vector<DeviceId>{DeviceId::cuda(0)}));
+    EXPECT_TRUE(heterogeneous_root.shouldPrepare(
+        DeviceId::cuda(0), 0, 0, Role::GATE));
+    EXPECT_TRUE(heterogeneous_root.shouldPrepare(
+        DeviceId::cpu(), 0, 2, Role::DOWN));
+    EXPECT_FALSE(heterogeneous_root.shouldPrepare(
+        DeviceId::rocm(0), 0, 1, Role::GATE));
+    EXPECT_THROW(
+        rank_wide.filteredForDevices({}),
+        std::invalid_argument);
+    EXPECT_THROW(
+        rank_wide.filteredForDevices(
+            {DeviceId::cuda(0), DeviceId::cuda(0)}),
+        std::invalid_argument);
 }
 
 TEST(Test__WeightManagerMoEExpertOverlayPreparation, SmallModelBudgetKeepsCudaPartialUnlessUncapped)

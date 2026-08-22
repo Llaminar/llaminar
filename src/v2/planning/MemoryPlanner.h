@@ -60,25 +60,50 @@ enum class AdditionalPersistentWeightSet
 {
     /** Full non-routed dense/shared/global decode view on each TP participant. */
     ReplicatedDenseDecode,
+    /** Full-vocabulary embedding retained beside the primary TP shard. */
+    MirroredDecodeEmbedding,
+    /** Full-vocabulary MTP terminal head retained beside the primary TP shard. */
+    MirroredMTPTerminalHead,
 };
 
 /**
  * @brief Resolve extra persistent sets implied by one dense execution policy.
  * @param policy Declarative dense/shared execution policy.
  * @param tensor_parallel_degree Number of participants in the primary view.
+ * @param mtp_enabled Whether a speculative sidecar is retained.
+ * @param mtp_terminal_logits_layout Exact participant-local MTP head layout.
  * @return Complete, duplicate-free list of additional physical weight sets.
  */
 [[nodiscard]] inline std::vector<AdditionalPersistentWeightSet>
 resolveAdditionalPersistentWeightSets(
     DenseParallelPolicy policy,
-    int tensor_parallel_degree)
+    int tensor_parallel_degree,
+    bool mtp_enabled = false,
+    MTPTerminalLogitsLayout mtp_terminal_logits_layout =
+        MTPTerminalLogitsLayout::VocabularyShardPerParticipant)
 {
-    if (tensor_parallel_degree > 1 &&
-        denseParallelPolicyReplicatesDecode(policy))
-    {
+    if (tensor_parallel_degree <= 1)
+        return {};
+    if (denseParallelPolicyReplicatesDecode(policy))
         return {AdditionalPersistentWeightSet::ReplicatedDenseDecode};
+
+    std::vector<AdditionalPersistentWeightSet> sets;
+    const bool mirrored_mtp_head =
+        mtp_enabled &&
+        mtp_terminal_logits_layout ==
+            MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+    if (denseParallelPolicyMirrorsDecodeEmbedding(policy) ||
+        mirrored_mtp_head)
+    {
+        sets.push_back(
+            AdditionalPersistentWeightSet::MirroredDecodeEmbedding);
     }
-    return {};
+    if (mirrored_mtp_head)
+    {
+        sets.push_back(
+            AdditionalPersistentWeightSet::MirroredMTPTerminalHead);
+    }
+    return sets;
 }
 
 /**

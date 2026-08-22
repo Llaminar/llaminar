@@ -33,10 +33,14 @@ namespace llaminar2
         std::atomic<std::uint64_t> stage_consensus_ready{0};
         std::atomic<std::uint64_t> stage_consensus_deferred{0};
         std::atomic<std::uint64_t> stage_consensus_failed{0};
-        std::atomic<std::uint64_t> commit_consensus_started{0};
-        std::atomic<std::uint64_t> commit_consensus_ready{0};
-        std::atomic<std::uint64_t> commit_consensus_failed{0};
-        std::atomic<std::uint64_t> local_commit_begin_failed{0};
+        std::atomic<std::uint64_t> preparation_consensus_started{0};
+        std::atomic<std::uint64_t> preparation_consensus_ready{0};
+        std::atomic<std::uint64_t> preparation_consensus_failed{0};
+        std::atomic<std::uint64_t> local_preparation_begin_failed{0};
+        std::atomic<std::uint64_t> publication_consensus_started{0};
+        std::atomic<std::uint64_t> publication_consensus_ready{0};
+        std::atomic<std::uint64_t> publication_consensus_failed{0};
+        std::atomic<std::uint64_t> local_publication_begin_failed{0};
         std::atomic<std::uint64_t> retirement_consensus_started{0};
         std::atomic<std::uint64_t> retirement_consensus_ready{0};
         std::atomic<std::uint64_t> retirement_consensus_failed{0};
@@ -54,8 +58,10 @@ namespace llaminar2
         {
             LocalReservation = 2101,
             LocalStagePoll = 2102,
-            LocalCommitBegin = 2103,
-            LocalCommitPoll = 2104,
+            LocalPreparationBegin = 2103,
+            LocalPreparationPoll = 2104,
+            LocalPublicationBegin = 2105,
+            LocalPublicationPoll = 2106,
         };
 
         /** @brief Assign an optional caller diagnostic. */
@@ -485,76 +491,76 @@ namespace llaminar2
                 return stage_interval_;
             }
 
-            /** @brief Start local commit but defer every outcome to commit vote. */
-            bool beginCommit(std::string *error) noexcept override
+            /** @brief Start local preparation but defer every outcome to its vote. */
+            bool beginPrepare(std::string *error) noexcept override
             {
-                if (!stage_ready_ || commit_started_ || aborted_ || published_)
+                if (!stage_ready_ || prepare_started_ || aborted_ || published_)
                 {
                     setDistributedError(
                         error,
-                        "Distributed residency commit has an invalid lifecycle state");
+                        "Distributed residency preparation has an invalid lifecycle state");
                     return false;
                 }
 
-                commit_started_ = true;
+                prepare_started_ = true;
                 std::string local_error;
-                if (!local_wave_->beginCommit(&local_error))
+                if (!local_wave_->beginPrepare(&local_error))
                 {
-                    local_commit_begin_failed_ = true;
-                    local_commit_error_ = local_error.empty()
-                                              ? "Local inactive-bank commit failed to start"
+                    local_prepare_begin_failed_ = true;
+                    local_prepare_error_ = local_error.empty()
+                                              ? "Local inactive-bank preparation failed to start"
                                               : std::move(local_error);
-                    stats_->local_commit_begin_failed.fetch_add(
+                    stats_->local_preparation_begin_failed.fetch_add(
                         1,
                         std::memory_order_relaxed);
                 }
                 /*
                  * Returning true is essential: a local enqueue failure must be
                  * exchanged as a Failed vote while every peer enters the same
-                 * commit collective. Returning false here would strand peers.
+                 * preparation collective. Returning false here would strand peers.
                  */
                 if (error)
                     error->clear();
                 return true;
             }
 
-            /** @brief Poll local commit, then the all-rank commit vote. */
-            MoEOverlayResidencyWaveProgress pollCommit(
+            /** @brief Poll local preparation, then the all-rank preparation vote. */
+            MoEOverlayResidencyWaveProgress pollPrepare(
                 std::string *error) noexcept override
             {
-                if (!commit_started_ || aborted_ || published_)
+                if (!prepare_started_ || aborted_ || published_)
                 {
                     setDistributedError(
                         error,
-                        "Distributed residency commit was polled in an invalid lifecycle state");
+                        "Distributed residency preparation was polled in an invalid lifecycle state");
                     return MoEOverlayResidencyWaveProgress::Failed;
                 }
-                if (commit_ready_)
+                if (prepare_ready_)
                     return MoEOverlayResidencyWaveProgress::Ready;
-                if (commit_failed_)
+                if (prepare_failed_)
                 {
                     setDistributedError(error, terminal_error_);
                     return MoEOverlayResidencyWaveProgress::Failed;
                 }
 
-                if (!commit_consensus_started_)
+                if (!prepare_consensus_started_)
                 {
                     auto decision =
                         MoEOverlayDistributedResidencyVoteDecision::Ready;
                     int error_code = 0;
                     std::string diagnostic;
-                    if (local_commit_begin_failed_)
+                    if (local_prepare_begin_failed_)
                     {
                         decision =
                             MoEOverlayDistributedResidencyVoteDecision::Failed;
                         error_code = static_cast<int>(
-                            DistributedResidencyError::LocalCommitBegin);
-                        diagnostic = local_commit_error_;
+                            DistributedResidencyError::LocalPreparationBegin);
+                        diagnostic = local_prepare_error_;
                     }
                     else
                     {
                         std::string local_error;
-                        const auto progress = local_wave_->pollCommit(&local_error);
+                        const auto progress = local_wave_->pollPrepare(&local_error);
                         if (progress ==
                             MoEOverlayResidencyWaveProgress::Pending)
                         {
@@ -566,9 +572,9 @@ namespace llaminar2
                             decision =
                                 MoEOverlayDistributedResidencyVoteDecision::Failed;
                             error_code = static_cast<int>(
-                                DistributedResidencyError::LocalCommitPoll);
+                                DistributedResidencyError::LocalPreparationPoll);
                             diagnostic = local_error.empty()
-                                             ? "Local inactive-bank commit failed"
+                                             ? "Local inactive-bank preparation failed"
                                              : std::move(local_error);
                         }
                     }
@@ -581,13 +587,13 @@ namespace llaminar2
                             diagnostic);
                         if (!consensus_->begin(vote, &terminal_error_))
                         {
-                            commit_failed_ = true;
+                            prepare_failed_ = true;
                             if (terminal_error_.empty())
                             {
                                 terminal_error_ =
-                                    "Failed to begin distributed ExpertOverlay commit consensus";
+                                    "Failed to begin distributed ExpertOverlay preparation consensus";
                             }
-                            stats_->commit_consensus_failed.fetch_add(
+                            stats_->preparation_consensus_failed.fetch_add(
                                 1,
                                 std::memory_order_relaxed);
                             setDistributedError(error, terminal_error_);
@@ -596,16 +602,16 @@ namespace llaminar2
                     }
                     catch (const std::exception &exception)
                     {
-                        commit_failed_ = true;
+                        prepare_failed_ = true;
                         terminal_error_ = exception.what();
-                        stats_->commit_consensus_failed.fetch_add(
+                        stats_->preparation_consensus_failed.fetch_add(
                             1,
                             std::memory_order_relaxed);
                         setDistributedError(error, terminal_error_);
                         return MoEOverlayResidencyWaveProgress::Failed;
                     }
-                    commit_consensus_started_ = true;
-                    stats_->commit_consensus_started.fetch_add(
+                    prepare_consensus_started_ = true;
+                    stats_->preparation_consensus_started.fetch_add(
                         1,
                         std::memory_order_relaxed);
                 }
@@ -621,8 +627,8 @@ namespace llaminar2
                 if (consensus_progress ==
                     MoEOverlayResidencyWaveProgress::Failed)
                 {
-                    commit_failed_ = true;
-                    stats_->commit_consensus_failed.fetch_add(
+                    prepare_failed_ = true;
+                    stats_->preparation_consensus_failed.fetch_add(
                         1,
                         std::memory_order_relaxed);
                     setDistributedError(error, terminal_error_);
@@ -632,23 +638,174 @@ namespace llaminar2
                 std::string protocol_error;
                 if (!protocol_.acceptConsensus(votes, &protocol_error))
                 {
-                    commit_failed_ = true;
+                    prepare_failed_ = true;
                     terminal_error_ = protocol_error.empty()
-                                          ? "Distributed ExpertOverlay commit consensus failed"
+                                          ? "Distributed ExpertOverlay preparation consensus failed"
                                           : std::move(protocol_error);
-                    stats_->commit_consensus_failed.fetch_add(
+                    stats_->preparation_consensus_failed.fetch_add(
                         1,
                         std::memory_order_relaxed);
                     setDistributedError(error, terminal_error_);
-                    recordCounter("distributed_commit_failed");
+                    recordCounter("distributed_preparation_failed");
                     return MoEOverlayResidencyWaveProgress::Failed;
                 }
 
-                commit_ready_ = true;
-                stats_->commit_consensus_ready.fetch_add(
+                prepare_ready_ = true;
+                stats_->preparation_consensus_ready.fetch_add(
                     1,
                     std::memory_order_relaxed);
-                recordCounter("distributed_commit_ready");
+                recordCounter("distributed_preparation_ready");
+                if (error)
+                    error->clear();
+                return MoEOverlayResidencyWaveProgress::Ready;
+            }
+
+            /** @brief Start local selector publication and retain its global vote. */
+            bool beginPublication(std::string *error) noexcept override
+            {
+                if (!prepare_ready_ || publication_started_ || aborted_ ||
+                    published_)
+                {
+                    setDistributedError(
+                        error,
+                        "Distributed residency publication has an invalid lifecycle state");
+                    return false;
+                }
+
+                publication_started_ = true;
+                std::string local_error;
+                if (!local_wave_->beginPublication(&local_error))
+                {
+                    local_publication_begin_failed_ = true;
+                    local_publication_error_ = local_error.empty()
+                                                   ? "Local runtime publication failed to start"
+                                                   : std::move(local_error);
+                    stats_->local_publication_begin_failed.fetch_add(
+                        1,
+                        std::memory_order_relaxed);
+                }
+                /* Every rank must still enter the publication vote. */
+                if (error)
+                    error->clear();
+                return true;
+            }
+
+            /** @brief Poll local selectors, then prove publication on all ranks. */
+            MoEOverlayResidencyWaveProgress pollPublication(
+                std::string *error) noexcept override
+            {
+                if (!publication_started_ || aborted_ || published_)
+                {
+                    setDistributedError(
+                        error,
+                        "Distributed residency publication was polled in an invalid lifecycle state");
+                    return MoEOverlayResidencyWaveProgress::Failed;
+                }
+                if (publication_ready_)
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                if (publication_failed_)
+                {
+                    setDistributedError(error, terminal_error_);
+                    return MoEOverlayResidencyWaveProgress::Failed;
+                }
+
+                if (!publication_consensus_started_)
+                {
+                    auto decision =
+                        MoEOverlayDistributedResidencyVoteDecision::Ready;
+                    int error_code = 0;
+                    std::string diagnostic;
+                    if (local_publication_begin_failed_)
+                    {
+                        decision =
+                            MoEOverlayDistributedResidencyVoteDecision::Failed;
+                        error_code = static_cast<int>(
+                            DistributedResidencyError::LocalPublicationBegin);
+                        diagnostic = local_publication_error_;
+                    }
+                    else
+                    {
+                        std::string local_error;
+                        const auto progress =
+                            local_wave_->pollPublication(&local_error);
+                        if (progress == MoEOverlayResidencyWaveProgress::Pending)
+                            return progress;
+                        if (progress != MoEOverlayResidencyWaveProgress::Ready)
+                        {
+                            decision =
+                                MoEOverlayDistributedResidencyVoteDecision::Failed;
+                            error_code = static_cast<int>(
+                                DistributedResidencyError::LocalPublicationPoll);
+                            diagnostic = local_error.empty()
+                                             ? "Local runtime publication failed"
+                                             : std::move(local_error);
+                        }
+                    }
+
+                    try
+                    {
+                        const auto vote = protocol_.makeLocalVote(
+                            decision, error_code, diagnostic);
+                        if (!consensus_->begin(vote, &terminal_error_))
+                        {
+                            publication_failed_ = true;
+                            if (terminal_error_.empty())
+                            {
+                                terminal_error_ =
+                                    "Failed to begin distributed ExpertOverlay publication consensus";
+                            }
+                            stats_->publication_consensus_failed.fetch_add(
+                                1, std::memory_order_relaxed);
+                            setDistributedError(error, terminal_error_);
+                            return MoEOverlayResidencyWaveProgress::Failed;
+                        }
+                    }
+                    catch (const std::exception &exception)
+                    {
+                        publication_failed_ = true;
+                        terminal_error_ = exception.what();
+                        stats_->publication_consensus_failed.fetch_add(
+                            1, std::memory_order_relaxed);
+                        setDistributedError(error, terminal_error_);
+                        return MoEOverlayResidencyWaveProgress::Failed;
+                    }
+                    publication_consensus_started_ = true;
+                    stats_->publication_consensus_started.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+
+                std::vector<MoEOverlayDistributedResidencyVote> votes;
+                const auto progress =
+                    consensus_->poll(&votes, &terminal_error_);
+                if (progress == MoEOverlayResidencyWaveProgress::Pending)
+                    return progress;
+                if (progress == MoEOverlayResidencyWaveProgress::Failed)
+                {
+                    publication_failed_ = true;
+                    stats_->publication_consensus_failed.fetch_add(
+                        1, std::memory_order_relaxed);
+                    setDistributedError(error, terminal_error_);
+                    return progress;
+                }
+
+                std::string protocol_error;
+                if (!protocol_.acceptConsensus(votes, &protocol_error))
+                {
+                    publication_failed_ = true;
+                    terminal_error_ = protocol_error.empty()
+                                          ? "Distributed ExpertOverlay publication consensus failed"
+                                          : std::move(protocol_error);
+                    stats_->publication_consensus_failed.fetch_add(
+                        1, std::memory_order_relaxed);
+                    setDistributedError(error, terminal_error_);
+                    recordCounter("distributed_publication_failed");
+                    return MoEOverlayResidencyWaveProgress::Failed;
+                }
+
+                publication_ready_ = true;
+                stats_->publication_consensus_ready.fetch_add(
+                    1, std::memory_order_relaxed);
+                recordCounter("distributed_publication_ready");
                 if (error)
                     error->clear();
                 return MoEOverlayResidencyWaveProgress::Ready;
@@ -750,11 +907,12 @@ namespace llaminar2
             }
 
             /** @brief Record the authority's exact successful publication edge. */
-            void markPublished() noexcept override
+            void markAuthorityPublished() noexcept override
             {
-                if (published_ || aborted_ || !commit_ready_ ||
+                if (published_ || aborted_ || !publication_ready_ ||
                     protocol_.state() !=
-                        MoEOverlayDistributedResidencyProtocolState::ReadyToPublish)
+                        MoEOverlayDistributedResidencyProtocolState::
+                            ReadyForAuthorityPublication)
                 {
                     LOG_ERROR(
                         "[DistributedResidencyWave] Invalid markPublished lifecycle");
@@ -762,7 +920,7 @@ namespace llaminar2
                 }
                 try
                 {
-                    protocol_.markPublished();
+                    protocol_.markAuthorityPublished();
                 }
                 catch (...)
                 {
@@ -794,6 +952,35 @@ namespace llaminar2
                 {
                     setDistributedError(error, terminal_error_);
                     return MoEOverlayResidencyWaveProgress::Failed;
+                }
+
+                /*
+                 * Device readers are a process-local grace period distinct
+                 * from host ticket leases. Complete that exact event-polled
+                 * fence before voting, otherwise another rank could reclaim
+                 * source storage while this rank still has an old GPU bank.
+                 */
+                if (!local_retirement_ready_)
+                {
+                    std::string local_error;
+                    const auto local_progress =
+                        local_wave_->pollRetirementFence(&local_error);
+                    if (local_progress ==
+                        MoEOverlayResidencyWaveProgress::Pending)
+                    {
+                        return local_progress;
+                    }
+                    if (local_progress !=
+                        MoEOverlayResidencyWaveProgress::Ready)
+                    {
+                        retirement_failed_ = true;
+                        terminal_error_ = local_error.empty()
+                                              ? "Local device retirement fence failed"
+                                              : std::move(local_error);
+                        setDistributedError(error, terminal_error_);
+                        return MoEOverlayResidencyWaveProgress::Failed;
+                    }
+                    local_retirement_ready_ = true;
                 }
 
                 if (!retirement_consensus_started_)
@@ -939,7 +1126,8 @@ namespace llaminar2
             std::uint64_t candidate_epoch_ = 0;
             std::chrono::steady_clock::time_point wave_started_at_{};
             MoEOverlayResidencyWaveInterval stage_interval_{};
-            std::string local_commit_error_;
+            std::string local_prepare_error_;
+            std::string local_publication_error_;
             std::string terminal_error_;
             bool stage_dispatch_started_ = false;
             bool reservation_consensus_started_ = false;
@@ -948,11 +1136,17 @@ namespace llaminar2
             bool stage_ready_ = false;
             bool stage_deferred_ = false;
             bool stage_failed_ = false;
-            bool commit_started_ = false;
-            bool local_commit_begin_failed_ = false;
-            bool commit_consensus_started_ = false;
-            bool commit_ready_ = false;
-            bool commit_failed_ = false;
+            bool prepare_started_ = false;
+            bool local_prepare_begin_failed_ = false;
+            bool prepare_consensus_started_ = false;
+            bool prepare_ready_ = false;
+            bool prepare_failed_ = false;
+            bool publication_started_ = false;
+            bool local_publication_begin_failed_ = false;
+            bool publication_consensus_started_ = false;
+            bool publication_ready_ = false;
+            bool publication_failed_ = false;
+            bool local_retirement_ready_ = false;
             bool retirement_consensus_started_ = false;
             bool retirement_ready_ = false;
             bool retirement_failed_ = false;
@@ -1094,14 +1288,29 @@ namespace llaminar2
                 stats_->stage_consensus_deferred.load(std::memory_order_relaxed),
             .stage_consensus_failed =
                 stats_->stage_consensus_failed.load(std::memory_order_relaxed),
-            .commit_consensus_started =
-                stats_->commit_consensus_started.load(std::memory_order_relaxed),
-            .commit_consensus_ready =
-                stats_->commit_consensus_ready.load(std::memory_order_relaxed),
-            .commit_consensus_failed =
-                stats_->commit_consensus_failed.load(std::memory_order_relaxed),
-            .local_commit_begin_failed =
-                stats_->local_commit_begin_failed.load(
+            .preparation_consensus_started =
+                stats_->preparation_consensus_started.load(
+                    std::memory_order_relaxed),
+            .preparation_consensus_ready =
+                stats_->preparation_consensus_ready.load(
+                    std::memory_order_relaxed),
+            .preparation_consensus_failed =
+                stats_->preparation_consensus_failed.load(
+                    std::memory_order_relaxed),
+            .local_preparation_begin_failed =
+                stats_->local_preparation_begin_failed.load(
+                    std::memory_order_relaxed),
+            .publication_consensus_started =
+                stats_->publication_consensus_started.load(
+                    std::memory_order_relaxed),
+            .publication_consensus_ready =
+                stats_->publication_consensus_ready.load(
+                    std::memory_order_relaxed),
+            .publication_consensus_failed =
+                stats_->publication_consensus_failed.load(
+                    std::memory_order_relaxed),
+            .local_publication_begin_failed =
+                stats_->local_publication_begin_failed.load(
                     std::memory_order_relaxed),
             .retirement_consensus_started =
                 stats_->retirement_consensus_started.load(

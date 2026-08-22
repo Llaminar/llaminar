@@ -232,7 +232,8 @@ namespace llaminar2
              params_.clear_output_before_scatter ||
              params_.broadcast_after_scatter ||
              params_.publish_ticket_completion ||
-             params_.release_residency_lease_on_completion))
+             params_.residency_lease_terminal ==
+                 MoEOverlayHostDispatchLeaseTerminal::Release))
         {
             LOG_ERROR("[MoESparseReturnReduceStage] Protocol-only participant "
                       "cannot own dense output, a captured ticket, broadcast, "
@@ -425,14 +426,32 @@ namespace llaminar2
                 prof_broadcast_ms);
         }
 
-        if (params_.release_residency_lease_on_completion)
+        if (params_.residency_lease_terminal ==
+            MoEOverlayHostDispatchLeaseTerminal::Release)
         {
             if (!last_collective_result_.collective_complete ||
                 !params_.dispatch_output_lifetime ||
                 !params_.dispatch_output_lifetime->residency_lease ||
                 params_.dispatch_output_lifetime->residency_epoch == 0)
             {
-                LOG_ERROR("[MoESparseReturnReduceStage] Final return cannot release a missing or incomplete residency lease");
+                LOG_ERROR(
+                    "[MoESparseReturnReduceStage] Final return cannot release "
+                    "a missing or incomplete residency lease"
+                    << " collective_complete="
+                    << last_collective_result_.collective_complete
+                    << " dispatch_output="
+                    << static_cast<const void *>(
+                           params_.dispatch_output_lifetime.get())
+                    << " lease_present="
+                    << (params_.dispatch_output_lifetime &&
+                        params_.dispatch_output_lifetime->residency_lease
+                            ? "true"
+                            : "false")
+                    << " epoch="
+                    << (params_.dispatch_output_lifetime
+                            ? params_.dispatch_output_lifetime
+                                  ->residency_epoch
+                            : 0));
                 return false;
             }
 
@@ -499,7 +518,8 @@ namespace llaminar2
         info.addScalarBool("publish_ticket_completion",
                            params_.publish_ticket_completion);
         info.addScalarBool("release_residency_lease_on_completion",
-                           params_.release_residency_lease_on_completion);
+                           params_.residency_lease_terminal ==
+                               MoEOverlayHostDispatchLeaseTerminal::Release);
         info.addScalarInt("continuation_root_tp_index", params_.continuation_root_tp_index);
         if (params_.continuation_tp_context)
         {

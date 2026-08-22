@@ -15,33 +15,56 @@
 
 #pragma once
 
+#include "MoEOverlayActivationChannelPlan.h"
 #include "MoEOverlayActivationEpochProtocol.h"
 #include "MoEOverlayActivationPacketABI.h"
 #include "MoEOverlayRankBatchTransport.h"
 #include "transfer/TransferEngine.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace llaminar2
 {
+    class TensorBase;
+
     /**
-     * @brief Captured node-local payload movement selected from fixed geometry.
+     * @brief Complete geometry-selected dispatch payload embedded by a lane.
      *
-     * Timeline words and packet metadata remain mapped in both modes. A
-     * one-row transaction is compacted into each lane. Multi-row prefill
-     * publishes one physical activation matrix per rank pair and each follower
-     * reads only the rows selected by its compact metadata. Both variants avoid
-     * per-lane bounce matrices and are immutable capture identity.
+     * The value binds the only three facts that may vary with retained graph
+     * geometry: hidden layout, exact hidden pointer, and mapped publication
+     * offset. Packet metadata is compact in both layouts. Keeping these facts
+     * indivisible prevents a consumer from combining a current descriptor with
+     * the other layout's stable-but-stale matrix.
      */
-    enum class MoEOverlayActivationPayloadPath : std::uint8_t
+    struct MoEOverlayMappedActivationDispatchPayloadView
     {
-        DirectMapped = 0, ///< Packet owns compact mapped hidden rows.
-        SharedPhysicalMapped = 1, ///< Packet selects rows from one shared physical matrix.
+        /** Geometry and hidden-row interpretation selected as one value. */
+        MoEOverlayActivationPayloadSelection selection{};
+        /** Exact metadata and selected hidden-matrix aliases. */
+        MoEOverlayMappedDispatchDeviceView packet{};
+        /** Region-relative destination used by bulk payload publication. */
+        std::size_t hidden_payload_offset = 0u;
+
+        /** @return Whether every address and geometry relation is complete. */
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return selection.valid() && packet.valid() &&
+                   packet.row_capacity >=
+                       static_cast<std::size_t>(selection.physical_rows);
+        }
+
+        /** @return Whether this view requires one rank-pair bulk publication. */
+        [[nodiscard]] bool requiresBulkPublication() const noexcept
+        {
+            return valid() && selection.usesSharedPhysicalRows();
+        }
     };
 
     /**
@@ -67,12 +90,15 @@ namespace llaminar2
         MoEOverlayActivationEpochControl *control_host = nullptr; ///< Scheduler/watchdog view.
         MoEOverlayActivationEpochControl *control_device = nullptr; ///< Exact endpoint alias.
         MoEOverlayActivationDeviceEpochGrant *grant_device = nullptr; ///< Endpoint-private hot-path state.
+        /** Setup publication event consumed once at each stage-zero graph edge. */
+        void *grant_initialization_event = nullptr;
         MoEOverlayMappedDispatchDeviceView dispatch; ///< Shared continuation-to-follower packet.
         MoEOverlayMappedReturnDeviceView returned; ///< Shared follower-to-continuation packet.
         std::size_t dispatch_hidden_offset = 0u; ///< Region offset of the mapped dispatch matrix.
         /** Region offset of the shared physical-row dispatch matrix. */
         std::size_t shared_dispatch_hidden_offset = 0u;
-        std::size_t return_output_offset = 0u; ///< Region offset of the mapped return matrix.
+        /** Region offset of the rank-pair canonical route-return matrix. */
+        std::size_t return_output_offset = 0u;
         std::size_t admission_signal_offset = 0u; ///< Scheduler release word for graph admission.
         std::array<std::size_t, kMoEOverlayActivationBufferCount>
             dispatch_signal_offsets{}; ///< Region-relative 64-bit publication words.
@@ -99,39 +125,12 @@ namespace llaminar2
                 return mapped_region->contains(
                     offset, rows * width * sizeof(float));
             };
-            const auto matrixBytes = [](
-                                         std::size_t rows,
-                                         std::int32_t columns,
-                                         std::size_t *bytes)
-            {
-                if (!bytes || columns <= 0)
-                    return false;
-                const auto width = static_cast<std::size_t>(columns);
-                constexpr auto maximum = static_cast<std::size_t>(-1);
-                if (rows > maximum / width ||
-                    rows * width > maximum / sizeof(float))
-                {
-                    return false;
-                }
-                *bytes = rows * width * sizeof(float);
-                return true;
-            };
-            std::size_t dispatch_matrix_bytes = 0u;
-            std::size_t return_matrix_bytes = 0u;
-            const bool matrix_geometry_valid =
-                matrixBytes(
-                    dispatch.row_capacity,
-                    dispatch.d_model,
-                    &dispatch_matrix_bytes) &&
-                matrixBytes(
-                    returned.row_capacity,
-                    returned.d_model,
-                    &return_matrix_bytes);
             return device.is_valid() && target_participant_id >= 0 &&
                    mapped_region && mapped_region->isBound() && control_host &&
                    control_device && grant_device &&
+                   (!device.is_gpu() || grant_initialization_event) &&
                    shared_dispatch_hidden_rows_fp32 && dispatch.valid() &&
-                   returned.valid() && matrix_geometry_valid &&
+                   returned.valid() &&
                    containsFP32Matrix(
                        dispatch_hidden_offset,
                        dispatch.row_capacity,
@@ -142,46 +141,155 @@ namespace llaminar2
                        dispatch.d_model) &&
                    containsFP32Matrix(
                        return_output_offset,
-                       returned.row_capacity,
+                       returned.route_slot_capacity,
                        returned.d_model) &&
                    mapped_region->contains(
                        admission_signal_offset, sizeof(std::uint64_t));
         }
 
         /**
-         * @brief Select the immutable payload path for one captured row geometry.
+         * @brief Resolve one indivisible dispatch view for fixed geometry.
          *
-         * @param physical_rows Exact padded rows embedded by this graph.
-         * @return Compact direct mapping for one-row decode, otherwise the one
-         *         shared physical activation mapping for prefill.
+         * Timeline words and packet metadata remain mapped for every geometry.
+         * One-row decode writes the compact participant matrix. Multi-row
+         * prefill publishes the source activation once per rank-pair and binds
+         * the returned view to that shared physical matrix. No caller is
+         * permitted to override the pointer or reinterpret the layout later.
+         *
+         * @param physical_rows Exact padded rows embedded by the graph.
+         * @return Capture-stable payload view, invalid for bad geometry.
          */
-        [[nodiscard]] MoEOverlayActivationPayloadPath payloadPath(
-            std::int32_t physical_rows) const noexcept
+        [[nodiscard]] MoEOverlayMappedActivationDispatchPayloadView
+        dispatchPayload(std::int32_t physical_rows) const noexcept
         {
-            return physical_rows == 1
-                       ? MoEOverlayActivationPayloadPath::DirectMapped
-                       : MoEOverlayActivationPayloadPath::SharedPhysicalMapped;
+            MoEOverlayMappedActivationDispatchPayloadView result{
+                .selection = MoEOverlayActivationPayloadSelection::
+                    forPhysicalRows(physical_rows),
+                .packet = dispatch,
+                .hidden_payload_offset = dispatch_hidden_offset,
+            };
+            if (result.selection.usesSharedPhysicalRows())
+            {
+                result.packet.hidden_rows_fp32 =
+                    shared_dispatch_hidden_rows_fp32;
+                result.hidden_payload_offset =
+                    shared_dispatch_hidden_offset;
+            }
+            return result;
         }
 
         /**
-         * @brief Resolve the hidden-matrix interpretation for fixed geometry.
+         * @brief Build the CPU follower's sparse view from the selected lane.
          *
-         * Bulk DMA publishes the original physical activation once per shared
-         * rank-pair channel. Direct mapped packets retain compact rows because
-         * that avoids a full-matrix transfer for decode-sized transactions.
+         * This is valid only for a planner-declared CPU endpoint because the
+         * packet aliases must be directly host-addressable. The returned object
+         * owns no storage; this lane and its mapped-region lifetime must outlive
+         * every local-expert use.
          *
-         * @param physical_rows Exact padded rows embedded by the graph.
-         * @return Capture-stable hidden payload layout for this lane.
+         * @param physical_rows Exact rows authenticated by the request ticket.
+         * @return Sparse CPU view carrying the same pointer/layout selection as
+         *         the device launch, or an invalid empty view on mismatch.
          */
-        [[nodiscard]] MoEOverlayActivationHiddenPayloadLayout
-        hiddenPayloadLayout(std::int32_t physical_rows) const noexcept
+        [[nodiscard]] MoEOverlaySparseRows hostDispatchPayload(
+            std::int32_t physical_rows) const noexcept
         {
-            return payloadPath(physical_rows) ==
-                           MoEOverlayActivationPayloadPath::SharedPhysicalMapped
-                       ? MoEOverlayActivationHiddenPayloadLayout::
-                             SharedPhysicalRows
-                       : MoEOverlayActivationHiddenPayloadLayout::CompactRows;
+            const auto payload = dispatchPayload(physical_rows);
+            if (!device.is_cpu() || !payload.valid())
+                return {};
+            MoEOverlaySparseRows rows;
+            rows.target_participant = target_participant_id;
+            rows.d_model = payload.packet.d_model;
+            rows.top_k = payload.packet.top_k;
+            rows.row_capacity = payload.packet.row_capacity;
+            rows.entry_capacity = payload.packet.entry_capacity;
+            rows.hidden_row_capacity =
+                static_cast<std::size_t>(payload.selection.physical_rows);
+            rows.hidden_payload_layout = payload.selection.layout;
+            rows.row_ids_host = payload.packet.row_ids;
+            rows.entry_offsets_host = payload.packet.entry_offsets;
+            rows.expert_ids_host = payload.packet.expert_ids;
+            rows.route_weights_host = payload.packet.route_weights;
+            rows.hidden_rows_fp32 = payload.packet.hidden_rows_fp32;
+            return rows;
         }
+    };
+
+    /** Element layout of one graph-private activation-protocol allocation. */
+    enum class MoEOverlayGraphStorageType : std::uint8_t
+    {
+        Int32 = 0, ///< Four-byte descriptor words or integer scratch.
+        FP32 = 1, ///< Canonical FP32 accumulation scratch.
+    };
+
+    /**
+     * @brief Own one capture-stable device tensor outside compute-stage lifecycle.
+     *
+     * Packet stages describe immutable launch metadata and scratch geometry,
+     * but they must never allocate or upload GPU storage themselves. This
+     * setup owner allocates through TransferEngine when the graph transaction
+     * is constructed, retains the host bytes needed by asynchronous metadata
+     * publication, and exposes only explicit-stream preparation/validation to
+     * the stages. Device addresses remain fixed until every retained graph
+     * sharing this owner has been destroyed.
+     */
+    class MoEOverlayPersistentGraphStorage final
+    {
+    public:
+        /** Complete immutable allocation identity. */
+        struct Config
+        {
+            DeviceId device = DeviceId::invalid(); ///< Exact allocation owner.
+            MoEOverlayGraphStorageType type =
+                MoEOverlayGraphStorageType::Int32; ///< Element representation.
+            std::vector<std::size_t> shape; ///< Positive tensor dimensions.
+            bool immutable_input = false; ///< True for host-authored metadata.
+            std::string identity; ///< Stable diagnostic role.
+        };
+
+        /**
+         * @brief Allocate the complete capture-stable storage during setup.
+         * @throws std::invalid_argument for an incomplete identity or shape.
+         * @throws std::runtime_error when the canonical transfer authority
+         *         cannot materialize the requested GPU allocation.
+         */
+        explicit MoEOverlayPersistentGraphStorage(Config config);
+        ~MoEOverlayPersistentGraphStorage();
+
+        MoEOverlayPersistentGraphStorage(
+            const MoEOverlayPersistentGraphStorage &) = delete;
+        MoEOverlayPersistentGraphStorage &operator=(
+            const MoEOverlayPersistentGraphStorage &) = delete;
+
+        /**
+         * @brief Publish immutable host bytes on the exact setup stream.
+         *
+         * The first call copies and uploads the complete allocation. Later
+         * calls must name byte-identical metadata and merely enqueue the
+         * existing producer-event dependency on @p stream.
+         */
+        bool publishImmutableBytes(
+            const void *bytes,
+            std::size_t byte_count,
+            void *stream);
+
+        /** @brief Validate/enqueue this immutable input on an exact stream. */
+        bool requireInput(void *stream) const;
+        /** @brief Validate this graph-private output on an exact stream. */
+        bool requireOutput(void *stream) const;
+
+        /** @return Stable device address, or nullptr before complete setup. */
+        [[nodiscard]] void *deviceData() const noexcept;
+        /** @return Immutable allocation capacity in bytes. */
+        [[nodiscard]] std::size_t sizeBytes() const noexcept;
+        /** @return Whether the allocation has a stable device address. */
+        [[nodiscard]] bool allocated() const noexcept;
+        /** @return Whether immutable input bytes have been published. */
+        [[nodiscard]] bool published() const noexcept { return published_; }
+
+    private:
+        Config config_;
+        std::unique_ptr<TensorBase> tensor_;
+        bool published_ = false;
     };
 
     /**
@@ -252,12 +360,16 @@ namespace llaminar2
         std::vector<MoEOverlayActivationGraphFamilyManifest>
             activation_graph_families;
         /**
-         * Process-local devices that register this mapping.
+         * Exact process-local participant/device lanes embedded by graphs.
          *
-         * This list is never mixed into POSIX mapping identity because the two
-         * ranks deliberately see different local endpoint sets.
+         * Capacity admission and preflight obtain this list from
+         * @ref MoEOverlayActivationChannelPlanner. Keeping participant identity
+         * beside device identity prevents an unpriced Cartesian product from
+         * being materialized when one target rank owns several accelerators.
+         * The list is never mixed into POSIX mapping identity because the two
+         * endpoint ranks deliberately own different local lanes.
          */
-        std::vector<DeviceId> local_devices;
+        std::vector<MoEOverlayActivationLocalLaneBinding> local_lanes;
     };
 
     /**
@@ -441,7 +553,7 @@ namespace llaminar2
          * The returned lane is setup-only immutable graph identity. It does not
          * arm a transaction, wait for a signal, or inspect mutable payload data.
          * The device must have appeared in this process's planner-provided
-         * `local_devices` set when the mapping was registered.
+         * `local_lanes` set when the mapping was registered.
          *
          * @param target_participant_id Exact participant packet within the rank batch.
          * @param graph_family_ordinal Main/MTP retained graph family ordinal.

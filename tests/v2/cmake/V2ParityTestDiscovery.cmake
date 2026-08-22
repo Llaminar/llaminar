@@ -238,6 +238,17 @@ foreach(_full_name IN LISTS _all_tests)
         if("${_full_name}" MATCHES "([0-9]+)xMPI")
             set(_campaign_mpi_procs "${CMAKE_MATCH_1}")
         endif()
+
+        # Current-batch LLEP owns a distinct request-scoped movement lifecycle
+        # from durable Static/Dynamic residency. Keep it in a canonical CTest
+        # campaign, but never hide it inside the same process campaign. This
+        # lets a sprint exclude the explicitly unfinished policy by registered
+        # campaign identity while Static and Dynamic still amortize one model
+        # load and remain part of the normal aggregate matrix.
+        set(_campaign_policy_slice "")
+        if("${_full_name}" MATCHES "CurrentBatchLLEP")
+            set(_campaign_policy_slice "LLEP")
+        endif()
         # A few production cells exercise a complete MPI application lifecycle
         # that cannot validly follow another runner teardown in the same world.
         # Give those explicitly declared cells a unique campaign key. The hash
@@ -262,6 +273,10 @@ foreach(_full_name IN LISTS _all_tests)
             endif()
         endforeach()
         set(_campaign_key "${_backend_signature}__MPI_${_campaign_mpi_procs}")
+        if(_campaign_policy_slice)
+            string(APPEND _campaign_key
+                "__POLICY_${_campaign_policy_slice}")
+        endif()
         if(_campaign_variant)
             string(APPEND _campaign_key "__${_campaign_variant}")
         endif()
@@ -269,9 +284,12 @@ foreach(_full_name IN LISTS _all_tests)
         set(_campaign_tests_var "_production_campaign_tests_${_signature_id}")
         set(_campaign_backend_var "_production_campaign_backend_${_signature_id}")
         set(_campaign_mpi_var "_production_campaign_mpi_${_signature_id}")
+        set(_campaign_policy_var
+            "_production_campaign_policy_${_signature_id}")
         set(_campaign_variant_var "_production_campaign_variant_${_signature_id}")
         set(${_campaign_backend_var} "${_backend_signature}")
         set(${_campaign_mpi_var} "${_campaign_mpi_procs}")
+        set(${_campaign_policy_var} "${_campaign_policy_slice}")
         set(${_campaign_variant_var} "${_campaign_variant}")
         list(APPEND ${_campaign_tests_var} "${_full_name}")
         list(FIND _production_campaign_keys
@@ -366,9 +384,12 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     set(_campaign_tests_var "_production_campaign_tests_${_signature_id}")
     set(_campaign_backend_var "_production_campaign_backend_${_signature_id}")
     set(_campaign_mpi_var "_production_campaign_mpi_${_signature_id}")
+    set(_campaign_policy_var
+        "_production_campaign_policy_${_signature_id}")
     set(_campaign_variant_var "_production_campaign_variant_${_signature_id}")
     set(_backend_signature "${${_campaign_backend_var}}")
     set(_campaign_mpi_procs "${${_campaign_mpi_var}}")
+    set(_campaign_policy_slice "${${_campaign_policy_var}}")
     set(_campaign_variant "${${_campaign_variant_var}}")
     set(_campaign_model_files ${_production_model_files_COMMON})
     foreach(_backend IN ITEMS CPU CUDA ROCm)
@@ -386,6 +407,10 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     string(JOIN "|" _campaign_model_manifest ${_campaign_model_files})
     string(REPLACE ";" ":" _gtest_filter "${${_campaign_tests_var}}")
     set(_campaign_test_prefix "${TEST_PREFIX}")
+    if(_campaign_policy_slice)
+        string(APPEND _campaign_test_prefix
+            "_${_campaign_policy_slice}")
+    endif()
     if(_campaign_variant)
         string(APPEND _campaign_test_prefix "_${_campaign_variant}")
     endif()
@@ -457,12 +482,19 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     string(APPEND _output "add_test(\"${_ctest_name}\" ${_cmd_str})\n")
 
     set(_campaign_labels ${LABELS})
-    list(REMOVE_ITEM _campaign_labels "CPU" "CUDA" "ROCm")
+    # Target-level labels describe every parameter in a binary. Policy labels
+    # must instead describe this exact process campaign.
+    list(REMOVE_ITEM _campaign_labels "CPU" "CUDA" "ROCm" "LLEP")
     foreach(_backend IN ITEMS CPU CUDA ROCm)
         if("${_backend_signature}" MATCHES "${_backend}")
             list(APPEND _campaign_labels "${_backend}")
         endif()
     endforeach()
+    if(_campaign_policy_slice)
+        list(APPEND _campaign_labels
+            "${_campaign_policy_slice}"
+            "PolicySlice")
+    endif()
     list(APPEND _campaign_labels
         "ProductionPath"
         "FullModel"

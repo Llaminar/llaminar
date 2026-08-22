@@ -1146,6 +1146,61 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Native device-resident view of one persistent floating K/V ring.
+         *
+         * Unlike @ref get_kv_batched_device_view, this contract does not
+         * linearize live rows into conversion scratch.  The returned tensors
+         * cover the immutable physical ring allocation, while @p device_head
+         * and @p device_count name the canonical metadata advanced by append,
+         * restore, and rollback kernels.  Attention must consume all four
+         * values on the supplied stream and translate logical row @c i as
+         * `(head - count + capacity + i) % capacity`.
+         *
+         * The direct contract is intentionally limited to native floating
+         * storage whose keys were published after RoPE. Quantized and
+         * pre-RoPE caches keep their explicit converted-view contracts; they
+         * must not claim this interface and silently dequantize or transform.
+         * Implementations return stable tensor wrappers and pointers for the
+         * cache lifetime, making the view safe to embed in a captured graph.
+         *
+         * @param layer Model/cache layer whose physical ring is requested.
+         * @param seq_idx Logical request slot within the cache.
+         * @param out_k Receives the persistent physical K ring tensor.
+         * @param out_v Receives the persistent physical V ring tensor.
+         * @param device_head Receives the device-owned next-write position.
+         * @param device_count Receives the device-owned live row count.
+         * @param physical_capacity Receives the ring modulus in rows.
+         * @param gpu_stream Exact consumer stream; required even though this
+         *        accessor launches no work, so ordering ownership is explicit.
+         * @return true only for a complete native post-RoPE floating view.
+         */
+        virtual bool get_kv_device_ring_view(
+            int layer,
+            int seq_idx,
+            ITensor **out_k,
+            ITensor **out_v,
+            const int **device_head,
+            const int **device_count,
+            int *physical_capacity,
+            void *gpu_stream)
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)gpu_stream;
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
+            if (device_head)
+                *device_head = nullptr;
+            if (device_count)
+                *device_count = nullptr;
+            if (physical_capacity)
+                *physical_capacity = 0;
+            return false;
+        }
+
         // =================================================================
         // Sharding Info (for tensor parallelism)
         // =================================================================

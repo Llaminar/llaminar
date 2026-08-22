@@ -26,9 +26,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace llaminar2
@@ -306,6 +308,87 @@ namespace llaminar2
          * @throws std::logic_error when this transport has no shared row storage.
          */
         virtual MoEOverlayReturnRows sharedReturnRows(int participant_id) const;
+    };
+
+    /**
+     * @brief Build the one canonical identity for a rank-pair activation channel.
+     *
+     * The identity intentionally excludes process-local devices and graph row
+     * capacities. Both endpoint ranks see different local registration sets,
+     * while the immutable graph-family topology authenticates capacity and
+     * retained geometry separately. Participant ids must already be strictly
+     * increasing so a caller cannot accidentally name the same physical
+     * channel with two different packet orders.
+     *
+     * @param tier_index Stable routed-tier ordinal.
+     * @param domain_ordinal Stable routed-domain ordinal.
+     * @param source_world_rank Continuation authority rank.
+     * @param target_world_rank Remote endpoint-owner rank.
+     * @param participant_ids Complete canonical target participant group.
+     * @return Pointer-independent channel name shared by both MPI ranks.
+     * @throws std::invalid_argument for incomplete or non-canonical topology.
+     */
+    [[nodiscard]] std::string makeMoEOverlayRankBatchChannelIdentity(
+        int tier_index,
+        int domain_ordinal,
+        int source_world_rank,
+        int target_world_rank,
+        std::span<const int> participant_ids);
+
+    /**
+     * @brief Setup-owned registry of already-rendezvoused rank-batch channels.
+     *
+     * Node-local mappings require both endpoint ranks to first-touch their
+     * consumer-owned pages at the same initialization phase. The orchestration
+     * preflight creates those mappings before weight preparation or graph
+     * capture and installs them here. Graph builders may only resolve an exact
+     * immutable channel; they cannot construct a replacement lazily and thereby
+     * make NUMA placement depend on unrelated setup latency.
+     *
+     * The registry is process-local. Each MPI rank owns its own transport
+     * object and driver registrations for the same canonical shared mapping.
+     */
+    class MoEOverlayRankBatchTransportRegistry final
+    {
+    public:
+        /**
+         * @brief Install one fully constructed transport under its channel identity.
+         * @param channel_identity Canonical value returned by
+         *        @ref makeMoEOverlayRankBatchChannelIdentity.
+         * @param transport Live transport whose lifetime must cover all graphs.
+         * @throws std::invalid_argument for a null or malformed transport.
+         * @throws std::logic_error if the identity is already installed.
+         */
+        void install(
+            std::string channel_identity,
+            std::shared_ptr<IMoEOverlayRankBatchTransport> transport);
+
+        /**
+         * @brief Resolve and validate one immutable pre-created transport.
+         * @param channel_identity Canonical rank-pair channel identity.
+         * @param source_world_rank Expected continuation authority rank.
+         * @param target_world_rank Expected endpoint-owner rank.
+         * @param participant_ids Expected canonical participant ordering.
+         * @return Shared model-lifetime transport authority.
+         * @throws std::logic_error when setup omitted or mismatched the channel.
+         */
+        [[nodiscard]] std::shared_ptr<IMoEOverlayRankBatchTransport> require(
+            const std::string &channel_identity,
+            int source_world_rank,
+            int target_world_rank,
+            std::span<const int> participant_ids) const;
+
+        /** @return Number of immutable channels installed during preflight. */
+        [[nodiscard]] std::size_t size() const;
+
+    private:
+        /** Protects setup publication from concurrent graph construction. */
+        mutable std::mutex mutex_;
+        /** Exact canonical identity to process-local transport lifetime. */
+        std::unordered_map<
+            std::string,
+            std::shared_ptr<IMoEOverlayRankBatchTransport>>
+            transports_;
     };
 
     /**

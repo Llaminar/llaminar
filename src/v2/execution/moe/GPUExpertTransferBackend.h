@@ -24,6 +24,21 @@ namespace llaminar2::detail
      */
     bool restoreCUDADeviceOrdinal(int ordinal) noexcept;
 
+    /**
+     * @brief Authenticate and enable one directed CUDA peer-memory edge.
+     *
+     * This setup-only operation selects the destination because its transfer
+     * stream will address the source allocation. It restores the caller's
+     * ambient CUDA device before returning.
+     *
+     * @param source Distinct CUDA allocation owner.
+     * @param destination CUDA stream/allocation owner.
+     * @return True only when the driver exposes and enables direct access.
+     */
+    bool prepareDirectPeerAccessCUDABackend(
+        const DeviceId &source,
+        const DeviceId &destination) noexcept;
+
     /** Submit one separated NativeVNNI expert copy on a CUDA stream. */
     bool transferExpertCUDABackend(
         const GPUExpertPointers &src_ptrs,
@@ -47,6 +62,20 @@ namespace llaminar2::detail
      * @return True when the exact ordinal became current.
      */
     bool restoreROCmDeviceOrdinal(int ordinal) noexcept;
+
+    /**
+     * @brief Authenticate and enable one directed ROCm peer-memory edge.
+     *
+     * HIP runtime state and `HipDeviceGuard` state are restored together, so
+     * setup cannot redirect later inference launches on the calling thread.
+     *
+     * @param source Distinct ROCm allocation owner.
+     * @param destination ROCm stream/allocation owner.
+     * @return True only when the driver exposes and enables direct access.
+     */
+    bool prepareDirectPeerAccessROCmBackend(
+        const DeviceId &source,
+        const DeviceId &destination) noexcept;
 
     /** Submit one separated NativeVNNI expert copy on a ROCm stream. */
     bool transferExpertROCmBackend(

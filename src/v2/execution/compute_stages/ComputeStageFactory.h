@@ -32,6 +32,7 @@
 #include "stages/MoEOverlayTicketPublishStage.h"
 #include "stages/MoEOverlayTicketConsumeStage.h"
 #include "stages/MoEOverlayActivationPacketStages.h"
+#include "stages/MoEOverlayDeviceControllerStage.h"
 #include "stages/MoEExpertDispatchStage.h"
 #include "stages/MoELocalExpertStage.h"
 #include "stages/MoESparseDispatchStage.h"
@@ -283,6 +284,11 @@ namespace llaminar2
         static std::unique_ptr<IComputeStage>
         createMoEOverlayActivationReturnConsumeBatch(
             const MoEOverlayActivationReturnConsumeBatchStage::Params &params);
+
+        /** @brief Create one captured mapped-controller transition. */
+        static std::unique_ptr<IComputeStage>
+        createMoEOverlayDeviceController(
+            const MoEOverlayDeviceControllerStage::Params &params);
 
         /**
          * @brief Create a host-side routed-row dispatch descriptor stage

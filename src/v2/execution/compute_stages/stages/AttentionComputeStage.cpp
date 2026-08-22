@@ -939,6 +939,9 @@ namespace llaminar2
         ITensor *effective_K = params_.K;
         ITensor *effective_V = params_.V;
         attention::AttentionKVLogicalView kv_logical_view{};
+        const int *device_ring_head = nullptr;
+        const int *device_ring_count = nullptr;
+        int device_ring_capacity = 0;
         bool cpu_grouped_request_cache = false;
         if (params_.kv_cache && params_.layer_idx >= 0)
         {
@@ -1153,7 +1156,34 @@ namespace llaminar2
                      * participates in production execution.
                      */
                     bool cache_read_ok = false;
-                    if (transform_cached_keys)
+                    const ActivationPrecision cache_precision =
+                        params_.kv_cache->k_precision();
+                    const bool native_floating_ring =
+                        !transform_cached_keys && params_.batch_size == 1 &&
+                        (cache_precision == ActivationPrecision::FP16 ||
+                         cache_precision == ActivationPrecision::BF16 ||
+                         cache_precision == ActivationPrecision::FP32);
+                    if (native_floating_ring)
+                    {
+                        /*
+                         * The append stage has already published post-RoPE K
+                         * into a stable physical ring. Pass that allocation and
+                         * its canonical device metadata directly to attention;
+                         * the following parameter writer derives the logical
+                         * origin in graph order. No live row is copied here.
+                         */
+                        cache_read_ok =
+                            params_.kv_cache->get_kv_device_ring_view(
+                                params_.layer_idx,
+                                /*seq_idx=*/0,
+                                &cache_k,
+                                &cache_v,
+                                &device_ring_head,
+                                &device_ring_count,
+                                &device_ring_capacity,
+                                gpuStream());
+                    }
+                    else if (transform_cached_keys)
                     {
                         IKVCache::KVReadParams read_params;
                         read_params.rope_theta = key_cache_policy.rope_theta;
@@ -1201,7 +1231,9 @@ namespace llaminar2
                               << " layer=" << params_.layer_idx
                               << " batch=" << params_.batch_size
                               << " max_kv_len=" << effective_kv_len
-                              << " type=" << cache_k->dtype_name());
+                              << " type=" << cache_k->dtype_name()
+                              << " direct_ring=" << native_floating_ring
+                              << " ring_capacity=" << device_ring_capacity);
                 }
             }
         }
@@ -1310,6 +1342,14 @@ namespace llaminar2
         {
             const int *device_cached_tokens =
                 params_.kv_cache->deviceCachedTokenCountPtr(params_.layer_idx, 0);
+            if (device_ring_count &&
+                device_cached_tokens != device_ring_count)
+            {
+                LOG_ERROR("[AttentionComputeStage] Direct ring view and attention parameter writer disagree on canonical count ownership"
+                          << " layer=" << params_.layer_idx
+                          << " device=" << params_.device_id.toString());
+                return false;
+            }
             const bool needs_device_sequence_params =
                 has_current_dynamic_sequence_state ||
                 effective_kv_len > logical_seq_len ||
@@ -1337,7 +1377,9 @@ namespace llaminar2
                             gpuStream(),
                             effective_kv_stride,
                             params_.active_query_rows_device,
-                            prefill_capture))
+                            prefill_capture,
+                            device_ring_head,
+                            device_ring_capacity))
                     {
                         LOG_ERROR("[AttentionComputeStage] Failed to derive dynamic attention params from device KV state for layer "
                                   << params_.layer_idx << " on " << params_.device_id.toString());

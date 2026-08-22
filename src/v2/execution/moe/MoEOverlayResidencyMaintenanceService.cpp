@@ -22,7 +22,12 @@ namespace llaminar2
             return status == MoEOverlayResidencyApplyStatus::Busy ||
                    status == MoEOverlayResidencyApplyStatus::Stale ||
                    status == MoEOverlayResidencyApplyStatus::StageFailed ||
-                   status == MoEOverlayResidencyApplyStatus::CommitFailed;
+                   status ==
+                       MoEOverlayResidencyApplyStatus::PreparationFailed ||
+                   status ==
+                       MoEOverlayResidencyApplyStatus::PublicationFailed ||
+                   status ==
+                       MoEOverlayResidencyApplyStatus::RetirementFailed;
         }
     } // namespace
 
@@ -61,6 +66,12 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay economy certification requires one uncertified dynamic authority");
         }
+        if (config_.device_service_telemetry_publisher &&
+            !config_.economy_certification)
+        {
+            throw std::invalid_argument(
+                "GPU service telemetry publication requires an active host economy certifier");
+        }
         if (config_.idle_poll_interval <= std::chrono::microseconds::zero())
         {
             throw std::invalid_argument(
@@ -72,14 +83,6 @@ namespace llaminar2
             config_.histogram_publisher &&
             !config_.histogram_publisher->isCoordinator();
 
-        /*
-         * Capture `this` only after every dependency and synchronization object
-         * has been constructed. stopAndDrain() joins this worker before member
-         * destruction begins.
-         */
-        worker_ = std::jthread(
-            [this](std::stop_token stop_token)
-            { run(stop_token); });
     }
 
     MoEOverlayResidencyMaintenanceService::
@@ -96,6 +99,47 @@ namespace llaminar2
         }
     }
 
+    void MoEOverlayResidencyMaintenanceService::start()
+    {
+        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
+        if (state_.load(std::memory_order_acquire) !=
+                MoEOverlayMaintenanceState::Prepared ||
+            worker_.joinable() ||
+            shutdown_requested_.load(std::memory_order_acquire))
+        {
+            throw std::logic_error(
+                "ExpertOverlay maintenance may start exactly once from Prepared");
+        }
+
+        state_.store(
+            MoEOverlayMaintenanceState::Starting,
+            std::memory_order_release);
+        try
+        {
+            /*
+             * Capture `this` only after every dependency, synchronization
+             * object, and distributed composition phase is complete.
+             * stopAndDrain() joins this worker before member destruction.
+             */
+            worker_ = std::jthread(
+                [this](std::stop_token stop_token)
+                { run(stop_token); });
+        }
+        catch (const std::exception &error)
+        {
+            fail(
+                std::string("ExpertOverlay maintenance worker creation failed: ") +
+                error.what());
+            throw;
+        }
+        catch (...)
+        {
+            fail(
+                "ExpertOverlay maintenance worker creation raised a non-standard exception");
+            throw;
+        }
+    }
+
     void MoEOverlayResidencyMaintenanceService::
         notifyMaintenanceProgress() noexcept
     {
@@ -109,9 +153,28 @@ namespace llaminar2
 
     void MoEOverlayResidencyMaintenanceService::stopAndDrain()
     {
-        std::lock_guard<std::mutex> shutdown_lock(shutdown_mutex_);
+        std::lock_guard<std::mutex> lifecycle_lock(lifecycle_mutex_);
         if (!worker_.joinable())
+        {
+            const auto current = state_.load(std::memory_order_acquire);
+            if (current == MoEOverlayMaintenanceState::Stopped)
+                return;
+
+            /*
+             * A prepared service owns no active wave. Close subordinate
+             * observation controllers without manufacturing a worker solely
+             * for teardown, then make the terminal explicit.
+             */
+            shutdown_requested_.store(true, std::memory_order_release);
+            if (config_.economy_certification)
+                config_.economy_certification->requestStop();
+            if (config_.device_service_telemetry_publisher)
+                config_.device_service_telemetry_publisher->requestStop();
+            state_.store(
+                MoEOverlayMaintenanceState::Stopped,
+                std::memory_order_release);
             return;
+        }
         if (worker_.get_id() == std::this_thread::get_id())
         {
             throw std::logic_error(
@@ -160,6 +223,9 @@ namespace llaminar2
                     std::memory_order_relaxed),
             .economy_certifications =
                 economy_certifications_.load(std::memory_order_relaxed),
+            .device_service_snapshots_imported =
+                device_service_snapshots_imported_.load(
+                    std::memory_order_relaxed),
             .proposals = proposals_.load(std::memory_order_relaxed),
             .deferred_attempts =
                 deferred_attempts_.load(std::memory_order_relaxed),
@@ -183,6 +249,25 @@ namespace llaminar2
         };
     }
 
+    InferenceMeasurementReadiness
+    MoEOverlayResidencyMaintenanceService::measurementReadiness() const
+    {
+        if (!healthy())
+        {
+            return {
+                .state = InferenceMeasurementReadinessState::Failed,
+                .owner = "expert_overlay_host_maintenance",
+                .phase = "failed",
+                .diagnostic = failureMessage().empty()
+                                  ? "ExpertOverlay host maintenance failed"
+                                  : failureMessage(),
+            };
+        }
+        if (!config_.economy_certification)
+            return {};
+        return config_.economy_certification->measurementReadiness();
+    }
+
     void MoEOverlayResidencyMaintenanceService::run(
         std::stop_token stop_token) noexcept
     {
@@ -204,14 +289,24 @@ namespace llaminar2
                     std::memory_order_release);
 
                 /*
-                 * A deferred transaction owns immutable host evidence but no
-                 * transport resources. Shutdown may discard it; an active wave
-                 * must be polled through publication/abort and retirement.
+                 * A process-local deferred proposal owns no externally visible
+                 * state and may be discarded. A distributed proposal cannot:
+                 * once its frozen histogram publication began, a peer may
+                 * already have derived or staged the same generation. The
+                 * coordinator must finish that exact generation before the
+                 * runner releases remote worker loops.
                  */
-                retained_transaction_ = {};
-                has_retained_transaction_ = false;
+                if (!config_.histogram_publisher)
+                {
+                    retained_transaction_ = {};
+                    has_retained_transaction_ = false;
+                }
                 if (config_.economy_certification)
                     config_.economy_certification->requestStop();
+                if (config_.device_service_telemetry_publisher)
+                {
+                    config_.device_service_telemetry_publisher->requestStop();
+                }
             }
 
             try
@@ -228,7 +323,14 @@ namespace llaminar2
                     "ExpertOverlay maintenance raised a non-standard exception");
             }
 
+            const bool distributed_coordinator_drained =
+                !config_.histogram_publisher ||
+                !config_.histogram_publisher->isCoordinator() ||
+                (!histogram_exchange_active_ &&
+                 !publishing_histogram_window_);
             if (stopping && !active_wave_ &&
+                !has_retained_transaction_ &&
+                distributed_coordinator_drained &&
                 !config_.authority->hasActiveBackgroundWave() &&
                 config_.authority->pendingAbortCount() == 0 &&
                 config_.authority->pendingRetirementCount() == 0 &&
@@ -269,6 +371,66 @@ namespace llaminar2
         {
             if (!allow_new_proposal)
                 config_.economy_certification->requestStop();
+            const auto pre_poll_certification_state =
+                config_.economy_certification->state();
+            const auto publication_action =
+                moeOverlayDeviceServicePublicationAction(
+                    pre_poll_certification_state);
+            if (config_.device_service_telemetry_publisher &&
+                publication_action ==
+                    MoEOverlayDeviceServicePublicationAction::PollAndImport)
+            {
+                std::vector<MoEOverlayDeviceServiceTelemetrySnapshot>
+                    snapshots;
+                std::string publication_error;
+                if (!config_.device_service_telemetry_publisher->poll(
+                        &snapshots, &publication_error))
+                {
+                    fail(
+                        publication_error.empty()
+                            ? config_.device_service_telemetry_publisher
+                                  ->failureMessage()
+                            : std::move(publication_error));
+                    return;
+                }
+                for (auto &snapshot : snapshots)
+                {
+                    if (!snapshot.valid())
+                    {
+                        fail(
+                            "Host economy maintenance received an invalid GPU service snapshot");
+                        return;
+                    }
+                    std::string import_error;
+                    if (!config_.economy_certification
+                             ->importDeviceServiceMeasurements(
+                                 snapshot.participant_id,
+                                 snapshot.rows,
+                                 &import_error))
+                    {
+                        fail(
+                            import_error.empty()
+                                ? "Host economy certification rejected a GPU service snapshot"
+                                : std::move(import_error));
+                        return;
+                    }
+                    device_service_snapshots_imported_.fetch_add(
+                        1u, std::memory_order_relaxed);
+                    recordPerfCounter(
+                        "maintenance_device_service_snapshots_imported");
+                }
+            }
+            else if (config_.device_service_telemetry_publisher &&
+                     publication_action ==
+                         MoEOverlayDeviceServicePublicationAction::Stop)
+            {
+                /* A Ready round retained its immutable registry snapshot
+                 * before entering service exchange. No later lifecycle state
+                 * can return to evidence collection, so the publisher may now
+                 * drain permanently. Readiness exchange itself merely pauses:
+                 * an AwaitingEvidence result must be able to resume polling. */
+                config_.device_service_telemetry_publisher->requestStop();
+            }
             economy_certification_polls_.fetch_add(
                 1, std::memory_order_relaxed);
             config_.economy_certification->poll();
@@ -328,12 +490,26 @@ namespace llaminar2
             return;
         }
 
-        if (!allow_new_proposal)
-            return;
-
         if (has_retained_transaction_)
         {
             tryBeginRetainedTransaction();
+            return;
+        }
+
+        if (!allow_new_proposal)
+        {
+            /*
+             * Only the histogram coordinator can own an irrevocable send at
+             * this point. Peers stopping after the coordinated root has
+             * drained hold at most a passive preposted receive, which their
+             * publisher cancels during runner teardown.
+             */
+            if (config_.histogram_publisher &&
+                config_.histogram_publisher->isCoordinator() &&
+                histogram_exchange_active_)
+            {
+                progressDistributedProposal();
+            }
             return;
         }
 
@@ -391,7 +567,7 @@ namespace llaminar2
         proposals_.fetch_add(1, std::memory_order_relaxed);
         recordPerfCounter("maintenance_proposals");
 
-        /* Do not launch new transport work after a concurrent shutdown request. */
+        /* Do not launch new process-local work after a concurrent shutdown. */
         if (shutdown_requested_.load(std::memory_order_acquire))
         {
             retained_transaction_ = {};
@@ -563,12 +739,11 @@ namespace llaminar2
             << retained_transaction_.economy
                    .projected_net_benefit_ns);
 
-        if (shutdown_requested_.load(std::memory_order_acquire))
-        {
-            retained_transaction_ = {};
-            has_retained_transaction_ = false;
-            return;
-        }
+        /*
+         * Histogram acknowledgement is the distributed irrevocability edge.
+         * Even if shutdown raced this local callback, every rank must now
+         * derive and finish the same transaction before resources are freed.
+         */
         tryBeginRetainedTransaction();
     }
 
@@ -657,12 +832,17 @@ namespace llaminar2
                 MoEOverlayMaintenanceState::Staging,
                 std::memory_order_release);
             return;
-        case MoEOverlayResidencyApplyStatus::Committing:
+        case MoEOverlayResidencyApplyStatus::Preparing:
             state_.store(
-                MoEOverlayMaintenanceState::Committing,
+                MoEOverlayMaintenanceState::Preparing,
                 std::memory_order_release);
             return;
-        case MoEOverlayResidencyApplyStatus::Committed:
+        case MoEOverlayResidencyApplyStatus::Publishing:
+            state_.store(
+                MoEOverlayMaintenanceState::Publishing,
+                std::memory_order_release);
+            return;
+        case MoEOverlayResidencyApplyStatus::Published:
             active_wave_ = false;
             retained_transaction_ = {};
             has_retained_transaction_ = false;
@@ -705,6 +885,20 @@ namespace llaminar2
 
         if (message.empty())
             message = "Unknown ExpertOverlay maintenance failure";
+
+        /*
+         * A fatal result is not backpressure. Once no physical wave is active,
+         * the immutable proposal is only retry intent; keeping it live would
+         * resubmit the same fatal operation on every worker poll. Clear that
+         * intent before publishing unhealthy so observers can never race a
+         * second submission. An active wave remains owned by the authority and
+         * is still polled through its asynchronous abort/retirement edges.
+         */
+        if (!active_wave_)
+        {
+            retained_transaction_ = {};
+            has_retained_transaction_ = false;
+        }
         {
             std::lock_guard<std::mutex> lock(failure_mutex_);
             failure_message_ = message;

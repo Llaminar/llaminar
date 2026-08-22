@@ -81,6 +81,8 @@ namespace llaminar2
             int kv_stride = 0;       ///< Physical request-major K/V row capacity.
             int position_offset = 0; ///< Absolute model position of this query row.
             int mask_stride = 0;     ///< Row stride of the optional attention mask.
+            int ring_row_origin = 0; ///< Physical row containing logical KV row zero.
+            int ring_row_capacity = 0; ///< Ring modulus; zero names contiguous K/V.
         };
     } // namespace attention
 } // namespace llaminar2

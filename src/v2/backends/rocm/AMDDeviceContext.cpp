@@ -493,6 +493,24 @@ namespace llaminar2
 
     void *AMDDeviceContext::getOrCreateAuxiliaryStream(const std::string &name, bool *created)
     {
+        return getOrCreateAuxiliaryStream(
+            name,
+            GPUAuxiliaryStreamSchedulingClass::Normal,
+            created);
+    }
+
+    /**
+     * @brief Materialize one HIP auxiliary stream with immutable priority.
+     *
+     * The highest-priority class is used by bounded controller work and the
+     * lowest-priority class by residency maintenance. HIP copy-engine
+     * scheduling is not inferred from this compute-stream priority.
+     */
+    void *AMDDeviceContext::getOrCreateAuxiliaryStream(
+        const std::string &name,
+        GPUAuxiliaryStreamSchedulingClass scheduling_class,
+        bool *created)
+    {
         if (created)
             *created = false;
         if (name.empty())
@@ -504,12 +522,60 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
         auto it = auxiliary_streams_.find(name);
         if (it != auxiliary_streams_.end() && it->second)
+        {
+            const auto class_it =
+                auxiliary_stream_scheduling_classes_.find(name);
+            if (class_it == auxiliary_stream_scheduling_classes_.end() ||
+                class_it->second != scheduling_class)
+            {
+                LOG_ERROR("[AMDDeviceContext] Auxiliary stream scheduling class changed for "
+                          << name);
+                return nullptr;
+            }
             return static_cast<void *>(it->second);
+        }
 
-        auto *stream = static_cast<hipStream_t>(createStream());
+        hipStream_t stream = nullptr;
+        if (scheduling_class ==
+            GPUAuxiliaryStreamSchedulingClass::Normal)
+        {
+            stream = static_cast<hipStream_t>(createStream());
+        }
+        else
+        {
+            if (!setAMDDeviceForResource(
+                    device_ordinal_,
+                    "getOrCreateAuxiliaryStream(prioritized)"))
+            {
+                return nullptr;
+            }
+            int least_priority = 0;
+            int greatest_priority = 0;
+            hipError_t error = hipDeviceGetStreamPriorityRange(
+                &least_priority, &greatest_priority);
+            const int priority =
+                scheduling_class ==
+                        GPUAuxiliaryStreamSchedulingClass::LatencyCritical
+                    ? greatest_priority
+                    : least_priority;
+            if (error == hipSuccess)
+            {
+                error = hipStreamCreateWithPriority(
+                    &stream,
+                    hipStreamNonBlocking,
+                    priority);
+            }
+            if (error != hipSuccess)
+            {
+                LOG_ERROR("[AMDDeviceContext] Could not create prioritized auxiliary stream: "
+                          << hipGetErrorString(error));
+                return nullptr;
+            }
+        }
         if (!stream)
             return nullptr;
         auxiliary_streams_[name] = stream;
+        auxiliary_stream_scheduling_classes_[name] = scheduling_class;
         if (created)
             *created = true;
         return static_cast<void *>(stream);
@@ -528,6 +594,7 @@ namespace llaminar2
             }
         }
         auxiliary_streams_.clear();
+        auxiliary_stream_scheduling_classes_.clear();
     }
 
     // ============================================================================

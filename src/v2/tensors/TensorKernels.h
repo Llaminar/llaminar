@@ -2061,6 +2061,10 @@ namespace llaminar2
          *        CUDA uses this before the parameter producer to establish native
          *        device-controlled graph branching. An empty value is valid for
          *        decode/grouped calls that do not construct a prefill graph.
+         * @param device_ring_head Optional device-owned next-write position for
+         *        a direct physical ring view. Null names contiguous K/V.
+         * @param ring_capacity Positive ring modulus when @p device_ring_head
+         *        is supplied; zero is required for contiguous K/V.
          */
         virtual bool prepareDynamicAttnParamsFromDeviceSequenceState(
             const int *post_append_cached_tokens_device,
@@ -2069,7 +2073,9 @@ namespace llaminar2
             void *stream,
             int kv_stride,
             const int *active_query_rows_device = nullptr,
-            const attention::AttentionPrefillCaptureGeometry &prefill_capture = {})
+            const attention::AttentionPrefillCaptureGeometry &prefill_capture = {},
+            const int *device_ring_head = nullptr,
+            int ring_capacity = 0)
         {
             (void)post_append_cached_tokens_device;
             (void)seq_len;
@@ -2078,6 +2084,8 @@ namespace llaminar2
             (void)kv_stride;
             (void)active_query_rows_device;
             (void)prefill_capture;
+            (void)device_ring_head;
+            (void)ring_capacity;
             return false;
         }
     };

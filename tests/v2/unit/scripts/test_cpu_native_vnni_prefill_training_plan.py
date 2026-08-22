@@ -668,7 +668,7 @@ class CPUNativeVNNIPrefillTrainingPlanTest(unittest.TestCase):
         )
         self.assertEqual(
             sorted(len(group) for group in groups),
-            [441, 1890, 2394],
+            [441, 1890, 2772],
         )
         self.assertEqual(
             sum((len(group) + 1) // 2 for group in groups),

@@ -659,7 +659,10 @@ namespace llaminar2
             void *out_stopped_flags_device = nullptr,
             void *out_next_sidecar_condition_tokens_device = nullptr,
             void *out_next_sidecar_position_ids_device = nullptr,
-            void *out_next_verifier_condition_tokens_device = nullptr) override;
+            void *out_next_verifier_condition_tokens_device = nullptr,
+            const void *verifier_input_tokens_device = nullptr,
+            int verifier_input_token_stride = 0,
+            void *out_committed_verifier_identity_device = nullptr) override;
         bool enqueueDeriveSpeculativePublicationMetadata(
             const void *meta_device,
             int meta_stride,
@@ -903,6 +906,28 @@ namespace llaminar2
                                   int device_id, void *stream) override;
         bool deviceToHostOnStream(void *dst, const void *src, size_t bytes,
                                   int device_id, void *stream) override;
+        /** @copydoc IBackend::deviceToMappedHostByKernelOnStream */
+        bool deviceToMappedHostByKernelOnStream(
+            void *dst,
+            const void *src,
+            size_t bytes,
+            int device_id,
+            void *stream) override;
+        /** @copydoc IBackend::enqueueMappedTransferProgressClaims */
+        bool enqueueMappedTransferProgressClaims(
+            const MappedTransferProgressCommand *commands,
+            MappedTransferProgressClaim *claims,
+            size_t slot_capacity,
+            int device_id,
+            void *stream) override;
+        /** @copydoc IBackend::enqueueMappedTransferProgressCopies */
+        bool enqueueMappedTransferProgressCopies(
+            const MappedTransferProgressClaim *claims,
+            MappedTransferProgressCompletion *completions,
+            size_t slot_capacity,
+            size_t maximum_bytes,
+            int device_id,
+            void *stream) override;
 
         // Pinned host memory
         void *allocatePinned(size_t bytes, int device_id) override;

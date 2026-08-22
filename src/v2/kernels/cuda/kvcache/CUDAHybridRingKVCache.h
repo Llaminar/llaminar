@@ -358,6 +358,54 @@ namespace llaminar2
                                            kv_lens, max_kv_len, stream);
         }
 
+        /**
+         * @brief Remap a model-layer direct ring read to its compressed FA slot.
+         *
+         * Hybrid storage allocates physical rings only for full-attention
+         * layers. The graph nevertheless addresses this interface with the
+         * model layer id, so payload, head, and count must all be resolved
+         * through the same immutable layer map before capture embeds them.
+         *
+         * @return true when @p layer names a full-attention layer with a
+         *         complete native floating ring contract.
+         */
+        bool get_kv_device_ring_view(
+            int layer,
+            int seq_idx,
+            ITensor **out_k,
+            ITensor **out_v,
+            const int **device_head,
+            const int **device_count,
+            int *physical_capacity,
+            void *gpu_stream) override
+        {
+            const int kv_idx =
+                layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+            {
+                if (out_k)
+                    *out_k = nullptr;
+                if (out_v)
+                    *out_v = nullptr;
+                if (device_head)
+                    *device_head = nullptr;
+                if (device_count)
+                    *device_count = nullptr;
+                if (physical_capacity)
+                    *physical_capacity = 0;
+                return false;
+            }
+            return Base::get_kv_device_ring_view(
+                kv_idx,
+                seq_idx,
+                out_k,
+                out_v,
+                device_head,
+                device_count,
+                physical_capacity,
+                gpu_stream);
+        }
+
         bool get_kv_batched_device_view(
             int layer,
             int first_seq_idx,

@@ -12,6 +12,9 @@
 
 #include "CUDAMoEOverlayEpochKernels.h"
 
+#include "execution/moe/MoEOverlayDeviceControllerABI.h"
+
+#include <cuda/atomic>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -25,6 +28,9 @@ namespace
     using llaminar2::DeviceMoEOverlayEpochStatus;
     using llaminar2::DeviceMoEOverlayEpochStatusCode;
     using llaminar2::DeviceMoEOverlayEpochTicket;
+    using llaminar2::DeviceMoEOverlayEpochAdmissionBarrierBinding;
+    using llaminar2::MoEOverlayPeerPlacementEpochBinding;
+    using llaminar2::MoEOverlayDeviceControllerInferenceEpochRecord;
 
     constexpr std::uint32_t kBankCount =
         llaminar2::kDeviceMoEOverlayEpochBankCount;
@@ -82,6 +88,25 @@ namespace
             reinterpret_cast<unsigned long long *>(
                 const_cast<std::uint64_t *>(value)),
             0ull));
+    }
+
+    /** @return System-scope acquire load for a mapped controller epoch. */
+    __device__ __forceinline__ std::uint64_t systemAcquire64(
+        const std::uint64_t *value)
+    {
+        cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system> reference(
+            *const_cast<std::uint64_t *>(value));
+        return reference.load(cuda::memory_order_acquire);
+    }
+
+    /** @brief System-scope release store into one node-local mapped ABI word. */
+    __device__ __forceinline__ void systemRelease64(
+        std::uint64_t *value,
+        std::uint64_t published)
+    {
+        cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system> reference(
+            *value);
+        reference.store(published, cuda::memory_order_release);
     }
 
     /** @return Atomic device load for one 32-bit lifecycle/status word. */
@@ -152,6 +177,45 @@ namespace
         atomicStore32(&status->code, rawCode(code));
     }
 
+    /**
+     * @brief Emit one failure-only epoch snapshot before the downstream guard aborts.
+     *
+     * Successful hot-path operations never call this helper. It keeps semantic
+     * acquire/release failures attributable to their actual boundary instead of
+     * letting a later MoE descriptor assertion obscure the causal state.
+     */
+    __device__ __forceinline__ void reportBoundaryFailure(
+        const char *reason,
+        const DeviceMoEOverlayEpochControl *control,
+        const DeviceMoEOverlayEpochTicket *ticket,
+        std::uint64_t required_epoch = 0u)
+    {
+        printf("overlay_epoch_boundary_failure reason=%s ticket=%p "
+               "ticket_epoch=%llu ticket_selector=%llu required_epoch=%llu "
+               "published_selector=%llu bank0_epoch=%llu bank1_epoch=%llu "
+               "bank0_readers=%llu bank1_readers=%llu "
+               "bank0_state=%u bank1_state=%u acquisitions=%llu\n",
+               reason,
+               ticket,
+               static_cast<unsigned long long>(ticket->epoch),
+               static_cast<unsigned long long>(ticket->selector),
+               static_cast<unsigned long long>(required_epoch),
+               static_cast<unsigned long long>(
+                   atomicLoad64(&control->published_selector)),
+               static_cast<unsigned long long>(
+                   atomicLoad64(&control->bank_epochs[0])),
+               static_cast<unsigned long long>(
+                   atomicLoad64(&control->bank_epochs[1])),
+               static_cast<unsigned long long>(
+                   atomicLoad64(&control->bank_readers[0])),
+               static_cast<unsigned long long>(
+                   atomicLoad64(&control->bank_readers[1])),
+               atomicLoad32(&control->bank_states[0]),
+               atomicLoad32(&control->bank_states[1]),
+               static_cast<unsigned long long>(
+                   atomicLoad64(&control->acquisitions_in_flight)));
+    }
+
     /** @return Bank retaining @p epoch, or the explicit invalid sentinel. */
     __device__ __forceinline__ std::uint32_t findEpochBank(
         const DeviceMoEOverlayEpochControl *control,
@@ -167,11 +231,206 @@ namespace
         return kInvalidBank;
     }
 
+    /**
+     * @brief Freeze one topology admission after every continuation GPU is guarded.
+     *
+     * The caller has already incremented its local `acquisitions_in_flight`.
+     * Publishing arrival only after that increment prevents maintenance on this
+     * participant from reclaiming either candidate bank while it waits for the
+     * symmetric transaction epoch selected by the logical root.
+     */
+    __device__ __forceinline__ bool resolveRequiredEpoch(
+        const std::uint64_t *external_admission_epoch,
+        DeviceMoEOverlayEpochAdmissionBarrierBinding barrier,
+        std::uint64_t *required_epoch)
+    {
+        if (!required_epoch)
+            return false;
+        if (!barrier.record)
+        {
+            if (barrier.participant_id != 0xffffffffu)
+                return false;
+            *required_epoch = external_admission_epoch
+                                  ? systemAcquire64(external_admission_epoch)
+                                  : 0u;
+            return true;
+        }
+
+        MoEOverlayDeviceControllerInferenceEpochRecord *const record =
+            barrier.record;
+        constexpr std::uint32_t kParticipantCount =
+            llaminar2::kMoEOverlayDeviceControllerInferenceEpochMaxParticipants;
+        constexpr std::uint32_t kValidMask =
+            (1u << kParticipantCount) - 1u;
+        const std::uint32_t participant = barrier.participant_id;
+        const std::uint32_t mask = record->participant_mask;
+        const std::uint32_t publisher = record->publisher_participant_id;
+        if (!external_admission_epoch ||
+            record->magic !=
+                llaminar2::kMoEOverlayDeviceControllerInferenceEpochMagic ||
+            record->version !=
+                llaminar2::kMoEOverlayDeviceControllerInferenceEpochVersion ||
+            record->topology_fingerprint == 0u || mask == 0u ||
+            (mask & ~kValidMask) != 0u || participant >= kParticipantCount ||
+            publisher >= kParticipantCount ||
+            (mask & (1u << participant)) == 0u ||
+            (mask & (1u << publisher)) == 0u)
+        {
+            return false;
+        }
+
+        const std::uint64_t previous =
+            systemAcquire64(&record->arrival_sequence[participant]);
+        if (previous == UINT64_MAX)
+            return false;
+        const std::uint64_t sequence = previous + 1u;
+        systemRelease64(&record->arrival_sequence[participant], sequence);
+
+        if (participant == publisher)
+        {
+            for (std::uint32_t member = 0u; member < kParticipantCount; ++member)
+            {
+                if ((mask & (1u << member)) == 0u)
+                    continue;
+                while (systemAcquire64(&record->arrival_sequence[member]) <
+                       sequence)
+                {
+                    // One control thread waits; all compute SMs remain available.
+                }
+            }
+
+            const std::uint64_t published =
+                systemAcquire64(&record->publication_sequence);
+            if (published == UINT64_MAX || published + 1u != sequence)
+            {
+                /* Release a poison epoch when possible so followers terminate
+                 * semantically instead of remaining in a stale wait forever. */
+                if (published < sequence)
+                {
+                    systemRelease64(&record->epoch, 0u);
+                    systemRelease64(
+                        &record->publication_sequence, sequence);
+                }
+                return false;
+            }
+            const std::uint64_t frozen =
+                systemAcquire64(external_admission_epoch);
+            systemRelease64(&record->epoch, frozen);
+            systemRelease64(&record->publication_sequence, sequence);
+        }
+        else
+        {
+            std::uint64_t published =
+                systemAcquire64(&record->publication_sequence);
+            while (published < sequence)
+            {
+                published = systemAcquire64(&record->publication_sequence);
+            }
+            if (published != sequence)
+                return false;
+        }
+
+        *required_epoch = systemAcquire64(&record->epoch);
+        return *required_epoch != 0u;
+    }
+
+    /**
+     * @brief Wait for the exact new activation descriptor, then read its epoch.
+     *
+     * Bank-local packet timelines deliberately reuse small captured values.
+     * The descriptor digest and strictly increasing activation generation are
+     * therefore the anti-ABA authority; observing `dispatch_signal >= 1` alone
+     * is insufficient after a channel lease has been reset.
+     */
+    __device__ __forceinline__ bool resolvePeerPlacementEpoch(
+        MoEOverlayPeerPlacementEpochBinding binding,
+        std::uint64_t *required_epoch)
+    {
+        if (!binding.valid() || !required_epoch)
+            return false;
+
+        const std::uint64_t previous_generation =
+            atomicLoad64(&binding.grant->generation);
+        const std::uint32_t bank =
+            llaminar2::moeOverlayActivationBufferIndex(
+                binding.stage_ordinal);
+        const std::uint64_t expected_timeline =
+            llaminar2::moeOverlayActivationLeasedTimelineValue(
+                llaminar2::moeOverlayActivationBufferVisit(
+                    binding.stage_ordinal));
+        if (bank >= llaminar2::kMoEOverlayActivationBufferCount ||
+            expected_timeline == 0u)
+        {
+            return false;
+        }
+
+        const auto *const control = binding.control;
+        const auto *const descriptor =
+            &control->buffers[bank].dispatch_descriptor;
+        const auto *const signal =
+            &control->buffers[bank].dispatch_signal.value;
+        for (;;)
+        {
+            const std::uint64_t ready =
+                systemAcquire64(&control->admission.ready_signal);
+            const std::uint64_t generation =
+                systemAcquire64(&control->identity.epoch_generation);
+            if (ready < llaminar2::kMoEOverlayActivationAdmissionTimeline ||
+                generation <= previous_generation)
+            {
+                __nanosleep(64u);
+                continue;
+            }
+
+            const std::uint64_t observed_timeline =
+                systemAcquire64(signal);
+            if (observed_timeline ==
+                llaminar2::kMoEOverlayActivationAbortTimeline)
+            {
+                return false;
+            }
+            if (observed_timeline < expected_timeline)
+            {
+                __nanosleep(64u);
+                continue;
+            }
+
+            /* The signal is a system-release publication for the descriptor.
+             * Recheck generation after copying its identity fields so a host
+             * reset/rearm cannot splice two transactions into one snapshot. */
+            const std::uint64_t descriptor_epoch =
+                systemAcquire64(&descriptor->placement_epoch);
+            const std::uint64_t descriptor_digest_low =
+                systemAcquire64(&descriptor->digest.low);
+            const std::uint64_t descriptor_digest_high =
+                systemAcquire64(&descriptor->digest.high);
+            const std::uint64_t identity_digest_low =
+                systemAcquire64(&control->identity.digest.low);
+            const std::uint64_t identity_digest_high =
+                systemAcquire64(&control->identity.digest.high);
+            const std::uint64_t generation_after =
+                systemAcquire64(&control->identity.epoch_generation);
+            if (generation == generation_after && descriptor_epoch != 0u &&
+                descriptor->timeline == expected_timeline &&
+                descriptor->stage_ordinal == binding.stage_ordinal &&
+                descriptor_digest_low == identity_digest_low &&
+                descriptor_digest_high == identity_digest_high)
+            {
+                *required_epoch = descriptor_epoch;
+                return true;
+            }
+            __nanosleep(64u);
+        }
+    }
+
     /** @brief Install a request reader in the exact selector it observes. */
     __global__ void acquireEpochKernel(
         DeviceMoEOverlayEpochControl *control,
         DeviceMoEOverlayEpochTicket *ticket,
-        DeviceMoEOverlayEpochStatus *status)
+        DeviceMoEOverlayEpochStatus *status,
+        const std::uint64_t *external_admission_epoch,
+        DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier,
+        MoEOverlayPeerPlacementEpochBinding peer_placement_epoch)
     {
         if (blockIdx.x != 0u || threadIdx.x != 0u)
             return;
@@ -180,6 +439,8 @@ namespace
         /* A live ticket here means the preceding request failed to release. */
         if (ticket->epoch != 0u || ticket->selector != 0u)
         {
+            reportBoundaryFailure(
+                "acquire_live_ticket", control, ticket);
             finishStatus(
                 status,
                 DeviceMoEOverlayEpochOperation::Acquire,
@@ -197,14 +458,16 @@ namespace
             1ull);
         const std::uint64_t selector =
             atomicLoad64(&control->published_selector);
-        const std::uint32_t bank = selectorBank(selector);
+        const std::uint32_t published_bank = selectorBank(selector);
         const std::uint64_t generation = selectorGeneration(selector);
-        if (generation == 0u || bank >= kBankCount)
+        if (generation == 0u || published_bank >= kBankCount)
         {
             atomicAdd(
                 reinterpret_cast<unsigned long long *>(
                     &control->acquisitions_in_flight),
                 ~0ull);
+            reportBoundaryFailure(
+                "acquire_invalid_selector", control, ticket);
             finishStatus(
                 status,
                 DeviceMoEOverlayEpochOperation::Acquire,
@@ -216,11 +479,67 @@ namespace
             return;
         }
 
+        std::uint64_t required_epoch = 0u;
+        bool resolved = true;
+        if (peer_placement_epoch.valid())
+        {
+            resolved = !external_admission_epoch &&
+                       !admission_barrier.record &&
+                       admission_barrier.participant_id == 0xffffffffu &&
+                       resolvePeerPlacementEpoch(
+                           peer_placement_epoch, &required_epoch);
+        }
+        else if (admission_barrier.record)
+        {
+            resolved = resolveRequiredEpoch(
+                external_admission_epoch,
+                admission_barrier,
+                &required_epoch);
+        }
+        else if (admission_barrier.participant_id != 0xffffffffu)
+        {
+            resolved = false;
+        }
+        else
+        {
+            required_epoch = external_admission_epoch
+                                 ? systemAcquire64(external_admission_epoch)
+                                 : atomicLoad64(
+                                       &control->bank_epochs[published_bank]);
+        }
+        const std::uint32_t bank = findEpochBank(control, required_epoch);
+        const std::uint64_t ticket_generation =
+            bank == published_bank
+                ? generation
+                : (generation > 1u ? generation - 1u : 0u);
+        if (!resolved || required_epoch == 0u || bank >= kBankCount ||
+            ticket_generation == 0u)
+        {
+            atomicAdd(
+                reinterpret_cast<unsigned long long *>(
+                    &control->acquisitions_in_flight),
+                ~0ull);
+            reportBoundaryFailure(
+                "acquire_unresolved_epoch",
+                control,
+                ticket,
+                required_epoch);
+            finishStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::Acquire,
+                DeviceMoEOverlayEpochStatusCode::InvalidControl,
+                required_epoch,
+                selector,
+                kInvalidBank,
+                rawState(DeviceMoEOverlayEpochBankState::Empty));
+            return;
+        }
+
         const std::uint32_t state =
             atomicLoad32(&control->bank_states[bank]);
         const std::uint64_t epoch =
             atomicLoad64(&control->bank_epochs[bank]);
-        if (epoch == 0u ||
+        if (epoch == 0u || epoch != required_epoch ||
             (state != rawState(DeviceMoEOverlayEpochBankState::Published) &&
              state != rawState(DeviceMoEOverlayEpochBankState::Retiring)))
         {
@@ -228,6 +547,11 @@ namespace
                 reinterpret_cast<unsigned long long *>(
                     &control->acquisitions_in_flight),
                 ~0ull);
+            reportBoundaryFailure(
+                "acquire_unpublished_bank",
+                control,
+                ticket,
+                required_epoch);
             finishStatus(
                 status,
                 DeviceMoEOverlayEpochOperation::Acquire,
@@ -244,7 +568,7 @@ namespace
                 &control->bank_readers[bank]),
             1ull);
         ticket->epoch = epoch;
-        ticket->selector = selector;
+        ticket->selector = makeSelector(ticket_generation, bank);
         __threadfence();
         atomicAdd(
             reinterpret_cast<unsigned long long *>(
@@ -277,6 +601,8 @@ namespace
             bank >= kBankCount ||
             atomicLoad64(&control->bank_epochs[bank]) != epoch)
         {
+            reportBoundaryFailure(
+                "release_invalid_ticket", control, ticket, epoch);
             finishStatus(
                 status,
                 DeviceMoEOverlayEpochOperation::Release,
@@ -323,6 +649,8 @@ namespace
             selector,
             bank,
             atomicLoad32(&control->bank_states[bank]));
+        reportBoundaryFailure(
+            "release_reader_underflow", control, ticket, epoch);
     }
 
     /** @brief Claim the non-published empty bank for background preparation. */
@@ -774,6 +1102,9 @@ extern "C"
         DeviceMoEOverlayEpochControl *control,
         DeviceMoEOverlayEpochTicket *ticket,
         DeviceMoEOverlayEpochStatus *status,
+        const std::uint64_t *external_admission_epoch,
+        DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier,
+        MoEOverlayPeerPlacementEpochBinding peer_placement_epoch,
         int device_ordinal,
         void *stream)
     {
@@ -781,7 +1112,12 @@ extern "C"
             !prepareLaunch(device_ordinal, stream, "cudaMoEOverlayEpochAcquire"))
             return false;
         acquireEpochKernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
-            control, ticket, status);
+            control,
+            ticket,
+            status,
+            external_admission_epoch,
+            admission_barrier,
+            peer_placement_epoch);
         return finishLaunch("cudaMoEOverlayEpochAcquire");
     }
 

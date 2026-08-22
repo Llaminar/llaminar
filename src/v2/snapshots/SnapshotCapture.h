@@ -65,10 +65,12 @@ namespace llaminar2
     /**
      * @brief Outcome of joining context-scoped prefill snapshots into sequences.
      *
-     * A checkpoint is sequence-shaped only when every chunk published the same
-     * column geometry and each chunk's row count equals its real-token count.
-     * Terminal-only values such as last-token logits intentionally remain as
-     * the final chunk's ordinary snapshot rather than being falsely expanded.
+     * A checkpoint is sequence-shaped only when every chunk publishes the same
+     * typed column geometry. Most values own one row per real token; packed
+     * routed-expert evidence owns one row per `(token, route)` pair and has its
+     * inactive fixed-bucket suffix removed during aggregation. Terminal-only
+     * values such as last-token logits intentionally remain as the final
+     * chunk's ordinary snapshot rather than being falsely expanded.
      */
     struct SnapshotChunkSequenceAggregation
     {
@@ -145,10 +147,11 @@ namespace llaminar2
          * context-qualified copy (for per-chunk diagnosis) and the historical
          * bare semantic key (which naturally contains only the most recent
          * chunk).  This diagnostic-only method validates the qualified row
-         * geometry, concatenates every sequence-shaped checkpoint in request
-         * order, and writes that complete value back under the bare key used by
-         * existing parity comparison and CSV code.  It never touches live
-         * device state or inserts work into the captured graph.
+         * geometry, projects packed tensors to their live logical rows,
+         * concatenates every sequence-shaped checkpoint in request order, and
+         * writes that complete value back under the bare key used by existing
+         * parity comparison and CSV code. It never touches live device state
+         * or inserts work into the captured graph.
          *
          * @param chunks Ordered real-row descriptors from the prefill scheduler.
          * @return Aggregation counts, or a precise error when a checkpoint that

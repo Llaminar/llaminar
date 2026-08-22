@@ -259,6 +259,18 @@ namespace llaminar2::test
             (std::vector<int>{7, 8, 9}));
     }
 
+    TEST(Test__MoEExpertOwnerMap,
+         ContiguousSelectionClassificationIsSharedAcrossPublicationPaths)
+    {
+        using routed_expert_ownership::expertIdsFormContiguousSpan;
+
+        EXPECT_TRUE(expertIdsFormContiguousSpan({}));
+        EXPECT_TRUE(expertIdsFormContiguousSpan({7}));
+        EXPECT_TRUE(expertIdsFormContiguousSpan({4, 5, 6, 7}));
+        EXPECT_FALSE(expertIdsFormContiguousSpan({4, 5, 7}));
+        EXPECT_FALSE(expertIdsFormContiguousSpan({4, 6, 7}));
+    }
+
     TEST(Test__MoEExpertOwnerMap, RandomAssignmentIsDeterministicBalancedDisjointAndMaskEquivalent)
     {
         using routed_expert_ownership::expertIdsForParticipant;

@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include "backends/IGPUGraphCapture.h"
 #include "kernels/common/SamplingMath.h"
 
 #include <algorithm>
@@ -21,10 +22,59 @@
 
 namespace
 {
+    using llaminar2::DeviceControlledLoopFragment;
+    using llaminar2::DeviceControlledLoopFragmentExecution;
+    using llaminar2::DeviceControlledLoopTicketSelection;
     using namespace llaminar2::sampling_math;
 
     using ControlRow = std::array<int, kDeviceGenerationControlCount>;
     using MetaRow = std::array<int, kSpeculativeBatchMetaCount>;
+
+    TEST(
+        Test__DeviceGenerationController,
+        HostedTicketSelectionPreservesTransactionThenMaintenanceOrder)
+    {
+        const std::array<DeviceControlledLoopFragment, 3> branch = {{
+            {.name = "transaction",
+             .execution = DeviceControlledLoopFragmentExecution::Always},
+            {.name = "epoch release",
+             .execution = DeviceControlledLoopFragmentExecution::Always},
+            {.name = "maintenance",
+             .execution = DeviceControlledLoopFragmentExecution::
+                 IfDeviceWordNonZero},
+        }};
+        const std::span<const DeviceControlledLoopFragment> ordered_branch(
+            branch);
+
+        const DeviceControlledLoopTicketSelection due{
+            .iteration_admitted = true,
+            .conditional_word_nonzero = true,
+        };
+        ASSERT_EQ(due.countSelected(ordered_branch), 3u);
+        ASSERT_NE(due.selectOrdinal(ordered_branch, 0u), nullptr);
+        ASSERT_NE(due.selectOrdinal(ordered_branch, 1u), nullptr);
+        ASSERT_NE(due.selectOrdinal(ordered_branch, 2u), nullptr);
+        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 0u)->name,
+                     "transaction");
+        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 1u)->name,
+                     "epoch release");
+        EXPECT_STREQ(due.selectOrdinal(ordered_branch, 2u)->name,
+                     "maintenance");
+
+        const DeviceControlledLoopTicketSelection not_due{
+            .iteration_admitted = true,
+            .conditional_word_nonzero = false,
+        };
+        EXPECT_EQ(not_due.countSelected(ordered_branch), 2u);
+        EXPECT_EQ(not_due.selectOrdinal(ordered_branch, 2u), nullptr);
+
+        const DeviceControlledLoopTicketSelection terminal{
+            .iteration_admitted = false,
+            .conditional_word_nonzero = true,
+        };
+        EXPECT_EQ(terminal.countSelected(ordered_branch), 0u);
+        EXPECT_EQ(terminal.selectOrdinal(ordered_branch, 0u), nullptr);
+    }
 
     /**
      * @brief Construct one valid compact verifier metadata row.
@@ -76,6 +126,73 @@ namespace
     DeviceGenerationDepthPolicy fixedDepthPolicy(int depth)
     {
         return DeviceGenerationDepthPolicy::fixed(depth);
+    }
+
+    /**
+     * @brief Prove that durable verifier identity uses the committed depth.
+     *
+     * Dynamic policy observation may choose the next depth as part of the same
+     * controller commit.  The diagnostic record must retain the depth and
+     * tokens of the transaction just retired, not reinterpret the reusable row
+     * with that next policy decision.
+     */
+    TEST(
+        Test__DeviceGenerationController,
+        CommittedVerifierIdentityIsCompleteAndUsesLastTransactionDepth)
+    {
+        ControlRow control{};
+        ASSERT_TRUE(initialize_device_generation_control(
+            16, 16, fixedDepthPolicy(3), control.data()));
+
+        std::array<int32_t, kSpeculativeBatchMaxOutputTokens> verifier{};
+        verifier.fill(-1);
+        verifier[0] = 101;
+        verifier[1] = 201;
+        verifier[2] = 202;
+        verifier[3] = 203;
+        ASSERT_TRUE(valid_committed_verifier_identity_input(
+            verifier.data(), verifier.size(), control.data()));
+
+        control[kDeviceGenerationControlTransactionCount] = 4;
+        control[kDeviceGenerationControlLastTransactionDraftDepth] = 3;
+        /* Model the adaptive controller selecting depth one for the next turn. */
+        control[kDeviceGenerationControlCurrentDraftDepth] = 1;
+
+        MTPCommittedVerifierIdentityRecord identity{};
+        ASSERT_TRUE(publish_committed_verifier_identity(
+            verifier.data(), verifier.size(), control.data(), &identity));
+        EXPECT_EQ(identity.valid, 1u);
+        EXPECT_EQ(identity.version, kMTPCommittedVerifierIdentityVersion);
+        EXPECT_EQ(identity.transaction_count, 4);
+        EXPECT_EQ(identity.draft_depth, 3);
+        EXPECT_EQ(identity.verifier_input_tokens[0], 101);
+        EXPECT_EQ(identity.verifier_input_tokens[1], 201);
+        EXPECT_EQ(identity.verifier_input_tokens[2], 202);
+        EXPECT_EQ(identity.verifier_input_tokens[3], 203);
+        for (int row = 4; row < kSpeculativeBatchMaxOutputTokens; ++row)
+            EXPECT_EQ(identity.verifier_input_tokens[row], -1);
+    }
+
+    TEST(
+        Test__DeviceGenerationController,
+        CommittedVerifierIdentityRejectsSentinelAndShortActiveRows)
+    {
+        ControlRow control{};
+        ASSERT_TRUE(initialize_device_generation_control(
+            16, 16, fixedDepthPolicy(3), control.data()));
+        std::array<int32_t, kSpeculativeBatchMaxOutputTokens> verifier{};
+        verifier.fill(-1);
+        verifier[0] = 101;
+        verifier[1] = 201;
+        verifier[2] = 202;
+
+        EXPECT_FALSE(valid_committed_verifier_identity_input(
+            verifier.data(), verifier.size(), control.data()));
+        verifier[3] = 203;
+        EXPECT_FALSE(valid_committed_verifier_identity_input(
+            verifier.data(), 3, control.data()));
+        EXPECT_TRUE(valid_committed_verifier_identity_input(
+            verifier.data(), verifier.size(), control.data()));
     }
 } // namespace
 

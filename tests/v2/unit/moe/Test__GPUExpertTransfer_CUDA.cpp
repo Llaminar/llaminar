@@ -35,6 +35,19 @@ namespace
         return err == cudaSuccess ? count : 0;
     }
 
+    /**
+     * @brief Query the exact destination-owned peer edge used by the peer lane.
+     * @return True only when CUDA device 1 may directly read device 0 memory.
+     */
+    bool cudaPeerLaneEdgeAvailable()
+    {
+        if (cudaDeviceCount() < 2)
+            return false;
+        int can_access = 0;
+        return cudaDeviceCanAccessPeer(&can_access, 1, 0) == cudaSuccess &&
+               can_access != 0;
+    }
+
     template <typename T>
     T *allocCuda(int ordinal, size_t count)
     {
@@ -711,20 +724,28 @@ TEST(Test__GPUExpertTransferCUDA, StagedActivationCopiesTransferSlotIntoActiveSl
 
 TEST(Test__ExpertTierGpuPeerTransferCUDA, EventPolledTransferIsByteExact)
 {
+    if (!cudaPeerLaneEdgeAvailable())
+        GTEST_SKIP() << "CUDA 1 cannot directly access CUDA 0";
     runCudaPeerLaneTransfer();
 }
 
 TEST(Test__ExpertTierGpuPeerTransferCUDA, FP16ContiguousTransferIsByteExact)
 {
+    if (!cudaPeerLaneEdgeAvailable())
+        GTEST_SKIP() << "CUDA 1 cannot directly access CUDA 0";
     runCudaContiguousPeerLaneTransfer("fp16", 2, 0xF016u);
 }
 
 TEST(Test__ExpertTierGpuPeerTransferCUDA, BF16ContiguousTransferIsByteExact)
 {
+    if (!cudaPeerLaneEdgeAvailable())
+        GTEST_SKIP() << "CUDA 1 cannot directly access CUDA 0";
     runCudaContiguousPeerLaneTransfer("bf16", 2, 0xBF16u);
 }
 
 TEST(Test__ExpertTierGpuPeerTransferCUDA, FP32ContiguousTransferIsByteExact)
 {
+    if (!cudaPeerLaneEdgeAvailable())
+        GTEST_SKIP() << "CUDA 1 cannot directly access CUDA 0";
     runCudaContiguousPeerLaneTransfer("fp32", 4, 0xF032u);
 }

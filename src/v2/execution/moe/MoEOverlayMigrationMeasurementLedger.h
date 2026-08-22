@@ -5,7 +5,7 @@
  * Physical migration lanes publish one pointer-free observation per completed
  * gate/up/down operation.  This setup-owned ledger stores a fixed number of
  * warmup and measured samples for every explicitly declared directed
- * participant/layer coordinate.  Recording performs no allocation, waiting,
+     * participant/layer coordinate.  Recording performs no allocation, waiting,
  * device work, or topology inference.  Once its single maintenance producer
  * is quiescent, sealing computes deterministic medians suitable for
  * `MoEOverlayEconomyProfileComposer`.
@@ -93,7 +93,7 @@ namespace llaminar2
             std::uint64_t warmup_samples_per_coordinate = 1;
             std::uint64_t measured_samples_per_coordinate =
                 MoEOverlayEconomyProfileComposer::kMinimumMigrationSamples;
-            /** Runtime-reachable phases whose interference must be sampled. */
+            /** Runtime-reachable phases used by subsequent service profiling. */
             ExpertHistogramProductionSourceMask required_sources =
                 kAllExpertHistogramProductionSources;
             std::string measurement_identity;
@@ -139,7 +139,7 @@ namespace llaminar2
             std::uint64_t concurrent_nanoseconds,
             std::string *error = nullptr) noexcept;
 
-        /** @return Whether every coordinate has robust movement and interference samples. */
+        /** @return Whether every coordinate has robust physical movement samples. */
         [[nodiscard]] bool ready() const noexcept;
 
         /**

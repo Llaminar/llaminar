@@ -675,6 +675,29 @@ namespace llaminar2
             dev.numa_node = -1; // Unknown
         }
 
+        /*
+         * Peer topology is an execution-policy input, not a presentation
+         * detail. Query it on every inventory generation even when table
+         * logging is disabled; otherwise ordinary MPI startup would silently
+         * classify a P2P-capable cell as host-only merely because it requested
+         * quiet device discovery.
+         */
+        p2p_matrices_.clear();
+#ifdef HAVE_CUDA
+        if (cuda_devices.size() > 1u)
+        {
+            p2p_matrices_.push_back(
+                cuda_enumeration::query_p2p_matrix(cuda_devices));
+        }
+#endif
+#ifdef HAVE_ROCM
+        if (rocm_devices.size() > 1u)
+        {
+            p2p_matrices_.push_back(
+                rocm_enumeration::query_p2p_matrix(rocm_devices));
+        }
+#endif
+
         devices_.insert(devices_.end(), cuda_devices.begin(), cuda_devices.end());
         devices_.insert(devices_.end(), rocm_devices.begin(), rocm_devices.end());
         devices_.insert(devices_.end(), vulkan_devices.begin(), vulkan_devices.end());
@@ -950,25 +973,13 @@ namespace llaminar2
             }
 
             // --- P2P access matrices ---
-            p2p_matrices_.clear();
-
-#ifdef HAVE_CUDA
-            if (cuda_devices.size() > 1)
+            for (const auto &matrix : p2p_matrices_)
             {
-                auto cuda_p2p = cuda_enumeration::query_p2p_matrix(cuda_devices);
-                log_p2p_table("CUDA", cuda_p2p);
-                p2p_matrices_.push_back(std::move(cuda_p2p));
+                if (matrix.backend == ComputeBackendType::GPU_CUDA)
+                    log_p2p_table("CUDA", matrix);
+                else if (matrix.backend == ComputeBackendType::GPU_ROCM)
+                    log_p2p_table("ROCm", matrix);
             }
-#endif
-
-#ifdef HAVE_ROCM
-            if (rocm_devices.size() > 1)
-            {
-                auto rocm_p2p = rocm_enumeration::query_p2p_matrix(rocm_devices);
-                log_p2p_table("ROCm", rocm_p2p);
-                p2p_matrices_.push_back(std::move(rocm_p2p));
-            }
-#endif
 
         } // end if (!inventory_logged_)
 
@@ -1068,6 +1079,62 @@ namespace llaminar2
         }
 
         return find_device(backend_type, device.ordinal) >= 0;
+    }
+
+    std::optional<PeerAccessCoverage> DeviceManager::peerAccessCoverage(
+        const std::vector<DeviceId> &devices) const
+    {
+        if (devices.size() < 2u || !devices.front().is_gpu())
+            return std::nullopt;
+
+        const DeviceType backend_type = devices.front().type;
+        std::vector<int> ordinals;
+        ordinals.reserve(devices.size());
+        for (const DeviceId &device : devices)
+        {
+            if (!device.is_gpu() || device.type != backend_type)
+                return std::nullopt;
+            ordinals.push_back(device.ordinal);
+        }
+
+        const ComputeBackendType matrix_backend =
+            backend_type == DeviceType::CUDA
+                ? ComputeBackendType::GPU_CUDA
+                : ComputeBackendType::GPU_ROCM;
+        for (const auto &matrix : p2p_matrices_)
+        {
+            if (matrix.backend == matrix_backend)
+                return matrix.coverageForDevices(ordinals);
+        }
+        return std::nullopt;
+    }
+
+    std::optional<bool> DeviceManager::peerAccessAvailable(
+        DeviceId accessor,
+        DeviceId peer) const
+    {
+        if (!accessor.is_gpu() || !peer.is_gpu() || accessor == peer ||
+            accessor.type != peer.type)
+        {
+            return std::nullopt;
+        }
+
+        const ComputeBackendType matrix_backend =
+            accessor.type == DeviceType::CUDA
+                ? ComputeBackendType::GPU_CUDA
+                : ComputeBackendType::GPU_ROCM;
+        for (const auto &matrix : p2p_matrices_)
+        {
+            if (matrix.backend != matrix_backend)
+                continue;
+            if (!matrix.indexForDevice(accessor.ordinal).has_value() ||
+                !matrix.indexForDevice(peer.ordinal).has_value())
+            {
+                return std::nullopt;
+            }
+            return matrix.canAccessDevice(accessor.ordinal, peer.ordinal);
+        }
+        return std::nullopt;
     }
 
     bool DeviceManager::deviceExists(const GlobalDeviceAddress &device, bool strict_numa) const

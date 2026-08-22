@@ -723,7 +723,9 @@ namespace llaminar2
             phase == MoEOverlayDistributedResidencyVotePhase::Reserved ||
             phase == MoEOverlayDistributedResidencyVotePhase::Staged ||
             phase ==
-                MoEOverlayDistributedResidencyVotePhase::InactiveCommitted ||
+                MoEOverlayDistributedResidencyVotePhase::InactivePrepared ||
+            phase ==
+                MoEOverlayDistributedResidencyVotePhase::RuntimePublished ||
             phase ==
                 MoEOverlayDistributedResidencyVotePhase::LeaseDrained;
         if (!phase_valid)
@@ -776,10 +778,15 @@ namespace llaminar2
         case MoEOverlayDistributedResidencyProtocolState::
             AwaitingStageConsensus:
             return MoEOverlayDistributedResidencyVotePhase::Staged;
-        case MoEOverlayDistributedResidencyProtocolState::AwaitingLocalCommit:
+        case MoEOverlayDistributedResidencyProtocolState::AwaitingLocalPrepare:
         case MoEOverlayDistributedResidencyProtocolState::
-            AwaitingCommitConsensus:
-            return MoEOverlayDistributedResidencyVotePhase::InactiveCommitted;
+            AwaitingPrepareConsensus:
+            return MoEOverlayDistributedResidencyVotePhase::InactivePrepared;
+        case MoEOverlayDistributedResidencyProtocolState::
+            AwaitingLocalPublication:
+        case MoEOverlayDistributedResidencyProtocolState::
+            AwaitingPublicationConsensus:
+            return MoEOverlayDistributedResidencyVotePhase::RuntimePublished;
         case MoEOverlayDistributedResidencyProtocolState::Published:
         case MoEOverlayDistributedResidencyProtocolState::
             AwaitingRetirementConsensus:
@@ -802,14 +809,17 @@ namespace llaminar2
         const bool awaiting_stage =
             state_ == MoEOverlayDistributedResidencyProtocolState::
                           AwaitingLocalStage;
-        const bool awaiting_commit =
+        const bool awaiting_prepare =
             state_ == MoEOverlayDistributedResidencyProtocolState::
-                          AwaitingLocalCommit;
+                          AwaitingLocalPrepare;
+        const bool awaiting_publication =
+            state_ == MoEOverlayDistributedResidencyProtocolState::
+                          AwaitingLocalPublication;
         const bool awaiting_retirement =
             state_ ==
             MoEOverlayDistributedResidencyProtocolState::Published;
-        if (!awaiting_reservation && !awaiting_stage && !awaiting_commit &&
-            !awaiting_retirement)
+        if (!awaiting_reservation && !awaiting_stage && !awaiting_prepare &&
+            !awaiting_publication && !awaiting_retirement)
         {
             throw std::logic_error(
                 "Distributed ExpertOverlay protocol is not awaiting a local vote");
@@ -869,11 +879,14 @@ namespace llaminar2
                      : (awaiting_stage
                             ? MoEOverlayDistributedResidencyProtocolState::
                                   AwaitingStageConsensus
-                            : (awaiting_commit
+                            : (awaiting_prepare
                                    ? MoEOverlayDistributedResidencyProtocolState::
-                                         AwaitingCommitConsensus
-                                   : MoEOverlayDistributedResidencyProtocolState::
-                                         AwaitingRetirementConsensus));
+                                         AwaitingPrepareConsensus
+                                   : (awaiting_publication
+                                          ? MoEOverlayDistributedResidencyProtocolState::
+                                                AwaitingPublicationConsensus
+                                          : MoEOverlayDistributedResidencyProtocolState::
+                                                AwaitingRetirementConsensus)));
         return vote;
     }
 
@@ -898,14 +911,17 @@ namespace llaminar2
         const bool awaiting_stage =
             state_ == MoEOverlayDistributedResidencyProtocolState::
                           AwaitingStageConsensus;
-        const bool awaiting_commit =
+        const bool awaiting_prepare =
             state_ == MoEOverlayDistributedResidencyProtocolState::
-                          AwaitingCommitConsensus;
+                          AwaitingPrepareConsensus;
+        const bool awaiting_publication =
+            state_ == MoEOverlayDistributedResidencyProtocolState::
+                          AwaitingPublicationConsensus;
         const bool awaiting_retirement =
             state_ == MoEOverlayDistributedResidencyProtocolState::
                           AwaitingRetirementConsensus;
-        if (!awaiting_reservation && !awaiting_stage && !awaiting_commit &&
-            !awaiting_retirement)
+        if (!awaiting_reservation && !awaiting_stage && !awaiting_prepare &&
+            !awaiting_publication && !awaiting_retirement)
         {
             fail(
                 {.phase =
@@ -1029,9 +1045,13 @@ namespace llaminar2
                            ? "staging"
                            : (phase ==
                                       MoEOverlayDistributedResidencyVotePhase::
-                                          InactiveCommitted
-                                  ? "inactive-bank commit"
-                                  : "old-epoch lease drain"));
+                                          InactivePrepared
+                                  ? "inactive-bank preparation"
+                                  : (phase ==
+                                             MoEOverlayDistributedResidencyVotePhase::
+                                                 RuntimePublished
+                                         ? "runtime publication"
+                                         : "old-epoch lease drain")));
             message << "Distributed ExpertOverlay " << phase_name
                     << " failed on world rank "
                     << first_failure->world_rank << " with code "
@@ -1057,24 +1077,28 @@ namespace llaminar2
                            AwaitingLocalStage
                      : (awaiting_stage
                             ? MoEOverlayDistributedResidencyProtocolState::
-                                  AwaitingLocalCommit
-                            : (awaiting_commit
+                                  AwaitingLocalPrepare
+                            : (awaiting_prepare
                                    ? MoEOverlayDistributedResidencyProtocolState::
-                                         ReadyToPublish
-                                   : MoEOverlayDistributedResidencyProtocolState::
-                                         ReadyToRetire));
+                                         AwaitingLocalPublication
+                                   : (awaiting_publication
+                                          ? MoEOverlayDistributedResidencyProtocolState::
+                                                ReadyForAuthorityPublication
+                                          : MoEOverlayDistributedResidencyProtocolState::
+                                                ReadyToRetire)));
         if (error)
             error->clear();
         return true;
     }
 
-    void MoEOverlayDistributedResidencyProtocol::markPublished()
+    void MoEOverlayDistributedResidencyProtocol::markAuthorityPublished()
     {
         if (state_ !=
-            MoEOverlayDistributedResidencyProtocolState::ReadyToPublish)
+            MoEOverlayDistributedResidencyProtocolState::
+                ReadyForAuthorityPublication)
         {
             throw std::logic_error(
-                "Distributed ExpertOverlay epoch cannot publish before unanimous commit readiness");
+                "Distributed ExpertOverlay epoch cannot become authoritative before unanimous runtime publication");
         }
         state_ = MoEOverlayDistributedResidencyProtocolState::Published;
     }

@@ -36,8 +36,17 @@ namespace llaminar2
 
     // ========== Constructor & Destructor ==========
 
-    IQ4_NLTensor::IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
-        : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr),
+    IQ4_NLTensor::IQ4_NLTensor(
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw_data)
+        : IQ4_NLTensor(shape, AlignedVector<uint8_t>(raw_data))
+    {
+    }
+
+    IQ4_NLTensor::IQ4_NLTensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint8_t> raw_data)
+        : shape_(shape), is_view_(false), raw_data_(std::move(raw_data)), raw_data_ptr_(nullptr),
           view_byte_offset_(0), parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr)
     {
         if (shape_.size() != 2u && shape_.size() != 3u)
@@ -119,7 +128,7 @@ namespace llaminar2
         // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
         // during implicit member destruction of large 3D MoE expert weight tensors.
         // See Q4_KTensor teardown investigation for details.
-        { std::vector<uint8_t>().swap(raw_data_); }
+        { AlignedVector<uint8_t>().swap(raw_data_); }
         { std::vector<size_t>().swap(shape_); }
     }
 

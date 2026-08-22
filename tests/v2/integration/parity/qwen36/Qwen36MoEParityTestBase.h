@@ -630,9 +630,10 @@ namespace llaminar2::test::parity::qwen36
     }
 
     inline bool applyMoEOverlayMaintenanceIfNeeded(
-        IOrchestrationRunner &runner)
+        IOrchestrationRunner &runner,
+        uint64_t committed_tokens)
     {
-        return runner.maybeApplyMoERebalance();
+        return runner.maybeApplyMoERebalance(committed_tokens);
     }
 
     inline RoutedExpertDomain localTPMoEDomain(
@@ -1510,6 +1511,30 @@ namespace llaminar2::test::parity::qwen36
             return;
         }
 
+        /*
+         * This custom MTP reference path does not pass through
+         * ParityTestBase::SetUp(), so it must join the same node-local writer
+         * lifecycle explicitly. CPU, CUDA, and ROCm campaigns may reach this
+         * boundary concurrently even though their inference resources are
+         * disjoint. Recheck after acquiring the lease because a peer may have
+         * published the complete immutable pack while this process waited.
+         */
+        ReferenceGenerationLease generation_lease;
+        identity_error.clear();
+        if (qwen36MoEDecodeSnapshotsLookUsable(
+                metadata_path,
+                test_case.prompt,
+                test_case.decode_steps,
+                require_mtp_sidecar_snapshots) &&
+            qwen36MoEReferenceIdentityMatches(
+                metadata_path,
+                model_path,
+                test_case.prompt,
+                &identity_error))
+        {
+            return;
+        }
+
         std::string output;
         ASSERT_TRUE(regenerateQwen36MoEDecodeSnapshots(
             model_path,
@@ -1566,6 +1591,19 @@ namespace llaminar2::test::parity::qwen36
                    test_case.minimum_prompt_tokens;
         };
 
+        if (metadata_matches_case())
+        {
+            return;
+        }
+
+        /*
+         * Metadata-only generation still loads the real 35B Hugging Face
+         * model and consumes substantial host memory. It is therefore the
+         * same heavyweight publication lifecycle as full snapshot generation,
+         * not a harmless per-backend setup action. Hold the shared writer lease
+         * and perform the mandatory post-wait recheck before spawning Python.
+         */
+        ReferenceGenerationLease generation_lease;
         if (metadata_matches_case())
         {
             return;
@@ -10943,7 +10981,7 @@ namespace llaminar2::test::parity::qwen36
                     return true;
                 if (serial_runner->moeOverlayAuthorityExecution() !=
                     MoEOverlayAuthorityExecutionKind::
-                        HomogeneousDeviceResident)
+                        DeviceResident)
                 {
                     ADD_FAILURE()
                         << context
@@ -10951,7 +10989,7 @@ namespace llaminar2::test::parity::qwen36
                            "independent oracle has no device controller";
                     return false;
                 }
-                if (!serial_runner->maybeApplyDecodeBoundaryMaintenance())
+                if (!serial_runner->maybeApplyDecodeBoundaryMaintenance(1u))
                 {
                     ADD_FAILURE()
                         << context
@@ -11212,7 +11250,7 @@ namespace llaminar2::test::parity::qwen36
                 return true;
             if (runner->moeOverlayAuthorityExecution() !=
                 MoEOverlayAuthorityExecutionKind::
-                    HomogeneousDeviceResident)
+                    DeviceResident)
             {
                 ADD_FAILURE()
                     << context
@@ -11221,7 +11259,7 @@ namespace llaminar2::test::parity::qwen36
                        "Dynamic/LLEP device controller";
                 return false;
             }
-            if (!runner->maybeApplyDecodeBoundaryMaintenance())
+            if (!runner->maybeApplyDecodeBoundaryMaintenance(1u))
             {
                 ADD_FAILURE()
                     << context
@@ -14237,7 +14275,8 @@ namespace llaminar2::test::parity::qwen36
                             step.tokens.end());
                     }
                     produced += static_cast<int>(step.tokens.size());
-                    if (!applyMoEOverlayMaintenanceIfNeeded(*runner))
+                    if (!applyMoEOverlayMaintenanceIfNeeded(
+                            *runner, step.tokens.size()))
                     {
                         ADD_FAILURE() << runner->lastError();
                         return false;
@@ -14322,7 +14361,7 @@ namespace llaminar2::test::parity::qwen36
                     {
                         out_tokens->push_back(step.tokens.front());
                     }
-                    if (!applyMoEOverlayMaintenanceIfNeeded(*runner))
+                    if (!applyMoEOverlayMaintenanceIfNeeded(*runner, 1u))
                     {
                         ADD_FAILURE() << runner->lastError();
                         return false;
@@ -14861,7 +14900,8 @@ namespace llaminar2::test::parity::qwen36
                         step.tokens.end());
                 }
                 produced += static_cast<int>(step.tokens.size());
-                if (!applyMoEOverlayMaintenanceIfNeeded(*runner))
+                if (!applyMoEOverlayMaintenanceIfNeeded(
+                        *runner, step.tokens.size()))
                 {
                     ADD_FAILURE() << runner->lastError();
                     return false;
@@ -15207,7 +15247,7 @@ namespace llaminar2::test::parity::qwen36
                     {
                         out_tokens->push_back(token);
                     }
-                    if (!applyMoEOverlayMaintenanceIfNeeded(*runner))
+                    if (!applyMoEOverlayMaintenanceIfNeeded(*runner, 1u))
                     {
                         ADD_FAILURE() << runner->lastError();
                         return false;
@@ -15317,7 +15357,7 @@ namespace llaminar2::test::parity::qwen36
             ASSERT_EQ(step.tokens.size(), 1u)
                 << "budget-limited MTP decode should emit exactly one token per step";
             tokens.push_back(step.tokens.front());
-            ASSERT_TRUE(applyMoEOverlayMaintenanceIfNeeded(*runner))
+            ASSERT_TRUE(applyMoEOverlayMaintenanceIfNeeded(*runner, 1u))
                 << runner->lastError();
             if (step.is_complete)
                 break;

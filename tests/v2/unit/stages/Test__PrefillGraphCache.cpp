@@ -428,6 +428,26 @@ TEST(Test__PrefillGraphCache,
            "request and prefix-runtime identities are installed";
 }
 
+TEST(Test__PrefillGraphCache,
+     ExpertOverlayLadderMinimizesPaddingWithinRetainedCacheBudget)
+{
+    const auto retained = retainedPrefillGraphBucketLadder(
+        defaultPrefillGraphBuckets(),
+        /*resident_graph_rows=*/768,
+        /*maximum_bucket_count=*/8);
+    EXPECT_EQ(
+        retained,
+        (std::vector<int>{64, 128, 256, 384, 512, 576, 672, 768}));
+    EXPECT_EQ(
+        retainedPrefillGraphBucketLadder(
+            {64, 128, 256}, 256, /*maximum_bucket_count=*/1),
+        (std::vector<int>{256}));
+    EXPECT_TRUE(
+        retainedPrefillGraphBucketLadder(
+            {64, 128}, 128, /*maximum_bucket_count=*/0)
+            .empty());
+}
+
 TEST(Test__PrefillGraphCache, ResidentCandidatesAreDescendingConfiguredShapes)
 {
     EXPECT_EQ(
@@ -495,6 +515,35 @@ TEST(Test__PrefillGraphCache,
     EXPECT_EQ(short_context, (std::vector<int>{32}))
         << "the shared resolver retains the capacity-complete short-context "
            "boundary";
+}
+
+TEST(Test__PrefillGraphCache,
+     RetainedRawPromptLadderPreservesTheForwardPreflightFloor)
+{
+    const auto retained = retainedRawPrefillGraphBucketLadder(
+        {64, 128, 256, 384, 512, 600},
+        /*resident_graph_rows=*/600,
+        /*configured_floor=*/256,
+        /*maximum_bucket_count=*/4u);
+    ASSERT_FALSE(retained.empty());
+    EXPECT_EQ(retained.front(), 256);
+    EXPECT_EQ(retained.back(), 600);
+    EXPECT_LE(retained.size(), 4u);
+    EXPECT_EQ(
+        std::find(retained.begin(), retained.end(), 64),
+        retained.end());
+    EXPECT_EQ(
+        std::find(retained.begin(), retained.end(), 128),
+        retained.end());
+
+    EXPECT_EQ(
+        retainedRawPrefillGraphBucketLadder(
+            {64, 128, 256},
+            /*resident_graph_rows=*/128,
+            /*configured_floor=*/256,
+            /*maximum_bucket_count=*/4u),
+        (std::vector<int>{128}))
+        << "a memory-planned graph below the global floor remains total";
 }
 
 TEST(Test__PrefillGraphCache, BucketPadding_CopiesRealTokensAndPadsTail)
@@ -944,7 +993,7 @@ TEST(Test__PrefillGraphCache, Preflight_AllowsPaddedBucketGraphStableMoERebalanc
         PrefillGraphPreflightMode::Default,
         /*collectives_graph_capturable=*/false,
         /*heterogeneous_segmentation_admitted=*/false,
-        /*moe_rebalancing_graph_stable=*/true);
+        PrefillMoEGraphStability::Stable);
     EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }
 

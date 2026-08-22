@@ -101,6 +101,10 @@ CPU_LARGE_MODEL_THRESHOLD_BILLIONS = 14.0
 _FIXED_MODEL_FAMILY_SIZE_BILLIONS = {
     "qwen36-dense": 27.0,
     "qwen36-moe": 35.0,
+    # TP-local aliases retain the owning release's evidence tier even when a
+    # sharded matrix is individually small.  Otherwise a 122B production
+    # projection would accidentally inherit the deepest small-model CPU sweep.
+    "qwen35-moe-tp-local": 122.0,
 }
 
 # Ordinary prefill never projects through the vocabulary-sized LM head.  This

@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <initializer_list>
 #include <memory> // uninitialized_copy, uninitialized_fill
+#include <vector>
 #ifdef __linux__
 #include <sys/mman.h> // madvise, MADV_HUGEPAGE
 #include <unistd.h>   // sysconf
@@ -93,6 +94,24 @@ namespace llaminar2
             {
                 allocate(size_);
                 std::uninitialized_copy(init.begin(), init.end(), data_);
+            }
+        }
+
+        /**
+         * @brief Copy ordinary vector elements into aligned storage.
+         * @param source Fully initialized source elements.
+         *
+         * The destination is allocated without a preceding fill pass, then
+         * constructed directly from @p source. This is the compatibility edge
+         * for callers that do not transfer an existing AlignedVector owner.
+         */
+        explicit AlignedVector(const std::vector<T> &source)
+            : data_(nullptr), size_(source.size()), capacity_(source.size())
+        {
+            if (size_ > 0u)
+            {
+                allocate(size_);
+                std::uninitialized_copy(source.begin(), source.end(), data_);
             }
         }
 

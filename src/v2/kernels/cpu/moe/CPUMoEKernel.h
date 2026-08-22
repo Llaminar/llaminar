@@ -84,7 +84,10 @@ namespace llaminar2
             const MoEKernelLaunchContext &launch,
             DeviceMoEOverlayEpochControl *control,
             DeviceMoEOverlayEpochTicket *ticket,
-            DeviceMoEOverlayEpochStatus *status) override;
+            DeviceMoEOverlayEpochStatus *status,
+            const std::uint64_t *external_admission_epoch = nullptr,
+            DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier = {},
+            MoEOverlayPeerPlacementEpochBinding peer_placement_epoch = {}) override;
 
         /** @brief Release and clear one CPU ExpertOverlay placement ticket. */
         bool releaseMoEOverlayEpoch(

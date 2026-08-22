@@ -26,9 +26,10 @@
  *   K >= N (K-heavy) → N_TILE=64  (V3-derived, deeper K iteration)
  *   K <  N (N-heavy) → N_TILE=128 (V7-derived, wider N coverage, all threads load B)
  *
- * Currently supports:
- *   Q4_0   (codebook_id=0): 4-bit symmetric, linear decode (q - 8)
- *   IQ4_NL (codebook_id=4): 4-bit symmetric, LUT decode via v_perm_b32
+ * The physical shard family supports every source format admitted by the
+ * canonical NativeVNNI registry and enumerated below. Format-specific payload
+ * decoding remains compile-time, while all formats share one explicit FP32
+ * contribution/publication contract with serial GEMV and CUDA.
  *
  * @see ROCmQuantisedGemmKernel_INT8_VNNI.hip for INT8 VNNI GEMM (V3/V7)
  * @see ROCmGemvKernel_native_VNNI.hip for native-VNNI GEMV (M=1 decode)
@@ -737,20 +738,18 @@ __device__ __forceinline__ void accumulate_block_gemm(
             #pragma unroll
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
             {
-                acc[mm][nn] = rocm_native_vnni_commit_dual_scale_block(
-                    acc[mm][nn],
-                    low_dot[mm][nn],
-                    high_dot[mm][nn],
-                    scale_lo,
-                    scale_hi,
-                    sa_blk[mm]);
-                acc[mm][nn] = rocm_native_vnni_commit_dual_scale_correction(
-                    acc[mm][nn],
-                    low_sum[mm],
-                    high_sum[mm],
-                    emin_lo,
-                    emin_hi,
-                    sa_blk[mm]);
+                acc[mm][nn] =
+                    rocm_native_vnni_commit_corrected_dual_scale_block(
+                        acc[mm][nn],
+                        low_dot[mm][nn],
+                        high_dot[mm][nn],
+                        scale_lo,
+                        scale_hi,
+                        low_sum[mm],
+                        high_sum[mm],
+                        emin_lo,
+                        emin_hi,
+                        sa_blk[mm]);
             }
         }
     }
@@ -851,13 +850,6 @@ __device__ __forceinline__ void accumulate_block_gemm(
             #pragma unroll
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
             {
-                acc[mm][nn] = rocm_native_vnni_commit_dual_scale_block(
-                    acc[mm][nn],
-                    low_dot[mm][nn],
-                    high_dot[mm][nn],
-                    scale_lo,
-                    scale_hi,
-                    sa_blk[mm]);
                 if constexpr (FMT == NVNNI_GEMM_IQ1_M)
                 {
                     constexpr float delta = 0.125f;
@@ -868,20 +860,31 @@ __device__ __forceinline__ void accumulate_block_gemm(
                             nn];
                     const uint8_t qh0 = static_cast<uint8_t>(qh);
                     const uint8_t qh1 = static_cast<uint8_t>(qh >> 8);
-                    acc[mm][nn] =
-                        rocm_native_vnni_commit_iq1_m_delta_correction(
-                            acc[mm][nn],
-                            iq1_m_group_sum[mm][0],
-                            iq1_m_group_sum[mm][1],
-                            iq1_m_group_sum[mm][2],
-                            iq1_m_group_sum[mm][3],
-                            (qh0 & 0x08) ? -delta : delta,
-                            (qh0 & 0x80) ? -delta : delta,
-                            (qh1 & 0x08) ? -delta : delta,
-                            (qh1 & 0x80) ? -delta : delta,
-                            scale_lo,
-                            scale_hi,
-                            sa_blk[mm]);
+                    acc[mm][nn] = rocm_native_vnni_commit_iq1_m_block(
+                        acc[mm][nn],
+                        low_dot[mm][nn],
+                        high_dot[mm][nn],
+                        iq1_m_group_sum[mm][0],
+                        iq1_m_group_sum[mm][1],
+                        iq1_m_group_sum[mm][2],
+                        iq1_m_group_sum[mm][3],
+                        (qh0 & 0x08) ? -delta : delta,
+                        (qh0 & 0x80) ? -delta : delta,
+                        (qh1 & 0x08) ? -delta : delta,
+                        (qh1 & 0x80) ? -delta : delta,
+                        scale_lo,
+                        scale_hi,
+                        sa_blk[mm]);
+                }
+                else
+                {
+                    acc[mm][nn] = rocm_native_vnni_commit_dual_scale_block(
+                        acc[mm][nn],
+                        low_dot[mm][nn],
+                        high_dot[mm][nn],
+                        scale_lo,
+                        scale_hi,
+                        sa_blk[mm]);
                 }
             }
         }
@@ -919,8 +922,9 @@ __device__ __forceinline__ void accumulate_block_gemm(
                     block_acc[mm][nn] = __builtin_amdgcn_sdot4(
                         a_reg[mm], b_reg[nn], block_acc[mm][nn], false);
         }
-        // FMA: acc += block_acc * scale + sum_a * aux(min)
-        // Read cooperative sum_a from LDS (lo + hi halves = full block sum)
+        // The canonical helper rounds the scaled dot and minimum correction
+        // before one ordered accumulator publication. Read cooperative sum_a
+        // from LDS (lo + hi halves = full block sum).
         int32_t sum_a[M_PER_THREAD];
         #pragma unroll
         for (int mm = 0; mm < M_PER_THREAD; ++mm)
@@ -935,16 +939,14 @@ __device__ __forceinline__ void accumulate_block_gemm(
             #pragma unroll
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
             {
-                acc[mm][nn] = rocm_native_vnni_commit_single_scale_block(
-                    acc[mm][nn],
-                    block_acc[mm][nn],
-                    block_scale,
-                    sa_blk[mm]);
-                acc[mm][nn] = rocm_native_vnni_commit_single_scale_correction(
-                    acc[mm][nn],
-                    sum_a[mm],
-                    block_min,
-                    sa_blk[mm]);
+                acc[mm][nn] =
+                    rocm_native_vnni_commit_corrected_single_scale_block(
+                        acc[mm][nn],
+                        block_acc[mm][nn],
+                        block_scale,
+                        sum_a[mm],
+                        block_min,
+                        sa_blk[mm]);
             }
         }
     }
@@ -2206,13 +2208,6 @@ void streaming_lm_head_kernel(
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
             {
-                acc[mm] = rocm_native_vnni_commit_dual_scale_block(
-                    acc[mm],
-                    low_dot[mm],
-                    high_dot[mm],
-                    slo,
-                    shi,
-                    sa_blk[mm]);
                 if constexpr (FMT == NVNNI_GEMM_IQ1_M)
                 {
                     constexpr int kGroupsPerBlock = 4;
@@ -2222,20 +2217,31 @@ void streaming_lm_head_kernel(
                     const uint8_t qh0 = static_cast<uint8_t>(iq1_m_qh);
                     const uint8_t qh1 =
                         static_cast<uint8_t>(iq1_m_qh >> 8);
-                    acc[mm] =
-                        rocm_native_vnni_commit_iq1_m_delta_correction(
-                            acc[mm],
-                            sum_a_shared[sum_base],
-                            sum_a_shared[sum_base + 1],
-                            sum_a_shared[sum_base + 2],
-                            sum_a_shared[sum_base + 3],
-                            (qh0 & 0x08) ? -kDelta : kDelta,
-                            (qh0 & 0x80) ? -kDelta : kDelta,
-                            (qh1 & 0x08) ? -kDelta : kDelta,
-                            (qh1 & 0x80) ? -kDelta : kDelta,
-                            slo,
-                            shi,
-                            sa_blk[mm]);
+                    acc[mm] = rocm_native_vnni_commit_iq1_m_block(
+                        acc[mm],
+                        low_dot[mm],
+                        high_dot[mm],
+                        sum_a_shared[sum_base],
+                        sum_a_shared[sum_base + 1],
+                        sum_a_shared[sum_base + 2],
+                        sum_a_shared[sum_base + 3],
+                        (qh0 & 0x08) ? -kDelta : kDelta,
+                        (qh0 & 0x80) ? -kDelta : kDelta,
+                        (qh1 & 0x08) ? -kDelta : kDelta,
+                        (qh1 & 0x80) ? -kDelta : kDelta,
+                        slo,
+                        shi,
+                        sa_blk[mm]);
+                }
+                else
+                {
+                    acc[mm] = rocm_native_vnni_commit_dual_scale_block(
+                        acc[mm],
+                        low_dot[mm],
+                        high_dot[mm],
+                        slo,
+                        shi,
+                        sa_blk[mm]);
                 }
             }
         }
@@ -2289,16 +2295,14 @@ void streaming_lm_head_kernel(
             #pragma unroll
             for (int mm = 0; mm < M_TILE; ++mm)
             {
-                acc[mm] = rocm_native_vnni_commit_single_scale_block(
-                    acc[mm],
-                    block_acc[mm],
-                    bs,
-                    sa_blk[mm]);
-                acc[mm] = rocm_native_vnni_commit_single_scale_correction(
-                    acc[mm],
-                    sum_a_shared[mm * blocks_per_row + block],
-                    bm,
-                    sa_blk[mm]);
+                acc[mm] =
+                    rocm_native_vnni_commit_corrected_single_scale_block(
+                        acc[mm],
+                        block_acc[mm],
+                        bs,
+                        sum_a_shared[mm * blocks_per_row + block],
+                        bm,
+                        sa_blk[mm]);
             }
         }
         else

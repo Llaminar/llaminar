@@ -116,6 +116,8 @@ namespace llaminar2
 
         Params params_;
         std::unique_ptr<IMoEKernel> moe_kernel_;
+        /** Setup proof that the exact capture stream joined grant creation. */
+        bool grant_initialization_joined_ = false;
     };
 
     /**
@@ -345,7 +347,11 @@ namespace llaminar2
 
         Params params_;
         std::unique_ptr<IMoEKernel> moe_kernel_;
-        std::unique_ptr<TensorBase> descriptor_storage_;
+        /** Graph-transaction-owned immutable launch descriptors. */
+        std::shared_ptr<MoEOverlayPersistentGraphStorage>
+            descriptor_storage_;
+        /** Setup proof covering every main or persistent lane stream. */
+        bool grant_initialization_joined_ = false;
     };
 
     /**
@@ -363,6 +369,8 @@ namespace llaminar2
         {
             STAGE_PARAMS_COMMON_FIELDS;
             MoEOverlayMappedActivationDeviceLane lane;
+            /** Follower-local device ticket and durable placement banks. */
+            MoEOverlayRoutePlacementDeviceBinding placement{};
             TensorBase *hidden = nullptr;
             TensorBase *routing_indices = nullptr;
             TensorBase *routing_weights = nullptr;
@@ -412,9 +420,11 @@ namespace llaminar2
 
         Params params_;
         std::unique_ptr<IMoEKernel> moe_kernel_;
+        /** Setup proof that the exact capture stream joined grant creation. */
+        bool grant_initialization_joined_ = false;
     };
 
-    /** @brief Pack follower-local expert outputs into one shared return lane. */
+    /** @brief Pack follower-local route contributions into shared canonical slots. */
     class MoEOverlayActivationReturnPackStage final : public IComputeStage
     {
     public:
@@ -423,8 +433,10 @@ namespace llaminar2
         {
             STAGE_PARAMS_COMMON_FIELDS;
             MoEOverlayMappedActivationDeviceLane lane;
-            TensorBase *local_output = nullptr;
-            BufferId local_output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+            /** Compact follower route bank indexed by packet-local route slot. */
+            TensorBase *local_canonical_route_contributions = nullptr;
+            BufferId local_canonical_route_contributions_buffer_id =
+                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
             std::int32_t physical_rows = 0;
             std::uint32_t stage_ordinal = 0u;
             std::int32_t model_layer_index = -1;
@@ -468,13 +480,7 @@ namespace llaminar2
         std::unique_ptr<IMoEKernel> moe_kernel_;
     };
 
-    /**
-     * @brief Fold one returned participant lane into continuation output.
-     *
-     * Parent lowering appends these stages in planner-canonical participant
-     * order. The kernel gives each output element one writer, preserving that
-     * exact FP32 fold order regardless of follower completion timing.
-     */
+    /** @brief Materialize one returned lane in continuation canonical slots. */
     class MoEOverlayActivationReturnConsumeStage final : public IComputeStage
     {
     public:
@@ -483,8 +489,9 @@ namespace llaminar2
         {
             STAGE_PARAMS_COMMON_FIELDS;
             MoEOverlayMappedActivationDeviceLane lane;
-            TensorBase *dense_output = nullptr;
-            BufferId dense_output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+            TensorBase *canonical_route_contributions = nullptr;
+            BufferId canonical_route_contributions_buffer_id =
+                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
             std::int32_t physical_rows = 0;
             std::uint32_t stage_ordinal = 0u;
             std::int32_t model_layer_index = -1;
@@ -529,7 +536,7 @@ namespace llaminar2
     };
 
     /**
-     * @brief Join independent lane returns and fold them in canonical order.
+     * @brief Join independent lane returns and materialize canonical slots.
      *
      * Exact one-row decode retains the topology-sized gather kernel. Wider-row
      * transactions wait only for the layer-owned import events already queued
@@ -546,8 +553,9 @@ namespace llaminar2
         {
             STAGE_PARAMS_COMMON_FIELDS;
             std::shared_ptr<MoEOverlayActivationLaneBatchState> transaction;
-            TensorBase *dense_output = nullptr;
-            BufferId dense_output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+            TensorBase *canonical_route_contributions = nullptr;
+            BufferId canonical_route_contributions_buffer_id =
+                BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
         };
 
         static_assert(StageParamsRequired<Params>);
@@ -603,12 +611,9 @@ namespace llaminar2
         Params params_;
         std::unique_ptr<IMoEKernel> moe_kernel_;
         /** Persistent planner-ordered launch descriptors for either batch geometry. */
-        std::unique_ptr<TensorBase> descriptor_storage_;
-        /** One-row gathered values; unused by multi-row transactions. */
-        std::unique_ptr<TensorBase> gathered_rows_;
-        /** One-row live counts or multi-row authenticated-lane flags. */
-        std::unique_ptr<TensorBase> lane_live_rows_;
-        /** Multi-row `[lane, destination_row] -> compact_row` lookup. */
-        std::unique_ptr<TensorBase> lane_row_to_compact_;
+        std::shared_ptr<MoEOverlayPersistentGraphStorage>
+            descriptor_storage_;
+        /** One device word per lane, published only after authentication. */
+        std::shared_ptr<MoEOverlayPersistentGraphStorage> lane_valid_;
     };
 } // namespace llaminar2

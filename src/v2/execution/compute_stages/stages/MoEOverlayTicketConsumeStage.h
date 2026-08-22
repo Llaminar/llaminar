@@ -22,6 +22,9 @@ namespace llaminar2
      *
      * The H2D node is captured once. Replay observes bytes written by the
      * preceding manual participant segment at the same immutable host address.
+     * Cold setup records that node before a request exists; mutable payload
+     * readiness is consequently validated only by live direct execution and by
+     * the typed manual-segment publication contract, never while recording.
      */
     class MoEOverlayTicketConsumeStage final : public IComputeStage
     {
@@ -42,6 +45,7 @@ namespace llaminar2
 
         explicit MoEOverlayTicketConsumeStage(Params params);
 
+        /** @brief Record or enqueue the fixed H2D ingress after its typed boundary. */
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override
         {

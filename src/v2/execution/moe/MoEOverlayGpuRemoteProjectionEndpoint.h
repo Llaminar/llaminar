@@ -3,12 +3,12 @@
  * @brief Event-polled GPU endpoints for cross-rank ExpertOverlay streaming.
  *
  * A remote projection is intentionally never materialized as a complete host
- * mirror.  Source GPUs either repack one final CPU NativeVNNI unit range or
- * copy one separated GPU blob range into persistent pinned storage. Destination
- * GPUs copy each authenticated MPI chunk into GPU-owned pinned storage and then
- * repack or place it on a named auxiliary stream.  The MPI data plane and the
- * device lane advance through non-blocking polls, so inference continues on the
- * retained old residency epoch until the complete candidate bank is published.
+ * mirror. Source GPUs either repack one final CPU NativeVNNI unit range or copy
+ * one separated NativeVNNI/contiguous floating GPU range into persistent pinned
+ * storage. Destination GPUs copy each authenticated MPI chunk into GPU-owned
+ * storage on a named auxiliary stream. The MPI data plane and device lane
+ * advance through non-blocking polls, so inference continues on the retained
+ * old residency epoch until the complete candidate bank is published.
  */
 
 #pragma once
@@ -64,9 +64,10 @@ namespace llaminar2
      * @brief One model-time stream/event/device/pinned resource for a GPU rank.
      *
      * Endpoints acquire this lane for exactly one network chunk, then release it
-     * after MPI or the destination event relinquishes staging ownership.  This
-     * provides fair bounded queueing across many experts while retaining only
-     * one source and one destination lane per GPU/projection role.
+     * after MPI or the destination event relinquishes staging ownership. The
+     * physical fabric creates an admission-sized pool per GPU/projection/role
+     * and assigns different endpoints to different lanes, so acquisition never
+     * serializes independent operations within one admitted wave.
      */
     class MoEOverlayGpuRemoteProjectionLane final
     {
@@ -111,7 +112,8 @@ namespace llaminar2
         /**
          * @brief Try to reserve the lane for one endpoint object.
          * @param owner Stable non-null endpoint address.
-         * @return True when ownership was acquired; false is ordinary queueing.
+         * @return True when ownership was acquired. False indicates a violated
+         *         admission/lifecycle invariant for a uniquely assigned lane.
          */
         bool tryAcquire(const void *owner) noexcept;
 
@@ -338,6 +340,22 @@ namespace llaminar2
             ExpertTierSourceReadiness readiness,
             std::shared_ptr<void> lifetime);
 
+        /**
+         * @brief Bind one raw floating manifest to a retained live GPU matrix.
+         * @param manifest GPU-to-GPU contiguous floating blob contract.
+         * @param lane Pre-materialized source lane for this GPU/projection role.
+         * @param source Exact live FP16, BF16, or FP32 descriptor.
+         * @param readiness Producer event or retained published-bank proof.
+         * @param lifetime Non-null engine/bank lifetime protecting source bytes.
+         * @throws std::invalid_argument For any mismatched topology or storage.
+         */
+        MoEOverlayGpuRemoteProjectionSource(
+            MoEOverlayRemoteProjectionManifest manifest,
+            std::shared_ptr<MoEOverlayGpuRemoteProjectionLane> lane,
+            ContiguousFloatingPointWeightDescriptor source,
+            ExpertTierSourceReadiness readiness,
+            std::shared_ptr<void> lifetime);
+
         /** @brief Enforce explicit lane release before endpoint destruction. */
         ~MoEOverlayGpuRemoteProjectionSource() override;
 
@@ -382,6 +400,7 @@ namespace llaminar2
         MoEOverlayRemoteProjectionManifest manifest_;
         std::shared_ptr<MoEOverlayGpuRemoteProjectionLane> lane_;
         GpuExpertPackedDescriptor source_;
+        ContiguousFloatingPointWeightDescriptor floating_source_;
         ExpertTierSourceReadiness readiness_;
         std::shared_ptr<void> lifetime_;
         std::optional<ExpertTierWeightDeviceLayout> cpu_layout_;
@@ -401,12 +420,17 @@ namespace llaminar2
     struct MoEOverlayGpuRemoteProjectionDestinationBinding
     {
         GpuExpertPackedDescriptor descriptor;
+        ContiguousFloatingPointWeightDescriptor floating_descriptor;
         std::shared_ptr<ITensorGemm> engine;
 
-        /** @return Whether exact writable arrays and executable ownership exist. */
+        /**
+         * @return Whether exactly one complete writable representation and its
+         *         executable engine are retained.
+         */
         [[nodiscard]] bool valid() const noexcept
         {
-            return descriptor.valid() && engine != nullptr;
+            return descriptor.valid() != floating_descriptor.valid() &&
+                   engine != nullptr;
         }
     };
 

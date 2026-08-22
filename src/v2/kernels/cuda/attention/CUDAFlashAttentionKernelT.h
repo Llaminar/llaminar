@@ -308,7 +308,9 @@ namespace llaminar2
                 void *stream,
                 int kv_stride,
                 const int *active_query_rows_device = nullptr,
-                const attention::AttentionPrefillCaptureGeometry &prefill_capture = {}) override;
+                const attention::AttentionPrefillCaptureGeometry &prefill_capture = {},
+                const int *device_ring_head = nullptr,
+                int ring_capacity = 0) override;
 
             bool compute(
                 const float *Q, const float *K, const float *V, float *output,

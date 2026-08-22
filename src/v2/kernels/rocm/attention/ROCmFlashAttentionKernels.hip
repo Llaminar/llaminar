@@ -86,7 +86,9 @@ namespace
         int seq_len,
         int query_rows,
         int kv_stride,
-        const int *__restrict__ active_query_rows_device)
+        const int *__restrict__ active_query_rows_device,
+        const int *__restrict__ ring_head_device,
+        int ring_capacity)
     {
         const int row = static_cast<int>(threadIdx.x);
         if (!out || !post_append_cached_tokens || row >= query_rows)
@@ -104,6 +106,13 @@ namespace
                        ? raw_logical_seq_len
                        : launch_seq_len)
                 : 1;
+        int ring_row_origin = 0;
+        if (ring_head_device && ring_capacity > 0)
+        {
+            ring_row_origin = (*ring_head_device - kv_len) % ring_capacity;
+            if (ring_row_origin < 0)
+                ring_row_origin += ring_capacity;
+        }
 
         /*
          * Ordinary prefill and M=1 decode share one parameter record across the
@@ -119,6 +128,8 @@ namespace
             const int base_position = kv_len - logical_seq_len;
             out[0].position_offset = base_position > 0 ? base_position : 0;
             out[0].mask_stride = kv_len;
+            out[0].ring_row_origin = ring_row_origin;
+            out[0].ring_row_capacity = ring_head_device ? ring_capacity : 0;
             return;
         }
 
@@ -130,6 +141,8 @@ namespace
             out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
             out[row].position_offset = 0;
             out[row].mask_stride = 1;
+            out[row].ring_row_origin = ring_row_origin;
+            out[row].ring_row_capacity = ring_head_device ? ring_capacity : 0;
             return;
         }
         const int base_position_raw = kv_len - grouped_logical_seq_len;
@@ -141,6 +154,8 @@ namespace
         out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
         out[row].position_offset = base_position + row;
         out[row].mask_stride = kv_len;
+        out[row].ring_row_origin = ring_row_origin;
+        out[row].ring_row_capacity = ring_head_device ? ring_capacity : 0;
     }
 
     /**
@@ -173,6 +188,8 @@ namespace
         out[row].kv_stride = kv_stride > kv_len ? kv_stride : kv_len;
         out[row].position_offset = position_offset + row;
         out[row].mask_stride = kv_len;
+        out[row].ring_row_origin = 0;
+        out[row].ring_row_capacity = 0;
     }
 
     /**
@@ -218,6 +235,8 @@ namespace
             kv_stride > post_append_kv_len ? kv_stride : post_append_kv_len;
         out[flat_row].position_offset = base_position + query_row;
         out[flat_row].mask_stride = post_append_kv_len;
+        out[flat_row].ring_row_origin = 0;
+        out[flat_row].ring_row_capacity = 0;
     }
 
     // Hardware exponential helper is defined beside the decode implementation
@@ -769,6 +788,8 @@ namespace
         int kv_len_runtime = kv_len;
         int position_offset_runtime = position_offset;
         int mask_stride = kv_len;
+        int ring_row_origin = 0;
+        int ring_row_capacity = 0;
 
         if (device_params)
         {
@@ -776,6 +797,8 @@ namespace
             kv_stride = device_params->kv_stride;
             position_offset_runtime = device_params->position_offset;
             mask_stride = device_params->mask_stride;
+            ring_row_origin = device_params->ring_row_origin;
+            ring_row_capacity = device_params->ring_row_capacity;
         }
 
         const int logical_query_tiles =
@@ -1053,7 +1076,11 @@ namespace
                     int local_row = i / head_dim_vec2;
                     int d2 = i % head_dim_vec2;
                     int d = d2 * 2;
-                    int global_row = kv_start + local_row;
+                    const int logical_row = kv_start + local_row;
+                    const int global_row = ring_row_capacity > 0
+                                               ? (ring_row_origin + logical_row) %
+                                                     ring_row_capacity
+                                               : logical_row;
                     const size_t element =
                         request_element_offset +
                         (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
@@ -1074,7 +1101,11 @@ namespace
                 {
                     int local_row = i / kernel_head_dim;
                     int d = i % kernel_head_dim;
-                    int global_row = kv_start + local_row;
+                    const int logical_row = kv_start + local_row;
+                    const int global_row = ring_row_capacity > 0
+                                               ? (ring_row_origin + logical_row) %
+                                                     ring_row_capacity
+                                               : logical_row;
                     const size_t element =
                         request_element_offset +
                         (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
@@ -1139,7 +1170,11 @@ namespace
                         int local_row = i / head_dim_vec2;
                         int d2 = i % head_dim_vec2;
                         int d = d2 * 2;
-                        int global_row = next_kv_start + local_row;
+                        const int logical_row = next_kv_start + local_row;
+                        const int global_row = ring_row_capacity > 0
+                                                   ? (ring_row_origin + logical_row) %
+                                                         ring_row_capacity
+                                                   : logical_row;
                         const size_t element =
                             request_element_offset +
                             (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
@@ -1160,7 +1195,11 @@ namespace
                     {
                         int local_row = i / kernel_head_dim;
                         int d = i % kernel_head_dim;
-                        int global_row = next_kv_start + local_row;
+                        const int logical_row = next_kv_start + local_row;
+                        const int global_row = ring_row_capacity > 0
+                                                   ? (ring_row_origin + logical_row) %
+                                                         ring_row_capacity
+                                                   : logical_row;
                         const size_t element =
                             request_element_offset +
                             (static_cast<size_t>(global_row) * n_kv_heads + kv_head_idx) *
@@ -1788,11 +1827,15 @@ namespace
 
         int kv_len_runtime = kv_len;
         int kv_batch_stride = kv_len;
+        int ring_row_origin = 0;
+        int ring_row_capacity = 0;
         if (device_params)
         {
             const int param_row = row_local_params ? blockIdx.z : 0;
             kv_len_runtime = device_params[param_row].kv_len;
             kv_batch_stride = device_params[param_row].kv_stride;
+            ring_row_origin = device_params[param_row].ring_row_origin;
+            ring_row_capacity = device_params[param_row].ring_row_capacity;
         }
 
         const int head_idx = blockIdx.x;
@@ -1988,7 +2031,12 @@ namespace
              active_thread && kv_pos < kv_end;
              kv_pos += num_wavefronts)
         {
-            const char *K_pos = K_base + kv_pos * row_byte_stride;
+            const int physical_kv_pos = ring_row_capacity > 0
+                                            ? (ring_row_origin + kv_pos) %
+                                                  ring_row_capacity
+                                            : kv_pos;
+            const char *K_pos =
+                K_base + physical_kv_pos * row_byte_stride;
 
             // Type-dispatched K load + dot product
             // FP16: half bandwidth, fdot2 for vectorized path (Q→FP16 on the fly)
@@ -2078,7 +2126,8 @@ namespace
 
             // Type-dispatched V load + O accumulation
             // Each lane updates only its own output dims (head_dim/64 per lane)
-            const char *V_pos = V_base + kv_pos * row_byte_stride;
+            const char *V_pos =
+                V_base + physical_kv_pos * row_byte_stride;
             int o_idx = 0;
             if constexpr (KV_TYPE == KVTypeTag::FP16)
             {
@@ -3599,11 +3648,15 @@ extern "C"
         int query_rows,
         int kv_stride,
         const int *active_query_rows_device,
+        const int *ring_head_device,
+        int ring_capacity,
         void *stream)
     {
         if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
             query_rows <= 0 || kv_stride <= 0 ||
-            query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream)
+            query_rows > MAX_DYNAMIC_ATTENTION_PARAM_ROWS || !stream ||
+            ((ring_head_device == nullptr) != (ring_capacity == 0)) ||
+            (ring_capacity > 0 && ring_capacity != kv_stride))
         {
             return -1;
         }
@@ -3615,7 +3668,9 @@ extern "C"
                            seq_len,
                            query_rows,
                            kv_stride,
-                           active_query_rows_device);
+                           active_query_rows_device,
+                           ring_head_device,
+                           ring_capacity);
         const hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {

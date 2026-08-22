@@ -144,6 +144,64 @@ namespace
                cache.ffn_cached_all_position_logits == all_position_logits;
     }
 
+    TEST(
+        Test__ServingGraphFamilyMaterializationPlan,
+        RejectsPrefillOnlyInventoryAndRequiresHistoryBearingSerialDecode)
+    {
+        ServingGraphFamilyMaterializationPlan plan{
+            .prefill_bucket_rows = {64, 128},
+            .prefill_pad_token_id = 0,
+        };
+
+        EXPECT_FALSE(plan.valid());
+        plan.main_decode_graph =
+            ServingMainDecodeGraphKind::HistoryBearingSerial;
+        EXPECT_TRUE(plan.valid());
+        plan.prefill_bucket_rows.clear();
+        EXPECT_FALSE(plan.valid());
+    }
+
+    TEST(
+        Test__DeviceGraphOrchestratorSourcePolicy,
+        ServingFamilySealsHistoryBearingDecodeBeforeFollowerAdmission)
+    {
+        const std::string source =
+            readSourceFileForDeviceGraphOrchestratorTest(
+                "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/"
+                "DeviceGraphOrchestrator.cpp");
+        ASSERT_FALSE(source.empty());
+
+        const size_t begin = source.find(
+            "bool DeviceGraphOrchestrator::materializeServingGraphFamilyWithoutLaunch");
+        const size_t end = source.find(
+            "bool DeviceGraphOrchestrator::setMoEOverlayCollectiveRequestGeneration",
+            begin);
+        ASSERT_NE(begin, std::string::npos);
+        ASSERT_NE(end, std::string::npos);
+        const std::string method = source.substr(begin, end - begin);
+
+        const size_t decode_phase = method.find(
+            "decode_input.execution_phase = ForwardExecutionPhase::Decode");
+        const size_t history_identity = method.find(
+            "decode_input.position_offset = 1", decode_phase);
+        const size_t materialize_decode = method.find(
+            "executeForward(decode_input, decode_output)", history_identity);
+        const size_t family_completion = method.find(
+            "serving_graph_family_participant_completions",
+            materialize_decode);
+        ASSERT_NE(decode_phase, std::string::npos);
+        ASSERT_NE(history_identity, std::string::npos);
+        ASSERT_NE(materialize_decode, std::string::npos);
+        ASSERT_NE(family_completion, std::string::npos);
+        EXPECT_LT(decode_phase, history_identity);
+        EXPECT_LT(history_identity, materialize_decode);
+        EXPECT_LT(materialize_decode, family_completion);
+        EXPECT_NE(
+            method.find(
+                "MaterializeExecutableWithoutLaunch", decode_phase),
+            std::string::npos);
+    }
+
     TEST(Test__LayerGraphCache, FFNVariantKeyIsIndependentFromAttentionVariant)
     {
         LayerGraphCache cache;
@@ -832,20 +890,14 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeL
     capturing_builder->setPreparedWeightStore(&store);
 
     /*
-     * Store registration and graph binding publication are separate typed
-     * lifecycle edges. The store must not infer a representation from a bare
-     * numeric binding id: embedding and GEMM registries can deliberately reuse
-     * that id. Production WeightManager attaches the returned prepared
-     * descriptor before publishing the binding set, so mirror that exact
-     * materialized state here instead of relying on the retired untyped lookup.
+     * The frozen binding id plus its typed graph role is the lookup identity.
+     * The graph helper selects CpuPackedGemm for this GDN projection, so an
+     * equal numeric id in the disjoint embedding registry cannot masquerade as
+     * the requested representation. No lazy tensor callback or host-side
+     * mutation of the frozen binding is required.
      */
-    EXPECT_FALSE(capturing_builder->exposePreparedRefForGraphWeight(
-        gdn_binding,
-        DeviceId::cpu()).has_value());
-    WeightBinding prepared_gdn_binding = *gdn_binding;
-    prepared_gdn_binding.prepared = registered_ref;
     auto graph_ref = capturing_builder->exposePreparedRefForGraphWeight(
-        &prepared_gdn_binding,
+        gdn_binding,
         DeviceId::cpu());
     ASSERT_TRUE(graph_ref.has_value());
     EXPECT_EQ(graph_ref->binding_id, registered_ref.binding_id);

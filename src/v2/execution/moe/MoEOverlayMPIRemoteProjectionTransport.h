@@ -323,6 +323,10 @@ namespace llaminar2
         std::uint64_t bytes_received = 0;
         std::uint64_t pending_mpi_polls = 0;
         std::uint64_t pending_endpoint_polls = 0;
+        /** Largest number of simultaneously outstanding MPI lane requests. */
+        std::uint64_t maximum_concurrent_mpi_requests = 0;
+        /** Outstanding requests at observation time; zero when transport is idle. */
+        std::uint64_t active_mpi_requests = 0;
         std::uint64_t operations_completed = 0;
         std::uint64_t operations_aborted = 0;
         std::uint64_t mpi_failures = 0;

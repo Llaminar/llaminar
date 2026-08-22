@@ -906,6 +906,49 @@ namespace llaminar2
     }
 
     MoEOverlayGpuRemoteProjectionSource::
+        MoEOverlayGpuRemoteProjectionSource(
+            MoEOverlayRemoteProjectionManifest manifest,
+            std::shared_ptr<MoEOverlayGpuRemoteProjectionLane> lane,
+            ContiguousFloatingPointWeightDescriptor source,
+            ExpertTierSourceReadiness readiness,
+            std::shared_ptr<void> lifetime)
+        : manifest_(std::move(manifest)),
+          lane_(std::move(lane)),
+          floating_source_(source),
+          readiness_(readiness),
+          lifetime_(std::move(lifetime))
+    {
+        std::string error;
+        const auto format = ExpertWeightFormat::floating(source.type);
+        if (!manifest_.valid(&error) || !lane_ || !lane_->materialized() ||
+            !source.valid() || !format.valid() || !lifetime_ ||
+            manifest_.identity.source_device != lane_->device() ||
+            !manifest_.identity.source_device.is_gpu() ||
+            !manifest_.identity.destination_device.is_gpu() ||
+            !manifest_.carriesGpuFloatingBytes() ||
+            manifest_.format_kind != format.kind ||
+            manifest_.N != source.n || manifest_.K != source.k ||
+            manifest_.region_bytes !=
+                std::array<std::uint64_t, 4>{
+                    source.bytes, 0u, 0u, 0u})
+        {
+            throw std::invalid_argument(
+                error.empty()
+                    ? "Remote ExpertOverlay floating GPU source has incomplete or mismatched topology, storage, or precision"
+                    : std::move(error));
+        }
+        if (readiness_.kind() ==
+                ExpertTierSourceReadiness::Kind::
+                    PublishedQuiescentResidencyBank &&
+            readiness_.epoch() != manifest_.identity.expected_epoch)
+        {
+            throw std::invalid_argument(
+                "Remote ExpertOverlay floating GPU source bank epoch differs from its transaction");
+        }
+        seekNextGpuRegion();
+    }
+
+    MoEOverlayGpuRemoteProjectionSource::
         ~MoEOverlayGpuRemoteProjectionSource()
     {
         if (lane_owned_)
@@ -932,6 +975,14 @@ namespace llaminar2
     MoEOverlayGpuRemoteProjectionSource::currentGpuRegionPointer()
         const noexcept
     {
+        if (floating_source_.valid())
+        {
+            return region_ == 0u
+                ? static_cast<const std::uint8_t *>(
+                      floating_source_.data) +
+                      region_offset_
+                : nullptr;
+        }
         const std::uint8_t *base = nullptr;
         switch (region_)
         {
@@ -1238,7 +1289,8 @@ namespace llaminar2
         {
             if (!factory_(manifest, &candidate, error) ||
                 !candidate.valid() ||
-                !descriptorPointersComplete(candidate.descriptor))
+                (candidate.descriptor.valid() &&
+                 !descriptorPointersComplete(candidate.descriptor)))
             {
                 if (error && error->empty())
                     *error = "Remote ExpertOverlay GPU destination factory returned incomplete storage";
@@ -1270,7 +1322,8 @@ namespace llaminar2
                 setGpuRemoteError(error, exception.what());
                 return false;
             }
-            if (candidate_cpu_layout->direction !=
+            if (!candidate.descriptor.valid() ||
+                candidate_cpu_layout->direction !=
                     ExpertTierWeightConversionDirection::CpuToGpu ||
                 !gpuMutableView(candidate.descriptor)
                      .validFor(*candidate_cpu_layout))
@@ -1284,7 +1337,8 @@ namespace llaminar2
         else if (manifest.carriesGpuBytes())
         {
             const auto &descriptor = candidate.descriptor;
-            if (!manifest.identity.source_device.is_gpu() ||
+            if (!descriptor.valid() ||
+                !manifest.identity.source_device.is_gpu() ||
                 manifest.N != descriptor.n || manifest.K != descriptor.k ||
                 manifest.blocks_per_row !=
                     static_cast<std::int32_t>(descriptor.blocks_per_row) ||
@@ -1303,6 +1357,26 @@ namespace llaminar2
                 setGpuRemoteError(
                     error,
                     "Remote GPU blob destination descriptor differs from its manifest");
+                return false;
+            }
+        }
+        else if (manifest.carriesGpuFloatingBytes())
+        {
+            const auto &descriptor = candidate.floating_descriptor;
+            const auto format = ExpertWeightFormat::floating(
+                descriptor.type);
+            if (!descriptor.valid() || !format.valid() ||
+                !manifest.identity.source_device.is_gpu() ||
+                manifest.format_kind != format.kind ||
+                manifest.N != descriptor.n ||
+                manifest.K != descriptor.k ||
+                manifest.region_bytes !=
+                    std::array<std::uint64_t, 4>{
+                        descriptor.bytes, 0u, 0u, 0u})
+            {
+                setGpuRemoteError(
+                    error,
+                    "Remote floating GPU blob destination descriptor differs from its manifest");
                 return false;
             }
         }
@@ -1483,6 +1557,13 @@ namespace llaminar2
     MoEOverlayGpuRemoteProjectionDestination::gpuRegionPointer(
         std::uint8_t region) const noexcept
     {
+        if (binding_.floating_descriptor.valid())
+        {
+            return region == 0u
+                ? static_cast<std::uint8_t *>(const_cast<void *>(
+                      binding_.floating_descriptor.data))
+                : nullptr;
+        }
         switch (region)
         {
         case 0:

@@ -408,6 +408,7 @@ namespace llaminar2
          */
         MTP_DRAFT_TOKEN_PUBLICATION,
         MOE_OVERLAY_EPOCH_BOUNDARY,
+        MOE_OVERLAY_DEVICE_CONTROLLER,
 
         /**
          * Captured verifier prelude: resident token composition, device geometry,

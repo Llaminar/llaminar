@@ -3,8 +3,9 @@
  * @brief Device-free adversarial tests for composite arbitrary-tier waves.
  *
  * These tests lock down the background protocol independently of CUDA, ROCm,
- * MPI, and prepared-weight implementations: every projection progresses, commit
- * starts only after all projections are ready, publication remains atomic, old
+ * MPI, and prepared-weight implementations: every projection progresses,
+ * preparation starts only after all projections are ready, selector
+ * publication remains atomic, old
  * banks wait for ticket retirement, malformed reservations abort, and failures
  * never expose the candidate epoch.
  */
@@ -33,14 +34,16 @@ namespace llaminar2::test
             std::size_t transfer_aborts = 0;
             std::size_t transfer_abort_polls = 0;
             std::size_t transfers_destroyed = 0;
-            std::size_t bank_begin_commits = 0;
-            std::size_t bank_commit_polls = 0;
+            std::size_t bank_begin_prepares = 0;
+            std::size_t bank_prepare_polls = 0;
+            std::size_t bank_begin_publications = 0;
+            std::size_t bank_publication_polls = 0;
             std::size_t bank_aborts = 0;
             std::size_t bank_abort_polls = 0;
             std::size_t banks_destroyed = 0;
             std::size_t bank_retires = 0;
             std::size_t measurement_sink_calls = 0;
-            std::size_t bank_commits_seen_by_measurement_sink = 0;
+            std::size_t bank_prepares_seen_by_measurement_sink = 0;
         };
 
         /** @brief Device-free operation that can be pending once or fail. */
@@ -156,8 +159,8 @@ namespace llaminar2::test
                 std::string *error) noexcept override
             {
                 ++observations_->measurement_sink_calls;
-                observations_->bank_commits_seen_by_measurement_sink =
-                    observations_->bank_begin_commits;
+                observations_->bank_prepares_seen_by_measurement_sink =
+                    observations_->bank_begin_prepares;
                 recorded = measurements;
                 if (!accept_)
                 {
@@ -175,7 +178,7 @@ namespace llaminar2::test
             bool accept_ = true;
         };
 
-        /** @brief Device-free inactive bank with one pending commit poll. */
+        /** @brief Device-free bank with explicit prepare and publish phases. */
         class ScriptedInactiveBank final
             : public IMoEOverlayInactiveBankTransaction
         {
@@ -194,28 +197,50 @@ namespace llaminar2::test
             }
 
             /** @brief Record the unique inactive-bank build request. */
-            bool beginCommit(std::string *) noexcept override
+            bool beginPrepare(std::string *) noexcept override
             {
-                ++observations_->bank_begin_commits;
-                begun_ = true;
+                ++observations_->bank_begin_prepares;
+                prepare_begun_ = true;
                 return true;
             }
 
-            /** @brief Return Pending once, then Ready after beginCommit(). */
-            MoEOverlayResidencyWaveProgress pollCommit(
+            /** @brief Return Pending once, then Ready after beginPrepare(). */
+            MoEOverlayResidencyWaveProgress pollPrepare(
                 std::string *error) noexcept override
             {
-                ++observations_->bank_commit_polls;
-                if (!begun_)
+                ++observations_->bank_prepare_polls;
+                if (!prepare_begun_)
                 {
                     if (error)
-                        *error = "commit polled before begin";
+                        *error = "preparation polled before begin";
                     return MoEOverlayResidencyWaveProgress::Failed;
                 }
-                if (!pending_observed_)
+                if (!prepare_pending_observed_)
                 {
-                    pending_observed_ = true;
+                    prepare_pending_observed_ = true;
                     return MoEOverlayResidencyWaveProgress::Pending;
+                }
+                return MoEOverlayResidencyWaveProgress::Ready;
+            }
+
+            /** @brief Begin inference-visible publication after preparation. */
+            bool beginPublication(std::string *) noexcept override
+            {
+                ++observations_->bank_begin_publications;
+                publication_begun_ = true;
+                return true;
+            }
+
+            /** @brief Complete selector publication without blocking. */
+            MoEOverlayResidencyWaveProgress pollPublication(
+                std::string *error) noexcept override
+            {
+                ++observations_->bank_publication_polls;
+                if (!publication_begun_)
+                {
+                    if (error)
+                        *error = "publication polled before begin";
+                    return MoEOverlayResidencyWaveProgress::Failed;
                 }
                 return MoEOverlayResidencyWaveProgress::Ready;
             }
@@ -256,8 +281,9 @@ namespace llaminar2::test
 
         private:
             std::shared_ptr<ProtocolObservations> observations_;
-            bool begun_ = false;
-            bool pending_observed_ = false;
+            bool prepare_begun_ = false;
+            bool prepare_pending_observed_ = false;
+            bool publication_begun_ = false;
             bool aborted_ = false;
             bool retired_ = false;
         };
@@ -495,7 +521,7 @@ namespace llaminar2::test
 
     TEST(
         MoEOverlayTierMigrationTransport,
-        AllNineProjectionsFinishBeforeCommitAndOldBankWaitsForTicket)
+        AllNineProjectionsPrepareThenPublishAndOldBankWaitsForTicket)
     {
         auto fixture = makeAuthority();
         auto old_ticket = fixture.authority->tryAcquireTicketSnapshot();
@@ -520,23 +546,29 @@ namespace llaminar2::test
         EXPECT_EQ(
             fixture.authority->advanceBackground().status,
             MoEOverlayResidencyApplyStatus::Staging);
-        EXPECT_EQ(factory.observations->bank_begin_commits, 0u);
+        EXPECT_EQ(factory.observations->bank_begin_prepares, 0u);
         EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
 
         EXPECT_EQ(
             fixture.authority->advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committing);
-        EXPECT_EQ(factory.observations->bank_begin_commits, 1u);
+            MoEOverlayResidencyApplyStatus::Preparing);
+        EXPECT_EQ(factory.observations->bank_begin_prepares, 1u);
         EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
 
         EXPECT_EQ(
             fixture.authority->advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committing);
+            MoEOverlayResidencyApplyStatus::Preparing);
         EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
 
         EXPECT_EQ(
             fixture.authority->advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committed);
+            MoEOverlayResidencyApplyStatus::Publishing);
+        EXPECT_EQ(factory.observations->bank_begin_publications, 1u);
+        EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
+
+        EXPECT_EQ(
+            fixture.authority->advanceBackground().status,
+            MoEOverlayResidencyApplyStatus::Published);
         EXPECT_EQ(fixture.authority->snapshot()->epoch, 2u);
         EXPECT_EQ(factory.observations->bank_retires, 0u);
         EXPECT_EQ(fixture.authority->pendingRetirementCount(), 1u);
@@ -582,7 +614,7 @@ namespace llaminar2::test
 
     TEST(
         MoEOverlayTierMigrationTransport,
-        CompleteMeasurementsAreRecordedBeforeInactiveBankCommit)
+        CompleteMeasurementsAreRecordedBeforeInactiveBankPreparation)
     {
         auto fixture = makeAuthority();
         const auto transaction = fixture.authority->proposeFromHistogram();
@@ -609,10 +641,10 @@ namespace llaminar2::test
 
         EXPECT_EQ(
             fixture.authority->advanceBackground().status,
-            MoEOverlayResidencyApplyStatus::Committing);
+            MoEOverlayResidencyApplyStatus::Preparing);
         ASSERT_EQ(factory.observations->measurement_sink_calls, 1u);
         EXPECT_EQ(
-            factory.observations->bank_commits_seen_by_measurement_sink,
+            factory.observations->bank_prepares_seen_by_measurement_sink,
             0u);
         ASSERT_EQ(sink->recorded.size(), transaction.migrations.size());
         for (std::size_t migration = 0;
@@ -670,7 +702,7 @@ namespace llaminar2::test
         EXPECT_NE(failed.error.find("omitted exact timing evidence"),
                   std::string::npos);
         EXPECT_EQ(factory.observations->measurement_sink_calls, 0u);
-        EXPECT_EQ(factory.observations->bank_begin_commits, 0u);
+        EXPECT_EQ(factory.observations->bank_begin_prepares, 0u);
         EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
     }
 
@@ -703,7 +735,7 @@ namespace llaminar2::test
         EXPECT_EQ(failed.status, MoEOverlayResidencyApplyStatus::StageFailed);
         EXPECT_EQ(failed.error, "scripted measurement rejection");
         EXPECT_EQ(factory.observations->measurement_sink_calls, 1u);
-        EXPECT_EQ(factory.observations->bank_begin_commits, 0u);
+        EXPECT_EQ(factory.observations->bank_begin_prepares, 0u);
         EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
     }
 
@@ -835,7 +867,7 @@ namespace llaminar2::test
 
     TEST(
         MoEOverlayTierMigrationTransport,
-        CalibrationPlannerCoversEveryDirectedEdgeAndCommitIsImpossible)
+        CalibrationPlannerCoversEveryDirectedEdgeAndPublicationIsImpossible)
     {
         auto fixture = makeAuthority();
         const auto live = fixture.authority->snapshot();
@@ -908,8 +940,8 @@ namespace llaminar2::test
         const auto interval = start.wave->completedStageInterval();
         ASSERT_TRUE(interval.has_value());
         EXPECT_TRUE(interval->valid());
-        EXPECT_FALSE(start.wave->beginCommit(&error));
-        EXPECT_NE(error.find("calibration waves cannot commit"),
+        EXPECT_FALSE(start.wave->beginPrepare(&error));
+        EXPECT_NE(error.find("calibration waves cannot prepare"),
                   std::string::npos);
         start.wave->abortStaged();
         EXPECT_EQ(

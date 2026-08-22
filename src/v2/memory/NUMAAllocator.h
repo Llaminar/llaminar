@@ -73,22 +73,26 @@ namespace llaminar2
         void *allocateAndTouch(size_t bytes, int numa_node, uint8_t init_value = 0);
 
         /**
-         * @brief Bind an externally owned, untouched allocation to one NUMA node.
+         * @brief Prepare exclusive external receive storage on one NUMA node.
          *
-         * This installs `MPOL_BIND` before a transport or accelerator first
-         * touches the pages. It is intended for final receive buffers whose
-         * allocation lifetime is owned elsewhere, such as `AlignedVector`
-         * storage filled directly by MPI. The range must start on a page
-         * boundary and its underlying allocation must cover the page-rounded
-         * byte count.
+         * The method discards any recycled physical pages, temporarily binds
+         * the calling thread to CPUs allowed on `numa_node`, first-touches every
+         * page, restores the exact incoming affinity mask, and certifies the
+         * resulting placement. This is intended only for final receive buffers
+         * that a transport will overwrite completely before publication.
          *
-         * @param ptr Page-aligned beginning of the still-unfaulted allocation.
+         * The range must start on a page boundary and its underlying allocation
+         * must cover the page-rounded byte count. It must not be registered with
+         * an accelerator or concurrently visible while preparation is active.
+         *
+         * @param ptr Page-aligned beginning of exclusively owned storage.
          * @param bytes Logical bytes that the producer will overwrite.
          * @param numa_node Exact destination NUMA node; aggregate `-1` is not
          *        accepted because direct cross-rank receives require one owner.
-         * @return `true` only when the kernel accepted the binding policy.
+         * @return `true` only when affinity restoration and every page-placement
+         *         certification succeed.
          */
-        bool bindUntouchedExternalRangeToNode(
+        bool prepareExternalReceiveRangeOnNode(
             void *ptr, size_t bytes, int numa_node) const;
 
         /**
@@ -203,6 +207,17 @@ namespace llaminar2
         // Internal helpers
         void initializeNUMA();
         int resolveNUMANode(int numa_node) const;
+
+        /**
+         * @brief Revoke and first-touch one exact page range on a NUMA node.
+         *
+         * @param ptr Page-aligned address owned exclusively by the caller.
+         * @param page_bytes Page-multiple allocation capacity to prepare.
+         * @param numa_node Exact configured NUMA node.
+         * @return `true` after exact page placement and affinity restoration.
+         */
+        bool firstTouchPageRangeOnNode(
+            void *ptr, size_t page_bytes, int numa_node) const;
     };
 
     /**

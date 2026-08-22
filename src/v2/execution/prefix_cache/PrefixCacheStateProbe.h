@@ -306,6 +306,23 @@ namespace llaminar2
         uint64_t mtp_verifier_token_count = 0;
         int mtp_last_transaction_draft_depth = 0;
         int mtp_last_transaction_emitted_token_count = 0;
+        /** Device-controller transaction ordinal paired with the observed row. */
+        int mtp_observed_verifier_transaction_count = 0;
+        /** Exact active draft depth paired with the observed row. */
+        int mtp_observed_verifier_draft_depth = 0;
+        /**
+         * @brief Draft-token identity of the last committed verifier transaction.
+         *
+         * Populated when ordinary tensor snapshots or explicit device logical-
+         * state diagnostics are enabled. The reusable verifier row is copied
+         * into a fixed record by the same device lane that commits response and
+         * controller state; its transaction ordinal, depth, and token prefix
+         * therefore cannot name different transactions. These bytes never
+         * participate in controller decisions. The vector contains exactly
+         * `mtp_observed_verifier_draft_depth` draft tokens (the target token is
+         * retained in the device record but intentionally omitted here).
+         */
+        std::vector<int32_t> mtp_observed_verifier_draft_tokens;
         /**
          * @brief Logical position consumed by the next MTP sidecar transaction.
          *

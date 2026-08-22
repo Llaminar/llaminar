@@ -7,6 +7,7 @@
  */
 
 #include "CPUMoEKernel.h"
+#include "../../../execution/moe/MoEOverlayDeviceControllerABI.h"
 #include "../../../execution/moe/MoEOverlayDeviceEpochProtocol.h"
 #include "../../cpu/primitives/SoftmaxPrimitives_New.h"
 #include "../../cpu/primitives/SwiGLUPrimitives.h"
@@ -17,11 +18,13 @@
 #include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
 
 namespace llaminar2
 {
@@ -76,17 +79,136 @@ namespace llaminar2
             }
             return kDeviceMoEOverlayInvalidBank;
         }
+
+        /**
+         * @brief CPU oracle for the node-local continuation admission barrier.
+         *
+         * The caller owns one extra `acquisitions_in_flight` guard for the whole
+         * operation. This mirrors CUDA/HIP exactly: every participant protects
+         * its local retiring bank before publishing arrival, then the immutable
+         * publisher freezes the live topology admission once for all siblings.
+         */
+        bool resolveSynchronizedAdmission(
+            const std::uint64_t *external_admission_epoch,
+            DeviceMoEOverlayEpochAdmissionBarrierBinding barrier,
+            std::uint64_t *required_epoch) noexcept
+        {
+            if (!external_admission_epoch || !barrier.record ||
+                !required_epoch)
+            {
+                return false;
+            }
+            auto &record = *barrier.record;
+            constexpr std::uint32_t kParticipantCount =
+                kMoEOverlayDeviceControllerInferenceEpochMaxParticipants;
+            constexpr std::uint32_t kValidMask =
+                (1u << kParticipantCount) - 1u;
+            const std::uint32_t participant = barrier.participant_id;
+            const std::uint32_t mask = record.participant_mask;
+            const std::uint32_t publisher =
+                record.publisher_participant_id;
+            if (record.magic !=
+                    kMoEOverlayDeviceControllerInferenceEpochMagic ||
+                record.version !=
+                    kMoEOverlayDeviceControllerInferenceEpochVersion ||
+                record.topology_fingerprint == 0u || mask == 0u ||
+                (mask & ~kValidMask) != 0u ||
+                participant >= kParticipantCount ||
+                publisher >= kParticipantCount ||
+                (mask & (1u << participant)) == 0u ||
+                (mask & (1u << publisher)) == 0u)
+            {
+                return false;
+            }
+
+            auto own_arrival = std::atomic_ref<std::uint64_t>(
+                record.arrival_sequence[participant]);
+            const std::uint64_t previous = own_arrival.load(
+                std::memory_order_acquire);
+            if (previous == std::numeric_limits<std::uint64_t>::max())
+                return false;
+            const std::uint64_t sequence = previous + 1u;
+            own_arrival.store(sequence, std::memory_order_release);
+
+            auto publication = std::atomic_ref<std::uint64_t>(
+                record.publication_sequence);
+            if (participant == publisher)
+            {
+                for (std::uint32_t member = 0u;
+                     member < kParticipantCount;
+                     ++member)
+                {
+                    if ((mask & (1u << member)) == 0u)
+                        continue;
+                    auto arrival = std::atomic_ref<std::uint64_t>(
+                        record.arrival_sequence[member]);
+                    while (arrival.load(std::memory_order_acquire) < sequence)
+                        std::this_thread::yield();
+                }
+
+                const std::uint64_t published = publication.load(
+                    std::memory_order_acquire);
+                if (published ==
+                        std::numeric_limits<std::uint64_t>::max() ||
+                    published + 1u != sequence)
+                {
+                    if (published < sequence)
+                    {
+                        std::atomic_ref<std::uint64_t>(record.epoch).store(
+                            0u, std::memory_order_release);
+                        publication.store(
+                            sequence, std::memory_order_release);
+                    }
+                    return false;
+                }
+                const std::uint64_t frozen =
+                    std::atomic_ref<std::uint64_t>(
+                        *const_cast<std::uint64_t *>(
+                            external_admission_epoch))
+                        .load(std::memory_order_acquire);
+                std::atomic_ref<std::uint64_t>(record.epoch).store(
+                    frozen, std::memory_order_release);
+                publication.store(sequence, std::memory_order_release);
+            }
+            else
+            {
+                std::uint64_t published = publication.load(
+                    std::memory_order_acquire);
+                while (published < sequence)
+                {
+                    std::this_thread::yield();
+                    published = publication.load(std::memory_order_acquire);
+                }
+                if (published != sequence)
+                    return false;
+            }
+
+            *required_epoch = std::atomic_ref<std::uint64_t>(record.epoch).load(
+                std::memory_order_acquire);
+            return *required_epoch != 0u;
+        }
     } // namespace
 
     bool CPUMoEKernel::acquireMoEOverlayEpoch(
         const MoEKernelLaunchContext &launch,
         DeviceMoEOverlayEpochControl *control,
         DeviceMoEOverlayEpochTicket *ticket,
-        DeviceMoEOverlayEpochStatus *status)
+        DeviceMoEOverlayEpochStatus *status,
+        const std::uint64_t *external_admission_epoch,
+        DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier,
+        MoEOverlayPeerPlacementEpochBinding peer_placement_epoch)
     {
         (void)launch;
         if (!status)
             return false;
+        if (peer_placement_epoch.valid())
+        {
+            writeOverlayEpochStatus(
+                status,
+                DeviceMoEOverlayEpochOperation::Acquire,
+                DeviceMoEOverlayEpochStatusCode::InvalidControl);
+            return true;
+        }
         if (!control)
         {
             writeOverlayEpochStatus(
@@ -105,7 +227,43 @@ namespace llaminar2
         }
 
         MoEOverlayDeviceEpochProtocol protocol(*control);
-        const auto acquired = protocol.tryAcquirePublished();
+        std::uint64_t admitted_epoch = 0u;
+        bool admission_valid = true;
+        const bool synchronized = admission_barrier.record != nullptr;
+        if (synchronized)
+        {
+            /* Protect this participant's old bank before advertising arrival.
+             * tryAcquireAdmitted owns its usual narrower guard as well; the
+             * outer guard is dropped only after that reader is installed. */
+            std::atomic_ref<std::uint64_t>(
+                control->acquisitions_in_flight)
+                .fetch_add(1u, std::memory_order_seq_cst);
+            admission_valid = resolveSynchronizedAdmission(
+                external_admission_epoch,
+                admission_barrier,
+                &admitted_epoch);
+        }
+        else if (admission_barrier.participant_id != 0xffffffffu)
+        {
+            admission_valid = false;
+        }
+        else if (external_admission_epoch)
+        {
+            admitted_epoch = std::atomic_ref<std::uint64_t>(
+                                 *const_cast<std::uint64_t *>(
+                                     external_admission_epoch))
+                                 .load(std::memory_order_acquire);
+        }
+
+        const auto acquired = admission_valid
+                                  ? protocol.tryAcquireAdmitted(admitted_epoch)
+                                  : std::nullopt;
+        if (synchronized)
+        {
+            std::atomic_ref<std::uint64_t>(
+                control->acquisitions_in_flight)
+                .fetch_sub(1u, std::memory_order_seq_cst);
+        }
         if (!acquired.has_value())
         {
             writeOverlayEpochStatus(

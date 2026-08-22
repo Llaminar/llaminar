@@ -10,6 +10,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <thread>
 
 namespace llaminar2::test
@@ -50,7 +52,112 @@ namespace llaminar2::test
                 .schedule_fingerprint = fingerprint,
             };
         }
+
+        /** @brief Device-free controllable terminal event for probe protocol tests. */
+        class ControllableCompletionFence final
+            : public IMoEOverlayInferenceCompletionEvent
+        {
+        public:
+            /** @copydoc IMoEOverlayInferenceCompletionEvent::record */
+            bool record(
+                void *producer_stream,
+                std::string *error) noexcept override
+            {
+                if (error)
+                    error->clear();
+                if (!producer_stream || recorded_.exchange(true))
+                {
+                    if (error)
+                        *error = "fake fence was invalid or already recorded";
+                    return false;
+                }
+                record_count_.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+
+            /** @copydoc IMoEOverlayInferenceCompletionFence::poll */
+            [[nodiscard]] MoEOverlayInferenceCompletionFenceProgress poll(
+                std::string *error) noexcept override
+            {
+                if (error)
+                    error->clear();
+                poll_count_.fetch_add(1, std::memory_order_relaxed);
+                if (!recorded_.load(std::memory_order_acquire))
+                    return MoEOverlayInferenceCompletionFenceProgress::Failed;
+                if (!ready_.load(std::memory_order_acquire))
+                    return MoEOverlayInferenceCompletionFenceProgress::Pending;
+                return MoEOverlayInferenceCompletionFenceProgress::Ready;
+            }
+
+            /** @brief Make the synthetic device terminal observable. */
+            void signal() noexcept
+            {
+                ready_.store(true, std::memory_order_release);
+            }
+
+            /** @return Number of exact terminal records. */
+            [[nodiscard]] std::uint64_t recordCount() const noexcept
+            {
+                return record_count_.load(std::memory_order_relaxed);
+            }
+
+            /** @return Number of non-blocking maintenance polls. */
+            [[nodiscard]] std::uint64_t pollCount() const noexcept
+            {
+                return poll_count_.load(std::memory_order_relaxed);
+            }
+
+        private:
+            std::atomic<bool> recorded_{false};
+            std::atomic<bool> ready_{false};
+            std::atomic<std::uint64_t> record_count_{0};
+            std::atomic<std::uint64_t> poll_count_{0};
+        };
     } // namespace
+
+    TEST(
+        MoEOverlayInferenceInterferenceProbe,
+        DeviceTerminalDefersCompletionWithoutBlockingInference)
+    {
+        MoEOverlayInferenceInterferenceProbe probe;
+        const auto armed = request(
+            ExpertHistogramSource::PrefillChunk,
+            MoEOverlayInterferenceProbeMode::Baseline,
+            91);
+        ASSERT_TRUE(probe.arm(armed));
+        const auto ticket = probe.beginSample(workload(
+            ExpertHistogramSource::PrefillChunk,
+            256));
+        ASSERT_TRUE(ticket.valid());
+
+        auto fence = std::make_shared<ControllableCompletionFence>();
+        std::string error;
+        ASSERT_TRUE(fence->record(
+            reinterpret_cast<void *>(0x1), &error)) << error;
+        ASSERT_TRUE(probe.deferSampleCompletion(
+            ticket,
+            fence,
+            &error)) << error;
+        EXPECT_EQ(fence->recordCount(), 1u);
+        EXPECT_FALSE(probe.finishSample(ticket))
+            << "Host submission must not truncate a device-owned interval";
+        EXPECT_EQ(
+            probe.progress(armed),
+            MoEOverlayInterferenceProbeProgress::Running);
+
+        MoEOverlayInterferenceProbeSample sample;
+        EXPECT_FALSE(probe.consume(&sample));
+        EXPECT_GE(fence->pollCount(), 2u);
+
+        fence->signal();
+        EXPECT_EQ(
+            probe.progress(armed),
+            MoEOverlayInterferenceProbeProgress::Completed);
+        ASSERT_TRUE(probe.consume(&sample));
+        EXPECT_TRUE(sample.valid());
+        EXPECT_EQ(sample.workload.real_rows, 256);
+        EXPECT_TRUE(probe.idle());
+    }
 
     TEST(
         MoEOverlayInferenceInterferenceProbe,

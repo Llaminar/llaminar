@@ -2,6 +2,7 @@
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/ModelMemoryProfile.h"
 #include "backends/DeviceId.h"
+#include "kernels/common/EmbedQ8Block.h"
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -452,6 +453,66 @@ TEST(Test__WeightMemoryEstimator, ExplicitLMHeadPreventsSyntheticTiedCopy)
     EXPECT_EQ(
         estimate.prepared_embedding_bytes,
         1000ULL * 2ULL * 36ULL);
+}
+
+TEST(Test__WeightMemoryEstimator,
+     TensorParallelVocabularyViewsAreExactThroughDegreeEight)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen3.6";
+    profile.n_layers = 1;
+    profile.d_model = 64;
+    profile.vocab_size = 248323;
+
+    TensorSizeInfo embedding;
+    embedding.name = "token_embd.weight";
+    embedding.elements =
+        static_cast<size_t>(profile.vocab_size) *
+        static_cast<size_t>(profile.d_model);
+    embedding.K = static_cast<size_t>(profile.d_model);
+    embedding.quant_type = "Q8_0";
+    embedding.native_bytes = embedding.elements * 34u / 32u;
+    profile.total_native_bytes = embedding.native_bytes;
+    profile.tensors.push_back(embedding);
+
+    const auto full = WeightMemoryEstimator::estimate(
+        profile, DeviceId::cuda(0));
+    ASSERT_GT(full.prepared_embedding_bytes, 0u);
+    ASSERT_GT(full.lm_head_bytes, 0u);
+
+    for (int degree = 2; degree <= 8; ++degree)
+    {
+        size_t prepared_sum = 0;
+        size_t row_sum = 0;
+        for (int shard = 0; shard < degree; ++shard)
+        {
+            const auto estimate = WeightMemoryEstimator::estimate(
+                profile,
+                DeviceId::cuda(shard),
+                shard,
+                degree);
+            const size_t expected_rows =
+                static_cast<size_t>(profile.vocab_size) /
+                    static_cast<size_t>(degree) +
+                (static_cast<size_t>(shard) <
+                         static_cast<size_t>(profile.vocab_size) %
+                             static_cast<size_t>(degree)
+                     ? 1u
+                     : 0u);
+            const size_t expected_prepared =
+                expected_rows * 2u * sizeof(EmbedQ8Block);
+            EXPECT_EQ(
+                estimate.prepared_embedding_bytes,
+                expected_prepared)
+                << "degree=" << degree << " shard=" << shard;
+            EXPECT_GT(estimate.lm_head_bytes, 0u);
+            EXPECT_LT(estimate.lm_head_bytes, full.lm_head_bytes);
+            prepared_sum += estimate.prepared_embedding_bytes;
+            row_sum += expected_rows;
+        }
+        EXPECT_EQ(row_sum, static_cast<size_t>(profile.vocab_size));
+        EXPECT_EQ(prepared_sum, full.prepared_embedding_bytes);
+    }
 }
 
 TEST(Test__WeightMemoryEstimator, TPSharded_ReducesDeviceBytes)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from collections import Counter
 from pathlib import Path
 
 
@@ -17,10 +18,13 @@ from native_vnni_dispatch.prefill_matrix import (  # noqa: E402
     CPU_14B_PLUS_PREFILL_M_BUCKETS,
     CPU_7B_TO_BELOW_14B_PREFILL_M_BUCKETS,
     CPU_BELOW_7B_PREFILL_M_BUCKETS,
+    CPU_LARGE_MODEL_THRESHOLD_BILLIONS,
+    CPU_MIDDLE_MODEL_THRESHOLD_BILLIONS,
     CPU_PREFILL_MAXIMUM_WEIGHT_ELEMENTS,
     CPU_PREFILL_M_BUCKETS,
     GPU_PREFILL_M_BUCKETS,
     QWEN36_35B_MOE_SHAPES,
+    _shape_owner_size_billions,
     cpu_prefill_maximum_weight_elements_for_m,
     cpu_prefill_measurements,
     gpu_prefill_measurements,
@@ -84,7 +88,25 @@ class NativeVNNIPrefillMatrixTest(unittest.TestCase):
         measurements = cpu_prefill_measurements()
         names = {row.shape.name for row in measurements}
 
-        self.assertEqual(len(measurements), 75)
+        manifest = load_shape_manifest()
+        release_prefill_dimensions = {
+            (geometry.n, geometry.k)
+            for geometry in qwen_release_geometries()
+            if any(use.projection != "lm_head" for use in geometry.uses)
+        }
+        expected_names = {
+            shape.name
+            for shape in manifest.shapes
+            if shape.role == ShapeRole.PRODUCTION
+            and shape.exact_overlay
+            and "LM_Head" not in shape.name
+            and (
+                shape.model_family != "qwen35-qwen36-release-geometries"
+                or (shape.n, shape.k) in release_prefill_dimensions
+            )
+        }
+        self.assertEqual(names, expected_names)
+        self.assertEqual(len(measurements), len(expected_names))
         self.assertFalse(any("LM_Head" in name for name in names))
         for prefix in ("0.5B", "1.5B", "3B", "7B", "14B", "32B"):
             self.assertTrue(any(name.startswith(prefix) for name in names), prefix)
@@ -145,30 +167,21 @@ class NativeVNNIPrefillMatrixTest(unittest.TestCase):
     def test_matrix_has_every_shape_depth_cell(self) -> None:
         matrix = cpu_prefill_measurements()
 
+        def expected_m_values(row):
+            owner_size = _shape_owner_size_billions(row.shape)
+            if owner_size >= CPU_LARGE_MODEL_THRESHOLD_BILLIONS:
+                return CPU_14B_PLUS_PREFILL_M_BUCKETS
+            if owner_size >= CPU_MIDDLE_MODEL_THRESHOLD_BILLIONS:
+                return CPU_7B_TO_BELOW_14B_PREFILL_M_BUCKETS
+            return CPU_BELOW_7B_PREFILL_M_BUCKETS
+
         self.assertEqual(
             sum(len(row.m_values) for row in matrix),
-            112,
+            sum(len(expected_m_values(row)) for row in matrix),
         )
         self.assertEqual(
-            sum(
-                row.m_values == CPU_BELOW_7B_PREFILL_M_BUCKETS
-                for row in matrix
-            ),
-            30,
-        )
-        self.assertEqual(
-            sum(
-                row.m_values == CPU_7B_TO_BELOW_14B_PREFILL_M_BUCKETS
-                for row in matrix
-            ),
-            7,
-        )
-        self.assertEqual(
-            sum(
-                row.m_values == CPU_14B_PLUS_PREFILL_M_BUCKETS
-                for row in matrix
-            ),
-            38,
+            Counter(row.m_values for row in matrix),
+            Counter(expected_m_values(row) for row in matrix),
         )
 
     def test_cpu_matrix_measures_qwen36_35b_moe_at_every_depth(self) -> None:

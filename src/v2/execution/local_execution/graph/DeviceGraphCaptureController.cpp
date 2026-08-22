@@ -1,3 +1,12 @@
+/**
+ * @file DeviceGraphCaptureController.cpp
+ * @brief Native graph capture lifecycle planning and execution.
+ *
+ * This implementation validates graph-owned lifecycle envelopes, materializes
+ * their replay units, and preserves every producer/consumer edge with streams,
+ * events, or an explicitly declared immutable host ticket.
+ */
+
 #include "DeviceGraphCaptureController.h"
 #include "GraphCaptureGuard.h"
 
@@ -77,6 +86,74 @@ namespace llaminar2
             }
             return true;
         }
+
+        /**
+         * @brief Pair one graph-owned auxiliary fork and join structurally.
+         *
+         * The owner lives wholly inside an already-open native capture. A stage
+         * failure still calls @ref finish before the backend capture closes, so
+         * the auxiliary stream can never remain an unjoined member of the
+         * capture transaction. Destruction with an active branch is fatal
+         * because ending the primary capture without its terminal edge would
+         * leave backend stream ownership unknowable.
+         */
+        class ScopedCapturedAuxiliaryBranch final
+        {
+        public:
+            /** Bind an optional cache-owned branch and exact primary stream. */
+            ScopedCapturedAuxiliaryBranch(
+                IGraphCaptureAuxiliaryBranch *branch,
+                void *primary_stream) noexcept
+                : branch_(branch), primary_stream_(primary_stream)
+            {
+            }
+
+            /** Join an abandoned active branch or terminate on lost ordering. */
+            ~ScopedCapturedAuxiliaryBranch()
+            {
+                if (!active_)
+                    return;
+                if (!branch_->recordJoin(primary_stream_))
+                {
+                    LOG_ERROR(
+                        "[DeviceGraphCaptureController] Fatal failure joining an abandoned captured auxiliary branch '"
+                        << branch_->name() << "'");
+                    std::terminate();
+                }
+            }
+
+            ScopedCapturedAuxiliaryBranch(
+                const ScopedCapturedAuxiliaryBranch &) = delete;
+            ScopedCapturedAuxiliaryBranch &operator=(
+                const ScopedCapturedAuxiliaryBranch &) = delete;
+
+            /** @return true after an absent branch or a complete recorded fork. */
+            [[nodiscard]] bool begin() noexcept
+            {
+                if (!branch_)
+                    return true;
+                if (!primary_stream_ || !branch_->recordFork(primary_stream_))
+                    return false;
+                active_ = true;
+                return true;
+            }
+
+            /** @return true after an absent branch or a complete recorded join. */
+            [[nodiscard]] bool finish() noexcept
+            {
+                if (!active_)
+                    return branch_ == nullptr;
+                if (!branch_->recordJoin(primary_stream_))
+                    return false;
+                active_ = false;
+                return true;
+            }
+
+        private:
+            IGraphCaptureAuxiliaryBranch *branch_ = nullptr;
+            void *primary_stream_ = nullptr;
+            bool active_ = false;
+        };
 
         const char *captureModeTag(GraphReplayCaptureMode mode)
         {
@@ -873,6 +950,111 @@ namespace llaminar2
         throw std::logic_error("Unknown GPU graph replay phase");
     }
 
+    bool DeviceGraphCaptureController::publishKernelInventory(
+        const IGPUGraphCapture &capture,
+        std::string_view fragment,
+        std::optional<int> transaction_depth,
+        DeviceId device,
+        std::string &error)
+    {
+        if (!debugEnv().runtime_debug.gpu_graph_kernel_inventory)
+            return true;
+
+        const std::string fragment_name(fragment);
+        const std::string depth_name = transaction_depth
+                                           ? std::to_string(*transaction_depth)
+                                           : "not_applicable";
+        std::vector<GPUGraphKernelNodeInfo> kernel_nodes;
+        std::string inspection_error;
+        if (!capture.inspectKernelNodes(kernel_nodes, &inspection_error))
+        {
+            error = "kernel inventory failed for fragment '" +
+                    fragment_name + "': " + inspection_error;
+            return false;
+        }
+
+        size_t unresolved_names = 0u;
+        for (const GPUGraphKernelNodeInfo &node : kernel_nodes)
+        {
+            if (!node.valid())
+            {
+                error =
+                    "kernel inventory returned invalid launch geometry for fragment '" +
+                    fragment_name + "' at " + node.graph_path;
+                return false;
+            }
+            unresolved_names += node.name_resolved ? 0u : 1u;
+
+            const std::string grid =
+                std::to_string(node.grid_x) + "x" +
+                std::to_string(node.grid_y) + "x" +
+                std::to_string(node.grid_z);
+            const std::string block =
+                std::to_string(node.block_x) + "x" +
+                std::to_string(node.block_y) + "x" +
+                std::to_string(node.block_z);
+            PerfStatsCollector::Tags tags{
+                {"backend", capture.backendName()},
+                {"fragment", fragment_name},
+                {"transaction_depth", depth_name},
+                {"kernel", node.name},
+                {"grid", grid},
+                {"block", block},
+                {"dynamic_smem_bytes",
+                 std::to_string(node.dynamic_shared_memory_bytes)},
+                {"static_smem_bytes",
+                 std::to_string(node.static_shared_memory_bytes)},
+                {"local_bytes_per_thread",
+                 std::to_string(node.local_memory_bytes_per_thread)},
+                {"registers_per_thread",
+                 std::to_string(node.registers_per_thread)},
+                {"max_threads_per_block",
+                 std::to_string(node.max_threads_per_block)},
+                {"max_active_blocks_per_sm",
+                 std::to_string(node.max_active_blocks_per_sm)},
+                {"nesting_depth", std::to_string(node.nesting_depth)},
+                {"name_resolved", node.name_resolved ? "true" : "false"},
+            };
+            if (!node.name_resolved)
+            {
+                tags.emplace(
+                    "function_identity",
+                    std::to_string(node.function_identity));
+            }
+            PerfStatsCollector::addCounter(
+                "gpu_graph_inventory",
+                "kernel_nodes",
+                1.0,
+                "graph_setup",
+                device.toString(),
+                std::move(tags));
+        }
+
+        const PerfStatsCollector::Tags summary_tags{
+            {"backend", capture.backendName()},
+            {"fragment", fragment_name},
+            {"transaction_depth", depth_name},
+        };
+        auto kernel_summary_tags = summary_tags;
+        kernel_summary_tags.emplace(
+            "unresolved_names", std::to_string(unresolved_names));
+        PerfStatsCollector::addCounter(
+            "gpu_graph_inventory",
+            "fragment_kernel_nodes",
+            static_cast<double>(kernel_nodes.size()),
+            "graph_setup",
+            device.toString(),
+            std::move(kernel_summary_tags));
+        PerfStatsCollector::addCounter(
+            "gpu_graph_inventory",
+            "fragment_native_nodes",
+            static_cast<double>(capture.nodeCount()),
+            "graph_setup",
+            device.toString(),
+            summary_tags);
+        return true;
+    }
+
     DeviceGraphCaptureController::Transition DeviceGraphCaptureController::beginStep(
         bool initialized,
         bool &needs_capture,
@@ -941,6 +1123,54 @@ namespace llaminar2
         const DeviceGraphExecutor::GraphSegmentCache &segment_cache)
     {
         return captureModeTag(captureModeForCache(segment_cache));
+    }
+
+    bool DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(
+        GraphNativeCaptureEnvelope envelope,
+        DeviceGraphExecutor::DecodeCapturePolicy &policy,
+        std::string *error)
+    {
+        if (error)
+            error->clear();
+
+        const auto reject = [&](std::string reason)
+        {
+            if (error)
+                *error = std::move(reason);
+            return false;
+        };
+
+        switch (envelope)
+        {
+        case GraphNativeCaptureEnvelope::Ordinary:
+            return true;
+        case GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction:
+            if (!policy.allow_cached_graph_replay)
+            {
+                return reject(
+                    "device-owned timeline requires mandatory native graph replay");
+            }
+            policy.graph_replay_plan_policy =
+                DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph;
+            policy.retained_parent_composer = {};
+            policy.defer_final_sync = true;
+            return true;
+        case GraphNativeCaptureEnvelope::HeterogeneousTicketTransaction:
+            if (!policy.allow_cached_graph_replay ||
+                !policy.heterogeneous_segmented_enabled)
+            {
+                return reject(
+                    "heterogeneous ticket transaction requires topology-admitted segmented native replay");
+            }
+            policy.graph_replay_plan_policy =
+                DeviceGraphExecutor::GraphReplayPlanPolicy::
+                    AllowHeterogeneousBoundarySegmentation;
+            policy.retained_parent_composer = {};
+            policy.defer_final_sync = true;
+            return true;
+        }
+
+        return reject("unknown graph-native capture envelope");
     }
 
     bool DeviceGraphCaptureController::prepareReplayGpuTiming(
@@ -1036,15 +1266,27 @@ namespace llaminar2
         segment_cache.graph_replay_plan_policy = plan_policy;
 
         const auto &order = graph.getExecutionOrder();
+        const GraphNativeCaptureEnvelope native_capture_envelope =
+            graph.nativeCaptureEnvelope();
         const bool device_owned_timeline_transaction =
-            graph.nativeCaptureEnvelope() ==
-            GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction;
+            requiresSingleNativeExecutable(native_capture_envelope);
+        const bool heterogeneous_ticket_transaction =
+            requiresHeterogeneousTicketSegmentation(
+                native_capture_envelope);
         if (device_owned_timeline_transaction &&
             plan_policy !=
                 DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph)
         {
             throw std::logic_error(
                 "A device-owned timeline transaction requires the full-graph replay policy");
+        }
+        if (heterogeneous_ticket_transaction &&
+            plan_policy !=
+                DeviceGraphExecutor::GraphReplayPlanPolicy::
+                    AllowHeterogeneousBoundarySegmentation)
+        {
+            throw std::logic_error(
+                "A heterogeneous ticket transaction requires the explicit heterogeneous segmentation policy");
         }
         const auto &segmented_collective_capture_allow =
             debugEnv().execution.gpu_graph_collective_segmented_capture_allow;
@@ -1078,7 +1320,8 @@ namespace llaminar2
             }
 
             const auto *const wave_contract =
-                !device_owned_timeline_transaction &&
+                native_capture_envelope ==
+                            GraphNativeCaptureEnvelope::Ordinary &&
                         node->graph_capture_wave
                     ? &*node->graph_capture_wave
                     : nullptr;
@@ -1432,6 +1675,7 @@ namespace llaminar2
                 passive_wave.ordinal = next_capture_wave_ordinal++;
         }
 
+        size_t host_ticket_boundary_segments = 0u;
         for (size_t segment_index = 0;
              segment_index < segment_cache.segments.size();
              ++segment_index)
@@ -1451,6 +1695,7 @@ namespace llaminar2
                     "Manual host ticket consumer '" + consumer_stage +
                     "' is not immediately preceded by a captured producer segment");
             }
+            ++host_ticket_boundary_segments;
         }
 
         size_t capturable_segments = 0, manual_segments = 0;
@@ -1493,8 +1738,80 @@ namespace llaminar2
              segment_cache.segments.size() != 1u ||
              !segment_cache.segments.front().passive_capture_waves_after.empty()))
         {
+            std::ostringstream diagnostic;
+            diagnostic
+                << "Device-owned timeline capture did not lower to exactly "
+                   "one native executable"
+                << ": segments=" << segment_cache.segments.size()
+                << " capturable_segments=" << capturable_segments
+                << " manual_segments=" << manual_segments
+                << " capturable_stages=" << capturable_stages
+                << " manual_stages=" << manual_stages;
+            for (std::size_t segment_index = 0u;
+                 segment_index < segment_cache.segments.size();
+                 ++segment_index)
+            {
+                const auto &segment =
+                    segment_cache.segments[segment_index];
+                diagnostic << " segment[" << segment_index
+                           << "]={capturable="
+                           << (segment.capturable ? "true" : "false")
+                           << ",stages=" << segment.stage_names.size()
+                           << ",passive_waves="
+                           << segment.passive_capture_waves_after.size();
+                if (!segment.capturable)
+                {
+                    diagnostic << ",manual_frontier=[";
+                    bool first_stage = true;
+                    for (const auto &stage_name : segment.stage_names)
+                    {
+                        auto *const node = graph.getNode(stage_name);
+                        if (!first_stage)
+                            diagnostic << ';';
+                        first_stage = false;
+                        diagnostic << stage_name;
+                        if (node && node->stage)
+                        {
+                            diagnostic << "(type="
+                                       << computeStageTypeName(
+                                              node->stage->type())
+                                       << ",readiness="
+                                       << node->stage
+                                              ->graphCaptureReadinessDebugString()
+                                       << ')';
+                        }
+                    }
+                    diagnostic << ']';
+                }
+                diagnostic << '}';
+            }
+            throw std::runtime_error(diagnostic.str());
+        }
+
+        if (heterogeneous_ticket_transaction &&
+            (capturable_segments < 2u || manual_segments == 0u ||
+             host_ticket_boundary_segments == 0u ||
+             segment_cache.segments.empty() ||
+             !segment_cache.segments.front().capturable ||
+             !segment_cache.segments.back().capturable))
+        {
             throw std::runtime_error(
-                "Device-owned timeline capture did not lower to exactly one native executable");
+                "Heterogeneous ticket capture must lower to captured producer and consumer units separated by an authenticated manual ticket boundary");
+        }
+
+        if (heterogeneous_ticket_transaction)
+        {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "heterogeneous_ticket_transactions",
+                1.0,
+                "capture",
+                "",
+                {{"capturable_segments",
+                  std::to_string(capturable_segments)},
+                 {"manual_segments", std::to_string(manual_segments)},
+                 {"ticket_boundaries",
+                  std::to_string(host_ticket_boundary_segments)}});
         }
 
         if (plan_policy ==
@@ -2174,6 +2491,7 @@ namespace llaminar2
             const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
         const std::function<bool(ComputeNode &)> &execute_node_cb,
         const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
+        IGraphCaptureAuxiliaryBranch *auxiliary_branch,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
@@ -2278,8 +2596,19 @@ namespace llaminar2
                 return false;
             }
 
+            ScopedCapturedAuxiliaryBranch captured_auxiliary(
+                auxiliary_branch,
+                capture_stream);
+            if (!captured_auxiliary.begin())
+            {
+                exec_ok = false;
+                failed_stage_name = "<auxiliary_branch_fork>";
+            }
+
             for (const auto &stage_name : segment.stage_names)
             {
+                if (!exec_ok)
+                    break;
                 auto *node = graph.getNode(stage_name);
                 if (!node || !node->stage || !execute_node_cb(*node))
                 {
@@ -2296,6 +2625,12 @@ namespace llaminar2
                     failed_stage_name = stage_name;
                     break;
                 }
+            }
+
+            if (!captured_auxiliary.finish() && exec_ok)
+            {
+                exec_ok = false;
+                failed_stage_name = "<auxiliary_branch_join>";
             }
 
             capture_transaction.finish();
@@ -2689,6 +3024,31 @@ namespace llaminar2
                 << " mode="
                 << (full_graph_capture ? "full_graph" : "segmented")
                 << " stages=" << describeSegmentStages(segment));
+            return false;
+        }
+
+        /*
+         * Inspect the exact graph that will be retained, rather than a logical
+         * stage list or a capture-time launch counter. This opt-in boundary is
+         * shared with MTP composition and therefore exposes missing native
+         * nodes in either lifecycle with one diagnostic vocabulary.
+         */
+        const std::string inventory_fragment =
+            perf_context +
+            (full_graph_capture ? "/full/" : "/segment/") +
+            (segment.stage_names.empty()
+                 ? std::string("empty")
+                 : segment.stage_names.front());
+        std::string inventory_error;
+        if (!publishKernelInventory(
+                *segment.capture,
+                inventory_fragment,
+                std::nullopt,
+                ctx->deviceId(),
+                inventory_error))
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] " << inventory_error);
             return false;
         }
 
@@ -3137,6 +3497,7 @@ namespace llaminar2
         const std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
             const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
         const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
+        IGraphCaptureAuxiliaryBranch *auxiliary_branch,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
@@ -3197,6 +3558,7 @@ namespace llaminar2
                 plan_capture_dependencies_cb,
                 execute_node_cb,
                 capture_boundary_cb,
+                auxiliary_branch,
                 record_snapshot_copies_cb,
                 launch_dependency_cb,
                 post_launch_cb);
@@ -3265,6 +3627,7 @@ namespace llaminar2
         const std::function<std::unique_ptr<GraphCaptureDependencyLedger>(
             const DeviceGraphExecutor::GraphSegment &)> &plan_capture_dependencies_cb,
         const DeviceGraphExecutor::GraphCaptureBoundaryHook &capture_boundary_cb,
+        IGraphCaptureAuxiliaryBranch *auxiliary_branch,
         const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const DeviceGraphExecutor::GraphLaunchDependencyHook &launch_dependency_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
@@ -3291,6 +3654,7 @@ namespace llaminar2
                 execute_node_cb,
                 plan_capture_dependencies_cb,
                 capture_boundary_cb,
+                auxiliary_branch,
                 record_snapshot_copies_cb,
                 launch_dependency_cb,
                 post_launch_cb);
@@ -3375,22 +3739,44 @@ namespace llaminar2
             return result;
         }
 
+        const bool heterogeneous_ticket_transaction =
+            requiresHeterogeneousTicketSegmentation(
+                graph.nativeCaptureEnvelope());
+
         /*
-         * A cross-lifetime dependency has exactly one legal placement: directly
-         * before launching one complete captured executable.  A segmented plan
-         * would make "before launch" ambiguous and could interleave host/manual
-         * work between the dependency and its consumer. Reject that topology at
-         * the controller boundary instead of relying on caller discipline.
+         * A cross-lifetime dependency has exactly one legal placement. For an
+         * ordinary graph it decorates the sole complete executable. For the
+         * typed heterogeneous ticket envelope it decorates only the leading
+         * captured producer unit: that callback publishes the remote ticket
+         * before any producer work launches, while later captured consumers
+         * remain ordered through the declared manual boundary and stream
+         * events. Applying it to every segment would publish one logical
+         * transaction more than once.
          */
         if (hooks.launch_dependency &&
             (!retained_parent_composition &&
-             (!full_graph_capture ||
-             segment_cache.segments.size() != 1u ||
-             !segment_cache.segments.front().capturable)))
+             !((full_graph_capture &&
+                segment_cache.segments.size() == 1u &&
+                segment_cache.segments.front().capturable) ||
+               (heterogeneous_ticket_transaction &&
+                !segment_cache.segments.empty() &&
+                segment_cache.segments.front().capturable))))
         {
             LOG_ERROR(
                 "[DeviceGraphCaptureController] A captured executable launch "
-                "dependency requires exactly one complete capturable graph");
+                "dependency requires one complete graph or the leading "
+                "producer of a typed heterogeneous ticket transaction");
+            result.reset_cache = true;
+            return result;
+        }
+        if (hooks.auxiliary_branch &&
+            (retained_parent_composition || !full_graph_capture ||
+             segment_cache.segments.size() != 1u ||
+             !segment_cache.segments.front().capturable ||
+             hooks.auxiliary_branch->device() != ctx->deviceId()))
+        {
+            LOG_ERROR(
+                "[DeviceGraphCaptureController] A graph-owned auxiliary branch requires exactly one complete capturable graph on the same device");
             result.reset_cache = true;
             return result;
         }
@@ -3644,8 +4030,24 @@ namespace llaminar2
                         return result;
                     }
 
+                    ScopedCapturedAuxiliaryBranch auxiliary_branch(
+                        hooks.auxiliary_branch,
+                        capture_stream);
+                    if (!auxiliary_branch.begin())
+                    {
+                        LOG_ERROR(
+                            "[DeviceGraphCaptureController] Could not record the graph-owned auxiliary fork for segment starting at "
+                            << (seg.stage_names.empty()
+                                    ? std::string("<empty>")
+                                    : seg.stage_names.front()));
+                        exec_ok = false;
+                        failed_stage_name = "<auxiliary_branch_fork>";
+                    }
+
                     for (const auto &stage_name : seg.stage_names)
                     {
+                        if (!exec_ok)
+                            break;
                         auto *node = graph.getNode(stage_name);
                         if (!node || !node->stage || !hooks.execute_node(*node))
                         {
@@ -3664,6 +4066,21 @@ namespace llaminar2
                             break;
                         }
                         graph.markCompleted(stage_name);
+                    }
+
+                    if (!auxiliary_branch.finish())
+                    {
+                        LOG_ERROR(
+                            "[DeviceGraphCaptureController] Could not record the graph-owned auxiliary join for segment starting at "
+                            << (seg.stage_names.empty()
+                                    ? std::string("<empty>")
+                                    : seg.stage_names.front()));
+                        if (exec_ok)
+                        {
+                            exec_ok = false;
+                            failed_stage_name =
+                                "<auxiliary_branch_join>";
+                        }
                     }
 
                     capture_transaction.finish();
@@ -3728,7 +4145,9 @@ namespace llaminar2
                     full_graph_capture,
                     segment_cache.perf_context,
                     current_step,
-                    retained_parent_composition
+                    retained_parent_composition ||
+                            (heterogeneous_ticket_transaction &&
+                             segment_index != 0u)
                         ? DeviceGraphExecutor::GraphLaunchDependencyHook{}
                         : hooks.launch_dependency,
                     hooks.post_launch,
@@ -3865,14 +4284,20 @@ namespace llaminar2
         const bool stream_only_default = exec_cfg.gpu_graph_stream_only_default;
         const GraphReplayCaptureMode replay_mode = captureModeForCache(segment_cache);
         const bool full_graph_replay = replay_mode == GraphReplayCaptureMode::FullGraph;
+        const bool heterogeneous_ticket_transaction =
+            requiresHeterogeneousTicketSegmentation(
+                graph.nativeCaptureEnvelope());
         if (hooks.launch_dependency &&
-            (!full_graph_replay ||
-             segment_cache.segments.size() != 1u ||
-             !segment_cache.segments.front().capturable))
+            !((full_graph_replay &&
+               segment_cache.segments.size() == 1u &&
+               segment_cache.segments.front().capturable) ||
+              (heterogeneous_ticket_transaction &&
+               !segment_cache.segments.empty() &&
+               segment_cache.segments.front().capturable)))
         {
             LOG_ERROR(
                 "[DeviceGraphCaptureController] A captured executable launch "
-                "dependency cannot decorate segmented or manual replay");
+                "dependency cannot decorate this replay envelope");
             return result;
         }
         if (stream_only_mode)
@@ -4033,6 +4458,11 @@ namespace llaminar2
             }
             // Segment execution picks capturable or manual behavior based on
             // segment metadata prepared during capture setup.
+            const DeviceGraphExecutor::GraphLaunchDependencyHook
+                segment_launch_dependency =
+                    heterogeneous_ticket_transaction && seg_idx != 0
+                        ? DeviceGraphExecutor::GraphLaunchDependencyHook{}
+                        : hooks.launch_dependency;
             const auto replay_result = executeReplaySegment(
                 graph,
                 seg,
@@ -4052,8 +4482,9 @@ namespace llaminar2
                 hooks.execute_node,
                 hooks.plan_capture_dependencies,
                 hooks.capture_boundary,
+                hooks.auxiliary_branch,
                 hooks.record_snapshot_copies,
-                hooks.launch_dependency,
+                segment_launch_dependency,
                 hooks.post_launch);
             if (profiling && !seg.capturable)
             {

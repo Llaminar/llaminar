@@ -349,6 +349,8 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                   sizeof(DeviceMoERebalanceApplyStatus) +
                   static_cast<size_t>(compact_params.config.participant_count) *
                       sizeof(DeviceMoERebalanceApplyStatus) +
+                  deviceMoETransferSlotClaimIndexBytes(
+                      compact_params.local_transfer_slot_count) +
                   transfer_command_buffers * compact_plan_entries *
                       static_cast<size_t>(compact_params.config.participant_count) *
                       sizeof(DeviceMoERebalancePlanEntry) +
@@ -361,13 +363,14 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                   compact_payload_gathered_bytes);
 
     const WorkspaceRequirements compact_reqs = compact_stage.getWorkspaceRequirements(0, 0, 0);
-    ASSERT_EQ(compact_reqs.buffers.size(), 17u);
+    ASSERT_EQ(compact_reqs.buffers.size(), 18u);
     const auto *compact_local_source_desc =
         compact_reqs.find("moe_rebalance_local_source_descriptors_decode_rebalance");
     ASSERT_NE(compact_local_source_desc, nullptr);
     EXPECT_NE(compact_reqs.find("moe_rebalance_copy_status_decode_rebalance"), nullptr);
     EXPECT_NE(compact_reqs.find("moe_rebalance_gathered_copy_status_decode_rebalance"), nullptr);
     EXPECT_NE(compact_reqs.find("moe_rebalance_gathered_wave_state_decode_rebalance"), nullptr);
+    EXPECT_NE(compact_reqs.find("moe_rebalance_transfer_slot_claim_index_decode_rebalance"), nullptr);
     EXPECT_EQ(compact_reqs.find("moe_rebalance_gathered_source_descriptors_decode_rebalance"), nullptr);
     EXPECT_EQ(compact_reqs.find("moe_rebalance_local_directory_decode_rebalance"), nullptr)
         << "Compact arrivals must not pack a full layer-by-expert resident directory.";
@@ -432,6 +435,8 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                   sizeof(DeviceMoERebalanceApplyStatus) +
                   static_cast<size_t>(config.participant_count) *
                       sizeof(DeviceMoERebalanceApplyStatus) +
+                  deviceMoETransferSlotClaimIndexBytes(
+                      params.local_transfer_slot_count) +
                   transfer_command_buffers * plan_entries *
                       static_cast<size_t>(config.participant_count) *
                       sizeof(DeviceMoERebalancePlanEntry) +
@@ -443,7 +448,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                   collective_payload_gathered_bytes);
 
     const WorkspaceRequirements transfer_reqs = transfer_stage.getWorkspaceRequirements(0, 0, 0);
-    ASSERT_EQ(transfer_reqs.buffers.size(), 17u);
+    ASSERT_EQ(transfer_reqs.buffers.size(), 18u);
     const auto *transfer_plan_desc =
         transfer_reqs.find("moe_rebalance_transfer_plan_decode_rebalance");
     const auto *transfer_plan_count_desc =
@@ -472,6 +477,8 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
         transfer_reqs.find("moe_rebalance_gathered_transfer_payload_decode_rebalance");
     const auto *apply_status_desc =
         transfer_reqs.find("moe_rebalance_apply_status_decode_rebalance");
+    const auto *transfer_slot_claim_index_desc =
+        transfer_reqs.find("moe_rebalance_transfer_slot_claim_index_decode_rebalance");
     ASSERT_NE(transfer_plan_desc, nullptr);
     ASSERT_NE(transfer_plan_count_desc, nullptr);
     ASSERT_NE(transfer_command_header_desc, nullptr);
@@ -487,6 +494,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
     ASSERT_NE(local_transfer_payload_desc, nullptr);
     ASSERT_NE(gathered_transfer_payload_desc, nullptr);
     ASSERT_NE(apply_status_desc, nullptr);
+    ASSERT_NE(transfer_slot_claim_index_desc, nullptr);
     EXPECT_EQ(transfer_plan_desc->size_bytes,
               transfer_command_buffers * plan_entries * sizeof(DeviceMoERebalancePlanEntry));
     EXPECT_EQ(transfer_plan_count_desc->size_bytes,
@@ -516,6 +524,9 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
     EXPECT_EQ(gathered_transfer_payload_desc->size_bytes,
               collective_payload_gathered_bytes);
     EXPECT_EQ(apply_status_desc->size_bytes, sizeof(DeviceMoERebalanceApplyStatus));
+    EXPECT_EQ(transfer_slot_claim_index_desc->size_bytes,
+              deviceMoETransferSlotClaimIndexBytes(
+                  params.local_transfer_slot_count));
 
     EXPECT_FALSE(stage.isGraphCapturable())
         << "capture must require a mirrored device runtime table";
@@ -680,7 +691,8 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromS
            int payload_bytes,
            bool has_mins,
            bool has_emins,
-           uint8_t codebook_id)
+           uint8_t codebook_id,
+           bool is_superblock)
     {
         ProjectionSpec result;
         result.label = label;
@@ -690,17 +702,22 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceFormatProfileSeparatesWireBytesFromS
         result.is_asymmetric = has_mins;
         result.has_emins = has_emins;
         result.codebook_id = codebook_id;
+        result.format = ExpertWeightFormat::nativeVnni({
+            .codebook_id = codebook_id,
+            .is_superblock = is_superblock,
+            .present = true,
+        });
         return result;
     };
 
     const std::vector<ProjectionSpec> q4_layer{
-        spec("gate", 16, false, false, 4),
-        spec("up", 16, false, false, 4),
-        spec("down", 16, false, false, 4)};
+        spec("gate", 16, false, false, 4, false),
+        spec("up", 16, false, false, 4, false),
+        spec("down", 16, false, false, 4, false)};
     const std::vector<ProjectionSpec> mixed_layer{
-        spec("gate", 32, false, false, 19),
-        spec("up", 8, true, true, 10),
-        spec("down", 9, true, false, 14)};
+        spec("gate", 32, false, false, 19, false),
+        spec("up", 8, true, true, 10, true),
+        spec("down", 9, true, false, 14, true)};
 
     const auto profile =
         DeviceMoETransferSlotDirectory::profileForLayerFormats(

@@ -172,9 +172,12 @@ namespace llaminar2
         return output;
     }
 
-    bool InferenceRunnerAdapter::maybeApplyDecodeBoundaryMaintenance()
+    bool InferenceRunnerAdapter::maybeApplyDecodeBoundaryMaintenance(
+        uint64_t committed_tokens)
     {
-        return orch_runner_ ? orch_runner_->maybeApplyMoERebalance() : false;
+        return orch_runner_
+                   ? orch_runner_->maybeApplyMoERebalance(committed_tokens)
+                   : false;
     }
 
     void InferenceRunnerAdapter::drainCompletedDecodeBoundaryMaintenanceDiagnostics()
@@ -187,6 +190,19 @@ namespace llaminar2
     {
         return orch_runner_ &&
                orch_runner_->waitForLastForwardCompletionForBenchmark();
+    }
+
+    InferenceReadiness
+    InferenceRunnerAdapter::inferenceReadiness() const
+    {
+        if (!orch_runner_)
+        {
+            return {
+                .state = InferenceReadinessState::Failed,
+                .diagnostic = "measurement readiness requested from a null orchestration runner",
+            };
+        }
+        return orch_runner_->inferenceReadiness();
     }
 
     void InferenceRunnerAdapter::setSkipLogitsGatherDecode(bool skip)

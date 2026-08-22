@@ -1078,13 +1078,26 @@ namespace llaminar2
         // ================================================================
 
         /**
-         * @brief Destroy and clear the current completion event through its owner.
+         * @brief Wait for any host-source use, then destroy the completion event.
          *
          * Caller must hold coherence_mutex_. Event handles are backend-specific;
          * missing ownership metadata is therefore a fatal lifecycle defect, not
          * permission to leak or destroy through the tensor's current backend.
+         * Graph-owned publication must use
+         * @ref discardDeviceValueCompletionProtection_ instead: it may not block
+         * inference merely to retire an older H2D source lifetime.
          */
         void retireCompletionEvent_();
+
+        /**
+         * @brief Remove only the event's device-value producer meaning.
+         *
+         * A graph-owned write supersedes the prior device value, but an
+         * asynchronous H2D may still be reading the tensor's host allocation.
+         * This transition preserves that independent source-lifetime proof and
+         * never waits on the host.
+         */
+        void discardDeviceValueCompletionProtection_();
 
         /**
          * @brief Publish a graph-owned GPU write without a per-tensor event.
@@ -1112,12 +1125,10 @@ namespace llaminar2
                     "Graph-owned device publication does not match tensor storage");
             }
 
-            /*
-             * Any older event describes a previous producer. The graph
-             * boundary will attach or expose the replay's real completion
-             * dependency after launch.
-             */
-            retireCompletionEvent_();
+            /* The graph supersedes only the previous device-value producer.
+             * An H2D source-lifetime proof remains live until host reuse or
+             * teardown observes its exact event. */
+            discardDeviceValueCompletionProtection_();
             setCoherenceState_(
                 is_mapped_
                     ? TensorCoherenceState::MAPPED
@@ -1988,26 +1999,45 @@ namespace llaminar2
         IBackend *resolveBackend(DeviceId device) const;
 
         /**
-         * @brief Work whose lifetime is represented by device_completion_event_.
+         * @brief Independent lifetimes represented by one exact event.
          *
-         * Device writes protect consumers of device bytes.  H2D source uses
-         * additionally protect the host allocation from mutation, unpinning,
-         * or release until DMA has consumed it.  Keeping that distinction
-         * typed prevents a logically SYNCED tensor from freeing an in-flight
-         * host source merely because both copies name the same generation.
+         * One H2D completion is both the producer of device bytes and the
+         * lifetime fence for its host source. A later device write may
+         * supersede only the first meaning. These four states make that partial
+         * transition explicit instead of losing one lifetime through a
+         * single-purpose enum or parallel booleans.
          */
-        enum class CompletionEventPurpose : uint8_t
+        enum class CompletionEventProtection : uint8_t
         {
-            NONE,
-            DEVICE_WRITE,
-            HOST_TO_DEVICE_SOURCE_USE,
+            None,
+            DeviceValue,
+            HostSource,
+            DeviceValueAndHostSource,
         };
 
+        /** @return Whether the event orders consumers of current device bytes. */
+        bool completionEventProtectsDeviceValue_() const noexcept
+        {
+            return completion_event_protection_ ==
+                       CompletionEventProtection::DeviceValue ||
+                   completion_event_protection_ ==
+                       CompletionEventProtection::DeviceValueAndHostSource;
+        }
+
+        /** @return Whether the event protects an asynchronous H2D host source. */
+        bool completionEventProtectsHostSource_() const noexcept
+        {
+            return completion_event_protection_ ==
+                       CompletionEventProtection::HostSource ||
+                   completion_event_protection_ ==
+                       CompletionEventProtection::DeviceValueAndHostSource;
+        }
+
         std::optional<DeviceId> gpu_device_;      // Which GPU device (nullopt = not on GPU)
-        void *device_completion_event_ = nullptr; // Exact event for device_completion_purpose_.
+        void *device_completion_event_ = nullptr; // Exact event for completion_event_protection_.
         std::optional<DeviceId> event_device_;    // Device where device_completion_event_ was created.
-        CompletionEventPurpose device_completion_purpose_ =
-            CompletionEventPurpose::NONE;
+        CompletionEventProtection completion_event_protection_ =
+            CompletionEventProtection::None;
 
         /**
          * @brief Exact producer-event generation already joined to one consumer stream.
@@ -2283,6 +2313,17 @@ namespace llaminar2
         explicit FP32Tensor(const std::vector<size_t> &shape, DeviceId device = DeviceId::cpu());
 
         /**
+         * @brief Adopt fully initialized aligned FP32 storage without copying.
+         * @param shape Tensor dimensions.
+         * @param host_data Exact element storage; ownership is transferred.
+         * @param device Logical home device for subsequent preparation.
+         * @throws std::invalid_argument When storage size does not match @p shape.
+         */
+        FP32Tensor(const std::vector<size_t> &shape,
+                   AlignedVector<float> host_data,
+                   DeviceId device = DeviceId::cpu());
+
+        /**
          * @brief Create a zero-copy mapped FP32Tensor for GPU execution
          *
          * Allocates tensor data in mapped host memory that is directly accessible
@@ -2526,6 +2567,13 @@ namespace llaminar2
 
         explicit FP16Tensor(const std::vector<size_t> &shape);
         FP16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &fp16_data);
+        /**
+         * @brief Adopt fully initialized aligned FP16 storage without copying.
+         * @param shape Tensor dimensions.
+         * @param fp16_data Exact FP16 element storage; ownership is transferred.
+         * @throws std::invalid_argument When storage size does not match @p shape.
+         */
+        FP16Tensor(const std::vector<size_t> &shape, AlignedVector<uint16_t> fp16_data);
         ~FP16Tensor() override;
 
         // TensorBase interface
@@ -2754,6 +2802,13 @@ namespace llaminar2
 
         explicit BF16Tensor(const std::vector<size_t> &shape);
         BF16Tensor(const std::vector<size_t> &shape, const std::vector<uint16_t> &bf16_data);
+        /**
+         * @brief Adopt fully initialized aligned BF16 storage without copying.
+         * @param shape Tensor dimensions.
+         * @param bf16_data Exact BF16 element storage; ownership is transferred.
+         * @throws std::invalid_argument When storage size does not match @p shape.
+         */
+        BF16Tensor(const std::vector<size_t> &shape, AlignedVector<uint16_t> bf16_data);
         ~BF16Tensor() override;
 
         // TensorBase interface
@@ -3249,6 +3304,13 @@ namespace llaminar2
         const IQ4_NLBlock *blocks() const { return typed_data(); }
 
         IQ4_NLTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ4_NL blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ4_NLTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ4_NLTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                      size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -3454,7 +3516,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -3501,6 +3563,13 @@ namespace llaminar2
         const Q8_0Block *blocks() const { return typed_data(); }
 
         Q8_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q8_0 blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q8_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q8_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -3699,7 +3768,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -4184,7 +4253,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -4650,7 +4719,7 @@ namespace llaminar2
         std::vector<size_t> shape_;
 
         bool is_view_;
-        std::vector<uint8_t> raw_data_;
+        AlignedVector<uint8_t> raw_data_;
         const uint8_t *raw_data_ptr_;
         size_t view_byte_offset_;
         std::shared_ptr<TensorBase> parent_;
@@ -4752,6 +4821,13 @@ namespace llaminar2
         const Q4_0Block *blocks() const { return typed_data(); }
 
         Q4_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q4_0 blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q4_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -4929,7 +5005,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -4972,6 +5048,13 @@ namespace llaminar2
         const Q4_1Block *blocks() const { return typed_data(); }
 
         Q4_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q4_1 blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q4_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_1Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5147,7 +5230,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -5191,6 +5274,13 @@ namespace llaminar2
         const Q5_0Block *blocks() const { return typed_data(); }
 
         Q5_0Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q5_0 blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q5_0Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_0Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5356,7 +5446,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -5400,6 +5490,13 @@ namespace llaminar2
         const Q5_1Block *blocks() const { return typed_data(); }
 
         Q5_1Tensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q5_1 blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q5_1Tensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_1Tensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5565,7 +5662,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -5605,6 +5702,13 @@ namespace llaminar2
         const Q6_KBlock *blocks() const { return typed_data(); }
 
         Q6_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q6_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q6_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q6_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5735,7 +5839,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -5773,6 +5877,13 @@ namespace llaminar2
         const Q2_KBlock *blocks() const { return typed_data(); }
 
         Q2_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q2_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q2_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q2_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -5902,7 +6013,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -5942,6 +6053,13 @@ namespace llaminar2
         const Q5_KBlock *blocks() const { return typed_data(); }
 
         Q5_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q5_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q5_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q5_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6078,7 +6196,7 @@ namespace llaminar2
             std::shared_ptr<TensorBase> parent);
 
         std::vector<size_t> shape_;
-        std::vector<uint8_t> raw_data_; // Owned only by parent tensor
+        AlignedVector<uint8_t> raw_data_; // Owned only by parent tensor
         DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
@@ -6114,6 +6232,13 @@ namespace llaminar2
         const Q3_KBlock *blocks() const { return typed_data(); }
 
         Q3_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q3_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q3_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q3_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6244,7 +6369,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -6282,6 +6407,13 @@ namespace llaminar2
         const Q4_KBlock *blocks() const { return typed_data(); }
 
         Q4_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q4_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q4_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q4_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6418,7 +6550,7 @@ namespace llaminar2
             std::shared_ptr<TensorBase> parent);
 
         std::vector<size_t> shape_;
-        std::vector<uint8_t> raw_data_; // Owned only by parent tensor
+        AlignedVector<uint8_t> raw_data_; // Owned only by parent tensor
         DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
@@ -6454,6 +6586,13 @@ namespace llaminar2
         const Q8_KBlock *blocks() const { return typed_data(); }
 
         Q8_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned Q8_K blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        Q8_KTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         Q8_KTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                    size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6637,7 +6776,7 @@ namespace llaminar2
             std::shared_ptr<TensorBase> parent);
 
         std::vector<size_t> shape_;
-        std::vector<uint8_t> raw_data_; // Owned only by parent tensor
+        AlignedVector<uint8_t> raw_data_; // Owned only by parent tensor
         DeviceId device_;
         void *device_blocks_;
         mutable std::vector<float> dequant_cache_;
@@ -6673,6 +6812,13 @@ namespace llaminar2
         const IQ4_XSBlock *blocks() const { return typed_data(); }
 
         IQ4_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ4_XS blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ4_XSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ4_XSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                      size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -6840,7 +6986,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -6872,6 +7018,13 @@ namespace llaminar2
         const IQ2_XXSBlock *blocks() const { return typed_data(); }
 
         IQ2_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ2_XXS blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ2_XXSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_XXSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                       size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7027,7 +7180,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -7059,6 +7212,13 @@ namespace llaminar2
         const IQ2_XSBlock *blocks() const { return typed_data(); }
 
         IQ2_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ2_XS blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ2_XSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_XSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                      size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7214,7 +7374,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -7246,6 +7406,13 @@ namespace llaminar2
         const IQ3_XXSBlock *blocks() const { return typed_data(); }
 
         IQ3_XXSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ3_XXS blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ3_XXSTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ3_XXSTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                       size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7405,7 +7572,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -7437,6 +7604,13 @@ namespace llaminar2
         const IQ2_SBlock *blocks() const { return typed_data(); }
 
         IQ2_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ2_S blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ2_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ2_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7592,7 +7766,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -7624,6 +7798,13 @@ namespace llaminar2
         const IQ3_SBlock *blocks() const { return typed_data(); }
 
         IQ3_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ3_S blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ3_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ3_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7783,7 +7964,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -7815,6 +7996,13 @@ namespace llaminar2
         const IQ1_SBlock *blocks() const { return typed_data(); }
 
         IQ1_STensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ1_S blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ1_STensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ1_STensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -7970,7 +8158,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)
@@ -8002,6 +8190,13 @@ namespace llaminar2
         const IQ1_MBlock *blocks() const { return typed_data(); }
 
         IQ1_MTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data);
+        /**
+         * @brief Adopt aligned IQ1_M blocks without copying.
+         * @param shape Logical tensor dimensions.
+         * @param raw_data Complete native blocks; ownership is transferred.
+         * @throws std::invalid_argument If byte count and shape disagree.
+         */
+        IQ1_MTensor(const std::vector<size_t> &shape, AlignedVector<uint8_t> raw_data);
         /// Zero-copy constructor for mmap-backed data (no memcpy)
         IQ1_MTensor(const std::vector<size_t> &shape, const uint8_t *mmap_data,
                     size_t byte_size, std::shared_ptr<void> mmap_lifetime_owner);
@@ -8157,7 +8352,7 @@ namespace llaminar2
 
         // Data ownership
         bool is_view_;
-        std::vector<uint8_t> raw_data_;      // Owned data (if !is_view_)
+        AlignedVector<uint8_t> raw_data_;      // Owned data (if !is_view_)
         const uint8_t *raw_data_ptr_;        // Borrowed data (if is_view_)
         size_t view_byte_offset_;            // Byte offset in parent's raw_data_
         std::shared_ptr<TensorBase> parent_; // Keep parent alive (if is_view_)

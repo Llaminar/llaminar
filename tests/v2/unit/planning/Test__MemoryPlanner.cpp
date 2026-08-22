@@ -14,6 +14,7 @@
 #include "planning/ModelMemoryProfile.h"
 #include "planning/ActivationBufferSizing.h"
 #include "planning/KVCacheMemoryEstimator.h"
+#include "planning/CollectiveMemoryEstimator.h"
 #include "backends/DeviceId.h"
 
 #include <string>
@@ -609,6 +610,69 @@ TEST(Test__MemoryPlanner,
     EXPECT_THROW(
         (void)MemoryPlanner::plan(profile, {config}),
         std::invalid_argument);
+}
+
+TEST(Test__MemoryPlanner,
+     MirroredMTPVocabularyPricesPrimaryShardAndBothFullViews)
+{
+    const auto profile = createTestProfile();
+    DevicePlanConfig config;
+    config.device = DeviceId::cuda(0);
+    config.device_total_bytes = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+    config.device_free_bytes = config.device_total_bytes;
+    config.device_compute_units = 82;
+    config.shard_index = 0;
+    config.total_shards = 2;
+    config.first_layer = 0;
+    config.last_layer = profile.n_layers - 1;
+    config.batch_size = 1;
+    config.max_seq_len = 4096;
+    config.mtp_enabled = true;
+    config.mtp_terminal_logits_layout =
+        MTPTerminalLogitsLayout::FullVocabularyPerParticipant;
+    config.additional_weight_sets =
+        resolveAdditionalPersistentWeightSets(
+            DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding,
+            config.total_shards,
+            config.mtp_enabled,
+            config.mtp_terminal_logits_layout);
+
+    ASSERT_EQ(config.additional_weight_sets.size(), 2u);
+    EXPECT_EQ(
+        config.additional_weight_sets[0],
+        AdditionalPersistentWeightSet::MirroredDecodeEmbedding);
+    EXPECT_EQ(
+        config.additional_weight_sets[1],
+        AdditionalPersistentWeightSet::MirroredMTPTerminalHead);
+
+    const auto primary = WeightMemoryEstimator::estimate(
+        profile,
+        config.device,
+        config.shard_index,
+        config.total_shards,
+        config.first_layer,
+        config.last_layer,
+        config.weight_residency);
+    const auto mirrored = WeightMemoryEstimator::estimate(
+        profile,
+        config.device,
+        /*shard_index=*/0,
+        /*total_shards=*/1,
+        config.first_layer,
+        config.last_layer,
+        config.weight_residency);
+    const auto planned = MemoryPlanner::plan(profile, {config});
+    ASSERT_EQ(planned.devices.size(), 1u);
+    EXPECT_EQ(planned.devices.front().weight_bytes, primary.device_bytes);
+    EXPECT_EQ(
+        planned.devices.front().additional_weight_bytes,
+        mirrored.prepared_embedding_bytes + mirrored.lm_head_bytes);
+    EXPECT_EQ(
+        planned.devices.front().collective_bytes,
+        CollectiveMemoryEstimator::localTP(
+            config.max_seq_len,
+            profile.d_model)
+            .perDeviceBytes());
 }
 
 TEST(Test__MemoryPlanner, TP2_ReducesKVCachePerDevice)

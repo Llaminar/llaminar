@@ -260,9 +260,13 @@ namespace llaminar2
                 placement.data(),
                 static_cast<uint32_t>(num_experts),
                 static_cast<uint32_t>(num_sockets),
+                moe_rebalance_policy::
+                    dynamicOwnershipEvidenceFromParticipantLoads(
+                        socket_loads.data(),
+                        static_cast<uint32_t>(num_sockets),
+                        config_.min_window_activations),
                 imbalance_threshold_per_mille,
-                min_improvement_per_mille,
-                config_.min_window_activations);
+                min_improvement_per_mille);
             if (!choice.valid)
                 break;
 

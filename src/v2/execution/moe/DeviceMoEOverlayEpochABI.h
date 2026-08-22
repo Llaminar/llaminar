@@ -18,6 +18,8 @@
 
 namespace llaminar2
 {
+    struct MoEOverlayDeviceControllerInferenceEpochRecord;
+
     /** Number of simultaneously retained ExpertOverlay execution banks. */
     inline constexpr std::uint32_t kDeviceMoEOverlayEpochBankCount = 2u;
 
@@ -148,6 +150,33 @@ namespace llaminar2
     };
 
     /**
+     * @brief Optional node-local transaction barrier bound to one epoch acquire.
+     *
+     * The record address is a process-local CUDA/HIP alias of the same physical
+     * mapped pages used by every continuation participant. `participant_id` is
+     * the immutable global id whose disjoint arrival lane this device may write.
+     * An empty binding preserves ordinary local or peer-selected admission.
+     */
+    struct DeviceMoEOverlayEpochAdmissionBarrierBinding
+    {
+        MoEOverlayDeviceControllerInferenceEpochRecord *record = nullptr;
+        std::uint32_t participant_id = 0xffffffffu;
+        std::uint32_t reserved = 0u;
+
+        /** @return Whether stable address and participant identity are present. */
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return record != nullptr && participant_id != 0xffffffffu;
+        }
+
+        /** @return Whether no transaction-wide synchronization was requested. */
+        [[nodiscard]] constexpr bool empty() const noexcept
+        {
+            return record == nullptr && participant_id == 0xffffffffu;
+        }
+    };
+
+    /**
      * @brief Device-resident completion and diagnostic for one epoch operation.
      *
      * Kernel launch success only proves that work entered the explicit stream.
@@ -188,6 +217,8 @@ namespace llaminar2
     static_assert(std::is_trivially_copyable_v<DeviceMoEOverlayEpochControl>);
     static_assert(std::is_trivially_copyable_v<DeviceMoEOverlayEpochTicket>);
     static_assert(std::is_trivially_copyable_v<DeviceMoEOverlayEpochStatus>);
+    static_assert(std::is_trivially_copyable_v<
+                  DeviceMoEOverlayEpochAdmissionBarrierBinding>);
     static_assert(sizeof(DeviceMoEOverlayEpochControl) == 64u);
     static_assert(alignof(DeviceMoEOverlayEpochControl) == 64u);
     static_assert(sizeof(DeviceMoEOverlayEpochTicket) == 16u);

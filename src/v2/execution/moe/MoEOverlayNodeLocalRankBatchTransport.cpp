@@ -5,6 +5,7 @@
 
 #include "MoEOverlayNodeLocalRankBatchTransport.h"
 
+#include "backends/BackendManager.h"
 #include "collective/CollectiveTimeoutPolicy.h"
 #include "interfaces/IMPIContext.h"
 #include "interfaces/IMPITopology.h"
@@ -18,9 +19,11 @@
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -34,7 +37,7 @@ namespace llaminar2
     namespace
     {
         constexpr uint64_t kSharedChannelMagic = 0x5a43574f454d4c4cULL;
-        constexpr uint32_t kSharedChannelVersion = 4;
+        constexpr uint32_t kSharedChannelVersion = 5;
         constexpr size_t kCacheLine = 64;
 
         enum class PublicationState : uint32_t
@@ -108,6 +111,8 @@ namespace llaminar2
             size_t entry_offsets = 0;
             size_t expert_ids = 0;
             size_t route_weights = 0;
+            size_t original_route_slots = 0;
+            size_t compact_route_slots = 0;
             size_t hidden_rows = 0;
             size_t dispatch_end = 0;
             size_t return_begin = 0;
@@ -334,14 +339,162 @@ namespace llaminar2
 
     } // namespace
 
+    MoEOverlayPersistentGraphStorage::MoEOverlayPersistentGraphStorage(
+        Config config)
+        : config_(std::move(config))
+    {
+        if (!config_.device.is_gpu() || config_.shape.empty() ||
+            config_.identity.empty() ||
+            std::any_of(
+                config_.shape.begin(),
+                config_.shape.end(),
+                [](std::size_t extent) { return extent == 0u; }))
+        {
+            throw std::invalid_argument(
+                "ExpertOverlay graph storage requires an exact GPU, positive shape, and identity");
+        }
+
+        switch (config_.type)
+        {
+        case MoEOverlayGraphStorageType::Int32:
+            tensor_ = std::make_unique<INT32Tensor>(config_.shape);
+            break;
+        case MoEOverlayGraphStorageType::FP32:
+            tensor_ = std::make_unique<FP32Tensor>(config_.shape);
+            break;
+        }
+        if (!tensor_)
+        {
+            throw std::runtime_error(
+                "ExpertOverlay graph storage could not construct its tensor owner");
+        }
+
+        TransferEngine::allocateDeviceStorage(tensor_.get(), config_.device);
+        if (!tensor_->gpu_data_ptr())
+        {
+            throw std::runtime_error(
+                "ExpertOverlay graph storage has no capture-stable device address for " +
+                config_.identity);
+        }
+    }
+
+    MoEOverlayPersistentGraphStorage::~MoEOverlayPersistentGraphStorage() =
+        default;
+
+    bool MoEOverlayPersistentGraphStorage::publishImmutableBytes(
+        const void *bytes,
+        std::size_t byte_count,
+        void *stream)
+    {
+        if (!config_.immutable_input || !tensor_ || !bytes || !stream ||
+            byte_count != tensor_->size_bytes())
+        {
+            LOG_ERROR(
+                "[MoEOverlayPersistentGraphStorage] Invalid immutable publication"
+                << " identity=" << config_.identity
+                << " bytes=" << byte_count
+                << " capacity=" << (tensor_ ? tensor_->size_bytes() : 0u)
+                << " stream=" << stream);
+            return false;
+        }
+
+        try
+        {
+            if (published_)
+            {
+                if (std::memcmp(tensor_->raw_data(), bytes, byte_count) != 0)
+                {
+                    LOG_ERROR(
+                        "[MoEOverlayPersistentGraphStorage] Immutable graph metadata changed after publication"
+                        << " identity=" << config_.identity);
+                    return false;
+                }
+                TransferEngine::requireDeviceInput(
+                    tensor_.get(), config_.device, stream);
+                return true;
+            }
+
+            std::memcpy(tensor_->raw_mutable_data(), bytes, byte_count);
+            TransferEngine::prepareDeviceInput(
+                tensor_.get(), config_.device, stream);
+            TransferEngine::requireDeviceInput(
+                tensor_.get(), config_.device, stream);
+            published_ = true;
+            return true;
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[MoEOverlayPersistentGraphStorage] Immutable publication failed"
+                << " identity=" << config_.identity
+                << " error=" << error.what());
+            return false;
+        }
+    }
+
+    bool MoEOverlayPersistentGraphStorage::requireInput(void *stream) const
+    {
+        if (!config_.immutable_input || !published_ || !tensor_ || !stream)
+            return false;
+        try
+        {
+            TransferEngine::requireDeviceInput(
+                tensor_.get(), config_.device, stream);
+            return true;
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[MoEOverlayPersistentGraphStorage] Input stream validation failed"
+                << " identity=" << config_.identity
+                << " error=" << error.what());
+            return false;
+        }
+    }
+
+    bool MoEOverlayPersistentGraphStorage::requireOutput(void *stream) const
+    {
+        if (config_.immutable_input || !tensor_ || !stream)
+            return false;
+        try
+        {
+            TransferEngine::requireDeviceOutput(
+                tensor_.get(), config_.device, stream);
+            return true;
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[MoEOverlayPersistentGraphStorage] Output stream validation failed"
+                << " identity=" << config_.identity
+                << " error=" << error.what());
+            return false;
+        }
+    }
+
+    void *MoEOverlayPersistentGraphStorage::deviceData() const noexcept
+    {
+        return tensor_ ? tensor_->gpu_data_ptr() : nullptr;
+    }
+
+    std::size_t MoEOverlayPersistentGraphStorage::sizeBytes() const noexcept
+    {
+        return tensor_ ? tensor_->size_bytes() : 0u;
+    }
+
+    bool MoEOverlayPersistentGraphStorage::allocated() const noexcept
+    {
+        return deviceData() != nullptr;
+    }
+
     /**
      * @brief Own one endpoint-private grant at a stable CPU or GPU address.
      *
-     * Construction is setup-only. GPU storage is allocated through
-     * TransferEngine without publishing tensor authority because stage zero
-     * overwrites every grant byte before any later stage consumes it. The
-     * tensor owner exists solely to provide canonical allocation teardown after
-     * every retained executable referencing the address has been destroyed.
+     * Construction is setup-only. TransferEngine publishes the zero generation
+     * asynchronously on a persistent setup stream, and one persistent event
+     * carries that edge into every stage-zero packet stream. The tensor, stream,
+     * and event remain alive until every retained executable referencing the
+     * grant has been destroyed; no host or stream synchronization is required.
      */
     class MoEOverlayNodeLocalRankBatchTransport::DeviceGrantStorage final
     {
@@ -370,11 +523,55 @@ namespace llaminar2
                     sizeof(MoEOverlayActivationDeviceEpochGrant));
                 gpu_storage_ =
                     std::make_unique<INT32Tensor>(std::vector<size_t>{words});
-                TransferEngine::allocateDeviceStorage(
-                    gpu_storage_.get(), device_);
+                std::memset(
+                    gpu_storage_->raw_mutable_data(),
+                    0,
+                    sizeof(MoEOverlayActivationDeviceEpochGrant));
+
+                /*
+                 * Stage zero ordinarily overwrites the complete grant, but its
+                 * monotonic generation is also the device-side anti-ABA cursor
+                 * for overlapping retained submissions. Establish the initial
+                 * Idle/zero generation through TransferEngine before any graph
+                 * can embed the address. The persistent event carries that
+                 * publication into each exact packet stream; inference never
+                 * blocks the host or transfers grant bytes back to it.
+                 */
+                backend_ = getBackendFor(device_);
+                device_ordinal_ = device_.gpu_ordinal();
+                setup_stream_ = backend_
+                                    ? backend_->createStream(device_ordinal_)
+                                    : nullptr;
+                initialization_event_ = backend_
+                                            ? backend_->createEvent(
+                                                  device_ordinal_)
+                                            : nullptr;
+                if (!backend_ || !setup_stream_ || !initialization_event_)
+                {
+                    releaseAsyncResources();
+                    throw std::runtime_error(
+                        "ExpertOverlay device grant could not create its asynchronous setup edge");
+                }
+                try
+                {
+                    TransferEngine::prepareDeviceInput(
+                        gpu_storage_.get(), device_, setup_stream_);
+                    if (!backend_->recordEvent(
+                            initialization_event_,
+                            device_ordinal_,
+                            setup_stream_))
+                    {
+                        throw std::runtime_error(
+                            "ExpertOverlay device grant initialization event was not recorded");
+                    }
+                }
+                catch (...)
+                {
+                    releaseAsyncResources();
+                    throw;
+                }
                 grant_ = static_cast<MoEOverlayActivationDeviceEpochGrant *>(
                     gpu_storage_->gpu_data_ptr());
-
             }
             else
             {
@@ -387,6 +584,12 @@ namespace llaminar2
                 throw std::runtime_error(
                     "ExpertOverlay device grant allocation returned a null address");
             }
+        }
+
+        /** @brief Retire persistent setup ordering after all graph users drain. */
+        ~DeviceGrantStorage()
+        {
+            releaseAsyncResources();
         }
 
         /** @return Whether this owner exactly matches a requested lane. */
@@ -405,10 +608,36 @@ namespace llaminar2
             return grant_;
         }
 
+        /** @return Persistent event publishing the complete zero grant. */
+        [[nodiscard]] void *initializationEvent() const noexcept
+        {
+            return initialization_event_;
+        }
+
     private:
+        /** @brief Release setup-only stream/event ownership without waiting. */
+        void releaseAsyncResources() noexcept
+        {
+            if (backend_ && initialization_event_)
+            {
+                backend_->destroyEvent(
+                    initialization_event_, device_ordinal_);
+            }
+            if (backend_ && setup_stream_)
+                backend_->destroyStream(setup_stream_, device_ordinal_);
+            initialization_event_ = nullptr;
+            setup_stream_ = nullptr;
+            backend_ = nullptr;
+            device_ordinal_ = -1;
+        }
+
         DeviceId device_ = DeviceId::invalid(); ///< Exact allocation device.
         int participant_id_ = -1; ///< Logical packet lane.
         size_t graph_family_ordinal_ = 0u; ///< Main/MTP graph family.
+        IBackend *backend_ = nullptr; ///< Exact setup event/stream backend.
+        int device_ordinal_ = -1; ///< Backend-local grant device.
+        void *setup_stream_ = nullptr; ///< Persistent async initialization stream.
+        void *initialization_event_ = nullptr; ///< Zero-generation publication.
         std::unique_ptr<INT32Tensor> gpu_storage_; ///< Canonical GPU allocation owner.
         std::unique_ptr<MoEOverlayActivationDeviceEpochGrant> cpu_storage_; ///< CPU authority.
         MoEOverlayActivationDeviceEpochGrant *grant_ = nullptr; ///< Stable captured address.
@@ -572,6 +801,9 @@ namespace llaminar2
             rows.top_k = top_k_;
             rows.row_capacity = max_rows_;
             rows.entry_capacity = max_entries_;
+            rows.hidden_row_capacity = max_rows_;
+            rows.hidden_payload_layout =
+                MoEOverlayActivationHiddenPayloadLayout::CompactRows;
             rows.row_ids_host = at<int32_t>(layout.row_ids);
             rows.entry_offsets_host = at<int32_t>(layout.entry_offsets);
             rows.expert_ids_host = at<int32_t>(layout.expert_ids);
@@ -597,6 +829,28 @@ namespace llaminar2
         float *sharedActivationHiddenRows() const noexcept
         {
             return at<float>(shared_dispatch_hidden_rows_offset_);
+        }
+
+        /** @return Original route-slot identities for one participant lane. */
+        std::int32_t *originalRouteSlots(int participant_id) const
+        {
+            return at<std::int32_t>(
+                layouts_[participantIndex(participant_id)]
+                    .original_route_slots);
+        }
+
+        /** @return Follower-local compact route-slot identities for one lane. */
+        std::int32_t *compactRouteSlots(int participant_id) const
+        {
+            return at<std::int32_t>(
+                layouts_[participantIndex(participant_id)]
+                    .compact_route_slots);
+        }
+
+        /** @return Shared original-route contribution matrix for this rank pair. */
+        float *sharedCanonicalReturnRoutes() const noexcept
+        {
+            return at<float>(shared_return_route_rows_offset_);
         }
 
         SharedParticipantControl &control(size_t index) const
@@ -754,6 +1008,8 @@ namespace llaminar2
                 max_entries_, sizeof(int32_t), "expert ids");
             const size_t weight_bytes = checkedMultiply(
                 max_entries_, sizeof(float), "route weights");
+            const size_t route_slot_bytes = checkedMultiply(
+                max_entries_, sizeof(int32_t), "route slot identities");
             const size_t activation_bytes = checkedMultiply(
                 checkedMultiply(max_rows_, static_cast<size_t>(d_model_),
                                 "activation elements"),
@@ -784,6 +1040,8 @@ namespace llaminar2
                 layout.entry_offsets = appendRegion(entry_offset_bytes);
                 layout.expert_ids = appendRegion(expert_bytes);
                 layout.route_weights = appendRegion(weight_bytes);
+                layout.original_route_slots = appendRegion(route_slot_bytes);
+                layout.compact_route_slots = appendRegion(route_slot_bytes);
                 layout.hidden_rows = appendRegion(activation_bytes);
                 mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
                 layout.dispatch_end = mapping_bytes_;
@@ -793,6 +1051,26 @@ namespace llaminar2
                 mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
                 layout.return_end = mapping_bytes_;
             }
+
+            /* All remote GPUs publish disjoint original router slots into one
+             * rank-pair matrix.  A single shared allocation avoids reserving a
+             * worst-case top-k matrix for every participant while preserving
+             * arbitrary dynamic placement: any one lane may still own every
+             * live route.  The continuation rank is the synchronous consumer,
+             * so first-touch places these pages with the return direction. */
+            const size_t canonical_return_bytes = checkedMultiply(
+                checkedMultiply(
+                    max_entries_,
+                    static_cast<size_t>(d_model_),
+                    "canonical return elements"),
+                sizeof(float),
+                "canonical return bytes");
+            mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
+            shared_return_begin_ = mapping_bytes_;
+            shared_return_route_rows_offset_ =
+                appendRegion(canonical_return_bytes);
+            mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
+            shared_return_end_ = mapping_bytes_;
             mapping_bytes_ = alignUp(mapping_bytes_, page_size_);
         }
 
@@ -866,6 +1144,25 @@ namespace llaminar2
                     touched_bytes,
                     end - begin,
                     "directional first-touch bytes");
+            }
+            if (source)
+            {
+                if (shared_return_begin_ % page_size_ != 0u ||
+                    shared_return_end_ % page_size_ != 0u ||
+                    shared_return_begin_ >= shared_return_end_ ||
+                    shared_return_end_ > mapping_bytes_)
+                {
+                    throw std::logic_error(
+                        "MoE shared canonical return range is not page isolated");
+                }
+                std::memset(
+                    static_cast<std::byte *>(base_) + shared_return_begin_,
+                    0,
+                    shared_return_end_ - shared_return_begin_);
+                touched_bytes = checkedAdd(
+                    touched_bytes,
+                    shared_return_end_ - shared_return_begin_,
+                    "canonical return first-touch bytes");
             }
 
             auto &local_ready =
@@ -1169,6 +1466,12 @@ namespace llaminar2
         size_t shared_dispatch_hidden_rows_offset_ = 0;
         /** Exclusive end of the shared physical activation page range. */
         size_t shared_dispatch_end_ = 0;
+        /** Source-owned page range for canonical follower contributions. */
+        size_t shared_return_begin_ = 0;
+        /** Byte offset of `[max_entries, d_model]` canonical route rows. */
+        size_t shared_return_route_rows_offset_ = 0;
+        /** Exclusive end of the canonical return page range. */
+        size_t shared_return_end_ = 0;
         std::vector<ParticipantLayout> layouts_;
         SharedChannelHeader *header_ = nullptr;
         SharedPublication *dispatch_publication_ = nullptr;
@@ -1208,7 +1511,7 @@ namespace llaminar2
             config_.activation_graph_families.size() >
                 static_cast<size_t>(
                     std::numeric_limits<std::uint32_t>::max()) ||
-            config_.local_devices.empty())
+            config_.local_lanes.empty())
         {
             throw std::invalid_argument(
                 "Node-local MoE rank-batch transport requires a complete rank, topology, and geometry contract");
@@ -1220,6 +1523,29 @@ namespace llaminar2
         {
             throw std::invalid_argument(
                 "Node-local MoE activation channel requires valid retained graph-family manifests");
+        }
+        std::vector<DeviceId> local_devices;
+        std::set<std::pair<int, DeviceId>> unique_local_lanes;
+        for (const auto &lane : config_.local_lanes)
+        {
+            if (!lane.valid() ||
+                std::find(
+                    config_.workspace->participantIds().begin(),
+                    config_.workspace->participantIds().end(),
+                    lane.participant_id) ==
+                    config_.workspace->participantIds().end() ||
+                !unique_local_lanes.emplace(
+                    lane.participant_id, lane.device).second)
+            {
+                throw std::invalid_argument(
+                    "Node-local MoE activation channel requires unique planner-declared participant/device lanes");
+            }
+            if (std::find(
+                    local_devices.begin(), local_devices.end(), lane.device) ==
+                local_devices.end())
+            {
+                local_devices.push_back(lane.device);
+            }
         }
         const auto *const topology = config_.mpi_ctx->topology();
         if (!topology ||
@@ -1236,7 +1562,7 @@ namespace llaminar2
             mapped_region_ = transfer_engine_.registerExternalMappedHostRegion(
                 mapping_->baseAddress(),
                 mapping_->bytes(),
-                config_.local_devices,
+                local_devices,
                 mapping_);
         }
         catch (...)
@@ -1247,30 +1573,28 @@ namespace llaminar2
         }
 
         /*
-         * Materialize every grant before any model graph can request a lane.
-         * The Cartesian product is immutable topology, not a runtime cache:
-         * migration may make an initially empty participant active, and every
-         * main/MTP retained family therefore needs its own serially reusable
-         * endpoint state at a capture-stable address.
+         * Materialize every planner-declared grant before any model graph can
+         * request a lane. Migration may make an initially empty participant
+         * active, so every declared lane and main/MTP retained family needs its
+         * own serially reusable endpoint state at a capture-stable address.
+         * The lane planner deliberately forbids a device-by-participant
+         * Cartesian product: such grants could allocate staging that admission
+         * never priced and that no production graph can legally request.
          */
-        const auto &participants = config_.workspace->participantIds();
         device_grants_.reserve(
-            config_.local_devices.size() * participants.size() *
+            config_.local_lanes.size() *
             config_.activation_graph_families.size());
-        for (const DeviceId device : config_.local_devices)
+        for (const auto &lane : config_.local_lanes)
         {
-            for (const int participant_id : participants)
+            for (size_t family = 0u;
+                 family < config_.activation_graph_families.size();
+                 ++family)
             {
-                for (size_t family = 0u;
-                     family < config_.activation_graph_families.size();
-                     ++family)
-                {
-                    device_grants_.push_back(
-                        std::make_unique<DeviceGrantStorage>(
-                            device,
-                            participant_id,
-                            family));
-                }
+                device_grants_.push_back(
+                    std::make_unique<DeviceGrantStorage>(
+                        lane.device,
+                        lane.participant_id,
+                        family));
             }
         }
         dispatch_ledger_.resize(config_.transaction_slot_count);
@@ -1466,16 +1790,18 @@ namespace llaminar2
             dispatch_rows.entry_capacity * sizeof(std::int32_t);
         const auto entry_weight_bytes =
             dispatch_rows.entry_capacity * sizeof(float);
+        const auto entry_route_slot_bytes =
+            dispatch_rows.entry_capacity * sizeof(std::int32_t);
         const auto activation_bytes =
             dispatch_rows.row_capacity *
             static_cast<size_t>(dispatch_rows.d_model) * sizeof(float);
-        const auto return_row_bytes =
-            return_rows.row_capacity * sizeof(std::int32_t);
-        const auto return_activation_bytes =
-            return_rows.row_capacity *
+        const auto return_route_activation_bytes =
+            dispatch_rows.entry_capacity *
             static_cast<size_t>(return_rows.d_model) * sizeof(float);
         float *const shared_activation_rows =
             mapping_->sharedActivationHiddenRows();
+        float *const shared_canonical_return_routes =
+            mapping_->sharedCanonicalReturnRoutes();
 
         const auto grant_owner = std::find_if(
             device_grants_.begin(),
@@ -1505,6 +1831,8 @@ namespace llaminar2
             .control_device = static_cast<MoEOverlayActivationEpochControl *>(
                 alias(&control, sizeof(control))),
             .grant_device = (*grant_owner)->grant(),
+            .grant_initialization_event =
+                (*grant_owner)->initializationEvent(),
             .dispatch = {
                 .row_ids = static_cast<std::int32_t *>(alias(
                     dispatch_rows.row_ids_host, dispatch_row_bytes)),
@@ -1516,6 +1844,12 @@ namespace llaminar2
                 .route_weights = static_cast<float *>(alias(
                     dispatch_rows.route_weights_host,
                     entry_weight_bytes)),
+                .original_route_slots = static_cast<std::int32_t *>(alias(
+                    mapping_->originalRouteSlots(target_participant_id),
+                    entry_route_slot_bytes)),
+                .compact_route_slots = static_cast<std::int32_t *>(alias(
+                    mapping_->compactRouteSlots(target_participant_id),
+                    entry_route_slot_bytes)),
                 .hidden_rows_fp32 = static_cast<float *>(alias(
                     dispatch_rows.hidden_rows_fp32, activation_bytes)),
                 .row_capacity = dispatch_rows.row_capacity,
@@ -1524,12 +1858,11 @@ namespace llaminar2
                 .top_k = dispatch_rows.top_k,
             },
             .returned = {
-                .row_ids = static_cast<std::int32_t *>(alias(
-                    return_rows.row_ids_host, return_row_bytes)),
-                .output_rows_fp32 = static_cast<float *>(alias(
-                    return_rows.output_rows_fp32,
-                    return_activation_bytes)),
-                .row_capacity = return_rows.row_capacity,
+                .canonical_route_contributions_fp32 =
+                    static_cast<float *>(alias(
+                        shared_canonical_return_routes,
+                        return_route_activation_bytes)),
+                .route_slot_capacity = dispatch_rows.entry_capacity,
                 .d_model = return_rows.d_model,
             },
             .dispatch_hidden_offset = mappedOffset(
@@ -1537,7 +1870,8 @@ namespace llaminar2
             .shared_dispatch_hidden_offset = mappedOffset(
                 shared_activation_rows, activation_bytes),
             .return_output_offset = mappedOffset(
-                return_rows.output_rows_fp32, return_activation_bytes),
+                shared_canonical_return_routes,
+                return_route_activation_bytes),
             .admission_signal_offset = mappedOffset(
                 &control.admission.ready_signal,
                 sizeof(control.admission.ready_signal)),

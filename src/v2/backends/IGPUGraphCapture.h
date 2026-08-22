@@ -226,6 +226,86 @@ namespace llaminar2
     };
 
     /**
+     * @brief Authenticated hosted replay view of one device-controlled iteration.
+     *
+     * Native conditional graphs preserve the source fragment order themselves.
+     * A backend without conditional graph nodes publishes the two immutable
+     * decisions needed to reproduce that selection: whether another loop
+     * iteration is admitted and whether its conditional tail is due.  This
+     * helper applies those decisions while retaining the original fragment
+     * order; it must never move a conditional maintenance tail ahead of the
+     * transaction that produces and releases its inference state.
+     */
+    struct DeviceControlledLoopTicketSelection
+    {
+        bool iteration_admitted = false;       ///< Whether the native loop body would run.
+        bool conditional_word_nonzero = false; ///< Authenticated value for the conditional tail.
+
+        /**
+         * @brief Decide whether one execution policy participates in this iteration.
+         * @param execution Typed policy stored in the retained branch.
+         * @return true when the fragment must be submitted.
+         */
+        [[nodiscard]] constexpr bool selects(
+            DeviceControlledLoopFragmentExecution execution) const noexcept
+        {
+            if (!iteration_admitted)
+                return false;
+            switch (execution)
+            {
+            case DeviceControlledLoopFragmentExecution::Always:
+                return true;
+            case DeviceControlledLoopFragmentExecution::IfDeviceWordNonZero:
+                return conditional_word_nonzero;
+            }
+            return false;
+        }
+
+        /**
+         * @brief Count selected fragments without allocating a filtered branch.
+         * @tparam Fragment A fragment type exposing an `execution` member.
+         * @param ordered_fragments Producer-ordered retained branch.
+         * @return Number of fragments selected for the authenticated iteration.
+         */
+        template <typename Fragment>
+        [[nodiscard]] constexpr size_t countSelected(
+            std::span<const Fragment> ordered_fragments) const noexcept
+        {
+            size_t count = 0;
+            for (const Fragment &fragment : ordered_fragments)
+            {
+                if (selects(fragment.execution))
+                    ++count;
+            }
+            return count;
+        }
+
+        /**
+         * @brief Resolve a selected ordinal while preserving producer order.
+         * @tparam Fragment A fragment type exposing an `execution` member.
+         * @param ordered_fragments Producer-ordered retained branch.
+         * @param selected_ordinal Zero-based ordinal in the filtered view.
+         * @return Borrowed selected fragment, or nullptr when out of range.
+         */
+        template <typename Fragment>
+        [[nodiscard]] constexpr const Fragment *selectOrdinal(
+            std::span<const Fragment> ordered_fragments,
+            size_t selected_ordinal) const noexcept
+        {
+            size_t current_ordinal = 0;
+            for (const Fragment &fragment : ordered_fragments)
+            {
+                if (!selects(fragment.execution))
+                    continue;
+                if (current_ordinal == selected_ordinal)
+                    return &fragment;
+                ++current_ordinal;
+            }
+            return nullptr;
+        }
+    };
+
+    /**
      * @brief Closed set of steps in one retained mapped-timeline transaction.
      *
      * A captured fragment owns ordinary kernels/library nodes. Wait and publish

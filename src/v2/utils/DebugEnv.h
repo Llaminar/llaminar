@@ -411,8 +411,8 @@ namespace llaminar2
         int cuda_moe_imma_down_columns = 32;    ///< Capture-time grouped-IMMA down output width (LLAMINAR_CUDA_MOE_IMMA_DOWN_COLUMNS, valid 32|64|128|256).
         int cuda_moe_imma_gateup_schedule = 0;  ///< Gate/up warp ownership (LLAMINAR_CUDA_MOE_IMMA_GATEUP_SCHEDULE, 0=parallel banks, 1=paired projections).
         bool cuda_moe_imma_geometry_override_active = false; ///< True only when a profiler/trainer or explicit environment overrides installed IMMA dispatch.
-        bool cuda_moe_router_q8 = true;           ///< Enable cached Q8 router gate weights for CUDA MoE decode routing (LLAMINAR_CUDA_MOE_ROUTER_Q8, disabled by LLAMINAR_DETERMINISTIC)
-        bool cuda_moe_reuse_router_q8_hidden = true; ///< Reuse CUDA router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN, disabled by LLAMINAR_DETERMINISTIC)
+        bool cuda_moe_router_q8 = true;           ///< Enable cached Q8 router gate weights for CUDA MoE decode routing (LLAMINAR_CUDA_MOE_ROUTER_Q8)
+        bool cuda_moe_reuse_router_q8_hidden = true; ///< Reuse CUDA router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN)
         int cuda_moe_prefill_tile_m = 0;          ///< Tokens-per-block override for grouped MoE prefill on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 0|2|4|8|16, default 0=auto)
         bool cuda_moe_prefill_fuse_swiglu = true; ///< Fuse SwiGLU + blockwise int8 quant into the grouped MoE prefill gate/up GEMM epilogue, eliminating the FP32 gate/up global round-trip + separate swiglu_quantize launch (LLAMINAR_CUDA_MOE_PREFILL_FUSE_SWIGLU, default ON)
 
@@ -613,11 +613,11 @@ namespace llaminar2
             const char *moe_reuse_router_q8_hidden_env = std::getenv("LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN");
             if (moe_reuse_router_q8_hidden_env)
                 cuda_moe_reuse_router_q8_hidden = (std::atoi(moe_reuse_router_q8_hidden_env) != 0);
-            if (deterministic)
-            {
-                cuda_moe_router_q8 = false;
-                cuda_moe_reuse_router_q8_hidden = false;
-            }
+            /*
+             * Router Q8 publication has a fixed quantizer and immutable
+             * producer/consumer ordering, so deterministic execution keeps it
+             * enabled. Explicit backend overrides remain authoritative.
+             */
 
             // CUDA grouped MoE prefill tokens-per-block (kTileM). Default auto
             // chooses 2/4 for MTP verifier rows and 16 for larger prompt prefill.
@@ -2766,12 +2766,12 @@ namespace llaminar2
         bool gdn_concurrent_decode = true;         ///< Enable multi-stream GDN decode projection GEMVs only (LLAMINAR_ROCM_GDN_CONCURRENT_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         bool moe_grouped_decode = true;            ///< Enable grouped MoE decode down path when supported (LLAMINAR_ROCM_MOE_GROUPED_DECODE)
         bool moe_grouped_decode_router = true;     ///< Enable grouped MoE decode router logits path (LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER, disabled by LLAMINAR_DETERMINISTIC)
-        bool moe_router_q8 = true;                 ///< Enable cached Q8 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_Q8, disabled by LLAMINAR_DETERMINISTIC)
+        bool moe_router_q8 = true;                 ///< Enable cached Q8 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_Q8)
         bool moe_router_fp16 = false;              ///< Enable cached FP16 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_FP16, disabled by LLAMINAR_DETERMINISTIC)
         bool moe_router_kpart_decode = false;      ///< Enable K-partitioned FP32 router logits for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         int moe_router_kparts = 8;                 ///< K partitions for FP32 router logits decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPARTS)
         bool moe_router_wave_topk = true;          ///< Enable shared-memory decode softmax/top-k runtime kernel for <=256 experts (LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK)
-        bool moe_reuse_router_q8_hidden = true;    ///< Reuse router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN, disabled by LLAMINAR_DETERMINISTIC)
+        bool moe_reuse_router_q8_hidden = true;    ///< Reuse router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN)
         int moe_prefill_gateup_tile_m = -1;        ///< Grouped prefill gate/up expert-row policy override (-1=generated; 4/8/12/16 fixed, 20=device-adaptive)
         int moe_prefill_gateup_tile_n = -1;        ///< Grouped prefill gate/up output-column tile override (-1=generated policy; 64/128/256 valid)
         int moe_prefill_down_tile_m = -1;          ///< Grouped prefill down expert-row policy override (-1=generated; 4/8/12/16 fixed, 20=device-adaptive)
@@ -3264,12 +3264,10 @@ namespace llaminar2
                 concurrent_prefill = false;
                 concurrent_decode = false;
                 gdn_concurrent_decode = false;
-                moe_router_q8 = false;
                 moe_router_fp16 = false;
                 moe_router_kpart_decode = false;
                 moe_router_wave_topk = false;
                 moe_grouped_decode_router = false;
-                moe_reuse_router_q8_hidden = false;
             }
 
             const char *moe_device_routed_decode_env = std::getenv("LLAMINAR_ROCM_MOE_DEVICE_ROUTED_DECODE");

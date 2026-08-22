@@ -179,7 +179,7 @@ TEST(Test__OrchestrationRunnerMoEOverlayPlan, KeepsExplicitPlacementsFrozen)
         MoEOverlayAuthorityExecutionKind::Unresolved);
     EXPECT_EQ(
         frozen_plan->authority_execution,
-        MoEOverlayAuthorityExecutionKind::HostCoordinated);
+        MoEOverlayAuthorityExecutionKind::HostResident);
     ASSERT_EQ(frozen_plan->placements.size(), 3u);
     EXPECT_EQ(frozen_plan->placements[0].routed_expert_tier,
               (std::vector<int>{0, 1, 0, 1, 0, 1}));
@@ -199,7 +199,7 @@ TEST(Test__OrchestrationRunnerMoEOverlayPlan,
     ASSERT_EQ(rank.world_rank, 1);
     EXPECT_EQ(rank.role, OverlayRankRole::CpuFallbackParticipant);
     EXPECT_TRUE(rank.hasRole(OverlayRankRole::CpuFallbackParticipant));
-    EXPECT_FALSE(rank.builds_root_graph);
+    EXPECT_FALSE(rank.ownsContinuationGraph());
 
     EXPECT_TRUE(rank.loads_expert_weights);
     EXPECT_FALSE(rank.local_devices.empty());

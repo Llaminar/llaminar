@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "ExpertWeightFormat.h"
 #include "ExpertTierWeightStream.h"
 #include "GPUExpertTransfer.h"
 #include "MoEOverlayDistributedResidencyProtocol.h"
@@ -37,6 +38,7 @@ namespace llaminar2
     {
         CpuNativeVnniInterleaved = 1, ///< Final CPU execution units.
         GpuSeparatedNativeVnni = 2,   ///< Payload/scales/mins/emins blobs.
+        GpuContiguousFloating = 3,    ///< One raw FP16/BF16/FP32 matrix blob.
     };
 
     /**
@@ -86,14 +88,16 @@ namespace llaminar2
     struct MoEOverlayRemoteProjectionManifest
     {
         static constexpr std::uint32_t kMagic = 0x50524F4Du; // "MORP"
-        static constexpr std::uint16_t kABIVersion = 1u;
+        static constexpr std::uint16_t kABIVersion = 2u;
         static constexpr std::size_t kWireBytes = 184u;
 
         std::uint32_t magic = kMagic;
         std::uint16_t abi_version = kABIVersion;
         MoEOverlayRemoteProjectionPacking packing =
             MoEOverlayRemoteProjectionPacking::CpuNativeVnniInterleaved;
-        std::uint8_t reserved_protocol = 0;
+        /** Mathematical representation family carried by this manifest. */
+        ExpertWeightFormatKind format_kind =
+            ExpertWeightFormatKind::Invalid;
         MoEOverlayRemoteProjectionIdentity identity;
 
         // Geometry is shared by CPU and GPU representations.
@@ -152,6 +156,13 @@ namespace llaminar2
             return packing == MoEOverlayRemoteProjectionPacking::
                                   GpuSeparatedNativeVnni;
         }
+
+        /** @return Whether region zero is one contiguous floating GPU matrix. */
+        [[nodiscard]] bool carriesGpuFloatingBytes() const noexcept
+        {
+            return packing == MoEOverlayRemoteProjectionPacking::
+                                  GpuContiguousFloating;
+        }
     };
 
     /**
@@ -193,6 +204,19 @@ namespace llaminar2
         const MoEOverlayRemoteProjectionIdentity &identity,
         const GpuExpertPackedDescriptor &source,
         NativeVnniSourceIdentity source_identity,
+        std::uint32_t maximum_chunk_bytes);
+
+    /**
+     * @brief Construct a byte-preserving contiguous floating GPU manifest.
+     * @param identity Exact cross-rank transaction/projection identity.
+     * @param source Live FP16, BF16, or FP32 matrix retained by its GEMM.
+     * @param maximum_chunk_bytes Persistent network staging capacity.
+     * @return Authenticated one-region raw floating blob contract.
+     */
+    [[nodiscard]] MoEOverlayRemoteProjectionManifest
+    makeMoEOverlayRemoteGpuFloatingProjectionManifest(
+        const MoEOverlayRemoteProjectionIdentity &identity,
+        const ContiguousFloatingPointWeightDescriptor &source,
         std::uint32_t maximum_chunk_bytes);
 
     /**

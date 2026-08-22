@@ -53,6 +53,50 @@ namespace llaminar2::detail
                    static_cast<int>(hipSuccess);
     }
 
+    bool prepareDirectPeerAccessROCmBackend(
+        const DeviceId &source,
+        const DeviceId &destination) noexcept
+    {
+        if (!source.is_rocm() || !destination.is_rocm() ||
+            source == destination)
+        {
+            return source == destination && source.is_rocm();
+        }
+
+        int original_device = -1;
+        if (hipGetDevice(&original_device) != hipSuccess)
+            return false;
+
+        const int source_ordinal = source.rocm_ordinal();
+        const int destination_ordinal = destination.rocm_ordinal();
+        bool prepared = false;
+        if (HipDeviceGuard::forceSetDevice(destination_ordinal) ==
+            static_cast<int>(hipSuccess))
+        {
+            int can_access = 0;
+            const hipError_t query = hipDeviceCanAccessPeer(
+                &can_access,
+                destination_ordinal,
+                source_ordinal);
+            if (query == hipSuccess && can_access != 0)
+            {
+                const hipError_t enable =
+                    hipDeviceEnablePeerAccess(source_ordinal, 0);
+                prepared = enable == hipSuccess ||
+                           enable == hipErrorPeerAccessAlreadyEnabled;
+            }
+        }
+
+        if (!restoreROCmDeviceOrdinal(original_device))
+        {
+            LOG_ERROR("[GPUExpertTransfer] Could not restore ROCm device "
+                      << original_device
+                      << " after direct-peer setup");
+            return false;
+        }
+        return prepared;
+    }
+
     bool transferExpertROCmBackend(
         const GPUExpertPointers &src_ptrs,
         const GPUExpertPointers &dst_ptrs,

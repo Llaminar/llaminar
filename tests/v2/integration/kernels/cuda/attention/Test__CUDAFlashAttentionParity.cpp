@@ -8715,6 +8715,169 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FusedQ81_HeadDim128_Parity)
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 }
 
+/**
+ * @brief Direct native FP16 ring attention is byte-identical to contiguous K/V.
+ *
+ * The production path passes the cache's physical allocation plus canonical
+ * device head/count metadata directly to FlashAttention. This regression
+ * crosses the ring boundary and compares both decode and suffix-prefill with
+ * the same kernel over a contiguous logical copy. Exact equality proves that
+ * removing the O(context) gather preserves arithmetic order.
+ */
+TEST_F(Test__CUDAFlashAttentionParity, NativeFP16RingWrappedDecodeAndPrefillAreByteExact)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int capacity = 64;
+    constexpr int kv_len = 37;
+    constexpr int ring_origin = 53;
+    constexpr int n_heads = 8;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr size_t kv_cols =
+        static_cast<size_t>(n_kv_heads) * head_dim;
+    constexpr size_t q_cols =
+        static_cast<size_t>(n_heads) * head_dim;
+
+    const auto logical_k_fp32 = randomFP32(
+        static_cast<size_t>(kv_len) * kv_cols);
+    const auto logical_v_fp32 = randomFP32(
+        static_cast<size_t>(kv_len) * kv_cols);
+    std::vector<uint16_t> logical_k(logical_k_fp32.size());
+    std::vector<uint16_t> logical_v(logical_v_fp32.size());
+    std::vector<uint16_t> physical_k(
+        static_cast<size_t>(capacity) * kv_cols, 0);
+    std::vector<uint16_t> physical_v(
+        static_cast<size_t>(capacity) * kv_cols, 0);
+    for (size_t element = 0; element < logical_k.size(); ++element)
+    {
+        logical_k[element] = fp32_to_fp16(logical_k_fp32[element]);
+        logical_v[element] = fp32_to_fp16(logical_v_fp32[element]);
+    }
+    for (int logical_row = 0; logical_row < kv_len; ++logical_row)
+    {
+        const int physical_row =
+            (ring_origin + logical_row) % capacity;
+        std::copy_n(
+            logical_k.data() + static_cast<size_t>(logical_row) * kv_cols,
+            kv_cols,
+            physical_k.data() + static_cast<size_t>(physical_row) * kv_cols);
+        std::copy_n(
+            logical_v.data() + static_cast<size_t>(logical_row) * kv_cols,
+            kv_cols,
+            physical_v.data() + static_cast<size_t>(physical_row) * kv_cols);
+    }
+
+    FP16Tensor contiguous_k(
+        {static_cast<size_t>(kv_len), kv_cols}, logical_k);
+    FP16Tensor contiguous_v(
+        {static_cast<size_t>(kv_len), kv_cols}, logical_v);
+    FP16Tensor ring_k(
+        {static_cast<size_t>(capacity), kv_cols}, physical_k);
+    FP16Tensor ring_v(
+        {static_cast<size_t>(capacity), kv_cols}, physical_v);
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+        cudaSuccess);
+    auto &transfer = TransferEngine::instance();
+    ASSERT_TRUE(transfer.uploadFull(&contiguous_k, gpu_device_, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&contiguous_v, gpu_device_, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&ring_k, gpu_device_, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&ring_v, gpu_device_, stream).success);
+
+    int *device_count = nullptr;
+    int *device_head = nullptr;
+    const int ring_head = (ring_origin + kv_len) % capacity;
+    ASSERT_EQ(cudaMalloc(&device_count, sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&device_head, sizeof(int)), cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            device_count, &kv_len, sizeof(int),
+            cudaMemcpyHostToDevice, stream),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemcpyAsync(
+            device_head, &ring_head, sizeof(int),
+            cudaMemcpyHostToDevice, stream),
+        cudaSuccess);
+
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32>
+        kernel(cuda_ordinal_);
+    auto workspace = bindAttentionWorkspace(
+        kernel, n_heads, head_dim, stream);
+    ASSERT_NE(workspace, nullptr);
+
+    for (const int seq_len : {1, 7})
+    {
+        const auto query = randomFP32(
+            static_cast<size_t>(seq_len) * q_cols);
+        FP32Tensor q_tensor({static_cast<size_t>(seq_len), q_cols});
+        FP32Tensor ring_output({static_cast<size_t>(seq_len), q_cols});
+        FP32Tensor contiguous_output({static_cast<size_t>(seq_len), q_cols});
+        std::copy(query.begin(), query.end(), q_tensor.mutable_data());
+        ASSERT_TRUE(transfer.uploadFull(&q_tensor, gpu_device_, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(&ring_output, gpu_device_, stream).success);
+        ASSERT_TRUE(transfer.uploadFull(&contiguous_output, gpu_device_, stream).success);
+
+        ASSERT_TRUE(kernel.prepareDynamicAttnParamsFromDeviceSequenceState(
+            device_count,
+            seq_len,
+            /*query_rows=*/1,
+            stream,
+            capacity,
+            /*active_query_rows_device=*/nullptr,
+            /*prefill_capture=*/{},
+            device_head,
+            capacity));
+        ASSERT_TRUE(kernel.compute_tensor(
+            &q_tensor, &ring_k, &ring_v, &ring_output,
+            /*batch_size=*/1, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            /*causal=*/true, /*window_size=*/-1,
+            nullptr, nullptr, &mpi_ctx_, cuda_ordinal_));
+
+        ASSERT_TRUE(kernel.prepareDynamicAttnParams(
+            kv_len, kv_len - seq_len, /*query_rows=*/1, stream));
+        ASSERT_TRUE(kernel.compute_tensor(
+            &q_tensor, &contiguous_k, &contiguous_v, &contiguous_output,
+            /*batch_size=*/1, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            /*causal=*/true, /*window_size=*/-1,
+            nullptr, nullptr, &mpi_ctx_, cuda_ordinal_));
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+        const size_t output_bytes =
+            static_cast<size_t>(seq_len) * q_cols * sizeof(float);
+        std::vector<float> ring_result(
+            static_cast<size_t>(seq_len) * q_cols);
+        std::vector<float> contiguous_result(ring_result.size());
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                ring_result.data(), ring_output.gpu_data_ptr(), output_bytes,
+                cudaMemcpyDeviceToHost, stream),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                contiguous_result.data(),
+                contiguous_output.gpu_data_ptr(), output_bytes,
+                cudaMemcpyDeviceToHost, stream),
+            cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_EQ(
+            std::memcmp(
+                ring_result.data(), contiguous_result.data(), output_bytes),
+            0)
+            << "direct wrapped ring changed CUDA attention bytes for seq_len="
+            << seq_len;
+    }
+
+    EXPECT_EQ(cudaFree(device_count), cudaSuccess);
+    EXPECT_EQ(cudaFree(device_head), cudaSuccess);
+    EXPECT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+}
+
 #else // !HAVE_CUDA
 
 TEST_F(Test__CUDAFlashAttentionParity, SkipWithoutCUDA)

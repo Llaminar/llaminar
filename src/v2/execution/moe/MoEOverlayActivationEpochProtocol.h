@@ -86,6 +86,7 @@ namespace llaminar2
         std::uint64_t dispatch_live_rows = 0u;
         std::uint64_t return_live_rows = 0u;
         std::uint64_t dispatch_live_entries = 0u;
+        std::uint64_t return_live_entries = 0u;
         std::uint64_t dispatch_stage_count = 0u;
         std::uint64_t return_stage_count = 0u;
     };
@@ -179,7 +180,9 @@ namespace llaminar2
 
         /**
          * @brief Follower publication of the exact stage's compact return packet.
-         * @param payload_bytes Return rows only; must be positive.
+         * @param payload_bytes Compact dense-row bytes; zero only for an empty
+         *        dispatch. Device-owned canonical-route publishers write their
+         *        entry geometry directly into the shared ABI.
          */
         bool publishReturn(
             const MoEOverlayActivationEpochIdentity &identity,

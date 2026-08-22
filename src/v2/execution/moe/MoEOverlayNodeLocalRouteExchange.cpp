@@ -220,7 +220,8 @@ namespace llaminar2
         {
             if (!sameEndpoints(endpoints_, endpoints) ||
                 root_participant_ != root_participant ||
-                route_capacity_ != route_capacity || d_model_ != d_model)
+                route_capacity_ != route_capacity || max_rows_ != max_rows ||
+                d_model_ != d_model)
             {
                 throw std::logic_error(
                     "node-local route exchange cannot change topology or capacity after materialization");
@@ -266,6 +267,41 @@ namespace llaminar2
                 layouts.size(), payload_bytes, "root staging offset");
             layouts.push_back(layout);
         }
+
+        /*
+         * Route publication is many producers to one root; continuation
+         * publication is the inverse. Keep a single dense payload bank and one
+         * cache-line acknowledgement per non-root endpoint so the root performs
+         * exactly one D2H transfer regardless of LocalTP degree. The root may
+         * overwrite that bank only after every peer has acknowledged the prior
+         * epoch on device.
+         */
+        cursor = checkedAlignUp(cursor, kPageBytes);
+        const std::size_t dense_control_offset = cursor;
+        cursor = checkedAdd(
+            cursor,
+            sizeof(MoENodeLocalDensePublicationControl),
+            "dense publication control");
+        cursor = checkedAlignUp(cursor, kCacheLineBytes);
+        const std::size_t dense_peers_offset = cursor;
+        const std::size_t dense_peers_bytes = checkedMultiply(
+            layouts.size(),
+            sizeof(MoENodeLocalDensePublicationPeer),
+            "dense publication peer acknowledgements");
+        cursor = checkedAdd(
+            cursor, dense_peers_bytes, "dense publication peer layout");
+        cursor = checkedAlignUp(cursor, kPageBytes);
+        const std::size_t dense_payload_offset = cursor;
+        const std::size_t dense_element_capacity = checkedMultiply(
+            static_cast<std::size_t>(max_rows),
+            static_cast<std::size_t>(d_model),
+            "dense publication elements");
+        const std::size_t dense_payload_bytes = checkedMultiply(
+            dense_element_capacity,
+            sizeof(float),
+            "dense publication payload bytes");
+        cursor = checkedAdd(
+            cursor, dense_payload_bytes, "dense publication payload layout");
         const std::size_t mapping_bytes = checkedAlignUp(cursor, kPageBytes);
 
         void *const mapping = ::mmap(
@@ -329,12 +365,40 @@ namespace llaminar2
             };
         }
 
+        auto *const dense_control =
+            static_cast<MoENodeLocalDensePublicationControl *>(
+                region->mutableHostData(dense_control_offset));
+        *dense_control = MoENodeLocalDensePublicationControl{
+            .peer_count = static_cast<std::uint32_t>(layouts.size()),
+            .d_model = d_model,
+            .element_capacity = dense_element_capacity,
+        };
+        for (std::size_t peer_index = 0u;
+             peer_index < layouts.size();
+             ++peer_index)
+        {
+            auto *const peer =
+                static_cast<MoENodeLocalDensePublicationPeer *>(
+                    region->mutableHostData(
+                        dense_peers_offset +
+                        peer_index *
+                            sizeof(MoENodeLocalDensePublicationPeer)));
+            *peer = MoENodeLocalDensePublicationPeer{
+                .participant_id = layouts[peer_index].producer_participant,
+            };
+        }
+
         endpoints_ = std::move(endpoints);
         lanes_ = std::move(layouts);
         root_participant_ = root_participant;
         route_capacity_ = route_capacity;
+        max_rows_ = max_rows;
         d_model_ = d_model;
         mapping_bytes_ = mapping_bytes;
+        dense_publication_control_offset_ = dense_control_offset;
+        dense_publication_peers_offset_ = dense_peers_offset;
+        dense_publication_payload_offset_ = dense_payload_offset;
+        dense_publication_element_capacity_ = dense_element_capacity;
         mapping_lifetime_ = std::move(lifetime);
         mapped_region_ = std::move(region);
         root_staging_ = std::move(root_staging);
@@ -352,7 +416,9 @@ namespace llaminar2
              {"route_capacity", std::to_string(route_capacity_)},
              {"d_model", std::to_string(d_model_)},
              {"root_staging_bytes",
-              std::to_string(root_staging_bytes)}});
+              std::to_string(root_staging_bytes)},
+             {"dense_publication_bytes",
+              std::to_string(dense_payload_bytes)}});
     }
 
     bool MoEOverlayNodeLocalRouteExchange::materialized() const noexcept
@@ -377,6 +443,12 @@ namespace llaminar2
     {
         std::lock_guard lock(mutex_);
         return d_model_;
+    }
+
+    std::uint32_t MoEOverlayNodeLocalRouteExchange::maxRows() const noexcept
+    {
+        std::lock_guard lock(mutex_);
+        return max_rows_;
     }
 
     MoENodeLocalRoutePeerDeviceBinding
@@ -469,6 +541,112 @@ namespace llaminar2
         return result;
     }
 
+    MoENodeLocalDensePublicationDeviceBinding
+    MoEOverlayNodeLocalRouteExchange::densePublicationBinding(
+        DeviceId device) const
+    {
+        std::lock_guard lock(mutex_);
+        if (!materialized_ || !mapped_region_ ||
+            !mapped_region_->hasDevice(device))
+        {
+            throw std::logic_error(
+                "dense continuation publication binding requested before complete materialization");
+        }
+
+        const auto endpoint = std::find_if(
+            endpoints_.begin(), endpoints_.end(),
+            [device](const MoENodeLocalRouteEndpoint &candidate)
+            {
+                return candidate.device == device;
+            });
+        if (endpoint == endpoints_.end())
+        {
+            throw std::logic_error(
+                "dense continuation publication has no endpoint for " +
+                device.toString());
+        }
+
+        auto *const peers =
+            static_cast<MoENodeLocalDensePublicationPeer *>(
+                mapped_region_->deviceAlias(
+                    device, dense_publication_peers_offset_));
+        MoENodeLocalDensePublicationPeer *local_peer = nullptr;
+        const bool is_root = device == config_.root_device;
+        if (!is_root)
+        {
+            const auto lane = std::find_if(
+                lanes_.begin(), lanes_.end(),
+                [device](const LaneLayout &candidate)
+                {
+                    return candidate.producer_device == device;
+                });
+            if (lane == lanes_.end())
+            {
+                throw std::logic_error(
+                    "dense continuation publication peer has no acknowledgement lane");
+            }
+            const std::size_t peer_index = static_cast<std::size_t>(
+                std::distance(lanes_.begin(), lane));
+            local_peer = peers + peer_index;
+        }
+
+        MoENodeLocalDensePublicationDeviceBinding binding{
+            .control =
+                static_cast<MoENodeLocalDensePublicationControl *>(
+                    mapped_region_->deviceAlias(
+                        device, dense_publication_control_offset_)),
+            .peers = peers,
+            .local_peer = local_peer,
+            .payload = static_cast<float *>(
+                mapped_region_->deviceAlias(
+                    device, dense_publication_payload_offset_)),
+            .participant_id = endpoint->participant_id,
+            .root_participant = root_participant_,
+            .peer_count = static_cast<std::uint32_t>(lanes_.size()),
+            .element_capacity = dense_publication_element_capacity_,
+            .role = is_root
+                        ? MoENodeLocalDensePublicationRole::RootProducer
+                        : MoENodeLocalDensePublicationRole::PeerConsumer,
+        };
+        if (!binding.valid())
+        {
+            throw std::logic_error(
+                "dense continuation publication produced an incomplete device binding");
+        }
+        return binding;
+    }
+
+    std::shared_ptr<const MappedHostTransferRegion>
+    MoEOverlayNodeLocalRouteExchange::mappedRegion() const
+    {
+        std::lock_guard lock(mutex_);
+        if (!materialized_ || !mapped_region_)
+        {
+            throw std::logic_error(
+                "node-local exchange mapped region requested before materialization");
+        }
+        return mapped_region_;
+    }
+
+    std::size_t
+    MoEOverlayNodeLocalRouteExchange::densePublicationPayloadOffset() const
+    {
+        std::lock_guard lock(mutex_);
+        if (!materialized_)
+        {
+            throw std::logic_error(
+                "dense publication payload offset requested before materialization");
+        }
+        return dense_publication_payload_offset_;
+    }
+
+    std::size_t
+    MoEOverlayNodeLocalRouteExchange::densePublicationElementCapacity() const
+    {
+        std::lock_guard lock(mutex_);
+        return dense_publication_element_capacity_;
+    }
+
     std::vector<MoENodeLocalRouteEndpoint>
     MoEOverlayNodeLocalRouteExchange::endpoints() const
     {
@@ -485,10 +663,13 @@ namespace llaminar2
             << " root_participant=" << root_participant_
             << " materialized=" << (materialized_ ? "true" : "false")
             << " route_capacity=" << route_capacity_
+            << " max_rows=" << max_rows_
             << " d_model=" << d_model_
             << " mapping_bytes=" << mapping_bytes_
             << " root_staging_bytes="
             << (root_staging_ ? root_staging_->sizeBytes() : 0u)
+            << " dense_publication_elements="
+            << dense_publication_element_capacity_
             << " endpoints=[";
         for (std::size_t index = 0u; index < endpoints_.size(); ++index)
         {
@@ -532,6 +713,40 @@ namespace llaminar2
                     kMoENodeLocalRouteExchangeAbortEpoch,
                     std::memory_order_release);
                 std::atomic_ref<std::uint64_t>(control->consumed_epoch).store(
+                    kMoENodeLocalRouteExchangeAbortEpoch,
+                    std::memory_order_release);
+            }
+
+            auto *const dense_control =
+                static_cast<MoENodeLocalDensePublicationControl *>(
+                    mapped_region_->mutableHostData(
+                        dense_publication_control_offset_));
+            std::atomic_ref<std::uint32_t>(dense_control->code).store(
+                static_cast<std::uint32_t>(
+                    MoENodeLocalDensePublicationCode::PeerAborted),
+                std::memory_order_release);
+            std::atomic_ref<std::uint32_t>(dense_control->state).store(
+                static_cast<std::uint32_t>(
+                    MoENodeLocalDensePublicationState::Aborted),
+                std::memory_order_release);
+            std::atomic_ref<std::uint64_t>(dense_control->produced_epoch).store(
+                kMoENodeLocalRouteExchangeAbortEpoch,
+                std::memory_order_release);
+            for (std::size_t peer_index = 0u;
+                 peer_index < lanes_.size();
+                 ++peer_index)
+            {
+                auto *const peer =
+                    static_cast<MoENodeLocalDensePublicationPeer *>(
+                        mapped_region_->mutableHostData(
+                            dense_publication_peers_offset_ +
+                            peer_index *
+                                sizeof(MoENodeLocalDensePublicationPeer)));
+                std::atomic_ref<std::uint32_t>(peer->state).store(
+                    static_cast<std::uint32_t>(
+                        MoENodeLocalDensePublicationState::Aborted),
+                    std::memory_order_release);
+                std::atomic_ref<std::uint64_t>(peer->consumed_epoch).store(
                     kMoENodeLocalRouteExchangeAbortEpoch,
                     std::memory_order_release);
             }

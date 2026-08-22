@@ -37,10 +37,14 @@ namespace llaminar2
         std::uint64_t stage_consensus_ready = 0;
         std::uint64_t stage_consensus_deferred = 0;
         std::uint64_t stage_consensus_failed = 0;
-        std::uint64_t commit_consensus_started = 0;
-        std::uint64_t commit_consensus_ready = 0;
-        std::uint64_t commit_consensus_failed = 0;
-        std::uint64_t local_commit_begin_failed = 0;
+        std::uint64_t preparation_consensus_started = 0;
+        std::uint64_t preparation_consensus_ready = 0;
+        std::uint64_t preparation_consensus_failed = 0;
+        std::uint64_t local_preparation_begin_failed = 0;
+        std::uint64_t publication_consensus_started = 0;
+        std::uint64_t publication_consensus_ready = 0;
+        std::uint64_t publication_consensus_failed = 0;
+        std::uint64_t local_publication_begin_failed = 0;
         std::uint64_t retirement_consensus_started = 0;
         std::uint64_t retirement_consensus_ready = 0;
         std::uint64_t retirement_consensus_failed = 0;
@@ -56,8 +60,9 @@ namespace llaminar2
      *
      * Even a locally deferred or failed start is represented by an owned wave:
      * its first poll contributes that terminal stage vote and waits for the
-     * all-rank result. A local commit-enqueue failure similarly becomes a commit
-     * vote instead of returning early and stranding peers in their collective.
+     * all-rank result. A local preparation or publication enqueue failure
+     * similarly becomes its typed phase vote instead of returning early and
+     * stranding peers in their collective.
      */
     class MoEOverlayDistributedResidencyTransport final
         : public IMoEOverlayResidencyTransport

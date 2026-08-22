@@ -25,11 +25,11 @@ Author: David Sanftenberg
 """
 
 from pathlib import Path
-from typing import Dict, Tuple, Any, Optional, Union
+from typing import Callable, Dict, Tuple, Any, Iterator, Optional, Union
 import os
 import re
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import numpy as np
 
@@ -313,6 +313,121 @@ class GGUFLoader:
             
             return state_dict
             
+        finally:
+            if close_parser:
+                parser.close()
+
+    def iter_state_dict(
+        self,
+        parser: Optional[GGUFParser] = None,
+        *,
+        as_torch: bool = True,
+        show_progress: Optional[bool] = None,
+        max_in_flight: int = 4,
+        include_mapped_name: Optional[Callable[[str], bool]] = None,
+    ) -> Iterator[Tuple[str, Any]]:
+        """Yield mapped, dequantized tensors with bounded temporary memory.
+
+        Large MoE checkpoints cannot materialize both a complete FP32 state
+        dictionary and a complete Hugging Face model. This iterator keeps at
+        most ``max_in_flight`` dequantizations alive so a caller can publish
+        each tensor directly into its final parameter allocation. Tensor order
+        is intentionally unspecified; every yielded name remains unique.
+
+        Args:
+            parser: Optional already-parsed aggregate GGUF parser.
+            as_torch: Convert arrays to ``torch.Tensor`` when true.
+            show_progress: Print a short dequantization summary.
+            max_in_flight: Strict bound on submitted-but-unconsumed tensors.
+            include_mapped_name: Optional predicate evaluated after name mapping
+                but before reading or dequantizing tensor bytes. This is used
+                by graph-external reference components which deliberately own
+                only a small, typed subset of a very large checkpoint.
+
+        Yields:
+            ``(mapped_name, tensor)`` pairs.
+        """
+        if max_in_flight < 1:
+            raise ValueError("max_in_flight must be positive")
+        if show_progress is None:
+            show_progress = self.verbose
+
+        close_parser = parser is None
+        if parser is None:
+            parser = GGUFParser(str(self.file_path))
+            parser.parse()
+
+        mapper = create_mapper_from_metadata(parser.metadata)
+        model_type = parser.get_model_type()
+        n_workers = min(os.cpu_count() or 4, 16, max_in_flight)
+
+        def process_tensor(tensor_info, mapped_name):
+            raw = parser.read_tensor_data(tensor_info)
+            fp32 = dequantize.dequantize(
+                raw, tensor_info.type, tensor_info.shape
+            )
+            if not fp32.flags.writeable:
+                fp32 = fp32.copy()
+            if isinstance(raw, memoryview):
+                raw.release()
+
+            if as_torch:
+                if not HAS_TORCH:
+                    raise RuntimeError(
+                        "PyTorch not available but as_torch=True"
+                    )
+                tensor = torch.from_numpy(fp32)
+                if model_type in ("qwen35", "qwen35moe"):
+                    tensor = self._apply_qwen35_transforms(
+                        tensor,
+                        tensor_info.name,
+                        mapped_name,
+                        metadata=parser.metadata,
+                    )
+            else:
+                tensor = fp32
+            return mapped_name, tensor
+
+        if show_progress:
+            print(
+                f"  Streaming {len(parser.tensors)} tensors with "
+                f"{n_workers} bounded workers..."
+            )
+
+        tensor_iterator = iter(parser.tensors)
+        try:
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                pending = set()
+
+                def submit_one() -> bool:
+                    while True:
+                        try:
+                            tensor_info = next(tensor_iterator)
+                        except StopIteration:
+                            return False
+                        mapped_name = mapper.map_name(tensor_info.name)
+                        if (
+                            include_mapped_name is None
+                            or include_mapped_name(mapped_name)
+                        ):
+                            pending.add(
+                                executor.submit(
+                                    process_tensor, tensor_info, mapped_name
+                                )
+                            )
+                            return True
+
+                for _ in range(max_in_flight):
+                    if not submit_one():
+                        break
+
+                while pending:
+                    completed, pending = wait(
+                        pending, return_when=FIRST_COMPLETED
+                    )
+                    for future in completed:
+                        yield future.result()
+                        submit_one()
         finally:
             if close_parser:
                 parser.close()

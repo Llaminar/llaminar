@@ -1942,7 +1942,7 @@ namespace
         {
             return uses_device_side_moe_rebalance_controller_
                        ? MoEOverlayAuthorityExecutionKind::
-                             HomogeneousDeviceResident
+                             DeviceResident
                        : MoEOverlayAuthorityExecutionKind::Unresolved;
         }
 
@@ -1959,8 +1959,10 @@ namespace
          * lifecycle edge without performing GPU work, allowing the unit test to
          * prove publication happens before the resident sidecar is launched.
          */
-        bool maybeApplyDecodeBoundaryMaintenance() override
+        bool maybeApplyDecodeBoundaryMaintenance(
+            uint64_t committed_tokens) override
         {
+            device_moe_maintenance_tokens_ += committed_tokens;
             ++device_moe_maintenance_count_;
             if (uses_device_side_moe_rebalance_controller_)
                 publication_events_.push_back("device_moe_maintenance");
@@ -4870,6 +4872,49 @@ namespace
             return true;
         }
 
+        /**
+         * @brief Open the mock's terminal hosted branch without GPU work.
+         *
+         * The production rank scheduler uses the begin/fragment/finish
+         * protocol so every LocalTP participant submits each sparse fragment
+         * symmetrically. This mock publishes only terminal tickets, so its
+         * selected branch contains no fragments and finish performs the same
+         * terminal publication modeled by the legacy aggregate helper above.
+         */
+        bool beginHostScheduledDeviceGenerationAdvance(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket,
+            size_t *out_fragment_count) override
+        {
+            if (!out_fragment_count || hosted_generation_advance_active_ ||
+                ticket.complete != 1 || ticket.maintenance_due != 0 ||
+                !ticket.hasSameDispatchDecision(
+                    last_device_generation_dispatch_ticket_))
+            {
+                return false;
+            }
+            *out_fragment_count = 0u;
+            hosted_generation_advance_active_ = true;
+            return true;
+        }
+
+        /** @brief Reject fragments because a terminal mock ticket selects none. */
+        bool submitHostScheduledDeviceGenerationFragment(
+            const sampling_math::DeviceGenerationDispatchTicket &,
+            size_t) override
+        {
+            return false;
+        }
+
+        /** @brief Publish the terminal mock result after the empty branch. */
+        bool finishHostScheduledDeviceGenerationAdvance(
+            const sampling_math::DeviceGenerationDispatchTicket &ticket) override
+        {
+            if (!hosted_generation_advance_active_)
+                return false;
+            hosted_generation_advance_active_ = false;
+            return submitHostScheduledDeviceGenerationAdvance(ticket);
+        }
+
         bool finishDeviceResidentGeneration(
             DeviceGenerationTerminalResult *out_result) override
         {
@@ -5868,6 +5913,10 @@ namespace
         {
             return device_moe_maintenance_count_;
         }
+        uint64_t deviceMoEMaintenanceTokens() const
+        {
+            return device_moe_maintenance_tokens_;
+        }
         int deviceGenerationAdmissionCount() const
         {
             return device_generation_admission_count_;
@@ -6739,6 +6788,7 @@ namespace
         int forward_mtp_from_resident_logical_state_for_device_sampling_count_{0};
         int resident_sidecar_count_at_last_host_bridge_{-1};
         int device_moe_maintenance_count_{0};
+        uint64_t device_moe_maintenance_tokens_{0u};
         int device_generation_admission_count_{0};
         int last_device_generation_request_count_{0};
         int last_device_generation_max_new_tokens_{0};
@@ -6767,6 +6817,7 @@ namespace
         bool device_resident_generation_sequence_enabled_{false};
         bool device_generation_controller_owned_outcomes_{false};
         bool device_generation_admitted_{false};
+        bool hosted_generation_advance_active_{false};
         bool device_generation_materialized_{false};
         bool device_generation_launched_{false};
         int all_position_verifier_sync_deferral_set_count_{0};
@@ -8993,6 +9044,9 @@ namespace
         GenerationResult first_forced = runner->forceDecodeToken(2);
         ASSERT_TRUE(first_forced.success()) << first_forced.error;
         EXPECT_THAT(first_forced.tokens, ElementsAre(2));
+        EXPECT_EQ(
+            first_forced.returned_token_commit,
+            ReturnedTokenCommitState::Pending);
         EXPECT_EQ(mock->forwardCallCount(), 1)
             << "Ready logits should let the first forced token avoid a main forward.";
         EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
@@ -9003,6 +9057,9 @@ namespace
         GenerationResult second_forced = runner->forceDecodeToken(4);
         ASSERT_TRUE(second_forced.success()) << second_forced.error;
         EXPECT_THAT(second_forced.tokens, ElementsAre(4));
+        EXPECT_EQ(
+            second_forced.returned_token_commit,
+            ReturnedTokenCommitState::Pending);
         EXPECT_EQ(mock->forwardCallCount(), 2)
             << "The second forced token must first append the previous one.";
         EXPECT_THAT(mock->lastForwardTokens(), ElementsAre(2));
@@ -9041,6 +9098,9 @@ namespace
         const GenerationResult first_forced = runner->forceDecodeToken(2);
         ASSERT_TRUE(first_forced.success()) << first_forced.error;
         EXPECT_THAT(first_forced.tokens, ElementsAre(2));
+        EXPECT_EQ(
+            first_forced.returned_token_commit,
+            ReturnedTokenCommitState::Committed);
         EXPECT_EQ(mock->stageStochasticTargetTokenCount(), 1);
         EXPECT_THAT(mock->lastStagedStochasticTargetTokens(), ElementsAre(2));
         EXPECT_THAT(mock->lastStagedStochasticTargetSlots(), ElementsAre(0));
@@ -9055,6 +9115,9 @@ namespace
         const GenerationResult second_forced = runner->forceDecodeToken(4);
         ASSERT_TRUE(second_forced.success()) << second_forced.error;
         EXPECT_THAT(second_forced.tokens, ElementsAre(4));
+        EXPECT_EQ(
+            second_forced.returned_token_commit,
+            ReturnedTokenCommitState::Committed);
         EXPECT_EQ(mock->stageStochasticTargetTokenCount(), 2);
         EXPECT_THAT(mock->lastStagedStochasticTargetTokens(), ElementsAre(2, 4));
         EXPECT_THAT(mock->lastStagedStochasticTargetSlots(), ElementsAre(0, 0));
@@ -9095,6 +9158,9 @@ namespace
         ASSERT_TRUE(forced_stop.success()) << forced_stop.error;
         EXPECT_TRUE(forced_stop.is_complete);
         EXPECT_THAT(forced_stop.tokens, ElementsAre(2));
+        EXPECT_EQ(
+            forced_stop.returned_token_commit,
+            ReturnedTokenCommitState::NoModelRow);
         EXPECT_EQ(mock->stageStochasticTargetTokenCount(), 0);
         EXPECT_EQ(mock->deviceTargetShiftedCommitCount(), 0);
         EXPECT_EQ(mock->prepareMTPVerifierInputTokensDeviceFirstCount(), 0);
@@ -12851,7 +12917,7 @@ namespace
                                 "device_moe_maintenance"))
             << "placement maintenance must publish before the retained generation parent is launched";
         EXPECT_EQ(mock->deviceMoEMaintenanceCount(), 1);
-        ASSERT_TRUE(runner->maybeApplyMoERebalance())
+        ASSERT_TRUE(runner->maybeApplyMoERebalance(1u))
             << "The outer decode boundary must acknowledge maintenance embedded "
                "in the resident graph family.";
         EXPECT_EQ(mock->deviceMoEMaintenanceCount(), 1)
@@ -16618,9 +16684,10 @@ namespace
         ASSERT_THAT(payloads[first_decode_payload],
                     ElementsAre(static_cast<int32_t>(
                         OrchestrationRunner::MPICommand::DECODE_STEP)));
-        ASSERT_THAT(payloads[first_decode_payload + 1], ElementsAre(1))
+        ASSERT_THAT(payloads[first_decode_payload + 1], ElementsAre(1, 0, 0))
             << "the DECODE_STEP command payload must carry the root token "
-               "budget so worker ranks clamp MTP draft depth identically";
+               "budget plus the exact prefill/decode progress sidebands so "
+               "workers clamp MTP depth and retire the same controller epoch";
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPTransactionRejectsUnsafeVerifierPrefillSnapshot)

@@ -733,7 +733,8 @@ namespace llaminar2
                 params_.publish_ticket_completion ||
                 params_.continuation_tp_context ||
                 params_.broadcast_after_scatter || params_.dispatch_output ||
-                params_.release_residency_lease_on_completion)
+                params_.residency_lease_terminal ==
+                    MoEOverlayHostDispatchLeaseTerminal::Release)
             {
                 throw std::invalid_argument(
                     "rank-batch return target cannot own continuation output state");
@@ -882,13 +883,28 @@ namespace llaminar2
             ticket->header->return_logical_row_count = logical_seq_len;
         }
 
-        if (params_.release_residency_lease_on_completion)
+        if (params_.residency_lease_terminal ==
+            MoEOverlayHostDispatchLeaseTerminal::Release)
         {
             if (!params_.dispatch_output ||
                 !params_.dispatch_output->residency_lease ||
                 params_.dispatch_output->residency_epoch == 0)
             {
-                LOG_ERROR("[MoERankBatchReturnReduceStage] Final batch cannot release a missing residency lease");
+                LOG_ERROR(
+                    "[MoERankBatchReturnReduceStage] Final batch cannot "
+                    "release a missing residency lease"
+                    << " dispatch_output="
+                    << static_cast<const void *>(
+                           params_.dispatch_output.get())
+                    << " lease_present="
+                    << (params_.dispatch_output &&
+                        params_.dispatch_output->residency_lease
+                            ? "true"
+                            : "false")
+                    << " epoch="
+                    << (params_.dispatch_output
+                            ? params_.dispatch_output->residency_epoch
+                            : 0));
                 return false;
             }
             const uint64_t epoch = params_.dispatch_output->residency_epoch;
@@ -1067,7 +1083,8 @@ namespace llaminar2
         info.addScalarBool("publish_ticket_completion",
                            params_.publish_ticket_completion);
         info.addScalarBool("release_residency_lease_on_completion",
-                           params_.release_residency_lease_on_completion);
+                           params_.residency_lease_terminal ==
+                               MoEOverlayHostDispatchLeaseTerminal::Release);
         return info;
     }
 

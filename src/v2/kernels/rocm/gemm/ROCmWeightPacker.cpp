@@ -70,10 +70,15 @@ namespace llaminar2
             static std::mutex iq_grid_mutex;
             static std::set<int> iq_grids_initialized_devices;
 
+            // Initialization publishes several translation-unit-local constant
+            // tables as one logical transaction. Keep the lock through the
+            // entire transaction so concurrent graph preparation cannot launch
+            // duplicate asynchronous table copies or observe partial success.
+            std::lock_guard<std::mutex> lock(iq_grid_mutex);
+            if (iq_grids_initialized_devices.find(device_id) !=
+                iq_grids_initialized_devices.end())
             {
-                std::lock_guard<std::mutex> lock(iq_grid_mutex);
-                if (iq_grids_initialized_devices.find(device_id) != iq_grids_initialized_devices.end())
-                    return true;
+                return true;
             }
 
             LOG_DEBUG("[ROCmWeightPacker] Initializing IQ grid LUT tables on device "
@@ -130,7 +135,6 @@ namespace llaminar2
                 return false;
             }
 
-            std::lock_guard<std::mutex> lock(iq_grid_mutex);
             iq_grids_initialized_devices.insert(device_id);
             return true;
 #else

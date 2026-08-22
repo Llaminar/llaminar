@@ -121,6 +121,7 @@ namespace llaminar2
         STOCHASTIC_BATCH_OUTPUT_TOKENS, ///< Reduced stochastic verifier output tokens [request, 5]
         STOCHASTIC_BATCH_OUTPUT_META,   ///< Reduced stochastic verifier metadata [request, 10]
         MTP_FIRST_TRANSACTION_DIAGNOSTIC, ///< Retained device-only stochastic transaction-zero evidence
+        MTP_COMMITTED_VERIFIER_IDENTITY, ///< Last response-visible verifier transaction identity [request, fixed record]
         MTP_GENERATION_RESPONSE_TOKENS, ///< Persistent device-owned response ledger [request, max_seq_len]
         MTP_GENERATION_CONTROL,         ///< Persistent device-owned generation controller [request, control_words]
         MTP_GENERATION_DISPATCH_TICKETS, ///< Narrow immutable HIP scheduler snapshots [request, ticket_words]
@@ -310,6 +311,8 @@ namespace llaminar2
             return "STOCHASTIC_BATCH_OUTPUT_META";
         case BufferId::MTP_FIRST_TRANSACTION_DIAGNOSTIC:
             return "MTP_FIRST_TRANSACTION_DIAGNOSTIC";
+        case BufferId::MTP_COMMITTED_VERIFIER_IDENTITY:
+            return "MTP_COMMITTED_VERIFIER_IDENTITY";
         case BufferId::MTP_GENERATION_RESPONSE_TOKENS:
             return "MTP_GENERATION_RESPONSE_TOKENS";
         case BufferId::MTP_GENERATION_CONTROL:

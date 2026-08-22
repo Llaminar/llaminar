@@ -19,8 +19,11 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <thread>
 
 namespace llaminar2::test
 {
@@ -346,6 +349,147 @@ namespace llaminar2::test
         std::unique_ptr<IMoEKernel> kernel_;
     };
 
+    /**
+     * @brief Prove a reused leased signal cannot admit an empty old descriptor.
+     *
+     * The peer timeline begins at the captured value while its descriptor is
+     * deliberately empty. The acquire must remain resident until a newer
+     * generation's matching descriptor is release-published from mapped host
+     * memory, then select that descriptor's exact placement epoch.
+     */
+    TEST_F(CUDAMoEOverlayEpochTest,
+           PeerEpochAcquireAuthenticatesGenerationBeyondReusedTimeline)
+    {
+        MoEOverlayActivationEpochControl *host_control = nullptr;
+        ASSERT_EQ(
+            cudaHostAlloc(
+                reinterpret_cast<void **>(&host_control),
+                sizeof(*host_control),
+                cudaHostAllocMapped),
+            cudaSuccess);
+        auto host_owner = std::unique_ptr<
+            MoEOverlayActivationEpochControl,
+            void (*)(MoEOverlayActivationEpochControl *)>(
+            host_control,
+            [](MoEOverlayActivationEpochControl *pointer)
+            {
+                if (pointer)
+                    (void)cudaFreeHost(pointer);
+            });
+        void *device_control_alias_raw = nullptr;
+        ASSERT_EQ(
+            cudaHostGetDevicePointer(
+                &device_control_alias_raw,
+                host_control,
+                0u),
+            cudaSuccess);
+        auto *const device_activation_control =
+            static_cast<MoEOverlayActivationEpochControl *>(
+                device_control_alias_raw);
+
+        MoEOverlayActivationDeviceEpochGrant *device_grant = nullptr;
+        ASSERT_EQ(
+            cudaMalloc(
+                reinterpret_cast<void **>(&device_grant),
+                sizeof(*device_grant)),
+            cudaSuccess);
+        auto grant_owner = std::unique_ptr<
+            MoEOverlayActivationDeviceEpochGrant,
+            void (*)(MoEOverlayActivationDeviceEpochGrant *)>(
+            device_grant,
+            [](MoEOverlayActivationDeviceEpochGrant *pointer)
+            {
+                if (pointer)
+                    (void)cudaFree(pointer);
+            });
+
+        *host_control = {};
+        host_control->channel.stage_count = 1u;
+        host_control->admission.ready_signal =
+            kMoEOverlayActivationAdmissionTimeline;
+        host_control->identity.epoch_generation = 8u;
+        host_control->identity.digest = {0x1234u, 0x5678u};
+        host_control->buffers[0].dispatch_signal.value =
+            moeOverlayActivationLeasedTimelineValue(1u);
+
+        MoEOverlayActivationDeviceEpochGrant grant{};
+        grant.generation = 7u;
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                device_grant,
+                &grant,
+                sizeof(grant),
+                cudaMemcpyHostToDevice,
+                inference_stream_),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemsetAsync(
+                &device_tickets_[1],
+                0,
+                sizeof(device_tickets_[1]),
+                inference_stream_),
+            cudaSuccess);
+
+        ASSERT_TRUE(kernel_->acquireMoEOverlayEpoch(
+            inferenceLaunch(),
+            device_control_,
+            &device_tickets_[1],
+            &device_statuses_[8],
+            nullptr,
+            {},
+            {
+                .control = device_activation_control,
+                .grant = device_grant,
+                .stage_ordinal = 0u,
+            }));
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        EXPECT_EQ(cudaStreamQuery(inference_stream_), cudaErrorNotReady)
+            << "a reused timeline admitted the empty prior descriptor";
+        (void)cudaGetLastError();
+
+        auto &descriptor =
+            host_control->buffers[0].dispatch_descriptor;
+        descriptor.digest = host_control->identity.digest;
+        descriptor.timeline = moeOverlayActivationLeasedTimelineValue(1u);
+        descriptor.placement_epoch = 1u;
+        descriptor.stage_ordinal = 0u;
+        std::atomic_thread_fence(std::memory_order_release);
+        std::atomic_ref<std::uint64_t>(
+            host_control->buffers[0].dispatch_signal.value)
+            .store(descriptor.timeline, std::memory_order_release);
+
+        ASSERT_EQ(cudaStreamSynchronize(inference_stream_), cudaSuccess);
+        DeviceMoEOverlayEpochTicket ticket{};
+        DeviceMoEOverlayEpochStatus status{};
+        ASSERT_EQ(
+            cudaMemcpy(
+                &ticket,
+                &device_tickets_[1],
+                sizeof(ticket),
+                cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpy(
+                &status,
+                &device_statuses_[8],
+                sizeof(status),
+                cudaMemcpyDeviceToHost),
+            cudaSuccess);
+        EXPECT_EQ(ticket.epoch, 1u);
+        EXPECT_EQ(
+            status.code,
+            static_cast<std::uint32_t>(
+                DeviceMoEOverlayEpochStatusCode::Success));
+
+        ASSERT_TRUE(kernel_->releaseMoEOverlayEpoch(
+            inferenceLaunch(),
+            device_control_,
+            &device_tickets_[1],
+            &device_statuses_[8]));
+        ASSERT_EQ(cudaStreamSynchronize(inference_stream_), cudaSuccess);
+    }
+
     TEST_F(CUDAMoEOverlayEpochTest,
            IndependentStreamsPublishWithoutReusingHeldInferenceBank)
     {
@@ -479,6 +623,93 @@ namespace llaminar2::test
                   deviceMoEOverlayEpochSelector(2u, 1u));
         EXPECT_FALSE(tickets[0].valid());
         EXPECT_FALSE(tickets[1].valid());
+    }
+
+    TEST_F(CUDAMoEOverlayEpochTest,
+           GlobalAdmissionSelectsRetiringBankDuringPublicationFanout)
+    {
+        ASSERT_TRUE(kernel_->reserveMoEOverlayEpochCandidate(
+            maintenanceLaunch(),
+            device_control_,
+            &device_epochs_[0],
+            &device_statuses_[0]));
+        ASSERT_TRUE(kernel_->markMoEOverlayEpochCandidateReady(
+            maintenanceLaunch(),
+            device_control_,
+            &device_epochs_[0],
+            &device_statuses_[1]));
+        ASSERT_TRUE(kernel_->publishMoEOverlayEpochCandidate(
+            maintenanceLaunch(),
+            device_control_,
+            &device_epochs_[0],
+            &device_statuses_[2]));
+        ASSERT_EQ(
+            cudaEventRecord(maintenance_event_, maintenance_stream_),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaStreamWaitEvent(inference_stream_, maintenance_event_, 0),
+            cudaSuccess);
+
+        // device_epochs_[1] remains one: the local selector is already two,
+        // but topology-wide admission still requires the retiring bank.
+        ASSERT_TRUE(kernel_->acquireMoEOverlayEpoch(
+            inferenceLaunch(),
+            device_control_,
+            &device_tickets_[0],
+            &device_statuses_[3],
+            &device_epochs_[1]));
+        DeviceMoEOverlayEpochTicket old_ticket{};
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                &old_ticket,
+                &device_tickets_[0],
+                sizeof(old_ticket),
+                cudaMemcpyDeviceToHost,
+                inference_stream_),
+            cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(inference_stream_), cudaSuccess);
+        EXPECT_EQ(old_ticket.epoch, 1u);
+        EXPECT_EQ(old_ticket.bank(), 0u);
+        EXPECT_EQ(old_ticket.generation(), 1u);
+
+        ASSERT_TRUE(kernel_->releaseMoEOverlayEpoch(
+            inferenceLaunch(),
+            device_control_,
+            &device_tickets_[0],
+            &device_statuses_[4]));
+        const std::uint64_t admitted_epoch = 2u;
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                &device_epochs_[1],
+                &admitted_epoch,
+                sizeof(admitted_epoch),
+                cudaMemcpyHostToDevice,
+                inference_stream_),
+            cudaSuccess);
+        ASSERT_TRUE(kernel_->acquireMoEOverlayEpoch(
+            inferenceLaunch(),
+            device_control_,
+            &device_tickets_[1],
+            &device_statuses_[5],
+            &device_epochs_[1]));
+        DeviceMoEOverlayEpochTicket new_ticket{};
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                &new_ticket,
+                &device_tickets_[1],
+                sizeof(new_ticket),
+                cudaMemcpyDeviceToHost,
+                inference_stream_),
+            cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(inference_stream_), cudaSuccess);
+        EXPECT_EQ(new_ticket.epoch, 2u);
+        EXPECT_EQ(new_ticket.bank(), 1u);
+        EXPECT_EQ(new_ticket.generation(), 2u);
+        ASSERT_TRUE(kernel_->releaseMoEOverlayEpoch(
+            inferenceLaunch(),
+            device_control_,
+            &device_tickets_[1],
+            &device_statuses_[6]));
     }
 
     TEST_F(CUDAMoEOverlayEpochTest,

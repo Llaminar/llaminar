@@ -48,6 +48,18 @@ namespace llaminar2
         std::unique_ptr<FP32Tensor> createFP32(const std::vector<size_t> &shape, DeviceId device = DeviceId::cpu());
 
         /**
+         * @brief Adopt initialized aligned FP32 storage on this factory's NUMA node.
+         * @param shape Tensor dimensions.
+         * @param host_data Exact element storage; ownership is transferred.
+         * @param device Logical home device for subsequent preparation.
+         * @return FP32 tensor owning the original allocation.
+         */
+        std::unique_ptr<FP32Tensor> createFP32Owned(
+            const std::vector<size_t> &shape,
+            AlignedVector<float> host_data,
+            DeviceId device = DeviceId::cpu());
+
+        /**
          * @brief Create FP16 tensor with NUMA-aware allocation
          * @param shape Tensor dimensions
          * @return FP16 tensor allocated on local NUMA node
@@ -64,6 +76,16 @@ namespace llaminar2
                                                const std::vector<uint16_t> &fp16_data);
 
         /**
+         * @brief Adopt initialized aligned FP16 storage without copying.
+         * @param shape Tensor dimensions.
+         * @param fp16_data Exact element storage; ownership is transferred.
+         * @return FP16 tensor owning the original allocation.
+         */
+        std::unique_ptr<FP16Tensor> createFP16Owned(
+            const std::vector<size_t> &shape,
+            AlignedVector<uint16_t> fp16_data);
+
+        /**
          * @brief Create BF16 tensor with NUMA-aware allocation
          * @param shape Tensor dimensions
          * @return BF16 tensor allocated on local NUMA node
@@ -78,6 +100,16 @@ namespace llaminar2
          */
         std::unique_ptr<BF16Tensor> createBF16(const std::vector<size_t> &shape,
                                                const std::vector<uint16_t> &bf16_data);
+
+        /**
+         * @brief Adopt initialized aligned BF16 storage without copying.
+         * @param shape Tensor dimensions.
+         * @param bf16_data Exact element storage; ownership is transferred.
+         * @return BF16 tensor owning the original allocation.
+         */
+        std::unique_ptr<BF16Tensor> createBF16Owned(
+            const std::vector<size_t> &shape,
+            AlignedVector<uint16_t> bf16_data);
 
         /**
          * @brief Create INT32 tensor with NUMA-aware allocation
@@ -168,12 +200,24 @@ namespace llaminar2
          * @brief Create quantized tensor from raw GGUF data
          * @param type Quantization type
          * @param shape Tensor dimensions
-         * @param raw_data Raw quantized blocks
+         * @param raw_data Raw quantized blocks copied into aligned tensor storage.
          * @return Quantized tensor of appropriate type
          */
         std::unique_ptr<TensorBase> createQuantized(TensorType type,
                                                     const std::vector<size_t> &shape,
                                                     const std::vector<uint8_t> &raw_data);
+
+        /**
+         * @brief Adopt initialized aligned native-codebook bytes without copying.
+         * @param type Quantization type.
+         * @param shape Tensor dimensions.
+         * @param raw_data Exact packed bytes; ownership is transferred.
+         * @return Quantized tensor owning the original aligned allocation.
+         */
+        std::unique_ptr<TensorBase> createQuantizedOwned(
+            TensorType type,
+            const std::vector<size_t> &shape,
+            AlignedVector<uint8_t> raw_data);
 
         /**
          * @brief Create quantized tensor with zero-copy mmap-backed data

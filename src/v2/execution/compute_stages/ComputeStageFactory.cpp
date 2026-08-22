@@ -216,6 +216,13 @@ namespace llaminar2
             MoEOverlayActivationReturnConsumeBatchStage>(params);
     }
 
+    std::unique_ptr<IComputeStage>
+    ComputeStageFactory::createMoEOverlayDeviceController(
+        const MoEOverlayDeviceControllerStage::Params &params)
+    {
+        return std::make_unique<MoEOverlayDeviceControllerStage>(params);
+    }
+
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertDispatch(
         const MoEExpertDispatchStage::Params &params)
     {

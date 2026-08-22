@@ -28,6 +28,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "execution/mtp/HostedDeviceGenerationLifecycle.h"
 #include "execution/runner/MTPVerifierForwardExecutor.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
@@ -1537,6 +1538,90 @@ namespace
         EXPECT_GT(fp32_abs_sum(v_payload), 0.0f);
     }
 } // namespace
+
+TEST(Test__MTPGraphConstruction,
+     HostedGenerationCursorRejectsInvalidAndNonContiguousTransitions)
+{
+    HostedDeviceGenerationCursor cursor;
+    EXPECT_EQ(cursor.state(), HostedDeviceGenerationCursorState::Inactive);
+    EXPECT_TRUE(cursor.inactive());
+    EXPECT_TRUE(cursor.mayObserveTicket());
+    EXPECT_FALSE(cursor.markTicketObservationSubmitted());
+    EXPECT_FALSE(cursor.acceptTicket(1));
+    EXPECT_FALSE(cursor.beginAdvance(1));
+    EXPECT_FALSE(cursor.finishAdvance(1, false));
+
+    ASSERT_TRUE(cursor.startScheduler());
+    EXPECT_FALSE(cursor.startScheduler());
+    EXPECT_EQ(
+        cursor.state(),
+        HostedDeviceGenerationCursorState::SchedulerReady);
+    ASSERT_TRUE(cursor.markTicketObservationSubmitted());
+    EXPECT_FALSE(cursor.markTicketObservationSubmitted());
+    EXPECT_FALSE(cursor.acceptTicket(0));
+    EXPECT_FALSE(cursor.acceptTicket(2));
+    ASSERT_TRUE(cursor.acceptTicket(1));
+    EXPECT_EQ(
+        cursor.state(),
+        HostedDeviceGenerationCursorState::TicketObserved);
+    EXPECT_FALSE(cursor.acceptTicket(1));
+    EXPECT_FALSE(cursor.beginAdvance(2));
+    ASSERT_TRUE(cursor.beginAdvance(1));
+    EXPECT_FALSE(cursor.beginAdvance(1));
+    EXPECT_FALSE(cursor.retireCompleted());
+    EXPECT_FALSE(cursor.finishAdvance(2, false));
+    ASSERT_TRUE(cursor.finishAdvance(1, false));
+
+    EXPECT_EQ(
+        cursor.state(),
+        HostedDeviceGenerationCursorState::SchedulerReady);
+    ASSERT_TRUE(cursor.markTicketObservationSubmitted());
+    EXPECT_FALSE(cursor.acceptTicket(1));
+    ASSERT_TRUE(cursor.acceptTicket(2));
+    ASSERT_TRUE(cursor.beginAdvance(2));
+    ASSERT_TRUE(cursor.finishAdvance(2, true));
+    EXPECT_TRUE(cursor.terminalSubmitted());
+    EXPECT_FALSE(cursor.mayObserveTicket());
+    EXPECT_FALSE(cursor.startScheduler());
+    EXPECT_FALSE(cursor.markTicketObservationSubmitted());
+    ASSERT_TRUE(cursor.retireCompleted());
+    EXPECT_TRUE(cursor.inactive());
+    EXPECT_EQ(cursor.lastTransactionCount(), 0);
+    EXPECT_TRUE(cursor.retireCompleted());
+}
+
+TEST(Test__MTPGraphConstruction,
+     HostedGenerationAdvanceCursorEnforcesEveryExactFragmentOrdinal)
+{
+    HostedDeviceGenerationAdvanceCursor cursor;
+    EXPECT_EQ(cursor.state(), HostedDeviceGenerationAdvanceState::Idle);
+    EXPECT_TRUE(cursor.idle());
+    EXPECT_FALSE(cursor.maySubmit(0));
+    EXPECT_FALSE(cursor.recordSubmission(0));
+    EXPECT_FALSE(cursor.mayFinish());
+    EXPECT_FALSE(cursor.finish());
+
+    ASSERT_TRUE(cursor.begin(3));
+    EXPECT_FALSE(cursor.begin(1));
+    EXPECT_EQ(cursor.fragmentCount(), 3u);
+    EXPECT_EQ(cursor.nextFragment(), 0u);
+    EXPECT_FALSE(cursor.maySubmit(1));
+    ASSERT_TRUE(cursor.recordSubmission(0));
+    EXPECT_FALSE(cursor.recordSubmission(0));
+    ASSERT_TRUE(cursor.recordSubmission(1));
+    EXPECT_FALSE(cursor.mayFinish());
+    ASSERT_TRUE(cursor.recordSubmission(2));
+    EXPECT_TRUE(cursor.mayFinish());
+    EXPECT_FALSE(cursor.recordSubmission(3));
+    ASSERT_TRUE(cursor.finish());
+    EXPECT_TRUE(cursor.idle());
+
+    /* A branch with no selected conditional fragment is still complete. */
+    ASSERT_TRUE(cursor.begin(0));
+    EXPECT_TRUE(cursor.mayFinish());
+    ASSERT_TRUE(cursor.finish());
+    EXPECT_TRUE(cursor.idle());
+}
 
 TEST(Test__MTPGraphConstruction, ConcatStageCopiesEmbeddingThenHidden)
 {

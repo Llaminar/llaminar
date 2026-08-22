@@ -222,6 +222,21 @@ namespace llaminar2
 
         configureBenchmarkPrefillBuckets(mpi_ctx, ctx.config);
 
+        /*
+         * Benchmarking and serving share this exact application-startup
+         * boundary. The orchestration layer owns any production-shaped setup;
+         * BenchmarkRunner receives an already-ready model and times only the
+         * caller-requested workload.
+         */
+        if (!runner->prepareForInference())
+        {
+            LOG_ERROR(
+                "Inference runtime did not become ready for benchmarking: "
+                << runner->lastError());
+            return shutdownAndFinalize(
+                false, "inference runtime preparation failed");
+        }
+
         auto adapter = std::make_shared<InferenceRunnerAdapter>(runner.get());
 
         BenchmarkRunner benchmark(adapter, tokenizer);

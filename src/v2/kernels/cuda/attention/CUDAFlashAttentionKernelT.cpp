@@ -188,6 +188,8 @@ extern "C"
         int query_rows,
         int kv_stride,
         const int *active_query_rows_device,
+        const int *ring_head_device,
+        int ring_capacity,
         unsigned long long prefill_branch_condition,
         int direct_kv_limit,
         void *stream);
@@ -2165,13 +2167,17 @@ namespace llaminar2
             void *stream,
             int kv_stride,
             const int *active_query_rows_device,
-            const attention::AttentionPrefillCaptureGeometry &prefill_capture)
+            const attention::AttentionPrefillCaptureGeometry &prefill_capture,
+            const int *device_ring_head,
+            int ring_capacity)
         {
             const int sanitized_query_rows = sanitizeSmallDecodeQueryRows(query_rows);
             if (!post_append_cached_tokens_device || seq_len <= 0 ||
-                kv_stride <= 0 || !stream)
+                kv_stride <= 0 || !stream ||
+                ((device_ring_head == nullptr) != (ring_capacity == 0)) ||
+                (ring_capacity > 0 && ring_capacity != kv_stride))
             {
-                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, positive seq_len/cache capacity, and explicit stream");
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, coherent ring geometry, positive seq_len/cache capacity, and explicit stream");
                 dynamic_attn_device_valid_ = false;
                 dynamic_attn_device_derived_ = false;
                 return false;
@@ -2289,6 +2295,8 @@ namespace llaminar2
                                            sanitized_query_rows,
                                            kv_stride,
                                            active_query_rows_device,
+                                           device_ring_head,
+                                           ring_capacity,
                                            prefill_branch_condition,
                                            direct_kv_limit,
                                            stream) == 0;
@@ -2320,6 +2328,8 @@ namespace llaminar2
                                      sanitized_query_rows,
                                      kv_stride,
                                      active_query_rows_device,
+                                     device_ring_head,
+                                     ring_capacity,
                                      /*prefill_branch_condition=*/0,
                                      /*direct_kv_limit=*/0,
                                      stream);

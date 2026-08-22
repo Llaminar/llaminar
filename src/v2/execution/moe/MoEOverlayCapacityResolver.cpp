@@ -610,9 +610,17 @@ namespace llaminar2
             state.output.shadow_copies_per_layer.assign(layer_count, 0);
             if (resourceUsed(state.output) > budget.usable_budget_bytes)
             {
-                throw std::invalid_argument(
-                    "ExpertOverlay fixed/staging/reserve BOM already exceeds physical resource '" +
-                    budget.resource_id + "'");
+                std::ostringstream error;
+                error
+                    << "ExpertOverlay fixed/staging/reserve BOM already exceeds "
+                       "physical resource '"
+                    << budget.resource_id << "': used="
+                    << resourceUsed(state.output) << " usable="
+                    << budget.usable_budget_bytes << " fixed="
+                    << state.output.fixed_bytes << " staging="
+                    << state.output.transfer_staging_bytes << " reserve="
+                    << state.output.safety_reserve_bytes;
+                throw std::invalid_argument(error.str());
             }
             resources.push_back(std::move(state));
         }

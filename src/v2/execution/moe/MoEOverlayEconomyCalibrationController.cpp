@@ -1,15 +1,14 @@
 /**
  * @file MoEOverlayEconomyCalibrationController.cpp
- * @brief Event-polled live-inference and real-migration calibration protocol.
+ * @brief Bounded production-lane transfer profiling without synthetic inference.
  */
 
 #include "MoEOverlayEconomyCalibrationController.h"
 
+#include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
-#include <array>
-#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -18,133 +17,35 @@ namespace llaminar2
 {
     namespace
     {
-        /** @brief Stable PerfStats spelling for one production inference phase. */
-        const char *calibrationSourceName(
-            ExpertHistogramSource source) noexcept
+        /** @brief Stable counter helper for rare setup/profile lifecycle edges. */
+        void recordProfileCounter(
+            const std::string &device,
+            const char *name,
+            double value,
+            PerfStatsCollector::Tags tags = {})
         {
-            switch (source)
-            {
-            case ExpertHistogramSource::DecodeToken:
-                return "decode";
-            case ExpertHistogramSource::PrefillChunk:
-                return "prefill";
-            case ExpertHistogramSource::GroupedVerifier:
-                return "grouped_verifier";
-            case ExpertHistogramSource::SyntheticTest:
-                return "synthetic_test";
-            }
-            return "unknown";
-        }
-
-        /**
-         * @brief Publish one identity-preserving probe lifecycle event.
-         *
-         * This is diagnostic state, not a scheduling command. Production
-         * traffic remains authoritative: the probe is satisfied only when a
-         * matching real prefill, decode, or grouped-verifier interval claims
-         * it. Keeping the complete identity on both arm and sample events lets
-         * operators distinguish an outstanding request from one the lock-free
-         * probe already consumed without inspecting controller-private state.
-         *
-         * @param event_name Stable PerfStats lifecycle counter name.
-         * @param perf_device Participant/device label owning calibration.
-         * @param request Exact immutable probe request identity.
-         */
-        void recordProbeEvent(
-            const char *event_name,
-            const std::string &perf_device,
-            const MoEOverlayInterferenceProbeRequest &request)
-        {
+            tags.emplace("synthetic_inference", "false");
+            tags.emplace("publish_residency", "false");
             PerfStatsCollector::addCounter(
                 "moe_overlay_residency",
-                event_name,
-                1.0,
-                "maintenance",
-                perf_device,
-                {{"calibration_sequence",
-                  std::to_string(request.calibration_sequence)},
-                 {"layer", std::to_string(request.coordinate.layer)},
-                 {"mode",
-                  request.mode ==
-                          MoEOverlayInterferenceProbeMode::Baseline
-                      ? "baseline"
-                      : "concurrent_movement"},
-                 {"source", calibrationSourceName(request.source)},
-                 {"source_participant",
-                  std::to_string(
-                      request.coordinate.source_participant)},
-                 {"destination_participant",
-                  std::to_string(
-                      request.coordinate.destination_participant)}});
-        }
-
-        /** @brief Publish one newly armed live-inference calibration probe. */
-        void recordProbeArm(
-            const std::string &perf_device,
-            const MoEOverlayInterferenceProbeRequest &request)
-        {
-            recordProbeEvent(
-                "economy_calibration_probe_arms",
-                perf_device,
-                request);
-        }
-
-        /** @brief Publish one production interval consumed by calibration. */
-        void recordProbeSample(
-            const std::string &perf_device,
-            const MoEOverlayInterferenceProbeRequest &request)
-        {
-            recordProbeEvent(
-                "economy_calibration_probe_samples",
-                perf_device,
-                request);
-        }
-
-        /**
-         * @brief Publish one reason-coded, retryable overlap rejection.
-         * @param perf_device Participant/device label owning calibration.
-         * @param request Exact concurrent probe whose attempt was rejected.
-         * @param reason Stable causal spelling for dashboards and tests.
-         *
-         * A rejection is expected under unlucky scheduling and is not a fatal
-         * error. Publishing it is nevertheless essential: repeated retries
-         * without an accepted pair otherwise look identical to useful
-         * calibration progress from outside the maintenance thread.
-         */
-        void recordCalibrationRejection(
-            const std::string &perf_device,
-            const MoEOverlayInterferenceProbeRequest &request,
-            const char *reason)
-        {
-            PerfStatsCollector::addCounter(
-                "moe_overlay_residency",
-                "economy_calibration_attempt_rejections",
-                1.0,
-                "maintenance",
-                perf_device,
-                {{"calibration_sequence",
-                  std::to_string(request.calibration_sequence)},
-                 {"layer", std::to_string(request.coordinate.layer)},
-                 {"reason", reason},
-                 {"source", calibrationSourceName(request.source)},
-                 {"source_participant",
-                  std::to_string(
-                      request.coordinate.source_participant)},
-                 {"destination_participant",
-                  std::to_string(
-                      request.coordinate.destination_participant)}});
+                name,
+                value,
+                "model_setup",
+                device,
+                std::move(tags));
         }
     } // namespace
 
     MoEOverlayEconomyCalibrationController::
         MoEOverlayEconomyCalibrationController(Config config)
-        : config_(std::move(config))
+        : config_(std::move(config)),
+          profiling_started_at_(std::chrono::steady_clock::now())
     {
         if (!config_.planner || !config_.ledger || !config_.journal ||
-            !config_.probe || !config_.transport || !config_.probe->idle())
+            !config_.transport)
         {
             throw std::invalid_argument(
-                "ExpertOverlay economy calibration requires complete idle production dependencies");
+                "ExpertOverlay transfer profiling requires complete production dependencies");
         }
         if (config_.evidence_exchange &&
             (!config_.evidence_exchange->idle() ||
@@ -154,34 +55,17 @@ namespace llaminar2
                  config_.evidence_exchange->worldSize()))
         {
             throw std::invalid_argument(
-                "Distributed ExpertOverlay calibration requires one idle valid evidence lane");
+                "Distributed ExpertOverlay transfer profiling requires one idle valid evidence lane");
         }
         if (config_.perf_device.empty())
             config_.perf_device = "expert_overlay";
-
-        constexpr std::array<ExpertHistogramSource, 3> sources{
-            ExpertHistogramSource::DecodeToken,
-            ExpertHistogramSource::PrefillChunk,
-            ExpertHistogramSource::GroupedVerifier,
-        };
-        const auto &required_sources = config_.ledger->requiredSources();
-        for (std::size_t phase = 0; phase < sources.size(); ++phase)
-        {
-            if (required_sources[phase])
-                phases_.push_back(sources[phase]);
-        }
-        if (phases_.empty())
-        {
-            throw std::invalid_argument(
-                "ExpertOverlay calibration requires a runtime-reachable phase");
-        }
 
         const auto &coordinates = config_.planner->requiredCoordinates();
         if (coordinates.empty() ||
             coordinates.size() != config_.ledger->coordinateCount())
         {
             throw std::invalid_argument(
-                "ExpertOverlay calibration planner and ledger coordinates disagree");
+                "ExpertOverlay transfer profiler and ledger coordinates disagree");
         }
         for (const auto &coordinate : coordinates)
         {
@@ -199,7 +83,7 @@ namespace llaminar2
                     coordinates.begin(), coordinates.end(), reverse))
             {
                 throw std::invalid_argument(
-                    "ExpertOverlay calibration is missing a reverse directed coordinate");
+                    "ExpertOverlay transfer profile is missing a reverse directed coordinate");
             }
             jobs_.push_back({
                 .first_participant = coordinate.source_participant,
@@ -210,46 +94,33 @@ namespace llaminar2
         if (jobs_.empty())
         {
             throw std::invalid_argument(
-                "ExpertOverlay calibration requires at least one unordered participant pair");
+                "ExpertOverlay transfer profile requires a reciprocal endpoint pair");
         }
 
         const std::uint64_t observations =
             config_.ledger->requiredObservationsPerCoordinate();
-        const std::uint64_t jobs = static_cast<std::uint64_t>(jobs_.size());
-        const std::uint64_t phases =
-            static_cast<std::uint64_t>(phases_.size());
-        const std::uint64_t maximum =
-            std::numeric_limits<std::uint64_t>::max();
-        if (observations == 0 || jobs > maximum / observations ||
-            phases > maximum / (jobs * observations))
+        if (observations == 0 ||
+            jobs_.size() >
+                std::numeric_limits<std::uint64_t>::max() / observations)
         {
             throw std::overflow_error(
-                "ExpertOverlay calibration plan has an invalid accepted-pair cardinality");
+                "ExpertOverlay transfer profile has invalid finite geometry");
         }
-        const std::uint64_t expected_pairs =
-            jobs * phases * observations;
-        /*
-         * Publish the exact finite corpus before the worker starts polling.
-         * Tests and operators can derive progress bounds from production policy
-         * instead of embedding topology-specific timeout/forward guesses.
-         */
-        PerfStatsCollector::addCounter(
-            "moe_overlay_residency",
-            "economy_calibration_expected_pairs",
-            static_cast<double>(expected_pairs),
-            "model_setup",
-            config_.perf_device,
-            {{"unordered_jobs", std::to_string(jobs)},
-             {"runtime_phases", std::to_string(phases)},
-             {"observations_per_coordinate",
-              std::to_string(observations)}});
+        expected_profile_waves_ =
+            static_cast<std::uint64_t>(jobs_.size()) * observations;
         local_rows_.reserve(2);
-    }
 
-    ExpertHistogramSource
-    MoEOverlayEconomyCalibrationController::currentSource() const noexcept
-    {
-        return phases_[phase_index_];
+        recordProfileCounter(
+            config_.perf_device,
+            "economy_transport_profile_expected_waves",
+            static_cast<double>(expected_profile_waves_),
+            {{"reciprocal_jobs", std::to_string(jobs_.size())},
+             {"observations_per_job", std::to_string(observations)}});
+        LOG_INFO(
+            "[ExpertOverlay][Economy] Starting bounded transport profile jobs="
+            << jobs_.size() << " observations_per_job=" << observations
+            << " total_waves=" << expected_profile_waves_
+            << " synthetic_inference=false");
     }
 
     MoEOverlayMigrationMeasurementCoordinate
@@ -266,10 +137,13 @@ namespace llaminar2
     void MoEOverlayEconomyCalibrationController::poll() noexcept
     {
         polls_.fetch_add(1, std::memory_order_relaxed);
-        if (!healthy() ||
-            state() == MoEOverlayEconomyCalibrationState::Complete ||
-            state() == MoEOverlayEconomyCalibrationState::Stopped)
+        const auto observed = state();
+        if (observed == MoEOverlayEconomyCalibrationState::Complete ||
+            observed == MoEOverlayEconomyCalibrationState::Failed ||
+            observed == MoEOverlayEconomyCalibrationState::Stopped)
+        {
             return;
+        }
         try
         {
             if (stop_requested_.load(std::memory_order_acquire))
@@ -277,28 +151,16 @@ namespace llaminar2
                 progressStop();
                 return;
             }
-            switch (state())
+            switch (observed)
             {
-            case MoEOverlayEconomyCalibrationState::ArmBaseline:
-                armBaseline();
-                break;
-            case MoEOverlayEconomyCalibrationState::AwaitBaseline:
-                awaitBaseline();
-                break;
             case MoEOverlayEconomyCalibrationState::StartWave:
                 startWave();
                 break;
-            case MoEOverlayEconomyCalibrationState::AwaitConcurrentInference:
-                awaitConcurrentInference();
-                break;
             case MoEOverlayEconomyCalibrationState::AwaitConcurrentWave:
-                awaitConcurrentWave();
+                pollWave();
                 break;
             case MoEOverlayEconomyCalibrationState::AbortCleanup:
                 pollAbortCleanup();
-                break;
-            case MoEOverlayEconomyCalibrationState::AwaitLateConcurrentSample:
-                awaitLateConcurrentSample();
                 break;
             case MoEOverlayEconomyCalibrationState::AwaitEvidenceExchange:
                 pollEvidenceExchange();
@@ -307,6 +169,13 @@ namespace llaminar2
             case MoEOverlayEconomyCalibrationState::Failed:
             case MoEOverlayEconomyCalibrationState::Stopped:
                 break;
+            case MoEOverlayEconomyCalibrationState::ArmBaseline:
+            case MoEOverlayEconomyCalibrationState::AwaitBaseline:
+            case MoEOverlayEconomyCalibrationState::AwaitBaselineReadiness:
+            case MoEOverlayEconomyCalibrationState::AwaitConcurrentInference:
+            case MoEOverlayEconomyCalibrationState::AwaitLateConcurrentSample:
+                throw std::logic_error(
+                    "Obsolete inference-pair state entered the transfer profiler");
             }
         }
         catch (const std::exception &error)
@@ -314,98 +183,54 @@ namespace llaminar2
             if (active_wave_)
                 beginAbort(error.what());
             else
-                deferFailureUntilProbeQuiescent(error.what());
+                fail(error.what());
         }
         catch (...)
         {
             if (active_wave_)
             {
                 beginAbort(
-                    "ExpertOverlay calibration raised a non-standard exception");
+                    "ExpertOverlay transfer profiler raised a non-standard exception");
             }
             else
             {
-                deferFailureUntilProbeQuiescent(
-                    "ExpertOverlay calibration raised a non-standard exception");
+                fail(
+                    "ExpertOverlay transfer profiler raised a non-standard exception");
             }
         }
-    }
-
-    void MoEOverlayEconomyCalibrationController::requestStop() noexcept
-    {
-        stop_requested_.store(true, std::memory_order_release);
-    }
-
-    void MoEOverlayEconomyCalibrationController::armBaseline()
-    {
-        if (!config_.probe->idle() || active_wave_ || baseline_sample_ ||
-            concurrent_sample_)
-        {
-            throw std::logic_error(
-                "ExpertOverlay calibration baseline arm found live attempt state");
-        }
-        ++calibration_sequence_;
-        if (calibration_sequence_ == 0)
-            throw std::overflow_error("ExpertOverlay calibration sequence overflowed");
-        const MoEOverlayInterferenceProbeRequest request{
-                .coordinate = currentCoordinate(),
-                .source = currentSource(),
-                .mode = MoEOverlayInterferenceProbeMode::Baseline,
-                .calibration_sequence = calibration_sequence_,
-            };
-        if (!config_.probe->arm(request))
-        {
-            throw std::logic_error(
-                "ExpertOverlay calibration could not arm its baseline probe");
-        }
-        recordProbeArm(config_.perf_device, request);
-        baseline_arms_.fetch_add(1, std::memory_order_relaxed);
-        state_.store(
-            MoEOverlayEconomyCalibrationState::AwaitBaseline,
-            std::memory_order_release);
-    }
-
-    void MoEOverlayEconomyCalibrationController::awaitBaseline()
-    {
-        MoEOverlayInterferenceProbeSample sample;
-        if (!config_.probe->consume(&sample))
-            return;
-        if (!sample.valid() ||
-            sample.request.mode != MoEOverlayInterferenceProbeMode::Baseline ||
-            sample.request.coordinate != currentCoordinate() ||
-            sample.request.source != currentSource() ||
-            sample.request.calibration_sequence != calibration_sequence_)
-        {
-            throw std::logic_error(
-                "ExpertOverlay calibration consumed a mismatched baseline sample");
-        }
-        recordProbeSample(config_.perf_device, sample.request);
-        baseline_sample_ = sample;
-        baseline_samples_.fetch_add(1, std::memory_order_relaxed);
-        state_.store(
-            MoEOverlayEconomyCalibrationState::StartWave,
-            std::memory_order_release);
     }
 
     void MoEOverlayEconomyCalibrationController::startWave()
     {
-        if (!baseline_sample_ || active_wave_ || !config_.probe->idle())
+        if (active_wave_ || evidence_exchange_active_ ||
+            config_.journal->hasUnreadWave())
         {
             throw std::logic_error(
-                "ExpertOverlay calibration cannot start a wave without one idle paired baseline");
+                "ExpertOverlay transfer profiler found stale attempt ownership");
         }
+        if (active_profile_sequence_ == 0)
+        {
+            if (next_profile_sequence_ ==
+                std::numeric_limits<std::uint64_t>::max())
+            {
+                throw std::overflow_error(
+                    "ExpertOverlay transfer-profile sequence overflowed");
+            }
+            active_profile_sequence_ = ++next_profile_sequence_;
+        }
+
         const auto &job = jobs_[job_index_];
         const auto transaction = config_.planner->buildPairSwap(
             job.first_participant,
             job.second_participant,
             job.layer,
-            calibration_sequence_);
+            active_profile_sequence_);
         wave_start_attempts_.fetch_add(1, std::memory_order_relaxed);
         auto started = config_.transport->beginStage(transaction);
         if (!started.valid())
         {
             throw std::logic_error(
-                "ExpertOverlay calibration transport returned invalid start ownership");
+                "ExpertOverlay transfer profiler received invalid transport ownership");
         }
         if (started.status == MoEOverlayResidencyStageStartStatus::Deferred)
         {
@@ -416,7 +241,7 @@ namespace llaminar2
         {
             active_wave_ = std::move(started.cleanup_wave);
             const std::string message = started.error.empty()
-                                            ? "ExpertOverlay calibration transport failed to start"
+                                            ? "ExpertOverlay transfer-profile wave failed to start"
                                             : std::move(started.error);
             if (active_wave_)
                 beginAbort(message);
@@ -426,155 +251,46 @@ namespace llaminar2
         }
 
         active_wave_ = std::move(started.wave);
+        stage_completed_ = false;
         waves_started_.fetch_add(1, std::memory_order_relaxed);
-        const auto concurrent_request = currentConcurrentRequest();
-        if (!config_.probe->arm(concurrent_request))
+        if (sample_index_ == 0)
         {
-            beginAbort(
-                "ExpertOverlay calibration could not arm its concurrent probe");
-            return;
+            LOG_DEBUG(
+                "[ExpertOverlay][Economy] Profiling physical pair="
+                << job.first_participant << "<->" << job.second_participant
+                << " representative_layer=" << job.layer);
         }
-        recordProbeArm(config_.perf_device, concurrent_request);
-        concurrent_arms_.fetch_add(1, std::memory_order_relaxed);
         state_.store(
-            MoEOverlayEconomyCalibrationState::AwaitConcurrentInference,
+            MoEOverlayEconomyCalibrationState::AwaitConcurrentWave,
             std::memory_order_release);
     }
 
-    MoEOverlayInterferenceProbeRequest
-    MoEOverlayEconomyCalibrationController::currentConcurrentRequest() const
+    void MoEOverlayEconomyCalibrationController::pollWave()
     {
-        if (!baseline_sample_)
+        if (!active_wave_)
         {
             throw std::logic_error(
-                "ExpertOverlay calibration has no baseline workload for its concurrent request");
+                "ExpertOverlay transfer profiler lost its active wave");
         }
-        return {
-            .coordinate = currentCoordinate(),
-            .source = currentSource(),
-            .require_exact_workload = true,
-            .required_workload = baseline_sample_->workload,
-            .mode = MoEOverlayInterferenceProbeMode::ConcurrentMovement,
-            .calibration_sequence = calibration_sequence_,
-        };
-    }
-
-    void MoEOverlayEconomyCalibrationController::awaitConcurrentInference()
-    {
-        if (!active_wave_ || !baseline_sample_ || stage_dispatch_started_)
-        {
-            throw std::logic_error(
-                "ExpertOverlay calibration launch handshake found incomplete wave ownership");
-        }
-
-        switch (config_.probe->progress(currentConcurrentRequest()))
-        {
-        case MoEOverlayInterferenceProbeProgress::Armed:
-            concurrent_launch_wait_polls_.fetch_add(
-                1, std::memory_order_relaxed);
-            return;
-        case MoEOverlayInterferenceProbeProgress::Running:
-            /*
-             * Only this edge releases reservation consensus and queued transfer
-             * operations.  The inference caller never polls transport work and
-             * the maintenance worker never waits for the caller.
-             */
-            stage_dispatch_started_ = true;
-            concurrent_launches_during_inference_.fetch_add(
-                1, std::memory_order_relaxed);
-            state_.store(
-                MoEOverlayEconomyCalibrationState::AwaitConcurrentWave,
-                std::memory_order_release);
-            awaitConcurrentWave();
-            return;
-        case MoEOverlayInterferenceProbeProgress::Completed:
-            /* The exact workload ended before maintenance could release bytes. */
-            (void)tryConsumeConcurrentSample();
-            concurrent_launch_misses_.fetch_add(1, std::memory_order_relaxed);
-            partial_overlap_rejections_.fetch_add(
-                1, std::memory_order_relaxed);
-            recordCalibrationRejection(
-                config_.perf_device,
-                currentConcurrentRequest(),
-                "inference_completed_before_dispatch");
-            beginAbort();
-            return;
-        case MoEOverlayInterferenceProbeProgress::Missing:
-            throw std::logic_error(
-                "ExpertOverlay calibration lost its armed concurrent inference request");
-        }
-        throw std::logic_error(
-            "ExpertOverlay calibration observed an unknown probe lifecycle");
-    }
-
-    bool MoEOverlayEconomyCalibrationController::
-        tryConsumeConcurrentSample()
-    {
-        if (concurrent_sample_)
-            return true;
-        MoEOverlayInterferenceProbeSample sample;
-        if (!config_.probe->consume(&sample))
-            return false;
-        if (!sample.valid() ||
-            sample.request.mode !=
-                MoEOverlayInterferenceProbeMode::ConcurrentMovement ||
-            sample.request.coordinate != currentCoordinate() ||
-            sample.request.source != currentSource() ||
-            sample.request.calibration_sequence != calibration_sequence_ ||
-            !baseline_sample_ ||
-            sample.workload != baseline_sample_->workload)
-        {
-            workload_pair_rejections_.fetch_add(1, std::memory_order_relaxed);
-            throw std::logic_error(
-                "ExpertOverlay calibration consumed a mismatched concurrent sample");
-        }
-        recordProbeSample(config_.perf_device, sample.request);
-        concurrent_sample_ = sample;
-        concurrent_samples_.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-
-    void MoEOverlayEconomyCalibrationController::awaitConcurrentWave()
-    {
-        if (!stage_dispatch_started_)
-        {
-            throw std::logic_error(
-                "ExpertOverlay calibration polled staging before inference-authorized dispatch");
-        }
-        (void)tryConsumeConcurrentSample();
         std::string error;
         const auto progress = active_wave_->pollStage(&error);
         if (progress == MoEOverlayResidencyWaveProgress::Pending)
             return;
+        if (progress == MoEOverlayResidencyWaveProgress::Failed)
+        {
+            beginAbort(
+                error.empty()
+                    ? "ExpertOverlay transfer-profile staging failed"
+                    : std::move(error));
+            return;
+        }
         if (progress == MoEOverlayResidencyWaveProgress::Deferred)
         {
             beginAbort();
             return;
         }
-        if (progress == MoEOverlayResidencyWaveProgress::Failed)
-        {
-            beginAbort(
-                error.empty()
-                    ? "ExpertOverlay calibration staging failed"
-                    : std::move(error));
-            return;
-        }
-
         stage_completed_ = true;
-        stage_interval_ = active_wave_->completedStageInterval();
-        if (!stage_interval_ || !stage_interval_->valid())
-        {
-            beginAbort(
-                "ExpertOverlay calibration wave omitted its exact staging interval");
-            return;
-        }
-        /*
-         * If no inference call claimed the request before physical readiness,
-         * cancel it now. A running call cannot be cancelled; its eventual end
-         * necessarily falls outside the frozen stage interval and is rejected.
-         */
-        if (!concurrent_sample_)
-            (void)config_.probe->cancelArmed();
+        waves_completed_.fetch_add(1, std::memory_order_relaxed);
         beginAbort();
     }
 
@@ -584,14 +300,14 @@ namespace llaminar2
         if (!active_wave_)
         {
             if (!failure_after_cleanup.empty())
-                deferFailureUntilProbeQuiescent(
-                    std::move(failure_after_cleanup));
-            else
-                retryAttempt();
+                fail(std::move(failure_after_cleanup));
             return;
         }
-        if (!failure_after_cleanup.empty())
+        if (!failure_after_cleanup.empty() &&
+            failure_after_cleanup_.empty())
+        {
             failure_after_cleanup_ = std::move(failure_after_cleanup);
+        }
         active_wave_->abortStaged();
         waves_aborted_.fetch_add(1, std::memory_order_relaxed);
         state_.store(
@@ -601,7 +317,11 @@ namespace llaminar2
 
     void MoEOverlayEconomyCalibrationController::pollAbortCleanup()
     {
-        (void)tryConsumeConcurrentSample();
+        if (!active_wave_)
+        {
+            throw std::logic_error(
+                "ExpertOverlay transfer profiler lost abort ownership");
+        }
         std::string error;
         const auto progress = active_wave_->pollAbort(&error);
         if (progress == MoEOverlayResidencyWaveProgress::Pending)
@@ -610,36 +330,25 @@ namespace llaminar2
         {
             fail(
                 error.empty()
-                    ? "ExpertOverlay calibration abort cleanup failed"
+                    ? "ExpertOverlay transfer-profile abort cleanup failed"
                     : std::move(error));
             return;
         }
         active_wave_.reset();
+
         if (!failure_after_cleanup_.empty())
         {
-            if (config_.probe->discardAvailable())
-            {
-                auto message = std::move(failure_after_cleanup_);
-                failure_after_cleanup_.clear();
-                fail(std::move(message));
-            }
-            else
-            {
-                state_.store(
-                    MoEOverlayEconomyCalibrationState::
-                        AwaitLateConcurrentSample,
-                    std::memory_order_release);
-            }
-            return;
-        }
-        if (stop_requested_.load(std::memory_order_acquire))
-        {
-            progressStop();
+            auto message = std::move(failure_after_cleanup_);
+            failure_after_cleanup_.clear();
+            fail(std::move(message));
             return;
         }
         if (!stage_completed_)
         {
-            retryAttempt();
+            active_profile_sequence_ = 0;
+            state_.store(
+                MoEOverlayEconomyCalibrationState::StartWave,
+                std::memory_order_release);
             return;
         }
 
@@ -648,329 +357,178 @@ namespace llaminar2
         {
             fail(
                 journal_error.empty()
-                    ? "ExpertOverlay calibration stage produced no measurement journal row"
+                    ? "ExpertOverlay transfer profile produced no timing rows"
                     : std::move(journal_error));
-            return;
-        }
-        if (tryConsumeConcurrentSample())
-        {
-            finalizeAttempt();
-            return;
-        }
-        if (config_.probe->idle())
-        {
-            if (config_.evidence_exchange)
-            {
-                finalizeAttempt();
-                return;
-            }
-            partial_overlap_rejections_.fetch_add(
-                1, std::memory_order_relaxed);
-            recordCalibrationRejection(
-                config_.perf_device,
-                currentConcurrentRequest(),
-                "sample_missing_after_stage");
-            retryAttempt();
-            return;
-        }
-        state_.store(
-            MoEOverlayEconomyCalibrationState::AwaitLateConcurrentSample,
-            std::memory_order_release);
-    }
-
-    void MoEOverlayEconomyCalibrationController::
-        awaitLateConcurrentSample()
-    {
-        if (!failure_after_cleanup_.empty())
-        {
-            if (!config_.probe->discardAvailable())
-                return;
-            auto message = std::move(failure_after_cleanup_);
-            failure_after_cleanup_.clear();
-            fail(std::move(message));
             return;
         }
         if (stop_requested_.load(std::memory_order_acquire))
         {
-            progressStop();
-            return;
-        }
-        if (!tryConsumeConcurrentSample())
-            return;
-        finalizeAttempt();
-    }
-
-    void MoEOverlayEconomyCalibrationController::finalizeAttempt()
-    {
-        if (!baseline_sample_ || !stage_interval_ || local_rows_.empty())
-        {
-            throw std::logic_error(
-                "ExpertOverlay calibration attempted to finalize incomplete evidence");
-        }
-        const bool exact_overlap =
-            concurrent_sample_ &&
-            concurrent_sample_->whollyContains(
-                stage_interval_->begin_steady_nanoseconds,
-                stage_interval_->end_steady_nanoseconds);
-        MoEOverlayCalibrationAttemptEvidence evidence{
-            .calibration_sequence = calibration_sequence_,
-            .coordinate = currentCoordinate(),
-            .source = currentSource(),
-            .workload = baseline_sample_->workload,
-            .baseline_nanoseconds = baseline_sample_->durationNanoseconds(),
-            .concurrent_nanoseconds = concurrent_sample_
-                                          ? concurrent_sample_
-                                                ->durationNanoseconds()
-                                          : 0,
-            .exact_overlap = exact_overlap,
-            .local_measurements = local_rows_,
-        };
-        if (!evidence.valid())
-        {
-            throw std::logic_error(
-                "ExpertOverlay calibration constructed invalid attempt evidence");
-        }
-
-        if (config_.evidence_exchange)
-        {
-            std::string exchange_error;
-            if (!config_.evidence_exchange->beginAttempt(
-                    evidence, &exchange_error))
-            {
-                throw std::logic_error(
-                    exchange_error.empty()
-                        ? "ExpertOverlay calibration failed to begin its all-rank evidence exchange"
-                        : std::move(exchange_error));
-            }
-            pending_attempt_evidence_ = std::move(evidence);
+            local_rows_.clear();
             state_.store(
-                MoEOverlayEconomyCalibrationState::AwaitEvidenceExchange,
+                MoEOverlayEconomyCalibrationState::Stopped,
                 std::memory_order_release);
             return;
         }
-
-        if (!exact_overlap)
+        if (!config_.evidence_exchange)
         {
-            partial_overlap_rejections_.fetch_add(
-                1, std::memory_order_relaxed);
-            recordCalibrationRejection(
-                config_.perf_device,
-                currentConcurrentRequest(),
-                "local_interval_not_contained");
-            retryAttempt();
+            recordCompletedWave(local_rows_);
             return;
         }
-        recordAcceptedAttempt(
-            MoEOverlayMigrationMeasurementMerger::merge({local_rows_}),
-            evidence.baseline_nanoseconds,
-            evidence.concurrent_nanoseconds);
+
+        const MoEOverlayMigrationProfileEvidence evidence{
+            .profile_sequence = active_profile_sequence_,
+            .coordinate = currentCoordinate(),
+            .local_measurements = local_rows_,
+        };
+        std::string exchange_error;
+        if (!config_.evidence_exchange->beginMigrationProfile(
+                evidence, &exchange_error))
+        {
+            fail(
+                exchange_error.empty()
+                    ? "ExpertOverlay could not begin migration-profile evidence exchange"
+                    : std::move(exchange_error));
+            return;
+        }
+        evidence_exchange_active_ = true;
+        evidence_exchanges_started_.fetch_add(1, std::memory_order_relaxed);
+        state_.store(
+            MoEOverlayEconomyCalibrationState::AwaitEvidenceExchange,
+            std::memory_order_release);
     }
 
     void MoEOverlayEconomyCalibrationController::pollEvidenceExchange()
     {
-        if (!config_.evidence_exchange || !pending_attempt_evidence_)
+        if (!config_.evidence_exchange || !evidence_exchange_active_)
         {
             throw std::logic_error(
-                "ExpertOverlay calibration has no active evidence exchange");
+                "ExpertOverlay transfer profiler lost evidence exchange ownership");
         }
-        MoEOverlayCalibrationAttemptResult result;
+        MoEOverlayMigrationProfileResult result;
         std::string error;
-        const auto progress = config_.evidence_exchange->pollAttempt(
+        const auto progress = config_.evidence_exchange->pollMigrationProfile(
             &result, &error);
         if (progress == MoEOverlayResidencyWaveProgress::Pending)
             return;
-        if (progress != MoEOverlayResidencyWaveProgress::Ready)
+        evidence_exchange_active_ = false;
+        if (progress != MoEOverlayResidencyWaveProgress::Ready ||
+            !result.valid())
         {
-            throw std::runtime_error(
+            fail(
                 error.empty()
-                    ? "ExpertOverlay calibration evidence exchange failed"
+                    ? "ExpertOverlay migration-profile evidence exchange failed"
                     : std::move(error));
-        }
-        if (!result.valid())
-        {
-            throw std::logic_error(
-                "ExpertOverlay calibration exchange returned an invalid result");
-        }
-        pending_attempt_evidence_.reset();
-        if (!result.accepted)
-        {
-            partial_overlap_rejections_.fetch_add(
-                1, std::memory_order_relaxed);
-            recordCalibrationRejection(
-                config_.perf_device,
-                currentConcurrentRequest(),
-                "distributed_overlap_vote_rejected");
-            retryAttempt();
             return;
         }
-        recordAcceptedAttempt(
-            result.measurements,
-            result.baseline_nanoseconds,
-            result.concurrent_nanoseconds);
+        evidence_exchanges_completed_.fetch_add(1, std::memory_order_relaxed);
+        recordCompletedWave(result.measurements);
     }
 
-    void MoEOverlayEconomyCalibrationController::recordAcceptedAttempt(
-        const std::vector<MoEOverlayCompletedMigrationMeasurement> &rows,
-        std::uint64_t baseline_nanoseconds,
-        std::uint64_t concurrent_nanoseconds)
+    void MoEOverlayEconomyCalibrationController::recordCompletedWave(
+        const std::vector<MoEOverlayCompletedMigrationMeasurement> &rows)
     {
         std::string ledger_error;
         if (!config_.ledger->recordCompletedWave(rows, &ledger_error))
         {
             throw std::logic_error(
                 ledger_error.empty()
-                    ? "ExpertOverlay calibration ledger rejected migration evidence"
+                    ? "ExpertOverlay transfer-profile ledger rejected timing rows"
                     : std::move(ledger_error));
         }
-        const auto &job = jobs_[job_index_];
-        for (const auto coordinate : {
-                 MoEOverlayMigrationMeasurementCoordinate{
-                     .source_participant = job.first_participant,
-                     .destination_participant = job.second_participant,
-                     .layer = job.layer,
-                 },
-                 MoEOverlayMigrationMeasurementCoordinate{
-                     .source_participant = job.second_participant,
-                     .destination_participant = job.first_participant,
-                     .layer = job.layer,
-                 }})
-        {
-            if (!config_.ledger->recordInterferenceSample(
-                    coordinate,
-                    currentSource(),
-                    baseline_nanoseconds,
-                    concurrent_nanoseconds,
-                    &ledger_error))
-            {
-                throw std::logic_error(
-                    ledger_error.empty()
-                        ? "ExpertOverlay calibration ledger rejected interference evidence"
-                        : std::move(ledger_error));
-            }
-        }
-        exact_overlap_samples_.fetch_add(1, std::memory_order_relaxed);
         accepted_pairs_.fetch_add(1, std::memory_order_relaxed);
-        const auto tags = PerfStatsCollector::Tags{
-            {"calibration_sequence",
-             std::to_string(calibration_sequence_)},
-            {"layer", std::to_string(job.layer)},
-            {"source", calibrationSourceName(currentSource())},
-            {"source_participant",
-             std::to_string(job.first_participant)},
-            {"destination_participant",
-             std::to_string(job.second_participant)},
-            {"observation", std::to_string(sample_index_)},
-        };
-        const auto add_timing = [&]
-            (const char *name, std::uint64_t nanoseconds)
-        {
-            PerfStatsCollector::addCounter(
-                "moe_overlay_residency",
-                name,
-                static_cast<double>(nanoseconds),
-                "maintenance",
-                config_.perf_device,
-                tags);
-        };
-        PerfStatsCollector::addCounter(
-            "moe_overlay_residency",
-            "economy_calibration_pairs_accepted",
-            1.0,
-            "maintenance",
+        recordProfileCounter(
             config_.perf_device,
-            tags);
-
-        /*
-         * Publish the exact accepted pair rather than only its final robust
-         * median.  The maximum merged row is the distributed pair-swap
-         * critical path; inference delta remains separate so operators can
-         * distinguish movement latency from physical resource contention.
-         */
-        const auto slowest_row = std::max_element(
-            rows.begin(),
-            rows.end(),
-            [](const auto &left, const auto &right)
-            {
-                return left.wave_wall_nanoseconds <
-                       right.wave_wall_nanoseconds;
-            });
-        add_timing(
-            "economy_calibration_wave_wall_ns",
-            slowest_row->wave_wall_nanoseconds);
-        add_timing(
-            "economy_calibration_inference_baseline_ns",
-            baseline_nanoseconds);
-        add_timing(
-            "economy_calibration_inference_concurrent_ns",
-            concurrent_nanoseconds);
-        add_timing(
-            "economy_calibration_inference_interference_ns",
-            concurrent_nanoseconds > baseline_nanoseconds
-                ? concurrent_nanoseconds - baseline_nanoseconds
-                : 0u);
-        advanceAcceptedPair();
+            "economy_transport_profile_waves_completed",
+            1.0,
+            {{"source_participant",
+              std::to_string(currentCoordinate().source_participant)},
+             {"destination_participant",
+              std::to_string(currentCoordinate().destination_participant)},
+             {"layer", std::to_string(currentCoordinate().layer)}});
+        advanceProfileWave();
     }
 
-    void MoEOverlayEconomyCalibrationController::retryAttempt()
+    void MoEOverlayEconomyCalibrationController::advanceProfileWave()
     {
-        baseline_sample_.reset();
-        concurrent_sample_.reset();
-        stage_interval_.reset();
         local_rows_.clear();
-        pending_attempt_evidence_.reset();
         stage_completed_ = false;
-        stage_dispatch_started_ = false;
-        failure_after_cleanup_.clear();
-        state_.store(
-            MoEOverlayEconomyCalibrationState::ArmBaseline,
-            std::memory_order_release);
-    }
-
-    void MoEOverlayEconomyCalibrationController::advanceAcceptedPair()
-    {
-        baseline_sample_.reset();
-        concurrent_sample_.reset();
-        stage_interval_.reset();
-        local_rows_.clear();
-        pending_attempt_evidence_.reset();
-        stage_completed_ = false;
-        stage_dispatch_started_ = false;
-
+        active_profile_sequence_ = 0;
         ++sample_index_;
         if (sample_index_ >=
             config_.ledger->requiredObservationsPerCoordinate())
         {
             sample_index_ = 0;
-            ++phase_index_;
-        }
-        if (phase_index_ >= phases_.size())
-        {
-            phase_index_ = 0;
             ++job_index_;
         }
-        if (job_index_ >= jobs_.size())
+        if (job_index_ < jobs_.size())
         {
-            if (!config_.ledger->ready())
-            {
-                throw std::logic_error(
-                    "ExpertOverlay calibration exhausted jobs before its ledger became ready");
-            }
-            sealed_ = config_.ledger->seal();
             state_.store(
-                MoEOverlayEconomyCalibrationState::Complete,
+                MoEOverlayEconomyCalibrationState::StartWave,
                 std::memory_order_release);
-            PerfStatsCollector::addCounter(
-                "moe_overlay_residency",
-                "economy_calibration_complete",
-                1.0,
-                "maintenance",
-                config_.perf_device,
-                {{"blocking", "false"}, {"movement", "real"}});
             return;
         }
+        if (!config_.ledger->ready())
+        {
+            throw std::logic_error(
+                "ExpertOverlay transfer profiler exhausted its finite jobs before the ledger became ready");
+        }
+        sealed_ = config_.ledger->seal();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - profiling_started_at_)
+                                 .count();
         state_.store(
-            MoEOverlayEconomyCalibrationState::ArmBaseline,
+            MoEOverlayEconomyCalibrationState::Complete,
             std::memory_order_release);
+        recordProfileCounter(
+            config_.perf_device,
+            "economy_transport_profile_complete",
+            1.0,
+            {{"elapsed_nanoseconds", std::to_string(std::max<int64_t>(1, elapsed))},
+             {"waves", std::to_string(expected_profile_waves_)}});
+        LOG_INFO(
+            "[ExpertOverlay][Economy] Transport profile complete waves="
+            << expected_profile_waves_ << " elapsed_ms="
+            << (std::max<int64_t>(1, elapsed) / 1000000.0)
+            << " synthetic_inference=false");
+    }
+
+    void MoEOverlayEconomyCalibrationController::progressStop()
+    {
+        if (active_wave_)
+        {
+            if (state() != MoEOverlayEconomyCalibrationState::AbortCleanup)
+                beginAbort();
+            pollAbortCleanup();
+            return;
+        }
+        if (evidence_exchange_active_)
+        {
+            MoEOverlayMigrationProfileResult ignored;
+            std::string error;
+            const auto progress =
+                config_.evidence_exchange->pollMigrationProfile(
+                    &ignored, &error);
+            if (progress == MoEOverlayResidencyWaveProgress::Pending)
+                return;
+            evidence_exchange_active_ = false;
+            if (progress != MoEOverlayResidencyWaveProgress::Ready)
+            {
+                fail(
+                    error.empty()
+                        ? "ExpertOverlay transfer-profile exchange failed while stopping"
+                        : std::move(error));
+                return;
+            }
+        }
+        local_rows_.clear();
+        state_.store(
+            MoEOverlayEconomyCalibrationState::Stopped,
+            std::memory_order_release);
+    }
+
+    void MoEOverlayEconomyCalibrationController::requestStop() noexcept
+    {
+        stop_requested_.store(true, std::memory_order_release);
     }
 
     void MoEOverlayEconomyCalibrationController::fail(
@@ -979,7 +537,7 @@ namespace llaminar2
         if (!healthy_.exchange(false, std::memory_order_acq_rel))
             return;
         if (message.empty())
-            message = "Unknown ExpertOverlay economy calibration failure";
+            message = "Unknown ExpertOverlay transfer-profile failure";
         {
             std::lock_guard<std::mutex> lock(failure_mutex_);
             failure_message_ = std::move(message);
@@ -987,93 +545,6 @@ namespace llaminar2
         fatal_failures_.fetch_add(1, std::memory_order_relaxed);
         state_.store(
             MoEOverlayEconomyCalibrationState::Failed,
-            std::memory_order_release);
-    }
-
-    void MoEOverlayEconomyCalibrationController::
-        deferFailureUntilProbeQuiescent(std::string message) noexcept
-    {
-        if (message.empty())
-            message = "Unknown ExpertOverlay economy calibration failure";
-        if (!failure_after_cleanup_.empty())
-        {
-            /* The first causal diagnostic remains authoritative through cleanup. */
-            if (config_.probe->discardAvailable())
-            {
-                auto retained = std::move(failure_after_cleanup_);
-                failure_after_cleanup_.clear();
-                fail(std::move(retained));
-                return;
-            }
-            state_.store(
-                MoEOverlayEconomyCalibrationState::AwaitLateConcurrentSample,
-                std::memory_order_release);
-            return;
-        }
-        if (config_.probe->discardAvailable())
-        {
-            fail(std::move(message));
-            return;
-        }
-        failure_after_cleanup_ = std::move(message);
-        state_.store(
-            MoEOverlayEconomyCalibrationState::AwaitLateConcurrentSample,
-            std::memory_order_release);
-    }
-
-    void MoEOverlayEconomyCalibrationController::progressStop()
-    {
-        if (config_.evidence_exchange &&
-            !config_.evidence_exchange->idle())
-        {
-            MoEOverlayCalibrationAttemptResult discarded;
-            std::string error;
-            const auto progress = config_.evidence_exchange->pollAttempt(
-                &discarded, &error);
-            if (progress == MoEOverlayResidencyWaveProgress::Pending)
-                return;
-            if (progress != MoEOverlayResidencyWaveProgress::Ready)
-            {
-                fail(
-                    error.empty()
-                        ? "ExpertOverlay calibration could not drain its evidence exchange"
-                        : std::move(error));
-                return;
-            }
-            pending_attempt_evidence_.reset();
-        }
-        if (active_wave_)
-        {
-            if (state() != MoEOverlayEconomyCalibrationState::AbortCleanup)
-            {
-                (void)config_.probe->discardAvailable();
-                active_wave_->abortStaged();
-                waves_aborted_.fetch_add(1, std::memory_order_relaxed);
-                state_.store(
-                    MoEOverlayEconomyCalibrationState::AbortCleanup,
-                    std::memory_order_release);
-                return;
-            }
-            pollAbortCleanup();
-            return;
-        }
-
-        if (!config_.probe->discardAvailable())
-        {
-            state_.store(
-                MoEOverlayEconomyCalibrationState::
-                    AwaitLateConcurrentSample,
-                std::memory_order_release);
-            return;
-        }
-        baseline_sample_.reset();
-        concurrent_sample_.reset();
-        stage_interval_.reset();
-        local_rows_.clear();
-        stage_completed_ = false;
-        stage_dispatch_started_ = false;
-        state_.store(
-            MoEOverlayEconomyCalibrationState::Stopped,
             std::memory_order_release);
     }
 
@@ -1088,8 +559,7 @@ namespace llaminar2
         return healthy_.load(std::memory_order_acquire);
     }
 
-    std::string
-    MoEOverlayEconomyCalibrationController::failureMessage() const
+    std::string MoEOverlayEconomyCalibrationController::failureMessage() const
     {
         std::lock_guard<std::mutex> lock(failure_mutex_);
         return failure_message_;
@@ -1100,39 +570,24 @@ namespace llaminar2
     {
         return {
             .polls = polls_.load(std::memory_order_relaxed),
-            .baseline_arms = baseline_arms_.load(std::memory_order_relaxed),
-            .baseline_samples = baseline_samples_.load(std::memory_order_relaxed),
-            .wave_start_attempts = wave_start_attempts_.load(std::memory_order_relaxed),
+            .wave_start_attempts =
+                wave_start_attempts_.load(std::memory_order_relaxed),
             .waves_started = waves_started_.load(std::memory_order_relaxed),
             .waves_deferred = waves_deferred_.load(std::memory_order_relaxed),
-            .concurrent_arms = concurrent_arms_.load(std::memory_order_relaxed),
-            .concurrent_launch_wait_polls =
-                concurrent_launch_wait_polls_.load(std::memory_order_relaxed),
-            .concurrent_launches_during_inference =
-                concurrent_launches_during_inference_.load(
-                    std::memory_order_relaxed),
-            .concurrent_launch_misses =
-                concurrent_launch_misses_.load(std::memory_order_relaxed),
-            .concurrent_samples = concurrent_samples_.load(std::memory_order_relaxed),
-            .exact_overlap_samples = exact_overlap_samples_.load(std::memory_order_relaxed),
-            .partial_overlap_rejections = partial_overlap_rejections_.load(std::memory_order_relaxed),
-            .workload_pair_rejections = workload_pair_rejections_.load(std::memory_order_relaxed),
+            .waves_completed = waves_completed_.load(std::memory_order_relaxed),
             .waves_aborted = waves_aborted_.load(std::memory_order_relaxed),
+            .evidence_exchanges_started =
+                evidence_exchanges_started_.load(std::memory_order_relaxed),
+            .evidence_exchanges_completed =
+                evidence_exchanges_completed_.load(std::memory_order_relaxed),
             .accepted_pairs = accepted_pairs_.load(std::memory_order_relaxed),
             .fatal_failures = fatal_failures_.load(std::memory_order_relaxed),
         };
     }
 
     const MoEOverlaySealedMigrationMeasurements *
-    MoEOverlayEconomyCalibrationController::sealedMeasurements()
-        const noexcept
+    MoEOverlayEconomyCalibrationController::sealedMeasurements() const noexcept
     {
-        /* Complete is release-published only after `sealed_` is initialized. */
-        if (state_.load(std::memory_order_acquire) !=
-            MoEOverlayEconomyCalibrationState::Complete)
-        {
-            return nullptr;
-        }
         return sealed_ ? &*sealed_ : nullptr;
     }
 } // namespace llaminar2

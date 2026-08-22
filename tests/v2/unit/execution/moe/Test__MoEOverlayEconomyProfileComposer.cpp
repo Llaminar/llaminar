@@ -717,7 +717,7 @@ namespace llaminar2::test
             .wave_wall_nanoseconds = 110,
             .wave_sample_count = 5,
             .inference_interference_nanoseconds = 0,
-            .interference_sample_count = 5,
+            .interference_sample_count = 0,
         };
         MoEOverlayParticipantLayerMigrationMeasurement earlier{
             .source_participant = 0,
@@ -731,8 +731,11 @@ namespace llaminar2::test
             },
             .wave_wall_nanoseconds = 70,
             .wave_sample_count = 3,
-            .inference_interference_nanoseconds = 7,
-            .interference_sample_count = 3,
+            // Transfer profiling is finite setup evidence. Runtime service
+            // interference is observed independently by ordinary inference
+            // telemetry and must not be folded into this sealed row.
+            .inference_interference_nanoseconds = 0,
+            .interference_sample_count = 0,
         };
 
         const auto normalized =
@@ -742,7 +745,7 @@ namespace llaminar2::test
         EXPECT_EQ(normalized[0].source_participant, 0);
         EXPECT_EQ(normalized[0].destination_participant, 1);
         EXPECT_EQ(normalized[0].transfer_and_repack_ns, 70u);
-        EXPECT_EQ(normalized[0].inference_interference_ns, 7u);
+        EXPECT_EQ(normalized[0].inference_interference_ns, 0u);
         EXPECT_EQ(normalized[1].source_participant, 2);
         EXPECT_EQ(normalized[1].destination_participant, 0);
         /* max(whole wave 110, longest lane 120), never 90+120+100. */

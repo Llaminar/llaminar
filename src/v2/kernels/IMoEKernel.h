@@ -21,6 +21,8 @@
 #include "../execution/config/RoutedExpertPolicy.h"
 #include "../execution/moe/MoEOverlayActivationPacketABI.h"
 #include "../execution/moe/MoEOverlayNodeLocalRouteExchangeABI.h"
+#include "../execution/moe/MoEOverlayDeviceControllerKernels.h"
+#include "../execution/moe/DeviceMoEOverlayServiceTelemetry.h"
 #include "../execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "../execution/moe/DeviceMoERebalanceController.h"
 #include "../tensors/TensorKernels.h"
@@ -45,6 +47,15 @@ namespace llaminar2
         std::vector<float> router_logits;  ///< [seq_len * num_experts] post-softmax probs
     };
 
+    /**
+     * @brief Select the sole weight-descriptor authority for one captured MoE
+     *        stage.
+     *
+     * Routing ids and weights may come from device runtime state in either
+     * mode. This value controls only expert projection descriptors and is
+     * immutable graph identity: setup, decode, grouped prefill, and MTP replay
+     * must all carry the same selection.
+     */
     enum class MoEDecodeDescriptorSource : uint8_t
     {
         /// Top-k ids/weights come from the runtime table, but expert weight
@@ -710,18 +721,30 @@ namespace llaminar2
          * Returns an opaque table id owned by the kernel implementation, or -1 if
          * the backend cannot use a persistent descriptor table. Entries may be
          * invalid for non-local experts; grouped table decode validates active
-         * expert ids before launching.
+         * expert ids before launching. A runtime-placement table must certify
+         * the complete capture-stable execution-format envelope reachable from
+         * each descriptor's authenticated source identity.
+         *
+         * @param down_descs Sparse host descriptor table indexed by expert id.
+         * @param num_experts Logical expert count and table entry count.
+         * @param d_model Down-projection row count.
+         * @param intermediate Down-projection reduction width.
+         * @param descriptor_source Immutable graph-selected descriptor authority.
+         * @return Persistent backend table id, or -1 on contract failure.
          */
         virtual int uploadGroupedExpertDownDescriptorTable(
             const DeviceNativeVNNIMatrixDesc *down_descs,
             int num_experts,
             int d_model,
-            int intermediate)
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source =
+                MoEDecodeDescriptorSource::StaticDescriptorTable)
         {
             (void)down_descs;
             (void)num_experts;
             (void)d_model;
             (void)intermediate;
+            (void)descriptor_source;
             return -1;
         }
 
@@ -731,20 +754,32 @@ namespace llaminar2
          * Returns an opaque table id owned by the kernel implementation, or -1 if
          * the backend cannot use the descriptor tables. Entries may be invalid
          * for non-local experts; grouped table decode validates active expert ids
-         * before launching.
+         * before launching. Runtime-placement tables widen their physical
+         * decoder envelope before capture without changing source arithmetic.
+         *
+         * @param gate_descs Sparse gate descriptors indexed by expert id.
+         * @param up_descs Sparse up descriptors indexed by expert id.
+         * @param num_experts Logical expert count and table entry count.
+         * @param d_model Gate/up reduction width.
+         * @param intermediate Gate/up row count.
+         * @param descriptor_source Immutable graph-selected descriptor authority.
+         * @return Persistent backend table id, or -1 on contract failure.
          */
         virtual int uploadGroupedExpertGateUpDescriptorTables(
             const DeviceNativeVNNIMatrixDesc *gate_descs,
             const DeviceNativeVNNIMatrixDesc *up_descs,
             int num_experts,
             int d_model,
-            int intermediate)
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source =
+                MoEDecodeDescriptorSource::StaticDescriptorTable)
         {
             (void)gate_descs;
             (void)up_descs;
             (void)num_experts;
             (void)d_model;
             (void)intermediate;
+            (void)descriptor_source;
             return -1;
         }
 
@@ -890,9 +925,11 @@ namespace llaminar2
         /**
          * @brief Grouped single-token gate/up projections using persistent descriptor tables.
          *
-         * Implementations should write gate_outputs[i] and up_outputs[i] for each
-         * active expert slot i. The default returns false so stages can fall back
-         * to multiply_fused_tensor().
+         * Implementations write gate_outputs[i] and up_outputs[i] for each active
+         * expert slot. Host-known expert metadata is immutable after its owner
+         * slot is prepared for capture; callers with changing routes use
+         * groupedExpertGateUpDecodeFromRouting() or the runtime-table variant.
+         * The default returns false.
          */
         virtual bool groupedExpertGateUpDecodeFromTable(
             const TensorBase *input,
@@ -983,8 +1020,10 @@ namespace llaminar2
         /**
          * @brief Grouped decode path using a persistent descriptor table.
          *
-         * The active expert ids are uploaded as tiny per-call routing metadata;
-         * the down projection descriptor is selected on device from the table.
+         * The active expert ids and weights belong to the immutable captured
+         * owner slot prepared during setup; the down descriptor is selected on
+         * device from the table. Callers with changing routing metadata use
+         * groupedExpertDownDecodeFromRouting() or the runtime-table variant.
          */
         virtual bool groupedExpertDownDecodeFromTable(
             ITensor *const *gate_tensors,
@@ -1076,6 +1115,13 @@ namespace llaminar2
          *        [1, top_k, d_model] publication target. When supplied, this
          *        tensor is the producer's sole output and @p output may not yet
          *        have device storage.
+         * @param runtime_layer Optional live placement/histogram authority. When
+         *        @p descriptor_source selects RuntimePlacementTable, the backend
+         *        filters the explicit route through this epoch-pinned bank and
+         *        records selected/local demand before resolving descriptors.
+         * @param descriptor_source Select immutable setup descriptors or the
+         *        mutable runtime placement bank. Runtime placement requires a
+         *        non-null @p runtime_layer and forbids a host ownership mask.
          * @return true after the output write has been published on the exact
          *         producer stream; false on any contract or launch failure.
          */
@@ -1090,7 +1136,10 @@ namespace llaminar2
             int d_model,
             int intermediate,
             const uint8_t *expert_mask = nullptr,
-            ITensor *canonical_route_contributions = nullptr)
+            ITensor *canonical_route_contributions = nullptr,
+            DeviceMoELayerRuntime *runtime_layer = nullptr,
+            MoEDecodeDescriptorSource descriptor_source =
+                MoEDecodeDescriptorSource::StaticDescriptorTable)
         {
             (void)input;
             (void)routing_indices;
@@ -1103,6 +1152,8 @@ namespace llaminar2
             (void)intermediate;
             (void)expert_mask;
             (void)canonical_route_contributions;
+            (void)runtime_layer;
+            (void)descriptor_source;
             return false;
         }
 
@@ -1586,9 +1637,180 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Gate root payload reuse on device-owned peer acknowledgements.
+         *
+         * Implementations enqueue exactly one graph-capturable wait kernel on
+         * @p launch.stream. TransferEngine inserts the dense D2H copy after
+         * this edge; no host progress or device synchronization is permitted.
+         */
+        virtual bool beginNodeLocalDensePublication(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalDensePublicationLaunch &publication)
+        {
+            (void)launch;
+            (void)publication;
+            return false;
+        }
+
+        /**
+         * @brief Release a root D2H-complete dense payload to every peer.
+         *
+         * The implementation advances the monotonic root epoch with a
+         * system-release store on the exact stream after TransferEngine's copy.
+         */
+        virtual bool finishNodeLocalDensePublication(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalDensePublicationLaunch &publication)
+        {
+            (void)launch;
+            (void)publication;
+            return false;
+        }
+
+        /**
+         * @brief Acquire the next dense root publication on one peer stream.
+         *
+         * TransferEngine inserts the peer's H2D copy only after this device
+         * wait, preserving root-to-peer visibility inside the captured graph.
+         */
+        virtual bool beginNodeLocalDensePublicationConsume(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalDensePublicationLaunch &publication)
+        {
+            (void)launch;
+            (void)publication;
+            return false;
+        }
+
+        /**
+         * @brief Acknowledge peer H2D completion to the root producer.
+         *
+         * The peer is the sole writer of its cache-line acknowledgement. The
+         * root may not overwrite the shared bank until every peer publishes it.
+         */
+        virtual bool finishNodeLocalDensePublicationConsume(
+            const MoEKernelLaunchContext &launch,
+            const MoENodeLocalDensePublicationLaunch &publication)
+        {
+            (void)launch;
+            (void)publication;
+            return false;
+        }
+
         // =================================================================
         // Captured ExpertOverlay epoch admission and maintenance
         // =================================================================
+
+        /**
+         * @brief Enqueue the start marker for one real routed-expert stage.
+         *
+         * GPU implementations write only the graph-local device sample. They
+         * perform no mapped write, allocation, copy, or synchronization.
+         *
+         * @param launch Exact non-null inference stream.
+         * @param sample Stable graph-workspace cursor for this stage.
+         * @return True when the backend accepted the graph-capturable launch.
+         */
+        virtual bool beginMoEOverlayServiceTelemetry(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoEOverlayServiceTelemetrySample *sample)
+        {
+            (void)launch;
+            (void)sample;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue service accumulation after routed expert publication.
+         *
+         * The finish kernel derives exact locally executed activations from
+         * the runtime histogram generation (or grouped expert counts), converts
+         * the device's steady clock to nanoseconds, and atomically adds one
+         * coherent sample to @p layer_telemetry.
+         *
+         * @param launch Exact producer stream containing all expert work.
+         * @param runtime_layer Device runtime whose route evidence was consumed.
+         * @param layer_telemetry Three phase cells for this model layer.
+         * @param sample Matching graph-local start marker and route baselines.
+         * @param num_experts Exact runtime expert count.
+         * @param hint Semantic phase identity or device-detected Auto.
+         * @param runtime_graph_role Optional device-owned authenticated phase
+         *        authority. When non-null it supersedes @p hint at execution.
+         * @return True when the backend accepted the graph-capturable launch.
+         */
+        virtual bool finishMoEOverlayServiceTelemetry(
+            const MoEKernelLaunchContext &launch,
+            DeviceMoELayerRuntime *runtime_layer,
+            DeviceMoEOverlayServiceTelemetryCell *layer_telemetry,
+            DeviceMoEOverlayServiceTelemetrySample *sample,
+            std::uint32_t num_experts,
+            MoEOverlayServicePhaseHint hint,
+            const MoEOverlayInferenceGraphRole *runtime_graph_role = nullptr)
+        {
+            (void)launch;
+            (void)runtime_layer;
+            (void)layer_telemetry;
+            (void)sample;
+            (void)num_experts;
+            (void)hint;
+            (void)runtime_graph_role;
+            return false;
+        }
+
+        /**
+         * @brief Publish cumulative service totals at a maintenance boundary.
+         *
+         * The finite kernel copies device-local cells into this participant's
+         * mapped record and release-publishes a new generation after a system
+         * fence. It is never launched from an inference graph.
+         *
+         * @param launch Exact dedicated maintenance stream.
+         * @param telemetry First local `[layer][phase]` accumulator.
+         * @param samples First per-layer timing cursor.
+         * @param layer_count Exact model layer count.
+         * @param participant_id Global dense overlay participant id.
+         * @param publication Participant-owned mapped destination.
+         * @return True when the backend accepted the graph-capturable launch.
+         */
+        virtual bool publishMoEOverlayServiceTelemetry(
+            const MoEKernelLaunchContext &launch,
+            const DeviceMoEOverlayServiceTelemetryCell *telemetry,
+            const DeviceMoEOverlayServiceTelemetrySample *samples,
+            std::uint32_t layer_count,
+            std::int32_t participant_id,
+            MoEOverlayDeviceServiceTelemetryPublicationHeader *publication)
+        {
+            (void)launch;
+            (void)telemetry;
+            (void)samples;
+            (void)layer_count;
+            (void)participant_id;
+            (void)publication;
+            return false;
+        }
+
+        /**
+         * @brief Execute one topology-wide mapped controller transition.
+         *
+         * CUDA and HIP implementations enqueue one fixed graph-capturable
+         * kernel on @p launch.stream. The leader GPU is the sole writer of
+         * global lifecycle/command state; a follower may write only its own
+         * group record. Semantic completion remains device-resident and is
+         * consumed by the next action or a terminal diagnostic read.
+         *
+         * @param launch Exact non-null graph or maintenance stream.
+         * @param action Immutable mapped aliases and typed transition.
+         * @return True when the backend accepted the enqueue.
+         */
+        virtual bool runMoEOverlayDeviceControllerAction(
+            const MoEKernelLaunchContext &launch,
+            const MoEOverlayDeviceControllerActionLaunch &action)
+        {
+            (void)launch;
+            (void)action;
+            return false;
+        }
 
         /**
          * @brief Acquire the currently published immutable placement bank.
@@ -1602,6 +1824,18 @@ namespace llaminar2
          * @param control Authoritative backend-resident epoch control block.
          * @param ticket Persistent request ticket, overwritten on success.
          * @param status Persistent semantic completion record.
+         * @param external_admission_epoch Optional system-visible global epoch.
+         *        When present, acquire selects that exact Published/Retiring
+         *        bank instead of the participant-local selector. This closes
+         *        multi-participant publication fan-out without blocking.
+         * @param admission_barrier Optional node-local continuation barrier.
+         *        When present, every symmetric participant raises its local RCU
+         *        guard before the publisher freezes @p external_admission_epoch.
+         * @param peer_placement_epoch Optional heterogeneous-follower source.
+         *        The device waits for an activation identity newer than the
+         *        endpoint's retained grant, authenticates the matching packet
+         *        descriptor, and selects its exact placement epoch. It is
+         *        mutually exclusive with the continuation admission inputs.
          * @return True when the operation executed or was enqueued; inspect
          *         @p status through an ordered consumer for semantic success.
          */
@@ -1609,12 +1843,18 @@ namespace llaminar2
             const MoEKernelLaunchContext &launch,
             DeviceMoEOverlayEpochControl *control,
             DeviceMoEOverlayEpochTicket *ticket,
-            DeviceMoEOverlayEpochStatus *status)
+            DeviceMoEOverlayEpochStatus *status,
+            const std::uint64_t *external_admission_epoch = nullptr,
+            DeviceMoEOverlayEpochAdmissionBarrierBinding admission_barrier = {},
+            MoEOverlayPeerPlacementEpochBinding peer_placement_epoch = {})
         {
             (void)launch;
             (void)control;
             (void)ticket;
             (void)status;
+            (void)external_admission_epoch;
+            (void)admission_barrier;
+            (void)peer_placement_epoch;
             return false;
         }
 
@@ -1821,11 +2061,20 @@ namespace llaminar2
          *
          * The graph-captured rebalance path all-gathers a flat
          * [wave_layer][expert] histogram from every participant before launching
-         * runDeviceRebalanceController().  GPU backends implement this as a
-         * small device kernel that reads DeviceMoELayerRuntime::decode_histogram
-         * directly from the mirrored runtime table; no host sync or host copy is
-         * permitted on this path.  The optional wave/controller pointers let the
-         * device packer follow the same rolling wave cursor as the controller.
+         * runDeviceRebalanceController(). GPU backends implement this as a small
+         * device kernel that reads the selected phase counters directly from the
+         * mirrored runtime table; no host sync or host copy is permitted on this
+         * path. The optional wave/controller pointers let the device packer follow
+         * the same rolling wave cursor as the controller.
+         *
+         * @param histogram_source_mask Bit mask of
+         *        `moe_runtime_abi::HistogramSource` values to combine. The default
+         *        preserves the graph-native same-domain aggregate policy.
+         * @param previous_activation_counts Optional device-owned cumulative
+         *        baseline indexed by `[layer][expert]`. When present, the packer
+         *        publishes `current - previous` and advances the baseline in the
+         *        same kernel. A counter-generation reset is represented by
+         *        `current < previous` and begins a fresh window at `current`.
          */
         virtual bool packDeviceRebalanceHistograms(
             const MoEKernelLaunchContext &launch,
@@ -1834,7 +2083,10 @@ namespace llaminar2
             const DeviceMoERebalanceConfig &config,
             const DeviceMoERebalanceWaveState *wave_state = nullptr,
             const DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
-            uint32_t command_buffer_count = 1)
+            uint32_t command_buffer_count = 1,
+            uint32_t histogram_source_mask =
+                moe_runtime_abi::kAllHistogramSourcesMask,
+            uint64_t *previous_activation_counts = nullptr)
         {
             (void)launch;
             (void)runtime_layers;
@@ -1843,6 +2095,8 @@ namespace llaminar2
             (void)wave_state;
             (void)controller_state;
             (void)command_buffer_count;
+            (void)histogram_source_mask;
+            (void)previous_activation_counts;
             return false;
         }
 

@@ -17,6 +17,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "kernels/common/DeviceNativeVNNIContributionContract.h"
+
 #include <cstdint>
 #include <iterator>
 
@@ -126,7 +128,9 @@ namespace llaminar2::cuda_native_vnni
      * Unused correction arguments are compiled away for codebooks that do not
      * need them. Keeping one complete signature is intentional: it makes a new
      * format's correction requirements visible at every execution engine and
-     * prevents a tensor-core-only approximation from quietly appearing.
+     * prevents a tensor-core-only approximation from quietly appearing. The
+     * final scale/correction tree delegates to the cross-backend contribution
+     * contract, so expert residency cannot select a different expression.
      *
      * @tparam CODEBOOK_ID NativeVNNI codebook identifier.
      * @param dot_lo Integer dot product for the low or complete 32-value block.
@@ -169,10 +173,13 @@ namespace llaminar2::cuda_native_vnni
         {
             const float scale_lo = fp16_bits_to_float(scale_bits);
             const float scale_hi = fp16_bits_to_float(secondary_bits);
-            const float dot_term = __fadd_rn(
-                __fmul_rn(scale_lo, static_cast<float>(dot_lo)),
-                __fmul_rn(scale_hi, static_cast<float>(dot_hi)));
-            float contribution = __fmul_rn(activation_scale, dot_term);
+            float contribution =
+                device_native_vnni_contract::dualScaleBlock(
+                    dot_lo,
+                    dot_hi,
+                    scale_lo,
+                    scale_hi,
+                    activation_scale);
 
             if constexpr (Traits::is_dual_scale_asym)
             {
@@ -180,16 +187,14 @@ namespace llaminar2::cuda_native_vnni
                     fp16_bits_to_float(static_cast<uint16_t>(emin_bits));
                 const float min_hi =
                     fp16_bits_to_float(static_cast<uint16_t>(emin_bits >> 16));
-                const float min_term = __fadd_rn(
-                    __fmul_rn(
-                        min_lo,
-                        static_cast<float>(activation_sum_lo)),
-                    __fmul_rn(
-                        min_hi,
-                        static_cast<float>(activation_sum_hi)));
-                contribution = __fadd_rn(
+                contribution = device_native_vnni_contract::accumulate(
                     contribution,
-                    __fmul_rn(activation_scale, min_term));
+                    device_native_vnni_contract::dualScaleCorrection(
+                        activation_sum_lo,
+                        activation_sum_hi,
+                        min_lo,
+                        min_hi,
+                        activation_scale));
             }
 
             if constexpr (Traits::is_iq1_m)
@@ -206,29 +211,20 @@ namespace llaminar2::cuda_native_vnni
                     (qh1 & 0x08) ? -kIQ1MDelta : kIQ1MDelta;
                 const float delta3 =
                     (qh1 & 0x80) ? -kIQ1MDelta : kIQ1MDelta;
-                const float low_delta = __fmul_rn(
-                    __fadd_rn(
-                        __fmul_rn(
-                            delta0,
-                            static_cast<float>(subgroup_sum0)),
-                        __fmul_rn(
-                            delta1,
-                            static_cast<float>(subgroup_sum1))),
-                    scale_lo);
-                const float high_delta = __fmul_rn(
-                    __fadd_rn(
-                        __fmul_rn(
-                            delta2,
-                            static_cast<float>(subgroup_sum2)),
-                        __fmul_rn(
-                            delta3,
-                            static_cast<float>(subgroup_sum3))),
-                    scale_hi);
-                contribution = __fadd_rn(
+                contribution = device_native_vnni_contract::accumulate(
                     contribution,
-                    __fmul_rn(
-                        activation_scale,
-                        __fadd_rn(low_delta, high_delta)));
+                    device_native_vnni_contract::iq1MDeltaCorrection(
+                        subgroup_sum0,
+                        subgroup_sum1,
+                        subgroup_sum2,
+                        subgroup_sum3,
+                        delta0,
+                        delta1,
+                        delta2,
+                        delta3,
+                        scale_lo,
+                        scale_hi,
+                        activation_scale));
             }
 
             return contribution;
@@ -236,19 +232,22 @@ namespace llaminar2::cuda_native_vnni
         else
         {
             const float weight_scale = fp16_bits_to_float(scale_bits);
-            float contribution = __fmul_rn(
-                __fmul_rn(activation_scale, weight_scale),
-                static_cast<float>(dot_lo));
+            float contribution =
+                device_native_vnni_contract::singleScaleBlock(
+                    dot_lo,
+                    weight_scale,
+                    activation_scale);
 
             if constexpr (Traits::is_asymmetric)
             {
                 const float weight_min =
                     fp16_bits_to_float(secondary_bits);
-                contribution = __fadd_rn(
+                contribution = device_native_vnni_contract::accumulate(
                     contribution,
-                    __fmul_rn(
-                        __fmul_rn(activation_scale, weight_min),
-                        static_cast<float>(activation_sum)));
+                    device_native_vnni_contract::singleScaleCorrection(
+                        activation_sum,
+                        weight_min,
+                        activation_scale));
             }
 
             return contribution;

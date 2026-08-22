@@ -20,6 +20,9 @@
 
 #pragma once
 
+#include "MoEOverlayActivationEpochABI.h"
+#include "MoEOverlayInferenceInterferenceProbe.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -39,16 +42,6 @@ namespace llaminar2
         Execute = 1, ///< Submit exactly one retained sparse graph transaction.
         Complete = 2, ///< Close the current outer inference command successfully.
         Abort = 3, ///< Close the command fatally with a positive error code.
-    };
-
-    /** @brief Already-built graph family selected by an execution ticket. */
-    enum class MoEOverlayInferenceGraphRole : std::uint32_t
-    {
-        None = 0, ///< Required for Complete and Abort terminal tickets.
-        MainPrefill = 1, ///< Main-model prompt or bounded prefill segment.
-        MainDecode = 2, ///< Main-model one-row decode per logical request.
-        MTPDraft = 3, ///< One NextN/MTP sidecar depth per logical request.
-        MTPGroupedVerifier = 4, ///< Main-model grouped verifier transaction.
     };
 
     /**
@@ -182,7 +175,7 @@ namespace llaminar2
     struct MoEOverlayInferenceTransactionTicket
     {
         static constexpr std::uint32_t kMagic = 0x54494F4Du; // "MOIT"
-        static constexpr std::uint32_t kABIVersion = 2u;
+        static constexpr std::uint32_t kABIVersion = 3u;
 
         std::uint32_t magic = kMagic;
         std::uint32_t abi_version = kABIVersion;
@@ -196,6 +189,14 @@ namespace llaminar2
         /** Absolute logical operation offset stamped into sparse wire keys. */
         std::uint64_t logical_step_id = 0;
         std::uint64_t workspace_generation = 0;
+        /**
+         * Scheduler-observed minimum placement epoch for this transaction.
+         *
+         * A host-authoritative topology uses this value exactly. A device-
+         * authoritative topology may acquire a newer already-published epoch
+         * at graph admission; the activation packet ABI authenticates that
+         * exact endpoint-local ticket against this monotonic floor.
+         */
         std::uint64_t placement_epoch = 0;
         std::uint64_t topology_fingerprint_low = 0;
         std::uint64_t topology_fingerprint_high = 0;
@@ -207,6 +208,21 @@ namespace llaminar2
         std::int32_t draft_depth = -1;
         std::int32_t sidecar_depth = -1;
         std::int32_t error_code = 0;
+        /**
+         * Complete caller-visible prefill schedule containing this ticket.
+         *
+         * Heterogeneous prefill may require many retained graph tickets.  The
+         * calibration probe must time that logical schedule as one interval;
+         * a physical migration can legitimately outlive any single segment.
+         * Zero in every field means this ticket is not part of an aggregate
+         * prefill schedule.  The fixed fields deliberately carry geometry,
+         * never token values or mutable inference state.
+         */
+        std::int32_t prefill_schedule_real_rows = 0;
+        std::int32_t prefill_schedule_execution_rows = 0;
+        std::int32_t prefill_schedule_transaction_count = 0;
+        std::int32_t prefill_schedule_reserved = 0;
+        std::uint64_t prefill_schedule_fingerprint = 0;
 
         /** @return Model-lifetime topology identity carried by this ticket. */
         [[nodiscard]] MoEOverlayInferenceTopologyIdentity topologyIdentity()
@@ -215,6 +231,14 @@ namespace llaminar2
         /** @return Dynamic outer-command identity carried by this ticket. */
         [[nodiscard]] MoEOverlayInferenceCommandIdentity commandIdentity()
             const noexcept;
+
+        /**
+         * @brief Reconstruct the aggregate prefill workload carried on wire.
+         * @return Valid complete schedule identity, or an invalid identity when
+         *         this ticket is not part of an aggregate prefill schedule.
+         */
+        [[nodiscard]] MoEOverlayInferenceWorkloadIdentity
+        prefillScheduleWorkload() const noexcept;
 
         /** @return Whether ABI and role-specific geometry are self-consistent. */
         [[nodiscard]] bool valid() const noexcept;
@@ -228,7 +252,7 @@ namespace llaminar2
 
     static_assert(
         std::is_trivially_copyable_v<MoEOverlayInferenceTransactionTicket>);
-    static_assert(sizeof(MoEOverlayInferenceTransactionTicket) == 112u);
+    static_assert(sizeof(MoEOverlayInferenceTransactionTicket) == 136u);
 
     /**
      * @brief Build and validate one retained-graph execution ticket.
@@ -249,7 +273,9 @@ namespace llaminar2
         int logical_rows_per_request,
         int physical_rows_per_request,
         int draft_depth = -1,
-        int sidecar_depth = -1);
+        int sidecar_depth = -1,
+        const MoEOverlayInferenceWorkloadIdentity &
+            prefill_schedule_workload = {});
 
     /**
      * @brief Build a successful or fatal terminal ticket for one command.

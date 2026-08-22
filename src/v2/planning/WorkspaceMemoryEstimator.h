@@ -36,6 +36,11 @@ struct WorkspaceMemoryGeometry
     int last_layer = -1; ///< Last model layer owned by this participant.
     int total_shards = 1; ///< Tensor-parallel degree for local dimensions.
     bool apportioned_routed_experts = false; ///< Experts are whole-owner slices, not TP slices.
+    /**
+     * Largest flattened grouped-verifier shape retained beside the main graph.
+     * Zero means no MTP graph family is materialized on this participant.
+     */
+    int mtp_target_query_rows = 0;
 };
 
 class WorkspaceMemoryEstimator
@@ -70,6 +75,11 @@ public:
      *
      * In addition to dense requirements, this overload accounts for hybrid
      * recurrent scratch and exact backend-specific MoE workspace declarations.
+     * A positive `mtp_target_query_rows` also reserves a second compact graph
+     * envelope. Main prefill and grouped-verifier/MTP graphs are event-ordered,
+     * but their stable workspace names and initialize-once publications are not
+     * fully aliasable; summing the two independently valid envelopes is the
+     * setup-time upper bound used before exact graph-family interval planning.
      * Declared MoE models with incomplete routing geometry are rejected because
      * silently returning a dense-only estimate would permit a late VRAM failure.
      *

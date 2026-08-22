@@ -767,6 +767,19 @@ namespace llaminar2::test::parity::qwen2
     {
     protected:
         /**
+         * @brief Whether multi-device routed execution requires ExpertOverlay.
+         *
+         * Dense fixtures leave this disabled. MoE fixtures override it so a
+         * simple homogeneous LocalTP declaration enters through the same
+         * OrchestrationRunner normalization used by the server instead of the
+         * retired tree-compiler residency path.
+         */
+        virtual bool requiresUniversalMoEAuthority() const
+        {
+            return false;
+        }
+
+        /**
          * @brief Get backend-specific threshold configuration
          * @return BackendThresholds struct with cosine/KL thresholds
          */
@@ -833,14 +846,16 @@ namespace llaminar2::test::parity::qwen2
         std::unique_ptr<RankOrchestrator> multi_orch_;
 
         /**
-         * @brief One bounded real-weight authority retained by a process campaign.
+         * @brief One bounded non-overlay model authority retained by a process campaign.
          *
          * The slot is template-local, so unrelated fixtures/topologies never
          * share mutable loader state.  It deliberately excludes KV precision
          * from its key: KV storage belongs to the runner, while model tensors
          * and their additive PreparedWeightStore remain invariant across those
          * runner policies.  A key change evicts the old context before loading
-         * another model, bounding host and device weight residency.
+         * another model, bounding host and device weight residency. ExpertOverlay
+         * does not use this slot: only an initialized production runner can emit
+         * the typed placement certificate required to reuse routed weights.
          */
         struct CampaignModelContextSlot
         {
@@ -1171,7 +1186,16 @@ namespace llaminar2::test::parity::qwen2
             beginProductionParityEvidence();
             ASSERT_TRUE(setupPipeline()) << "Production parity pipeline setup failed";
 
-            if (cfg().is_local_tp())
+            /*
+             * Legacy dense LocalTP exposes participant snapshots through its
+             * RankOrchestrator. A routed model normalized by the production
+             * OrchestrationRunner exposes semantic post-collective snapshots,
+             * exactly like the HTTP surface, so it uses the ordinary complete
+             * checkpoint comparator instead of reaching into child runners.
+             */
+            const bool inspect_legacy_tp_partials =
+                cfg().is_local_tp() && !hasOrchestrationRunner();
+            if (inspect_legacy_tp_partials)
             {
                 const auto prefill = runTPPrefillParity();
                 assertTPParity(prefill);
@@ -1190,7 +1214,7 @@ namespace llaminar2::test::parity::qwen2
             activeClearCache();
 
             DecodeParitySummary decode;
-            if (cfg().is_local_tp())
+            if (inspect_legacy_tp_partials)
                 decode = runTPDecodeParity();
             else
                 decode = runDecodeParity();
@@ -1367,15 +1391,109 @@ namespace llaminar2::test::parity::qwen2
             config.moe_rebalance = cfg().moe_rebalance;
             config.moe_routed_expert_plan = cfg().moe_routed_expert_plan;
 
-            auto model_context =
-                acquireParityModelContext(getWeightStrategy());
-            if (!model_context)
+            /*
+             * Let the production runner own model loading, plan resolution,
+             * model-aware tier freezing, and prepared-weight certification as
+             * one transition. A bare context from the generic campaign cache
+             * cannot prove any of those facts. Genuine reuse must enter through
+             * setupOrchestrationRunner(config, ModelContextReuseContract).
+             */
+            production_parity_model_context_reused_ = false;
+            if (!setupOrchestrationRunner(config))
+                return false;
+
+            SamplingParams greedy;
+            greedy.temperature = 0.0f;
+            greedy.top_k = 1;
+            greedy.top_p = 1.0f;
+            greedy.seed = 1;
+            orch_runner_->setSamplingParams(greedy);
+            return true;
+        }
+
+        /**
+         * @brief Build homogeneous rank-local MoE TP through production setup.
+         *
+         * The public configuration names only ordinary LocalTP intent. During
+         * initialization OrchestrationRunner resolves the devices, synthesizes
+         * the canonical one-domain/one-tier ExpertOverlay authority, freezes
+         * capacity, and builds the same graph family used by the server. This
+         * keeps the parity fixture unaware of implicit tier implementation
+         * details while ensuring that no legacy MoE controller survives beside
+         * the universal authority.
+         *
+         * @return true after the production runner and snapshot graph are ready.
+         */
+        bool setupImplicitLocalTPMoEOrchestrationPipeline()
+        {
+            if (!cfg().is_local_tp() || cfg().device_count() < 2)
             {
-                LOG_ERROR("[Parity] Failed to acquire ExpertOverlay model context");
+                LOG_ERROR("[Parity] Implicit LocalTP MoE authority requires at "
+                          "least two rank-local participants");
                 return false;
             }
 
-            if (!setupOrchestrationRunner(config, std::move(model_context)))
+            std::vector<GlobalDeviceAddress> devices;
+            devices.reserve(cfg().devices.size());
+            int cuda_index = 0;
+            int rocm_index = 0;
+            for (const auto device : cfg().devices)
+            {
+                switch (device)
+                {
+                case ParityDeviceType::CPU:
+                    devices.push_back(GlobalDeviceAddress::cpu());
+                    break;
+                case ParityDeviceType::CUDA:
+                    devices.push_back(
+                        GlobalDeviceAddress::cuda(cuda_index++));
+                    break;
+                case ParityDeviceType::ROCm:
+                    devices.push_back(
+                        GlobalDeviceAddress::rocm(rocm_index++));
+                    break;
+                }
+            }
+
+            OrchestrationConfig config = OrchestrationConfig::defaults();
+            config.model_path = config_.model_path;
+            config.max_seq_len = 4096;
+            config.batch_size = 1;
+            config.activation_precision =
+                orchestrationActivationPrecisionValue(
+                    cfg().activation_precision);
+            config.kv_cache_precision =
+                orchestrationKVCachePrecisionValue(
+                    cfg().kv_cache_precision);
+            config.tp_allreduce_precision_override =
+                cfg().tp_allreduce_precision_override;
+            config.tp_degree = static_cast<int>(devices.size());
+            config.tp_scope = TPScope::RANK_LOCAL;
+            config.tp_devices = devices;
+            config.tp_weights.assign(
+                devices.size(),
+                1.0f / static_cast<float>(devices.size()));
+            config.pp_degree = 1;
+            config.default_backend =
+                toCollectiveBackend(cfg().collective);
+            config.device_mode = DeviceAssignmentMode::AUTO;
+            config.deterministic = true;
+            config.routed_expert_compute_policy =
+                cfg().routed_expert_compute_policy;
+            config.routed_expert_owner_order =
+                cfg().routed_expert_owner_order;
+            config.moe_hot_expert_cache = cfg().moe_hot_expert_cache;
+            config.moe_routed_prefill = cfg().moe_routed_prefill;
+            config.moe_rebalance = cfg().moe_rebalance;
+
+            /*
+             * The implicit authority is synthesized from live model metadata.
+             * Production must therefore create the ModelContext only after it
+             * has resolved and frozen that plan. Supplying a context prepared
+             * before normalization would violate the exact reuse certificate
+             * contract and is correctly rejected by OrchestrationRunner.
+             */
+            if (!setupOrchestrationRunner(config))
                 return false;
 
             SamplingParams greedy;
@@ -1409,6 +1527,9 @@ namespace llaminar2::test::parity::qwen2
             {
                 return setupExpertOverlayMoEOrchestrationPipeline();
             }
+
+            if (requiresUniversalMoEAuthority() && cfg().is_local_tp())
+                return setupImplicitLocalTPMoEOrchestrationPipeline();
 
             if (cfg().moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
             {

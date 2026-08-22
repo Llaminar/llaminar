@@ -263,7 +263,7 @@ namespace llaminar2
                     }
                     if (config.memory_placement.requiresNodeBinding() &&
                         !NUMAAllocator::instance()
-                             .bindUntouchedExternalRangeToNode(
+                             .prepareExternalReceiveRangeOnNode(
                                  destination,
                                  destination_bytes,
                                  config.memory_placement.node()))
@@ -298,7 +298,7 @@ namespace llaminar2
                 CpuPacked packed = makePackedMetadata(
                     spec, allocation_alignment);
                 if (config.memory_placement.requiresNodeBinding() &&
-                    !NUMAAllocator::instance().bindUntouchedExternalRangeToNode(
+                    !NUMAAllocator::instance().prepareExternalReceiveRangeOnNode(
                         packed.native_interleaved.data(),
                         packed.native_interleaved.size(),
                         config.memory_placement.node()))

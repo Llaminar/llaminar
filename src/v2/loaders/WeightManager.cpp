@@ -69,25 +69,6 @@ namespace llaminar2
     namespace
     {
         /**
-         * @brief Return whether sorted expert IDs form one contiguous span.
-         *
-         * Physical routed-expert loading records this property as structured
-         * setup evidence.  Ordinal ownership must remain contiguous, whereas
-         * the deterministic random policy intentionally selects non-contiguous
-         * IDs before packing them back into source-tensor order.
-         */
-        bool routedExpertSelectionIsContiguous(
-            const std::vector<int> &expert_ids) noexcept
-        {
-            for (size_t index = 1; index < expert_ids.size(); ++index)
-            {
-                if (expert_ids[index] != expert_ids[index - 1u] + 1)
-                    return false;
-            }
-            return true;
-        }
-
-        /**
          * @brief Publish the physical routed-expert selection used by a loader.
          *
          * This is setup-only evidence: it performs no inference-path transfer
@@ -116,7 +97,8 @@ namespace llaminar2
                     {"owner_order", routedExpertOwnerOrderToString(owner_order)},
                     {"participant", std::to_string(participant_index)},
                     {"selection_layout",
-                     routedExpertSelectionIsContiguous(expert_ids)
+                     routed_expert_ownership::expertIdsFormContiguousSpan(
+                         expert_ids)
                          ? "contiguous"
                          : "noncontiguous"},
                 });
@@ -2034,6 +2016,16 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
         return prepared_weight_store_;
+    }
+
+    size_t WeightManager::preparedRecordCountForDevice(DeviceId device) const
+    {
+        const auto store = preparedWeightStoreIfInitialized();
+        const size_t store_records =
+            store ? store->sizeForDevice(device) : 0u;
+        return store_records +
+               expert_gemm_registry_
+                   .countOwnedEnginesForDeviceAcrossScopes(device);
     }
 
     void WeightManager::setPreparedWeightStore(std::shared_ptr<PreparedWeightStore> store)
@@ -4382,7 +4374,24 @@ namespace llaminar2
             routed_expert_bytes_per_expert);
         if (execution_plan)
             preparation_plan = preparation_plan.filteredForRank(execution_plan->currentRankPlan());
-        preparation_plan = preparation_plan.filteredForDevice(target_device);
+        std::vector<DeviceId> graph_execution_devices{target_device};
+        if (execution_plan && target_device.is_gpu() &&
+            execution_plan->currentRankPlan().hasRole(
+                OverlayRankRole::ContinuationRoot) &&
+            target_device == runtime_plan.continuationDevice())
+        {
+            /*
+             * The logical continuation-root graph may contain explicit CPU
+             * sparse endpoints owned by the same rank.  Their engines belong
+             * to this graph transaction even though dense weights and capture
+             * remain on the primary GPU. Sibling LocalTP GPU callers retain
+             * exact-device preparation because only the declared root device
+             * matches continuationDevice().
+             */
+            graph_execution_devices.push_back(DeviceId::cpu());
+        }
+        preparation_plan = preparation_plan.filteredForDevices(
+            graph_execution_devices);
 
         /**
          * Accelerator expert preparation must consume the same immutable bindings
@@ -5933,81 +5942,29 @@ namespace llaminar2
          */
         const auto *planned_pool = orchestrator->getPool(target_device.ordinal);
         const size_t planned_weight_bytes = planned_pool ? planned_pool->totalPlannedBytes() : 0;
-        const size_t free_vram_bytes = backend->deviceMemoryFree(target_device.ordinal);
         const size_t total_vram_bytes = backend->deviceMemoryTotal(target_device.ordinal);
         const auto load_bom = gpuWeightLoadMemoryBOM(
             planned_weight_bytes,
             max_raw_bytes,
-            free_vram_bytes,
+            /*free_vram_bytes=*/0,
             total_vram_bytes,
             configuredGPUWeightLoadMemoryPolicy(
                 staging_budget_bytes_override));
         const int repack_streams = load_bom.staging_stream_count;
         const size_t staging_slot_bytes = load_bom.staging_slot_bytes;
         const size_t staging_bytes = load_bom.staging_bytes;
-        const size_t required_vram_bytes = load_bom.load_bytes;
-        const size_t safety_margin_bytes = load_bom.safety_margin_bytes;
-
-        if (!load_bom.fits())
-        {
-            logVramBomLine(
-                "weight_preflight",
-                "source=WeightManager status=fail device=" + target_device.to_string() +
-                    " required_bytes=" + std::to_string(required_vram_bytes) +
-                    " required_mib=" + vramBomMiB(required_vram_bytes) +
-                    " planned_weights_bytes=" + std::to_string(planned_weight_bytes) +
-                    " planned_weights_mib=" + vramBomMiB(planned_weight_bytes) +
-                    " staging_bytes=" + std::to_string(staging_bytes) +
-                    " staging_mib=" + vramBomMiB(staging_bytes) +
-                    " safety_margin_bytes=" + std::to_string(safety_margin_bytes) +
-                    " safety_margin_mib=" + vramBomMiB(safety_margin_bytes) +
-                    " free_bytes=" + std::to_string(free_vram_bytes) +
-                    " free_mib=" + vramBomMiB(free_vram_bytes) +
-                    " total_bytes=" + std::to_string(total_vram_bytes) +
-                    " total_mib=" + vramBomMiB(total_vram_bytes));
-            LOG_ERROR("[WeightManager] GPU pipeline VRAM preflight failed for "
-                      << target_device.to_string()
-                      << ": required=" << formatMiB(required_vram_bytes)
-                      << " available_after_margin="
-                      << formatMiB(load_bom.availableAfterSafetyReserve())
-                      << " free=" << formatMiB(free_vram_bytes)
-                      << " total=" << formatMiB(total_vram_bytes)
-                      << " planned_weights=" << formatMiB(planned_weight_bytes)
-                      << " staging=" << formatMiB(staging_bytes)
-                      << " safety_margin=" << formatMiB(safety_margin_bytes)
-                      << ". Mitigations: "
-                      << gpuPipelineVramPreflightMitigations(
-                             debugEnv().streaming.enabled,
-                             !moe_jobs.empty()));
-            return false;
-        }
-
-        logVramBomLine(
-            "weight_preflight",
-            "source=WeightManager status=pass device=" + target_device.to_string() +
-                " required_bytes=" + std::to_string(required_vram_bytes) +
-                " required_mib=" + vramBomMiB(required_vram_bytes) +
-                " planned_weights_bytes=" + std::to_string(planned_weight_bytes) +
-                " planned_weights_mib=" + vramBomMiB(planned_weight_bytes) +
-                " staging_bytes=" + std::to_string(staging_bytes) +
-                " staging_mib=" + vramBomMiB(staging_bytes) +
-                " safety_margin_bytes=" + std::to_string(safety_margin_bytes) +
-                " safety_margin_mib=" + vramBomMiB(safety_margin_bytes) +
-                " free_bytes=" + std::to_string(free_vram_bytes) +
-                " free_mib=" + vramBomMiB(free_vram_bytes) +
-                " total_bytes=" + std::to_string(total_vram_bytes) +
-                " total_mib=" + vramBomMiB(total_vram_bytes));
-        LOG_DEBUG("[WeightManager] GPU pipeline VRAM preflight for " << target_device.to_string()
-                                                                     << ": required=" << formatMiB(required_vram_bytes)
-                                                                     << " planned_weights=" << formatMiB(planned_weight_bytes)
-                                                                     << " staging=" << formatMiB(staging_bytes)
-                                                                     << " free=" << formatMiB(free_vram_bytes)
-                                                                     << " safety_margin=" << formatMiB(safety_margin_bytes));
-
         LOG_DEBUG("[WeightManager] GPU load staging bounded to " << formatMiB(staging_bytes)
                                                                   << " total (" << repack_streams
                                                                   << " slots x " << formatMiB(staging_slot_bytes)
                                                                   << ", largest weight=" << formatMiB(max_raw_bytes) << ")");
+        /*
+         * LoadOrchestrator owns the only live free-memory observation and
+         * performs it immediately before allocation. A second check here was
+         * both redundant and racy with concurrently prepared embedding views.
+         * This BOM call resolves only the shared staging policy; automatic
+         * ExpertOverlay capacity and the allocator-adjacent preflight consume
+         * the same arithmetic authority.
+         */
         orchestrator->allocate(staging_slot_bytes, repack_streams);
 
         // ------------------------------------------------------------------

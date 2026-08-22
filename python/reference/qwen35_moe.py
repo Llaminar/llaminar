@@ -28,7 +28,10 @@ MoE-specific GGUF tensors:
 """
 
 import copy
+import os
 import re
+import tempfile
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -54,6 +57,57 @@ def production_router_distribution(router_output) -> torch.Tensor:
             "Qwen3.5 MoE router did not return probabilities, weights, and indices"
         )
     return router_output[0]
+
+
+def mtp_sidecar_replay_depth(
+    step: int,
+    max_draft_depth: int,
+    draft_token_overrides: dict[int, list[int]],
+) -> int:
+    """Return the minimum predictor depth needed by an additive branch pass.
+
+    A branch-qualified reference still has to replay MTP0 at every preceding
+    committed decode position so its recurrent sidecar cache is authentic.
+    Deeper predictors are speculative and are required only at a requested
+    branch step. Canonical pack generation has no overrides and therefore
+    retains the complete requested depth at every step.
+    """
+
+    if not draft_token_overrides:
+        return max_draft_depth
+    tokens = draft_token_overrides.get(step)
+    return 1 if tokens is None else len(tokens) + 1
+
+
+def save_mtp_snapshot_atomic(path, payload: np.ndarray) -> None:
+    """Atomically publish one additive MTP reference tensor.
+
+    Production campaigns may be interrupted while the expensive CPU oracle is
+    running. A temporary file in the destination directory plus ``replace``
+    ensures a later campaign observes either the complete old tensor or the
+    complete new tensor, never a truncated ``.npy`` file.
+    """
+
+    destination = os.fspath(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{os.path.basename(destination)}.",
+            suffix=".tmp",
+            dir=os.path.dirname(destination),
+            delete=False,
+        ) as output:
+            temporary = output.name
+            np.save(output, payload)
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
 
 class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
@@ -165,52 +219,280 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
     # ------------------------------------------------------------------
 
     def _load_from_gguf(self, gguf_path: str, torch_dtype=None, **kwargs) -> None:
-        """Load GGUF with MoE expert gate+up fusion into gate_up_proj."""
-        import warnings
+        """Stream GGUF tensors directly into the final Hugging Face model.
+
+        A 122B checkpoint expands to roughly 488 GB in FP32. Materializing a
+        second state dictionary beside the model exceeds host memory and makes
+        split-model parity impossible. The bounded loader publishes ordinary
+        parameters and each half of the fused expert tensor directly into its
+        final allocation; the trailing MTP decoder is loaded into its own
+        layer by the same transaction.
+        """
         from .loaders import GGUFLoader
+        from .loaders.gguf_parser import GGUFParser
         from transformers.initialization import no_init_weights
+        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+            Qwen3_5MoeDecoderLayer,
+            Qwen3_5MoeForCausalLM,
+        )
 
         print(f"Loading GGUF file: {gguf_path}")
         loader = GGUFLoader(gguf_path, verbose=self.verbose)
-        config_dict, state_dict = loader.load(
-            as_transformers_config=False,
-            as_torch=True,
-            show_progress=self.verbose,
-        )
+        parser = GGUFParser(gguf_path)
+        parser.parse()
+        try:
+            config_dict = loader.load_config(
+                parser=parser, as_transformers_config=False
+            )
+            sidecar_reference_pack = kwargs.get("mtp_sidecar_reference_pack")
+            self._mtp_sidecar_reference_pack = (
+                Path(sidecar_reference_pack)
+                if sidecar_reference_pack is not None
+                else None
+            )
+            with no_init_weights():
+                self.hf_config = self._build_hf_config(config_dict)
+                if torch_dtype:
+                    self.hf_config.torch_dtype = torch_dtype
+                if self._mtp_sidecar_reference_pack is None:
+                    self.hf_model = Qwen3_5MoeForCausalLM(self.hf_config)
+                else:
+                    # An additive branch oracle consumes the authenticated
+                    # main-model trajectory already stored in the canonical
+                    # Hugging Face pack. It owns only graph-external MTP state:
+                    # embeddings, LM head, rotary state, and one sidecar layer.
+                    # Retaining 48 unused FP32 main layers would add roughly
+                    # 450 GiB and defeat campaign-level context amortization.
+                    shell_config = copy.deepcopy(self.hf_config)
+                    shell_config.num_hidden_layers = 0
+                    shell_config.layer_types = []
+                    self.hf_model = Qwen3_5MoeForCausalLM(shell_config)
+                    # The top-level Transformers model resolves its concrete
+                    # expert implementation during construction. Propagate
+                    # that typed choice to the original full-depth config used
+                    # by the standalone sidecar layer so both canonical and
+                    # additive contexts execute the same HF expert kernel.
+                    self.hf_config._experts_implementation = (
+                        shell_config._experts_implementation
+                    )
 
-        # Fuse expert gate+up tensors: GGUF has separate gate_proj and up_proj,
-        # HF expects a single gate_up_proj = cat(gate, up, dim=1)
-        state_dict = self._fuse_expert_gate_up(state_dict)
-        self._capture_mtp_sidecar_state(state_dict)
+            nextn_sources = sorted(
+                {
+                    int(match.group(1))
+                    for tensor in parser.tensors
+                    if (
+                        match := re.fullmatch(
+                            r"blk\.(\d+)\.nextn\.eh_proj\.weight",
+                            tensor.name,
+                        )
+                    )
+                }
+            )
+            if len(nextn_sources) > 1:
+                raise RuntimeError(
+                    f"Multiple MTP source layers are unsupported: {nextn_sources}"
+                )
+            self._mtp_sidecar_source_layer = (
+                nextn_sources[0] if nextn_sources else None
+            )
+            self._mtp_sidecar_state = {}
+            self._mtp_sidecar_layer = None
 
-        # Fix shared_expert_gate shape: GGUF stores as [hidden_size] (1D),
-        # HF nn.Linear(hidden_size, 1) expects [1, hidden_size] (2D)
-        for key in list(state_dict.keys()):
-            if 'shared_expert_gate.weight' in key and state_dict[key].dim() == 1:
-                state_dict[key] = state_dict[key].unsqueeze(0)
+            sidecar_parameters = {}
+            sidecar_loaded = set()
+            sidecar_expert_halves = {}
+            if self._mtp_sidecar_source_layer is not None:
+                sidecar_config = copy.deepcopy(self.hf_config)
+                sidecar_config.num_hidden_layers = 1
+                sidecar_config.layer_types = ["full_attention"]
+                with no_init_weights():
+                    self._mtp_sidecar_layer = Qwen3_5MoeDecoderLayer(
+                        sidecar_config, 0
+                    )
+                self._mtp_sidecar_layer._llaminar_mtp_config = sidecar_config
+                sidecar_parameters = dict(
+                    self._mtp_sidecar_layer.named_parameters()
+                )
 
-        with no_init_weights():
-            self.hf_config, self.hf_model = self._create_model_from_gguf_config(
-                config_dict, torch_dtype
+            main_parameters = dict(self.hf_model.named_parameters())
+            main_loaded = set()
+            main_expert_halves = {}
+            unexpected = []
+            source_layer_prefix = (
+                f"model.layers.{self._mtp_sidecar_source_layer}."
+                if self._mtp_sidecar_source_layer is not None
+                else None
+            )
+            raw_nextn_prefix = (
+                f"blk.{self._mtp_sidecar_source_layer}.nextn."
+                if self._mtp_sidecar_source_layer is not None
+                else None
             )
 
-        print(f"Loading {len(state_dict)} tensors into model...")
-        missing, unexpected = self.hf_model.load_state_dict(state_dict, strict=False)
+            def include_sidecar_tensor(mapped_name: str) -> bool:
+                """Select tensors owned by the additive sidecar context."""
 
-        if "lm_head.weight" in missing or missing == ["lm_head.weight"]:
-            print("Tying lm_head.weight to model.embed_tokens.weight (weight sharing)")
-            self.hf_model.lm_head.weight = self.hf_model.model.embed_tokens.weight
+                if self._mtp_sidecar_reference_pack is None:
+                    return True
+                return (
+                    mapped_name in main_parameters
+                    or (
+                        raw_nextn_prefix is not None
+                        and mapped_name.startswith(raw_nextn_prefix)
+                    )
+                    or (
+                        source_layer_prefix is not None
+                        and mapped_name.startswith(source_layer_prefix)
+                    )
+                )
 
-        if missing and missing != ["lm_head.weight"]:
-            warnings.warn(f"Missing keys when loading GGUF: {missing}")
-        if unexpected:
-            warnings.warn(f"Unexpected keys when loading GGUF: {unexpected}")
+            for mapped_name, tensor in loader.iter_state_dict(
+                parser=parser,
+                as_torch=True,
+                show_progress=self.verbose,
+                max_in_flight=8,
+                include_mapped_name=include_sidecar_tensor,
+            ):
+                if raw_nextn_prefix and mapped_name.startswith(raw_nextn_prefix):
+                    self._mtp_sidecar_state[mapped_name] = tensor.detach()
+                    continue
+                if source_layer_prefix and mapped_name.startswith(
+                    source_layer_prefix
+                ):
+                    sidecar_name = mapped_name[len(source_layer_prefix):]
+                    if not self._copy_streamed_parameter(
+                        sidecar_name,
+                        tensor,
+                        sidecar_parameters,
+                        sidecar_loaded,
+                        sidecar_expert_halves,
+                    ):
+                        unexpected.append(mapped_name)
+                    continue
+                if not self._copy_streamed_parameter(
+                    mapped_name,
+                    tensor,
+                    main_parameters,
+                    main_loaded,
+                    main_expert_halves,
+                ):
+                    if mapped_name not in {
+                        "rope_freqs.weight",
+                        "rope.freqs",
+                        "pos_embd.weight",
+                    }:
+                        unexpected.append(mapped_name)
 
-        self.hf_model = self.hf_model.to(self.device)
-        self.hf_model.eval()
+            main_missing = set(main_parameters) - main_loaded
+            if main_missing == {"lm_head.weight"} and (
+                "model.embed_tokens.weight" in main_loaded
+            ):
+                print("Tying lm_head.weight to model.embed_tokens.weight")
+                self.hf_model.lm_head.weight = (
+                    self.hf_model.model.embed_tokens.weight
+                )
+                main_missing.clear()
+            if main_missing:
+                raise RuntimeError(
+                    "Streamed GGUF model is missing parameters: "
+                    f"{sorted(main_missing)}"
+                )
+
+            sidecar_missing = set(sidecar_parameters) - sidecar_loaded
+            if sidecar_missing:
+                raise RuntimeError(
+                    "Streamed GGUF MTP layer is missing parameters: "
+                    f"{sorted(sidecar_missing)}"
+                )
+            if unexpected:
+                raise RuntimeError(
+                    "Streamed GGUF contains unexpected tensors: "
+                    f"{sorted(unexpected)}"
+                )
+            if self._mtp_sidecar_source_layer is not None:
+                for suffix in (
+                    "eh_proj.weight",
+                    "enorm.weight",
+                    "hnorm.weight",
+                    "shared_head_norm.weight",
+                ):
+                    self._mtp_tensor(suffix)
+
+            self.hf_model = self.hf_model.to(self.device).eval()
+            if self._mtp_sidecar_layer is not None:
+                self._mtp_sidecar_layer = (
+                    self._mtp_sidecar_layer.to(self.device).eval()
+                )
+        finally:
+            parser.close()
 
         self._resolve_tokenizer(gguf_path)
         print("✓ GGUF MoE model loaded successfully")
+
+    @staticmethod
+    def _copy_streamed_parameter(
+        name: str,
+        tensor: torch.Tensor,
+        parameters: dict[str, torch.nn.Parameter],
+        loaded: set[str],
+        expert_halves: dict[str, set[str]],
+    ) -> bool:
+        """Copy one mapped tensor into its final parameter allocation.
+
+        GGUF stores expert gate and up projections independently while
+        Transformers owns one ``gate_up_proj`` parameter. Copying each source
+        into its exact slice avoids constructing a second fused 6+ GB tensor.
+        """
+        expert_match = re.fullmatch(
+            r"((?:.*\.)?mlp\.experts)\.(gate_proj|up_proj)\.weight",
+            name,
+        )
+        target_name = name
+        target_view = None
+        half_name = None
+        if expert_match:
+            target_name = f"{expert_match.group(1)}.gate_up_proj"
+            if target_name not in parameters or tensor.ndim != 3:
+                return False
+            target = parameters[target_name]
+            if target.shape[0] != tensor.shape[0] or target.shape[2] != tensor.shape[2]:
+                raise RuntimeError(
+                    f"Expert tensor shape mismatch for {name}: "
+                    f"source={tuple(tensor.shape)}, target={tuple(target.shape)}"
+                )
+            if target.shape[1] != tensor.shape[1] * 2:
+                raise RuntimeError(
+                    f"Expert fused width mismatch for {name}: "
+                    f"source={tuple(tensor.shape)}, target={tuple(target.shape)}"
+                )
+            half_name = expert_match.group(2)
+            offset = 0 if half_name == "gate_proj" else tensor.shape[1]
+            target_view = target[:, offset:offset + tensor.shape[1], :]
+        elif target_name not in parameters:
+            return False
+        else:
+            target_view = parameters[target_name]
+            if name.endswith("mlp.shared_expert_gate.weight") and tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+
+        if tuple(target_view.shape) != tuple(tensor.shape):
+            raise RuntimeError(
+                f"Parameter shape mismatch for {name}: "
+                f"source={tuple(tensor.shape)}, target={tuple(target_view.shape)}"
+            )
+        with torch.no_grad():
+            target_view.copy_(
+                tensor.to(device=target_view.device, dtype=target_view.dtype)
+            )
+
+        if half_name is None:
+            loaded.add(target_name)
+        else:
+            halves = expert_halves.setdefault(target_name, set())
+            halves.add(half_name)
+            if halves == {"gate_proj", "up_proj"}:
+                loaded.add(target_name)
+        return True
 
     def _capture_mtp_sidecar_state(self, state_dict: dict) -> None:
         """Keep only the trailing nextn tensors needed for MTP sidecar parity."""
@@ -257,6 +539,8 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
         return tensor.detach().cpu().float().numpy()
 
     def _make_mtp_sidecar_layer(self):
+        if getattr(self, "_mtp_sidecar_layer", None) is not None:
+            return self._mtp_sidecar_layer
         if not getattr(self, "_mtp_sidecar_state", None):
             return None
 
@@ -290,6 +574,106 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             raise RuntimeError(f"Missing MTP sidecar tensor {key}")
         return self._mtp_sidecar_state[key].to(self.device)
 
+    def _load_mtp_reference_pack_trajectory(
+        self,
+        prompt: str,
+        decode_steps: int,
+    ) -> tuple[list[int], list[int], torch.Tensor]:
+        """Load the authenticated main-model trajectory for a branch oracle.
+
+        Additive MTP branches do not alter committed main-model execution. The
+        canonical Hugging Face pack therefore is the exact authority for the
+        prompt's final-layer hidden rows and committed greedy tokens. Reusing
+        those immutable FP32 artifacts lets one small sidecar context evaluate
+        every production-observed branch without loading the 48-layer main
+        model again.
+
+        Returns:
+            Prompt token IDs, committed decode tokens, and the prefill final-
+            layer residual tensor.
+        """
+
+        pack = getattr(self, "_mtp_sidecar_reference_pack", None)
+        if pack is None:
+            raise RuntimeError("No MTP sidecar reference pack was configured")
+        metadata_path = pack / "metadata.txt"
+        if not metadata_path.is_file():
+            raise RuntimeError(
+                f"MTP sidecar reference pack has no metadata: {metadata_path}"
+            )
+
+        metadata = {}
+        for line in metadata_path.read_text(encoding="utf-8").splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            metadata[key.strip()] = value.strip()
+
+        def require(key: str) -> str:
+            value = metadata.get(key)
+            if value is None or not value:
+                raise RuntimeError(
+                    f"MTP sidecar reference metadata is missing {key}"
+                )
+            return value
+
+        if require("reference_engine") != "pytorch":
+            raise RuntimeError("MTP sidecar branches require a PyTorch reference pack")
+        if require("reference_dtype") != "float32":
+            raise RuntimeError("MTP sidecar branches require an FP32 reference pack")
+        if int(require("n_layers")) != self.hf_config.num_hidden_layers:
+            raise RuntimeError(
+                "MTP sidecar reference layer count does not match the GGUF model"
+            )
+        if int(require("decode_steps")) != decode_steps:
+            raise RuntimeError(
+                "MTP sidecar reference decode length does not match the request"
+            )
+
+        token_ids = [int(token) for token in require("token_ids").split(",")]
+        encoded_ids = self.tokenizer(prompt, return_tensors="pt")[
+            "input_ids"
+        ][0].tolist()
+        if encoded_ids != token_ids:
+            raise RuntimeError(
+                "MTP sidecar reference prompt tokens do not match the request"
+            )
+
+        decode_tokens = [
+            int(token) for token in require("decode_tokens").split(",")
+        ]
+        if len(decode_tokens) != decode_steps + 1:
+            raise RuntimeError(
+                "MTP sidecar reference pack must contain the prefill token and "
+                "one successor token for every decode step"
+            )
+
+        last_main_layer = self.hf_config.num_hidden_layers - 1
+        hidden_path = pack / f"layer{last_main_layer}_FFN_RESIDUAL.npy"
+        last_hidden = self._load_mtp_reference_hidden(hidden_path)
+        if last_hidden.shape[:2] != (1, len(token_ids)):
+            raise RuntimeError(
+                f"Unexpected MTP prefill trajectory shape {tuple(last_hidden.shape)}"
+            )
+        return token_ids, decode_tokens, last_hidden
+
+    def _load_mtp_reference_hidden(self, path: Path) -> torch.Tensor:
+        """Load and validate one immutable FP32 hidden-state checkpoint."""
+
+        if not path.is_file():
+            raise RuntimeError(f"Missing MTP main-model trajectory tensor: {path}")
+        payload = np.load(path, allow_pickle=False)
+        if payload.dtype != np.float32 or payload.ndim != 3:
+            raise RuntimeError(
+                f"Invalid MTP trajectory tensor {path}: "
+                f"dtype={payload.dtype}, shape={payload.shape}"
+            )
+        if payload.shape[-1] != self.hf_config.hidden_size:
+            raise RuntimeError(
+                f"MTP trajectory hidden width does not match the model: {path}"
+            )
+        return torch.from_numpy(payload).to(self.device)
+
     def generate_mtp_sidecar_decode_snapshots(
         self,
         prompt: str,
@@ -297,6 +681,7 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
         output_dir,
         max_draft_depth: int = 3,
         verbose: bool = False,
+        draft_token_overrides: Optional[dict[int, list[int]]] = None,
     ) -> int:
         """Generate recursive MTP0..MTPN checkpoints for the Qwen3.6 sidecar.
 
@@ -304,13 +689,29 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
         normalized hidden state.  That tensor is both the LM-head input and the
         hidden-state result published by the reference Qwen3.5 MTP module; the
         pre-normalized decoder residual is an intermediate checkpoint only.
+
+        ``draft_token_overrides`` names production-selected recursive condition
+        tokens by decode step.  Entry zero is consumed by MTP1, entry one by
+        MTP2, and so on; MTP0 always consumes the main-model condition token.
+        Alternate snapshots include the consumed branch in their filename so
+        they can coexist with the canonical Hugging Face greedy branch.
         """
         if not getattr(self, "_mtp_sidecar_state", None):
             return 0
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer not loaded")
-        if max_draft_depth < 1 or max_draft_depth > 3:
-            raise ValueError("max_draft_depth must be in [1, 3]")
+        if max_draft_depth < 1 or max_draft_depth > 15:
+            raise ValueError("max_draft_depth must be in [1, 15]")
+        draft_token_overrides = draft_token_overrides or {}
+        for step, tokens in draft_token_overrides.items():
+            if step < 0 or step >= decode_steps:
+                raise ValueError(
+                    f"MTP draft override step {step} is outside decode range"
+                )
+            if len(tokens) > max_draft_depth - 1 or any(token < 0 for token in tokens):
+                raise ValueError(
+                    f"MTP draft override step {step} has invalid recursive tokens"
+                )
 
         from pathlib import Path
         from transformers.cache_utils import DynamicCache
@@ -321,27 +722,39 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
         last_main_layer = self.hf_config.num_hidden_layers - 1
         sidecar_layer = self._make_mtp_sidecar_layer()
         sidecar_cache = DynamicCache(config=sidecar_layer._llaminar_mtp_config)
+        reference_pack = getattr(self, "_mtp_sidecar_reference_pack", None)
+        if reference_pack is not None and not draft_token_overrides:
+            raise RuntimeError(
+                "A sidecar-only context may generate additive branch snapshots "
+                "only; canonical pack generation requires the complete model"
+            )
 
         hnorm = self._mtp_tensor("hnorm.weight")
         enorm = self._mtp_tensor("enorm.weight")
         eh_proj = self._mtp_tensor("eh_proj.weight")
         shared_head_norm = self._mtp_tensor("shared_head_norm.weight")
 
-        encoding = self.tokenizer(prompt, return_tensors="pt")
-        token_ids = encoding["input_ids"][0].tolist()
-
-        result = self.forward(
-            token_ids,
-            clear_snapshots=True,
-            use_cache=True,
-            capture_stages=[PipelineStage.FFN_RESIDUAL],
-        )
-        main_cache = result["past_key_values"]
-        last_hidden = torch.from_numpy(
-            self.snapshots[(PipelineStage.FFN_RESIDUAL, last_main_layer)]
-        ).to(self.device)
-        if last_hidden.dim() == 2:
-            last_hidden = last_hidden.unsqueeze(0)
+        if reference_pack is None:
+            encoding = self.tokenizer(prompt, return_tensors="pt")
+            token_ids = encoding["input_ids"][0].tolist()
+            result = self.forward(
+                token_ids,
+                clear_snapshots=True,
+                use_cache=True,
+                capture_stages=[PipelineStage.FFN_RESIDUAL],
+            )
+            main_cache = result["past_key_values"]
+            last_hidden = torch.from_numpy(
+                self.snapshots[(PipelineStage.FFN_RESIDUAL, last_main_layer)]
+            ).to(self.device)
+            if last_hidden.dim() == 2:
+                last_hidden = last_hidden.unsqueeze(0)
+            committed_decode_tokens = None
+        else:
+            token_ids, committed_decode_tokens, last_hidden = (
+                self._load_mtp_reference_pack_trajectory(prompt, decode_steps)
+            )
+            main_cache = None
 
         def project_sidecar_hidden(
             terminal_hidden: torch.Tensor,
@@ -523,13 +936,29 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
                     row + 1,
                     sidecar_cache)
 
-            next_token = int(result["logits"][0, -1, :].argmax())
+            next_token = (
+                int(result["logits"][0, -1, :].argmax())
+                if committed_decode_tokens is None
+                else committed_decode_tokens[0]
+            )
             total = 0
             for step in range(decode_steps):
                 committed_cache_length = sidecar_cache.get_seq_length()
                 draft_hidden = last_hidden[:, -1:, :]
                 draft_condition_token = next_token
-                for depth_index in range(max_draft_depth):
+                step_overrides = draft_token_overrides.get(step)
+                consumed_recursive_tokens = []
+                replay_depth = mtp_sidecar_replay_depth(
+                    step, max_draft_depth, draft_token_overrides)
+                for depth_index in range(replay_depth):
+                    if (
+                        depth_index > 0
+                        and step_overrides is not None
+                        and depth_index - 1 < len(step_overrides)
+                    ):
+                        draft_condition_token = step_overrides[depth_index - 1]
+                    if depth_index > 0:
+                        consumed_recursive_tokens.append(draft_condition_token)
                     prefix = f"MTP{depth_index}_"
                     pieces = project_sidecar_hidden(
                         draft_hidden,
@@ -571,10 +1000,26 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
                             "MTP0_TERMINAL_HIDDEN_ROW_SELECT"
                         ]
                     snapshots.update(sidecar_captures)
+                    branch_qualifier = ""
+                    if step_overrides is not None and depth_index > 0:
+                        branch_qualifier = "_BRANCH_" + "_".join(
+                            str(token) for token in consumed_recursive_tokens
+                        )
+                    persist_snapshot = (
+                        not draft_token_overrides
+                        or (step_overrides is not None and depth_index > 0)
+                    )
                     for snapshot_key, payload in snapshots.items():
-                        np.save(
-                            output_dir / f"decode_step{step}_{snapshot_key}.npy",
-                            payload)
+                        if not persist_snapshot:
+                            continue
+                        snapshot_path = (
+                            output_dir
+                            / f"decode_step{step}{branch_qualifier}_{snapshot_key}.npy"
+                        )
+                        if draft_token_overrides:
+                            save_mtp_snapshot_atomic(snapshot_path, payload)
+                        else:
+                            np.save(snapshot_path, payload)
                         total += 1
                         if verbose:
                             print(
@@ -590,20 +1035,36 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
                 # the reference cache used by the following main decode step.
                 sidecar_cache.crop(committed_cache_length + 1)
 
-                result = self.forward(
-                    [next_token],
-                    clear_snapshots=True,
-                    past_key_values=main_cache,
-                    use_cache=True,
-                    capture_stages=[PipelineStage.FFN_RESIDUAL],
-                )
-                main_cache = result["past_key_values"]
-                last_hidden = torch.from_numpy(
-                    self.snapshots[(PipelineStage.FFN_RESIDUAL, last_main_layer)]
-                ).to(self.device)
-                if last_hidden.dim() == 2:
-                    last_hidden = last_hidden.unsqueeze(0)
-                next_token = int(result["logits"][0, -1, :].argmax())
+                if committed_decode_tokens is None:
+                    result = self.forward(
+                        [next_token],
+                        clear_snapshots=True,
+                        past_key_values=main_cache,
+                        use_cache=True,
+                        capture_stages=[PipelineStage.FFN_RESIDUAL],
+                    )
+                    main_cache = result["past_key_values"]
+                    last_hidden = torch.from_numpy(
+                        self.snapshots[
+                            (PipelineStage.FFN_RESIDUAL, last_main_layer)
+                        ]
+                    ).to(self.device)
+                    if last_hidden.dim() == 2:
+                        last_hidden = last_hidden.unsqueeze(0)
+                    next_token = int(result["logits"][0, -1, :].argmax())
+                else:
+                    hidden_path = (
+                        reference_pack
+                        / f"decode_step{step}_layer{last_main_layer}_"
+                        "FFN_RESIDUAL.npy"
+                    )
+                    last_hidden = self._load_mtp_reference_hidden(hidden_path)
+                    if last_hidden.shape[:2] != (1, 1):
+                        raise RuntimeError(
+                            "MTP decode trajectory must contain exactly one row: "
+                            f"{hidden_path}"
+                        )
+                    next_token = committed_decode_tokens[step + 1]
 
         return total
 

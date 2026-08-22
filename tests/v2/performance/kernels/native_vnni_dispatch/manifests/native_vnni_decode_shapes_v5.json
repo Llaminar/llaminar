@@ -49,6 +49,72 @@
       "verifier_partition": "development"
     },
     {
+      "name": "Qwen35MoE_122B_TP2_AttnKVProjection",
+      "n": 256,
+      "k": 3072,
+      "model_family": "qwen35-moe-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen35MoE_122B_TP2_GDNZProjection",
+      "n": 4096,
+      "k": 3072,
+      "model_family": "qwen35-moe-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "balanced",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen35MoE_122B_TP2_AttnGDNOutputProjection",
+      "n": 3072,
+      "k": 4096,
+      "model_family": "qwen35-moe-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "balanced",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen35MoE_122B_TP4_AttnKVProjection",
+      "n": 128,
+      "k": 3072,
+      "model_family": "qwen35-moe-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen35MoE_122B_TP4_GDNZProjection",
+      "n": 2048,
+      "k": 3072,
+      "model_family": "qwen35-moe-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "tall",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
+      "name": "Qwen35MoE_122B_TP4_AttnGDNOutputProjection",
+      "n": 3072,
+      "k": 2048,
+      "model_family": "qwen35-moe-tp-local",
+      "role": "production",
+      "exact_overlay": true,
+      "aspect_bucket": "balanced",
+      "fast_partition": "development",
+      "verifier_partition": "development"
+    },
+    {
       "name": "0.5B_AttnOut",
       "n": 896,
       "k": 896,

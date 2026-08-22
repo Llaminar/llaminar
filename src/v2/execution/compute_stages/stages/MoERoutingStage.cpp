@@ -444,6 +444,29 @@ namespace llaminar2
         if (stream)
             setGPUStream(stream);
 
+        /* Async histogram banks are initialized on their maintenance stream.
+         * Admit the exact routing stream now, while the graph owner can legally
+         * join that uncaptured setup event. execute() will only publish the
+         * already-prepared identity from inside the capture interval. */
+        if (isRuntimeTableDecodeGraphCapturable() &&
+            params_.collect_device_runtime_histogram)
+        {
+            try
+            {
+                params_.moe_runtime_table->prepareDecodeHistogramProducerStream(
+                    stream);
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR("[MoERoutingStage] Failed to prepare the runtime "
+                          "histogram producer before graph capture"
+                          << " device=" << params_.device_id.toString()
+                          << " layer=" << params_.layer_idx
+                          << " reason=" << error.what());
+                return false;
+            }
+        }
+
         /*
          * Resolve and bind the backend wrapper before beginCapture(). Creating
          * the wrapper from execute() used to require an eager routing pass; no
@@ -857,7 +880,23 @@ namespace llaminar2
                           << params_.device_id.toString());
                 return false;
             }
-            params_.moe_runtime_table->recordDecodeHistogramProducerStream(route_stream);
+            if (params_.collect_device_runtime_histogram)
+            {
+                try
+                {
+                    params_.moe_runtime_table->recordDecodeHistogramProducerStream(
+                        route_stream);
+                }
+                catch (const std::exception &error)
+                {
+                    LOG_ERROR("[MoERoutingStage] Runtime histogram producer was not "
+                              "prepared for graph execution"
+                              << " device=" << params_.device_id.toString()
+                              << " layer=" << params_.layer_idx
+                              << " reason=" << error.what());
+                    return false;
+                }
+            }
 
             bool routed = false;
             if (params_.device_rebalance_route_apply)
@@ -944,7 +983,7 @@ namespace llaminar2
                     params_.output_indices,
                     params_.output_weights,
                     /*write_legacy_outputs=*/true,
-                    /*update_runtime_histogram=*/true,
+                    params_.collect_device_runtime_histogram,
                     plan_entries,
                     params_.device_rebalance_plan_capacity,
                     command_headers,
@@ -975,7 +1014,7 @@ namespace llaminar2
                     params_.output_indices,
                     params_.output_weights,
                     /*write_legacy_outputs=*/true,
-                    /*update_runtime_histogram=*/true,
+                    params_.collect_device_runtime_histogram,
                     params_.absolute_position_ids_device,
                     params_.routed_row_execution_policy);
             }
@@ -988,7 +1027,8 @@ namespace llaminar2
 
             LOG_TRACE("[MoERoutingStage] Runtime-routed single token to top-"
                       << top_k << " of " << num_experts << " experts");
-            recordRuntimeHistogramTokenBoundary();
+            if (params_.collect_device_runtime_histogram)
+                recordRuntimeHistogramTokenBoundary();
             return true;
         }
 

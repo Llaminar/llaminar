@@ -451,6 +451,24 @@ namespace llaminar2
 
     void *NvidiaDeviceContext::getOrCreateAuxiliaryStream(const std::string &name, bool *created)
     {
+        return getOrCreateAuxiliaryStream(
+            name,
+            GPUAuxiliaryStreamSchedulingClass::Normal,
+            created);
+    }
+
+    /**
+     * @brief Materialize one CUDA auxiliary stream with immutable priority.
+     *
+     * CUDA stream priority makes controller work latency-critical and keeps
+     * residency maintenance below ordinary compute work. It deliberately does
+     * not claim to prioritize copy-engine DMA.
+     */
+    void *NvidiaDeviceContext::getOrCreateAuxiliaryStream(
+        const std::string &name,
+        GPUAuxiliaryStreamSchedulingClass scheduling_class,
+        bool *created)
+    {
         if (created)
             *created = false;
         if (name.empty())
@@ -462,12 +480,58 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
         auto it = auxiliary_streams_.find(name);
         if (it != auxiliary_streams_.end() && it->second)
+        {
+            const auto class_it =
+                auxiliary_stream_scheduling_classes_.find(name);
+            if (class_it == auxiliary_stream_scheduling_classes_.end() ||
+                class_it->second != scheduling_class)
+            {
+                LOG_ERROR("[NvidiaDeviceContext] Auxiliary stream scheduling class changed for "
+                          << name);
+                return nullptr;
+            }
             return static_cast<void *>(it->second);
+        }
 
-        auto *stream = static_cast<cudaStream_t>(createStream());
+        cudaStream_t stream = nullptr;
+        if (scheduling_class ==
+            GPUAuxiliaryStreamSchedulingClass::Normal)
+        {
+            stream = static_cast<cudaStream_t>(createStream());
+        }
+        else
+        {
+            cudaError_t error = cudaSetDevice(device_ordinal_);
+            int least_priority = 0;
+            int greatest_priority = 0;
+            if (error == cudaSuccess)
+            {
+                error = cudaDeviceGetStreamPriorityRange(
+                    &least_priority, &greatest_priority);
+            }
+            const int priority =
+                scheduling_class ==
+                        GPUAuxiliaryStreamSchedulingClass::LatencyCritical
+                    ? greatest_priority
+                    : least_priority;
+            if (error == cudaSuccess)
+            {
+                error = cudaStreamCreateWithPriority(
+                    &stream,
+                    cudaStreamNonBlocking,
+                    priority);
+            }
+            if (error != cudaSuccess)
+            {
+                LOG_ERROR("[NvidiaDeviceContext] Could not create prioritized auxiliary stream: "
+                          << cudaGetErrorString(error));
+                return nullptr;
+            }
+        }
         if (!stream)
             return nullptr;
         auxiliary_streams_[name] = stream;
+        auxiliary_stream_scheduling_classes_[name] = scheduling_class;
         if (created)
             *created = true;
         return static_cast<void *>(stream);
@@ -482,6 +546,7 @@ namespace llaminar2
             if (set_err == cudaErrorCudartUnloading)
             {
                 auxiliary_streams_.clear();
+                auxiliary_stream_scheduling_classes_.clear();
                 return;
             }
             LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
@@ -503,6 +568,7 @@ namespace llaminar2
             }
         }
         auxiliary_streams_.clear();
+        auxiliary_stream_scheduling_classes_.clear();
     }
 
     // ============================================================================

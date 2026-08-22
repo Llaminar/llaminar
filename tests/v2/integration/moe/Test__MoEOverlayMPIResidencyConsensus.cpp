@@ -140,24 +140,52 @@ namespace llaminar2::test
             }
         }
 
-        /** @brief Poll one service-readiness reduction without an MPI wait. */
-        bool finishEconomyServiceReadiness(
+        /** @brief Poll one calibration-readiness all-gather without waiting. */
+        MoEOverlayResidencyWaveProgress finishCalibrationReadiness(
             MoEOverlayMPIEconomyEvidenceExchange &exchange)
         {
-            bool all_ranks_ready = false;
             for (;;)
             {
                 std::string error;
-                const auto progress = exchange.pollServiceReadiness(
-                    &all_ranks_ready, &error);
-                if (progress == MoEOverlayResidencyWaveProgress::Ready)
-                    return all_ranks_ready;
+                const auto progress =
+                    exchange.pollCalibrationReadiness(&error);
+                if (progress == MoEOverlayResidencyWaveProgress::Ready ||
+                    progress == MoEOverlayResidencyWaveProgress::Deferred)
+                {
+                    EXPECT_TRUE(error.empty());
+                    return progress;
+                }
                 EXPECT_EQ(
                     progress,
                     MoEOverlayResidencyWaveProgress::Pending)
                     << error;
                 if (progress == MoEOverlayResidencyWaveProgress::Failed)
-                    return false;
+                    return progress;
+                std::this_thread::yield();
+            }
+        }
+
+        /** @brief Poll one typed service-readiness round without an MPI wait. */
+        MoEOverlayServiceEvidenceReadiness finishEconomyServiceReadiness(
+            MoEOverlayMPIEconomyEvidenceExchange &exchange)
+        {
+            auto global_readiness =
+                MoEOverlayServiceEvidenceReadiness::AwaitingEvidence;
+            for (;;)
+            {
+                std::string error;
+                const auto progress = exchange.pollServiceReadiness(
+                    &global_readiness, &error);
+                if (progress == MoEOverlayResidencyWaveProgress::Ready)
+                    return global_readiness;
+                EXPECT_EQ(
+                    progress,
+                    MoEOverlayResidencyWaveProgress::Pending)
+                    << error;
+                if (progress == MoEOverlayResidencyWaveProgress::Failed)
+                {
+                    return MoEOverlayServiceEvidenceReadiness::Stopping;
+                }
                 std::this_thread::yield();
             }
         }
@@ -358,7 +386,7 @@ namespace llaminar2::test
             : public IMoEOverlayResidencyTransport
         {
         public:
-            /** @brief Device-free local bank with independently failable commit. */
+            /** @brief Device-free local bank with independently failable preparation. */
             class Wave final : public IMoEOverlayResidencyWave
             {
             public:
@@ -376,15 +404,28 @@ namespace llaminar2::test
                 }
 
                 /** @brief Return the rank-local scripted bank enqueue result. */
-                bool beginCommit(std::string *error) noexcept override
+                bool beginPrepare(std::string *error) noexcept override
                 {
-                    if (!owner_->commit_begin_ok && error)
-                        *error = "injected real-MPI local commit failure";
-                    return owner_->commit_begin_ok;
+                    if (!owner_->prepare_begin_ok && error)
+                        *error = "injected real-MPI local preparation failure";
+                    return owner_->prepare_begin_ok;
                 }
 
                 /** @brief Successful enqueues are immediately observable. */
-                MoEOverlayResidencyWaveProgress pollCommit(
+                MoEOverlayResidencyWaveProgress pollPrepare(
+                    std::string *) noexcept override
+                {
+                    return MoEOverlayResidencyWaveProgress::Ready;
+                }
+
+                /** @brief Publish the already-prepared device-free selector. */
+                bool beginPublication(std::string *) noexcept override
+                {
+                    return true;
+                }
+
+                /** @brief Device-free publication is immediately observable. */
+                MoEOverlayResidencyWaveProgress pollPublication(
                     std::string *) noexcept override
                 {
                     return MoEOverlayResidencyWaveProgress::Ready;
@@ -425,7 +466,7 @@ namespace llaminar2::test
             }
 
             bool defer_start = false;
-            bool commit_begin_ok = true;
+            bool prepare_begin_ok = true;
             int begin_calls = 0;
             int aborts = 0;
             int retirements = 0;
@@ -441,7 +482,9 @@ namespace llaminar2::test
                 const auto result = authority.advanceBackground();
                 if (result.status != MoEOverlayResidencyApplyStatus::Staging &&
                     result.status !=
-                        MoEOverlayResidencyApplyStatus::Committing)
+                        MoEOverlayResidencyApplyStatus::Preparing &&
+                    result.status !=
+                        MoEOverlayResidencyApplyStatus::Publishing)
                 {
                     return result;
                 }
@@ -462,7 +505,7 @@ namespace llaminar2::test
             {
                 const auto progress = authority.advanceBackground();
                 if (progress.status ==
-                    MoEOverlayResidencyApplyStatus::CommitFailed)
+                    MoEOverlayResidencyApplyStatus::RetirementFailed)
                 {
                     if (error)
                         *error = progress.error;
@@ -817,67 +860,6 @@ namespace llaminar2::test
             }};
         }
 
-        /**
-         * @brief Offer one exact live workload and keep concurrent work alive.
-         *
-         * A real MPI transfer needs several nonblocking progress polls. Keep the
-         * winning inference ticket open until calibration has completed the
-         * physical stage, matching the production invariant that the whole wave
-         * interval must lie inside the inference interval.
-         */
-        void runEconomyInferencePhases(
-            MoEOverlayInferenceInterferenceProbe &probe,
-            MoEOverlayEconomyCalibrationController &calibration,
-            MoEOverlayEconomyCertificationController &certification)
-        {
-            for (const auto source : {
-                     ExpertHistogramSource::DecodeToken,
-                     ExpertHistogramSource::PrefillChunk,
-                     ExpertHistogramSource::GroupedVerifier})
-            {
-                const int depth =
-                    source == ExpertHistogramSource::GroupedVerifier ? 3 : 0;
-                const int rows =
-                    source == ExpertHistogramSource::PrefillChunk
-                        ? 16
-                        : depth + 1;
-                const auto ticket = probe.beginSample({
-                    .source = source,
-                    .real_rows = rows,
-                    .execution_rows = rows,
-                    .transaction_count = 1,
-                    .speculative_depth = depth,
-                    .schedule_fingerprint =
-                        0xabc000u +
-                        static_cast<std::uint64_t>(source),
-                });
-                if (!ticket.valid())
-                    continue;
-
-                if (calibration.state() ==
-                    MoEOverlayEconomyCalibrationState::
-                        AwaitConcurrentInference)
-                {
-                    const auto deadline =
-                        std::chrono::steady_clock::now() +
-                        std::chrono::seconds(2);
-                    while ((calibration.state() ==
-                                MoEOverlayEconomyCalibrationState::
-                                    AwaitConcurrentInference ||
-                            calibration.state() ==
-                                MoEOverlayEconomyCalibrationState::
-                                    AwaitConcurrentWave) &&
-                           calibration.healthy() &&
-                           std::chrono::steady_clock::now() < deadline)
-                    {
-                        certification.poll();
-                        std::this_thread::yield();
-                    }
-                }
-                EXPECT_TRUE(probe.finishSample(ticket));
-            }
-        }
-
         /** @brief Verify every final byte against the source's fill function. */
         bool distributedCpuBytesMatchSeed(
             const MoEOverlayPreparedExpertTriplet &triplet,
@@ -982,6 +964,32 @@ namespace llaminar2::test
             };
         }
 
+        /** @brief One valid pre-staging identity, optionally rank-divergent. */
+        MoEOverlayCalibrationReadiness economyReadiness(
+            int world_rank,
+            bool divergent)
+        {
+            return {
+                .kind =
+                    MoEOverlayCalibrationReadinessKind::BaselineDeviceComplete,
+                .calibration_sequence = 40,
+                .coordinate = {
+                    .source_participant = 0,
+                    .destination_participant = 1,
+                    .layer = 0,
+                },
+                .source = ExpertHistogramSource::PrefillChunk,
+                .workload = {
+                    .source = ExpertHistogramSource::PrefillChunk,
+                    .real_rows = divergent && world_rank == 1 ? 31 : 32,
+                    .execution_rows = 32,
+                    .transaction_count = 1,
+                    .speculative_depth = 0,
+                    .schedule_fingerprint = 0x1234u,
+                },
+            };
+        }
+
         /** @brief Sampled local prepared-expert service row. */
         MoEOverlayParticipantLayerServiceTotals economyServiceRow(
             int participant,
@@ -1026,6 +1034,22 @@ namespace llaminar2::test
         });
 
         std::string error;
+        ASSERT_TRUE(exchange.beginCalibrationReadiness(
+            economyReadiness(context->rank(), false), &error))
+            << error;
+        EXPECT_EQ(
+            finishCalibrationReadiness(exchange),
+            MoEOverlayResidencyWaveProgress::Ready);
+        EXPECT_TRUE(exchange.idle());
+
+        ASSERT_TRUE(exchange.beginCalibrationReadiness(
+            economyReadiness(context->rank(), true), &error))
+            << error;
+        EXPECT_EQ(
+            finishCalibrationReadiness(exchange),
+            MoEOverlayResidencyWaveProgress::Deferred);
+        EXPECT_TRUE(exchange.idle());
+
         ASSERT_TRUE(exchange.beginAttempt(
             economyAttempt(context->rank(), true), &error))
             << error;
@@ -1069,15 +1093,35 @@ namespace llaminar2::test
         }
         ASSERT_GE(local_participant, 0);
         ASSERT_TRUE(exchange.beginServiceReadiness(
-            context->rank() == 0, &error))
+            context->rank() == 0
+                ? MoEOverlayServiceEvidenceReadiness::Ready
+                : MoEOverlayServiceEvidenceReadiness::AwaitingEvidence,
+            &error))
             << error;
-        EXPECT_FALSE(finishEconomyServiceReadiness(exchange))
+        EXPECT_EQ(
+            finishEconomyServiceReadiness(exchange),
+            MoEOverlayServiceEvidenceReadiness::AwaitingEvidence)
             << "One ready rank must not enter the service all-gather alone";
         EXPECT_TRUE(exchange.idle());
 
-        ASSERT_TRUE(exchange.beginServiceReadiness(true, &error))
+        ASSERT_TRUE(exchange.beginServiceReadiness(
+            context->rank() == 0
+                ? MoEOverlayServiceEvidenceReadiness::Ready
+                : MoEOverlayServiceEvidenceReadiness::Stopping,
+            &error))
             << error;
-        EXPECT_TRUE(finishEconomyServiceReadiness(exchange));
+        EXPECT_EQ(
+            finishEconomyServiceReadiness(exchange),
+            MoEOverlayServiceEvidenceReadiness::Stopping)
+            << "One stopping rank must close the shared readiness lifecycle";
+        EXPECT_TRUE(exchange.idle());
+
+        ASSERT_TRUE(exchange.beginServiceReadiness(
+            MoEOverlayServiceEvidenceReadiness::Ready, &error))
+            << error;
+        EXPECT_EQ(
+            finishEconomyServiceReadiness(exchange),
+            MoEOverlayServiceEvidenceReadiness::Ready);
         EXPECT_TRUE(exchange.idle());
 
         ASSERT_TRUE(exchange.beginService(
@@ -1093,9 +1137,13 @@ namespace llaminar2::test
         const auto stats = exchange.stats();
         EXPECT_EQ(stats.attempt_exchanges_started, 2u);
         EXPECT_EQ(stats.attempt_exchanges_completed, 2u);
-        EXPECT_EQ(stats.service_readiness_exchanges_started, 2u);
-        EXPECT_EQ(stats.service_readiness_exchanges_completed, 2u);
+        EXPECT_EQ(stats.calibration_readiness_exchanges_started, 2u);
+        EXPECT_EQ(stats.calibration_readiness_exchanges_completed, 1u);
+        EXPECT_EQ(stats.calibration_readiness_retries, 1u);
+        EXPECT_EQ(stats.service_readiness_exchanges_started, 3u);
+        EXPECT_EQ(stats.service_readiness_exchanges_completed, 3u);
         EXPECT_EQ(stats.service_readiness_incomplete, 1u);
+        EXPECT_EQ(stats.service_readiness_stops, 1u);
         EXPECT_EQ(stats.service_exchanges_started, 1u);
         EXPECT_EQ(stats.service_exchanges_completed, 1u);
         EXPECT_GT(stats.progress_polls, 0u);
@@ -1530,7 +1578,7 @@ namespace llaminar2::test
         {
             progress = authority->advanceBackground();
             ASSERT_TRUE(progress.ok()) << progress.error;
-            if (progress.status == MoEOverlayResidencyApplyStatus::Committed)
+            if (progress.status == MoEOverlayResidencyApplyStatus::Published)
             {
                 committed = true;
                 break;
@@ -1604,7 +1652,8 @@ namespace llaminar2::test
         EXPECT_EQ(distributed_stats.waves_started, 1u);
         EXPECT_EQ(distributed_stats.reservation_consensus_ready, 1u);
         EXPECT_EQ(distributed_stats.stage_consensus_ready, 1u);
-        EXPECT_EQ(distributed_stats.commit_consensus_ready, 1u);
+        EXPECT_EQ(distributed_stats.preparation_consensus_ready, 1u);
+        EXPECT_EQ(distributed_stats.publication_consensus_ready, 1u);
         EXPECT_EQ(distributed_stats.waves_published, 1u);
         EXPECT_EQ(distributed_stats.inference_thread_waits, 0u);
         EXPECT_EQ(distributed_stats.blocking_synchronizations, 0u);
@@ -1616,9 +1665,13 @@ namespace llaminar2::test
         EXPECT_EQ(authority->pendingRetirementCount(), 0u);
     }
 
-    TEST(
-        Test__MoEOverlayMPIResidencyConsensus,
-        DistributedEconomyCertificationUsesRealAbortOnlyMovementBeforeProposals)
+    /**
+     * @brief Exercise distributed certification through completion or stop.
+     * @param stop_while_peer_waits When true, stop after one shared incomplete
+     *        round while rank zero still lacks local evidence.
+     */
+    void assertDistributedEconomyCertification(
+        bool stop_while_peer_waits)
     {
         auto context = worldContext();
         if (!requireTwoRanks(*context))
@@ -1699,9 +1752,9 @@ namespace llaminar2::test
             }
         };
         /*
-         * Rank zero deliberately starts without service evidence. The first
-         * all-rank readiness vote must complete false instead of allowing rank
-         * one to enter the larger service all-gather alone.
+         * Rank zero deliberately starts without service evidence. Both ranks
+         * must complete one typed AwaitingEvidence round before either can
+         * enter a later Ready round or the larger service all-gather.
          */
         bool local_service_recorded = context->rank() != 0;
         if (local_service_recorded)
@@ -1795,15 +1848,12 @@ namespace llaminar2::test
                         kMinimumMigrationSamples,
                 .measurement_identity = catalog->identity(),
             });
-        auto probe =
-            std::make_shared<MoEOverlayInferenceInterferenceProbe>();
         auto calibration = std::make_shared<
             MoEOverlayEconomyCalibrationController>(
             MoEOverlayEconomyCalibrationController::Config{
                 .planner = planner,
                 .ledger = ledger,
                 .journal = journal,
-                .probe = probe,
                 .transport = distributed_transport,
                 .evidence_exchange = evidence_exchange,
                 .perf_device = "mpi-distributed-economy-cpu",
@@ -1827,50 +1877,110 @@ namespace llaminar2::test
                 .minimum_residency_generations = 0,
             },
             .evidence_exchange = evidence_exchange,
+            .service_readiness_retry_interval =
+                stop_while_peer_waits
+                    ? std::chrono::milliseconds(1'000)
+                    : std::chrono::milliseconds(0),
             .perf_device = "mpi-distributed-economy-cpu",
         });
 
+        const auto terminal_state = [&]
+        {
+            return certification.state() ==
+                   (stop_while_peer_waits
+                        ? MoEOverlayEconomyCertificationState::Stopped
+                        : MoEOverlayEconomyCertificationState::Complete);
+        };
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (certification.state() !=
-                   MoEOverlayEconomyCertificationState::Complete &&
-               certification.healthy() &&
-               std::chrono::steady_clock::now() < deadline)
+        if (stop_while_peer_waits)
         {
-            certification.poll();
-            if (!local_service_recorded &&
-                evidence_exchange->stats()
-                        .service_readiness_incomplete != 0)
+            while ((certification.state() !=
+                        MoEOverlayEconomyCertificationState::
+                            AwaitingServiceEvidence ||
+                    evidence_exchange->stats()
+                            .service_readiness_incomplete == 0u) &&
+                   certification.healthy() &&
+                   std::chrono::steady_clock::now() < deadline)
             {
-                recordLocalServiceEvidence();
-                local_service_recorded = true;
+                certification.poll();
+                std::this_thread::yield();
             }
-            runEconomyInferencePhases(
-                *probe, *calibration, certification);
-            std::this_thread::yield();
+            ASSERT_TRUE(certification.healthy())
+                << certification.failureMessage();
+            ASSERT_EQ(
+                certification.state(),
+                MoEOverlayEconomyCertificationState::
+                    AwaitingServiceEvidence);
+
+            /*
+             * Synchronize only the test harness on MPI_COMM_WORLD.  The
+             * production economy exchange owns its duplicated communicator.
+             * Both controllers observe stop before either opens the next
+             * retry round, then the typed Stopping reduction closes the same
+             * lifecycle on every rank.
+             */
+            int local_edge_ready = 1;
+            int every_edge_ready = 0;
+            ASSERT_EQ(
+                MPI_Allreduce(
+                    &local_edge_ready,
+                    &every_edge_ready,
+                    1,
+                    MPI_INT,
+                    MPI_LAND,
+                    MPI_COMM_WORLD),
+                MPI_SUCCESS);
+            ASSERT_EQ(every_edge_ready, 1);
+            certification.requestStop();
+            while (!terminal_state() && certification.healthy() &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                certification.poll();
+                std::this_thread::yield();
+            }
+        }
+        else
+        {
+            while (!terminal_state() && certification.healthy() &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                certification.poll();
+                if (!local_service_recorded &&
+                    evidence_exchange->stats()
+                            .service_readiness_incomplete != 0u)
+                {
+                    recordLocalServiceEvidence();
+                    local_service_recorded = true;
+                }
+                std::this_thread::yield();
+            }
         }
         ASSERT_TRUE(certification.healthy())
             << certification.failureMessage();
         ASSERT_EQ(
             certification.state(),
-            MoEOverlayEconomyCertificationState::Complete);
-        EXPECT_TRUE(authority->hasEconomyCertification());
+            stop_while_peer_waits
+                ? MoEOverlayEconomyCertificationState::Stopped
+                : MoEOverlayEconomyCertificationState::Complete);
+        EXPECT_EQ(
+            authority->hasEconomyCertification(),
+            !stop_while_peer_waits);
         EXPECT_EQ(authority->stats().checks, 0u)
             << "Certification must precede the first histogram proposal";
         EXPECT_EQ(authority->snapshot()->epoch, initial_snapshot->epoch)
             << "Calibration waves are never publishable";
-        EXPECT_TRUE(probe->idle());
         EXPECT_TRUE(evidence_exchange->idle());
 
         const auto calibration_stats = calibration->stats();
-        EXPECT_EQ(calibration_stats.accepted_pairs, 9u);
-        EXPECT_EQ(calibration_stats.exact_overlap_samples, 9u);
+        EXPECT_EQ(calibration_stats.accepted_pairs, 3u);
+        EXPECT_EQ(calibration_stats.exact_overlap_samples, 0u);
         EXPECT_EQ(calibration_stats.partial_overlap_rejections, 0u);
-        EXPECT_EQ(calibration_stats.waves_started, 9u);
-        EXPECT_EQ(calibration_stats.waves_aborted, 9u);
-        EXPECT_EQ(fabric->stats().waves_prepared, 9u);
+        EXPECT_EQ(calibration_stats.waves_started, 3u);
+        EXPECT_EQ(calibration_stats.waves_aborted, 3u);
+        EXPECT_EQ(fabric->stats().waves_prepared, 3u);
         EXPECT_EQ(local_transport->stats().commits_started, 0u);
-        EXPECT_EQ(local_transport->stats().waves_aborted, 9u);
+        EXPECT_EQ(local_transport->stats().waves_aborted, 3u);
         EXPECT_EQ(
             distributed_transport->stats().waves_published,
             0u);
@@ -1881,16 +1991,35 @@ namespace llaminar2::test
             remote_projection_transport->stats().mpi_failures,
             0u);
         EXPECT_EQ(evidence_exchange->stats().mpi_failures, 0u);
-        EXPECT_GE(
+        EXPECT_EQ(
             evidence_exchange->stats()
                 .service_readiness_exchanges_started,
             2u);
-        EXPECT_GE(
+        EXPECT_EQ(
             evidence_exchange->stats().service_readiness_incomplete,
             1u);
         EXPECT_EQ(
+            evidence_exchange->stats().service_readiness_stops,
+            stop_while_peer_waits ? 1u : 0u);
+        EXPECT_EQ(
             certification.stats().certifications_installed,
-            1u);
+            stop_while_peer_waits ? 0u : 1u);
+    }
+
+    TEST(
+        Test__MoEOverlayMPIResidencyConsensus,
+        DistributedEconomyCertificationUsesRealAbortOnlyMovementBeforeProposals)
+    {
+        assertDistributedEconomyCertification(
+            /*stop_while_peer_waits=*/false);
+    }
+
+    TEST(
+        Test__MoEOverlayMPIResidencyConsensus,
+        DistributedEconomyCertificationPropagatesTypedStopAfterIncompleteRound)
+    {
+        assertDistributedEconomyCertification(
+            /*stop_while_peer_waits=*/true);
     }
 
     TEST(
@@ -1962,7 +2091,7 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayMPIResidencyConsensus,
-        UnanimousStageAndCommitVotesCompleteOnPrivateLane)
+        UnanimousStagePrepareAndPublicationVotesCompleteOnPrivateLane)
     {
         auto context = worldContext();
         if (!requireTwoRanks(*context))
@@ -2000,22 +2129,35 @@ namespace llaminar2::test
         EXPECT_EQ(
             protocol.state(),
             MoEOverlayDistributedResidencyProtocolState::
-                AwaitingLocalCommit);
+                AwaitingLocalPrepare);
 
-        const auto commit_vote = protocol.makeLocalVote(
+        const auto prepare_vote = protocol.makeLocalVote(
             MoEOverlayDistributedResidencyVoteDecision::Ready);
-        ASSERT_TRUE(lane.begin(commit_vote, &error)) << error;
-        const auto commit_votes = finishExchange(lane);
-        ASSERT_EQ(commit_votes.size(), 2u);
-        ASSERT_TRUE(protocol.acceptConsensus(commit_votes, &error)) << error;
+        ASSERT_TRUE(lane.begin(prepare_vote, &error)) << error;
+        const auto prepare_votes = finishExchange(lane);
+        ASSERT_EQ(prepare_votes.size(), 2u);
+        ASSERT_TRUE(protocol.acceptConsensus(prepare_votes, &error)) << error;
         EXPECT_EQ(
             protocol.state(),
-            MoEOverlayDistributedResidencyProtocolState::ReadyToPublish);
-        protocol.markPublished();
+            MoEOverlayDistributedResidencyProtocolState::
+                AwaitingLocalPublication);
+
+        const auto publication_vote = protocol.makeLocalVote(
+            MoEOverlayDistributedResidencyVoteDecision::Ready);
+        ASSERT_TRUE(lane.begin(publication_vote, &error)) << error;
+        const auto publication_votes = finishExchange(lane);
+        ASSERT_EQ(publication_votes.size(), 2u);
+        ASSERT_TRUE(protocol.acceptConsensus(publication_votes, &error))
+            << error;
+        EXPECT_EQ(
+            protocol.state(),
+            MoEOverlayDistributedResidencyProtocolState::
+                ReadyForAuthorityPublication);
+        protocol.markAuthorityPublished();
 
         const auto stats = lane.stats();
-        EXPECT_EQ(stats.exchanges_started, 3u);
-        EXPECT_EQ(stats.exchanges_completed, 3u);
+        EXPECT_EQ(stats.exchanges_started, 4u);
+        EXPECT_EQ(stats.exchanges_completed, 4u);
         EXPECT_GT(stats.progress_polls, 0u);
         EXPECT_EQ(stats.mpi_failures, 0u);
         EXPECT_TRUE(lane.idle());
@@ -2023,7 +2165,7 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayMPIResidencyConsensus,
-        RemoteStageFailureAbortsEveryRankBeforeCommit)
+        RemoteStageFailureAbortsEveryRankBeforePreparation)
     {
         auto context = worldContext();
         if (!requireTwoRanks(*context))
@@ -2065,7 +2207,7 @@ namespace llaminar2::test
         ASSERT_TRUE(protocol.failure().has_value());
         EXPECT_EQ(protocol.failure()->world_rank, 1);
         EXPECT_EQ(protocol.failure()->error_code, 61);
-        EXPECT_THROW(protocol.markPublished(), std::logic_error);
+        EXPECT_THROW(protocol.markAuthorityPublished(), std::logic_error);
         EXPECT_TRUE(lane.idle());
     }
 
@@ -2145,7 +2287,7 @@ namespace llaminar2::test
         ASSERT_EQ(result.status, MoEOverlayResidencyApplyStatus::Started)
             << result.error;
         result = finishAuthorityWave(*fixture.authority);
-        ASSERT_EQ(result.status, MoEOverlayResidencyApplyStatus::Committed)
+        ASSERT_EQ(result.status, MoEOverlayResidencyApplyStatus::Published)
             << result.error;
         EXPECT_EQ(fixture.authority->snapshot()->epoch, 2u);
         ASSERT_EQ(local.fingerprints.size(), 2u);
@@ -2154,7 +2296,7 @@ namespace llaminar2::test
         /*
          * Publication may immediately start the non-blocking retirement vote,
          * so the shared lane is not required to be idle at the return edge of
-         * Committed. Poll the maintenance authority until both ranks have
+         * Published. Poll the maintenance authority until both ranks have
          * drained that exact fence; inference remains absent from this loop.
          */
         std::string retirement_error;
@@ -2167,7 +2309,8 @@ namespace llaminar2::test
         EXPECT_EQ(stats.reservation_consensus_deferred, 1u);
         EXPECT_EQ(stats.reservation_consensus_ready, 1u);
         EXPECT_EQ(stats.stage_consensus_ready, 1u);
-        EXPECT_EQ(stats.commit_consensus_ready, 1u);
+        EXPECT_EQ(stats.preparation_consensus_ready, 1u);
+        EXPECT_EQ(stats.publication_consensus_ready, 1u);
         EXPECT_EQ(stats.waves_published, 1u);
         EXPECT_EQ(stats.inference_thread_waits, 0u);
         EXPECT_EQ(stats.blocking_synchronizations, 0u);
@@ -2175,7 +2318,7 @@ namespace llaminar2::test
 
     TEST(
         Test__MoEOverlayMPIResidencyConsensus,
-        DistributedCommitStartFailureReachesEveryRankWithoutHang)
+        DistributedPrepareStartFailureReachesEveryRankWithoutHang)
     {
         auto context = worldContext();
         if (!requireTwoRanks(*context))
@@ -2183,7 +2326,7 @@ namespace llaminar2::test
 
         auto fixture = realTransaction();
         ImmediateLocalResidencyTransport local;
-        local.commit_begin_ok = context->rank() != 1;
+        local.prepare_begin_ok = context->rank() != 1;
         auto lane = std::make_shared<MoEOverlayMPIResidencyConsensus>(
             MoEOverlayMPIResidencyConsensus::Config{
                 .mpi_context = context,
@@ -2201,7 +2344,9 @@ namespace llaminar2::test
         ASSERT_EQ(result.status, MoEOverlayResidencyApplyStatus::Started)
             << result.error;
         result = finishAuthorityWave(*fixture.authority);
-        EXPECT_EQ(result.status, MoEOverlayResidencyApplyStatus::CommitFailed)
+        EXPECT_EQ(
+            result.status,
+            MoEOverlayResidencyApplyStatus::PreparationFailed)
             << result.error;
         EXPECT_NE(result.error.find("world rank 1"), std::string::npos)
             << result.error;
@@ -2209,7 +2354,7 @@ namespace llaminar2::test
             << result.error;
         EXPECT_EQ(fixture.authority->snapshot()->epoch, 1u);
         EXPECT_TRUE(lane->idle());
-        EXPECT_EQ(transport.stats().commit_consensus_failed, 1u);
+        EXPECT_EQ(transport.stats().preparation_consensus_failed, 1u);
         EXPECT_EQ(local.aborts, 1);
 
         /* Reap the synchronously ready CPU abort before lane destruction. */
@@ -2278,6 +2423,9 @@ namespace llaminar2::test
             .idle_poll_interval = std::chrono::microseconds(100),
             .perf_device = "real_mpi_maintenance_test",
         });
+        ASSERT_EQ(service.state(), MoEOverlayMaintenanceState::Prepared);
+        context->barrier();
+        service.start();
 
         ASSERT_TRUE(waitForService(
             [&]
@@ -2291,7 +2439,8 @@ namespace llaminar2::test
         EXPECT_EQ(service.stats().proposals, 1u);
         EXPECT_EQ(service.stats().committed_waves, 1u);
         EXPECT_EQ(local_transport->stats().stage_consensus_ready, 1u);
-        EXPECT_EQ(local_transport->stats().commit_consensus_ready, 1u);
+        EXPECT_EQ(local_transport->stats().preparation_consensus_ready, 1u);
+        EXPECT_EQ(local_transport->stats().publication_consensus_ready, 1u);
         EXPECT_EQ(local_transport->stats().waves_published, 1u);
 
         if (context->rank() == coordinator_world_rank)

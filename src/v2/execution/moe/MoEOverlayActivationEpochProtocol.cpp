@@ -346,7 +346,7 @@ namespace llaminar2
             .transaction_ordinal = ticket.transaction_ordinal,
             .logical_step_id = ticket.logical_step_id,
             .workspace_generation = ticket.workspace_generation,
-            .placement_epoch = ticket.placement_epoch,
+            .placement_epoch_floor = ticket.placement_epoch,
             .topology_fingerprint_low = ticket.topology_fingerprint_low,
             .topology_fingerprint_high = ticket.topology_fingerprint_high,
             .channel_nonce = control_->channel.channel_nonce,
@@ -576,7 +576,7 @@ namespace llaminar2
         buffer.dispatch_descriptor = {
             .digest = identity.digest,
             .timeline = timeline,
-            .placement_epoch = identity.placement_epoch,
+            .placement_epoch = identity.placement_epoch_floor,
             .live_rows = live_rows,
             .live_entries = live_entries,
             .payload_bytes = payload_bytes,
@@ -657,7 +657,14 @@ namespace llaminar2
                 static_cast<std::int32_t>(stage_ordinal),
                 layer,
                 observed);
-            fail("ExpertOverlay dispatch timeline is not ready", error);
+            std::ostringstream diagnostic;
+            diagnostic
+                << "ExpertOverlay dispatch timeline is not ready"
+                << " (observed=" << observed
+                << ",expected=" << timeline
+                << ",generation=" << identity.epoch_generation
+                << ",stage=" << stage_ordinal << ")";
+            fail(diagnostic.str(), error);
             return std::nullopt;
         }
         const MoEOverlayActivationPayloadDescriptor descriptor =
@@ -768,7 +775,10 @@ namespace llaminar2
         buffer.return_descriptor = {
             .digest = identity.digest,
             .timeline = timeline,
-            .placement_epoch = identity.placement_epoch,
+            /* The follower returns under the exact placement epoch named by
+             * the authenticated dispatch, which may be newer than the host
+             * scheduler's immutable floor. */
+            .placement_epoch = dispatch.placement_epoch,
             .live_rows = dispatch.live_rows,
             .live_entries = 0u,
             .payload_bytes = payload_bytes,
@@ -858,7 +868,8 @@ namespace llaminar2
         if (observed != timeline ||
             !validDescriptor(descriptor, identity, stage_ordinal, timeline) ||
             descriptor.live_entries != 0u ||
-            descriptor.live_rows != dispatch.live_rows)
+            descriptor.live_rows != dispatch.live_rows ||
+            descriptor.placement_epoch != dispatch.placement_epoch)
         {
             reject(
                 endpoint,
@@ -1164,6 +1175,10 @@ namespace llaminar2
         snapshot.last_consumed_stage = acquireValue(
             source.last_consumed_stage);
         snapshot.last_model_layer = acquireValue(source.last_model_layer);
+        snapshot.failure_diagnostic = acquireValue(
+            source.failure_diagnostic);
+        snapshot.failure_auxiliary = acquireValue(
+            source.failure_auxiliary);
         snapshot.published_payload_bytes = acquireValue(
             source.published_payload_bytes);
         snapshot.published_live_rows = acquireValue(
@@ -1239,12 +1254,21 @@ namespace llaminar2
         const bool row_symmetric =
             continuation.published_live_rows ==
             follower.published_live_rows;
+        const bool dispatch_entry_geometry_valid =
+            continuation.published_live_rows == 0u
+                ? continuation.published_live_entries == 0u
+                : continuation.published_live_entries >=
+                      continuation.published_live_rows;
+        /* CPU followers still publish one compact dense row and therefore no
+         * route-entry count. CUDA/ROCm mapped followers publish one canonical
+         * contribution for every dispatched entry. Both are first-class wire
+         * layouts; any partial entry total is malformed. */
+        const bool return_entry_geometry_valid =
+            follower.published_live_entries == 0u ||
+            follower.published_live_entries ==
+                continuation.published_live_entries;
         const bool entry_geometry_valid =
-            follower.published_live_entries == 0u &&
-            (continuation.published_live_rows == 0u
-                 ? continuation.published_live_entries == 0u
-                 : continuation.published_live_entries >=
-                       continuation.published_live_rows);
+            dispatch_entry_geometry_valid && return_entry_geometry_valid;
         const bool byte_geometry_valid =
             (continuation.published_payload_bytes == 0u) ==
                 (continuation.published_live_rows == 0u) &&
@@ -1267,6 +1291,7 @@ namespace llaminar2
             .return_live_rows = follower.published_live_rows,
             .dispatch_live_entries =
                 continuation.published_live_entries,
+            .return_live_entries = follower.published_live_entries,
             .dispatch_stage_count =
                 continuation.published_stage_count,
             .return_stage_count = follower.published_stage_count,
@@ -1469,7 +1494,8 @@ namespace llaminar2
             descriptor.live_rows != 0u && descriptor.payload_bytes != 0u;
         return descriptor.digest == identity.digest &&
                descriptor.timeline == timeline &&
-               descriptor.placement_epoch == identity.placement_epoch &&
+               descriptor.placement_epoch >=
+                   identity.placement_epoch_floor &&
                (empty_payload || nonempty_payload) &&
                descriptor.stage_ordinal == stage_ordinal &&
                descriptor.model_layer_index == modelLayer(stage_ordinal);

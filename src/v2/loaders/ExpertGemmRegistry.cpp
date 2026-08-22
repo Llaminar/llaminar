@@ -287,6 +287,22 @@ namespace llaminar2
         return count;
     }
 
+    size_t ExpertGemmRegistry::countOwnedEnginesForDeviceAcrossScopes(
+        DeviceId device) const
+    {
+        std::shared_lock lock(mutex_);
+        size_t count = 0;
+        for (const auto &[key, entry] : engines_)
+        {
+            if (key.device == device && entry.engine != nullptr &&
+                entry.ownership)
+            {
+                ++count;
+            }
+        }
+        return count;
+    }
+
     size_t ExpertGemmRegistry::countEnginesForLayer(DeviceId device, int layer) const
     {
         return countEnginesForLayerInDomain({}, device, layer);

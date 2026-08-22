@@ -33,8 +33,17 @@ namespace llaminar2
     // Note: IQ4_XS uses the same codebook as IQ4_NL (kvalues_iq4nl from IQQuantTables.h)
     // If IQ4_XS requires a different codebook, it should be added to IQQuantTables.h
 
-    IQ4_XSTensor::IQ4_XSTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
-        : shape_(shape), is_view_(false), raw_data_(raw_data), raw_data_ptr_(nullptr),
+    IQ4_XSTensor::IQ4_XSTensor(
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw_data)
+        : IQ4_XSTensor(shape, AlignedVector<uint8_t>(raw_data))
+    {
+    }
+
+    IQ4_XSTensor::IQ4_XSTensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint8_t> raw_data)
+        : shape_(shape), is_view_(false), raw_data_(std::move(raw_data)), raw_data_ptr_(nullptr),
           view_byte_offset_(0), parent_(nullptr), device_(DeviceId::cpu()), device_blocks_(nullptr)
     {
         if (shape.empty())
@@ -238,7 +247,7 @@ namespace llaminar2
         // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
         // during implicit member destruction of large 3D MoE expert weight tensors.
         // See Q4_KTensor teardown investigation for details.
-        { std::vector<uint8_t>().swap(raw_data_); }
+        { AlignedVector<uint8_t>().swap(raw_data_); }
         { std::vector<size_t>().swap(shape_); }
     }
 

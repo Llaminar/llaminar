@@ -697,7 +697,9 @@ namespace llaminar2::test
         EXPECT_TRUE(rank.hasRole(OverlayRankRole::ContinuationRoot));
         EXPECT_TRUE(rank.hasRole(OverlayRankRole::LocalAcceleratorParticipant));
         EXPECT_FALSE(rank.hasRole(OverlayRankRole::RelayOnly));
-        EXPECT_TRUE(rank.builds_root_graph);
+        EXPECT_TRUE(rank.ownsContinuationGraph());
+        EXPECT_EQ(rank.execution_kind,
+                  OverlayRankExecutionKind::ContinuationAuthority);
         EXPECT_TRUE(containsDomain(rank, "rocm_hot"));
         EXPECT_TRUE(containsDevice(rank, DeviceId::rocm(0)));
         EXPECT_TRUE(containsDevice(rank, DeviceId::rocm(1)));
@@ -739,13 +741,13 @@ namespace llaminar2::test
         EXPECT_TRUE(rank0->hasRole(OverlayRankRole::ContinuationRoot));
         EXPECT_TRUE(rank0->hasRole(OverlayRankRole::LocalAcceleratorParticipant));
         EXPECT_TRUE(rank0->hasRole(OverlayRankRole::CpuFallbackParticipant));
-        EXPECT_TRUE(rank0->builds_root_graph);
+        EXPECT_TRUE(rank0->ownsContinuationGraph());
         EXPECT_TRUE(containsDomain(*rank0, "rocm_hot"));
         EXPECT_TRUE(containsDomain(*rank0, "cpu_cold"));
 
         EXPECT_EQ(rank1->role, OverlayRankRole::CpuFallbackParticipant);
         EXPECT_TRUE(rank1->hasRole(OverlayRankRole::CpuFallbackParticipant));
-        EXPECT_FALSE(rank1->builds_root_graph);
+        EXPECT_FALSE(rank1->ownsContinuationGraph());
         EXPECT_TRUE(containsDomain(*rank1, "cpu_cold"));
 
         const std::string diagnostics = execution_plan.diagnostics();
@@ -773,7 +775,9 @@ namespace llaminar2::test
         ASSERT_NE(participant, nullptr);
 
         EXPECT_TRUE(root->hasRole(OverlayRankRole::ContinuationRoot));
-        EXPECT_TRUE(root->builds_root_graph);
+        EXPECT_TRUE(root->ownsContinuationGraph());
+        EXPECT_EQ(root->execution_kind,
+                  OverlayRankExecutionKind::ContinuationAuthority);
         EXPECT_TRUE(root->loads_tokenizer);
         EXPECT_TRUE(root->loads_root_weights);
 
@@ -781,7 +785,9 @@ namespace llaminar2::test
             OverlayRankRole::ContinuationParticipant));
         EXPECT_TRUE(participant->hasRole(
             OverlayRankRole::CpuFallbackParticipant));
-        EXPECT_TRUE(participant->builds_root_graph);
+        EXPECT_TRUE(participant->ownsContinuationGraph());
+        EXPECT_EQ(participant->execution_kind,
+                  OverlayRankExecutionKind::ContinuationPeer);
         EXPECT_FALSE(participant->loads_tokenizer);
         EXPECT_TRUE(participant->loads_root_weights);
         EXPECT_TRUE(participant->loads_shared_expert_weights);
@@ -802,7 +808,9 @@ namespace llaminar2::test
         EXPECT_FALSE(rank.hasRole(OverlayRankRole::ContinuationRoot));
         EXPECT_FALSE(rank.hasRole(OverlayRankRole::LocalAcceleratorParticipant));
         EXPECT_FALSE(rank.hasRole(OverlayRankRole::RelayOnly));
-        EXPECT_FALSE(rank.builds_root_graph);
+        EXPECT_FALSE(rank.ownsContinuationGraph());
+        EXPECT_EQ(rank.execution_kind,
+                  OverlayRankExecutionKind::ExpertOnlyFollower);
         EXPECT_EQ(rank.owned_domains, (std::vector<std::string>{"cpu_cold"}));
         EXPECT_TRUE(containsDevice(rank, DeviceId::cpu()));
         EXPECT_FALSE(rank.loads_tokenizer);
@@ -824,7 +832,7 @@ namespace llaminar2::test
 
         const auto &root = root_execution.currentRankPlan();
         EXPECT_EQ(root.role, OverlayRankRole::ContinuationRoot);
-        EXPECT_TRUE(root.builds_root_graph);
+        EXPECT_TRUE(root.ownsContinuationGraph());
         EXPECT_TRUE(containsDomain(root, "cuda_fast"));
         EXPECT_TRUE(containsDevice(root, DeviceId::cuda(0)));
         EXPECT_TRUE(root.loads_root_weights);
@@ -835,7 +843,7 @@ namespace llaminar2::test
 
         const auto &rocm = rocm_execution.currentRankPlan();
         EXPECT_EQ(rocm.role, OverlayRankRole::LocalAcceleratorParticipant);
-        EXPECT_FALSE(rocm.builds_root_graph);
+        EXPECT_FALSE(rocm.ownsContinuationGraph());
         EXPECT_TRUE(rocm.hasRole(OverlayRankRole::LocalAcceleratorParticipant));
         EXPECT_FALSE(rocm.hasRole(OverlayRankRole::ContinuationRoot));
         EXPECT_TRUE(containsDomain(rocm, "rocm_warm"));
@@ -849,7 +857,7 @@ namespace llaminar2::test
 
         const auto &cpu = cpu_execution.currentRankPlan();
         EXPECT_EQ(cpu.role, OverlayRankRole::CpuFallbackParticipant);
-        EXPECT_FALSE(cpu.builds_root_graph);
+        EXPECT_FALSE(cpu.ownsContinuationGraph());
         EXPECT_TRUE(cpu.hasRole(OverlayRankRole::CpuFallbackParticipant));
         EXPECT_FALSE(cpu.hasRole(OverlayRankRole::ContinuationRoot));
         EXPECT_TRUE(containsDomain(cpu, "cpu_cold"));
@@ -881,7 +889,9 @@ namespace llaminar2::test
         EXPECT_EQ(execution_plan.rankPlanFor(1)->role, OverlayRankRole::LocalAcceleratorParticipant);
         EXPECT_EQ(execution_plan.rankPlanFor(2)->role, OverlayRankRole::CpuFallbackParticipant);
         EXPECT_EQ(execution_plan.rankPlanFor(3)->role, OverlayRankRole::RelayOnly);
-        EXPECT_FALSE(execution_plan.rankPlanFor(3)->builds_root_graph);
+        EXPECT_FALSE(execution_plan.rankPlanFor(3)->ownsContinuationGraph());
+        EXPECT_EQ(execution_plan.rankPlanFor(3)->execution_kind,
+                  OverlayRankExecutionKind::RelayOnly);
         EXPECT_FALSE(execution_plan.rankPlanFor(3)->loads_full_model_metadata);
 
         const std::string diagnostics = execution_plan.diagnostics();
@@ -909,7 +919,9 @@ namespace llaminar2::test
         EXPECT_TRUE(rank.hasRole(OverlayRankRole::RemoteExpertParticipant));
         EXPECT_FALSE(rank.hasRole(OverlayRankRole::LocalAcceleratorParticipant));
         EXPECT_FALSE(rank.hasRole(OverlayRankRole::ContinuationRoot));
-        EXPECT_FALSE(rank.builds_root_graph);
+        EXPECT_FALSE(rank.ownsContinuationGraph());
+        EXPECT_EQ(rank.execution_kind,
+                  OverlayRankExecutionKind::ExpertOnlyFollower);
         EXPECT_TRUE(containsDomain(rank, "remote_experts"));
         EXPECT_TRUE(containsDevice(rank, DeviceId::cuda(0)));
     }
@@ -949,7 +961,7 @@ namespace llaminar2::test
 
         for (const auto &rank : execution_plan.rank_plans)
         {
-            EXPECT_EQ(rank.builds_root_graph,
+            EXPECT_EQ(rank.ownsContinuationGraph(),
                       rank.world_rank == execution_plan.continuation_root_rank)
                 << execution_plan.diagnostics();
             if (rank.world_rank != execution_plan.continuation_root_rank)
@@ -978,10 +990,10 @@ namespace llaminar2::test
         const auto execution_plan = resolveMoEExpertOverlayExecutionPlan(layoutAPlan(), 1);
         const auto &rank = execution_plan.currentRankPlan();
         EXPECT_EQ(rank.role, OverlayRankRole::CpuFallbackParticipant);
-        EXPECT_FALSE(rank.builds_root_graph);
+        EXPECT_FALSE(rank.ownsContinuationGraph());
         EXPECT_FALSE(rank.hasRole(OverlayRankRole::ContinuationRoot));
         EXPECT_TRUE(rank.hasRole(OverlayRankRole::CpuFallbackParticipant));
-        EXPECT_NE(execution_plan.diagnostics().find("builds_root_graph=false"), std::string::npos);
+        EXPECT_NE(execution_plan.diagnostics().find("owns_continuation_graph=false"), std::string::npos);
     }
 
     TEST(Test__MoEExpertOverlayRuntimePlan, HardwareBindingFollowsSplitGpuSocketInventory)
@@ -1103,7 +1115,7 @@ namespace llaminar2::test
                 .current_world_rank = 0,
                 .world_size = 1,
             });
-        EXPECT_TRUE(execution.currentRankPlan().builds_root_graph);
+        EXPECT_TRUE(execution.currentRankPlan().ownsContinuationGraph());
         EXPECT_TRUE(containsDevice(
             execution.currentRankPlan(), DeviceId::cuda(0)));
         EXPECT_TRUE(containsDevice(

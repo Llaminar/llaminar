@@ -101,6 +101,7 @@ TEST(Test__BenchmarkMode, NonRootRankEntersWorkerLoopWithoutStartingASecondContr
 
     EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
     EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(1);
+    EXPECT_CALL(*h.runner, prepareForInference()).Times(0);
     EXPECT_CALL(*h.runner, shutdown()).Times(1);
     EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(0);
     EXPECT_CALL(*h.runner, clearCache()).Times(0);
@@ -119,10 +120,29 @@ TEST(Test__BenchmarkMode, RootRankOwnsControllerAndClosesWorkersOnEarlyFailure)
 
     EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
     EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(0);
+    EXPECT_CALL(*h.runner, prepareForInference()).Times(1).WillOnce(Return(true));
     EXPECT_CALL(*h.tokenizer, encode(_, false, false))
         .WillOnce(Return(std::vector<int>{}));
     EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(1);
     EXPECT_CALL(*h.runner, abortMPIWorkers(_)).Times(0);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+
+    BenchmarkMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 1);
+}
+
+TEST(Test__BenchmarkMode, RootRefusesToBenchmarkAnUnreadyRuntime)
+{
+    ModeHarness h(/*rank=*/0, /*world_size=*/2);
+    h.ctx.config.benchmark_mode = true;
+
+    EXPECT_CALL(*h.runner, setMPICoordinatedMode(true)).Times(1);
+    EXPECT_CALL(*h.runner, runMPIWorkerLoop()).Times(0);
+    EXPECT_CALL(*h.runner, prepareForInference())
+        .Times(1)
+        .WillOnce(Return(false));
+    EXPECT_CALL(*h.tokenizer, encode(_, _, _)).Times(0);
+    EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(1);
     EXPECT_CALL(*h.runner, shutdown()).Times(1);
 
     BenchmarkMode mode;

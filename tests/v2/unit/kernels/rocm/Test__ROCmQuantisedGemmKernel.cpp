@@ -61,6 +61,11 @@ namespace
         LaunchRequiresExplicitProducerStreamBeforeValidation)
     {
         ROCmPackedWeights packed;
+        packed.native_source_identity = {
+            .codebook_id = native_vnni_formats::Q4_0.codebook_id,
+            .is_superblock = native_vnni_formats::Q4_0.is_superblock,
+            .present = true,
+        };
         ROCmQuantisedGemmKernel kernel(&packed, 0);
 
         EXPECT_THROW(

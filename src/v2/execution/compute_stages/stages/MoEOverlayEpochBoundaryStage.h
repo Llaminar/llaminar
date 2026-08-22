@@ -15,22 +15,27 @@
 #include "../StageParamsBase.h"
 
 #include "../../../execution/moe/DeviceMoEOverlayEpochArena.h"
+#include "../../../execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
 #include "../../../kernels/IMoEKernel.h"
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace llaminar2
 {
+    class MappedHostTransferRegion;
+
     /**
      * @brief One typed edge of an ExpertOverlay inference-reader transaction.
      *
      * Acquire snapshots the currently published selector into the request slot
      * and increments that bank's reader count. Release decrements the exact
      * reader named by the ticket and clears the slot. The two operations are
-     * deliberately separate captured graphs so an orchestrator can place every
-     * main, sidecar, verifier, and publication graph between them.
+     * separate graph-capturable stages. A normal main forward embeds them as
+     * its root and terminal; a composite MTP parent places every child and
+     * publication fragment between equivalent retained boundary fragments.
      */
     class MoEOverlayEpochBoundaryStage final : public IComputeStage
     {
@@ -40,6 +45,30 @@ namespace llaminar2
         {
             Acquire = 0,
             Release = 1,
+        };
+
+        /**
+         * @brief Peer-published exact epoch used by a mapped follower acquire.
+         *
+         * A heterogeneous follower must consume the same durable placement
+         * generation that produced its dispatch. Leased packet timeline values
+         * repeat across graph replays, so the acquire kernel authenticates a
+         * strictly newer activation identity and matching stage descriptor
+         * before reading its placement epoch. All addresses are model-lifetime
+         * capture identity; no host placement mirror exists.
+         */
+        struct PeerEpochSource
+        {
+            /** Keeps every mapped control/descriptor address registered. */
+            std::shared_ptr<const MappedHostTransferRegion> mapped_region;
+            /** Exact mapped control plus endpoint-local anti-ABA grant. */
+            MoEOverlayPeerPlacementEpochBinding binding;
+
+            /** @return Whether every immutable mapped acquire edge is present. */
+            [[nodiscard]] bool valid() const noexcept
+            {
+                return mapped_region && binding.valid();
+            }
         };
 
         /**
@@ -56,6 +85,16 @@ namespace llaminar2
             std::shared_ptr<DeviceMoEOverlayEpochArena> arena;
             std::uint32_t request_slot = 0u;
             Operation operation = Operation::Acquire;
+            /** Exact peer-selected epoch; legal only for follower Acquire. */
+            std::optional<PeerEpochSource> peer_epoch_source;
+            /**
+             * Exact device-controller receipt lane used only after Release.
+             * The binding's opaque lifetime keeps every mapped address valid
+             * for the retained graph; omitting it is legal only for a topology
+             * without a device-resident ExpertOverlay authority.
+             */
+            std::optional<MoEOverlayDeviceControllerParticipantBinding>
+                retirement_readiness_controller;
             std::string stage_name = "moe_overlay_epoch_boundary";
         };
 

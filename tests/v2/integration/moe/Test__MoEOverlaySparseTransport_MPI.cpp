@@ -804,7 +804,8 @@ namespace llaminar2::test
                 sidecar_depth));
         };
 
-        /* One serial main transaction followed by dynamic depth-2 and depth-3 cycles. */
+        /* One bucketed prefill and serial decode precede depth-2/depth-3 cycles. */
+        append(MoEOverlayInferenceGraphRole::MainPrefill, 4, 4);
         append(MoEOverlayInferenceGraphRole::MainDecode, 1, 1);
         append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 2, 0);
         append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 2, 1);
@@ -815,6 +816,7 @@ namespace llaminar2::test
         append(MoEOverlayInferenceGraphRole::MTPDraft, 1, 1, 3, 2);
         append(MoEOverlayInferenceGraphRole::MTPGroupedVerifier, 4, 4, 3);
         RecordingTransactionExecutor executor;
+        std::uint64_t retired_prefill_tokens = 0u;
         if (rank_ == 0)
         {
             MoEOverlayInferenceTransactionPublisher publisher({
@@ -869,12 +871,22 @@ namespace llaminar2::test
                     .max_rows_per_request = 4,
                     .max_mtp_draft_depth = 3,
                 },
+                .retired_prefill_progress_sink =
+                    [&retired_prefill_tokens](
+                        std::uint64_t completed_tokens,
+                        std::string *)
+                {
+                    retired_prefill_tokens += completed_tokens;
+                    return true;
+                },
             });
             const auto result = follower.runOneCommand();
             ASSERT_TRUE(result.ok) << result.error;
             EXPECT_FALSE(result.aborted);
             EXPECT_EQ(result.executed_transactions, expected.size());
             EXPECT_EQ(executor.tickets, expected);
+            EXPECT_EQ(retired_prefill_tokens, 8u)
+                << "The follower must sideband request_count times real rows";
             EXPECT_EQ(follower.state(),
                       MoEOverlayInferenceProtocolState::Complete);
         }

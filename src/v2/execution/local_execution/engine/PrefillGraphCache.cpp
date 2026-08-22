@@ -224,7 +224,7 @@ namespace llaminar2
         PrefillGraphPreflightMode mode,
         bool collectives_graph_capturable,
         bool heterogeneous_segmentation_admitted,
-        bool moe_rebalancing_graph_stable,
+        PrefillMoEGraphStability moe_graph_stability,
         std::string *reject_stage_name,
         std::string *reject_stage_type) const
     {
@@ -251,7 +251,8 @@ namespace llaminar2
         if (padded_bucket && !config_.buckets_enabled)
             return PrefillGraphRejectReason::FeatureDisabled;
 
-        if (moe_rebalancing_active && padded_bucket && !moe_rebalancing_graph_stable)
+        if (moe_rebalancing_active && padded_bucket &&
+            moe_graph_stability != PrefillMoEGraphStability::Stable)
             return PrefillGraphRejectReason::ActiveMoERebalancing;
 
         if (collective_nodes && !collective_nodes->empty() &&

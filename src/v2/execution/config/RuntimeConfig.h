@@ -766,6 +766,18 @@ namespace llaminar2
         bool enabled = false;
         int draft_tokens = 1;
         /**
+         * @brief Retained graph/arena draft capacity, or zero to derive it.
+         *
+         * This is deliberately independent of the selected execution depth.
+         * A service may retain one maximum-capacity graph family while fixed
+         * requests execute smaller depths, avoiding weight-placement changes
+         * and graph recapture when only the requested speculative width
+         * changes.  A positive value must cover the fixed depth or adaptive
+         * policy ceiling; it never authorizes the depth controller to select
+         * additional drafts.
+         */
+        int graph_capacity_draft_tokens = 0;
+        /**
          * @brief Maximum number of requests to amortize in one speculative transaction.
          *
          * vLLM-style production MTP batches target verification rows across
@@ -793,15 +805,15 @@ namespace llaminar2
     };
 
     /**
-     * @brief Resolve the largest draft depth that runtime planning must own.
+     * @brief Resolve the largest depth the execution policy may select.
      *
-     * Fixed mode executes exactly @ref MTPRuntimeConfig::draft_tokens. Dynamic
-     * and observe modes may promote as far as the policy maximum, so graph and
-     * workspace planning must reserve that larger value even when the initial
-     * depth is smaller. The result is a capacity request, not a kernel
-     * specialization or an architectural maximum.
+     * Fixed mode selects exactly @ref MTPRuntimeConfig::draft_tokens. Dynamic
+     * and observe modes may select up to the adaptive policy ceiling. This is
+     * an execution-policy bound and deliberately ignores retained graph
+     * over-capacity.
      */
-    inline int resolveMTPMaximumDraftDepth(const MTPRuntimeConfig &config)
+    inline int resolveMTPMaximumExecutionDraftDepth(
+        const MTPRuntimeConfig &config)
     {
         if (config.depth_policy.mode == MTPDepthPolicyMode::Fixed)
             return std::max(1, config.draft_tokens);
@@ -810,6 +822,26 @@ namespace llaminar2
             config.depth_policy.max_depth > 0
                 ? config.depth_policy.max_depth
                 : config.draft_tokens);
+    }
+
+    /**
+     * @brief Resolve the largest draft depth that runtime planning must own.
+     *
+     * By default the retained capacity equals the execution-policy ceiling.
+     * An explicit @ref MTPRuntimeConfig::graph_capacity_draft_tokens may make
+     * the graph, arena, transaction slots, and prepared-weight admission
+     * envelope wider without changing the depth selected for execution. The
+     * configuration validator rejects an explicit value narrower than the
+     * execution-policy ceiling.
+     */
+    inline int resolveMTPMaximumDraftDepth(const MTPRuntimeConfig &config)
+    {
+        const int execution_maximum =
+            resolveMTPMaximumExecutionDraftDepth(config);
+        return config.graph_capacity_draft_tokens > 0
+                   ? std::max(execution_maximum,
+                              config.graph_capacity_draft_tokens)
+                   : execution_maximum;
     }
 
     /**
@@ -826,6 +858,31 @@ namespace llaminar2
         const int request_count = std::max(1, config.max_request_batch);
         const int draft_count = resolveMTPMaximumDraftDepth(config);
         return request_count * (draft_count + 1);
+    }
+
+    /**
+     * @brief Resolve one retained graph's complete activation-row capacity.
+     *
+     * Captured prefill and MTP verification reuse one resident graph family.
+     * The prefill bucket therefore cannot be treated as the whole graph's row
+     * capacity: verification may need `maximum draft depth + 1` rows even when
+     * the selected prefill segment is smaller. This helper is the single
+     * accounting rule shared by admission and preflight. It does not change
+     * the selected prefill segment; it only sizes the graph that owns both
+     * shapes.
+     *
+     * @param prefill_rows Positive row capacity selected for captured prefill.
+     * @param config Runtime MTP policy and maximum request batch.
+     * @return Rows the shared retained graph must materialize.
+     */
+    inline int resolveRetainedGraphRowCapacity(
+        int prefill_rows,
+        const MTPRuntimeConfig &config)
+    {
+        const int base_rows = std::max(1, prefill_rows);
+        if (!config.enabled)
+            return base_rows;
+        return std::max(base_rows, resolveMTPMaxTargetQueryRows(config));
     }
 
     /**

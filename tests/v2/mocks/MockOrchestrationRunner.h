@@ -59,8 +59,13 @@ namespace llaminar2::test
                                                    return r;
                                                }));
             ON_CALL(*this, setDecodeStepTokenBudget(testing::_)).WillByDefault(testing::Return());
-            ON_CALL(*this, maybeApplyMoERebalance()).WillByDefault(testing::Return(true));
+            ON_CALL(*this, maybeApplyMoERebalance(testing::_))
+                .WillByDefault(testing::Return(true));
             ON_CALL(*this, prefixStateProbe()).WillByDefault(testing::Return(PrefixRuntimeStateSnapshot{}));
+            ON_CALL(*this, inferenceReadiness())
+                .WillByDefault(testing::Return(InferenceReadiness{}));
+            ON_CALL(*this, prepareForInference())
+                .WillByDefault(testing::Return(true));
         }
 
         // Lifecycle
@@ -83,7 +88,7 @@ namespace llaminar2::test
                      const SamplingParams &sampling),
                     (override));
         MOCK_METHOD(void, setDecodeStepTokenBudget, (int max_tokens), (override));
-        MOCK_METHOD(bool, maybeApplyMoERebalance, (), (override));
+        MOCK_METHOD(bool, maybeApplyMoERebalance, (uint64_t), (override));
 
         // Configuration
         MOCK_METHOD(const RankExecutionPlan &, executionPlan, (), (const, override));
@@ -96,6 +101,8 @@ namespace llaminar2::test
         MOCK_METHOD(int, currentPosition, (), (const, override));
         MOCK_METHOD(void, clearCache, (), (override));
         MOCK_METHOD(DeviceId, primaryDeviceId, (), (const, override));
+        MOCK_METHOD(InferenceReadiness, inferenceReadiness, (), (const, override));
+        MOCK_METHOD(bool, prepareForInference, (), (override));
 
         // Advanced
         MOCK_METHOD(const float *, lastLogits, (), (const, override));

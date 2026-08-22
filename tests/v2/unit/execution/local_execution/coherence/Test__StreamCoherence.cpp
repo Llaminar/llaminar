@@ -84,7 +84,13 @@ public:
     void injectCompletionEvent(void *event)
     {
         device_completion_event_ = event;
-        event_device_ = gpu_device_;
+        completion_event_protection_ = event
+                                           ? CompletionEventProtection::DeviceValue
+                                           : CompletionEventProtection::None;
+        if (event)
+            event_device_ = gpu_device_;
+        else
+            event_device_.reset();
     }
 
     void injectGpuDevice(DeviceId device)

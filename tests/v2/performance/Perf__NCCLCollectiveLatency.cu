@@ -35,6 +35,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cuda/atomic>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -43,6 +44,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -76,6 +78,9 @@ namespace
         std::max(
             kVerifierMaximumSendBytes,
             kQwen35MaximumPrefillPublicationBytes);
+    constexpr size_t kQwen35ProductionPrefillRows = 600u;
+    constexpr size_t kQwen35ProductionAttentionBytes =
+        kQwen35ProductionPrefillRows * kQwen35MoEHidden * sizeof(float);
 
     /**
      * @brief One production-relevant collective message geometry.
@@ -226,6 +231,212 @@ namespace
         throw std::runtime_error(
             std::string(operation) + " failed: " + cudaGetErrorString(status));
     }
+
+    /** @return `value` rounded up to the next `alignment` boundary. */
+    constexpr size_t alignUp(size_t value, size_t alignment) noexcept
+    {
+        return ((value + alignment - 1u) / alignment) * alignment;
+    }
+
+    /** @brief System-acquire load used by graph-resident epoch waiters. */
+    __device__ __forceinline__ std::uint64_t loadSystemAcquire(
+        std::uint64_t *address)
+    {
+        cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system> reference(
+            *address);
+        return reference.load(cuda::memory_order_acquire);
+    }
+
+    /** @brief Release one completed mapped payload chunk to its peer GPU. */
+    static __global__ void publishMappedEpochKernel(std::uint64_t *epoch)
+    {
+        if (blockIdx.x != 0u || threadIdx.x != 0u)
+            return;
+        __threadfence_system();
+        cuda::atomic_ref<std::uint64_t, cuda::thread_scope_system> reference(
+            *epoch);
+        reference.fetch_add(1u, cuda::memory_order_release);
+    }
+
+    /** @brief Root-side device wait for one fresh non-root input chunk. */
+    static __global__ void waitForMappedInputKernel(
+        std::uint64_t *input_epoch,
+        std::uint64_t *output_epoch)
+    {
+        if (blockIdx.x != 0u || threadIdx.x != 0u)
+            return;
+        while (loadSystemAcquire(input_epoch) <=
+               loadSystemAcquire(output_epoch))
+        {
+            __nanosleep(64u);
+        }
+    }
+
+    /** @brief Non-root device wait for the root's matching output chunk. */
+    static __global__ void waitForMappedOutputKernel(
+        std::uint64_t *input_epoch,
+        std::uint64_t *output_epoch)
+    {
+        if (blockIdx.x != 0u || threadIdx.x != 0u)
+            return;
+        const std::uint64_t expected = loadSystemAcquire(input_epoch);
+        while (loadSystemAcquire(output_epoch) < expected)
+            __nanosleep(64u);
+    }
+
+    /**
+     * @brief Add one peer chunk in fixed participant order and publish it.
+     *
+     * The root reads its own input from VRAM, then the rank-one input from the
+     * mapped aperture. Writing the same rounded FP32 result to root VRAM and
+     * the mapped output preserves two-participant arithmetic exactly while
+     * eliminating a separate root D2H copy from the critical path.
+     */
+    static __global__ void reduceAndPublishMappedChunkKernel(
+        const float *root_input,
+        const float *peer_input,
+        float *root_output,
+        float *mapped_output,
+        size_t count)
+    {
+        for (size_t index =
+                 static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             index < count;
+             index += static_cast<size_t>(gridDim.x) * blockDim.x)
+        {
+            const float reduced = root_input[index] + peer_input[index];
+            root_output[index] = reduced;
+            mapped_output[index] = reduced;
+        }
+    }
+
+    /**
+     * @brief Retained mapped pages and endpoint-correct CUDA aliases.
+     *
+     * This is deliberately test infrastructure. Production installation must
+     * obtain the same ownership through TransferEngine and expose it through a
+     * typed LocalTP collective authority. The isolated benchmark uses raw CUDA
+     * only so it can reject an uneconomical protocol before adding production
+     * surface area.
+     */
+    class MappedAllreduceRegion final
+    {
+    public:
+        MappedAllreduceRegion(size_t payload_bytes, size_t chunk_count)
+            : payload_bytes_(payload_bytes),
+              chunk_count_(chunk_count),
+              output_offset_(alignUp(payload_bytes_, 256u)),
+              input_epoch_offset_(
+                  alignUp(output_offset_ + payload_bytes_, 256u)),
+              output_epoch_offset_(
+                  input_epoch_offset_ +
+                  chunk_count_ * sizeof(std::uint64_t)),
+              total_bytes_(
+                  alignUp(
+                      output_epoch_offset_ +
+                          chunk_count_ * sizeof(std::uint64_t),
+                      4096u))
+        {
+            requireCudaSuccess(
+                cudaHostAlloc(
+                    &host_base_,
+                    total_bytes_,
+                    cudaHostAllocMapped | cudaHostAllocPortable),
+                "cudaHostAlloc(mapped allreduce region)");
+            std::memset(host_base_, 0, total_bytes_);
+            for (int participant = 0;
+                 participant < kDeviceCount;
+                 ++participant)
+            {
+                requireCudaSuccess(
+                    cudaSetDevice(participant),
+                    "cudaSetDevice(mapped allreduce alias)");
+                requireCudaSuccess(
+                    cudaHostGetDevicePointer(
+                        &device_bases_[static_cast<size_t>(participant)],
+                        host_base_,
+                        0u),
+                    "cudaHostGetDevicePointer(mapped allreduce alias)");
+            }
+        }
+
+        ~MappedAllreduceRegion()
+        {
+            if (host_base_)
+                cudaFreeHost(host_base_);
+        }
+
+        MappedAllreduceRegion(const MappedAllreduceRegion &) = delete;
+        MappedAllreduceRegion &operator=(
+            const MappedAllreduceRegion &) = delete;
+
+        /** @return CPU pointer used only as an asynchronous copy endpoint. */
+        [[nodiscard]] void *hostInput(size_t byte_offset) const
+        {
+            return static_cast<std::byte *>(host_base_) + byte_offset;
+        }
+
+        /** @return CPU pointer to one root-published output chunk. */
+        [[nodiscard]] void *hostOutput(size_t byte_offset) const
+        {
+            return static_cast<std::byte *>(host_base_) + output_offset_ +
+                   byte_offset;
+        }
+
+        /** @return GPU alias for the non-root input payload. */
+        [[nodiscard]] float *deviceInput(
+            int participant,
+            size_t byte_offset) const
+        {
+            return reinterpret_cast<float *>(
+                static_cast<std::byte *>(
+                    device_bases_[static_cast<size_t>(participant)]) +
+                byte_offset);
+        }
+
+        /** @return GPU alias for the root-published output payload. */
+        [[nodiscard]] float *deviceOutput(
+            int participant,
+            size_t byte_offset) const
+        {
+            return reinterpret_cast<float *>(
+                static_cast<std::byte *>(
+                    device_bases_[static_cast<size_t>(participant)]) +
+                output_offset_ + byte_offset);
+        }
+
+        /** @return GPU alias for one non-root publication epoch. */
+        [[nodiscard]] std::uint64_t *deviceInputEpoch(
+            int participant,
+            size_t chunk) const
+        {
+            return reinterpret_cast<std::uint64_t *>(
+                static_cast<std::byte *>(
+                    device_bases_[static_cast<size_t>(participant)]) +
+                input_epoch_offset_) + chunk;
+        }
+
+        /** @return GPU alias for one root output epoch. */
+        [[nodiscard]] std::uint64_t *deviceOutputEpoch(
+            int participant,
+            size_t chunk) const
+        {
+            return reinterpret_cast<std::uint64_t *>(
+                static_cast<std::byte *>(
+                    device_bases_[static_cast<size_t>(participant)]) +
+                output_epoch_offset_) + chunk;
+        }
+
+    private:
+        size_t payload_bytes_ = 0u;
+        size_t chunk_count_ = 0u;
+        size_t output_offset_ = 0u;
+        size_t input_epoch_offset_ = 0u;
+        size_t output_epoch_offset_ = 0u;
+        size_t total_bytes_ = 0u;
+        void *host_base_ = nullptr;
+        std::array<void *, kDeviceCount> device_bases_{};
+    };
 
     /**
      * @brief Persistent resources for one CUDA collective participant.
@@ -826,6 +1037,305 @@ namespace
                         resources.stream);
                 });
             printResult("graph_ar", shape, benchmarkCaptured());
+        }
+    }
+
+    /**
+     * @brief Compare NCCL with a chunked device-epoch mapped-host allreduce.
+     *
+     * This candidate targets a homogeneous two-GPU continuation domain whose
+     * PCIe topology exposes no CUDA P2P. The non-root graph publishes fixed
+     * chunks through the D2H engine, the root consumes and adds them in fixed
+     * participant order while writing the result back to mapped pages, and the
+     * non-root graph imports completed chunks. All waits are device-owned
+     * system-scope epochs captured in the participant graphs; the host only
+     * submits the two retained graphs and observes their final timing events.
+     *
+     * Exact 1.0f + 2.0f output is checked on every element and participant for
+     * every chunk geometry before timing. This is an isolated design gate, not
+     * a production fallback: an economical result must still be installed as
+     * a typed LocalTP authority using TransferEngine-owned mapped pages.
+     */
+    TEST_F(Perf__NCCLCollectiveLatency,
+           GraphCapturedMappedHostChunkedAllreduce)
+    {
+        if (!initialized_)
+            GTEST_SKIP();
+
+        const size_t count =
+            kQwen35ProductionAttentionBytes / sizeof(float);
+        const std::array<std::vector<float>, kDeviceCount> inputs{
+            std::vector<float>(count, 1.0f),
+            std::vector<float>(count, 2.0f),
+        };
+
+        for (int participant = 0;
+             participant < kDeviceCount;
+             ++participant)
+        {
+            auto &resources =
+                participants_[static_cast<size_t>(participant)];
+            requireCudaSuccess(
+                cudaSetDevice(resources.ordinal),
+                "cudaSetDevice(mapped candidate input)");
+            requireCudaSuccess(
+                cudaMemcpyAsync(
+                    resources.buffer,
+                    inputs[static_cast<size_t>(participant)].data(),
+                    kQwen35ProductionAttentionBytes,
+                    cudaMemcpyHostToDevice,
+                    resources.stream),
+                "cudaMemcpyAsync(NCCL baseline input)");
+            requireCudaSuccess(
+                cudaMemcpyAsync(
+                    resources.send_buffer,
+                    inputs[static_cast<size_t>(participant)].data(),
+                    kQwen35ProductionAttentionBytes,
+                    cudaMemcpyHostToDevice,
+                    resources.stream),
+                "cudaMemcpyAsync(mapped candidate input)");
+            requireCudaSuccess(
+                cudaStreamSynchronize(resources.stream),
+                "cudaStreamSynchronize(candidate setup)");
+        }
+
+        captureCollective(
+            [&](int participant, ParticipantResources &resources)
+            {
+                return coordinator_.allreduceSingleDeviceOnStream(
+                    resources.buffer,
+                    count,
+                    CollectiveDataType::FLOAT32,
+                    CollectiveOp::ALLREDUCE_SUM,
+                    participant,
+                    resources.stream);
+            });
+        const LatencySummary nccl = benchmarkCaptured();
+
+        const MessageShape attention_shape{
+            "Qwen35 attention M=600",
+            kQwen35ProductionAttentionBytes,
+            kQwen35ProductionAttentionBytes,
+        };
+        std::cout << "\nCUDA peer access: "
+                  << (bidirectionalPeerAccessAvailable()
+                          ? "bidirectional P2P"
+                          : "unavailable; measuring mapped-host candidate")
+                  << "\n";
+        std::cout << std::left << std::setw(18) << "operation"
+                  << std::setw(24) << "shape"
+                  << std::right << std::setw(10) << "bytes"
+                  << std::setw(12) << "median_us"
+                  << std::setw(12) << "p95_us"
+                  << std::setw(12) << "min_us"
+                  << std::setw(12) << "max_us" << '\n';
+        std::cout << std::left << std::setw(18) << "nccl_allreduce"
+                  << std::setw(24) << attention_shape.label
+                  << std::right << std::setw(10)
+                  << attention_shape.send_bytes
+                  << std::setw(12) << std::fixed << std::setprecision(2)
+                  << nccl.median_us
+                  << std::setw(12) << nccl.p95_us
+                  << std::setw(12) << nccl.minimum_us
+                  << std::setw(12) << nccl.maximum_us << '\n';
+
+        constexpr std::array<size_t, 5> candidate_chunk_bytes{
+            64u * 1024u,
+            256u * 1024u,
+            1024u * 1024u,
+            4u * 1024u * 1024u,
+            kQwen35ProductionAttentionBytes,
+        };
+        for (const size_t requested_chunk_bytes :
+             candidate_chunk_bytes)
+        {
+            const size_t chunk_bytes = std::min(
+                requested_chunk_bytes,
+                kQwen35ProductionAttentionBytes);
+            const size_t chunk_count =
+                (kQwen35ProductionAttentionBytes + chunk_bytes - 1u) /
+                chunk_bytes;
+            MappedAllreduceRegion region(
+                kQwen35ProductionAttentionBytes,
+                chunk_count);
+
+            captureCollective(
+                [&](int participant, ParticipantResources &resources)
+                {
+                    constexpr int root = 0;
+                    constexpr int non_root = 1;
+                    if (participant == non_root)
+                    {
+                        /* Publish every input chunk first. The root consumes
+                         * completed early chunks while this stream's D2H
+                         * engine advances through the remaining payload. */
+                        for (size_t chunk = 0u;
+                             chunk < chunk_count;
+                             ++chunk)
+                        {
+                            const size_t byte_offset = chunk * chunk_bytes;
+                            const size_t live_bytes = std::min(
+                                chunk_bytes,
+                                kQwen35ProductionAttentionBytes -
+                                    byte_offset);
+                            const auto *source =
+                                static_cast<const std::byte *>(
+                                    resources.send_buffer) + byte_offset;
+                            if (cudaMemcpyAsync(
+                                    region.hostInput(byte_offset),
+                                    source,
+                                    live_bytes,
+                                    cudaMemcpyDeviceToHost,
+                                    resources.stream) != cudaSuccess)
+                            {
+                                return false;
+                            }
+                            publishMappedEpochKernel<<<
+                                1,
+                                1,
+                                0,
+                                resources.stream>>>(
+                                region.deviceInputEpoch(
+                                    participant, chunk));
+                        }
+
+                        /* Import in the same chunk order after all outbound
+                         * copies are queued. Device waits make an early root
+                         * completion cheap and preserve one cyclic epoch per
+                         * chunk without host intervention. */
+                        for (size_t chunk = 0u;
+                             chunk < chunk_count;
+                             ++chunk)
+                        {
+                            const size_t byte_offset = chunk * chunk_bytes;
+                            const size_t live_bytes = std::min(
+                                chunk_bytes,
+                                kQwen35ProductionAttentionBytes -
+                                    byte_offset);
+                            waitForMappedOutputKernel<<<
+                                1,
+                                1,
+                                0,
+                                resources.stream>>>(
+                                region.deviceInputEpoch(
+                                    participant, chunk),
+                                region.deviceOutputEpoch(
+                                    participant, chunk));
+                            auto *destination =
+                                static_cast<std::byte *>(resources.buffer) +
+                                byte_offset;
+                            if (cudaMemcpyAsync(
+                                    destination,
+                                    region.hostOutput(byte_offset),
+                                    live_bytes,
+                                    cudaMemcpyHostToDevice,
+                                    resources.stream) != cudaSuccess)
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                    else if (participant == root)
+                    {
+                        for (size_t chunk = 0u;
+                             chunk < chunk_count;
+                             ++chunk)
+                        {
+                            const size_t byte_offset = chunk * chunk_bytes;
+                            const size_t live_bytes = std::min(
+                                chunk_bytes,
+                                kQwen35ProductionAttentionBytes -
+                                    byte_offset);
+                            const size_t live_count =
+                                live_bytes / sizeof(float);
+                            waitForMappedInputKernel<<<
+                                1,
+                                1,
+                                0,
+                                resources.stream>>>(
+                                region.deviceInputEpoch(
+                                    participant, chunk),
+                                region.deviceOutputEpoch(
+                                    participant, chunk));
+                            const int blocks = static_cast<int>(std::min<size_t>(
+                                1024u,
+                                (live_count + 255u) / 256u));
+                            reduceAndPublishMappedChunkKernel<<<
+                                blocks,
+                                256,
+                                0,
+                                resources.stream>>>(
+                                static_cast<const float *>(
+                                    resources.send_buffer) +
+                                    byte_offset / sizeof(float),
+                                region.deviceInput(
+                                    participant, byte_offset),
+                                static_cast<float *>(resources.buffer) +
+                                    byte_offset / sizeof(float),
+                                region.deviceOutput(
+                                    participant, byte_offset),
+                                live_count);
+                            publishMappedEpochKernel<<<
+                                1,
+                                1,
+                                0,
+                                resources.stream>>>(
+                                region.deviceOutputEpoch(
+                                    participant, chunk));
+                        }
+                    }
+                    else
+                    {
+                        return false;
+                    }
+                    return cudaPeekAtLastError() == cudaSuccess;
+                });
+
+            /* One replay proves the captured protocol before performance is
+             * sampled. Blocking copies below are diagnostic-only and occur
+             * after both retained graphs have completed. */
+            (void)measureCapturedOne();
+            for (int participant = 0;
+                 participant < kDeviceCount;
+                 ++participant)
+            {
+                auto &resources =
+                    participants_[static_cast<size_t>(participant)];
+                std::vector<float> output(count, 0.0f);
+                requireCudaSuccess(
+                    cudaSetDevice(resources.ordinal),
+                    "cudaSetDevice(mapped candidate verification)");
+                requireCudaSuccess(
+                    cudaMemcpy(
+                        output.data(),
+                        resources.buffer,
+                        kQwen35ProductionAttentionBytes,
+                        cudaMemcpyDeviceToHost),
+                    "cudaMemcpy(mapped candidate verification)");
+                const auto mismatch = std::find_if(
+                    output.begin(),
+                    output.end(),
+                    [](float value) { return value != 3.0f; });
+                ASSERT_EQ(mismatch, output.end())
+                    << "participant=" << participant
+                    << " chunk_bytes=" << chunk_bytes
+                    << " mismatch_index="
+                    << std::distance(output.begin(), mismatch)
+                    << " value="
+                    << (mismatch == output.end() ? 3.0f : *mismatch);
+            }
+
+            const LatencySummary mapped = benchmarkCaptured();
+            const std::string operation =
+                "mapped_" + std::to_string(chunk_bytes / 1024u) + "K";
+            std::cout << std::left << std::setw(18) << operation
+                      << std::setw(24) << attention_shape.label
+                      << std::right << std::setw(10)
+                      << attention_shape.send_bytes
+                      << std::setw(12) << mapped.median_us
+                      << std::setw(12) << mapped.p95_us
+                      << std::setw(12) << mapped.minimum_us
+                      << std::setw(12) << mapped.maximum_us << '\n';
         }
     }
 

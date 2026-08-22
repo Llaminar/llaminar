@@ -36,19 +36,13 @@
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "utils/PerfStatsCollector.h"
 
-#include <array>
-#include <charconv>
-#include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
-#include <set>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 using namespace llaminar2;
@@ -286,8 +280,8 @@ namespace
                 .request_every_decode_steps = 1,
                 .min_decode_steps = 2,
                 /*
-                 * This fixture completes production economy calibration and a
-                 * committed migration before collecting parity checkpoints.
+                 * This fixture completes production economy certification and
+                 * a committed migration before collecting parity checkpoints.
                  * The generic three-token parity epilogue must not demand a
                  * second, unrelated residency epoch; the policy-specific
                  * PerfStats gate below proves the already-completed movement.
@@ -358,133 +352,6 @@ namespace
                             ? record.value
                             : 0.0);
             });
-    }
-
-    /** @brief Complete identity of one production economy-calibration probe. */
-    using CalibrationProbeIdentity = std::array<std::string, 6>;
-
-    /** @brief Ordinary inference phase currently requested by calibration. */
-    struct CalibrationProbeDemand
-    {
-        CalibrationProbeIdentity identity;
-        std::uint64_t sequence = 0;
-        ExpertHistogramSource source =
-            ExpertHistogramSource::SyntheticTest;
-        bool concurrent = false;
-    };
-
-    /**
-     * @brief Reconstruct the correlation key published by a probe event.
-     * @param record One production arm or consumed-sample counter.
-     * @return Exact immutable identity, or no value for malformed evidence.
-     */
-    std::optional<CalibrationProbeIdentity> calibrationProbeIdentity(
-        const PerfStatRecord &record)
-    {
-        constexpr std::array<const char *, 6> kIdentityTags{
-            "calibration_sequence",
-            "mode",
-            "source",
-            "layer",
-            "source_participant",
-            "destination_participant",
-        };
-        CalibrationProbeIdentity identity;
-        for (std::size_t index = 0; index < kIdentityTags.size(); ++index)
-        {
-            const auto tag = record.tags.find(kIdentityTags[index]);
-            if (tag == record.tags.end())
-                return std::nullopt;
-            identity[index] = tag->second;
-        }
-        return identity;
-    }
-
-    /**
-     * @brief Find the newest production probe that has not consumed a sample.
-     * @param records One process-local residency evidence snapshot.
-     * @return Phase-directed inference demand, or no outstanding request.
-     *
-     * The test uses this only to admit matching ordinary model traffic. The
-     * maintenance controller remains the sole owner of calibration timing,
-     * transfer overlap, evidence acceptance, and economy certification.
-     */
-    std::optional<CalibrationProbeDemand> outstandingCalibrationProbe(
-        const std::vector<PerfStatRecord> &records)
-    {
-        std::set<CalibrationProbeIdentity> sampled;
-        for (const auto &record : records)
-        {
-            if (record.kind != PerfStatRecord::Kind::Counter ||
-                record.domain != "moe_overlay_residency" ||
-                record.name != "economy_calibration_probe_samples")
-            {
-                continue;
-            }
-            if (const auto identity = calibrationProbeIdentity(record))
-                sampled.insert(*identity);
-        }
-
-        std::optional<CalibrationProbeDemand> newest;
-        for (const auto &record : records)
-        {
-            if (record.kind != PerfStatRecord::Kind::Counter ||
-                record.domain != "moe_overlay_residency" ||
-                record.name != "economy_calibration_probe_arms")
-            {
-                continue;
-            }
-
-            const auto identity = calibrationProbeIdentity(record);
-            if (!identity || sampled.contains(*identity))
-                continue;
-
-            const auto sequence_tag = record.tags.find("calibration_sequence");
-            const auto source_tag = record.tags.find("source");
-            const auto mode_tag = record.tags.find("mode");
-            if (sequence_tag == record.tags.end() ||
-                source_tag == record.tags.end() ||
-                mode_tag == record.tags.end())
-            {
-                continue;
-            }
-
-            std::uint64_t sequence = 0;
-            const char *const begin = sequence_tag->second.data();
-            const char *const end = begin + sequence_tag->second.size();
-            const auto parsed = std::from_chars(begin, end, sequence);
-            if (parsed.ec != std::errc{} || parsed.ptr != end)
-                continue;
-
-            std::optional<ExpertHistogramSource> source;
-            if (source_tag->second == "prefill")
-                source = ExpertHistogramSource::PrefillChunk;
-            else if (source_tag->second == "decode")
-                source = ExpertHistogramSource::DecodeToken;
-            else if (source_tag->second == "grouped_verifier")
-                source = ExpertHistogramSource::GroupedVerifier;
-            if (!source)
-                continue;
-
-            const bool concurrent =
-                mode_tag->second == "concurrent_movement";
-            if (!concurrent && mode_tag->second != "baseline")
-                continue;
-            if (newest &&
-                (sequence < newest->sequence ||
-                 (sequence == newest->sequence &&
-                  !concurrent && newest->concurrent)))
-            {
-                continue;
-            }
-            newest = CalibrationProbeDemand{
-                .identity = *identity,
-                .sequence = sequence,
-                .source = *source,
-                .concurrent = concurrent,
-            };
-        }
-        return newest;
     }
 
     /**
@@ -609,66 +476,40 @@ protected:
      * @brief Drive measured economy certification and one durable CPU migration.
      * @return True after production publishes a same-tier residency epoch.
      *
-     * A newly started dynamic authority first measures real packed-weight
-     * transfers and their overlap with every reachable inference phase. The
-     * test therefore follows the outstanding PerfStats probe with an ordinary
-     * prefill or decode call. It never supplies a timing, histogram, proposal,
-     * placement, or completion value. Once the controller has certified its
-     * measured economy, a stationary request stream lets the production
-     * histogram policy decide and commit a profitable same-priority move.
+     * A newly started Dynamic authority profiles a finite set of reversible
+     * production transfer waves in the background. Ordinary prefill/decode
+     * traffic independently supplies prepared-expert service telemetry. The
+     * fixture knows neither controller state nor requested workloads: it uses
+     * the same public request surface as the server and observes only outcome
+     * evidence. Once production certifies economy, a stationary request stream
+     * lets the histogram policy commit a profitable same-priority move.
      */
     bool driveDynamicEconomyAndMovement()
     {
         if (cfg().moe_rebalance.mode != MoERebalanceRuntimeMode::Dynamic)
             return true;
 
-        constexpr auto kProgressTimeout = std::chrono::seconds(30);
-        constexpr auto kPollPeriod = std::chrono::milliseconds(2);
-        constexpr int kDecodeStepsPerHistogramRequest = 4;
+        constexpr int kDecodeStepsPerRequest = 4;
+        constexpr int kMaximumServiceProfileRequests = 24;
         constexpr int kMaximumHistogramRequests = 24;
 
-        const double expected_pairs_value =
-            localResidencyCounter("economy_calibration_expected_pairs");
-        if (expected_pairs_value <= 0.0 ||
-            expected_pairs_value > static_cast<double>(
-                                       std::numeric_limits<std::uint64_t>::max()))
-        {
-            LOG_ERROR(
-                "[Qwen3.5 MoE CPU ExpertOverlay] Invalid economy calibration pair count: "
-                << expected_pairs_value);
-            return false;
-        }
-        const auto expected_pairs =
-            static_cast<std::uint64_t>(expected_pairs_value);
-        if (static_cast<double>(expected_pairs) != expected_pairs_value ||
-            expected_pairs >
-                (std::numeric_limits<std::uint64_t>::max() - 32u) / 8u)
-        {
-            LOG_ERROR(
-                "[Qwen3.5 MoE CPU ExpertOverlay] Non-integral or overflowing economy calibration plan: "
-                << expected_pairs_value);
-            return false;
-        }
-        const std::uint64_t maximum_calibration_forwards =
-            expected_pairs * 8u + 32u;
-
         /*
-         * Calibration must time the serving graph, not thousands of diagnostic
-         * checkpoint copies. A deliberately unmatched semantic key keeps
-         * snapshot infrastructure enabled but rejects every calibration stage.
+         * Pre-certification service traffic is ordinary production inference,
+         * but it is not part of the authenticated Hugging Face comparison. A
+         * deliberately unmatched semantic key avoids diagnostic checkpoint
+         * copies while that traffic fills the service telemetry ledger.
          * runPrefillParity() restores the complete evidence filter before the
-         * post-migration request, so every authenticated CSV checkpoint remains
-         * unchanged while calibration measures the production economy.
+         * post-migration comparison, preserving every canonical CSV artifact.
          */
         activeSetSnapshotCaptureFilter(
-            {"__EXPERT_OVERLAY_ECONOMY_CALIBRATION_NO_SNAPSHOT__"});
+            {"__EXPERT_OVERLAY_SERVICE_PROFILE_NO_SNAPSHOT__"});
 
         const std::vector<int32_t> reference_prompt(
             config_.token_ids.begin(), config_.token_ids.end());
         if (reference_prompt.empty())
         {
             LOG_ERROR(
-                "[Qwen3.5 MoE CPU ExpertOverlay] Economy calibration requires the authenticated parity prompt");
+                "[Qwen3.5 MoE CPU ExpertOverlay] Economy certification requires the authenticated parity prompt");
             return false;
         }
 
@@ -676,7 +517,7 @@ protected:
         if (vocabulary_size <= 4'096)
         {
             LOG_ERROR(
-                "[Qwen3.5 MoE CPU ExpertOverlay] Invalid vocabulary for calibration service coverage: "
+                "[Qwen3.5 MoE CPU ExpertOverlay] Invalid vocabulary for service coverage: "
                 << vocabulary_size);
             return false;
         }
@@ -713,10 +554,10 @@ protected:
             return prompt;
         };
 
-        bool request_active = false;
-        const auto wake_maintenance = [&](const char *phase)
+        const auto wake_maintenance = [&](const char *phase,
+                                          uint64_t committed_tokens)
         {
-            if (orch_runner_->maybeApplyMoERebalance())
+            if (orch_runner_->maybeApplyMoERebalance(committed_tokens))
                 return true;
             LOG_ERROR(
                 "[Qwen3.5 MoE CPU ExpertOverlay] Maintenance wake failed after "
@@ -730,12 +571,11 @@ protected:
             if (!orch_runner_->prefill(prompt))
             {
                 LOG_ERROR(
-                    "[Qwen3.5 MoE CPU ExpertOverlay] Calibration prefill failed: "
+                    "[Qwen3.5 MoE CPU ExpertOverlay] Service-profile prefill failed: "
                     << orch_runner_->lastError());
                 return false;
             }
-            request_active = true;
-            return wake_maintenance("prefill");
+            return true;
         };
         const auto run_decode = [&]() -> std::optional<bool>
         {
@@ -743,222 +583,56 @@ protected:
             if (!generated.success() || generated.tokens.empty())
             {
                 LOG_ERROR(
-                    "[Qwen3.5 MoE CPU ExpertOverlay] Calibration decode failed: "
+                    "[Qwen3.5 MoE CPU ExpertOverlay] Service-profile decode failed: "
                     << generated.error);
                 return std::nullopt;
             }
-            if (!wake_maintenance("decode"))
+            if (!wake_maintenance("decode", generated.tokens.size()))
                 return std::nullopt;
-            request_active = !generated.is_complete;
             return generated.is_complete;
         };
 
-        std::uint64_t calibration_forwards = 0;
-        int service_coverage_request = 1;
-        int service_coverage_decode_steps =
-            kDecodeStepsPerHistogramRequest;
-        std::optional<CalibrationProbeIdentity> last_served_probe;
-        std::optional<CalibrationProbeIdentity> last_observed_probe;
-        double last_accepted_pairs =
-            localResidencyCounter("economy_calibration_pairs_accepted");
-        double last_rejected_attempts = localResidencyCounter(
-            "economy_calibration_attempt_rejections");
-        auto last_progress = std::chrono::steady_clock::now();
-
-        /* Admit one real request while the background worker publishes its arm. */
-        if (!run_prefill(reference_prompt))
-            return false;
-        ++calibration_forwards;
-
-        while (calibration_forwards < maximum_calibration_forwards)
+        std::uint64_t service_profile_forwards = 0;
+        for (int request = 0;
+             request < kMaximumServiceProfileRequests &&
+             localResidencyCounter("economy_certification_complete") == 0.0;
+             ++request)
         {
-            const auto records =
-                PerfStatsCollector::snapshot({"moe_overlay_residency"});
-            if (perfCounterTotal(
-                    records,
-                    "moe_overlay_residency",
-                    "economy_certification_complete") > 0.0)
-            {
-                break;
-            }
-
-            const auto requested_probe =
-                outstandingCalibrationProbe(records);
-            const double accepted_pairs = perfCounterTotal(
-                records,
-                "moe_overlay_residency",
-                "economy_calibration_pairs_accepted");
-            const double rejected_attempts = perfCounterTotal(
-                records,
-                "moe_overlay_residency",
-                "economy_calibration_attempt_rejections");
-            const bool movement_calibration_complete = perfCounterTotal(
-                records,
-                "moe_overlay_residency",
-                "economy_calibration_complete") > 0.0;
-            const bool probe_changed =
-                requested_probe.has_value() !=
-                    last_observed_probe.has_value() ||
-                (requested_probe &&
-                 requested_probe->identity != *last_observed_probe);
-            if (probe_changed || accepted_pairs != last_accepted_pairs)
-            {
-                if (accepted_pairs != last_accepted_pairs)
-                {
-                    LOG_INFO(
-                        "[Qwen3.5 MoE CPU ExpertOverlay] Economy calibration accepted "
-                        << accepted_pairs << "/" << expected_pairs
-                        << " robust pairs after " << calibration_forwards
-                        << " forwards");
-                }
-                last_observed_probe =
-                    requested_probe
-                        ? std::optional<CalibrationProbeIdentity>{
-                              requested_probe->identity}
-                        : std::nullopt;
-                last_accepted_pairs = accepted_pairs;
-                last_progress = std::chrono::steady_clock::now();
-            }
-            if (rejected_attempts != last_rejected_attempts)
-            {
-                std::string newest_reason = "unknown";
-                for (auto record = records.rbegin();
-                     record != records.rend(); ++record)
-                {
-                    if (record->kind != PerfStatRecord::Kind::Counter ||
-                        record->domain != "moe_overlay_residency" ||
-                        record->name !=
-                            "economy_calibration_attempt_rejections")
-                    {
-                        continue;
-                    }
-                    if (const auto reason = record->tags.find("reason");
-                        reason != record->tags.end())
-                    {
-                        newest_reason = reason->second;
-                    }
-                    break;
-                }
-                LOG_INFO(
-                    "[Qwen3.5 MoE CPU ExpertOverlay] Economy calibration rejected attempt "
-                    << rejected_attempts << " after "
-                    << calibration_forwards << " forwards; reason="
-                    << newest_reason);
-                last_rejected_attempts = rejected_attempts;
-            }
-
-            if (!requested_probe && movement_calibration_complete)
-            {
-                /*
-                 * Migration timing is complete. Continue real, broad traffic
-                 * until every participant/layer/phase service coordinate has
-                 * contributed to the all-rank certification vote.
-                 */
-                if (!request_active ||
-                    service_coverage_decode_steps >=
-                        kDecodeStepsPerHistogramRequest)
-                {
-                    if (!run_prefill(
-                            routing_corpus_prompt(service_coverage_request++)))
-                    {
-                        return false;
-                    }
-                    service_coverage_decode_steps = 0;
-                }
-                else
-                {
-                    const auto complete = run_decode();
-                    if (!complete)
-                        return false;
-                    ++service_coverage_decode_steps;
-                    if (*complete)
-                    {
-                        service_coverage_decode_steps =
-                            kDecodeStepsPerHistogramRequest;
-                    }
-                }
-                ++calibration_forwards;
-                if ((calibration_forwards % 8u) == 0u)
-                {
-                    LOG_INFO(
-                        "[Qwen3.5 MoE CPU ExpertOverlay] Movement calibration complete; collecting measured service coverage at forward "
-                        << calibration_forwards);
-                }
-                last_progress = std::chrono::steady_clock::now();
-                continue;
-            }
-
-            if (!requested_probe ||
-                (last_served_probe &&
-                 requested_probe->identity == *last_served_probe))
-            {
-                if (!wake_maintenance("calibration progress"))
-                    return false;
-                if (std::chrono::steady_clock::now() - last_progress >
-                    kProgressTimeout)
-                {
-                    LOG_ERROR(
-                        "[Qwen3.5 MoE CPU ExpertOverlay] Economy calibration made no progress for 30 seconds after "
-                        << calibration_forwards << " production forwards\n"
-                        << PerfStatsCollector::summaryString(
-                               {"moe_overlay_residency"}));
-                    return false;
-                }
-                std::this_thread::sleep_for(kPollPeriod);
-                continue;
-            }
-
-            if (requested_probe->source ==
-                ExpertHistogramSource::PrefillChunk)
-            {
-                if (!run_prefill(reference_prompt))
-                    return false;
-                last_served_probe = requested_probe->identity;
-                ++calibration_forwards;
-                continue;
-            }
-            if (requested_probe->source ==
-                ExpertHistogramSource::GroupedVerifier)
-            {
-                LOG_ERROR(
-                    "[Qwen3.5 MoE CPU ExpertOverlay] Non-MTP cell received a grouped-verifier calibration probe");
-                return false;
-            }
-            if (!request_active)
-            {
-                if (!run_prefill(reference_prompt))
-                    return false;
-                ++calibration_forwards;
-                continue;
-            }
-
             /*
-             * The first decodeStep consumes prefill logits without executing a
-             * DecodeToken graph. Leave the arm outstanding until the next call
-             * actually traverses the model.
+             * This is the same public request surface used by the server. The
+             * finite transport profiler advances independently; these broad,
+             * valid-token requests only populate prepared-expert service
+             * telemetry. No controller arm, timing, or private state is read.
              */
-            const bool executes_decode_phase =
-                !activePrefixStateProbe().prefill_logits_ready;
-            const auto complete = run_decode();
-            if (!complete)
+            if (!run_prefill(routing_corpus_prompt(request)))
                 return false;
-            if (executes_decode_phase)
-                last_served_probe = requested_probe->identity;
-            ++calibration_forwards;
+            ++service_profile_forwards;
+
+            for (int step = 0;
+                 step < kDecodeStepsPerRequest;
+                 ++step)
+            {
+                const auto complete = run_decode();
+                if (!complete)
+                    return false;
+                ++service_profile_forwards;
+                if (*complete)
+                    break;
+            }
         }
 
         if (localResidencyCounter("economy_certification_complete") == 0.0)
         {
             LOG_ERROR(
-                "[Qwen3.5 MoE CPU ExpertOverlay] Economy calibration did not certify after "
-                << calibration_forwards << " production forwards\n"
+                "[Qwen3.5 MoE CPU ExpertOverlay] Economy profile did not certify after "
+                << service_profile_forwards << " ordinary production forwards\n"
                 << PerfStatsCollector::summaryString(
                        {"moe_overlay_residency"}));
             return false;
         }
         LOG_INFO(
             "[Qwen3.5 MoE CPU ExpertOverlay] Measured economy certified after "
-            << calibration_forwards << " production forwards");
+            << service_profile_forwards << " ordinary production forwards");
 
         /*
          * Keep the post-certification workload stationary. A changed corpus
@@ -972,7 +646,7 @@ protected:
             if (!run_prefill(reference_prompt))
                 return false;
             for (int step = 0;
-                 step < kDecodeStepsPerHistogramRequest;
+                 step < kDecodeStepsPerRequest;
                  ++step)
             {
                 const auto complete = run_decode();
@@ -987,7 +661,7 @@ protected:
             {
                 LOG_INFO(
                     "[Qwen3.5 MoE CPU ExpertOverlay] Certified economy and committed same-tier movement after "
-                    << calibration_forwards << " calibration forwards and "
+                    << service_profile_forwards << " service-profile forwards and "
                     << (request + 1) << " stationary histogram requests");
                 return true;
             }
@@ -1070,26 +744,32 @@ protected:
             records,
             "moe_overlay_residency",
             "maintenance_waves_committed");
-        const double calibration_complete = globalPerfCounterTotal(
+        const double transport_profile_complete = globalPerfCounterTotal(
             records,
             "moe_overlay_residency",
-            "economy_calibration_complete");
+            "economy_transport_profile_complete");
+        const double non_synthetic_transport_profiles =
+            globalPerfCounterTotal(
+                records,
+                "moe_overlay_residency",
+                "economy_transport_profile_complete",
+                std::pair<std::string, std::string>{
+                    "synthetic_inference", "false"});
+        const double non_publishing_transport_profiles =
+            globalPerfCounterTotal(
+                records,
+                "moe_overlay_residency",
+                "economy_transport_profile_complete",
+                std::pair<std::string, std::string>{
+                    "publish_residency", "false"});
+        const double transport_profile_waves = globalPerfCounterTotal(
+            records,
+            "moe_overlay_residency",
+            "economy_transport_profile_waves_completed");
         const double certification_complete = globalPerfCounterTotal(
             records,
             "moe_overlay_residency",
             "economy_certification_complete");
-        const double calibration_wave_ns = globalPerfCounterTotal(
-            records,
-            "moe_overlay_residency",
-            "economy_calibration_wave_wall_ns");
-        const double calibration_baseline_ns = globalPerfCounterTotal(
-            records,
-            "moe_overlay_residency",
-            "economy_calibration_inference_baseline_ns");
-        const double calibration_concurrent_ns = globalPerfCounterTotal(
-            records,
-            "moe_overlay_residency",
-            "economy_calibration_inference_concurrent_ns");
         const double local_copied_bytes = globalPerfCounterTotal(
             records,
             "moe_overlay_residency",
@@ -1132,16 +812,20 @@ protected:
 
             if (dynamic_maintenance)
             {
-                EXPECT_GT(calibration_complete, 0.0)
-                    << "Dynamic ExpertOverlay did not complete real movement calibration";
+                EXPECT_GT(transport_profile_complete, 0.0)
+                    << "Dynamic ExpertOverlay did not complete its finite real-transfer profile";
+                EXPECT_EQ(
+                    non_synthetic_transport_profiles,
+                    transport_profile_complete)
+                    << "Dynamic transport profiling must not request synthetic inference";
+                EXPECT_EQ(
+                    non_publishing_transport_profiles,
+                    transport_profile_complete)
+                    << "Dynamic transport profiling must not publish residency";
+                EXPECT_GT(transport_profile_waves, 0.0)
+                    << "Dynamic ExpertOverlay retained no completed transfer-profile waves";
                 EXPECT_GT(certification_complete, 0.0)
                     << "Dynamic ExpertOverlay did not install measured economy profiles";
-                EXPECT_GT(calibration_wave_ns, 0.0)
-                    << "Dynamic ExpertOverlay did not retain accepted wave timing evidence";
-                EXPECT_GT(calibration_baseline_ns, 0.0)
-                    << "Dynamic ExpertOverlay did not retain baseline inference timing";
-                EXPECT_GT(calibration_concurrent_ns, 0.0)
-                    << "Dynamic ExpertOverlay did not retain concurrent inference timing";
                 EXPECT_GT(committed_waves, 0.0)
                     << "Dynamic ExpertOverlay committed no background wave";
                 EXPECT_GT(committed_migrations, 0.0)
@@ -1288,7 +972,7 @@ TEST_P(Qwen35MoENodeTPParityTest, NodeTPContextInitialization)
         EXPECT_EQ(plan.global_tp_rank_in_domain, mpi_ctx_->rank());
         EXPECT_TRUE(plan.primary_device.isCPU());
         EXPECT_EQ(plan.primary_device.numa_node, mpi_ctx_->rank());
-        EXPECT_TRUE(plan.primary_device_numa_explicit);
+        EXPECT_TRUE(plan.hasResolvedPrimaryDeviceNuma());
         EXPECT_EQ(
             plan.runtime.activation_precision,
             cfg().activation_precision);

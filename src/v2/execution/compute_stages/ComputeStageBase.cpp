@@ -238,6 +238,8 @@ namespace llaminar2
             return "MTP_DRAFT_TOKEN_PUBLICATION";
         case ComputeStageType::MOE_OVERLAY_EPOCH_BOUNDARY:
             return "MOE_OVERLAY_EPOCH_BOUNDARY";
+        case ComputeStageType::MOE_OVERLAY_DEVICE_CONTROLLER:
+            return "MOE_OVERLAY_DEVICE_CONTROLLER";
         case ComputeStageType::MTP_VERIFIER_PREPARATION:
             return "MTP_VERIFIER_PREPARATION";
         case ComputeStageType::MTP_STOCHASTIC_TARGET_DISTRIBUTION:

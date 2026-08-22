@@ -21,6 +21,8 @@
 #include "GraphResolver.h"
 #include "../../../models/GraphTypes.h"
 #include "../../../backends/DeviceId.h"
+#include "../../../execution/moe/MoEOverlayDeviceControllerRuntimeBinding.h"
+#include "../../../execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
 
 #include <cstdint>
 #include <memory>
@@ -151,6 +153,9 @@ namespace llaminar2
     {
         std::shared_ptr<DeviceMoEOverlayEpochArena> arena; ///< Stable model-lifetime storage.
         std::uint32_t request_slot = 0u;                   ///< Captured ticket/status slot.
+        /** Device-authenticated grace-period receipt lane, when device-owned. */
+        std::optional<MoEOverlayDeviceControllerParticipantBinding>
+            retirement_readiness_controller;
 
         /** @return Whether a model supplied an epoch arena for this participant. */
         [[nodiscard]] explicit operator bool() const noexcept
@@ -576,6 +581,22 @@ namespace llaminar2
          * and this value together identify one logical collective operation.
          */
         uint64_t moe_overlay_collective_step_id = 0;
+        /**
+         * @brief Immutable rank-local execution-sequence identity.
+         *
+         * The ExpertOverlay coordinator assigns one identity to either one
+         * serial graph or the complete MTP draft-plus-verifier sequence.  The
+         * device orchestrator uses it only to retain and validate the residency
+         * lease across graph submissions; it is orchestration metadata and is
+         * deliberately excluded from native graph-cache identity.
+         */
+        uint64_t moe_overlay_sequence_id = 0;
+        /** @brief Placement epoch pinned for the complete execution sequence. */
+        uint64_t moe_overlay_sequence_placement_epoch = 0;
+        /** @brief Zero-based graph ordinal within @ref moe_overlay_sequence_id. */
+        int moe_overlay_sequence_graph_ordinal = -1;
+        /** @brief Exact admitted graph count for @ref moe_overlay_sequence_id. */
+        int moe_overlay_sequence_graph_count = 0;
         /**
          * @brief Exact pre-launch arm for a heterogeneous ExpertOverlay graph.
          *
@@ -1316,6 +1337,20 @@ namespace llaminar2
          */
         virtual DeviceMoECurrentBatchLLEPEvidenceSource
         deviceMoECurrentBatchLLEPEvidenceSource(DeviceId device) const
+        {
+            (void)device;
+            return {};
+        }
+
+        /**
+         * @brief Return the canonical durable runtime table used by device policy.
+         *
+         * The returned pointer remains model-lifetime stable and is consumed
+         * only by a captured backend pack kernel. Non-overlay builders return
+         * an empty binding. Implementations must reject ambiguous main tables.
+         */
+        virtual MoEOverlayDeviceControllerRuntimeBinding
+        deviceMoEOverlayControllerRuntimeBinding(DeviceId device) const
         {
             (void)device;
             return {};

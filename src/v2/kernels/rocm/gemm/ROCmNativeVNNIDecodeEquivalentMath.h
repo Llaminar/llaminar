@@ -9,24 +9,27 @@
  * equivalent rewrites can round differently and make speculative verification
  * depend on the grouped row count.
  *
- * Keep the operations in this file small, explicit, and shared by every ROCm
- * NativeVNNI execution family.  Callers own the integer dot products and K
- * traversal; these helpers own the exact FP32 parenthesization at the point
- * where one K block is committed to the running accumulator.
+ * This file is the ROCm-facing adapter used by existing kernels. It delegates
+ * every contribution to the backend-neutral NativeVNNI contract; callers own
+ * integer dot products and K traversal, while the shared contract owns exact
+ * FP32 parenthesization.
  */
 
 #pragma once
 
 #include <hip/hip_runtime.h>
+
+#include "kernels/common/DeviceNativeVNNIContributionContract.h"
+
 #include <cstdint>
 
 /**
  * @brief Commit one single-scale NativeVNNI K block in serial-decode order.
  *
- * Serial decode first applies the weight scale to the exact INT32 dot product,
- * then applies the activation scale while adding the block to the running FP32
- * accumulator. Keeping this order explicit avoids the tile-dependent rewrite
- * `(dot * activation_scale) * weight_scale`.
+ * Movable-expert projection first rounds the activation/weight scale product,
+ * then its multiplication by the exact INT32 dot product, and finally adds the
+ * persisted contribution to the running accumulator. The shared contract owns
+ * the HIP dependency barriers required to retain those rounding edges.
  *
  * @param accumulator Running FP32 dot-product accumulator.
  * @param dot INT32 dot product for the complete 32-value K block.
@@ -40,35 +43,48 @@ __device__ __forceinline__ float rocm_native_vnni_commit_single_scale_block(
     float weight_scale,
     float activation_scale)
 {
-    const float weight_scaled_dot =
-        static_cast<float>(dot) * weight_scale;
-    return __fmaf_rn(
-        weight_scaled_dot,
-        activation_scale,
-        accumulator);
+    return llaminar2::device_native_vnni_contract::accumulate(
+        accumulator,
+        llaminar2::device_native_vnni_contract::singleScaleBlock(
+            dot,
+            weight_scale,
+            activation_scale));
 }
 
 /**
- * @brief Commit one asymmetric minimum correction in serial-decode order.
+ * @brief Commit one corrected single-scale block as one publication unit.
  *
  * @param accumulator Running FP32 dot-product accumulator.
+ * @param dot INT32 dot product for the complete 32-value K block.
+ * @param weight_scale FP16-derived scale for the weight block.
  * @param activation_sum Exact INT32 sum of the quantized activation block.
  * @param weight_min FP16-derived asymmetric minimum for the weight block.
  * @param activation_scale FP32 scale for the quantized activation K block.
  * @return The updated FP32 accumulator.
  */
-__device__ __forceinline__ float rocm_native_vnni_commit_single_scale_correction(
+__device__ __forceinline__ float
+rocm_native_vnni_commit_corrected_single_scale_block(
     float accumulator,
+    int32_t dot,
+    float weight_scale,
     int32_t activation_sum,
     float weight_min,
     float activation_scale)
 {
-    const float weight_scaled_sum =
-        static_cast<float>(activation_sum) * weight_min;
-    return __fmaf_rn(
-        weight_scaled_sum,
-        activation_scale,
-        accumulator);
+    float contribution =
+        llaminar2::device_native_vnni_contract::singleScaleBlock(
+            dot,
+            weight_scale,
+            activation_scale);
+    contribution = llaminar2::device_native_vnni_contract::accumulate(
+        contribution,
+        llaminar2::device_native_vnni_contract::singleScaleCorrection(
+            activation_sum,
+            weight_min,
+            activation_scale));
+    return llaminar2::device_native_vnni_contract::accumulate(
+        accumulator,
+        contribution);
 }
 
 /**
@@ -77,12 +93,13 @@ __device__ __forceinline__ float rocm_native_vnni_commit_single_scale_correction
  * The low and high 16-value half-blocks are accumulated exactly in INT32 by the
  * caller.  This helper then:
  *
- * 1. rounds the low scaled contribution to FP32,
- * 2. fuses the high scaled contribution into that low contribution,
- * 3. fuses the activation-scaled block contribution into the running result.
+ * 1. rounds each half-block scale multiplication independently,
+ * 2. adds those persisted values,
+ * 3. multiplies by the activation scale, and
+ * 4. adds the persisted block contribution to the running result.
  *
- * Using explicit round-to-nearest FMAs prevents a surrounding tile kernel from
- * reassociating these operations according to its register layout.  Serial
+ * Using explicit retained round-to-nearest operations prevents a surrounding
+ * tile kernel from reassociating according to its register layout. Serial
  * decode, grouped verification, dense prefill, and grouped MoE prefill must all
  * call this helper rather than reproducing the formula locally.
  *
@@ -102,26 +119,28 @@ __device__ __forceinline__ float rocm_native_vnni_commit_dual_scale_block(
     float high_weight_scale,
     float activation_scale)
 {
-    const float low_contribution =
-        static_cast<float>(low_dot) * low_weight_scale;
-    const float paired_contribution = __fmaf_rn(
-        static_cast<float>(high_dot),
-        high_weight_scale,
-        low_contribution);
-    return __fmaf_rn(
-        paired_contribution,
-        activation_scale,
-        accumulator);
+    return llaminar2::device_native_vnni_contract::accumulate(
+        accumulator,
+        llaminar2::device_native_vnni_contract::dualScaleBlock(
+            low_dot,
+            high_dot,
+            low_weight_scale,
+            high_weight_scale,
+            activation_scale));
 }
 
 /**
- * @brief Commit a two-half asymmetric correction in serial-decode order.
+ * @brief Commit one corrected dual-scale block as one publication unit.
  *
  * Q2_K stores a separate minimum for each 16-value half-block. The correction
- * must combine those two weighted activation sums before applying the shared
- * activation scale, matching serial M=1 decode.
+ * is first combined with the dual-scale dot contribution, then that completed
+ * block is appended once to the row accumulator.
  *
  * @param accumulator Running FP32 dot-product accumulator.
+ * @param low_dot INT32 dot product for elements 0..15 of the K block.
+ * @param high_dot INT32 dot product for elements 16..31 of the K block.
+ * @param low_weight_scale FP16-derived scale for elements 0..15.
+ * @param high_weight_scale FP16-derived scale for elements 16..31.
  * @param low_activation_sum INT32 activation sum for elements 0..15.
  * @param high_activation_sum INT32 activation sum for elements 16..31.
  * @param low_weight_min FP16-derived minimum for elements 0..15.
@@ -129,28 +148,41 @@ __device__ __forceinline__ float rocm_native_vnni_commit_dual_scale_block(
  * @param activation_scale FP32 scale for the quantized activation K block.
  * @return The updated FP32 accumulator.
  */
-__device__ __forceinline__ float rocm_native_vnni_commit_dual_scale_correction(
+__device__ __forceinline__ float
+rocm_native_vnni_commit_corrected_dual_scale_block(
     float accumulator,
+    int32_t low_dot,
+    int32_t high_dot,
+    float low_weight_scale,
+    float high_weight_scale,
     int32_t low_activation_sum,
     int32_t high_activation_sum,
     float low_weight_min,
     float high_weight_min,
     float activation_scale)
 {
-    const float low_correction =
-        static_cast<float>(low_activation_sum) * low_weight_min;
-    const float paired_correction = __fmaf_rn(
-        static_cast<float>(high_activation_sum),
-        high_weight_min,
-        low_correction);
-    return __fmaf_rn(
-        paired_correction,
-        activation_scale,
-        accumulator);
+    float contribution =
+        llaminar2::device_native_vnni_contract::dualScaleBlock(
+            low_dot,
+            high_dot,
+            low_weight_scale,
+            high_weight_scale,
+            activation_scale);
+    contribution = llaminar2::device_native_vnni_contract::accumulate(
+        contribution,
+        llaminar2::device_native_vnni_contract::dualScaleCorrection(
+            low_activation_sum,
+            high_activation_sum,
+            low_weight_min,
+            high_weight_min,
+            activation_scale));
+    return llaminar2::device_native_vnni_contract::accumulate(
+        accumulator,
+        contribution);
 }
 
 /**
- * @brief Commit the IQ1_M signed one-eighth delta correction.
+ * @brief Commit one IQ1_M dual-scale block and delta as one publication unit.
  *
  * IQ1_M uses four independently signed eight-value grid groups. The group
  * activation sums and signs are combined in the same nested order used by
@@ -158,6 +190,8 @@ __device__ __forceinline__ float rocm_native_vnni_commit_dual_scale_correction(
  * scale.
  *
  * @param accumulator Running FP32 dot-product accumulator.
+ * @param low_dot INT32 dot product for elements 0..15 of the K block.
+ * @param high_dot INT32 dot product for elements 16..31 of the K block.
  * @param sum0 Activation sum for values 0..7.
  * @param sum1 Activation sum for values 8..15.
  * @param sum2 Activation sum for values 16..23.
@@ -171,8 +205,10 @@ __device__ __forceinline__ float rocm_native_vnni_commit_dual_scale_correction(
  * @param activation_scale FP32 scale for the quantized activation K block.
  * @return The updated FP32 accumulator.
  */
-__device__ __forceinline__ float rocm_native_vnni_commit_iq1_m_delta_correction(
+__device__ __forceinline__ float rocm_native_vnni_commit_iq1_m_block(
     float accumulator,
+    int32_t low_dot,
+    int32_t high_dot,
     int32_t sum0,
     int32_t sum1,
     int32_t sum2,
@@ -185,23 +221,30 @@ __device__ __forceinline__ float rocm_native_vnni_commit_iq1_m_delta_correction(
     float high_weight_scale,
     float activation_scale)
 {
-    const float low_group = __fmaf_rn(
-        delta1,
-        static_cast<float>(sum1),
-        delta0 * static_cast<float>(sum0));
-    const float high_group = __fmaf_rn(
-        delta3,
-        static_cast<float>(sum3),
-        delta2 * static_cast<float>(sum2));
-    const float low_scaled = low_group * low_weight_scale;
-    const float paired_scaled = __fmaf_rn(
-        high_group,
-        high_weight_scale,
-        low_scaled);
-    return __fmaf_rn(
-        paired_scaled,
-        activation_scale,
-        accumulator);
+    float contribution =
+        llaminar2::device_native_vnni_contract::dualScaleBlock(
+            low_dot,
+            high_dot,
+            low_weight_scale,
+            high_weight_scale,
+            activation_scale);
+    contribution = llaminar2::device_native_vnni_contract::accumulate(
+        contribution,
+        llaminar2::device_native_vnni_contract::iq1MDeltaCorrection(
+            sum0,
+            sum1,
+            sum2,
+            sum3,
+            delta0,
+            delta1,
+            delta2,
+            delta3,
+            low_weight_scale,
+            high_weight_scale,
+            activation_scale));
+    return llaminar2::device_native_vnni_contract::accumulate(
+        accumulator,
+        contribution);
 }
 
 /**
@@ -209,9 +252,8 @@ __device__ __forceinline__ float rocm_native_vnni_commit_iq1_m_delta_correction(
  *
  * Collective publication stores each weighted route row before reducing it,
  * while a single-device kernel may reduce the row immediately.  Expressing the
- * multiplication as an FMA with an exact zero addend gives both forms the same
- * FP32 rounding boundary and prevents the immediate form from contracting the
- * multiplication into its following accumulation.
+ * multiplication through the shared retained-rounding primitive gives both
+ * forms the same FP32 boundary and prevents contraction into its accumulation.
  *
  * @param route_weight Router probability for one original top-k slot.
  * @param expert_value Complete or split-K-reduced expert down value.
@@ -221,7 +263,9 @@ __device__ __forceinline__ float rocm_native_vnni_weight_route_rn(
     float route_weight,
     float expert_value)
 {
-    return __fmaf_rn(route_weight, expert_value, 0.0f);
+    return llaminar2::device_native_vnni_contract::weightRoute(
+        route_weight,
+        expert_value);
 }
 
 /**
@@ -235,5 +279,7 @@ __device__ __forceinline__ float rocm_native_vnni_accumulate_rn(
     float accumulator,
     float contribution)
 {
-    return __fadd_rn(accumulator, contribution);
+    return llaminar2::device_native_vnni_contract::accumulate(
+        accumulator,
+        contribution);
 }

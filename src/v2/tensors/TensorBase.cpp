@@ -220,7 +220,8 @@ namespace llaminar2
                     backend->destroyEvent(device_completion_event_, backend_device_id);
                     device_completion_event_ = nullptr;
                     event_device_.reset();
-                    device_completion_purpose_ = CompletionEventPurpose::NONE;
+                    completion_event_protection_ =
+                        CompletionEventProtection::None;
                 }
 
                 backend->free(gpu_data_ptr_, backend_device_id);
@@ -913,6 +914,7 @@ namespace llaminar2
          * completion event can release the source lifetime safely.
          */
         TransferEngine::waitForPendingHostSourceUseLocked(this);
+        retireCompletionEvent_();
 
         // Mark GPU data as stale - next ensureOnDevice() will re-upload from host
         // Mark device as invalid (stale) - do NOT free GPU memory
@@ -944,6 +946,7 @@ namespace llaminar2
          * this tensor hook cannot substitute a stream-wide synchronization.
          */
         TransferEngine::waitForPendingHostSourceUseLocked(this);
+        retireCompletionEvent_();
         if (is_mapped_)
         {
             setCoherenceState_(TensorCoherenceState::MAPPED);
@@ -1276,20 +1279,7 @@ namespace llaminar2
             if (device_completion_event_ && event_device_.has_value() &&
                 *event_device_ != publication_device)
             {
-                IBackend *event_backend = resolveBackend(*event_device_);
-                if (!event_backend ||
-                    event_backend->backendDeviceType() != event_device_->type)
-                {
-                    throw std::runtime_error(
-                        "[TensorBase::publishDeviceWriteStateWithEvent] Cannot retire completion "
-                        "event owned by " +
-                        event_device_->toString());
-                }
-                event_backend->destroyEvent(
-                    device_completion_event_,
-                    event_device_->gpu_ordinal());
-                device_completion_event_ = nullptr;
-                event_device_.reset();
+                retireCompletionEvent_();
             }
 
             bool created_event = false;
@@ -1325,8 +1315,10 @@ namespace llaminar2
                     "event on " +
                     publication_device.toString());
             }
-            device_completion_purpose_ =
-                CompletionEventPurpose::DEVICE_WRITE;
+            completion_event_protection_ =
+                completionEventProtectsHostSource_()
+                    ? CompletionEventProtection::DeviceValueAndHostSource
+                    : CompletionEventProtection::DeviceValue;
         }
 
         /*
@@ -1347,10 +1339,12 @@ namespace llaminar2
 
     void TensorBase::retireCompletionEvent_()
     {
+        TransferEngine::waitForPendingHostSourceUseLocked(this);
         if (!device_completion_event_)
         {
             event_device_.reset();
-            device_completion_purpose_ = CompletionEventPurpose::NONE;
+            completion_event_protection_ =
+                CompletionEventProtection::None;
             return;
         }
         if (!event_device_.has_value() || !event_device_->is_gpu())
@@ -1375,7 +1369,29 @@ namespace llaminar2
             event_device_->gpu_ordinal());
         device_completion_event_ = nullptr;
         event_device_.reset();
-        device_completion_purpose_ = CompletionEventPurpose::NONE;
+        completion_event_protection_ = CompletionEventProtection::None;
+        last_joined_completion_event_ = nullptr;
+        last_joined_consumer_stream_ = nullptr;
+    }
+
+    void TensorBase::discardDeviceValueCompletionProtection_()
+    {
+        last_joined_completion_event_ = nullptr;
+        last_joined_consumer_stream_ = nullptr;
+        switch (completion_event_protection_)
+        {
+        case CompletionEventProtection::None:
+        case CompletionEventProtection::HostSource:
+            return;
+        case CompletionEventProtection::DeviceValue:
+            completion_event_protection_ = CompletionEventProtection::None;
+            retireCompletionEvent_();
+            return;
+        case CompletionEventProtection::DeviceValueAndHostSource:
+            completion_event_protection_ =
+                CompletionEventProtection::HostSource;
+            return;
+        }
     }
 
     bool TensorBase::releaseDeviceMemory()
@@ -1397,8 +1413,7 @@ namespace llaminar2
                 // Destroy completion event if it exists
                 if (device_completion_event_)
                 {
-                    backend->destroyEvent(device_completion_event_, backend_device_id);
-                    device_completion_event_ = nullptr;
+                    retireCompletionEvent_();
                 }
 
                 backend->free(gpu_data_ptr_, backend_device_id);

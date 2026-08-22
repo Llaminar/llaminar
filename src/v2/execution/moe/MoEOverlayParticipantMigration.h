@@ -15,6 +15,7 @@
 #pragma once
 
 #include "ExpertTierWeightStream.h"
+#include "MoEOverlayHostAuthorityDeviceBankPublisher.h"
 #include "MoEOverlayParticipantResidency.h"
 #include "MoEOverlayTierMigrationTransport.h"
 
@@ -216,6 +217,12 @@ namespace llaminar2
             std::shared_ptr<MoEOverlayParticipantResidencyRegistry> registry;
             std::shared_ptr<IMoEOverlayParticipantTransferProvider>
                 transfer_provider;
+            /**
+             * Process-local GPU bank authority for heterogeneous host policy.
+             * Null is valid only when every local participant is CPU-owned.
+             */
+            std::shared_ptr<IMoEOverlayHostAuthorityDeviceBankPublisher>
+                device_bank_publisher;
             std::string perf_device;
         };
 

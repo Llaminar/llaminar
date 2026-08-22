@@ -190,6 +190,27 @@ namespace llaminar2
         int resident_graph_rows);
 
     /**
+     * @brief Select a cache-resident bucket ladder with minimum worst padding.
+     *
+     * The smallest and largest reachable buckets are retained. When the full
+     * configured inventory exceeds @p maximum_bucket_count, dynamic programming
+     * chooses the intermediate boundaries that minimize the worst multiplicative
+     * padding jump, then the sum of all jumps. This makes a finite captured
+     * graph cache a declared topology constraint instead of silently evicting
+     * setup-certified graphs and recapturing them during serving.
+     *
+     * @param buckets User/default bucket inventory.
+     * @param resident_graph_rows Largest admitted physical graph shape.
+     * @param maximum_bucket_count Number of retained prefill identities.
+     * @return Sorted non-empty ladder no larger than the cache budget, or empty
+     *         when the row capacity/count is invalid.
+     */
+    std::vector<int> retainedPrefillGraphBucketLadder(
+        const std::vector<int> &buckets,
+        int resident_graph_rows,
+        std::size_t maximum_bucket_count);
+
+    /**
      * @brief Bound the raw-prompt bucket floor by resident graph capacity.
      *
      * The configured floor controls padding economy for ordinary contexts. A
@@ -225,6 +246,26 @@ namespace llaminar2
         const std::vector<int> &configured_buckets,
         int resident_graph_rows,
         int configured_floor);
+
+    /**
+     * @brief Resolve the cache-resident raw-prompt ladder from one accounting truth.
+     *
+     * This composes the capacity/floor inventory used by forward preflight with
+     * the finite graph-cache optimizer. Memory accounting, distributed
+     * schedule publication, and execution therefore price and retain exactly
+     * the same physical graph identities.
+     *
+     * @param configured_buckets User/default captured-prefill buckets.
+     * @param resident_graph_rows Maximum rows admitted by the memory plan.
+     * @param configured_floor Minimum economical raw-prompt bucket.
+     * @param maximum_bucket_count Number of retained prefill identities.
+     * @return Sorted retained raw-prompt ladder, or empty for invalid bounds.
+     */
+    std::vector<int> retainedRawPrefillGraphBucketLadder(
+        const std::vector<int> &configured_buckets,
+        int resident_graph_rows,
+        int configured_floor,
+        std::size_t maximum_bucket_count);
 
     /**
      * @brief Select the smallest bucket that can contain real_seq_len tokens.

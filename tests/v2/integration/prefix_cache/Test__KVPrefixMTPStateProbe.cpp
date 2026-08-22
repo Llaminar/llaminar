@@ -1,3 +1,13 @@
+/**
+ * @file Test__KVPrefixMTPStateProbe.cpp
+ * @brief Integration probes for prefix-cache, retained graph, and MTP state.
+ *
+ * These tests exercise production runners with real model weights and inspect
+ * request-owned state only through the public diagnostic surface.  Backend
+ * cases intentionally retain native CUDA/HIP graph policies so lifecycle
+ * regressions cannot be hidden by eager execution or host-owned state.
+ */
+
 #include <gtest/gtest.h>
 
 #include "backends/ComputeBackend.h"
@@ -1558,7 +1568,8 @@ namespace
      * Phase 6 MTP graph capture relies on named forward-graph contexts
      * (`main_decode`, `main_verifier`, sidecar contexts, and later TP variants).
      * The lifecycle counter is intentionally small and stable: each record says
-     * which context ran and whether that step was warmup, capture, or replay.
+     * which context ran and whether that transaction captured or replayed its
+     * retained executable.
      * Tests should assert the phase shape without depending on exact decode
      * token counts, since speculative acceptance can change the number of
      * iterations a prompt needs.
@@ -1653,28 +1664,39 @@ namespace
     }
 
     /**
-     * @brief Assert that a graph-captured MTP context reached the expected phases.
+     * @brief Required retained-graph lifecycle evidence for one observation window.
+     *
+     * Transaction zero captures, instantiates, and launches the executable in
+     * one typed `Capture` phase.  There is deliberately no separate eager
+     * warmup phase: adding one would execute model state outside the production
+     * graph transaction.  Later observation windows may therefore require
+     * either the complete capture-plus-replay history or replay alone.
      */
-    void expectSegmentedGraphLifecycle(
+    enum class RetainedGraphLifecycleProof
+    {
+        CaptureAndReplay,
+        ReplayOnly,
+    };
+
+    /**
+     * @brief Assert that a retained MTP graph reached its typed lifecycle state.
+     */
+    void expectRetainedGraphLifecycle(
         const std::vector<PerfStatRecord> &records,
         const std::string &backend_name,
         const std::string &context,
-        bool require_warmup_capture,
-        bool require_replay)
+        RetainedGraphLifecycleProof required_proof)
     {
         SCOPED_TRACE(backend_name + " " + context);
-        if (require_warmup_capture)
+        if (required_proof ==
+            RetainedGraphLifecycleProof::CaptureAndReplay)
         {
-            EXPECT_GE(decodeGraphPhaseCount(records, context, "warmup"), 1.0)
-                << context << " must execute an explicit warmup before graph capture";
             EXPECT_GE(decodeGraphPhaseCount(records, context, "capture"), 1.0)
-                << context << " must record a graph capture before replay";
+                << context
+                << " must capture and launch transaction zero before replay";
         }
-        if (require_replay)
-        {
-            EXPECT_GE(decodeGraphPhaseCount(records, context, "replay"), 1.0)
-                << context << " must replay a previously captured graph";
-        }
+        EXPECT_GE(decodeGraphPhaseCount(records, context, "replay"), 1.0)
+            << context << " must replay a previously captured graph";
     }
 
     /**
@@ -1689,8 +1711,7 @@ namespace
     void expectMTPVerifierGraphLifecycle(
         const std::vector<PerfStatRecord> &records,
         const std::string &backend_name,
-        bool require_warmup_capture,
-        bool require_replay)
+        RetainedGraphLifecycleProof required_proof)
     {
         const MTPVerifierGraphPath path = mtpVerifierGraphPath(records);
         ASSERT_NE(path, MTPVerifierGraphPath::None)
@@ -1699,27 +1720,24 @@ namespace
         if (path == MTPVerifierGraphPath::AllPositionStatePublication ||
             path == MTPVerifierGraphPath::GroupedDeviceResidentPublication)
         {
-            expectSegmentedGraphLifecycle(
+            expectRetainedGraphLifecycle(
                 records,
                 backend_name,
                 "main_verifier",
-                require_warmup_capture,
-                require_replay);
+                required_proof);
             return;
         }
 
-        expectSegmentedGraphLifecycle(
+        expectRetainedGraphLifecycle(
             records,
             backend_name,
             "main_decode",
-            require_warmup_capture,
-            require_replay);
-        expectSegmentedGraphLifecycle(
+            required_proof);
+        expectRetainedGraphLifecycle(
             records,
             backend_name,
             "mtp_decode_catchup",
-            require_warmup_capture,
-            require_replay);
+            required_proof);
     }
 
     /**
@@ -2666,14 +2684,12 @@ namespace
         expectMTPVerifierGraphLifecycle(
             records,
             backend_name,
-            /*require_warmup_capture=*/true,
-            /*require_replay=*/true);
-        expectSegmentedGraphLifecycle(
+            RetainedGraphLifecycleProof::CaptureAndReplay);
+        expectRetainedGraphLifecycle(
             records,
             backend_name,
             "mtp_decode_sidecar",
-            /*require_warmup_capture=*/true,
-            /*require_replay=*/true);
+            RetainedGraphLifecycleProof::CaptureAndReplay);
         expectMTPAcceptedStateFastPublication(
             records,
             backend_name);
@@ -2703,6 +2719,7 @@ namespace
         ScopedDebugEnv env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_PREFIX_PROBE_CAPTURE_DEVICE_LOGICAL_STATE", "1"},
             {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_stochastic_mtp_stats.json"},
             {"LLAMINAR_PERF_STATS_FILTER", "mtp,forward_graph"},
         });
@@ -2759,6 +2776,7 @@ namespace
         {
             runner->clearCache();
             std::vector<int32_t> tokens;
+            bool observed_committed_verifier_row = false;
             if (!runner->prefill(prompt))
             {
                 ADD_FAILURE() << "cycle " << cycle << ": " << runner->lastError();
@@ -2787,8 +2805,35 @@ namespace
                                   << ": stochastic MTP decode exceeded remaining token budget";
                     return tokens;
                 }
+                if (!observed_committed_verifier_row)
+                {
+                    /*
+                     * Probe immediately after the first completed grouped
+                     * transaction. This is intentionally earlier than a
+                     * following decode can make an unordered read appear to
+                     * work by chance. CUDA and ROCm must join the verifier
+                     * row's exact arena producer event before its diagnostic
+                     * D2H result boundary.
+                     */
+                    const auto verifier_probe = runner->prefixStateProbe();
+                    if (verifier_probe.mtp_verifier_runs > 0)
+                    {
+                        EXPECT_FALSE(
+                            verifier_probe
+                                .mtp_observed_verifier_draft_tokens.empty())
+                            << backend_name << " cycle " << cycle
+                            << " completed a grouped verifier transaction "
+                               "without publishing its stable token row";
+                        observed_committed_verifier_row =
+                            !verifier_probe
+                                 .mtp_observed_verifier_draft_tokens.empty();
+                    }
+                }
                 tokens.insert(tokens.end(), step.tokens.begin(), step.tokens.end());
             }
+            EXPECT_TRUE(observed_committed_verifier_row)
+                << backend_name << " cycle " << cycle
+                << " never exposed a committed verifier-row identity";
             return tokens;
         };
 
@@ -2810,14 +2855,12 @@ namespace
         expectMTPVerifierGraphLifecycle(
             graph_lifecycle_records,
             backend_name,
-            /*require_warmup_capture=*/true,
-            /*require_replay=*/true);
-        expectSegmentedGraphLifecycle(
+            RetainedGraphLifecycleProof::CaptureAndReplay);
+        expectRetainedGraphLifecycle(
             graph_lifecycle_records,
             backend_name,
             "mtp_decode_sidecar",
-            /*require_warmup_capture=*/true,
-            /*require_replay=*/true);
+            RetainedGraphLifecycleProof::CaptureAndReplay);
         expectMTPAcceptedStateFastPublication(
             graph_lifecycle_records,
             backend_name);
@@ -2860,14 +2903,12 @@ namespace
         expectMTPVerifierGraphLifecycle(
             records,
             backend_name,
-            /*require_warmup_capture=*/false,
-            /*require_replay=*/true);
-        expectSegmentedGraphLifecycle(
+            RetainedGraphLifecycleProof::ReplayOnly);
+        expectRetainedGraphLifecycle(
             records,
             backend_name,
             "mtp_decode_sidecar",
-            /*require_warmup_capture=*/false,
-            /*require_replay=*/true);
+            RetainedGraphLifecycleProof::ReplayOnly);
         expectMTPAcceptedStateFastPublication(
             records,
             backend_name);
@@ -2980,11 +3021,16 @@ namespace
                     << backend_name << " deferred draft samples must record a stream dependency";
                 EXPECT_GE(counter("stochastic_draft_sample_ready_waits"), 1.0)
                     << backend_name << " sidecar/verifier consumers must wait on deferred draft samples";
-                EXPECT_GE(counter("verifier_device_token_input_prepares"), 1.0)
-                    << backend_name << " verifier input tokens should be staged from device draft slots";
                 if (verifier_path ==
                     MTPVerifierGraphPath::AllPositionStatePublication)
                 {
+                    EXPECT_GE(
+                        counter("verifier_device_token_input_prepares") +
+                            counter(
+                                "verifier_device_token_batch_input_prepares"),
+                        1.0)
+                        << backend_name << " direct all-position verification "
+                        << "must stage verifier tokens from device-owned slots";
                     EXPECT_GE(counter("stochastic_batch_summary_device_first_tokens"), 1.0)
                         << backend_name << " direct all-position summary should "
                         << "read the first token from device scratch";
@@ -2996,15 +3042,32 @@ namespace
                 {
                     EXPECT_GE(
                         counter(
-                            "stochastic_serial_equivalent_verify_batch_device_token_rows"),
+                            "verifier_device_token_batch_input_prepares"),
                         1.0)
-                        << backend_name << " grouped resident verification must "
-                        << "reduce serial-equivalent rows from device token slots";
+                        << backend_name << " grouped verification must stage "
+                        << "the complete verifier batch from device-owned slots";
+                    EXPECT_EQ(
+                        counter("verifier_device_token_input_prepares"),
+                        0.0)
+                        << backend_name << " grouped verification must not "
+                        << "substitute the legacy scalar token-row plan";
                     EXPECT_GE(
-                        counter("stochastic_verify_request_batch_outcomes"),
+                        counter(
+                            "stochastic_serial_equivalent_captured_outcomes"),
                         1.0)
                         << backend_name << " grouped resident verification must "
-                        << "produce compact request-batched outcomes";
+                        << "use the retained serial-equivalent compact reducer";
+                    EXPECT_EQ(
+                        counter(
+                            "stochastic_serial_equivalent_verify_batch_device_token_rows"),
+                        0.0)
+                        << backend_name << " retained generation must not run "
+                        << "the separately submitted compact reducer";
+                    EXPECT_EQ(
+                        counter("stochastic_verify_request_batch_outcomes"),
+                        0.0)
+                        << backend_name << " retained generation must not copy "
+                        << "an intermediate compact outcome to the host";
                     EXPECT_GE(
                         counter("grouped_outcome_verifier_device_token_inputs"),
                         1.0)
@@ -3033,8 +3096,27 @@ namespace
             }
         }
         EXPECT_GE(counter("stochastic_accept_tests"), 1.0);
-        EXPECT_GE(counter("transaction_validation_passes"), 1.0)
-            << backend_name << " stochastic MTP must validate at least one Phase 13.8 transaction";
+        const double terminal_transactions =
+            counter("device_generation_terminal_transactions");
+        EXPECT_GE(terminal_transactions, 1.0)
+            << backend_name << " stochastic MTP must finish at least one "
+            << "device-owned generation transaction";
+        EXPECT_EQ(
+            counter("device_generation_terminal_compact_outcome_reductions"),
+            terminal_transactions)
+            << backend_name << " every committed device-generation transaction "
+            << "must be certified by one captured compact reducer";
+        EXPECT_GE(
+            counter("device_generation_terminal_published_state_commits"),
+            1.0)
+            << backend_name << " the terminal controller ledger must prove "
+            << "device-resident state publication";
+        EXPECT_EQ(counter("transaction_validation_passes"), 0.0)
+            << backend_name << " device-owned generation must not invoke the "
+            << "retired host transaction validator";
+        EXPECT_EQ(counter("transaction_validation_failures"), 0.0)
+            << backend_name << " device-owned generation reported a host-side "
+            << "transaction-validation failure";
         EXPECT_EQ(counter("first_token_stochastic_samples"), 0.0)
             << backend_name << " stochastic MTP must not sample first token from host full logits";
         EXPECT_EQ(counter("mtp_token_stochastic_samples"), 0.0)
@@ -5257,7 +5339,22 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsBaselineThenMTPRegressio
     EXPECT_GE(mtp_snapshot.mtp_accepted_tokens + mtp_snapshot.mtp_rejected_tokens, 2u);
 }
 
-TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegression)
+/**
+ * @brief Prove padded retained-prefill capture preserves main and shifted MTP state.
+ *
+ * Setup-only retained graph materialization happens before an admitted request.
+ * This regression therefore exercises the exact lifecycle that must capture a
+ * stable device request-length pointer, then publishes 595 live rows through a
+ * 600-row executable.  Exact-shape execution is the state oracle.  Decode is
+ * deliberately included because a shifted cache can look plausible at the
+ * main-cache boundary yet make every subsequent MTP draft reject.
+ *
+ * @param device Concrete CUDA or ROCm participant under test.
+ * @param backend_name Human-readable backend identity for diagnostics.
+ */
+void runQwen36PaddedPrefillMTPGraphCaptureRegression(
+    GlobalDeviceAddress device,
+    const std::string &backend_name)
 {
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -5268,7 +5365,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegre
         {"LLAMINAR_PREFIX_PROBE_HASH_KV_PAYLOADS", "1"},
         {"LLAMINAR_PREFIX_PROBE_HASH_GDN_DEVICE_STATE", "1"},
         {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_padded_prefill_bucket_stats.json"},
-        {"LLAMINAR_PERF_STATS_FILTER", "forward_graph"},
+        {"LLAMINAR_PERF_STATS_FILTER", "forward_graph,mtp"},
     });
     PerfStatsCollector::reset();
 
@@ -5282,25 +5379,16 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegre
         GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
     }
 
-    auto &dm = DeviceManager::instance();
-    dm.initialize(-1, false);
-    if (dm.rocm_device_count() <= 0)
-    {
-        GTEST_SKIP() << "No ROCm device available for Qwen3.6 padded prefill bucket regression";
-    }
-    const int rocm_ordinal = qwen36RocmSingleDeviceOrdinal();
-    ASSERT_GE(rocm_ordinal, 0);
-    ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
-        << "Selected ROCm device ordinal is outside the available device range";
-
     OrchestrationConfig config = OrchestrationConfig::defaults();
     config.model_path = model_path;
     config.max_seq_len = 1024;
     config.batch_size = 1;
     config.tp_degree = 1;
     config.pp_degree = 1;
-    config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
+    config.device_for_this_rank = device;
     config.kv_cache_precision = "auto";
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
 
     auto factory = createOrchestrationRunnerFactory();
     std::vector<int32_t> prompt;
@@ -5339,6 +5427,9 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegre
     auto runner = factory->createFromOrchestrationConfig(config);
     ASSERT_NE(runner, nullptr);
     ASSERT_TRUE(runner->initialize()) << runner->lastError();
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    runner->setSamplingParams(greedy);
 
     ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
     EXPECT_EQ(runner->currentPosition(), 595);
@@ -5354,12 +5445,33 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegre
     EXPECT_EQ(runner->currentPosition(), 595);
     replay_state = runner->prefixStateProbe();
 
-    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    constexpr size_t kDecodeTokens = 16;
+    std::vector<int32_t> generated_tokens;
+    while (generated_tokens.size() < kDecodeTokens)
+    {
+        const int remaining = static_cast<int>(
+            kDecodeTokens - generated_tokens.size());
+        runner->setDecodeStepTokenBudget(remaining);
+        GenerationResult step = runner->decodeStep();
+        runner->setDecodeStepTokenBudget(0);
+        ASSERT_TRUE(step.error.empty()) << step.error;
+        ASSERT_FALSE(step.tokens.empty())
+            << backend_name
+            << " padded-prefill MTP decode produced no transaction output";
+        ASSERT_LE(step.tokens.size(), static_cast<size_t>(remaining));
+        generated_tokens.insert(
+            generated_tokens.end(),
+            step.tokens.begin(),
+            step.tokens.end());
+    }
+    const PrefixRuntimeStateSnapshot decoded_state = runner->prefixStateProbe();
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph", "mtp"});
     runner->shutdown();
 
     MTPRuntimeSnapshotComparisonOptions state_compare_options;
     state_compare_options.compare_main_kv_payload_hashes = true;
-    state_compare_options.compare_shifted_mtp_kv = false;
+    state_compare_options.compare_shifted_mtp_kv = true;
     state_compare_options.compare_gdn_hashes = true;
     for (const auto &[phase_name, state] :
          std::vector<std::pair<std::string, PrefixRuntimeStateSnapshot>>{
@@ -5373,7 +5485,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegre
                 state,
                 state_compare_options);
         EXPECT_TRUE(equivalent)
-            << "ROCm padded-prefill " << phase_name
+            << backend_name << " padded-prefill " << phase_name
             << " changed exact-shape KV/GDN device state: "
             << equivalent.reason
             << "\nexact: " << summarizeStateContinuityProbe(exact_state)
@@ -5455,7 +5567,53 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegre
             "lazy_initialized_after_request_reset"),
         1.0);
     EXPECT_EQ(lifecycle_count("replay", "ready", "none"), 1.0);
+
+    EXPECT_EQ(generated_tokens.size(), kDecodeTokens);
+    EXPECT_TRUE(decoded_state.mtp_config_enabled);
+    EXPECT_FALSE(decoded_state.mtp_bypassed)
+        << decoded_state.mtp_bypass_reason;
+    EXPECT_GT(decoded_state.mtp_draft_steps, 0u);
+    EXPECT_GT(decoded_state.mtp_verifier_runs, 0u);
+    EXPECT_GT(decoded_state.mtp_accepted_tokens, 0u)
+        << backend_name
+        << " produced zero accepted drafts after a padded prefill; this is a "
+           "shifted-state correctness failure, not a valid MTP outcome";
+    EXPECT_GT(decoded_state.mtp_transaction_commits, 0u);
+    EXPECT_EQ(decoded_state.mtp_transaction_rollbacks, 0u);
+    EXPECT_EQ(decoded_state.mtp_transaction_validation_failures, 0u);
     PerfStatsCollector::reset();
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegression)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No ROCm device available for Qwen3.6 padded prefill MTP regression";
+    }
+    const int ordinal = qwen36RocmSingleDeviceOrdinal();
+    ASSERT_GE(ordinal, 0);
+    ASSERT_LT(ordinal, dm.rocm_device_count());
+    runQwen36PaddedPrefillMTPGraphCaptureRegression(
+        GlobalDeviceAddress::rocm(ordinal),
+        "ROCm");
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAPaddedPrefillBucketGraphCaptureRegression)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.cuda_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No CUDA device available for Qwen3.6 padded prefill MTP regression";
+    }
+    const int ordinal = qwen36CudaSingleDeviceOrdinal();
+    ASSERT_GE(ordinal, 0);
+    ASSERT_LT(ordinal, dm.cuda_device_count());
+    runQwen36PaddedPrefillMTPGraphCaptureRegression(
+        GlobalDeviceAddress::cuda(ordinal),
+        "CUDA");
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)

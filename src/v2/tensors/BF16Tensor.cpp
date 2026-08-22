@@ -66,6 +66,23 @@ namespace llaminar2
         std::copy(bf16_data.begin(), bf16_data.end(), host_bf16_data_.begin());
     }
 
+    BF16Tensor::BF16Tensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint16_t> bf16_data)
+        : shape_(shape), device_(DeviceId::cpu()), is_view_(false),
+          host_bf16_data_(std::move(bf16_data)), parent_data_ptr_(nullptr),
+          view_offset_(0), parent_(nullptr), device_data_(nullptr)
+    {
+        if (shape.empty())
+            throw std::invalid_argument("BF16Tensor: shape cannot be empty");
+
+        size_t expected_elements = 1u;
+        for (const size_t dimension : shape)
+            expected_elements *= dimension;
+        if (host_bf16_data_.size() != expected_elements)
+            throw std::invalid_argument("BF16Tensor: data size mismatch");
+    }
+
     // Private view constructor
     BF16Tensor::BF16Tensor(const std::vector<size_t> &shape,
                            DeviceId device,

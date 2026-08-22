@@ -851,11 +851,13 @@ namespace
      * @brief Prove a ROCm MoE grouped verifier codegroup equals rowwise decode.
      *
      * This helper deliberately compares grouped prefill against the production
-     * M=1 table-decode entry points, not against a CPU or FP32 oracle.  MTP
-     * verifier rows publish device state produced by these exact backend paths;
-     * therefore the grouped result must match what serial decode would have
-     * produced for the same quantized codebook, route ids, route weights, and
-     * hidden rows.
+     * M=1 device-routed entry points, not against a CPU or FP32 oracle. The
+     * one-row routing tensors are republished for every serial row because the
+     * immutable table API owns one captured route set and must reject changing
+     * expert ids. MTP verifier rows publish device state produced by these
+     * exact backend paths; therefore the grouped result must match what serial
+     * decode would have produced for the same quantized codebook, route ids,
+     * route weights, and hidden rows.
      */
     void runROCmMoECodegroupVerifierRowsMatchSerialDecode(const NativeCodegroupCase &gateup_format,
                                                           const NativeCodegroupCase &down_format,
@@ -1001,15 +1003,20 @@ namespace
                           hidden->data() + static_cast<size_t>(row + 1) * d_model, hidden_row->mutable_data());
                 ASSERT_TRUE(hidden_row->ensureOnDevice(device, stream));
 
-                std::array<int, top_k> expert_ids = {};
-                std::array<float, top_k> expert_weights = {};
+                auto row_routing_indices = TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(top_k)});
+                auto row_routing_weights = TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(top_k)});
                 for (int route = 0; route < top_k; ++route)
                 {
                     const int slot = row * top_k + route;
-                    expert_ids[static_cast<size_t>(route)] =
-                        static_cast<int>(routing_indices->data()[static_cast<size_t>(slot)]);
-                    expert_weights[static_cast<size_t>(route)] = routing_weights->data()[static_cast<size_t>(slot)];
+                    row_routing_indices->mutable_data()[static_cast<size_t>(route)] =
+                        routing_indices->data()[static_cast<size_t>(slot)];
+                    row_routing_weights->mutable_data()[static_cast<size_t>(route)] =
+                        routing_weights->data()[static_cast<size_t>(slot)];
                 }
+                ASSERT_TRUE(row_routing_indices->ensureOnDevice(device, stream));
+                ASSERT_TRUE(row_routing_weights->ensureOnDevice(device, stream));
 
                 std::array<std::shared_ptr<FP32Tensor>, top_k> gate_owned;
                 std::array<std::shared_ptr<FP32Tensor>, top_k> up_owned;
@@ -1029,13 +1036,16 @@ namespace
 
                 auto decode_output = TestTensorFactory::createFP32({1u, static_cast<size_t>(d_model)});
                 ASSERT_TRUE(decode_output->ensureOnDevice(device, stream));
-                ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromTable(hidden_row.get(), expert_ids.data(),
-                                                                          gateup_table, top_k, gate_outputs.data(),
-                                                                          up_outputs.data(), d_model, intermediate))
+                ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromRouting(
+                    hidden_row.get(), row_routing_indices.get(), gateup_table,
+                    top_k, gate_outputs.data(), up_outputs.data(), d_model,
+                    intermediate))
                     << gateup_format.label << "/" << down_format.label << " rowwise gate/up row=" << row;
-                ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromTable(
-                    gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(), down_table, top_k,
-                    decode_output.get(), d_model, intermediate))
+                ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromRouting(
+                    gate_outputs.data(), up_outputs.data(),
+                    row_routing_indices.get(), row_routing_weights.get(),
+                    down_table, top_k, decode_output.get(), d_model,
+                    intermediate))
                     << gateup_format.label << "/" << down_format.label << " rowwise down row=" << row;
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
                 TransferEngine::publishDeviceWrite(decode_output, device, stream);

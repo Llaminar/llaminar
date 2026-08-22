@@ -104,6 +104,23 @@ namespace llaminar2
          */
         MoEExpertOverlayPreparationPlan filteredForDevice(DeviceId device) const;
 
+        /**
+         * @brief Restrict preparation to an explicit graph execution device set.
+         *
+         * A heterogeneous continuation root can execute its captured GPU graph
+         * and one or more colocated CPU sparse endpoints.  Those endpoints are
+         * one graph ownership unit even though their prepared engines have
+         * different physical devices.  Callers provide the complete typed set;
+         * no domain name or implicit host-fallback rule is reconstructed here.
+         *
+         * @param devices Exact devices whose rank-local requests are retained.
+         * @return A plan with rebuilt diagnostics for only those devices.
+         * @throws std::invalid_argument when @p devices is empty or contains an
+         *         invalid or duplicate device.
+         */
+        MoEExpertOverlayPreparationPlan filteredForDevices(
+            const std::vector<DeviceId> &devices) const;
+
         bool shouldPrepare(
             DeviceId device,
             int layer,

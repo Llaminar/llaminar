@@ -20,6 +20,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <string_view>
 
@@ -27,6 +29,80 @@ namespace llaminar2
 {
     namespace
     {
+        /**
+         * @brief Row ownership used when rebuilding a segmented prefill snapshot.
+         *
+         * Most checkpoints publish one row per real token. Canonical routed
+         * expert contributions instead publish one row per `(token, route)`
+         * pair and retain the fixed graph bucket's inactive suffix. Terminal
+         * values, such as last-token logits, do not describe a token sequence.
+         */
+        enum class PrefillSnapshotSequenceLayout : std::uint8_t
+        {
+            LogicalRows,     ///< Exactly one captured row per real token.
+            PackedRouteRows, ///< `top_k` captured rows per real token.
+            Terminal,        ///< Latest observation is the complete value.
+        };
+
+        /** @return True when @p value ends with the exact semantic suffix. */
+        bool hasSemanticSuffix(
+            const std::string &value,
+            const std::string_view suffix) noexcept
+        {
+            return value.size() >= suffix.size() &&
+                   value.compare(
+                       value.size() - suffix.size(),
+                       suffix.size(),
+                       suffix) == 0;
+        }
+
+        /**
+         * @brief Classify the live-row geometry of one semantic checkpoint.
+         *
+         * The packed route contribution is named by its typed graph output.
+         * All other tensors remain sequence-shaped only when their producer
+         * already projected the first fixed bucket down to real token rows.
+         */
+        PrefillSnapshotSequenceLayout prefillSnapshotSequenceLayout(
+            const std::string &semantic_key,
+            const StoredSnapshot &first,
+            const size_t first_logical_rows) noexcept
+        {
+            constexpr std::string_view kCanonicalRouteContributions =
+                "_MOE_CANONICAL_ROUTE_CONTRIBUTIONS";
+            if (hasSemanticSuffix(
+                    semantic_key,
+                    kCanonicalRouteContributions))
+            {
+                return PrefillSnapshotSequenceLayout::PackedRouteRows;
+            }
+            return first.rows == first_logical_rows
+                       ? PrefillSnapshotSequenceLayout::LogicalRows
+                       : PrefillSnapshotSequenceLayout::Terminal;
+        }
+
+        /**
+         * @brief Name the routing-index companion that owns `top_k` geometry.
+         * @return Companion key, or an empty string for a non-route checkpoint.
+         */
+        std::string routingIndexCompanionKey(
+            const std::string &semantic_key)
+        {
+            constexpr std::string_view kCanonicalRouteContributions =
+                "_MOE_CANONICAL_ROUTE_CONTRIBUTIONS";
+            if (!hasSemanticSuffix(
+                    semantic_key,
+                    kCanonicalRouteContributions))
+            {
+                return {};
+            }
+            return semantic_key.substr(
+                       0,
+                       semantic_key.size() -
+                           kCanonicalRouteContributions.size()) +
+                   "_MOE_ROUTING_INDICES";
+        }
+
         std::string snapshotContextPrefix(const std::string &context)
         {
             std::string result;
@@ -82,6 +158,57 @@ namespace llaminar2
 
             return prefix + "_MOE_OVERLAY_CUMULATIVE_" +
                    snapshotContextPrefix(participant);
+        }
+
+        /**
+         * @brief Resolve the model-layer prefix for a pinned route producer.
+         *
+         * A LocalTP continuation publishes this evidence at its ordered route
+         * reducer. A single-participant continuation publishes the identical
+         * views at its final mapped return join, after grouped planning has
+         * finalized the invocation-local domain assignment ledger. Both are
+         * observations of the same runtime-table authority.
+         */
+        std::string pinnedRouteEvidencePrefix(
+            const std::string &stage_name)
+        {
+            constexpr std::string_view kOrderedReduce =
+                "_moe_overlay_continuation_routes_ordered_reduce";
+            constexpr std::string_view kMappedReturn =
+                "_moe_overlay_activation_return_consume";
+            size_t marker = stage_name.find(kOrderedReduce);
+            if (marker == std::string::npos)
+                marker = stage_name.find(kMappedReturn);
+            return marker == std::string::npos
+                       ? std::string{}
+                       : stage_name.substr(0, marker);
+        }
+
+        /**
+         * @brief Map one named device view to its stable parity checkpoint.
+         *
+         * @param prefix Model-layer prefix returned by
+         *        @ref pinnedRouteEvidencePrefix.
+         * @param output_name Typed StageDumpInfo output name.
+         * @return Stable snapshot key, or an empty string for unrelated data.
+         */
+        std::string pinnedRouteEvidenceKey(
+            const std::string &prefix,
+            const std::string &output_name)
+        {
+            if (output_name == "output")
+                return prefix + "_MOE_EXPERT_OUTPUT";
+            if (output_name == "domain_route_participant_ids")
+                return prefix + "_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS";
+            if (output_name == "runtime_route_weights")
+                return prefix + "_MOE_RUNTIME_ROUTE_WEIGHTS";
+            if (output_name == "overlay_route_participants_bank0")
+                return prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0";
+            if (output_name == "overlay_route_participants_bank1")
+                return prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1";
+            if (output_name == "overlay_route_selected_bank")
+                return prefix + "_MOE_OVERLAY_ROUTE_SELECTED_BANK";
+            return {};
         }
     } // namespace
 
@@ -427,6 +554,29 @@ namespace llaminar2
         }
 
         /*
+         * A routed-output finalizer consumes two projections of one pinned
+         * epoch: overlay-wide expert placement and the invocation-local domain
+         * schedule. Capture both only after grouped planning and every required
+         * return are complete, before a later layer reuses route scratch. The
+         * request ticket selects which durable placement bank applied even if
+         * background publication has advanced the newest active bank.
+         */
+        if (const std::string prefix = pinnedRouteEvidencePrefix(name);
+            !prefix.empty())
+        {
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                const std::string key =
+                    pinnedRouteEvidenceKey(prefix, output_name);
+                if (!key.empty() && output.data)
+                    storeOutput(key, output);
+            }
+            return;
+        }
+
+        /*
          * The Qwen3.6 MoE combined shared-verifier path can fuse routed expert
          * and shared expert output inside MoEExpertComputeStage.  The stage name
          * is still `_moe_expert_ffn`, so route by output name before the generic
@@ -465,9 +615,9 @@ namespace llaminar2
 
         // Handle shared-expert gate. In the ordinary path the stage has one
         // output, the gated shared contribution. In the fused gate-add path it
-        // publishes both that gated contribution and the final routed+shared
-        // combined row. Route by output name so both paths keep the same
-        // semantic snapshot keys.
+        // publishes the unchanged complete routed input, that gated
+        // contribution, and the final routed+shared combined row. Route by
+        // output name so both paths keep the same semantic snapshot keys.
         if (name.find("_shared_expert_gate") != std::string::npos)
         {
             size_t pos = name.find("_shared_expert_gate");
@@ -478,6 +628,8 @@ namespace llaminar2
                 const std::string output_name = output.name ? output.name : "";
                 if (output_name == "shared_output" && output.data)
                     storeOutput(prefix + "_MOE_SHARED_GATE_OUTPUT", output);
+                else if (output_name == "routed_output" && output.data)
+                    storeOutput(prefix + "_MOE_EXPERT_OUTPUT", output);
                 else if (output_name == "combined_output" && output.data)
                     storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
             }
@@ -686,7 +838,12 @@ namespace llaminar2
             }
 
             const StoredSnapshot &first = *pieces.snapshots.front();
-            if (first.rows != chunks.front().logical_rows)
+            const PrefillSnapshotSequenceLayout layout =
+                prefillSnapshotSequenceLayout(
+                    semantic_key,
+                    first,
+                    chunks.front().logical_rows);
+            if (layout == PrefillSnapshotSequenceLayout::Terminal)
             {
                 /*
                  * Last-token logits and other terminal-state values are
@@ -708,6 +865,26 @@ namespace llaminar2
                 snapshots_[semantic_key] = pieces.snapshots[latest_chunk - 1];
                 ++result.terminal_or_nonsequence_keys;
                 continue;
+            }
+
+            size_t rows_per_logical_row = 1;
+            if (layout == PrefillSnapshotSequenceLayout::PackedRouteRows)
+            {
+                const std::string companion_key =
+                    routingIndexCompanionKey(semantic_key);
+                const auto companion = sequences.find(companion_key);
+                if (companion == sequences.end() ||
+                    !companion->second.present.front() ||
+                    !companion->second.snapshots.front() ||
+                    companion->second.snapshots.front()->cols == 0)
+                {
+                    result.error =
+                        "packed prefill snapshot '" + semantic_key +
+                        "' has no routing-index companion geometry";
+                    return result;
+                }
+                rows_per_logical_row =
+                    companion->second.snapshots.front()->cols;
             }
 
             if (first.cols == 0 ||
@@ -734,17 +911,34 @@ namespace llaminar2
                 }
 
                 const StoredSnapshot &piece = *pieces.snapshots[chunk_index];
-                if (piece.rows != chunks[chunk_index].logical_rows ||
+                const size_t logical_rows = chunks[chunk_index].logical_rows;
+                if (logical_rows >
+                    std::numeric_limits<size_t>::max() /
+                        rows_per_logical_row)
+                {
+                    result.error = "prefill chunk sequence for '" +
+                                   semantic_key +
+                                   "' overflows its live-row geometry";
+                    return result;
+                }
+                const size_t live_rows =
+                    logical_rows * rows_per_logical_row;
+                const bool row_geometry_valid =
+                    layout == PrefillSnapshotSequenceLayout::LogicalRows
+                        ? piece.rows == live_rows
+                        : piece.rows >= live_rows &&
+                              piece.rows % rows_per_logical_row == 0;
+                if (!row_geometry_valid ||
                     piece.cols != first.cols ||
                     piece.rows > std::numeric_limits<size_t>::max() / piece.cols ||
                     piece.data.size() != piece.rows * piece.cols ||
-                    total_rows > std::numeric_limits<size_t>::max() - piece.rows)
+                    total_rows > std::numeric_limits<size_t>::max() - live_rows)
                 {
                     result.error = "prefill chunk sequence for '" + semantic_key +
                                    "' has inconsistent chunk " +
                                    std::to_string(chunk_index) +
                                    " (expected rows=" +
-                                   std::to_string(chunks[chunk_index].logical_rows) +
+                                   std::to_string(live_rows) +
                                    ", cols=" + std::to_string(first.cols) +
                                    "; got rows=" + std::to_string(piece.rows) +
                                    ", cols=" + std::to_string(piece.cols) +
@@ -752,16 +946,34 @@ namespace llaminar2
                                    ")";
                     return result;
                 }
-                total_rows += piece.rows;
+                total_rows += live_rows;
 
+                if (live_rows >
+                    std::numeric_limits<size_t>::max() / piece.cols)
+                {
+                    result.error = "prefill chunk sequence for '" +
+                                   semantic_key +
+                                   "' overflows its live element count";
+                    return result;
+                }
+                const size_t live_elements = live_rows * piece.cols;
                 if (joined.size() > std::numeric_limits<size_t>::max() -
-                                        piece.data.size())
+                                        live_elements)
                 {
                     result.error = "prefill chunk sequence for '" + semantic_key +
                                    "' overflows diagnostic storage";
                     return result;
                 }
-                joined.insert(joined.end(), piece.data.begin(), piece.data.end());
+                /*
+                 * Packed graph tensors retain a fixed-bucket suffix. Routes
+                 * are row-major, so the first `logical_rows * top_k` rows are
+                 * the only production contributions belonging to this chunk.
+                 */
+                joined.insert(
+                    joined.end(),
+                    piece.data.begin(),
+                    piece.data.begin() +
+                        static_cast<std::ptrdiff_t>(live_elements));
             }
 
             storeSnapshot(
@@ -983,6 +1195,18 @@ namespace llaminar2
              * the same semantic checkpoint as the ordinary MoE expert stage.
              */
             {"_moe_overlay_ticket_consume", "_MOE_EXPERT_OUTPUT"},
+            /*
+             * A heterogeneous ExpertOverlay continuation root receives the
+             * sum of LocalTP shared-expert partials through a rooted
+             * collective.  That publication is not another local
+             * shared-expert projection: it exists on the root only and the
+             * collective stage describes its flat transfer span as
+             * `[1,count]`.  Give it a distinct diagnostic identity before the
+             * generic `_shared_expert` suffix can mistake it for the
+             * row-parallel `[tokens,hidden]` producer and overwrite the root
+             * participant's canonical checkpoint.
+             */
+            {"_shared_expert_reduce_to_overlay_root", "_MOE_SHARED_EXPERT_OUTPUT_REDUCED_TO_OVERLAY_ROOT"},
             {"_shared_expert_allreduce", "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"},
             {"_moe_sparse_return_reduce", "_MOE_EXPERT_OUTPUT"},
             {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
@@ -1106,6 +1330,13 @@ namespace llaminar2
         {
             return {prefixBefore("_shared_expert_allreduce") + "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"};
         }
+        if (stage_name.find("_shared_expert_reduce_to_overlay_root") !=
+            std::string::npos)
+        {
+            return {
+                prefixBefore("_shared_expert_reduce_to_overlay_root") +
+                "_MOE_SHARED_EXPERT_OUTPUT_REDUCED_TO_OVERLAY_ROOT"};
+        }
         if (stage_name.find("_moe_overlay_continuation_broadcast") !=
             std::string::npos)
         {
@@ -1166,6 +1397,19 @@ namespace llaminar2
             return {prefix + "_MOE_EXPERT_OUTPUT",
                     prefix + "_MOE_SHARED_GATE_OUTPUT",
                     prefix + "_MOE_COMBINED_OUTPUT"};
+        }
+        if (const std::string prefix =
+                pinnedRouteEvidencePrefix(stage_name);
+            !prefix.empty())
+        {
+            std::vector<std::string> keys{
+                prefix + "_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
+                prefix + "_MOE_RUNTIME_ROUTE_WEIGHTS",
+                prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+                prefix + "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+                prefix + "_MOE_OVERLAY_ROUTE_SELECTED_BANK"};
+            keys.insert(keys.begin(), prefix + "_MOE_EXPERT_OUTPUT");
+            return keys;
         }
         if (stage_name.find("_shared_expert_gate") != std::string::npos)
         {
@@ -1241,6 +1485,23 @@ namespace llaminar2
                 prefixBefore("_moe_canonical_publication_finalize"),
                 /*canonical_finalizer=*/true);
         }
+        if (const std::string prefix =
+                pinnedRouteEvidencePrefix(stage_name);
+            !prefix.empty())
+        {
+            std::vector<std::string> keys;
+            keys.reserve(dump_info.outputs.size());
+            for (const auto &output : dump_info.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                const std::string key =
+                    pinnedRouteEvidenceKey(prefix, output_name);
+                if (!key.empty())
+                    keys.push_back(key);
+            }
+            return keys;
+        }
         if (stage_name.find("_moe_expert_ffn") != std::string::npos)
         {
             return outputNamesToKeys(
@@ -1258,6 +1519,8 @@ namespace llaminar2
                     output.name ? output.name : "";
                 if (output_name == "shared_output" || output_name == "output")
                     keys.push_back(prefix + "_MOE_SHARED_GATE_OUTPUT");
+                else if (output_name == "routed_output")
+                    keys.push_back(prefix + "_MOE_EXPERT_OUTPUT");
                 else if (output_name == "combined_output")
                     keys.push_back(prefix + "_MOE_COMBINED_OUTPUT");
             }

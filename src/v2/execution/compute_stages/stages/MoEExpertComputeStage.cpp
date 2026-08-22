@@ -26,6 +26,7 @@
 #include "../../../execution/moe/ExpertWeightPayloadProvider.h"
 #include "../../../execution/moe/MoEExpertWeightService.h"
 #include "../../../execution/moe/MoEOverlayNodeLocalRouteExchange.h"
+#include "../../../execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -1215,9 +1216,31 @@ namespace llaminar2
         params_.prepared_down_gemm.resize(expert_count, nullptr);
         invalidateFixedTopologyMaskPublication();
 
+        DeviceMoEOverlayServiceTelemetryBinding service_telemetry =
+            params_.overlay_service_telemetry;
+        if (!service_telemetry.empty() && !service_telemetry.valid())
+        {
+            throw std::invalid_argument(
+                "[MoEExpertComputeStage] Sparse service telemetry binding is partial");
+        }
+
         if (params_.moe_runtime_table && params_.layer_idx >= 0)
         {
             moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
+            const auto table_telemetry =
+                params_.moe_runtime_table
+                    ->deviceOverlayServiceTelemetryBinding(
+                        params_.layer_idx);
+            if (!table_telemetry.empty())
+            {
+                if (!service_telemetry.empty() &&
+                    !(service_telemetry == table_telemetry))
+                {
+                    throw std::invalid_argument(
+                        "[MoEExpertComputeStage] Explicit service telemetry disagrees with the runtime table");
+                }
+                service_telemetry = table_telemetry;
+            }
             /*
              * Construction has no executor-owned stream, so it may inspect an
              * already published bank but must never publish a new one. A cold
@@ -1225,6 +1248,37 @@ namespace llaminar2
              * executor binds the exact producer stream.
              */
             moe_runtime_table_initialized_ = runtimeTableHasActiveGroupedDecodeBank();
+        }
+        if (!service_telemetry.empty())
+        {
+            if (!params_.device_id.is_gpu() || !service_telemetry.valid())
+            {
+                throw std::invalid_argument(
+                    "[MoEExpertComputeStage] Dynamic service telemetry requires one complete GPU observation binding");
+            }
+            overlay_service_runtime_layer_ =
+                service_telemetry.runtime_layer;
+            overlay_service_telemetry_layer_ =
+                service_telemetry.layer_telemetry;
+            overlay_service_sample_ = service_telemetry.sample;
+            PerfStatsCollector::addCounter(
+                "moe_overlay_residency",
+                "device_service_stage_bindings",
+                1.0,
+                "model_setup",
+                params_.device_id.toString(),
+                {{"layer", std::to_string(params_.layer_idx)},
+                 {"rows", std::to_string(params_.seq_len)},
+                 {"sparse_endpoint",
+                  sparse_overlay_invocation_bound_ ? "true" : "false"},
+                 {"telemetry_allocation",
+                  std::to_string(reinterpret_cast<std::uintptr_t>(
+                      overlay_service_telemetry_layer_ -
+                      static_cast<std::size_t>(params_.layer_idx) *
+                          kDeviceMoEOverlayServicePhaseCount))},
+                 {"sample_allocation",
+                  std::to_string(reinterpret_cast<std::uintptr_t>(
+                      overlay_service_sample_ - params_.layer_idx))}});
         }
 
         /*
@@ -1915,6 +1969,12 @@ namespace llaminar2
         int rows_per_request,
         void *producer_stream)
     {
+        /* This diagnostic wrapper is explicitly outside captured execution.
+         * Complete producer admission before the publication kernel writes the
+         * active bank; enqueue-only graph callers are prepared by their graph
+         * lifecycle owner and never enter this wrapper. */
+        params_.moe_runtime_table->prepareDecodeHistogramProducerStream(
+            producer_stream);
         if (!enqueueCommittedGroupedVerifierHistograms(
                 accepted_state_counts_device,
                 publication_ok_flags_device,
@@ -2260,7 +2320,86 @@ namespace llaminar2
         return true;
     }
 
+    MoEOverlayServicePhaseHint
+    MoEExpertComputeStage::serviceTelemetryPhaseHint() const noexcept
+    {
+        if (params_.force_decode_equivalent_verifier_prefill ||
+            params_.force_grouped_verifier_prefill_for_decode)
+        {
+            return MoEOverlayServicePhaseHint::GroupedVerifier;
+        }
+        if (sparse_overlay_invocation_bound_)
+            return MoEOverlayServicePhaseHint::Auto;
+        return params_.seq_len == 1
+                   ? MoEOverlayServicePhaseHint::Decode
+                   : MoEOverlayServicePhaseHint::Prefill;
+    }
+
     bool MoEExpertComputeStage::execute(IDeviceContext *ctx)
+    {
+        if (!overlay_service_telemetry_layer_)
+            return executeWithoutServiceTelemetry(ctx);
+        if (!ctx || !overlay_service_sample_ ||
+            !overlay_service_runtime_layer_)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Dynamic service telemetry lost its exact runtime binding");
+            return false;
+        }
+
+        IMoEKernel *const kernel = ensureMoEKernel();
+        void *const stream = gpuStream();
+        const MoEKernelLaunchContext launch{
+            .stream = stream,
+            .workspace = bound_workspace_,
+        };
+        if (!kernel || !stream ||
+            !kernel->beginMoEOverlayServiceTelemetry(
+                launch, overlay_service_sample_))
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Could not enqueue the device-local service start marker"
+                << " layer=" << params_.layer_idx
+                << " device=" << params_.device_id.toString());
+            return false;
+        }
+
+        /* This setup/capture-side witness proves that the retained graph
+         * actually received both service markers. Device publications remain
+         * the authority for executions and accumulated arithmetic. */
+        PerfStatsCollector::addCounter(
+            "moe_overlay_residency",
+            "device_service_marker_pairs_enqueued",
+            1.0,
+            "graph_capture",
+            params_.device_id.toString(),
+            {{"layer", std::to_string(params_.layer_idx)},
+             {"rows", std::to_string(params_.seq_len)},
+             {"sparse_endpoint",
+              sparse_overlay_invocation_bound_ ? "true" : "false"}});
+
+        if (!executeWithoutServiceTelemetry(ctx))
+            return false;
+        if (!kernel->finishMoEOverlayServiceTelemetry(
+                launch,
+                overlay_service_runtime_layer_,
+                overlay_service_telemetry_layer_,
+                overlay_service_sample_,
+                static_cast<std::uint32_t>(params_.num_experts),
+                serviceTelemetryPhaseHint(),
+                params_.runtime_service_graph_role_device))
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] Could not enqueue the device-local service finish marker"
+                << " layer=" << params_.layer_idx
+                << " device=" << params_.device_id.toString());
+            return false;
+        }
+        return true;
+    }
+
+    bool MoEExpertComputeStage::executeWithoutServiceTelemetry(
+        IDeviceContext *ctx)
     {
         if (!ctx)
         {
@@ -2748,6 +2887,7 @@ namespace llaminar2
         }
 
         const bool can_try_device_routed_decode =
+            !params_.require_device_routing_tensor_decode &&
             supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
             params_.moe_runtime_table &&
             moe_runtime_layer_ &&
@@ -2771,7 +2911,9 @@ namespace llaminar2
                  {"initialized", perfBool(moe_runtime_table_initialized_)},
                  {"active_bank", perfBool(runtime_decode_bank_active_for_expert_stage)},
                  {"descriptor_source",
-                  params_.runtime_decode_uses_mutable_descriptors ? "runtime" : "static_table"},
+                  usesRuntimePlacementWeightDescriptors()
+                      ? "runtime"
+                      : "static_table"},
                  {"top_k", std::to_string(top_k)},
                  {"replicas", std::to_string(params_.replica_set.num_replicated)}});
         }
@@ -2780,9 +2922,7 @@ namespace llaminar2
         {
             bool device_routed_done = false;
             const MoEDecodeDescriptorSource descriptor_source =
-                params_.runtime_decode_uses_mutable_descriptors
-                    ? MoEDecodeDescriptorSource::RuntimePlacementTable
-                    : MoEDecodeDescriptorSource::StaticDescriptorTable;
+                params_.weight_descriptor_source;
             const bool have_grouped_tables =
                 grouped_gateup_desc_table_id_ >= 0 &&
                 grouped_gateup_desc_table_num_experts_ == num_experts &&
@@ -2903,7 +3043,8 @@ namespace llaminar2
                 device_routing_expert_mask[static_cast<size_t>(expert_id)] = 1u;
                 device_routing_required_expert_ids.push_back(expert_id);
             }
-            if (!device_routing_required_expert_ids.empty())
+            if (!usesRuntimePlacementWeightDescriptors() &&
+                !device_routing_required_expert_ids.empty())
                 device_routing_expert_mask_ptr = device_routing_expert_mask.data();
         }
 
@@ -2982,7 +3123,11 @@ namespace llaminar2
                     d_model,
                     intermediate,
                     device_routing_expert_mask_ptr,
-                    params_.canonical_route_contributions))
+                    params_.canonical_route_contributions,
+                    usesRuntimePlacementWeightDescriptors()
+                        ? moe_runtime_layer_
+                        : nullptr,
+                    params_.weight_descriptor_source))
             {
                 LOG_ERROR("[MoEExpertComputeStage] Mandatory fused explicit-routing "
                           "GPU decode failed for layer "
@@ -5136,7 +5281,8 @@ namespace llaminar2
                              up_descs.data(),
                              params_.num_experts,
                              d_model,
-                             intermediate)
+                             intermediate,
+                             params_.weight_descriptor_source)
                        : kernel->uploadGroupedExpertFloatingGateUpDescriptorTables(
                              floating_gate_descs.data(),
                              floating_up_descs.data(),
@@ -5268,7 +5414,8 @@ namespace llaminar2
                              down_descs.data(),
                              params_.num_experts,
                              d_model,
-                             intermediate)
+                             intermediate,
+                             params_.weight_descriptor_source)
                        : kernel->uploadGroupedExpertFloatingDownDescriptorTable(
                              floating_down_descs.data(),
                              *table_format,
@@ -5428,7 +5575,7 @@ namespace llaminar2
             }
 
             const bool has_replicas = params_.replica_set.num_replicated > 0;
-            if (params_.runtime_decode_uses_mutable_descriptors ||
+            if (usesRuntimePlacementWeightDescriptors() ||
                 params_.runtime_decode_has_explicit_owner_metadata)
             {
                 LOG_ERROR("[MoEExpertComputeStage] Cannot synthesize MoE runtime decode bank for layer "
@@ -5694,7 +5841,7 @@ namespace llaminar2
             return false;
 
         const bool mutable_runtime_descriptors =
-            params_.runtime_decode_uses_mutable_descriptors;
+            usesRuntimePlacementWeightDescriptors();
         const bool runtime_owner_metadata =
             mutable_runtime_descriptors ||
             params_.runtime_decode_has_explicit_owner_metadata;
@@ -7099,6 +7246,7 @@ namespace llaminar2
         return false;
 #else
         return supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+               !params_.require_device_routing_tensor_decode &&
                params_.seq_len == 1 &&
                params_.d_model > 0 &&
                params_.expert_intermediate > 0 &&
@@ -7137,6 +7285,8 @@ namespace llaminar2
             !params_.routing_indices ||
             !params_.routing_weights ||
             params_.replica_set.num_replicated != 0 ||
+            (usesRuntimePlacementWeightDescriptors() &&
+             (!params_.moe_runtime_table || params_.layer_idx < 0)) ||
             (!params_.expert_mask.empty() &&
              params_.expert_mask.size() !=
                  static_cast<size_t>(params_.num_experts)))
@@ -7196,7 +7346,7 @@ namespace llaminar2
                 params_.top_k,
                 params_.d_model,
                 params_.expert_intermediate,
-                MoEDecodeDescriptorSource::StaticDescriptorTable))
+                params_.weight_descriptor_source))
         {
             runtime_grouped_decode_launch_state_prepared_ = false;
             LOG_ERROR("[MoEExpertComputeStage] Failed to prepare fused "
@@ -7691,8 +7841,9 @@ namespace llaminar2
         if (isDeviceRoutedDecodeGraphCapturable())
             return true;
 
-        // Heterogeneous followers consume their explicit participant-local
-        // routing tensors directly and intentionally have no runtime table.
+        // Heterogeneous followers consume explicit participant-local routing
+        // tensors. Dynamic followers additionally filter those tensors through
+        // their live epoch-pinned runtime placement table.
         if (isExplicitRoutingDecodeGraphCapturable())
             return true;
 
@@ -7781,6 +7932,7 @@ namespace llaminar2
 #else
         const bool runtime_decode_supported =
             !params_.force_grouped_verifier_prefill_for_decode &&
+            !params_.require_device_routing_tensor_decode &&
             supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
             params_.seq_len == 1 &&
             params_.d_model > 0 &&
@@ -7835,14 +7987,13 @@ namespace llaminar2
 
             const bool runtime_decode =
                 !params_.force_grouped_verifier_prefill_for_decode &&
+                !params_.require_device_routing_tensor_decode &&
                 params_.seq_len == 1 && params_.moe_runtime_table;
             if (runtime_decode)
             {
                 IMoEKernel *kernel = ensureMoEKernel();
                 const MoEDecodeDescriptorSource descriptor_source =
-                    params_.runtime_decode_uses_mutable_descriptors
-                        ? MoEDecodeDescriptorSource::RuntimePlacementTable
-                        : MoEDecodeDescriptorSource::StaticDescriptorTable;
+                    params_.weight_descriptor_source;
                 if (!kernel ||
                     !kernel->prepareGroupedRuntimeDecodeLaunchState(
                         grouped_gateup_desc_table_id_,
@@ -9319,14 +9470,9 @@ namespace llaminar2
             moe_kernel_ = owned_moe_kernel_.get();
         }
         if (params_.device_id.is_gpu() &&
-            shouldUseGroupedVerifierPrefillRoute())
+            shouldUseGroupedVerifierPrefillRoute() &&
+            params_.required_router_q8_publication)
         {
-            if (!params_.required_router_q8_publication)
-            {
-                LOG_ERROR("[SharedExpertFFNStage] GPU grouped verifier is missing "
-                          "its required router Q8 publication binding");
-                return nullptr;
-            }
             if (!moe_kernel_ ||
                 !moe_kernel_->bindRouterQ8HiddenPublication(
                     params_.required_router_q8_publication,
@@ -9597,7 +9743,6 @@ namespace llaminar2
                    params_.gate_w &&
                    params_.up_w &&
                    params_.down_w &&
-                   params_.required_router_q8_publication &&
                    params_.output;
         }
         return supportsLazyPrefillGraphCapturePreflight();
@@ -10228,7 +10373,20 @@ namespace llaminar2
                 info.addOutput("shared_output", params_.shared_output, params_.seq_len, params_.d_model);
         }
         if (params_.routed_residual)
+        {
+            /*
+             * The fused epilogue reads but does not mutate the complete routed
+             * row.  Publish that already-live value as a diagnostic output as
+             * well as an execution input: post-graph snapshot capture copies
+             * outputs only, and this stage is the sole root-owned observation
+             * point when a heterogeneous overlay defers its routed broadcast
+             * until the final shared+routed publication.  This declaration
+             * adds no production copy or buffer; it only authenticates the
+             * existing pointer for the diagnostic manifest.
+             */
             info.addInput("routed_residual", params_.routed_residual, params_.seq_len, params_.d_model);
+            info.addOutput("routed_output", params_.routed_residual, params_.seq_len, params_.d_model);
+        }
         if (params_.combined_output)
             info.addOutput("combined_output", params_.combined_output, params_.seq_len, params_.d_model);
         info.addScalarInt("seq_len", params_.seq_len);
@@ -10250,8 +10408,48 @@ namespace llaminar2
         {
             packed_record_for_route_slot_.resize(
                 static_cast<size_t>(params_.seq_len) *
-                    static_cast<size_t>(params_.top_k),
+                static_cast<size_t>(params_.top_k),
                 -1);
+        }
+
+        /*
+         * The route scratch is shared serially by every MoE layer, so a host
+         * read after the complete forward can observe only the last layer.
+         * Bind a pure-device view at graph construction instead. Diagnostic
+         * capture then publishes each layer's authenticated ledger at the
+         * reducer boundary, on the same stream/event edge that consumed it.
+         */
+        const std::uint64_t route_slots =
+            static_cast<std::uint64_t>(std::max(0, params_.seq_len)) *
+            static_cast<std::uint64_t>(std::max(0, params_.top_k));
+        if (params_.device_id.is_gpu() &&
+            params_.reduction_role ==
+                MoECanonicalRouteReductionRole::RootOwner &&
+            route_slots > 0u &&
+            route_slots <=
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<std::uint32_t>::max()) &&
+            params_.domain_route_assignment.validFor(
+                static_cast<std::uint32_t>(route_slots)))
+        {
+            /* Global placement and domain scheduling are two projections of
+             * one pinned epoch. The shared view type keeps their geometry and
+             * selected-bank semantics identical at every producer boundary. */
+            pinned_route_evidence_views_ =
+                std::make_unique<MoEOverlayPinnedRouteEvidenceViews>(
+                    MoEOverlayPinnedRouteEvidenceViews::Params{
+                        .device = params_.device_id,
+                        .domain_route_assignment =
+                            params_.domain_route_assignment,
+                        .runtime_route_weights =
+                            params_.runtime_route_weights,
+                        .overlay_route_placement =
+                            params_.overlay_route_placement,
+                        .physical_rows =
+                            static_cast<std::uint32_t>(params_.seq_len),
+                        .top_k =
+                            static_cast<std::uint32_t>(params_.top_k),
+                    });
         }
     }
 
@@ -10274,6 +10472,27 @@ namespace llaminar2
         }
 
         /**
+         * @brief Validate the graph-bound final route publication.
+         *
+         * The stable pointer/capacity prove setup binding. Stream-ordered graph
+         * dependencies from route publication through expert completion prove
+         * that the current invocation's contents are ready for this reducer.
+         */
+        bool hasCompleteNodeLocalRouteAssignment(
+            const MoECanonicalRouteReduceStage::Params &params) noexcept
+        {
+            const std::uint64_t slots =
+                static_cast<std::uint64_t>(std::max(0, params.seq_len)) *
+                static_cast<std::uint64_t>(std::max(0, params.top_k));
+            return slots > 0u &&
+                   slots <=
+                       static_cast<std::uint64_t>(
+                           std::numeric_limits<std::uint32_t>::max()) &&
+                   params.domain_route_assignment.validFor(
+                       static_cast<std::uint32_t>(slots));
+        }
+
+        /**
          * @brief Upload immutable root-side mapped-lane descriptors once.
          *
          * INT32Tensor is only the aligned RAII storage owner. The bytes retain
@@ -10282,8 +10501,9 @@ namespace llaminar2
          */
         bool uploadNodeLocalRoutePeerBindings(
             const std::vector<MoENodeLocalRoutePeerDeviceBinding> &bindings,
-            const StageGPUExecution &execution,
-            std::unique_ptr<TensorBase> *storage)
+            DeviceId device,
+            void *stream,
+            std::shared_ptr<MoEOverlayPersistentGraphStorage> *storage)
         {
             static_assert(std::is_trivially_copyable_v<
                           MoENodeLocalRoutePeerDeviceBinding>);
@@ -10291,7 +10511,7 @@ namespace llaminar2
                 sizeof(MoENodeLocalRoutePeerDeviceBinding) %
                     sizeof(std::int32_t) ==
                 0u);
-            if (!storage || bindings.empty())
+            if (!storage || bindings.empty() || !device.is_gpu() || !stream)
                 return false;
             try
             {
@@ -10300,17 +10520,22 @@ namespace llaminar2
                     sizeof(MoENodeLocalRoutePeerDeviceBinding);
                 const std::size_t words =
                     bytes / sizeof(std::int32_t);
-                auto prepared = std::make_unique<INT32Tensor>(
-                    std::vector<std::size_t>{words});
-                std::memcpy(
-                    prepared->raw_mutable_data(), bindings.data(), bytes);
-                execution.prepareInput(prepared.get());
-                execution.requirePreparedInput(prepared.get());
-                if (!prepared->gpu_data_ptr())
-                    throw std::runtime_error(
-                        "peer descriptor upload has no device address");
-                *storage = std::move(prepared);
-                return true;
+                if (!*storage)
+                {
+                    *storage = std::make_shared<
+                        MoEOverlayPersistentGraphStorage>(
+                        MoEOverlayPersistentGraphStorage::Config{
+                            .device = device,
+                            .type = MoEOverlayGraphStorageType::Int32,
+                            .shape = {words},
+                            .immutable_input = true,
+                            .identity =
+                                "node_local_route_peer_bindings",
+                        });
+                }
+                return (*storage)->sizeBytes() == bytes &&
+                       (*storage)->publishImmutableBytes(
+                           bindings.data(), bytes, stream);
             }
             catch (const std::exception &error)
             {
@@ -10321,6 +10546,7 @@ namespace llaminar2
                 return false;
             }
         }
+
     } // namespace
 
     bool MoECanonicalRouteReduceStage::execute(IDeviceContext *ctx)
@@ -10340,7 +10566,9 @@ namespace llaminar2
             params_.reduction_role ==
                 MoECanonicalRouteReductionRole::Unspecified ||
             (uses_node_local_exchange &&
-             (!params_.route_participant_ids ||
+             (!hasCompleteNodeLocalRouteAssignment(params_) ||
+              params_.external_route_source ==
+                  MoEExternalCanonicalRouteSource::Unspecified ||
               params_.route_participant_id < 0 ||
               !params_.node_local_route_exchange->materialized())))
         {
@@ -10362,8 +10590,16 @@ namespace llaminar2
                       << static_cast<int>(params_.reduction_role)
                       << " node_local_exchange="
                       << uses_node_local_exchange
-                      << " route_participant_ids="
-                      << (params_.route_participant_ids != nullptr)
+                      << " domain_route_assignment_bound="
+                      << (params_.domain_route_assignment.participant_ids !=
+                          nullptr)
+                      << " domain_route_assignment_capacity="
+                      << params_.domain_route_assignment.capacity
+                      << " domain_route_assignment_complete="
+                      << hasCompleteNodeLocalRouteAssignment(params_)
+                      << " external_route_source="
+                      << static_cast<std::uint32_t>(
+                             params_.external_route_source)
                       << " route_participant_id="
                       << params_.route_participant_id);
             return false;
@@ -10656,6 +10892,16 @@ namespace llaminar2
                     "publication has invalid device input or geometry");
                 return false;
             }
+            const MoEDomainRouteAssignmentLedger domain_assignment =
+                params_.domain_route_assignment;
+            if (!domain_assignment.validFor(
+                    static_cast<std::uint32_t>(live_route_slots)))
+            {
+                LOG_ERROR(
+                    "[MoECanonicalRouteReduceStage] Sparse route assignment "
+                    "did not resolve to a complete device binding");
+                return false;
+            }
             const MoEKernelLaunchContext launch{
                 .stream = execution.nativeStream(),
             };
@@ -10675,16 +10921,17 @@ namespace llaminar2
                 MoENodeLocalRouteConsumeLaunch consumption{
                     .peers = static_cast<
                         const MoENodeLocalRoutePeerDeviceBinding *>(
-                        node_local_peer_bindings_storage_->gpu_data_ptr()),
+                        node_local_peer_bindings_storage_->deviceData()),
                     .peer_count = node_local_peer_count_,
                     .root_canonical_route_contributions =
                         route_contributions,
-                    .route_participant_ids =
-                        params_.route_participant_ids,
+                    .domain_assignment = domain_assignment,
+                    .external_route_source =
+                        params_.external_route_source,
                     .dense_output = static_cast<float *>(
                         params_.output->gpu_data_ptr()),
                     .validation_status = static_cast<std::int32_t *>(
-                        node_local_validation_storage_->gpu_data_ptr()),
+                        node_local_validation_storage_->deviceData()),
                     .root_participant = params_.route_participant_id,
                     .physical_rows =
                         static_cast<std::uint32_t>(params_.seq_len),
@@ -10728,7 +10975,7 @@ namespace llaminar2
             MoENodeLocalRoutePublishLaunch publication{
                 .lane = node_local_producer_binding_,
                 .canonical_route_contributions = route_contributions,
-                .route_participant_ids = params_.route_participant_ids,
+                .domain_assignment = domain_assignment,
                 .live_route_slots =
                     static_cast<std::uint32_t>(live_route_slots),
             };
@@ -10831,14 +11078,16 @@ namespace llaminar2
 
         if (!uses_node_local_exchange)
             return true;
-        if (!params_.route_participant_ids ||
+        if (!hasCompleteNodeLocalRouteAssignment(params_) ||
+            params_.external_route_source ==
+                MoEExternalCanonicalRouteSource::Unspecified ||
             params_.route_participant_id < 0 ||
             !params_.node_local_route_exchange->materialized())
         {
             LOG_ERROR(
                 "[MoECanonicalRouteReduceStage] Sparse route launch "
                 "preparation requires a materialized fabric and stable "
-                "device-owned route assignment");
+                "typed device-owned route assignment");
             return false;
         }
         const bool is_root =
@@ -10857,7 +11106,6 @@ namespace llaminar2
             return false;
         }
 
-        const StageGPUExecution execution = gpuExecution();
         if (is_root)
         {
             const auto bindings =
@@ -10873,7 +11121,8 @@ namespace llaminar2
             {
                 if (!uploadNodeLocalRoutePeerBindings(
                         bindings,
-                        execution,
+                        params_.device_id,
+                        stream,
                         &node_local_peer_bindings_storage_))
                 {
                     return false;
@@ -10881,23 +11130,27 @@ namespace llaminar2
             }
             else
             {
-                execution.requirePreparedInput(
-                    node_local_peer_bindings_storage_.get());
+                if (!node_local_peer_bindings_storage_->requireInput(stream))
+                    return false;
             }
             if (!node_local_validation_storage_)
             {
-                auto validation = std::make_unique<INT32Tensor>(
-                    std::vector<std::size_t>{1u});
-                execution.prepareOutput(validation.get());
-                execution.requirePreparedOutput(validation.get());
-                if (!validation->gpu_data_ptr())
+                node_local_validation_storage_ = std::make_shared<
+                    MoEOverlayPersistentGraphStorage>(
+                    MoEOverlayPersistentGraphStorage::Config{
+                        .device = params_.device_id,
+                        .type = MoEOverlayGraphStorageType::Int32,
+                        .shape = {1u},
+                        .immutable_input = false,
+                        .identity = "node_local_route_validation",
+                    });
+                if (!node_local_validation_storage_->requireOutput(stream))
                     return false;
-                node_local_validation_storage_ = std::move(validation);
             }
             else
             {
-                execution.requirePreparedOutput(
-                    node_local_validation_storage_.get());
+                if (!node_local_validation_storage_->requireOutput(stream))
+                    return false;
             }
         }
         else
@@ -10927,7 +11180,9 @@ namespace llaminar2
                params_.top_k > 0 &&
                params_.d_model > 0 &&
                (!params_.node_local_route_exchange ||
-                (params_.route_participant_ids &&
+                (hasCompleteNodeLocalRouteAssignment(params_) &&
+                 params_.external_route_source !=
+                     MoEExternalCanonicalRouteSource::Unspecified &&
                  params_.route_participant_id >= 0)) &&
                params_.reduction_role !=
                    MoECanonicalRouteReductionRole::Unspecified;
@@ -11048,12 +11303,20 @@ namespace llaminar2
                 params_.seq_len,
                 params_.d_model);
         }
+        if (owns_reduction && pinned_route_evidence_views_)
+            pinned_route_evidence_views_->appendOutputs(info);
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("top_k", params_.top_k);
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt(
             "reduction_role",
             static_cast<int>(params_.reduction_role));
+        info.addScalarInt(
+            "domain_route_assignment_capacity",
+            static_cast<int>(params_.domain_route_assignment.capacity));
+        info.addScalarInt(
+            "external_route_source",
+            static_cast<int>(params_.external_route_source));
         info.addScalarBool("owns_reduction", owns_reduction);
         return info;
     }

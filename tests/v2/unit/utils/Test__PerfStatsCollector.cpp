@@ -11,11 +11,15 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
@@ -894,6 +898,64 @@ TEST(Test__PerfStatsCollector, ExistingProfilersPublishStructuredRecords)
     EXPECT_TRUE(has_record("kv_cache", "tokens"));
     EXPECT_TRUE(has_record("kv_cache", "bytes"));
     EXPECT_TRUE(has_record("weight_loading", "weights.gemm_pack.test"));
+}
+
+TEST(Test__PerfStatsCollector, WeightLoadingTimersRetainConcurrentParticipantScopes)
+{
+    ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    WeightLoadingProfiler::reset();
+
+    constexpr int kParticipants = 4;
+    std::mutex mutex;
+    std::condition_variable condition;
+    int arrived = 0;
+    bool release = false;
+    std::vector<std::thread> workers;
+    workers.reserve(kParticipants);
+    for (int participant = 0; participant < kParticipants; ++participant)
+    {
+        workers.emplace_back(
+            [&]
+            {
+                ScopedWeightLoadTimer phase(WeightLoadPhase::GRAPH_BUILD);
+                ScopedWeightLoadDetailTimer detail(
+                    "graph.build.concurrent_participant");
+                std::unique_lock<std::mutex> lock(mutex);
+                ++arrived;
+                condition.notify_all();
+                condition.wait(lock, [&] { return release; });
+            });
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        condition.wait(lock, [&] { return arrived == kParticipants; });
+        release = true;
+    }
+    condition.notify_all();
+    for (auto &worker : workers)
+        worker.join();
+
+    const auto records = PerfStatsCollector::snapshot({"weight_loading"});
+    const auto find_record = [&](const char *name) -> const PerfStatRecord *
+    {
+        const auto it = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record) { return record.name == name; });
+        return it == records.end() ? nullptr : &*it;
+    };
+    const auto *phase_record = find_record("graph_build");
+    const auto *detail_record =
+        find_record("graph.build.concurrent_participant");
+    ASSERT_NE(phase_record, nullptr);
+    ASSERT_NE(detail_record, nullptr);
+    EXPECT_EQ(phase_record->count, kParticipants);
+    EXPECT_EQ(detail_record->count, kParticipants);
+
+    WeightLoadingProfiler::reset();
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__PerfStatsCollector, GraphReplayTimersCarrySyncScopeTags)

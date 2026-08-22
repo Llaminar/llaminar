@@ -15,6 +15,7 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "MoEOverlayPinnedRouteEvidenceViews.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
 #include "../../../kernels/IMoEKernel.h"
@@ -51,6 +52,7 @@ namespace llaminar2
     class ILocalTPContext;
     class DeviceMoERebalanceTransferState;
     class MoEOverlayNodeLocalRouteExchange;
+    class MoEOverlayPersistentGraphStorage;
 
     /**
      * @brief Select how a grouped LLEP invocation assigns the current batch.
@@ -359,6 +361,27 @@ namespace llaminar2
             // layer; stages only cache the per-layer device pointer.
             IMoERuntimeTable *moe_runtime_table = nullptr;
             /**
+             * @brief Optional observation-only service telemetry capability.
+             *
+             * Ordinary runtime-table-backed stages derive this view from
+             * @ref moe_runtime_table. Retained sparse endpoints bind it
+             * explicitly because their immutable residency bank, not the
+             * runtime table, is their sole placement authority.
+             */
+            DeviceMoEOverlayServiceTelemetryBinding
+                overlay_service_telemetry;
+            /**
+             * @brief Optional authenticated device-owned transaction role.
+             *
+             * Mapped heterogeneous follower graphs reuse one captured row
+             * shape for decode, prefill, and grouped verification. Their
+             * endpoint-private activation grant owns the current role, so
+             * service telemetry reads this exact device address instead of
+             * baking a phase into capture or accepting a host-side update.
+             */
+            const MoEOverlayInferenceGraphRole
+                *runtime_service_graph_role_device = nullptr;
+            /**
              * Route grouped rows through the persistent runtime-table grouper.
              *
              * This mechanism is shared by ordinary prefill and grouped MTP
@@ -415,14 +438,18 @@ namespace llaminar2
                 prefix_runtime_rehydration_transfer_state;
             std::string prefill_llep_workspace_name;
 
-            /*
-             * Runtime decode always consumes runtime top-k ids/weights. This
-             * flag controls where the expert weight descriptors come from:
-             * false keeps static/off decode on the fast immutable descriptor
-             * tables; true makes graph replay observe mutable runtime placement
-             * descriptors after device-side rebalance applies ownership changes.
+            /**
+             * @brief Sole authority for routed-expert weight descriptors.
+             *
+             * Runtime routing always consumes device-owned top-k ids and
+             * weights. This typed value independently selects whether every
+             * decode and grouped-prefill projection reads the immutable
+             * prepared table or the request-pinned runtime placement bank.
+             * Graph lowering chooses it once; setup, capture, and replay must
+             * carry it unchanged rather than reconstructing policy from flags.
              */
-            bool runtime_decode_uses_mutable_descriptors = false;
+            MoEDecodeDescriptorSource weight_descriptor_source =
+                MoEDecodeDescriptorSource::StaticDescriptorTable;
 
             /*
              * True when graph construction has published an explicit
@@ -557,9 +584,7 @@ namespace llaminar2
 
         MoEDecodeDescriptorSource runtimeDecodeDescriptorSourceForTesting() const
         {
-            return params_.runtime_decode_uses_mutable_descriptors
-                       ? MoEDecodeDescriptorSource::RuntimePlacementTable
-                       : MoEDecodeDescriptorSource::StaticDescriptorTable;
+            return params_.weight_descriptor_source;
         }
 
         /// Test-only visibility for placement metadata stamped onto rebuilt graphs.
@@ -611,6 +636,13 @@ namespace llaminar2
             return supportsRequestedRoutedAssignmentPolicy();
         }
         bool hasMoERuntimeTableForTesting() const { return params_.moe_runtime_table != nullptr; }
+        /** @return Whether this stage owns one complete observation capability. */
+        bool hasOverlayServiceTelemetryForTesting() const noexcept
+        {
+            return overlay_service_runtime_layer_ &&
+                   overlay_service_telemetry_layer_ &&
+                   overlay_service_sample_;
+        }
         /**
          * @brief Expose the immutable runtime-table binding to graph tests.
          *
@@ -1131,6 +1163,16 @@ namespace llaminar2
 
     private:
         /**
+         * @brief Query the already-selected weight-descriptor authority.
+         * @return True only for request-pinned runtime placement descriptors.
+         */
+        [[nodiscard]] bool usesRuntimePlacementWeightDescriptors() const noexcept
+        {
+            return params_.weight_descriptor_source ==
+                   MoEDecodeDescriptorSource::RuntimePlacementTable;
+        }
+
+        /**
          * @brief Lifecycle state for the graph-stable fixed-topology expert mask.
          *
          * A mask is ordinary control-plane metadata until it has been copied to
@@ -1523,6 +1565,18 @@ namespace llaminar2
         bool hasPreparedExpertGemmEnginesForLocalOwnership() const;
         bool hasPreparedExpertGemmEnginesForExperts(const std::vector<int> &expert_ids) const;
         bool hasGroupedDecodeDescriptorExportSupport() const;
+        /**
+         * @brief Execute the routed path between device timing markers.
+         *
+         * The public @ref execute method owns the optional Dynamic service
+         * markers. Keeping the existing implementation behind this helper
+         * guarantees that every successful decode, prefill, verifier, and
+         * sparse-participant exit reaches one common finish publication.
+         */
+        bool executeWithoutServiceTelemetry(IDeviceContext *ctx);
+
+        /** @return Capture-stable semantic phase for service accounting. */
+        MoEOverlayServicePhaseHint serviceTelemetryPhaseHint() const noexcept;
         const DeviceMoEPlacementBank *activeRuntimePlacementBank() const;
         bool runtimeLocalComputeEnabled(const DeviceMoEPlacementBank *bank, int expert_id) const;
         void ensureScratchBuffers(int max_batch) const;
@@ -1561,6 +1615,14 @@ namespace llaminar2
         mutable std::shared_ptr<FP32Tensor> combined_shared_up_scratch_;
 
         DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
+        /** Route-count source used only by the service observation kernel. */
+        DeviceMoELayerRuntime *overlay_service_runtime_layer_ = nullptr;
+        /** First of this layer's three canonical device-local service cells. */
+        DeviceMoEOverlayServiceTelemetryCell *overlay_service_telemetry_layer_ =
+            nullptr;
+        /** Serial retained-graph timing cursor owned by the runtime table. */
+        DeviceMoEOverlayServiceTelemetrySample *overlay_service_sample_ =
+            nullptr;
         bool moe_runtime_table_initialized_ = false;
         bool moe_runtime_row_grouping_available_ = false;
         bool moe_prefill_fixed_topology_available_ = false;
@@ -1614,12 +1676,15 @@ namespace llaminar2
             bool force_grouped_verifier_prefill_for_decode = false;
             bool force_decode_equivalent_verifier_prefill = false;
             /**
-             * @brief Required router-owned Q8 rows for GPU grouped verification.
+             * @brief Optional binding for required router-owned GPU Q8 rows.
              *
              * This object exposes only immutable capture-time row addresses;
              * the shared expert retains a private MoE kernel and private
-             * grouping scratch. A grouped GPU verifier must provide it and
-             * execution fails hard if its exact source/geometry is absent.
+             * grouping scratch. When non-null, execution requires the exact
+             * router publication and fails hard if its source or geometry does
+             * not match. When null, the grouped verifier owns standalone input
+             * quantization; deterministic mode uses that branch because router
+             * Q8 reuse is intentionally disabled there.
              */
             std::shared_ptr<MoERouterQ8HiddenPublication>
                 required_router_q8_publication;
@@ -2125,9 +2190,28 @@ namespace llaminar2
              */
             std::shared_ptr<MoEOverlayNodeLocalRouteExchange>
                 node_local_route_exchange;
-            /** Stable device pointer to the authoritative per-slot owner ids. */
-            const std::int32_t *route_participant_ids = nullptr;
-            /** Stable logical participant represented by this device graph. */
+            /**
+             * Final device-owned assignment within the continuation domain.
+             * A `-1` slot belongs to another overlay domain and is completed by
+             * the heterogeneous return path. The reducer never reconstructs
+             * this invocation-local schedule from setup metadata.
+             */
+            MoEDomainRouteAssignmentLedger domain_route_assignment{};
+            /** Typed source for routes assigned outside this continuation domain. */
+            MoEExternalCanonicalRouteSource external_route_source =
+                MoEExternalCanonicalRouteSource::Unspecified;
+            /** Final post-filter runtime weight for every original route slot. */
+            const float *runtime_route_weights = nullptr;
+            /**
+             * Request-pinned overlay-wide expert placement authority.
+             *
+             * Production packet dispatch consumes this same two-bank binding.
+             * The reducer exposes non-owning diagnostic views only, allowing
+             * parity evidence to distinguish global tier placement from the
+             * domain-local route schedule without creating a host shadow.
+             */
+            MoEOverlayRoutePlacementDeviceBinding overlay_route_placement{};
+            /** Stable domain-local participant represented by this graph. */
             int route_participant_id = -1;
             BufferId canonical_route_contributions_buffer_id =
                 BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS;
@@ -2235,13 +2319,24 @@ namespace llaminar2
          */
         std::vector<int32_t> packed_record_for_route_slot_;
         /** Root-device copy of endpoint-correct mapped peer descriptors. */
-        std::unique_ptr<TensorBase> node_local_peer_bindings_storage_;
+        std::shared_ptr<MoEOverlayPersistentGraphStorage>
+            node_local_peer_bindings_storage_;
         /** Root-device semantic status shared by acquire/validate/fold nodes. */
-        std::unique_ptr<TensorBase> node_local_validation_storage_;
+        std::shared_ptr<MoEOverlayPersistentGraphStorage>
+            node_local_validation_storage_;
         /** Capture-stable producer alias for a non-root participant. */
         MoENodeLocalRoutePeerDeviceBinding node_local_producer_binding_{};
         /** Number of descriptors in root storage; zero on producer graphs. */
         std::uint32_t node_local_peer_count_ = 0u;
+        /**
+         * Shared typed view of the final domain schedule and pinned placement.
+         *
+         * The same object is used by mapped packet producers in topologies
+         * without this reducer, so diagnostic ownership follows the real route
+         * authority instead of depending on LocalTP cardinality.
+         */
+        std::unique_ptr<MoEOverlayPinnedRouteEvidenceViews>
+            pinned_route_evidence_views_;
         mutable std::unique_ptr<IMoEKernel> owned_moe_kernel_;
         mutable IMoEKernel *moe_kernel_ = nullptr;
     };

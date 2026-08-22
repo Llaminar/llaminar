@@ -18,14 +18,15 @@ namespace llaminar2
     std::optional<DeviceGraphExecutor::RetainedParentCompositionHook>
     makeMoEOverlayRetainedParentComposer(const ComputeGraph &graph)
     {
-        if (graph.nativeCaptureEnvelope() ==
-            GraphNativeCaptureEnvelope::DeviceOwnedTimelineTransaction)
+        if (graph.nativeCaptureEnvelope() !=
+            GraphNativeCaptureEnvelope::Ordinary)
         {
             /*
-             * Timeline-aware packet stages already splice their waits and
-             * publications into the top-level stream capture. Re-wrapping
-             * that graph as children is both redundant and illegal on CUDA
-             * when adaptive attention contributes conditional nodes.
+             * A non-ordinary graph already declares its complete native
+             * lifecycle. Device-owned timelines splice waits/publications into
+             * one executable; heterogeneous ticket transactions deliberately
+             * retain their authenticated manual boundary. Re-wrapping either
+             * as retained children would erase that graph-owned authority.
              */
             return std::nullopt;
         }

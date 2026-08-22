@@ -82,6 +82,24 @@ namespace llaminar2
         tryAcquirePublished() noexcept;
 
         /**
+         * @brief Acquire one exact globally admitted epoch from either live bank.
+         * @param admission_epoch Positive epoch published by the topology-wide
+         *        controller, or zero to select the participant-local publication.
+         * @return A reader-holding ticket, or empty when the admitted epoch is
+         *         absent/corrupt rather than Published or Retiring.
+         *
+         * Multi-participant publication flips local selectors independently.
+         * During that bounded fan-out some participants have the new bank
+         * Published while others still expose the old one. The topology-wide
+         * admission word remains old until every flip completes, so this
+         * method deliberately permits acquisition of that old Retiring bank.
+         * The acquisition guard spans exact-epoch lookup and reader install,
+         * preventing retirement from reclaiming it in between.
+         */
+        [[nodiscard]] std::optional<DeviceMoEOverlayEpochTicket>
+        tryAcquireAdmitted(std::uint64_t admission_epoch) noexcept;
+
+        /**
          * @brief Release one reader installed by @ref tryAcquirePublished.
          * @param ticket Exact immutable ticket being released.
          * @return False for stale, malformed, or already-released identity.

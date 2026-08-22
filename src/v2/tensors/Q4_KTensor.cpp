@@ -26,10 +26,19 @@
 namespace llaminar2
 {
 
-    Q4_KTensor::Q4_KTensor(const std::vector<size_t> &shape, const std::vector<uint8_t> &raw_data)
+    Q4_KTensor::Q4_KTensor(
+        const std::vector<size_t> &shape,
+        const std::vector<uint8_t> &raw_data)
+        : Q4_KTensor(shape, AlignedVector<uint8_t>(raw_data))
+    {
+    }
+
+    Q4_KTensor::Q4_KTensor(
+        const std::vector<size_t> &shape,
+        AlignedVector<uint8_t> raw_data)
         : shape_(shape),
           is_view_(false),
-          raw_data_(raw_data),
+          raw_data_(std::move(raw_data)),
           raw_data_ptr_(nullptr),
           view_byte_offset_(0),
           parent_(nullptr),
@@ -548,7 +557,7 @@ namespace llaminar2
         // See Q4_KTensor teardown investigation: freeing raw_data_ (~72MB) during
         // implicit destruction corrupts heap metadata for shape_ (24 bytes).
         // Swapping to temporaries changes deallocation ordering enough to avoid it.
-        { std::vector<uint8_t>().swap(raw_data_); }
+        { AlignedVector<uint8_t>().swap(raw_data_); }
         { std::vector<size_t>().swap(shape_); }
     }
 

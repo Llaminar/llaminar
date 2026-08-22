@@ -386,6 +386,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsNonCapturableStage)
         PrefillGraphPreflightMode::Default,
         false,
         false,
+        PrefillMoEGraphStability::Unstable,
         &reject_stage_name,
         &reject_stage_type);
     EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);

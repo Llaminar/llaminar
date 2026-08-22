@@ -282,9 +282,8 @@ extern "C"
      * @param d_group_counts Device-resident row count per expert.
      * @param d_group_offsets Device-resident first grouped slot per expert.
      * @param d_directory Packed `(expert, local_first_row)` work directory.
-     * @param d_partition_weights Optional route weight for every grouped row.
-     *        When non-null, each public-M1 K-partition is multiplied before the
-     *        ascending partition fold. This is the serial down-projection tree;
+     * @param d_route_weights Optional route weight for every grouped row. When
+     *        non-null, it is applied once after the ordered K-partition fold;
      *        gate/up projections pass null.
      * @param d_output FP32 grouped projection output `[slots,N]`.
      * @param directory_entries Captured conservative directory capacity.
@@ -306,7 +305,7 @@ extern "C"
         const int *d_group_counts,
         const int *d_group_offsets,
         const uint32_t *d_directory,
-        const float *d_partition_weights,
+        const float *d_route_weights,
         float *d_output,
         int directory_entries,
         int num_experts,

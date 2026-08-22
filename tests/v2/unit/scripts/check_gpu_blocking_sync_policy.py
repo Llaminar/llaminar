@@ -162,6 +162,10 @@ CATEGORY_REASONS = {
         "Initialization, reset, loader drain, resource destruction, or final "
         "release boundary outside steady-state graph execution."
     ),
+    "setup_certification": (
+        "One setup-only exact event makes a retained graph's immutable "
+        "terminal record observable before inference admission."
+    ),
 }
 
 
@@ -263,7 +267,6 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::exportCompletedDeviceMoERebalanceMaintenanceStats", "worker_stream", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "completeMTPDiagnosticObservation", "backend_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "logMTPGraphReuseBoundaryDiagnostics", "backend_event", 1),
-        ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "DeviceGraphOrchestrator::waitForLastForwardCompletionForBenchmark", "backend_event", 1),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp", "CUDAQuantisedGemmKernel::multiply_fused_tensor_impl", "raw_stream", 2),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp", "CUDAQuantisedGemmKernel::multiply_with_fused_swiglu", "raw_stream", 1),
         ("src/v2/kernels/cuda/gemm/CuBLASGemmKernel.cu", "CuBLASGemmKernel::execute_batched_same_a", "raw_stream", 1),
@@ -278,6 +281,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
     *reviewed(
         "graph_ownership",
         ("src/v2/execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp", "DeviceGraphExecutor::GraphSegmentCache::waitForCaptureStreamFence", "worker_event", 1),
+        ("src/v2/execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp", "waitForPublishedCaptureStreamTerminal", "worker_event", 1),
         ("src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp", "initializeMoEOverlayEpochExecutionBinding", "backend_event", 1),
     ),
     *reviewed(
@@ -346,6 +350,9 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/moe/DeviceMoETransferSlotDirectory.cpp", "DeviceMoETransferSlotDirectory::create", "worker_stream", 1),
         ("src/v2/execution/moe/MoEExpertWeightService.cpp", "finish", "worker_stream", 1),
         ("src/v2/execution/moe/MoEExpertWeightService.cpp", "~ScopedGpuDirectTransferStream", "worker_stream", 2),
+        ("src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp", "MoEOverlayDeviceControllerGraphService::releaseEndpoint", "worker_event", 1),
+        ("src/v2/execution/moe/MoEOverlayDevicePreparedArrivalInbox.cpp", "MoEOverlayDevicePreparedArrivalInbox::release", "backend_event", 1),
+        ("src/v2/execution/moe/MoEOverlayDeviceServiceTelemetryPublisher.cpp", "MoEOverlayDeviceServiceTelemetryPublisher::releaseEndpoint", "worker_event", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "DeviceMoERuntimeTable::releaseRuntimeHistogramDrainResources", "worker_stream", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "synchronizeMirror", "worker_stream", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "copyHostToMirror", "backend_sync_copy", 1),
@@ -371,6 +378,10 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/loaders/gpu_pipeline/WeightTranslator.h", "uploadGpuPackedWeights", "backend_sync_copy", 4),
         ("src/v2/loaders/gpu_pipeline/PinnedRingBuffer.cpp", "PinnedRingBuffer::release", "backend_device", 1),
         ("src/v2/loaders/gpu_pipeline/WeightVRAMPool.cpp", "WeightVRAMPool::releaseStaging", "backend_device", 1),
+    ),
+    *reviewed(
+        "setup_certification",
+        ("src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp", "validateAllStaticTerminals", "worker_event", 1),
     ),
 )
 

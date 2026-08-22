@@ -1152,10 +1152,24 @@ namespace
                 : (expected_down_accumulation
                        ? expected_down_accumulation
                        : "");
-        const std::string effective_policy_source =
-            expected_imma
-                ? "tensor_core_imma_prefill"
-                : (expected_policy_source ? expected_policy_source : "");
+        std::string effective_policy_source;
+        if (expected_policy_source)
+        {
+            if (expected_imma &&
+                std::string_view(expected_policy_source) == "exact_overlay")
+            {
+                effective_policy_source = "tensor_core_imma_exact_overlay";
+            }
+            else if (expected_imma &&
+                     std::string_view(expected_policy_source) == "generic")
+            {
+                effective_policy_source = "tensor_core_imma_generic";
+            }
+            else
+            {
+                effective_policy_source = expected_policy_source;
+            }
+        }
         const bool expected_kpart_gateup =
             !expected_imma && expected_gateup_route &&
             std::string(expected_gateup_route) == "kpart_prefill";
@@ -1178,6 +1192,17 @@ namespace
                     const auto it = record.tags.find(key);
                     return it != record.tags.end() && it->second == value;
                 };
+                const auto policy_source = record.tags.find("policy_source");
+                const bool policy_source_matches =
+                    !effective_policy_source.empty()
+                        ? tag_equals("policy_source", effective_policy_source)
+                        : (!expected_imma ||
+                           (policy_source != record.tags.end() &&
+                            (policy_source->second == "tensor_core_imma_generic" ||
+                             policy_source->second ==
+                                 "tensor_core_imma_exact_overlay" ||
+                             policy_source->second ==
+                                 "tensor_core_imma_explicit_override")));
                 return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
                        tag_equals("swiglu_path", expected_path) &&
                        tag_equals("total_slots", expected_total_slots) &&
@@ -1186,8 +1211,7 @@ namespace
                        tag_equals("num_experts", expected_num_experts) &&
                        tag_equals("tile_m", expected_tile) &&
                        tag_equals("tile_n", expected_tile_n_text) &&
-                       (effective_policy_source.empty() ||
-                        tag_equals("policy_source", effective_policy_source)) &&
+                       policy_source_matches &&
                        (effective_gateup_route.empty() ||
                         tag_equals("gateup_route", effective_gateup_route)) &&
                        (effective_down_route.empty() ||
@@ -3214,7 +3238,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
               cudaSuccess);
 
     EXPECT_EQ(route_experts, (std::array<int32_t, total_slots>{0, 1, 2, 3, 2, 1}));
-    EXPECT_EQ(route_participants, (std::array<int32_t, total_slots>{0, -1, 0, -1, 0, -1}));
+    EXPECT_EQ(route_participants, (std::array<int32_t, total_slots>{0, 1, 0, 1, 0, 1}));
     EXPECT_EQ(counts, (std::array<int32_t, num_experts>{1, 0, 2, 0}));
     EXPECT_EQ(offsets, (std::array<int32_t, num_experts>{0, 1, 1, 3}));
     EXPECT_EQ(grouped_tokens[0], 0);
@@ -3526,6 +3550,17 @@ TEST_F(Test__CUDAMoEKernel,
     }
     ASSERT_TRUE(routing_indices->ensureOnDevice(device, stream_));
     ASSERT_TRUE(routing_weights->ensureOnDevice(device, stream_));
+    /*
+     * DeviceGraphExecutor performs this external-input admission before native
+     * capture.  This focused kernel harness owns no graph executor, so join
+     * both upload producer events to the exact capture stream explicitly.
+     * Discovering either event inside ScopedCudaTestGraph would make the
+     * captured transaction depend on uncaptured setup work.
+     */
+    ASSERT_NO_THROW(llaminar2::TransferEngine::requireDeviceInput(
+        routing_indices.get(), device, stream_));
+    ASSERT_NO_THROW(llaminar2::TransferEngine::requireDeviceInput(
+        routing_weights.get(), device, stream_));
     std::array<int32_t, max_m> logical_positions{};
     for (int row = 0; row < max_m; ++row)
         logical_positions[static_cast<size_t>(row)] = 73 + row;
@@ -7481,6 +7516,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillGatherScatter_ZeroCountExpertNoOps)
     cuda_config.num_experts = num_experts;
     cuda_config.top_k = top_k;
     cuda_config.mirror_to_device = true;
+    /* Participant-assigned decode publishes one participant per top-k route. */
+    cuda_config.prefill_token_capacity = seq_len;
     DeviceMoERuntimeTable cuda_table(cuda_config);
 
     llaminar2::MoEPlacementUpdate update;
@@ -7504,6 +7541,11 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillGatherScatter_ZeroCountExpertNoOps)
     auto cuda_weights = makeZeros({seq_len, top_k});
     auto cpu_indices = makeZeros({seq_len, top_k});
     auto cpu_weights = makeZeros({seq_len, top_k});
+    const llaminar2::DeviceId cuda_device = llaminar2::DeviceId::cuda(0);
+    ASSERT_TRUE(hidden->ensureOnDevice(cuda_device, stream_));
+    ASSERT_TRUE(gate->ensureOnDevice(cuda_device, stream_));
+    ASSERT_TRUE(cuda_indices->ensureOnDevice(cuda_device, stream_));
+    ASSERT_TRUE(cuda_weights->ensureOnDevice(cuda_device, stream_));
 
     // CUDA decode uses the mirrored runtime table; CPU routeWithTensors is the
     // host reference for the same one-token top-k routing result.
@@ -7517,6 +7559,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillGatherScatter_ZeroCountExpertNoOps)
                                               num_experts, top_k, true,
                                               cpu_indices.get(), cpu_weights.get(), cpu_host_result));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    ASSERT_TRUE(cuda_indices->ensureOnHost(stream_));
+    ASSERT_TRUE(cuda_weights->ensureOnHost(stream_));
 
     // Compare legacy outputs
     expectNearArray(cuda_indices->data(), cpu_indices->data(), seq_len * top_k, 0.0f);
@@ -7546,10 +7590,88 @@ TEST_F(Test__CUDAMoEKernel, RuntimePrefillGatherScatter_ZeroCountExpertNoOps)
         EXPECT_EQ(runtime_histogram.activationCount(0, expert), static_cast<uint64_t>(expected_counts[expert]));
 
     ASSERT_TRUE(cuda_table.syncDecodeHistogramToHost(runtime_histogram, stream_, true));
-        for (int expert = 0; expert < num_experts; ++expert)
-            EXPECT_EQ(runtime_histogram.activationCount(0, expert), static_cast<uint64_t>(expected_counts[expert]));
+    for (int expert = 0; expert < num_experts; ++expert)
+        EXPECT_EQ(runtime_histogram.activationCount(0, expert), static_cast<uint64_t>(expected_counts[expert]));
+
+    /* Static routing must publish the identical top-k row without creating
+     * placement evidence. The preceding sync reset both device counters, so a
+     * disabled collection pass must leave every selected/local cell at zero. */
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        cuda_layer, hidden.get(), gate.get(), d_model, num_experts, top_k,
+        true, cuda_indices.get(), cuda_weights.get(), true,
+        /*update_runtime_histogram=*/false, nullptr,
+        llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    ASSERT_TRUE(cuda_indices->ensureOnHost(stream_));
+    ASSERT_TRUE(cuda_weights->ensureOnHost(stream_));
+    expectNearArray(cuda_indices->data(), cpu_indices->data(), seq_len * top_k, 0.0f);
+    expectNearArray(cuda_weights->data(), cpu_weights->data(), seq_len * top_k, 1e-5f);
+
+    std::vector<uint64_t> disabled_selected;
+    std::vector<uint64_t> disabled_local;
+    ASSERT_TRUE(cuda_table.captureDecodeHistogramCounts(
+        disabled_selected, disabled_local, stream_));
+    ASSERT_EQ(disabled_selected.size(), static_cast<size_t>(num_experts));
+    ASSERT_EQ(disabled_local.size(), static_cast<size_t>(num_experts));
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        EXPECT_EQ(disabled_selected[static_cast<size_t>(expert)], 0u);
+        EXPECT_EQ(disabled_local[static_cast<size_t>(expert)], 0u);
+    }
 #endif
     }
+
+/**
+ * @brief Prove async histogram setup is joined before CUDA graph capture.
+ *
+ * The runtime table initializes its double-buffered banks on a maintenance
+ * stream. CUDA capture may not discover that uncaptured event from inside the
+ * graph body. Production therefore admits the exact routing stream during
+ * `prepareGraphLaunch()` and limits captured execution to recording an already
+ * prepared producer identity. This regression recreates that lifecycle and
+ * also verifies that an unprepared captured/eager producer is rejected.
+ */
+TEST_F(Test__CUDAMoEKernel,
+       AsyncHistogramProducerPreparationPrecedesGraphCapture)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    llaminar2::DeviceMoERuntimeTable::Config config;
+    config.device_id = llaminar2::DeviceId::cuda(0);
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.mirror_to_device = true;
+    llaminar2::DeviceMoERuntimeTable table(config);
+    table.enableAsyncDecodeHistogramDrain(
+        llaminar2::kAllRuntimeExpertHistogramSources);
+
+    EXPECT_THROW(
+        table.recordDecodeHistogramProducerStream(stream_),
+        std::logic_error);
+    ASSERT_NO_THROW(
+        table.prepareDecodeHistogramProducerStream(stream_));
+
+    CudaAllocation graph_witness(sizeof(uint32_t));
+    ScopedCudaTestGraph graph(
+        stream_,
+        "async histogram producer pre-capture admission");
+    ASSERT_NO_THROW(
+        table.recordDecodeHistogramProducerStream(stream_));
+    ASSERT_EQ(
+        cudaMemsetAsync(
+            graph_witness.get(), 0xa5, sizeof(uint32_t), stream_),
+        cudaSuccess);
+    ASSERT_TRUE(graph.finishAndInstantiate());
+    ASSERT_TRUE(graph.launch());
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    EXPECT_EQ(table.decodeHistogramProducerStream(), stream_);
+#endif
+}
 
     TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectUsesQ8RouterForAlignedFP32Gate)
     {
@@ -14323,6 +14445,165 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalancePackHistogramsFeedsController)
 }
 
 /**
+ * @brief Prove retained controller snapshots are phase-pure window deltas.
+ *
+ * Production counters are cumulative so inference never pauses for maintenance.
+ * The controller owns one device baseline per semantic phase and must therefore
+ * exclude unrelated prefill/decode traffic while advancing exactly the selected
+ * baseline after each snapshot.
+ */
+TEST_F(Test__CUDAMoEKernel,
+       DeviceRebalancePackHistogramsPreservesPhaseWindowDeltas)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    using llaminar2::DeviceMoERuntimeTable;
+    DeviceMoERuntimeTable::Config table_config;
+    table_config.device_id = llaminar2::DeviceId::cuda(0);
+    table_config.num_layers = 1;
+    table_config.num_experts = 4;
+    table_config.top_k = 2;
+    table_config.mirror_to_device = true;
+    DeviceMoERuntimeTable runtime_table(table_config);
+    auto update = makeParticipantOneBaseUpdate(1);
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(0, update));
+    ASSERT_TRUE(runtime_table.flipActiveBank(0, update.epoch, stream_));
+
+    llaminar2::DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 1;
+    config.participant_count = 3;
+    config.window_size_tokens = 1;
+
+    constexpr std::size_t kEntries = 4u;
+    CudaAllocation packed_storage(kEntries * sizeof(std::uint64_t));
+    CudaAllocation prefill_baseline_storage(
+        kEntries * sizeof(std::uint64_t));
+    CudaAllocation decode_baseline_storage(
+        kEntries * sizeof(std::uint64_t));
+    auto *const packed = static_cast<std::uint64_t *>(packed_storage.get());
+    auto *const prefill_baseline = static_cast<std::uint64_t *>(
+        prefill_baseline_storage.get());
+    auto *const decode_baseline = static_cast<std::uint64_t *>(
+        decode_baseline_storage.get());
+    ASSERT_EQ(
+        cudaMemsetAsync(
+            prefill_baseline, 0, kEntries * sizeof(std::uint64_t), stream_),
+        cudaSuccess);
+    ASSERT_EQ(
+        cudaMemsetAsync(
+            decode_baseline, 0, kEntries * sizeof(std::uint64_t), stream_),
+        cudaSuccess);
+
+    const auto publish_local_counts = [&](const std::array<std::uint64_t, 4> &decode,
+                                          const std::array<std::uint64_t, 4> &prefill,
+                                          const std::array<std::uint64_t, 4> &verifier)
+    {
+        auto *const runtime = runtime_table.deviceLayerState(0);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                runtime->decode_local_histogram,
+                decode.data(),
+                sizeof(decode),
+                cudaMemcpyHostToDevice,
+                stream_),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                runtime->prefill_local_histogram,
+                prefill.data(),
+                sizeof(prefill),
+                cudaMemcpyHostToDevice,
+                stream_),
+            cudaSuccess);
+        ASSERT_EQ(
+            cudaMemcpyAsync(
+                runtime->grouped_verifier_local_histogram,
+                verifier.data(),
+                sizeof(verifier),
+                cudaMemcpyHostToDevice,
+                stream_),
+            cudaSuccess);
+    };
+    const auto snapshot = [&](std::uint32_t source_mask,
+                              std::uint64_t *baseline)
+    {
+        EXPECT_TRUE(cuda_kernel_->packDeviceRebalanceHistograms(
+            launchContext(),
+            runtime_table.deviceLayerState(0),
+            packed,
+            config,
+            /*wave_state=*/nullptr,
+            /*controller_state=*/nullptr,
+            /*command_buffer_count=*/1u,
+            source_mask,
+            baseline));
+        std::array<std::uint64_t, kEntries> host{};
+        EXPECT_EQ(
+            cudaMemcpyAsync(
+                host.data(),
+                packed,
+                sizeof(host),
+                cudaMemcpyDeviceToHost,
+                stream_),
+            cudaSuccess);
+        EXPECT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        for (auto &word : host)
+        {
+            word = llaminar2::moe_rebalance_policy::
+                collectedStateActivationCount(word);
+        }
+        return host;
+    };
+
+    const std::uint32_t prefill_mask =
+        llaminar2::moe_runtime_abi::histogramSourceBit(
+            llaminar2::moe_runtime_abi::HistogramSource::Prefill);
+    const std::uint32_t decode_mask =
+        llaminar2::moe_runtime_abi::histogramSourceBit(
+            llaminar2::moe_runtime_abi::HistogramSource::Decode) |
+        llaminar2::moe_runtime_abi::histogramSourceBit(
+            llaminar2::moe_runtime_abi::HistogramSource::GroupedVerifier);
+
+    publish_local_counts(
+        {5u, 6u, 7u, 8u},
+        {10u, 20u, 30u, 40u},
+        {1u, 2u, 3u, 4u});
+    EXPECT_EQ(
+        snapshot(prefill_mask, prefill_baseline),
+        (std::array<std::uint64_t, 4>{10u, 20u, 30u, 40u}));
+
+    // Large unrelated decode/verifier changes cannot contaminate prefill.
+    publish_local_counts(
+        {105u, 206u, 307u, 408u},
+        {13u, 24u, 35u, 46u},
+        {11u, 12u, 13u, 14u});
+    EXPECT_EQ(
+        snapshot(prefill_mask, prefill_baseline),
+        (std::array<std::uint64_t, 4>{3u, 4u, 5u, 6u}));
+    EXPECT_EQ(
+        snapshot(decode_mask, decode_baseline),
+        (std::array<std::uint64_t, 4>{116u, 218u, 320u, 422u}));
+
+    // The decode baseline advances independently and combines accepted verifier
+    // demand with ordinary serial decode demand.
+    publish_local_counts(
+        {107u, 209u, 311u, 413u},
+        {999u, 999u, 999u, 999u},
+        {12u, 14u, 16u, 18u});
+    EXPECT_EQ(
+        snapshot(decode_mask, decode_baseline),
+        (std::array<std::uint64_t, 4>{3u, 5u, 7u, 9u}));
+#endif
+}
+
+/**
  * @brief Prove device claim audit accepts a promoted staging-origin slot.
  *
  * LLEP may leave an authoritative owner with zero rows for one routing window.
@@ -14649,6 +14930,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectBF16GateMatchesCPU)
     cuda_config.num_experts = num_experts;
     cuda_config.top_k = top_k;
     cuda_config.mirror_to_device = true;
+    cuda_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable cuda_table(cuda_config);
 
     llaminar2::MoEPlacementUpdate update;
@@ -16646,6 +16928,8 @@ TEST_F(Test__CUDAMoEKernel, RouteVerifierRowsDecodeEquivalentMatchesSerialDecode
     cuda_config.num_experts = num_experts;
     cuda_config.top_k = top_k;
     cuda_config.mirror_to_device = true;
+    /* Serial participant assignment is the oracle for every verifier row. */
+    cuda_config.prefill_token_capacity = 1;
     DeviceMoERuntimeTable cuda_table(cuda_config);
 
     llaminar2::MoEPlacementUpdate update;
@@ -17440,7 +17724,11 @@ TEST_F(
 
         if (capture)
         {
-            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            /* Reproduce DeviceGraphExecutor's external-input admission. */
+            ASSERT_NO_THROW(llaminar2::TransferEngine::requireDeviceInput(
+                publisher_shared.get(), device, stream_));
+            ASSERT_NO_THROW(llaminar2::TransferEngine::requireDeviceInput(
+                publisher_payload.get(), device, stream_));
             ScopedCudaTestGraph graph(
                 stream_,
                 "canonical shared rank-bank publication");
@@ -17508,7 +17796,22 @@ TEST_F(
 
         if (capture)
         {
-            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            /*
+             * The finalizer consumes the canonical publication and the
+             * preinitialized output rows. Join every external producer before
+             * capture so none of those model-setup edges leak into the graph.
+             */
+            for (llaminar2::ITensor *tensor : {
+                     grouped_input.get(),
+                     gate.get(),
+                     grouped_publication.get(),
+                     grouped_routed.get(),
+                     grouped_shared.get(),
+                     grouped_combined.get()})
+            {
+                ASSERT_NO_THROW(llaminar2::TransferEngine::requireDeviceInput(
+                    tensor, device, stream_));
+            }
             ScopedCudaTestGraph graph(
                 stream_,
                 "canonical MoE publication finalizer");
@@ -20463,10 +20766,13 @@ TEST_F(Test__CUDAMoEKernel, ReplicatedMTPRoutedExpertCUDA2AllNativeFormatsAreByt
         runtime_config0.num_experts = num_experts;
         runtime_config0.top_k = top_k;
         runtime_config0.mirror_to_device = true;
+        runtime_config0.prefill_token_capacity = seq_len;
         llaminar2::DeviceMoERuntimeTable runtime0(runtime_config0);
         auto runtime_config1 = runtime_config0;
         runtime_config1.device_id = device1;
         llaminar2::DeviceMoERuntimeTable runtime1(runtime_config1);
+        ASSERT_TRUE(runtime0.hasPrefillRouteScratchCapacity(0, seq_len));
+        ASSERT_TRUE(runtime1.hasPrefillRouteScratchCapacity(0, seq_len));
 
         std::vector<int> owner_participants(static_cast<size_t>(num_experts));
         for (int expert = 0; expert < num_experts; ++expert)
@@ -21247,7 +21553,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
                                    "device_work_directory") &&
                                tag_equals(
                                    "policy_source",
-                                   "tensor_core_imma_prefill"))
+                                   "tensor_core_imma_generic"))
                             : (tag_equals(
                                    "splitk_tile_rows",
                                    expected_splitk_tile_rows) &&
@@ -21349,14 +21655,24 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
             auto row_hidden = makeTensor({1, d_model}, row_hidden_values);
             ASSERT_TRUE(row_hidden->ensureOnDevice(device, stream_));
 
-            std::array<int, top_k> expert_ids = {};
-            std::array<float, top_k> expert_weights = {};
+            std::vector<float> row_routing_index_values(
+                static_cast<size_t>(top_k));
+            std::vector<float> row_routing_weight_values(
+                static_cast<size_t>(top_k));
             for (int k = 0; k < top_k; ++k)
             {
                 const size_t slot = static_cast<size_t>(row) * top_k + k;
-                expert_ids[static_cast<size_t>(k)] = static_cast<int>(routing_indices_values[slot]);
-                expert_weights[static_cast<size_t>(k)] = routing_weights_values[slot];
+                row_routing_index_values[static_cast<size_t>(k)] =
+                    routing_indices_values[slot];
+                row_routing_weight_values[static_cast<size_t>(k)] =
+                    routing_weights_values[slot];
             }
+            auto row_routing_indices = makeTensor(
+                {1, top_k}, row_routing_index_values);
+            auto row_routing_weights = makeTensor(
+                {1, top_k}, row_routing_weight_values);
+            ASSERT_TRUE(row_routing_indices->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(row_routing_weights->ensureOnDevice(device, stream_));
 
             std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> gate_owned;
             std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> up_owned;
@@ -21376,11 +21692,12 @@ TEST_F(Test__CUDAMoEKernel, VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAn
 
             auto decode_output = makeZeros({d_model});
             ASSERT_TRUE(decode_output->ensureOnDevice(device, stream_));
-            ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
-                row_hidden.get(), expert_ids.data(), gateup_table, top_k,
+            ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromRouting(
+                row_hidden.get(), row_routing_indices.get(), gateup_table, top_k,
                 gate_outputs.data(), up_outputs.data(), d_model, intermediate));
-            ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromTable(
-                gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(),
+            ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromRouting(
+                gate_outputs.data(), up_outputs.data(), row_routing_indices.get(),
+                row_routing_weights.get(),
                 down_table, top_k, decode_output.get(), d_model, intermediate));
             ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
             ASSERT_TRUE(decode_output->ensureOnHost(stream_));
@@ -22537,16 +22854,22 @@ TEST_F(Test__CUDAMoEKernel,
                       hidden_row->mutable_data());
             ASSERT_TRUE(hidden_row->ensureOnDevice(device, stream_));
 
-            std::array<int, top_k> expert_ids = {};
-            std::array<float, top_k> expert_weights = {};
+            auto row_routing_indices =
+                llaminar2::test::TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(top_k)});
+            auto row_routing_weights =
+                llaminar2::test::TestTensorFactory::createFP32(
+                    {1u, static_cast<size_t>(top_k)});
             for (int route = 0; route < top_k; ++route)
             {
                 const int slot = row * top_k + route;
-                expert_ids[static_cast<size_t>(route)] =
-                    static_cast<int>(route_indices[static_cast<size_t>(slot)]);
-                expert_weights[static_cast<size_t>(route)] =
+                row_routing_indices->mutable_data()[static_cast<size_t>(route)] =
+                    route_indices[static_cast<size_t>(slot)];
+                row_routing_weights->mutable_data()[static_cast<size_t>(route)] =
                     route_weights[static_cast<size_t>(slot)];
             }
+            ASSERT_TRUE(row_routing_indices->ensureOnDevice(device, stream_));
+            ASSERT_TRUE(row_routing_weights->ensureOnDevice(device, stream_));
 
             std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> gate_owned;
             std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> up_owned;
@@ -22569,11 +22892,12 @@ TEST_F(Test__CUDAMoEKernel,
             auto decode_output = llaminar2::test::TestTensorFactory::createFP32(
                 {1u, static_cast<size_t>(d_model)});
             ASSERT_TRUE(decode_output->ensureOnDevice(device, stream_));
-            ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
-                hidden_row.get(), expert_ids.data(), gateup_table, top_k,
+            ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromRouting(
+                hidden_row.get(), row_routing_indices.get(), gateup_table, top_k,
                 gate_outputs.data(), up_outputs.data(), d_model, intermediate));
-            ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromTable(
-                gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(),
+            ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromRouting(
+                gate_outputs.data(), up_outputs.data(), row_routing_indices.get(),
+                row_routing_weights.get(),
                 down_table, top_k, decode_output.get(), d_model, intermediate));
             ASSERT_TRUE(decode_output->ensureOnHost(stream_));
             const float *decode_host = decode_output->data();
@@ -23080,16 +23404,22 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
                           hidden_row->mutable_data());
                 ASSERT_TRUE(hidden_row->ensureOnDevice(device, stream_));
 
-                std::array<int, top_k> expert_ids = {};
-                std::array<float, top_k> expert_weights = {};
+                auto row_routing_indices =
+                    llaminar2::test::TestTensorFactory::createFP32(
+                        {1u, static_cast<size_t>(top_k)});
+                auto row_routing_weights =
+                    llaminar2::test::TestTensorFactory::createFP32(
+                        {1u, static_cast<size_t>(top_k)});
                 for (int route = 0; route < top_k; ++route)
                 {
                     const int slot = row * top_k + route;
-                    expert_ids[static_cast<size_t>(route)] =
-                        static_cast<int>(routing_index_values[static_cast<size_t>(slot)]);
-                    expert_weights[static_cast<size_t>(route)] =
+                    row_routing_indices->mutable_data()[static_cast<size_t>(route)] =
+                        routing_index_values[static_cast<size_t>(slot)];
+                    row_routing_weights->mutable_data()[static_cast<size_t>(route)] =
                         routing_weight_values[static_cast<size_t>(slot)];
                 }
+                ASSERT_TRUE(row_routing_indices->ensureOnDevice(device, stream_));
+                ASSERT_TRUE(row_routing_weights->ensureOnDevice(device, stream_));
 
                 std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> gate_owned;
                 std::array<std::shared_ptr<llaminar2::FP32Tensor>, top_k> up_owned;
@@ -23114,22 +23444,6 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
                 ASSERT_TRUE(decode_output->ensureOnDevice(device, stream_));
                 if (masked_local_tp)
                 {
-                    auto row_routing_indices =
-                        llaminar2::test::TestTensorFactory::createFP32(
-                            {1u, static_cast<size_t>(top_k)});
-                    auto row_routing_weights =
-                        llaminar2::test::TestTensorFactory::createFP32(
-                            {1u, static_cast<size_t>(top_k)});
-                    for (int route = 0; route < top_k; ++route)
-                    {
-                        const int slot = row * top_k + route;
-                        row_routing_indices->mutable_data()[static_cast<size_t>(route)] =
-                            routing_index_values[static_cast<size_t>(slot)];
-                        row_routing_weights->mutable_data()[static_cast<size_t>(route)] =
-                            routing_weight_values[static_cast<size_t>(slot)];
-                    }
-                    ASSERT_TRUE(row_routing_indices->ensureOnDevice(device, stream_));
-                    ASSERT_TRUE(row_routing_weights->ensureOnDevice(device, stream_));
                     ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromRouting(
                         hidden_row.get(),
                         row_routing_indices.get(),
@@ -23158,12 +23472,13 @@ TEST_F(Test__CUDAMoEKernel, RoutedAndMaskedLocalTPVerifierPrefill_AllNativeForma
                 }
                 else
                 {
-                    ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromTable(
-                        hidden_row.get(), expert_ids.data(), active_gateup_table, top_k,
+                    ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromRouting(
+                        hidden_row.get(), row_routing_indices.get(), active_gateup_table, top_k,
                         gate_outputs.data(), up_outputs.data(), d_model, intermediate))
                         << case_label << " rowwise gate/up M=" << seq_len << " row=" << row;
-                    ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromTable(
-                        gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(),
+                    ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromRouting(
+                        gate_outputs.data(), up_outputs.data(), row_routing_indices.get(),
+                        row_routing_weights.get(),
                         active_down_table, top_k, decode_output.get(), d_model, intermediate))
                         << case_label << " rowwise down M=" << seq_len << " row=" << row;
                 }

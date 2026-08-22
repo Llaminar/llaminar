@@ -285,7 +285,9 @@ namespace
             const DeviceNativeVNNIMatrixDesc *,
             int,
             int,
-            int) override
+            int,
+            MoEDecodeDescriptorSource =
+                MoEDecodeDescriptorSource::StaticDescriptorTable) override
         {
             return gateup_table_uploads++;
         }
@@ -293,7 +295,9 @@ namespace
             const DeviceNativeVNNIMatrixDesc *,
             int,
             int,
-            int) override
+            int,
+            MoEDecodeDescriptorSource =
+                MoEDecodeDescriptorSource::StaticDescriptorTable) override
         {
             return down_table_uploads++;
         }
@@ -1600,7 +1604,8 @@ TEST_F(MoEExpertPrefillGraphCapture, RuntimeDecodeDescriptorSourceDefaultsToStat
         << "Static/off GPU decode should keep using immutable descriptor tables; "
            "only runtime top-k ids/weights need the runtime table.";
 
-    params.runtime_decode_uses_mutable_descriptors = true;
+    params.weight_descriptor_source =
+        MoEDecodeDescriptorSource::RuntimePlacementTable;
     MoEExpertComputeStage mutable_stage(params);
     EXPECT_EQ(mutable_stage.runtimeDecodeDescriptorSourceForTesting(),
               MoEDecodeDescriptorSource::RuntimePlacementTable)
@@ -1632,7 +1637,8 @@ TEST_F(MoEExpertPrefillGraphCapture, MutableDecodePreservesApportionedRuntimeOwn
         params.my_socket_id = 0;
         params.participant_count = 2;
         params.expert_mask = {true, true, false, false};
-        params.runtime_decode_uses_mutable_descriptors = true;
+        params.weight_descriptor_source =
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
 
         MoEExpertComputeStage stage(params);
         stage.setMoEKernelForTesting(&stub_kernel_);
@@ -1687,7 +1693,8 @@ TEST_F(MoEExpertPrefillGraphCapture, StaticDescriptorMaskedDecodeAcceptsExplicit
         params.my_socket_id = 0;
         params.participant_count = 2;
         params.expert_mask = {true, true, false, false};
-        params.runtime_decode_uses_mutable_descriptors = false;
+        params.weight_descriptor_source =
+            MoEDecodeDescriptorSource::StaticDescriptorTable;
         params.runtime_decode_has_explicit_owner_metadata = true;
 
         MoEExpertComputeStage stage(params);
@@ -1749,7 +1756,8 @@ TEST_F(MoEExpertPrefillGraphCapture, FullyReplicatedDecodePreservesExplicitRunti
         params.my_socket_id = 0;
         params.participant_count = kParticipantCount;
         params.expert_mask.assign(NUM_EXPERTS, true);
-        params.runtime_decode_uses_mutable_descriptors = false;
+        params.weight_descriptor_source =
+            MoEDecodeDescriptorSource::StaticDescriptorTable;
         params.runtime_decode_has_explicit_owner_metadata = true;
 
         MoEExpertComputeStage stage(params);
@@ -2094,6 +2102,54 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedVerifierSmallMUsesGroupedPre
                 << backend_name << " all-position verifier shared expert M=" << seq_len
                 << " grouped prefill route support mismatch";
         }
+    };
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true, "CUDA");
+#else
+    expect_backend(DeviceId::cuda(0), false, "CUDA");
+#endif
+
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true, "ROCm");
+#else
+    expect_backend(DeviceId::rocm(0), false, "ROCm");
+#endif
+}
+
+/**
+ * @brief Standalone grouped verifier quantization remains graph-capturable.
+ *
+ * Deterministic execution disables router-Q8 reuse on CUDA and ROCm. The
+ * shared verifier must keep the same grouped production route while owning its
+ * input quantization instead of requiring a publication that cannot exist.
+ */
+TEST_F(SharedExpertFFNPrefillGraphCapture,
+       GpuForcedVerifierDoesNotRequireRouterQ8ReuseForCapturePreflight)
+{
+    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
+
+    auto expect_backend = [&](DeviceId device, bool supported, const char *backend_name)
+    {
+        SharedExpertFFNStage::Params params;
+        params.device_id = device;
+        params.seq_len = 2;
+        params.d_model = D_MODEL;
+        params.intermediate = INTERMEDIATE;
+        params.input = input_.get();
+        params.gate_w = gate_w.get();
+        params.up_w = up_w.get();
+        params.down_w = down_w.get();
+        params.output = output_.get();
+        params.force_grouped_verifier_prefill_for_decode = true;
+
+        SharedExpertFFNStage stage(params);
+        EXPECT_EQ(stage.supportsPaddedPrefillGraphCapturePreflight(), supported)
+            << backend_name << " standalone grouped-verifier quantization must "
+                            "remain a capturable production path";
+        EXPECT_FALSE(stage.requiresRouterQ8PublicationForTesting());
     };
 
 #if defined(HAVE_CUDA)

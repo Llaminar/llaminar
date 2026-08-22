@@ -173,6 +173,34 @@ namespace llaminar2
 
         try
         {
+            if (config_.source_device != config_.destination_device)
+            {
+                bool direct_peer_ready = false;
+#ifdef HAVE_CUDA
+                if (config_.source_device.is_cuda())
+                {
+                    direct_peer_ready =
+                        detail::prepareDirectPeerAccessCUDABackend(
+                            config_.source_device,
+                            config_.destination_device);
+                }
+#endif
+#ifdef HAVE_ROCM
+                if (config_.source_device.is_rocm())
+                {
+                    direct_peer_ready =
+                        detail::prepareDirectPeerAccessROCmBackend(
+                            config_.source_device,
+                            config_.destination_device);
+                }
+#endif
+                if (!direct_peer_ready)
+                {
+                    throw std::runtime_error(
+                        "GPU peer tier lane requires a driver-authorized direct edge; use the explicit host-relay lane when peer access is unavailable");
+                }
+            }
+
             IBackend *source_backend = getBackendFor(config_.source_device);
             IBackend *destination_backend =
                 getBackendFor(config_.destination_device);

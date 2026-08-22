@@ -1040,6 +1040,46 @@ TEST(Test__CUDAHybridKVCacheReset, DeviceSequenceMetadataPointersUseCompressedFu
         << "The old un-remapped path would read this parent slot for global layer 3.";
 }
 
+TEST(Test__CUDAHybridKVCacheReset, DirectRingViewUsesCompressedFullAttentionSlotExactlyOnce)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    auto cache = createHybridCache(makeOffsetFullAttentionHybridConfig());
+    CudaStream stream;
+    llaminar2::ITensor *k = nullptr;
+    llaminar2::ITensor *v = nullptr;
+    const int *head = nullptr;
+    const int *count = nullptr;
+    int capacity = 0;
+
+    ASSERT_TRUE(cache.owner->get_kv_device_ring_view(
+        /*layer=*/3,
+        /*seq_idx=*/0,
+        &k,
+        &v,
+        &head,
+        &count,
+        &capacity,
+        stream.opaque()));
+    EXPECT_NE(k, nullptr);
+    EXPECT_NE(v, nullptr);
+    EXPECT_EQ(head, cache.owner->deviceRingHeadPtr(3, 0));
+    EXPECT_EQ(count, cache.owner->deviceCachedTokenCountPtr(3, 0));
+    EXPECT_EQ(capacity, 8);
+
+    EXPECT_FALSE(cache.owner->get_kv_device_ring_view(
+        /*layer=*/0,
+        /*seq_idx=*/0,
+        &k,
+        &v,
+        &head,
+        &count,
+        &capacity,
+        stream.opaque()))
+        << "GDN model layers must never alias compact full-attention slot zero";
+}
+
 TEST(Test__CUDAHybridKVCacheReset, GetKVUsesCompressedFullAttentionSlot)
 {
     if (!hasCUDA())

@@ -292,7 +292,6 @@ void moe_prefill_hidden_quantize_rows_kernel(
 
     const float scale =
         llaminar2::rocm::decode_equivalent::q8Scale(abs_val);
-    const float inv_scale = 1.0f / scale;
 
     // Write scale (one per block, lane 0 writes)
     const int blocks_per_row = K / 32;
@@ -302,8 +301,8 @@ void moe_prefill_hidden_quantize_rows_kernel(
     // Quantize and write
     A_int8_out[static_cast<size_t>(original_token) * K + k] =
         static_cast<int8_t>(
-            llaminar2::rocm::decode_equivalent::quantizeQ8(
-                val, inv_scale));
+            llaminar2::rocm::decode_equivalent::quantizeQ8FromScale(
+                val, scale));
 }
 
 
@@ -659,14 +658,6 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
         const float scale_hi =
             __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
-        acc = rocm_native_vnni_commit_dual_scale_block(
-            acc,
-            acc_lo,
-            acc_hi,
-            scale_lo,
-            scale_hi,
-            scale_ab);
-
         if constexpr (Traits::is_dual_scale_asym)
         {
             constexpr int32_t ones = 0x01010101;
@@ -690,8 +681,12 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
                 *reinterpret_cast<const __half*>(&emin_lo_bits));
             const float min_hi = __half2float(
                 *reinterpret_cast<const __half*>(&emin_hi_bits));
-            acc = rocm_native_vnni_commit_dual_scale_correction(
+            acc = rocm_native_vnni_commit_corrected_dual_scale_block(
                 acc,
+                acc_lo,
+                acc_hi,
+                scale_lo,
+                scale_hi,
                 sum_a_lo,
                 sum_a_hi,
                 min_lo,
@@ -699,7 +694,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
                 scale_ab);
         }
 
-        if constexpr (FMT == NVNNI_PF_IQ1_M)
+        else if constexpr (FMT == NVNNI_PF_IQ1_M)
         {
             constexpr float IQ1S_DELTA = 0.125f;
             constexpr int32_t ones = 0x01010101;
@@ -728,8 +723,10 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             const float delta3 =
                 (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
 
-            acc = rocm_native_vnni_commit_iq1_m_delta_correction(
+            acc = rocm_native_vnni_commit_iq1_m_block(
                 acc,
+                acc_lo,
+                acc_hi,
                 sum_a_g0,
                 sum_a_g1,
                 sum_a_g2,
@@ -738,6 +735,16 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
                 delta1,
                 delta2,
                 delta3,
+                scale_lo,
+                scale_hi,
+                scale_ab);
+        }
+        else
+        {
+            acc = rocm_native_vnni_commit_dual_scale_block(
+                acc,
+                acc_lo,
+                acc_hi,
                 scale_lo,
                 scale_hi,
                 scale_ab);
@@ -753,9 +760,6 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
         const uint16_t scale_bits = scale_base[linear];
         const float block_d =
             __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-        acc = rocm_native_vnni_commit_single_scale_block(
-            acc, dot, block_d, scale_ab);
-
         if constexpr (Traits::is_asymmetric)
         {
             constexpr int32_t ones = 0x01010101;
@@ -767,8 +771,18 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
             const uint16_t min_bits = min_base[linear];
             const float block_m =
                 __half2float(*reinterpret_cast<const __half*>(&min_bits));
-            acc = rocm_native_vnni_commit_single_scale_correction(
-                acc, sum_a, block_m, scale_ab);
+            acc = rocm_native_vnni_commit_corrected_single_scale_block(
+                acc,
+                dot,
+                block_d,
+                sum_a,
+                block_m,
+                scale_ab);
+        }
+        else
+        {
+            acc = rocm_native_vnni_commit_single_scale_block(
+                acc, dot, block_d, scale_ab);
         }
     }
 
@@ -2041,7 +2055,6 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
 
     const float scale =
         llaminar2::rocm::decode_equivalent::q8Scale(abs_val);
-    const float inv_scale = 1.0f / scale;
 
     const int blocks_per_row = intermediate / 32;
     if (lane == 0)
@@ -2049,8 +2062,8 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
 
     A_int8_out[static_cast<size_t>(global_slot) * intermediate + k] =
         static_cast<int8_t>(
-            llaminar2::rocm::decode_equivalent::quantizeQ8(
-                val, inv_scale));
+            llaminar2::rocm::decode_equivalent::quantizeQ8FromScale(
+                val, scale));
 }
 
 /**

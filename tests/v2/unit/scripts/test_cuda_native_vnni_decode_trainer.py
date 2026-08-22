@@ -630,14 +630,30 @@ class CUDANativeVNNIDecodeTrainerTest(unittest.TestCase):
 
         runtime = RUNTIME_SOURCE.read_text(encoding="utf-8")
         debug_env = DEBUG_ENV_SOURCE.read_text(encoding="utf-8")
-        self.assertEqual(runtime.count("selectGeneratedDispatch<CB>("), 1)
+        self.assertEqual(
+            runtime.count(
+                "selectGeneratedDispatch<trainedPolicyCodebook<CB>()>("
+            ),
+            1,
+        )
         self.assertGreaterEqual(
             runtime.count("selectCachedGeneratedDispatch<CB>("),
-            3,
+            1,
         )
-        self.assertEqual(runtime.count("selectGeneratedGroupedTuning<CB>("), 1)
         self.assertGreaterEqual(
-            runtime.count("selectCachedGeneratedGroupedTuning<CB>("),
+            runtime.count("selectCachedGeneratedDispatchForPolicy<CB>("),
+            2,
+        )
+        self.assertEqual(
+            runtime.count(
+                "selectGeneratedGroupedTuning<trainedPolicyCodebook<CB>()>("
+            ),
+            1,
+        )
+        self.assertGreaterEqual(
+            runtime.count(
+                "selectCachedGeneratedGroupedTuningForPolicy<CB>("
+            ),
             1,
         )
         self.assertNotIn("classifyShapeGenerated<CB>", runtime)

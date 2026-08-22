@@ -50,6 +50,16 @@ namespace llaminar2::moe_rebalance_policy
     constexpr uint32_t kCollectedStateActiveSlotCountShift = 48u;
     constexpr uint64_t kCollectedStateActiveSlotCountMask =
         0x1ffULL << kCollectedStateActiveSlotCountShift;
+    /**
+     * @brief This participant is the durable logical owner of the expert.
+     *
+     * Physical residency alone is insufficient for topology-wide planning:
+     * an LLEP arrival or a retained replica can make several participants
+     * resident at once.  Keeping the owner bit in the same release-published
+     * word as the histogram and residency evidence prevents the global device
+     * controller from composing a new epoch from mismatched observations.
+     */
+    constexpr uint64_t kCollectedStateAuthoritativeOwnerBit = 1ULL << 61u;
     constexpr uint64_t kCollectedStateTransferBackedBit = 1ULL << 62u;
     constexpr uint64_t kCollectedStatePhysicallyResidentBit = 1ULL << 63u;
     constexpr float kDefaultDynamicImbalanceThresholdRatio =
@@ -65,13 +75,16 @@ namespace llaminar2::moe_rebalance_policy
      *        live across this participant's complete managed runtime.
      * @param physically_resident Whether this participant can source the bytes.
      * @param transfer_backed Whether the live descriptor consumes transfer storage.
+     * @param authoritative_owner Whether this participant owns durable routing
+     *        for the expert in the sampled placement epoch.
      * @return One collective word consumed by all backend planners.
      */
     LLAMINAR_MOE_REBALANCE_HD uint64_t packCollectedState(
         uint64_t activation_count,
         uint32_t active_transfer_slots,
         bool physically_resident,
-        bool transfer_backed) noexcept
+        bool transfer_backed,
+        bool authoritative_owner = false) noexcept
     {
         uint64_t packed =
             activation_count & kCollectedStateActivationCountMask;
@@ -84,6 +97,8 @@ namespace llaminar2::moe_rebalance_policy
             packed |= kCollectedStatePhysicallyResidentBit;
         if (transfer_backed)
             packed |= kCollectedStateTransferBackedBit;
+        if (authoritative_owner)
+            packed |= kCollectedStateAuthoritativeOwnerBit;
         return packed;
     }
 
@@ -115,6 +130,13 @@ namespace llaminar2::moe_rebalance_policy
         uint64_t packed) noexcept
     {
         return (packed & kCollectedStateTransferBackedBit) != 0ULL;
+    }
+
+    /// Return whether this participant is the durable logical expert owner.
+    LLAMINAR_MOE_REBALANCE_HD bool collectedStateAuthoritativeOwner(
+        uint64_t packed) noexcept
+    {
+        return (packed & kCollectedStateAuthoritativeOwnerBit) != 0ULL;
     }
 
     struct LoadSpreadDelta
@@ -159,6 +181,66 @@ namespace llaminar2::moe_rebalance_policy
         uint64_t improvement = 0;
         bool valid = false;
     };
+
+    /**
+     * @brief Evidence scope that qualifies one Dynamic ownership decision.
+     *
+     * `routed_activations` names the complete routed layer window before any
+     * tier or participant partitioning.  The optimization may inspect only a
+     * subset of those routes, but partitioning must not silently redefine the
+     * public minimum-window policy.  Keeping both values in one typed argument
+     * makes host, CUDA, and ROCm callers state that accounting explicitly.
+     */
+    struct DynamicOwnershipEvidenceWindow
+    {
+        uint64_t routed_activations = 0;
+        uint64_t minimum_routed_activations =
+            kDefaultDynamicMinWindowActivations;
+
+        /** @return Whether the complete routed window clears its policy floor. */
+        LLAMINAR_MOE_REBALANCE_HD bool sufficient() const noexcept
+        {
+            return routed_activations >= minimum_routed_activations;
+        }
+    };
+
+    /**
+     * @brief Build whole-window evidence when the candidate spans every owner.
+     *
+     * Single-tier and legacy Dynamic callers optimize over the complete owner
+     * set, so summing participant loads recovers the routed layer window. A
+     * multi-tier authority instead supplies its pre-partition layer total
+     * directly and must not call this helper on one tier slice.
+     *
+     * @param participant_load Routed load for every participant in the window.
+     * @param participant_count Number of participant load entries.
+     * @param minimum_routed_activations Configured evidence floor.
+     * @return Saturation-safe typed evidence for the shared selector.
+     */
+    LLAMINAR_MOE_REBALANCE_HD DynamicOwnershipEvidenceWindow
+    dynamicOwnershipEvidenceFromParticipantLoads(
+        const uint64_t *participant_load,
+        uint32_t participant_count,
+        uint64_t minimum_routed_activations) noexcept
+    {
+        DynamicOwnershipEvidenceWindow evidence{
+            0u,
+            minimum_routed_activations,
+        };
+        if (!participant_load)
+            return evidence;
+        for (uint32_t participant = 0;
+             participant < participant_count;
+             ++participant)
+        {
+            const uint64_t load = participant_load[participant];
+            evidence.routed_activations =
+                UINT64_MAX - evidence.routed_activations < load
+                    ? UINT64_MAX
+                    : evidence.routed_activations + load;
+        }
+        return evidence;
+    }
 
     /**
      * @brief Storage-lifetime classification for one stable GPU transfer slot.
@@ -467,6 +549,111 @@ namespace llaminar2::moe_rebalance_policy
                denominator * static_cast<uint64_t>(threshold_per_mille);
     }
 
+    /**
+     * @brief Test a strict scalar reduction against an integer economy floor.
+     *
+     * The quotient/remainder form avoids overflowing either side of a
+     * cross-multiplied per-mille comparison. CUDA, HIP, and the CPU oracle use
+     * this exact helper so a borderline candidate cannot be accepted by one
+     * controller backend and rejected by another.
+     *
+     * @param before Objective value before the candidate cycle.
+     * @param after Objective value after the candidate cycle.
+     * @param minimum_reduction_per_mille Required fractional reduction.
+     * @return True only when the objective strictly decreases by the floor.
+     */
+    LLAMINAR_MOE_REBALANCE_HD bool relativeReductionAtLeastPerMille(
+        uint64_t before,
+        uint64_t after,
+        uint32_t minimum_reduction_per_mille) noexcept
+    {
+        if (before == 0u || after >= before)
+            return false;
+        if (minimum_reduction_per_mille == 0u)
+            return true;
+        if (minimum_reduction_per_mille >= 1000u)
+            return after == 0u;
+
+        const uint64_t whole =
+            (before / 1000u) * minimum_reduction_per_mille;
+        const uint64_t remainder_product =
+            (before % 1000u) * minimum_reduction_per_mille;
+        const uint64_t rounded_remainder =
+            (remainder_product + 999u) / 1000u;
+        return before - after >= whole + rounded_remainder;
+    }
+
+    /**
+     * @brief Apply the Dynamic planner's lexicographic improvement floor.
+     *
+     * Cross-tier placement cost is authoritative. Same-priority makespan is
+     * considered only when the priority cost is unchanged, preserving the
+     * hottest-experts-first contract while rejecting tiny reshuffles that
+     * cannot plausibly repay physical movement.
+     */
+    LLAMINAR_MOE_REBALANCE_HD bool dynamicObjectiveImprovesByPerMille(
+        uint64_t current_priority_cost,
+        uint64_t current_same_priority_makespan,
+        uint64_t candidate_priority_cost,
+        uint64_t candidate_same_priority_makespan,
+        uint32_t minimum_improvement_per_mille) noexcept
+    {
+        if (candidate_priority_cost < current_priority_cost)
+        {
+            return relativeReductionAtLeastPerMille(
+                current_priority_cost,
+                candidate_priority_cost,
+                minimum_improvement_per_mille);
+        }
+        return candidate_priority_cost == current_priority_cost &&
+               relativeReductionAtLeastPerMille(
+                   current_same_priority_makespan,
+                   candidate_same_priority_makespan,
+                   minimum_improvement_per_mille);
+    }
+
+    /**
+     * @brief Test whether one equal-priority participant set is skewed enough.
+     *
+     * @param participant_load Exact routed load under the current owner map.
+     * @param participant_priority Opaque integer priority per participant.
+     * @param participant_count Number of valid entries in both arrays.
+     * @param selected_priority Priority shared by the candidate cycle.
+     * @param threshold_per_mille Required maximum/minimum load ratio.
+     */
+    LLAMINAR_MOE_REBALANCE_HD bool samePriorityLoadIsImbalanced(
+        const uint64_t *participant_load,
+        const int32_t *participant_priority,
+        uint32_t participant_count,
+        int32_t selected_priority,
+        uint32_t threshold_per_mille) noexcept
+    {
+        if (!participant_load || !participant_priority ||
+            participant_count < 2u)
+        {
+            return false;
+        }
+        uint32_t members = 0u;
+        uint64_t minimum = UINT64_MAX;
+        uint64_t maximum = 0u;
+        for (uint32_t participant = 0u;
+             participant < participant_count;
+             ++participant)
+        {
+            if (participant_priority[participant] != selected_priority)
+                continue;
+            const uint64_t load = participant_load[participant];
+            minimum = load < minimum ? load : minimum;
+            maximum = load > maximum ? load : maximum;
+            ++members;
+        }
+        return members >= 2u && maximum != 0u &&
+               ratioAtLeastPerMille(
+                   maximum,
+                   minimum == UINT64_MAX ? 0u : minimum,
+                   threshold_per_mille);
+    }
+
     LLAMINAR_MOE_REBALANCE_HD bool finiteRatioImprovesByPerMille(
         uint64_t old_max,
         uint64_t old_min,
@@ -618,15 +805,46 @@ namespace llaminar2::moe_rebalance_policy
         return true;
     }
 
+    /**
+     * @brief Find the best capacity-preserving expert-owner exchange.
+     *
+     * The most-loaded and least-loaded participants define the skew that must
+     * be reduced.  The selected payload pair is nevertheless searched
+     * exhaustively: exchanging the hottest expert with the coldest expert can
+     * overshoot the balance point and make the ratio worse even when another
+     * pair is profitable.  This exact search is deterministic and shared by
+     * host, CUDA, and ROCm controllers so every authority publishes the same
+     * ownership transition from identical histogram evidence.
+     *
+     * Candidates minimize the resulting parallel makespan first, maximize the
+     * resulting minimum load second, avoid reversing the overloaded endpoint
+     * when those objectives tie, and finally use expert IDs for a stable tie
+     * break.  Transfer-slot constraints are applied during enumeration, not
+     * after selecting an otherwise impossible mathematical winner.
+     *
+     * @param participant_load Aggregate routed activations per participant.
+     * @param expert_counts Routed activations per expert.
+     * @param expert_owner Participant-local owner index per expert.
+     * @param num_experts Number of entries in both expert arrays.
+     * @param participant_count Number of entries in participant_load.
+     * @param evidence Complete routed-layer evidence before placement
+     *        partitioning.
+     * @param imbalance_threshold_per_mille Minimum current max/min ratio.
+     * @param min_improvement_per_mille Required ratio improvement.
+     * @param expert_transfer_backed_participant_mask Optional physical slots.
+     * @param participant_active_transfer_slots Optional live slot counts.
+     * @param active_transfer_slot_capacity Optional per-participant capacity.
+     * @return The best executable paired swap, or an invalid choice.
+     */
     LLAMINAR_MOE_REBALANCE_HD OwnershipSwapChoice bestDynamicOwnershipSwap(
         const uint64_t *participant_load,
         const uint64_t *expert_counts,
         const int32_t *expert_owner,
         uint32_t num_experts,
         uint32_t participant_count,
-        uint32_t imbalance_threshold_per_mille = kDefaultDynamicImbalanceThresholdPerMille,
-        uint32_t min_improvement_per_mille = kDefaultDynamicMinImprovementPerMille,
-        uint64_t min_window_activations = kDefaultDynamicMinWindowActivations,
+        DynamicOwnershipEvidenceWindow evidence,
+        uint32_t imbalance_threshold_per_mille,
+        uint32_t min_improvement_per_mille,
         const uint32_t *expert_transfer_backed_participant_mask = nullptr,
         const uint32_t *participant_active_transfer_slots = nullptr,
         uint32_t active_transfer_slot_capacity = UINT32_MAX) noexcept
@@ -636,13 +854,32 @@ namespace llaminar2::moe_rebalance_policy
             !expert_counts ||
             !expert_owner ||
             num_experts == 0u ||
-            participant_count < 2u ||
+            participant_count < 2u)
+        {
+            return choice;
+        }
+
+        const bool has_transfer_masks =
+            expert_transfer_backed_participant_mask != nullptr;
+        const bool has_transfer_counts =
+            participant_active_transfer_slots != nullptr;
+        const bool has_transfer_capacity =
+            active_transfer_slot_capacity != UINT32_MAX;
+        const bool enforce_transfer_capacity =
+            has_transfer_masks && has_transfer_counts &&
+            has_transfer_capacity;
+        if ((has_transfer_masks || has_transfer_counts ||
+             has_transfer_capacity) &&
+            !enforce_transfer_capacity)
+        {
+            return choice;
+        }
+        if (enforce_transfer_capacity &&
             participant_count > kMaxPolicyParticipants)
         {
             return choice;
         }
 
-        uint64_t total = 0;
         uint32_t overloaded = 0;
         uint32_t underloaded = 0;
         uint64_t max_load = 0;
@@ -650,7 +887,6 @@ namespace llaminar2::moe_rebalance_policy
         for (uint32_t participant = 0; participant < participant_count; ++participant)
         {
             const uint64_t load = participant_load[participant];
-            total += load;
             if (load > max_load)
             {
                 max_load = load;
@@ -662,7 +898,7 @@ namespace llaminar2::moe_rebalance_policy
                 underloaded = participant;
             }
         }
-        if (total < min_window_activations ||
+        if (!evidence.sufficient() ||
             max_load == 0u ||
             overloaded == underloaded)
         {
@@ -674,10 +910,6 @@ namespace llaminar2::moe_rebalance_policy
             return choice;
         }
 
-        const bool enforce_transfer_capacity =
-            expert_transfer_backed_participant_mask != nullptr &&
-            participant_active_transfer_slots != nullptr &&
-            active_transfer_slot_capacity != UINT32_MAX;
         if (enforce_transfer_capacity)
         {
             for (uint32_t participant = 0;
@@ -714,104 +946,124 @@ namespace llaminar2::moe_rebalance_policy
             participant_active_transfer_slots[underloaded] >=
                 active_transfer_slot_capacity;
 
-        uint32_t heavy_expert = num_experts;
-        uint32_t light_expert = num_experts;
-        uint64_t heavy_count = 0;
-        uint64_t light_count = UINT64_MAX;
-        for (uint32_t expert = 0; expert < num_experts; ++expert)
+        for (uint32_t heavy_expert = 0;
+             heavy_expert < num_experts;
+             ++heavy_expert)
         {
-            const int32_t owner = expert_owner[expert];
-            const uint64_t count = expert_counts[expert];
-            if (owner == static_cast<int32_t>(overloaded))
+            if (expert_owner[heavy_expert] !=
+                static_cast<int32_t>(overloaded))
             {
-                if (overloaded_requires_transfer_departure &&
-                    (expert_transfer_backed_participant_mask[expert] &
-                     participantBit(overloaded)) == 0u)
+                continue;
+            }
+            if (overloaded_requires_transfer_departure &&
+                (expert_transfer_backed_participant_mask[heavy_expert] &
+                 participantBit(overloaded)) == 0u)
+            {
+                continue;
+            }
+            const uint64_t heavy_count = expert_counts[heavy_expert];
+
+            for (uint32_t light_expert = 0;
+                 light_expert < num_experts;
+                 ++light_expert)
+            {
+                if (expert_owner[light_expert] !=
+                    static_cast<int32_t>(underloaded))
                 {
                     continue;
                 }
-                if (heavy_expert == num_experts ||
-                    count > heavy_count ||
-                    (count == heavy_count && expert < heavy_expert))
-                {
-                    heavy_expert = expert;
-                    heavy_count = count;
-                }
-            }
-            else if (owner == static_cast<int32_t>(underloaded))
-            {
                 if (underloaded_requires_transfer_departure &&
-                    (expert_transfer_backed_participant_mask[expert] &
+                    (expert_transfer_backed_participant_mask[light_expert] &
                      participantBit(underloaded)) == 0u)
                 {
                     continue;
                 }
-                if (light_expert == num_experts ||
-                    count < light_count ||
-                    (count == light_count && expert < light_expert))
+                const uint64_t light_count = expert_counts[light_expert];
+                if (heavy_count <= light_count)
+                    continue;
+
+                const uint64_t proposed_overloaded_load =
+                    max_load - heavy_count + light_count;
+                const uint64_t proposed_underloaded_load =
+                    min_load - light_count + heavy_count;
+                uint64_t new_min = UINT64_MAX;
+                uint64_t new_max = 0u;
+                for (uint32_t participant = 0;
+                     participant < participant_count;
+                     ++participant)
                 {
-                    light_expert = expert;
-                    light_count = count;
+                    uint64_t load = participant_load[participant];
+                    if (participant == overloaded)
+                        load = proposed_overloaded_load;
+                    else if (participant == underloaded)
+                        load = proposed_underloaded_load;
+                    if (load < new_min)
+                        new_min = load;
+                    if (load > new_max)
+                        new_max = load;
                 }
+
+                const bool accept =
+                    min_load > 0u
+                        ? finiteRatioImprovesByPerMille(
+                              max_load,
+                              min_load,
+                              new_max,
+                              new_min,
+                              min_improvement_per_mille)
+                        : (new_min > 0u || new_max < max_load);
+                if (!accept)
+                    continue;
+
+                const bool reverses_extrema =
+                    proposed_overloaded_load < proposed_underloaded_load;
+                const uint64_t current_overloaded_load =
+                    choice.valid
+                        ? max_load - choice.heavy_count + choice.light_count
+                        : 0u;
+                const uint64_t current_underloaded_load =
+                    choice.valid
+                        ? min_load - choice.light_count + choice.heavy_count
+                        : 0u;
+                const bool current_reverses_extrema =
+                    choice.valid &&
+                    current_overloaded_load < current_underloaded_load;
+                const bool better =
+                    !choice.valid ||
+                    new_max < choice.new_max_load ||
+                    (new_max == choice.new_max_load &&
+                     new_min > choice.new_min_load) ||
+                    (new_max == choice.new_max_load &&
+                     new_min == choice.new_min_load &&
+                     reverses_extrema != current_reverses_extrema &&
+                     !reverses_extrema) ||
+                    (new_max == choice.new_max_load &&
+                     new_min == choice.new_min_load &&
+                     reverses_extrema == current_reverses_extrema &&
+                     (heavy_expert < choice.heavy_expert ||
+                      (heavy_expert == choice.heavy_expert &&
+                       light_expert < choice.light_expert)));
+                if (!better)
+                    continue;
+
+                choice.overloaded_participant = overloaded;
+                choice.underloaded_participant = underloaded;
+                choice.heavy_expert = heavy_expert;
+                choice.light_expert = light_expert;
+                choice.heavy_count = heavy_count;
+                choice.light_count = light_count;
+                choice.old_min_load = min_load;
+                choice.old_max_load = max_load;
+                choice.new_min_load = new_min;
+                choice.new_max_load = new_max;
+                const uint64_t old_spread = max_load - min_load;
+                const uint64_t new_spread = new_max - new_min;
+                choice.improvement = old_spread > new_spread
+                                         ? old_spread - new_spread
+                                         : 1u;
+                choice.valid = true;
             }
         }
-        if (heavy_expert == num_experts || light_expert == num_experts)
-            return choice;
-
-        uint64_t new_loads[kMaxPolicyParticipants] = {};
-        for (uint32_t participant = 0; participant < participant_count; ++participant)
-            new_loads[participant] = participant_load[participant];
-        new_loads[overloaded] = max_load - heavy_count + light_count;
-        new_loads[underloaded] = min_load - light_count + heavy_count;
-
-        uint64_t new_min = UINT64_MAX;
-        uint64_t new_max = 0;
-        for (uint32_t participant = 0; participant < participant_count; ++participant)
-        {
-            const uint64_t load = new_loads[participant];
-            if (load < new_min)
-                new_min = load;
-            if (load > new_max)
-                new_max = load;
-        }
-        if (new_min == UINT64_MAX)
-            new_min = 0;
-
-        bool accept = false;
-        if (min_load > 0u)
-        {
-            accept = finiteRatioImprovesByPerMille(
-                max_load,
-                min_load,
-                new_max,
-                new_min,
-                min_improvement_per_mille);
-        }
-        else if (new_min > 0u)
-        {
-            accept = true;
-        }
-        else
-        {
-            accept = new_max < max_load;
-        }
-        if (!accept)
-            return choice;
-
-        choice.overloaded_participant = overloaded;
-        choice.underloaded_participant = underloaded;
-        choice.heavy_expert = heavy_expert;
-        choice.light_expert = light_expert;
-        choice.heavy_count = heavy_count;
-        choice.light_count = light_count;
-        choice.old_min_load = min_load == UINT64_MAX ? 0u : min_load;
-        choice.old_max_load = max_load;
-        choice.new_min_load = new_min;
-        choice.new_max_load = new_max;
-        const uint64_t old_spread = max_load - choice.old_min_load;
-        const uint64_t new_spread = new_max - new_min;
-        choice.improvement = old_spread > new_spread ? old_spread - new_spread : 1u;
-        choice.valid = true;
         return choice;
     }
 

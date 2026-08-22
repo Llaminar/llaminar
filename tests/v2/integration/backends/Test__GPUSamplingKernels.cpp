@@ -615,6 +615,16 @@ namespace
                 12, 13, 14, -1,
                 21, 22, 23, 24,
                 -901, -902, -903, -904};
+        const std::array<int32_t, request_count * verifier_row_capacity>
+            first_verifier_inputs = {
+                100, 101, 102, 103,
+                200, 201, 202, 203,
+                300, 301, 302, 303};
+        const std::array<int32_t, request_count * verifier_row_capacity>
+            second_verifier_inputs = {
+                110, 111, 112, 113,
+                210, 211, 212, 213,
+                310, 311, 312, 313};
         const std::array<int, request_count> first_base_cached_tokens = {
             100, 200, 300};
         const std::array<int, request_count> second_base_cached_tokens = {
@@ -747,6 +757,10 @@ namespace
             first_tokens.size() * sizeof(int32_t), device_id_);
         void *d_second_tokens = backend_->allocate(
             second_tokens.size() * sizeof(int32_t), device_id_);
+        void *d_first_verifier_inputs = backend_->allocate(
+            first_verifier_inputs.size() * sizeof(int32_t), device_id_);
+        void *d_second_verifier_inputs = backend_->allocate(
+            second_verifier_inputs.size() * sizeof(int32_t), device_id_);
         void *d_first_meta = backend_->allocate(
             first_meta.size() * sizeof(int), device_id_);
         void *d_second_meta = backend_->allocate(
@@ -781,12 +795,18 @@ namespace
             backend_->allocate(request_count * sizeof(int), device_id_);
         void *d_shifted_ok =
             backend_->allocate(request_count * sizeof(int), device_id_);
+        void *d_committed_verifier_identity = backend_->allocate(
+            request_count *
+                sizeof(MTPCommittedVerifierIdentityRecord),
+            device_id_);
 
         auto cleanup = [&]()
         {
             void *allocations[] = {
                 d_first_tokens,
                 d_second_tokens,
+                d_first_verifier_inputs,
+                d_second_verifier_inputs,
                 d_first_meta,
                 d_second_meta,
                 d_first_base,
@@ -806,7 +826,8 @@ namespace
                 d_next_sidecar_position_ids,
                 d_shifted_target_cached_tokens,
                 d_shifted_accepted_state_counts,
-                d_shifted_ok};
+                d_shifted_ok,
+                d_committed_verifier_identity};
             for (void *allocation : allocations)
             {
                 if (allocation)
@@ -816,6 +837,8 @@ namespace
 
         ASSERT_NE(d_first_tokens, nullptr);
         ASSERT_NE(d_second_tokens, nullptr);
+        ASSERT_NE(d_first_verifier_inputs, nullptr);
+        ASSERT_NE(d_second_verifier_inputs, nullptr);
         ASSERT_NE(d_first_meta, nullptr);
         ASSERT_NE(d_second_meta, nullptr);
         ASSERT_NE(d_first_base, nullptr);
@@ -836,6 +859,7 @@ namespace
         ASSERT_NE(d_shifted_target_cached_tokens, nullptr);
         ASSERT_NE(d_shifted_accepted_state_counts, nullptr);
         ASSERT_NE(d_shifted_ok, nullptr);
+        ASSERT_NE(d_committed_verifier_identity, nullptr);
 
         auto run_capture = [&](IWorkerGPUContext &ctx)
         {
@@ -852,6 +876,18 @@ namespace
                 ASSERT_TRUE(copyHostToDevice(
                     d_second_tokens, second_tokens.data(),
                     second_tokens.size() * sizeof(int32_t), device_id_, stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_first_verifier_inputs,
+                    first_verifier_inputs.data(),
+                    first_verifier_inputs.size() * sizeof(int32_t),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(copyHostToDevice(
+                    d_second_verifier_inputs,
+                    second_verifier_inputs.data(),
+                    second_verifier_inputs.size() * sizeof(int32_t),
+                    device_id_,
+                    stream));
                 ASSERT_TRUE(copyHostToDevice(
                     d_first_meta, first_meta.data(),
                     first_meta.size() * sizeof(int), device_id_, stream));
@@ -874,6 +910,13 @@ namespace
                 ASSERT_TRUE(copyHostToDevice(
                     d_response, initial_response.data(),
                     initial_response.size() * sizeof(int32_t), device_id_, stream));
+                ASSERT_TRUE(backend_->memset(
+                    d_committed_verifier_identity,
+                    0,
+                    request_count *
+                        sizeof(MTPCommittedVerifierIdentityRecord),
+                    device_id_,
+                    stream));
                 ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
 
                 EXPECT_FALSE(backend_->enqueueInitializeDeviceGeneration(
@@ -903,7 +946,10 @@ namespace
                         d_all_drafts_accepted, d_stopped,
                         d_next_sidecar_condition_tokens,
                         d_next_sidecar_position_ids,
-                        d_next_verifier_condition_tokens));
+                        d_next_verifier_condition_tokens,
+                        d_first_verifier_inputs,
+                        verifier_row_capacity,
+                        d_committed_verifier_identity));
 
                 auto capture = ctx.createGraphCapture(stream);
                 ASSERT_NE(capture, nullptr);
@@ -935,7 +981,10 @@ namespace
                         d_all_drafts_accepted, d_stopped,
                         d_next_sidecar_condition_tokens,
                         d_next_sidecar_position_ids,
-                        d_next_verifier_condition_tokens));
+                        d_next_verifier_condition_tokens,
+                        d_first_verifier_inputs,
+                        verifier_row_capacity,
+                        d_committed_verifier_identity));
                 ASSERT_TRUE(
                     backend_->enqueuePrepareDeviceGenerationTransactionBudget(
                         d_control, control_stride, request_count,
@@ -956,7 +1005,10 @@ namespace
                         d_all_drafts_accepted, d_stopped,
                         d_next_sidecar_condition_tokens,
                         d_next_sidecar_position_ids,
-                        d_next_verifier_condition_tokens));
+                        d_next_verifier_condition_tokens,
+                        d_second_verifier_inputs,
+                        verifier_row_capacity,
+                        d_committed_verifier_identity));
                 /*
                  * A statically captured resident loop may reach one more body
                  * after its controller becomes terminal.  Feed stale compact
@@ -983,7 +1035,10 @@ namespace
                         d_all_drafts_accepted, d_stopped,
                         d_next_sidecar_condition_tokens,
                         d_next_sidecar_position_ids,
-                        d_next_verifier_condition_tokens));
+                        d_next_verifier_condition_tokens,
+                        d_first_verifier_inputs,
+                        verifier_row_capacity,
+                        d_committed_verifier_identity));
                 ASSERT_TRUE(capture->endCapture());
                 ASSERT_TRUE(capture->instantiate());
 
@@ -1022,6 +1077,10 @@ namespace
         std::array<int32_t, request_count>
             actual_next_sidecar_condition_tokens{};
         std::array<int32_t, request_count> actual_next_sidecar_position_ids{};
+        std::array<
+            MTPCommittedVerifierIdentityRecord,
+            request_count>
+            actual_committed_verifier_identities{};
         ASSERT_TRUE(copyDeviceToHost(
             actual_response.data(), d_response,
             actual_response.size() * sizeof(int32_t), device_id_));
@@ -1064,6 +1123,11 @@ namespace
             d_next_sidecar_position_ids,
             actual_next_sidecar_position_ids.size() * sizeof(int32_t),
             device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            actual_committed_verifier_identities.data(),
+            d_committed_verifier_identity,
+            sizeof(actual_committed_verifier_identities),
+            device_id_));
 
         EXPECT_EQ(actual_response, expected_response);
         EXPECT_EQ(actual_control, expected_control);
@@ -1092,6 +1156,39 @@ namespace
             SCOPED_TRACE(::testing::Message() << "request=" << request);
             const int *control =
                 actual_control.data() + request * control_stride;
+            const auto &identity =
+                actual_committed_verifier_identities[
+                    static_cast<size_t>(request)];
+            const bool committed_second_transaction = request < 2;
+            const auto &expected_verifier_inputs =
+                committed_second_transaction
+                    ? second_verifier_inputs
+                    : first_verifier_inputs;
+            EXPECT_EQ(identity.valid, 1u);
+            EXPECT_EQ(
+                identity.version,
+                kMTPCommittedVerifierIdentityVersion);
+            EXPECT_EQ(
+                identity.transaction_count,
+                committed_second_transaction ? 2 : 1);
+            EXPECT_EQ(
+                identity.draft_depth,
+                verifier_row_capacity - 1);
+            for (int row = 0; row < verifier_row_capacity; ++row)
+            {
+                EXPECT_EQ(
+                    identity.verifier_input_tokens[row],
+                    expected_verifier_inputs[
+                        static_cast<size_t>(request) *
+                            verifier_row_capacity +
+                        row]);
+            }
+            for (int row = verifier_row_capacity;
+                 row < kSpeculativeBatchMaxOutputTokens;
+                 ++row)
+            {
+                EXPECT_EQ(identity.verifier_input_tokens[row], -1);
+            }
             EXPECT_EQ(control[kDeviceGenerationControlOk], 1);
             EXPECT_EQ(control[kDeviceGenerationControlRequestComplete], 1);
             EXPECT_EQ(
@@ -1127,6 +1224,121 @@ namespace
                 EXPECT_EQ(control[kDeviceGenerationControlModelStopped], 1);
             }
         }
+
+        /*
+         * Poison one active draft after proving the captured happy path. The
+         * fused kernel must reject it before response/controller commit on both
+         * backends, and the admission-reset identity storage must remain
+         * invalid rather than certifying the prior request's row.
+         */
+        auto invalid_verifier_inputs = first_verifier_inputs;
+        invalid_verifier_inputs[1] = -1;
+        std::array<int32_t, request_count * response_token_stride>
+            reset_response{};
+        reset_response.fill(-1);
+        ASSERT_TRUE(copyHostToDevice(
+            d_first_verifier_inputs,
+            invalid_verifier_inputs.data(),
+            invalid_verifier_inputs.size() * sizeof(int32_t),
+            device_id_));
+        ASSERT_TRUE(copyHostToDevice(
+            d_first_meta,
+            first_meta.data(),
+            first_meta.size() * sizeof(int),
+            device_id_));
+        ASSERT_TRUE(copyHostToDevice(
+            d_first_base,
+            first_base_cached_tokens.data(),
+            first_base_cached_tokens.size() * sizeof(int),
+            device_id_));
+        ASSERT_TRUE(copyHostToDevice(
+            d_response,
+            reset_response.data(),
+            reset_response.size() * sizeof(int32_t),
+            device_id_));
+        ASSERT_TRUE(backend_->memset(
+            d_committed_verifier_identity,
+            0,
+            request_count *
+                sizeof(MTPCommittedVerifierIdentityRecord),
+            device_id_,
+            stream_));
+        ASSERT_TRUE(backend_->enqueueInitializeDeviceGeneration(
+            request_count,
+            max_new_tokens,
+            DeviceGenerationDepthPolicy::fixed(
+                verifier_row_capacity - 1),
+            DeviceGenerationLeadingRowDisposition::PendingResponse,
+            response_token_stride,
+            d_response,
+            control_stride,
+            d_control,
+            device_id_,
+            stream_));
+        ASSERT_TRUE(
+            backend_->enqueuePrepareDeviceGenerationTransactionBudget(
+                d_control,
+                control_stride,
+                request_count,
+                verifier_row_capacity,
+                /*maintenance_rows_remaining_device=*/nullptr,
+                /*maintenance_due_device=*/nullptr,
+                /*decode_boundary_advanced_device=*/nullptr,
+                device_id_,
+                stream_));
+        ASSERT_TRUE(
+            backend_->enqueueCommitDeviceGenerationAndDeriveSpeculativePublicationMetadata(
+                d_first_tokens,
+                output_token_stride,
+                d_first_meta,
+                meta_stride,
+                d_first_base,
+                request_count,
+                verifier_row_capacity,
+                d_response,
+                response_token_stride,
+                d_control,
+                control_stride,
+                device_id_,
+                stream_,
+                d_restore_rows,
+                d_target_cached_tokens,
+                d_accepted_state_counts,
+                d_publication_ok,
+                d_next_condition_tokens,
+                d_all_drafts_accepted,
+                d_stopped,
+                d_next_sidecar_condition_tokens,
+                d_next_sidecar_position_ids,
+                d_next_verifier_condition_tokens,
+                d_first_verifier_inputs,
+                verifier_row_capacity,
+                d_committed_verifier_identity));
+
+        std::array<int, request_count * control_stride> invalid_control{};
+        std::array<
+            MTPCommittedVerifierIdentityRecord,
+            request_count>
+            invalid_identities{};
+        ASSERT_TRUE(copyDeviceToHost(
+            invalid_control.data(),
+            d_control,
+            invalid_control.size() * sizeof(int),
+            device_id_));
+        ASSERT_TRUE(copyDeviceToHost(
+            invalid_identities.data(),
+            d_committed_verifier_identity,
+            sizeof(invalid_identities),
+            device_id_));
+        EXPECT_EQ(
+            invalid_control[kDeviceGenerationControlOk],
+            0);
+        EXPECT_EQ(
+            invalid_control[kDeviceGenerationControlErrorCode],
+            static_cast<int>(
+                DeviceGenerationError::
+                    InvalidVerifierTransactionIdentity));
+        EXPECT_EQ(invalid_identities[0].valid, 0u);
 
         cleanup();
     }

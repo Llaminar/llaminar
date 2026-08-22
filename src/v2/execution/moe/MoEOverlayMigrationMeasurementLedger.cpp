@@ -83,9 +83,8 @@ namespace llaminar2
                            row.wave_sample_count <
                                MoEOverlayEconomyProfileComposer::
                                    kMinimumMigrationSamples ||
-                           row.interference_sample_count <
-                               MoEOverlayEconomyProfileComposer::
-                                   kMinimumMigrationSamples)
+                           row.inference_interference_nanoseconds != 0 ||
+                           row.interference_sample_count != 0)
                        {
                            return false;
                        }
@@ -403,19 +402,6 @@ namespace llaminar2
             {
                 return false;
             }
-            for (std::size_t phase = 0;
-                 phase < kExpertHistogramProductionSourceCount;
-                 ++phase)
-            {
-                if (!config_.required_sources[phase])
-                    continue;
-                if (coordinate_state_[index]
-                        .interference_observations[phase]
-                        .load(std::memory_order_acquire) < required)
-                {
-                    return false;
-                }
-            }
         }
         return true;
     }
@@ -436,12 +422,6 @@ namespace llaminar2
 
         MoEOverlaySealedMigrationMeasurements result;
         result.rows.reserve(coordinates_.size());
-        std::vector<
-            std::array<
-                std::uint64_t,
-                kExpertHistogramProductionSourceCount>>
-            phase_interference_medians;
-        phase_interference_medians.reserve(coordinates_.size());
         const std::size_t sample_count = static_cast<std::size_t>(
             config_.measured_samples_per_coordinate);
         for (std::size_t coordinate_index = 0;
@@ -461,41 +441,14 @@ namespace llaminar2
                 wave_samples_.begin() + static_cast<std::ptrdiff_t>(end)));
             row.wave_sample_count =
                 config_.measured_samples_per_coordinate;
-            std::array<
-                std::uint64_t,
-                kExpertHistogramProductionSourceCount>
-                phase_medians{};
-            for (std::size_t phase = 0;
-                 phase < kExpertHistogramProductionSourceCount;
-                 ++phase)
-            {
-                if (!config_.required_sources[phase])
-                    continue;
-                const std::size_t phase_begin = interferenceSampleOffset(
-                    coordinate_index, phase, 0);
-                phase_medians[phase] = median(std::vector<std::uint64_t>(
-                    interference_samples_.begin() +
-                        static_cast<std::ptrdiff_t>(phase_begin),
-                    interference_samples_.begin() +
-                        static_cast<std::ptrdiff_t>(
-                            phase_begin + sample_count)));
-            }
             /*
-             * Placement is shared by all inference phases.  Charge the worst
-             * robust phase median so a cheap decode sample cannot conceal a
-             * prefill or grouped-verifier contention regression.
+             * Runtime contention is controlled by the maintenance byte/cycle
+             * budget and certified by the real-device performance campaign.
+             * It is not a stable property of one inference transaction, so it
+             * does not belong in the immutable startup transport profile.
              */
-            row.inference_interference_nanoseconds = *std::max_element(
-                phase_medians.begin(), phase_medians.end());
-            const auto required_phase_count = static_cast<std::uint64_t>(
-                std::count(
-                    config_.required_sources.begin(),
-                    config_.required_sources.end(),
-                    true));
-            row.interference_sample_count =
-                config_.measured_samples_per_coordinate *
-                required_phase_count;
-            phase_interference_medians.push_back(phase_medians);
+            row.inference_interference_nanoseconds = 0u;
+            row.interference_sample_count = 0u;
 
             for (std::size_t projection = 0; projection < 3; ++projection)
             {
@@ -530,10 +483,8 @@ namespace llaminar2
         }
 
         std::uint64_t hash = kFNV1a64OffsetBasis;
-        hashString(hash, "MoEOverlayMigrationMeasurementLedger/v2");
+        hashString(hash, "MoEOverlayMigrationMeasurementLedger/v3");
         hashString(hash, config_.measurement_identity);
-        for (const bool required : config_.required_sources)
-            hashUnsigned(hash, required ? 1u : 0u);
         for (std::size_t row_index = 0; row_index < result.rows.size(); ++row_index)
         {
             const auto &row = result.rows[row_index];
@@ -542,11 +493,6 @@ namespace llaminar2
             hashUnsigned(hash, static_cast<std::uint64_t>(row.layer));
             hashUnsigned(hash, row.wave_wall_nanoseconds);
             hashUnsigned(hash, row.inference_interference_nanoseconds);
-            for (const auto phase_median :
-                 phase_interference_medians[row_index])
-            {
-                hashUnsigned(hash, phase_median);
-            }
             for (const auto &projection : row.projections)
             {
                 hashUnsigned(hash, projection.bytes);
@@ -557,7 +503,7 @@ namespace llaminar2
             }
         }
         std::ostringstream identity;
-        identity << "expert-overlay-migration-measurements-v2/"
+        identity << "expert-overlay-migration-measurements-v3/"
                  << std::hex << std::setfill('0') << std::setw(16) << hash;
         result.identity = identity.str();
         if (!result.valid())

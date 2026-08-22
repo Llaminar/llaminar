@@ -32,13 +32,15 @@ namespace
         "GDN_Z_PROJECTION",
         "GDN_DELTA_RULE_OUTPUT",
         "GDN_NORM_GATE_OUTPUT",
-    };
-
-    const std::vector<std::string> kLocalTPMoEAllreduceStages = {
+        /*
+         * ExpertOverlay reduces the routed and shared branches through typed
+         * rooted collectives, then publishes one replicated canonical
+         * MOE_COMBINED_OUTPUT. Branch-local buffers are deliberately not
+         * semantic post-collective checkpoints in that production DAG.
+         */
         "MOE_EXPERT_OUTPUT",
         "MOE_SHARED_EXPERT_OUTPUT",
         "MOE_SHARED_GATE_OUTPUT",
-        "MOE_COMBINED_OUTPUT",
     };
 
     const std::vector<TestConfig> kLocalTPMoEConfigs = {
@@ -54,7 +56,12 @@ namespace
                 .min_early_layers_passed = 5,
                 .kl_threshold = 0.05f,
                 .excluded_stages = kLocalTPMoEExcludedStages,
-                .allreduce_stages = kLocalTPMoEAllreduceStages,
+                /*
+                 * MOE_COMBINED_OUTPUT is already the post-publication tensor.
+                 * Requiring a second `_ALLREDUCED` alias would describe the
+                 * retired ordinary-TP graph rather than the live sparse path.
+                 */
+                .allreduce_stages = {},
                 .min_top1_accuracy = 0.80f,
                 .min_top5_accuracy = 0.80f,
                 .pytorch_top1_in_topk = 4,

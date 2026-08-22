@@ -27,6 +27,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -88,8 +89,10 @@ namespace llaminar2
     /**
      * @brief Singleton profiler for weight loading phases
      *
-     * Simple wall-clock timing per phase. Not thread-safe (weight loading
-     * is single-threaded per rank).
+     * Graph construction and device loading fan out across participant worker
+     * threads. Starts are stacked per thread and label before their durations
+     * are aggregated process-wide. Nested scopes with the same label are also
+     * well-defined.
      */
     class WeightLoadingProfiler
     {
@@ -111,7 +114,9 @@ namespace llaminar2
                 return;
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
-            inst.starts_[static_cast<size_t>(phase)] = Clock::now();
+            inst.phase_starts_[std::this_thread::get_id()]
+                [static_cast<size_t>(phase)]
+                    .push_back(Clock::now());
         }
 
         static void end(WeightLoadPhase phase)
@@ -121,7 +126,23 @@ namespace llaminar2
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
             auto idx = static_cast<size_t>(phase);
-            auto elapsed = Clock::now() - inst.starts_[idx];
+            const auto thread_id = std::this_thread::get_id();
+            auto thread_it = inst.phase_starts_.find(thread_id);
+            if (thread_it == inst.phase_starts_.end() ||
+                thread_it->second[idx].empty())
+            {
+                return;
+            }
+            const TimePoint start = thread_it->second[idx].back();
+            thread_it->second[idx].pop_back();
+            if (std::all_of(
+                    thread_it->second.begin(),
+                    thread_it->second.end(),
+                    [](const auto &stack) { return stack.empty(); }))
+            {
+                inst.phase_starts_.erase(thread_it);
+            }
+            auto elapsed = Clock::now() - start;
             const double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
             inst.durations_ms_[idx] += elapsed_ms;
             inst.call_counts_[idx]++;
@@ -138,7 +159,8 @@ namespace llaminar2
                 return;
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
-            inst.detail_starts_[label] = Clock::now();
+            inst.detail_starts_[std::this_thread::get_id()][label]
+                .push_back(Clock::now());
         }
 
         static void endDetail(const std::string &label)
@@ -147,14 +169,23 @@ namespace llaminar2
                 return;
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
-            auto it = inst.detail_starts_.find(label);
-            if (it == inst.detail_starts_.end())
+            const auto thread_id = std::this_thread::get_id();
+            auto thread_it = inst.detail_starts_.find(thread_id);
+            if (thread_it == inst.detail_starts_.end())
                 return;
-            auto elapsed = Clock::now() - it->second;
+            auto label_it = thread_it->second.find(label);
+            if (label_it == thread_it->second.end() || label_it->second.empty())
+                return;
+            const TimePoint start = label_it->second.back();
+            label_it->second.pop_back();
+            if (label_it->second.empty())
+                thread_it->second.erase(label_it);
+            if (thread_it->second.empty())
+                inst.detail_starts_.erase(thread_it);
+            auto elapsed = Clock::now() - start;
             const double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
             inst.detail_durations_ms_[label] += elapsed_ms;
             inst.detail_call_counts_[label] += 1;
-            inst.detail_starts_.erase(it);
             PerfStatsCollector::recordTimingNs(
                 "weight_loading",
                 label,
@@ -185,6 +216,7 @@ namespace llaminar2
         {
             auto &inst = getInstance();
             std::lock_guard<std::mutex> lock(inst.mutex_);
+            inst.phase_starts_.clear();
             inst.durations_ms_.fill(0.0);
             inst.call_counts_.fill(0);
             inst.detail_starts_.clear();
@@ -351,10 +383,15 @@ namespace llaminar2
             return instance;
         }
 
-        std::array<TimePoint, PHASE_COUNT> starts_{};
+        using PhaseStartStacks =
+            std::array<std::vector<TimePoint>, PHASE_COUNT>;
+        using DetailStartStacks =
+            std::unordered_map<std::string, std::vector<TimePoint>>;
+
+        std::unordered_map<std::thread::id, PhaseStartStacks> phase_starts_;
         std::array<double, PHASE_COUNT> durations_ms_{};
         std::array<uint32_t, PHASE_COUNT> call_counts_{};
-        std::unordered_map<std::string, TimePoint> detail_starts_{};
+        std::unordered_map<std::thread::id, DetailStartStacks> detail_starts_;
         std::unordered_map<std::string, double> detail_durations_ms_{};
         std::unordered_map<std::string, uint32_t> detail_call_counts_{};
         mutable std::mutex mutex_;

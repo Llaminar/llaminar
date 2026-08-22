@@ -1,25 +1,21 @@
 /**
  * @file ExpertTierGpuBlobTransferLane.cpp
- * @brief Event-polled CUDA/ROCm packed expert blob relay implementation.
+ * @brief Async-DMA CUDA/ROCm packed expert blob relay implementation.
  *
- * Device work is split into source-runtime and destination-runtime phases. A
- * host event query is the only portable ownership handoff between CUDA and HIP;
+ * Device work is split into source D2H and destination H2D event-polled phases.
+ * Host completion is the portable ownership handoff between CUDA and HIP;
  * cross-runtime event waits are deliberately forbidden. Two persistent slots
- * allow the source to prepare a later chunk while the destination consumes an
- * earlier one, without allocating, synchronizing, or rebinding inference data.
+ * let the source prepare a later chunk while the destination consumes an
+ * earlier one, without allocation, synchronization, or inference-stream joins.
  */
 
 #include "ExpertTierGpuBlobTransferLane.h"
 
-#include "../../backends/BackendManager.h"
-#include "../../backends/GPUDeviceContextPool.h"
-#include "../../backends/IBackend.h"
-#include "../../backends/IWorkerGPUContext.h"
+#include "../../transfer/TransferEngine.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <exception>
 #include <numeric>
@@ -181,16 +177,38 @@ namespace llaminar2
             !config_.destination_device.is_gpu())
         {
             throw std::invalid_argument(
-                "Heterogeneous GPU blob lane requires two GPU endpoints");
+                "GPU host-relay lane requires two GPU endpoints");
         }
-        if (config_.source_device.type == config_.destination_device.type)
+        const bool same_backend =
+            config_.source_device.type == config_.destination_device.type;
+        const bool topology_matches =
+            (config_.relay_kind == ExpertTierGpuBlobRelayKind::CrossBackend &&
+             !same_backend) ||
+            (config_.relay_kind ==
+                 ExpertTierGpuBlobRelayKind::SameBackendWithoutPeerAccess &&
+             same_backend &&
+             config_.source_device != config_.destination_device);
+        if (!topology_matches)
         {
             throw std::invalid_argument(
-                "Heterogeneous GPU blob lane requires different backend types");
+                "GPU blob host relay kind contradicts its endpoint topology");
         }
         if (config_.lane_name.empty())
             throw std::invalid_argument(
-                "Heterogeneous GPU blob lane requires a stable non-empty name");
+                "GPU host-relay lane requires a stable non-empty name");
+        if (!config_.source_progress_epoch ||
+            !config_.destination_progress_epoch ||
+            config_.source_progress_epoch->device() != config_.source_device ||
+            config_.destination_progress_epoch->device() !=
+                config_.destination_device ||
+            config_.source_progress_epoch->maximumBytes() <
+                config_.staging_capacity_bytes ||
+            config_.destination_progress_epoch->maximumBytes() <
+                config_.staging_capacity_bytes)
+        {
+            throw std::invalid_argument(
+                "GPU host-relay lane requires matching source and destination retained epochs with sufficient byte capacity");
+        }
         if (config_.perf_device.empty())
         {
             config_.perf_device =
@@ -201,9 +219,9 @@ namespace llaminar2
 
     ExpertTierGpuBlobTransferLane::~ExpertTierGpuBlobTransferLane()
     {
-        if (hasInFlightWork() || unfenced_work_)
+        if (hasInFlightWork())
         {
-            LOG_ERROR("[ExpertTierGpuBlobTransferLane] Destroyed with unresolved DMA"
+            LOG_ERROR("[ExpertTierGpuBlobTransferLane] Destroyed with unresolved retained progress"
                       << " lane=" << config_.lane_name
                       << " src=" << config_.source_device.to_string()
                       << " dst=" << config_.destination_device.to_string());
@@ -214,28 +232,17 @@ namespace llaminar2
 
     bool ExpertTierGpuBlobTransferLane::materialized() const noexcept
     {
-        if (!source_backend_ || !destination_backend_ ||
-            !source_context_ || !destination_context_ ||
-            source_ordinal_ < 0 || destination_ordinal_ < 0 ||
-            !source_stream_ || !destination_stream_)
-        {
-            return false;
-        }
         return std::all_of(
             slots_.begin(),
             slots_.end(),
-            [this](const Slot &slot)
+            [](const Slot &slot)
             {
-                const bool base = slot.source_pinned &&
-                                  slot.destination_pinned &&
-                                  slot.source_event &&
-                                  slot.destination_event;
-                const bool timing = !config_.collect_timing_measurements ||
-                                    (slot.source_timing_start_event &&
-                                     slot.source_timing_stop_event &&
-                                     slot.destination_timing_start_event &&
-                                     slot.destination_timing_stop_event);
-                return base && timing;
+                return slot.source_mapped &&
+                       slot.source_mapped->isBound() &&
+                       slot.destination_mapped &&
+                       slot.destination_mapped->isBound() &&
+                       slot.source_progress.valid() &&
+                       slot.destination_progress.valid();
             });
     }
 
@@ -244,78 +251,66 @@ namespace llaminar2
     {
         if (materialized())
             return true;
-        if (source_backend_ || destination_backend_ || source_context_ ||
-            destination_context_ || source_ordinal_ >= 0 ||
-            destination_ordinal_ >= 0 || source_stream_ || destination_stream_)
+        if (std::any_of(
+                slots_.begin(),
+                slots_.end(),
+                [](const Slot &slot)
+                {
+                    return slot.source_mapped || slot.destination_mapped ||
+                           slot.source_progress.valid() ||
+                           slot.destination_progress.valid();
+                }))
         {
             assignBlobTransferError(
                 error,
-                "Heterogeneous GPU blob lane has a partial resource set");
+                "GPU host-relay lane has a partial resource set");
             return false;
         }
 
         try
         {
-            source_backend_ = getBackendFor(config_.source_device);
-            destination_backend_ = getBackendFor(config_.destination_device);
-            if (!source_backend_ || !destination_backend_)
-                throw std::runtime_error("A configured GPU backend is unavailable");
-
-            source_ordinal_ = config_.source_device.gpu_ordinal();
-            destination_ordinal_ = config_.destination_device.gpu_ordinal();
-            source_context_ = &GPUDeviceContextPool::instance().getContext(
-                config_.source_device);
-            destination_context_ = &GPUDeviceContextPool::instance().getContext(
-                config_.destination_device);
-            source_stream_ = source_context_->getOrCreateAuxiliaryStream(
-                "expert_tier_gpu_blob_source:" + config_.lane_name);
-            destination_stream_ =
-                destination_context_->getOrCreateAuxiliaryStream(
-                    "expert_tier_gpu_blob_destination:" + config_.lane_name);
-            if (!source_stream_ || !destination_stream_)
-                throw std::runtime_error("Could not create both auxiliary streams");
-
             /*
-             * Each runtime owns the host memory used by its own DMA engine.
-             * A bounded CPU memcpy is the portable bridge between CUDA and HIP.
+             * Each staging allocation is mapped only into the GPU that touches
+             * it. The setup thread first-touches both host regions; a bounded
+             * CPU memcpy is the sole portable CUDA/HIP ownership bridge.
              */
-            for (Slot &slot : slots_)
+            TransferEngine transfer_engine;
+            const std::array<DeviceId, 1> source_devices{
+                config_.source_device};
+            const std::array<DeviceId, 1> destination_devices{
+                config_.destination_device};
+            for (std::size_t slot_index = 0u;
+                 slot_index < slots_.size(); ++slot_index)
             {
-                slot.source_event =
-                    source_backend_->createEvent(source_ordinal_);
-                slot.destination_event =
-                    destination_backend_->createEvent(destination_ordinal_);
-                if (config_.collect_timing_measurements)
-                {
-                    slot.source_timing_start_event =
-                        source_backend_->createTimingEvent(source_ordinal_);
-                    slot.source_timing_stop_event =
-                        source_backend_->createTimingEvent(source_ordinal_);
-                    slot.destination_timing_start_event =
-                        destination_backend_->createTimingEvent(
-                            destination_ordinal_);
-                    slot.destination_timing_stop_event =
-                        destination_backend_->createTimingEvent(
-                            destination_ordinal_);
-                }
-                slot.source_pinned = static_cast<std::uint8_t *>(
-                    source_backend_->allocatePinned(
+                Slot &slot = slots_[slot_index];
+                slot.source_mapped =
+                    transfer_engine.allocateMappedHostRegion(
                         config_.staging_capacity_bytes,
-                        source_ordinal_));
-                slot.destination_pinned = static_cast<std::uint8_t *>(
-                    destination_backend_->allocatePinned(
+                        source_devices);
+                slot.destination_mapped =
+                    transfer_engine.allocateMappedHostRegion(
                         config_.staging_capacity_bytes,
-                        destination_ordinal_));
-                if (!slot.source_event || !slot.destination_event ||
-                    !slot.source_pinned || !slot.destination_pinned ||
-                    (config_.collect_timing_measurements &&
-                     (!slot.source_timing_start_event ||
-                      !slot.source_timing_stop_event ||
-                      !slot.destination_timing_start_event ||
-                      !slot.destination_timing_stop_event)))
+                        destination_devices);
+                slot.source_progress =
+                    config_.source_progress_epoch->reserveSlot(
+                        MappedTransferDirection::DeviceToHost,
+                        slot.source_mapped,
+                        config_.lane_name + ":source:" +
+                        std::to_string(slot_index));
+                slot.destination_progress =
+                    config_.destination_progress_epoch->reserveSlot(
+                        MappedTransferDirection::HostToDevice,
+                        slot.destination_mapped,
+                        config_.lane_name + ":destination:" +
+                        std::to_string(slot_index));
+                if (!slot.source_mapped || !slot.source_mapped->isBound() ||
+                    !slot.destination_mapped ||
+                    !slot.destination_mapped->isBound() ||
+                    !slot.source_progress.valid() ||
+                    !slot.destination_progress.valid())
                 {
                     throw std::runtime_error(
-                        "Could not allocate double-buffered events/pinned storage");
+                        "Could not allocate double-buffered mapped storage and epoch slots");
                 }
             }
         }
@@ -329,7 +324,7 @@ namespace llaminar2
         {
             assignBlobTransferError(
                 error,
-                "Heterogeneous GPU blob lane materialization threw a non-standard exception");
+                "GPU host-relay lane materialization threw a non-standard exception");
             releaseQuiescentResources();
             return false;
         }
@@ -346,7 +341,7 @@ namespace llaminar2
         {
             assignBlobTransferError(
                 error,
-                "Heterogeneous GPU blob lane is not materialized");
+                "GPU host-relay lane is not materialized");
             return false;
         }
         if (progress_ == ExpertTierGpuBlobTransferProgress::Pending ||
@@ -354,7 +349,7 @@ namespace llaminar2
         {
             assignBlobTransferError(
                 error,
-                "Heterogeneous GPU blob lane is already occupied");
+                "GPU host-relay lane is already occupied");
             return false;
         }
         if (!protocol_.begin(source, destination, error))
@@ -379,7 +374,7 @@ namespace llaminar2
         {
             assignBlobTransferError(
                 error,
-                "Heterogeneous GPU blob lane is not materialized");
+                "GPU host-relay lane is not materialized");
             return false;
         }
         if (progress_ == ExpertTierGpuBlobTransferProgress::Pending ||
@@ -387,7 +382,7 @@ namespace llaminar2
         {
             assignBlobTransferError(
                 error,
-                "Heterogeneous GPU blob lane is already occupied");
+                "GPU host-relay lane is already occupied");
             return false;
         }
         if (!source || !destination ||
@@ -408,45 +403,108 @@ namespace llaminar2
         return beginTransfer(source_readiness, error);
     }
 
+    bool ExpertTierGpuBlobTransferLane::validateBoundDeviceStorage(
+        std::string *error) noexcept
+    {
+        std::array<const void *, 4> source_addresses{};
+        std::array<const void *, 4> destination_addresses{};
+        std::size_t source_count = 0u;
+        std::size_t destination_count = 0u;
+        if (carries_contiguous_projection_)
+        {
+            source_addresses[source_count++] = contiguous_source_;
+            destination_addresses[destination_count++] =
+                contiguous_destination_;
+        }
+        else
+        {
+            source_addresses[source_count++] = source_.ptrs.d_vnni;
+            source_addresses[source_count++] = source_.ptrs.d_scales;
+            destination_addresses[destination_count++] =
+                destination_.ptrs.d_vnni;
+            destination_addresses[destination_count++] =
+                destination_.ptrs.d_scales;
+            if (source_.mins_bytes != 0u)
+                source_addresses[source_count++] = source_.ptrs.d_mins;
+            if (source_.emins_bytes != 0u)
+                source_addresses[source_count++] = source_.ptrs.d_emins;
+            if (destination_.mins_bytes != 0u)
+                destination_addresses[destination_count++] =
+                    destination_.ptrs.d_mins;
+            if (destination_.emins_bytes != 0u)
+                destination_addresses[destination_count++] =
+                    destination_.ptrs.d_emins;
+        }
+
+        std::string validation_error;
+        if (!config_.source_progress_epoch->validateDeviceAddresses(
+                std::span<const void *const>(
+                    source_addresses.data(), source_count),
+                config_.lane_name + ":source",
+                &validation_error) ||
+            !config_.destination_progress_epoch->validateDeviceAddresses(
+                std::span<const void *const>(
+                    destination_addresses.data(), destination_count),
+                config_.lane_name + ":destination",
+                &validation_error))
+        {
+            assignBlobTransferError(
+                error,
+                validation_error.empty()
+                    ? "GPU host-relay endpoint pointer ownership validation failed"
+                    : validation_error);
+            return false;
+        }
+        return true;
+    }
+
     bool ExpertTierGpuBlobTransferLane::beginTransfer(
         const ExpertTierSourceReadiness &source_readiness,
         std::string *error) noexcept
     {
-
         /*
-         * Only a freshly produced source needs the source-runtime dependency.
-         * An installed RCU bank is already quiescent and immutable. The
-         * destination never sees a CUDA event in HIP or a HIP event in CUDA.
+         * A retained replay may already be between claim and copy while the
+         * maintenance thread enters here. Publishing a producer-dependent
+         * command and then appending an event wait would therefore be racy.
+         * Physical ExpertOverlay migration always reads an installed immutable
+         * RCU bank, so make that production invariant an explicit type gate.
          */
-        if (source_readiness.requiresProducerWait() &&
-            !source_context_->waitEventChecked(
-                source_readiness.event(),
-                source_stream_))
+        if (source_readiness.requiresProducerWait())
         {
             assignBlobTransferError(
                 error,
-                "Could not enqueue source producer dependency");
+                "Retained GPU host relay requires an immutable published-residency-bank source");
             return false;
         }
+        if (!validateBoundDeviceStorage(error))
+            return false;
 
         for (Slot &slot : slots_)
         {
             slot.chunk = {};
             slot.phase = SlotPhase::Idle;
-            slot.source_timing_valid = false;
-            slot.destination_timing_valid = false;
+            if (slot.source_progress.pending() ||
+                slot.destination_progress.pending())
+            {
+                assignBlobTransferError(
+                    error,
+                    "GPU host-relay lane retained an unexpected outstanding command");
+                return false;
+            }
         }
         active_slots_ = 0;
         completed_bytes_ = 0;
-        last_destination_event_ = nullptr;
         failure_requested_ = false;
         failure_counted_ = false;
-        unfenced_work_ = false;
         failure_.clear();
         transfer_device_nanoseconds_ = 0;
         transfer_host_nanoseconds_ = 0;
+        max_source_dma_residence_nanoseconds_ = 0;
+        max_destination_dma_residence_nanoseconds_ = 0;
+        max_maintenance_poll_gap_nanoseconds_ = 0;
         progress_ = ExpertTierGpuBlobTransferProgress::Pending;
         transfer_started_at_ = std::chrono::steady_clock::now();
+        last_poll_at_ = transfer_started_at_;
         ++stats_.transfers_started;
         return enqueueAvailableSourceChunks(error);
     }
@@ -467,7 +525,7 @@ namespace llaminar2
             ++stats_.failed_transfers;
             PerfStatsCollector::addCounter(
                 "moe_overlay_residency",
-                "heterogeneous_gpu_blob_transfer_failures",
+                "gpu_host_relay_transfer_failures",
                 1.0,
                 "maintenance",
                 config_.perf_device,
@@ -545,74 +603,54 @@ namespace llaminar2
             chunk.bytes > config_.staging_capacity_bytes)
         {
             requestFailure(
-                "Heterogeneous GPU blob protocol produced an invalid source chunk",
+                "GPU host-relay protocol produced an invalid source chunk",
                 error);
             return false;
         }
 
-        bool timing_started = true;
         if (config_.collect_timing_measurements)
+            slot.source_submitted_at = std::chrono::steady_clock::now();
+
+        bool published = false;
+        std::string submission_failure;
+        try
         {
-            timing_started = source_backend_->recordEvent(
-                slot.source_timing_start_event,
-                source_ordinal_,
-                source_stream_);
+            slot.source_progress.publishDeviceToMappedHost(
+                source_pointer,
+                chunk.bytes,
+                0u,
+                chunk.bytes);
+            published = true;
         }
-        bool copied = timing_started && source_backend_->deviceToHostOnStream(
-            slot.source_pinned,
-            source_pointer,
-            chunk.bytes,
-            source_ordinal_,
-            source_stream_);
-        bool timing_stopped = true;
-        if (config_.collect_timing_measurements)
+        catch (const std::exception &exception)
         {
-            timing_stopped = source_backend_->recordEvent(
-                slot.source_timing_stop_event,
-                source_ordinal_,
-                source_stream_);
-            copied = copied && timing_stopped;
-            if (!timing_started || !timing_stopped)
-                ++stats_.timing_measurement_failures;
+            submission_failure = exception.what();
         }
-        /*
-         * Fence even after an enqueue error: a runtime may have accepted part
-         * of the operation before reporting failure. The slot is not reusable
-         * until its source event is observed ready.
-         */
-        if (!source_backend_->recordEvent(
-                slot.source_event,
-                source_ordinal_,
-                source_stream_))
+        catch (...)
         {
-            unfenced_work_ = true;
+            submission_failure =
+                "Source retained progress publication threw a non-standard exception";
+        }
+
+        if (!published)
+        {
             requestFailure(
-                "Could not fence heterogeneous source DMA",
+                submission_failure.empty()
+                    ? "Could not publish GPU host-relay source command"
+                    : submission_failure,
                 error);
-            progress_ = ExpertTierGpuBlobTransferProgress::Failed;
             return false;
         }
-
         slot.chunk = chunk;
-        slot.phase = SlotPhase::SourceDmaPending;
-        slot.source_timing_valid = timing_started && timing_stopped;
-        slot.destination_timing_valid = false;
+        slot.phase = SlotPhase::SourceProgressPending;
         ++active_slots_;
         ++stats_.chunks_submitted;
         ++stats_.source_d2h_submissions;
+        ++stats_.source_progress_kernel_submissions;
         stats_.bytes_submitted += chunk.bytes;
         stats_.maximum_in_flight_chunks = std::max<std::uint64_t>(
             stats_.maximum_in_flight_chunks,
             static_cast<std::uint64_t>(active_slots_));
-        if (!copied)
-        {
-            requestFailure(
-                slot.source_timing_valid
-                    ? "Could not submit heterogeneous source D2H chunk"
-                    : "Could not record heterogeneous source timing events",
-                error);
-            return false;
-        }
         return true;
     }
 
@@ -644,20 +682,20 @@ namespace llaminar2
         if (!destination_pointer)
         {
             requestFailure(
-                "Heterogeneous GPU blob destination pointer is null",
+                "GPU host-relay destination pointer is null",
                 error);
             return false;
         }
 
         /*
-         * The source event made source_pinned CPU-owned. Copying into the
-         * destination runtime's pinned allocation is the only cross-runtime
-         * handoff; it is bounded by the lane capacity and runs on maintenance.
+         * The source completion generation made the mapped source pages
+         * CPU-owned. Copying into destination-mapped pages is the only
+         * cross-runtime handoff; it is bounded and runs on maintenance.
          */
         const auto host_copy_started = std::chrono::steady_clock::now();
         std::memcpy(
-            slot.destination_pinned,
-            slot.source_pinned,
+            slot.destination_mapped->mutableHostData(),
+            slot.source_mapped->mutableHostData(),
             slot.chunk.bytes);
         const auto host_elapsed =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -669,57 +707,42 @@ namespace llaminar2
         ++stats_.host_relay_copies;
         stats_.host_relay_bytes += slot.chunk.bytes;
 
-        bool timing_started = true;
         if (config_.collect_timing_measurements)
+            slot.destination_submitted_at = std::chrono::steady_clock::now();
+
+        bool published = false;
+        std::string submission_failure;
+        try
         {
-            timing_started = destination_backend_->recordEvent(
-                slot.destination_timing_start_event,
-                destination_ordinal_,
-                destination_stream_);
+            slot.destination_progress.publishMappedHostToDevice(
+                destination_pointer,
+                slot.chunk.bytes,
+                0u,
+                slot.chunk.bytes);
+            published = true;
         }
-        bool copied = timing_started && destination_backend_->hostToDeviceOnStream(
-            destination_pointer,
-            slot.destination_pinned,
-            slot.chunk.bytes,
-            destination_ordinal_,
-            destination_stream_);
-        bool timing_stopped = true;
-        if (config_.collect_timing_measurements)
+        catch (const std::exception &exception)
         {
-            timing_stopped = destination_backend_->recordEvent(
-                slot.destination_timing_stop_event,
-                destination_ordinal_,
-                destination_stream_);
-            copied = copied && timing_stopped;
-            if (!timing_started || !timing_stopped)
-                ++stats_.timing_measurement_failures;
+            submission_failure = exception.what();
         }
-        if (!destination_backend_->recordEvent(
-                slot.destination_event,
-                destination_ordinal_,
-                destination_stream_))
+        catch (...)
         {
-            unfenced_work_ = true;
-            requestFailure(
-                "Could not fence heterogeneous destination DMA",
-                error);
-            progress_ = ExpertTierGpuBlobTransferProgress::Failed;
-            return false;
+            submission_failure =
+                "Destination retained progress publication threw a non-standard exception";
         }
 
-        slot.phase = SlotPhase::DestinationDmaPending;
-        slot.destination_timing_valid = timing_started && timing_stopped;
-        last_destination_event_ = slot.destination_event;
-        ++stats_.destination_h2d_submissions;
-        if (!copied)
+        if (!published)
         {
             requestFailure(
-                slot.destination_timing_valid
-                    ? "Could not submit heterogeneous destination H2D chunk"
-                    : "Could not record heterogeneous destination timing events",
+                submission_failure.empty()
+                    ? "Could not publish GPU host-relay destination command"
+                    : submission_failure,
                 error);
             return false;
         }
+        slot.phase = SlotPhase::DestinationProgressPending;
+        ++stats_.destination_h2d_submissions;
+        ++stats_.destination_progress_kernel_submissions;
         return true;
     }
 
@@ -733,80 +756,99 @@ namespace llaminar2
             return progress_;
         }
 
+        if (config_.collect_timing_measurements)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            const auto poll_gap =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    now - last_poll_at_).count();
+            max_maintenance_poll_gap_nanoseconds_ = std::max(
+                max_maintenance_poll_gap_nanoseconds_,
+                static_cast<std::uint64_t>(
+                    std::max<std::int64_t>(1, poll_gap)));
+            last_poll_at_ = now;
+        }
+
         bool observed_pending = false;
         for (Slot &slot : slots_)
         {
-            if (slot.phase == SlotPhase::SourceDmaPending)
+            if (slot.phase == SlotPhase::SourceProgressPending)
             {
-                bool ready = false;
-                if (!source_context_->queryEventChecked(
-                        slot.source_event,
-                        ready))
+                std::string progress_error;
+                const MappedTransferProgress source_progress =
+                    slot.source_progress.poll(&progress_error);
+                if (source_progress == MappedTransferProgress::Failed)
                 {
-                    unfenced_work_ = true;
                     requestFailure(
-                        "Heterogeneous source event query failed",
+                        progress_error.empty()
+                            ? "GPU host-relay source progress command failed"
+                            : progress_error,
                         error);
-                    progress_ = ExpertTierGpuBlobTransferProgress::Failed;
-                    return progress_;
+                    slot.phase = SlotPhase::Idle;
+                    slot.chunk = {};
+                    --active_slots_;
+                    continue;
                 }
-                if (!ready)
+                if (source_progress == MappedTransferProgress::Pending)
                 {
                     observed_pending = true;
                     continue;
                 }
-                if (config_.collect_timing_measurements &&
-                    slot.source_timing_valid &&
-                    !collectSourceTiming(slot, error))
+                if (config_.collect_timing_measurements)
                 {
-                    requestFailure(
-                        "Heterogeneous source timing interval is unavailable",
-                        error);
+                    const auto residence =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() -
+                            slot.source_submitted_at).count();
+                    max_source_dma_residence_nanoseconds_ = std::max(
+                        max_source_dma_residence_nanoseconds_,
+                        static_cast<std::uint64_t>(
+                            std::max<std::int64_t>(1, residence)));
                 }
-                slot.source_timing_valid = false;
-                if (!failure_requested_ &&
+                if (failure_requested_ ||
                     !relayAndEnqueueDestination(slot, error))
                 {
-                    /* The destination event, when recorded, still owns slot. */
-                }
-                else if (failure_requested_)
-                {
-                    /* No new DMA after failure; source completion frees slot. */
+                    /* Source completion owns no storage after this point. */
                     slot.phase = SlotPhase::Idle;
                     slot.chunk = {};
                     --active_slots_;
                 }
             }
 
-            if (slot.phase == SlotPhase::DestinationDmaPending)
+            if (slot.phase == SlotPhase::DestinationProgressPending)
             {
-                bool ready = false;
-                if (!destination_context_->queryEventChecked(
-                        slot.destination_event,
-                        ready))
+                std::string progress_error;
+                const MappedTransferProgress destination_progress =
+                    slot.destination_progress.poll(&progress_error);
+                if (destination_progress == MappedTransferProgress::Failed)
                 {
-                    unfenced_work_ = true;
                     requestFailure(
-                        "Heterogeneous destination event query failed",
+                        progress_error.empty()
+                            ? "GPU host-relay destination progress command failed"
+                            : progress_error,
                         error);
-                    progress_ = ExpertTierGpuBlobTransferProgress::Failed;
-                    return progress_;
+                    slot.phase = SlotPhase::Idle;
+                    slot.chunk = {};
+                    --active_slots_;
+                    continue;
                 }
-                if (!ready)
+                if (destination_progress == MappedTransferProgress::Pending)
                 {
                     observed_pending = true;
                     continue;
                 }
 
-                if (config_.collect_timing_measurements &&
-                    slot.destination_timing_valid &&
-                    !collectDestinationTiming(slot, error))
+                if (config_.collect_timing_measurements)
                 {
-                    requestFailure(
-                        "Heterogeneous destination timing interval is unavailable",
-                        error);
+                    const auto residence =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() -
+                            slot.destination_submitted_at).count();
+                    max_destination_dma_residence_nanoseconds_ = std::max(
+                        max_destination_dma_residence_nanoseconds_,
+                        static_cast<std::uint64_t>(
+                            std::max<std::int64_t>(1, residence)));
                 }
-                slot.destination_timing_valid = false;
 
                 completed_bytes_ += slot.chunk.bytes;
                 ++stats_.chunks_completed;
@@ -840,7 +882,7 @@ namespace llaminar2
             if (completed_bytes_ != protocol_.totalBytes())
             {
                 requestFailure(
-                    "Heterogeneous GPU blob completion byte count mismatched",
+                    "GPU host-relay completion byte count mismatched",
                     error);
                 progress_ = ExpertTierGpuBlobTransferProgress::Failed;
                 return progress_;
@@ -856,58 +898,6 @@ namespace llaminar2
         return ExpertTierGpuBlobTransferProgress::Pending;
     }
 
-    bool ExpertTierGpuBlobTransferLane::collectSourceTiming(
-        const Slot &slot,
-        std::string *error) noexcept
-    {
-        float elapsed_ms = 0.0F;
-        if (!source_backend_->eventElapsedTimeMs(
-                slot.source_timing_start_event,
-                slot.source_timing_stop_event,
-                source_ordinal_,
-                &elapsed_ms) ||
-            !std::isfinite(elapsed_ms) || elapsed_ms < 0.0F)
-        {
-            ++stats_.timing_measurement_failures;
-            assignBlobTransferError(
-                error,
-                "Could not read heterogeneous source timing events");
-            return false;
-        }
-        const auto nanoseconds = static_cast<std::uint64_t>(std::max(
-            1.0,
-            std::ceil(static_cast<double>(elapsed_ms) * 1'000'000.0)));
-        transfer_device_nanoseconds_ = saturatingExpertTierMeasurementAdd(
-            transfer_device_nanoseconds_, nanoseconds);
-        return true;
-    }
-
-    bool ExpertTierGpuBlobTransferLane::collectDestinationTiming(
-        const Slot &slot,
-        std::string *error) noexcept
-    {
-        float elapsed_ms = 0.0F;
-        if (!destination_backend_->eventElapsedTimeMs(
-                slot.destination_timing_start_event,
-                slot.destination_timing_stop_event,
-                destination_ordinal_,
-                &elapsed_ms) ||
-            !std::isfinite(elapsed_ms) || elapsed_ms < 0.0F)
-        {
-            ++stats_.timing_measurement_failures;
-            assignBlobTransferError(
-                error,
-                "Could not read heterogeneous destination timing events");
-            return false;
-        }
-        const auto nanoseconds = static_cast<std::uint64_t>(std::max(
-            1.0,
-            std::ceil(static_cast<double>(elapsed_ms) * 1'000'000.0)));
-        transfer_device_nanoseconds_ = saturatingExpertTierMeasurementAdd(
-            transfer_device_nanoseconds_, nanoseconds);
-        return true;
-    }
-
     void ExpertTierGpuBlobTransferLane::recordCompletion() noexcept
     {
         const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -921,32 +911,46 @@ namespace llaminar2
             .device_nanoseconds = transfer_device_nanoseconds_,
             .host_nanoseconds = transfer_host_nanoseconds_,
         };
+        stats_.last_max_source_dma_residence_nanoseconds =
+            max_source_dma_residence_nanoseconds_;
+        stats_.last_max_destination_dma_residence_nanoseconds =
+            max_destination_dma_residence_nanoseconds_;
+        stats_.last_max_maintenance_poll_gap_nanoseconds =
+            max_maintenance_poll_gap_nanoseconds_;
         const PerfStatsCollector::Tags tags{
             {"lane", config_.lane_name},
             {"src", config_.source_device.to_string()},
             {"dst", config_.destination_device.to_string()},
+            {"relay_kind",
+             config_.relay_kind == ExpertTierGpuBlobRelayKind::CrossBackend
+                 ? "cross_backend"
+                 : "same_backend_no_peer"},
             {"slots", std::to_string(slots_.size())},
             {"layout", carries_contiguous_projection_ ? "contiguous"
                                                         : "separated"},
+            {"source_transport", "retained_mapped_progress_epoch"},
+            {"destination_transport", "retained_mapped_progress_epoch"},
+            {"submission", "ahead_of_inference"},
+            {"stream_class", "latency_critical"},
             {"background", "true"},
             {"blocking", "false"}};
         PerfStatsCollector::addCounter(
             "moe_overlay_residency",
-            "heterogeneous_gpu_blob_transfers_completed",
+            "gpu_host_relay_transfers_completed",
             1.0,
             "maintenance",
             config_.perf_device,
             tags);
         PerfStatsCollector::addCounter(
             "moe_overlay_residency",
-            "heterogeneous_gpu_blob_bytes_completed",
+            "gpu_host_relay_bytes_completed",
             static_cast<double>(completed_bytes_),
             "maintenance",
             config_.perf_device,
             tags);
         PerfStatsCollector::recordTimingNs(
             "moe_overlay_residency",
-            "heterogeneous_gpu_blob_transfer_wall_time",
+            "gpu_host_relay_transfer_wall_time",
             wall_nanoseconds,
             "maintenance",
             config_.perf_device,
@@ -955,15 +959,36 @@ namespace llaminar2
         {
             PerfStatsCollector::recordTimingNs(
                 "moe_overlay_residency",
-                "heterogeneous_gpu_blob_device_work_time",
+                "gpu_host_relay_device_work_time",
                 transfer_device_nanoseconds_,
                 "maintenance",
                 config_.perf_device,
                 tags);
             PerfStatsCollector::recordTimingNs(
                 "moe_overlay_residency",
-                "heterogeneous_gpu_blob_host_relay_time",
+                "gpu_host_relay_host_copy_time",
                 transfer_host_nanoseconds_,
+                "maintenance",
+                config_.perf_device,
+                tags);
+            PerfStatsCollector::recordTimingNs(
+                "moe_overlay_residency",
+                "gpu_host_relay_source_dma_max_chunk_residence_time",
+                max_source_dma_residence_nanoseconds_,
+                "maintenance",
+                config_.perf_device,
+                tags);
+            PerfStatsCollector::recordTimingNs(
+                "moe_overlay_residency",
+                "gpu_host_relay_destination_dma_max_chunk_residence_time",
+                max_destination_dma_residence_nanoseconds_,
+                "maintenance",
+                config_.perf_device,
+                tags);
+            PerfStatsCollector::recordTimingNs(
+                "moe_overlay_residency",
+                "gpu_host_relay_maintenance_max_poll_gap",
+                max_maintenance_poll_gap_nanoseconds_,
                 "maintenance",
                 config_.perf_device,
                 tags);
@@ -985,54 +1010,9 @@ namespace llaminar2
     {
         for (Slot &slot : slots_)
         {
-            if (source_backend_ && source_ordinal_ >= 0)
-            {
-                if (slot.source_event)
-                    source_backend_->destroyEvent(
-                        slot.source_event,
-                        source_ordinal_);
-                if (slot.source_timing_start_event)
-                    source_backend_->destroyEvent(
-                        slot.source_timing_start_event,
-                        source_ordinal_);
-                if (slot.source_timing_stop_event)
-                    source_backend_->destroyEvent(
-                        slot.source_timing_stop_event,
-                        source_ordinal_);
-                if (slot.source_pinned)
-                    source_backend_->freePinned(
-                        slot.source_pinned,
-                        source_ordinal_);
-            }
-            if (destination_backend_ && destination_ordinal_ >= 0)
-            {
-                if (slot.destination_event)
-                    destination_backend_->destroyEvent(
-                        slot.destination_event,
-                        destination_ordinal_);
-                if (slot.destination_timing_start_event)
-                    destination_backend_->destroyEvent(
-                        slot.destination_timing_start_event,
-                        destination_ordinal_);
-                if (slot.destination_timing_stop_event)
-                    destination_backend_->destroyEvent(
-                        slot.destination_timing_stop_event,
-                        destination_ordinal_);
-                if (slot.destination_pinned)
-                    destination_backend_->freePinned(
-                        slot.destination_pinned,
-                        destination_ordinal_);
-            }
+            /* Slot destruction releases leases and mapped registrations only
+             * after both completion generations have been observed. */
             slot = {};
         }
-        /* Both auxiliary streams remain owned by their worker contexts. */
-        source_stream_ = nullptr;
-        destination_stream_ = nullptr;
-        source_context_ = nullptr;
-        destination_context_ = nullptr;
-        source_backend_ = nullptr;
-        destination_backend_ = nullptr;
-        source_ordinal_ = -1;
-        destination_ordinal_ = -1;
     }
 } // namespace llaminar2

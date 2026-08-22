@@ -9,6 +9,7 @@
 #include "../../../execution/mtp/MTPSpecStatePublisher.h"
 #include "../../../execution/moe/IMoEGroupedVerifierHistogramPublisher.h"
 #include "../../../kernels/IKVCache.h"
+#include "../../../kernels/common/SamplingMath.h"
 #include "../../../memory/BufferId.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -72,6 +73,10 @@ namespace llaminar2
              params_.generation_response_token_stride <= 0 ||
              !params_.generation_control_device ||
              params_.generation_control_stride <= 0 ||
+             !params_.verifier_input_tokens_device ||
+             params_.verifier_input_token_stride <
+                 params_.verifier_rows_per_request ||
+             !params_.committed_verifier_identity_device ||
              !params_.next_sidecar_condition_tokens_device ||
              !params_.next_sidecar_position_ids_device))
         {
@@ -361,7 +366,10 @@ namespace llaminar2
                           params_.stopped_flags_device,
                           params_.next_sidecar_condition_tokens_device,
                           params_.next_sidecar_position_ids_device,
-                          params_.next_verifier_condition_tokens_device)
+                          params_.next_verifier_condition_tokens_device,
+                          params_.verifier_input_tokens_device,
+                          params_.verifier_input_token_stride,
+                          params_.committed_verifier_identity_device)
                 : params_.backend
                       ->enqueueDeriveSpeculativePublicationMetadata(
                           params_.outcome_meta_device,
@@ -426,7 +434,14 @@ namespace llaminar2
                 ? request_rows * 3U *
                       params_.shifted_kv_caches.size() * sizeof(int32_t)
                 : 0U;
-        return metadata_words + shifted_words;
+        const size_t committed_identity_bytes =
+            params_.generation_controller_owned
+                ? request_rows *
+                      sizeof(
+                          sampling_math::
+                              MTPCommittedVerifierIdentityRecord)
+                : 0U;
+        return metadata_words + shifted_words + committed_identity_bytes;
     }
 
     bool MTPSpeculativeStatePublicationStage::supportsBackend(
@@ -476,6 +491,12 @@ namespace llaminar2
                 "INT32");
             contract.addPreallocatedInOut(
                 BufferId::MTP_GENERATION_CONTROL,
+                "INT32");
+            contract.addInput(
+                BufferId::MTP_VERIFIER_INPUT_TOKENS,
+                "INT32");
+            contract.addPreallocatedOutput(
+                BufferId::MTP_COMMITTED_VERIFIER_IDENTITY,
                 "INT32");
             contract.addPreallocatedOutput(
                 BufferId::MTP_CONDITION_TOKEN,
@@ -538,6 +559,12 @@ namespace llaminar2
                    other.generation_control_device &&
                self.generation_control_stride ==
                    other.generation_control_stride &&
+               self.verifier_input_tokens_device ==
+                   other.verifier_input_tokens_device &&
+               self.verifier_input_token_stride ==
+                   other.verifier_input_token_stride &&
+               self.committed_verifier_identity_device ==
+                   other.committed_verifier_identity_device &&
                self.request_count == other.request_count &&
                self.verifier_rows_per_request ==
                    other.verifier_rows_per_request &&

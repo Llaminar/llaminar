@@ -23,6 +23,7 @@
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"
 #include "tensors/Tensors.h"
+#include "loaders/PreparedWeightStore.h"
 #include "utils/DebugEnv.h"
 #include "mocks/MockModelContext.h"
 #include <algorithm>
@@ -172,6 +173,15 @@ public:
         snapshot.current_position = *prefix_probe_position_override_;
         snapshot.positions = {*prefix_probe_position_override_};
         snapshot.sequence_lengths = {*prefix_probe_position_override_};
+        snapshot.mtp_observed_verifier_draft_tokens =
+            prefix_probe_verifier_draft_tokens_;
+        if (!prefix_probe_verifier_draft_tokens_.empty())
+        {
+            snapshot.mtp_observed_verifier_transaction_count = 1;
+            snapshot.mtp_observed_verifier_draft_depth =
+                static_cast<int>(
+                    prefix_probe_verifier_draft_tokens_.size());
+        }
         return snapshot;
     }
 
@@ -2272,6 +2282,14 @@ public:
         prefix_probe_position_override_ = position;
     }
     /**
+     * @brief Install the mock's committed grouped-verifier proposal identity.
+     * @param tokens Draft portion of the stable `[target, drafts...]` row.
+     */
+    void set_prefix_probe_verifier_draft_tokens(std::vector<int32_t> tokens)
+    {
+        prefix_probe_verifier_draft_tokens_ = std::move(tokens);
+    }
+    /**
      * @brief Seed the mock's device-owned pre-verifier sequence position.
      *
      * This is test setup for the resident cache-count snapshot.  It must not be
@@ -2718,6 +2736,7 @@ private:
     bool device_moe_ticket_submission_ok_ = true;
     bool device_moe_known_non_due_boundary_ok_ = true;
     std::optional<int> prefix_probe_position_override_;
+    std::vector<int32_t> prefix_probe_verifier_draft_tokens_;
     bool prefix_populate_ok_ = true;
     bool prefix_harvest_ok_ = true;
     bool prefix_terminal_restore_ok_ = true;
@@ -3505,6 +3524,28 @@ static RankOrchestrator::Config makeRankConfigForRunnerCount(int count)
     return config;
 }
 
+/**
+ * @brief Certified reuse is unrepresentable without its exact model store.
+ *
+ * Memory admission and rank materialization deliberately share the same typed
+ * policy. The validation boundary must reject a caller that asks to suppress
+ * packing without also supplying the authority that owns every prepared
+ * handle.
+ */
+TEST(Test__RankOrchestratorConfig,
+     CertifiedPreparedWeightReuseRequiresModelOwnedStore)
+{
+    auto config = makeRankConfigForRunnerCount(2);
+    config.prepared_weight_admission =
+        PreparedWeightAdmission::ReuseCertifiedCompleteSet;
+
+    EXPECT_FALSE(config.validate());
+
+    config.prepared_weight_store =
+        std::make_shared<PreparedWeightStore>(ModelContextId{77});
+    EXPECT_TRUE(config.validate());
+}
+
 static DeviceMoERebalanceDispatchTicket makeDeviceMoEDispatchTicket(
     uint32_t participant_id,
     uint32_t participant_count,
@@ -3568,7 +3609,7 @@ TEST_F(
             orchestrator->deviceMoERebalanceMaintenanceExecutionPolicy(),
             DeviceMoERebalanceMaintenanceExecutionPolicy::
                 HostScheduledCapturedMaintenance);
-        ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
+        ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance(1u));
         EXPECT_EQ(probe->observations.load(std::memory_order_acquire), 2u);
         EXPECT_EQ(probe->submissions.load(std::memory_order_acquire), 2u);
         EXPECT_FALSE(
@@ -3668,7 +3709,7 @@ TEST_F(
         makeRankConfigForRunnerCount(2));
 
     for (uint32_t boundary = 1u; boundary < 64u; ++boundary)
-        ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
+        ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance(1u));
     for (const auto *runner : runner_ptrs)
     {
         ASSERT_NE(runner, nullptr);
@@ -3679,7 +3720,7 @@ TEST_F(
         EXPECT_EQ(runner->device_moe_ticket_submission_call_count(), 0u);
     }
 
-    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
+    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance(1u));
     for (const auto *runner : runner_ptrs)
     {
         EXPECT_EQ(
@@ -3722,8 +3763,8 @@ TEST_F(
         makeTPContextForRunnerCount(2),
         makeRankConfigForRunnerCount(2));
 
-    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
-    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
+    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance(4u));
+    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance(4u));
     for (const auto *runner : runner_ptrs)
     {
         ASSERT_NE(runner, nullptr);
@@ -3733,9 +3774,11 @@ TEST_F(
         EXPECT_EQ(runner->device_moe_ticket_observation_call_count(), 1u);
     }
 
-    /* The authenticated non-due ticket reports only three rounds remaining,
-     * so ceil(3 / 4) requires another observation on the very next boundary. */
-    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance());
+    /* The authenticated non-due ticket reports five exact rounds remaining.
+     * A four-token MTP commit leaves one round, so the following one-token
+     * transaction reaches the next authenticated observation precisely. */
+    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance(4u));
+    ASSERT_TRUE(orchestrator->maybeApplyDecodeBoundaryMaintenance(1u));
     for (const auto *runner : runner_ptrs)
         EXPECT_EQ(runner->device_moe_ticket_observation_call_count(), 2u);
 }
@@ -4847,7 +4890,8 @@ TEST_F(Test__RankOrchestrator, ProductionDecodeBoundaryCannotEnterLegacyLocalTPP
             "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
     ASSERT_FALSE(runner_source.empty());
 
-    const auto maybe_pos = runner_source.find("bool OrchestrationRunner::maybeApplyMoERebalance()");
+    const auto maybe_pos = runner_source.find(
+        "bool OrchestrationRunner::maybeApplyMoERebalance(");
     ASSERT_NE(maybe_pos, std::string::npos);
     const auto maybe_end = runner_source.find(
         "// =========================================================================",
@@ -7556,6 +7600,83 @@ TEST_F(Test__RankOrchestrator,
     EXPECT_THAT(snapshot.sequence_lengths, ::testing::ElementsAre(596));
     EXPECT_EQ(orchestrator->get_position(), 597)
         << "Observation must not mutate the scheduler-owned parent cursor.";
+}
+
+/**
+ * @brief Aggregate the immutable verifier row instead of proposal scratch.
+ *
+ * A mirrored participant may recycle or leave its private proposal workspace
+ * empty after verifier preparation. The grouped verifier row is nevertheless
+ * materialized identically on every participant and is the only valid branch
+ * identity for post-transaction parity diagnostics.
+ */
+TEST_F(Test__RankOrchestrator,
+       PrefixStateProbeAggregatesCommittedVerifierDraftIdentity)
+{
+    const std::vector<int32_t> committed_drafts = {41, 73, 109};
+
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_primary_device_id(DeviceId::cuda(0));
+    runner0_ptr->set_prefix_probe_position_override(64);
+    runner0_ptr->set_prefix_probe_verifier_draft_tokens(committed_drafts);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_primary_device_id(DeviceId::cuda(1));
+    runner1_ptr->set_prefix_probe_position_override(64);
+    runner1_ptr->set_prefix_probe_verifier_draft_tokens(committed_drafts);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    const PrefixRuntimeStateSnapshot snapshot =
+        orchestrator->prefixStateProbe();
+    EXPECT_EQ(
+        snapshot.mtp_observed_verifier_draft_tokens,
+        committed_drafts);
+}
+
+/**
+ * @brief Reject different verifier identities from mirrored participants.
+ *
+ * Unlike absent proposal scratch, different committed verifier rows are a real
+ * transaction-coherence failure and must never be silently attributed to one
+ * participant.
+ */
+TEST_F(Test__RankOrchestrator,
+       PrefixStateProbeRejectsDivergentCommittedVerifierDraftIdentity)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_primary_device_id(DeviceId::cuda(0));
+    runner0_ptr->set_prefix_probe_position_override(64);
+    runner0_ptr->set_prefix_probe_verifier_draft_tokens({41, 73, 109});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_primary_device_id(DeviceId::cuda(1));
+    runner1_ptr->set_prefix_probe_position_override(64);
+    runner1_ptr->set_prefix_probe_verifier_draft_tokens({41, 74, 109});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_THROW(
+        static_cast<void>(orchestrator->prefixStateProbe()),
+        std::runtime_error);
 }
 
 TEST_F(Test__RankOrchestrator, SpecStateBatchPublicationFailureStillAttemptsEveryLocalTPChild)

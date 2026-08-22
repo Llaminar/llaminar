@@ -511,7 +511,7 @@ namespace llaminar2::test
             RoutedExpertResidencyPolicy::RoutedTierRebalanced);
         EXPECT_EQ(
             normalized.plan->authority_execution,
-            MoEOverlayAuthorityExecutionKind::HomogeneousDeviceResident);
+            MoEOverlayAuthorityExecutionKind::DeviceResident);
         EXPECT_EQ(
             normalized.plan->owner_order,
             RoutedExpertOwnerOrder::Random);
@@ -552,11 +552,11 @@ namespace llaminar2::test
             RoutedExpertResidencyPolicy::StaticById);
         EXPECT_EQ(
             normalized.plan->authority_execution,
-            MoEOverlayAuthorityExecutionKind::HomogeneousDeviceResident);
+            MoEOverlayAuthorityExecutionKind::DeviceResident);
     }
 
     TEST(Test__MoERoutedExpertPlacementPlan,
-         MultiTierAuthorityIsHostCoordinatedEvenForOneGpuVendor)
+         MultiTierAllGpuAuthorityRemainsDeviceResident)
     {
         auto plan = validTwoTierPlan();
         plan.domains[1] = localGpuTPDomain("gpu_second_priority");
@@ -564,11 +564,11 @@ namespace llaminar2::test
 
         EXPECT_EQ(
             resolveMoEOverlayAuthorityExecutionKind(plan),
-            MoEOverlayAuthorityExecutionKind::HostCoordinated);
+            MoEOverlayAuthorityExecutionKind::DeviceResident);
     }
 
     TEST(Test__MoERoutedExpertPlacementPlan,
-         HeterogeneousSingleTierAuthorityIsHostCoordinated)
+         HeterogeneousSingleTierAllGpuAuthorityRemainsDeviceResident)
     {
         MoERoutedExpertPlacementPlan plan;
         plan.enabled = true;
@@ -588,11 +588,11 @@ namespace llaminar2::test
 
         EXPECT_EQ(
             resolveMoEOverlayAuthorityExecutionKind(plan),
-            MoEOverlayAuthorityExecutionKind::HostCoordinated);
+            MoEOverlayAuthorityExecutionKind::DeviceResident);
     }
 
     TEST(Test__MoERoutedExpertPlacementPlan,
-         ExplicitHostStagingCannotMasqueradeAsDeviceResidentAuthority)
+         HostStagedGpuBytesDoNotMoveLiveAuthorityToTheHost)
     {
         MoERoutedExpertPlacementPlan plan;
         plan.enabled = true;
@@ -609,15 +609,23 @@ namespace llaminar2::test
         plan.routed_tiers = {
             tier("priority_0", domain.name, 0, true),
         };
+        EXPECT_EQ(
+            resolveMoEOverlayAuthorityExecutionKind(plan),
+            MoEOverlayAuthorityExecutionKind::DeviceResident);
+
+        /*
+         * HOST names the byte transport only.  It is not permission to build
+         * a host policy mirror or publish a host-owned ExpertOverlay epoch.
+         */
         plan.authority_execution =
-            MoEOverlayAuthorityExecutionKind::HomogeneousDeviceResident;
+            MoEOverlayAuthorityExecutionKind::HostResident;
 
         const auto validation =
             validateMoERoutedExpertPlacementPlan(plan);
         EXPECT_FALSE(validation.ok());
         EXPECT_TRUE(hasErrorContaining(
             validation,
-            "does not match topology-required 'host-coordinated'"));
+            "does not match topology-required 'device-resident'"));
         EXPECT_THROW(
             (void)normalizeMoEExpertOverlayAuthorityPlan({
                 .requested_plan =
@@ -625,6 +633,37 @@ namespace llaminar2::test
                 .model_has_routed_experts = true,
             }),
             std::invalid_argument);
+    }
+
+    TEST(Test__MoERoutedExpertPlacementPlan,
+         CpuParticipantsRequireTheHostResidentAuthority)
+    {
+        auto plan = validTwoTierPlan();
+        plan.topology = RoutedExpertPlacementTopology::SingleDomain;
+        plan.continuation_domain = "cpu_cold";
+        plan.shared_expert_domain = "cpu_cold";
+        plan.domains = {cpuNodeTPDomain("cpu_cold")};
+        plan.routed_tiers = {
+            tier("priority_0", "cpu_cold", 0, true),
+        };
+        plan.placements = {
+            placement(0, {0, 0, 0, 0}),
+            placement(1, {0, 0, 0, 0}),
+        };
+
+        EXPECT_EQ(
+            resolveMoEOverlayAuthorityExecutionKind(plan),
+            MoEOverlayAuthorityExecutionKind::HostResident);
+
+        plan.authority_execution =
+            MoEOverlayAuthorityExecutionKind::DeviceResident;
+        const auto validation =
+            validateMoERoutedExpertPlacementPlan(
+                plan, twoLayerFourExpertOptions());
+        EXPECT_FALSE(validation.ok());
+        EXPECT_TRUE(hasErrorContaining(
+            validation,
+            "does not match topology-required 'host-resident'"));
     }
 
     TEST(Test__MoERoutedExpertPlacementPlan,

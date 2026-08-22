@@ -994,6 +994,37 @@ namespace
 class Test__TransferEngine_EventFailure : public ::testing::Test
 {
 protected:
+    /**
+     * @brief Keep a persistent mock wait failure scoped to one assertion.
+     *
+     * A tensor with a queued H2D source may legitimately need to retire that
+     * source in its destructor. Resetting the injected backend fault before
+     * local tensors unwind keeps the test focused on the requested transfer
+     * boundary instead of poisoning the independent lifetime cleanup path.
+     */
+    class ScopedEventWaitFailure final
+    {
+    public:
+        explicit ScopedEventWaitFailure(FailableEventMockBackend &backend)
+            : backend_(backend)
+        {
+            backend_.setEventWaitFails(true);
+        }
+
+        ~ScopedEventWaitFailure()
+        {
+            backend_.setEventWaitFails(false);
+        }
+
+        ScopedEventWaitFailure(const ScopedEventWaitFailure &) = delete;
+        ScopedEventWaitFailure &operator=(const ScopedEventWaitFailure &) = delete;
+        ScopedEventWaitFailure(ScopedEventWaitFailure &&) = delete;
+        ScopedEventWaitFailure &operator=(ScopedEventWaitFailure &&) = delete;
+
+    private:
+        FailableEventMockBackend &backend_;
+    };
+
     void SetUp() override
     {
         llaminar2::testing::installHardwareFreeGPUContextFactories();
@@ -1045,7 +1076,7 @@ TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_ReturnsHard
     auto tensor = createTensorOnDeviceWithEvent();
 
     // Now make event wait fail — simulates corrupted event from graph capture
-    mock_->setEventWaitFails(true);
+    ScopedEventWaitFailure event_wait_failure(*mock_);
 
     auto result = engine.downloadFull(tensor.get());
 
@@ -1067,7 +1098,7 @@ TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_ErrorMessag
     auto tensor = createTensorOnDeviceWithEvent();
     tensor->setDebugName("test_attention_output");
 
-    mock_->setEventWaitFails(true);
+    ScopedEventWaitFailure event_wait_failure(*mock_);
 
     auto result = engine.downloadFull(tensor.get());
 
@@ -1084,7 +1115,7 @@ TEST_F(
 
     auto tensor = createTensorOnDeviceWithEvent();
 
-    mock_->setEventWaitFails(true);
+    ScopedEventWaitFailure event_wait_failure(*mock_);
     mock_->resetTransferStats();
 
     engine.downloadFull(tensor.get());
@@ -1108,7 +1139,7 @@ TEST_F(
     TransferEngine engine(resolver_);
 
     auto tensor = createTensorOnDeviceWithEvent();
-    mock_->setEventWaitFails(true);
+    ScopedEventWaitFailure event_wait_failure(*mock_);
     mock_->resetTransferStats();
     mock_->resetEventRecords();
 
@@ -1184,7 +1215,7 @@ TEST_F(
     auto tensor = createTensorOnDeviceWithEvent();
 
     // A host wait would fail, proving that success cannot be coming from one.
-    mock_->setEventWaitFails(true);
+    ScopedEventWaitFailure event_wait_failure(*mock_);
 
     // No consumer stream was named, so this placement check must retain the
     // published event for a later exact device consumer.
@@ -1203,7 +1234,7 @@ TEST_F(
     TransferEngine engine(resolver_);
 
     auto tensor = createTensorOnDeviceWithEvent();
-    mock_->setEventWaitFails(true);
+    ScopedEventWaitFailure event_wait_failure(*mock_);
 
     auto result = engine.uploadFull(tensor.get(), DeviceId::cuda(0));
     ASSERT_TRUE(result.success);

@@ -41,10 +41,24 @@ namespace llaminar2
     class DecodeExpertHistogram;
     class MoEOverlayResidencyAuthority;
     class MoEOverlayParticipantResidencyRegistry;
+    class MoEOverlayNodeLocalDeviceControllerFabric;
     class IMoEOverlayRankBatchTransport;
+    class MoEOverlayRankBatchTransportRegistry;
     class TensorBase;
     class WorkspaceAllocator;
     struct MoERoutedExpertPlacementPlan;
+
+    /**
+     * @brief Durable placement lifecycle represented by participant graphs.
+     *
+     * Current-batch LLEP is intentionally orthogonal: it may alter one request's
+     * assignment without publishing or retiring a durable placement bank.
+     */
+    enum class MoEOverlayDurableMaintenancePolicy : std::uint8_t
+    {
+        Immutable = 0, ///< Static/observe residency; no durable bank retirement.
+        DynamicPlacement = 1, ///< Dynamic promotion/rebalance may retire a bank.
+    };
 
     /**
      * @brief Construction contract for one rank-local expert graph.
@@ -68,6 +82,34 @@ namespace llaminar2
             participant_residency;
         /** @brief Shared route-histogram lifetime for dynamic residency. */
         std::shared_ptr<DecodeExpertHistogram> decode_histogram;
+        /**
+         * @brief Process-local aliases into the topology-wide GPU controller.
+         *
+         * Every mapped GPU follower binds its runtime epoch admission directly
+         * to this fabric. A Dynamic runner must never invent an independent
+         * host-owned placement generation for remote participants.
+         */
+        std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric>
+            device_controller_fabric;
+        /**
+         * @brief Exact durable placement lifecycle lowered into this graph.
+         *
+         * Dynamic placement enables both service telemetry and the captured
+         * post-inference retirement-readiness receipt. Immutable residency owns
+         * neither. Keeping one typed policy prevents those two pieces of the
+         * same lifecycle from diverging behind independent booleans.
+         */
+        MoEOverlayDurableMaintenancePolicy durable_maintenance_policy =
+            MoEOverlayDurableMaintenancePolicy::Immutable;
+        /**
+         * @brief Setup-owned node-local channels after bilateral NUMA first-touch.
+         *
+         * A same-node follower requires its exact channel from this registry;
+         * constructing one while preparing weights would serialize the source
+         * and target ranks and make page placement timing-dependent.
+         */
+        std::shared_ptr<MoEOverlayRankBatchTransportRegistry>
+            rank_batch_transport_registry;
         /** @brief Full request/KV context limit; this is not a graph scratch allocation size. */
         int max_seq_len = 0;
         /**
@@ -166,6 +208,27 @@ namespace llaminar2
          * therefore bypasses the generic forward() shape heuristic.
          */
         bool forwardPrefill(const int *tokens, int seq_len) override;
+        /** @copydoc IInferenceRunner::servingGraphPreparationKind */
+        ServingGraphPreparationKind
+        servingGraphPreparationKind() const noexcept override;
+        /**
+         * @brief Seal every mapped follower endpoint after transfer epochs bind.
+         *
+         * Graph construction publishes prepared residency banks, but native
+         * capture is deliberately deferred until the physical migration fabric
+         * has installed each GPU's topology-accounted progress epoch. This
+         * setup-only phase embeds that epoch as a cache-owned root fork/terminal
+         * join in every admitted row and MTP family before any ticket can run.
+         *
+         * @param plan Frozen distributed prefill/decode graph inventory.
+         * @return True only when every mapped GPU executable is resident and no
+         *         standalone progress submission remains necessary.
+         */
+        bool materializeServingGraphFamilyWithoutLaunch(
+            const ServingGraphFamilyMaterializationPlan &plan) override;
+        /** @copydoc IInferenceRunner::installMoEOverlayTransferProgressEpoch */
+        bool installMoEOverlayTransferProgressEpoch(
+            std::shared_ptr<MappedTransferProgressEpoch> epoch) override;
         /**
          * @brief Report support for the root-published bounded prefill schedule.
          *
@@ -190,6 +253,17 @@ namespace llaminar2
             const PrefillChunkSchedulerPolicy &policy,
             int pad_token_id,
             bool allow_padded_execution) override;
+        /**
+         * @brief Bind rank-local calibration timing to retained graph groups.
+         *
+         * A remote expert rank does not run the continuation RankOrchestrator,
+         * so its authenticated follower transaction is the only truthful
+         * rank-wide inference boundary. Direct test forwards use the same
+         * owner through @ref executeAtLogicalStep.
+         */
+        bool setMoEOverlayInferenceInterferenceProbe(
+            std::shared_ptr<MoEOverlayInferenceInterferenceProbe> probe)
+            override;
         /**
          * @brief Install the root-published generation for sparse wire keys.
          *
@@ -238,6 +312,9 @@ namespace llaminar2
         /** @return Fixed follower protocol bounds derived during setup. */
         MoEOverlayInferenceTransactionProtocol::Config
         inferenceTransactionProtocolConfig() const;
+        /** @return One live runtime/epoch source for every local GPU participant. */
+        std::vector<MoEOverlayDeviceControllerRuntimeBinding>
+        moeOverlayDeviceControllerRuntimeBindings() const override;
 
     private:
         /**
@@ -284,6 +361,14 @@ namespace llaminar2
          * @brief Own one graph and the allocations whose addresses its stages use.
          */
         struct CachedParticipantGraph;
+        /**
+         * @brief Model-lifetime runtime, epoch, and event authority for one GPU.
+         *
+         * The definition remains private to the implementation so callers can
+         * neither mutate placement banks nor record a boundary on the wrong
+         * stream.
+         */
+        struct ParticipantGpuRuntime;
 
         /** @brief Validate metadata and resolve every rank-local participant. */
         void resolveTopology();
@@ -302,6 +387,20 @@ namespace llaminar2
         void prepareParticipantWeights();
         /** @brief Create exact CPU/GPU contexts for every local endpoint. */
         void createDeviceContexts();
+        /**
+         * @brief Allocate every participant-local GPU placement runtime.
+         *
+         * GPU execution state remains device-owned under both authority
+         * regimes. A host-resident heterogeneous policy publishes inactive
+         * banks through the retained host-authority publisher, while an
+         * all-GPU policy additionally binds the same runtime to the mapped
+         * device-controller fabric. Graph capture always consumes the one
+         * device table created here.
+         */
+        void createParticipantGpuRuntimes();
+        /** @return The exact participant GPU runtime or throw for stale topology. */
+        ParticipantGpuRuntime &participantGpuRuntimeForParticipant(
+            int participant_id) const;
         /**
          * @brief Return the prebuilt fixed-capacity graph after validating live rows.
          *
@@ -355,7 +454,8 @@ namespace llaminar2
             const int *tokens,
             int seq_len,
             int logical_step,
-            SparseTransactionPhase phase);
+            SparseTransactionPhase phase,
+            int physical_rows = -1);
         /** @brief Release raw selected GGUF tensors after prepared engines own them. */
         void releasePreparedSourceBytes();
         /**
@@ -374,6 +474,9 @@ namespace llaminar2
         std::unique_ptr<MoEExpertOwnerMap> owner_map_;
         std::shared_ptr<MoEOverlayResidencyAuthority> residency_authority_;
         std::shared_ptr<DecodeExpertHistogram> decode_histogram_;
+        /** Lock-free timing authority claimed around complete retained graphs. */
+        std::shared_ptr<MoEOverlayInferenceInterferenceProbe>
+            interference_probe_;
         std::vector<const MoEExpertOwnerParticipant *> local_participants_;
         std::shared_ptr<PreparedWeightStore> prepared_store_;
         std::unique_ptr<FrozenModelWeightSet> frozen_weights_;
@@ -390,11 +493,48 @@ namespace llaminar2
          */
         std::unordered_map<int, std::shared_ptr<MoELocalExpertSerialBufferArena>>
             serial_compact_buffer_arenas_;
+        /**
+         * @brief One maximum-shape canonical route bank per mapped GPU follower.
+         *
+         * Every retained decode, verifier, prefill, and MTP graph for a
+         * participant executes serially on the participant worker stream. The
+         * graphs may therefore share this immutable-address
+         * `[max_rows * top_k, d_model]` bank. Keeping it outside the per-shape
+         * compact families avoids multiplying a large route-contribution
+         * allocation by the complete prefill bucket ladder. Portable MPI and
+         * CPU followers do not allocate this mapped-return resource.
+         */
+        std::unordered_map<int, std::shared_ptr<TensorBase>>
+            participant_canonical_route_buffers_;
+        /**
+         * @brief One durable device-owned execution runtime per GPU participant.
+         *
+         * Main, MTP, decode, and prefill graph specializations share these
+         * addresses regardless of whether placement policy is authored on the
+         * host or device. The map precedes graph members so graphs are
+         * destroyed before their embedded runtime pointers and epoch tickets.
+         */
+        std::unordered_map<int, std::unique_ptr<ParticipantGpuRuntime>>
+            participant_gpu_runtimes_;
+        /** One exact graph-branch authority for each mapped relay GPU. */
+        std::unordered_map<
+            DeviceId,
+            std::shared_ptr<MappedTransferProgressEpoch>>
+            transfer_progress_epochs_;
         /** @brief Main decoder graph retained at the admitted prefill capacity. */
         std::unique_ptr<CachedParticipantGraph> main_graph_;
         /** @brief Learned MTP sidecar graphs indexed by manifest graph depth. */
         std::vector<std::unique_ptr<CachedParticipantGraph>>
             mtp_sidecar_graphs_;
+        /** Typed setup state shared by eager CPU and native GPU followers. */
+        enum class ServingGraphFamilyLifecycle : std::uint8_t
+        {
+            Built,  ///< Rank-local graph objects exist but cannot accept tickets.
+            Sealed, ///< Every declared endpoint is certified for transaction zero.
+        };
+        /** Sole authority for request-ticket admission into this graph family. */
+        ServingGraphFamilyLifecycle serving_graph_family_lifecycle_ =
+            ServingGraphFamilyLifecycle::Built;
         /** @brief Main decoder layer count after excluding trailing NextN blocks. */
         int main_layer_count_ = 0;
         /** @brief Routed NextN GGUF source layer for each retained graph depth. */

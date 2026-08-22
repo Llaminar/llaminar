@@ -423,11 +423,11 @@ namespace llaminar2
                 (has_previous && coordinate == previous) ||
                 measurement.wave_wall_nanoseconds == 0 ||
                 measurement.wave_sample_count < kMinimumMigrationSamples ||
-                measurement.interference_sample_count <
-                    kMinimumMigrationSamples)
+                measurement.inference_interference_nanoseconds != 0 ||
+                measurement.interference_sample_count != 0)
             {
                 throw std::invalid_argument(
-                    "ExpertOverlay migration measurement has an invalid coordinate, duplicate row, zero wave time, or insufficient samples");
+                    "ExpertOverlay migration measurement has an invalid coordinate, duplicate row, zero wave time, runtime-interference charge, or insufficient samples");
             }
 
             std::uint64_t critical_path =

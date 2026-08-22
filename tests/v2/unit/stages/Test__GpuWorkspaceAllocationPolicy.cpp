@@ -1193,9 +1193,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto compact_graph_source = removeAsciiWhitespace(graph_source);
     EXPECT_NE(
         compact_factory.find(
-            "graphStableActivationRowCapacity(config_,device)"),
+            "overlaySparseProtocolRowCapacity(config_,device)"),
         std::string::npos)
-        << "ordinary prefill must contribute the admitted graph-stable row envelope";
+        << "ordinary prefill and grouped verification must share the complete "
+           "immutable sparse-protocol row envelope";
     EXPECT_NE(
         compact_graph_source.find(
             "resolveActivationBufferSeqLen(config.max_seq_len,device)"),
@@ -1743,6 +1744,55 @@ TEST(Test__GpuWorkspaceAllocationPolicy, DecodeCapturePolicyCannotDependOnProfil
         << "The guard must continue to inspect the production replay admission policy.";
 }
 
+/**
+ * @brief Initial and hosted sidecar replay must compose one graph-owned policy.
+ *
+ * The heterogeneous rank topology generally admits segmentation, while a
+ * mapped ExpertOverlay sidecar declares an indivisible device timeline. A
+ * prior split implementation applied the declaration only during capture, so
+ * the first hosted replay tried to mutate the initialized cache policy.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     MTPSidecarCaptureAndHostedReplayShareNativeEnvelopePolicy)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto executable_source =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+
+    const std::string policy_call = "buildDecodeCapturePolicyForGraph(";
+    size_t call_count = 0;
+    size_t cursor = 0;
+    while ((cursor = executable_source.find(policy_call, cursor)) !=
+           std::string::npos)
+    {
+        ++call_count;
+        cursor += policy_call.size();
+    }
+    EXPECT_EQ(call_count, 3u)
+        << "The graph-aware policy must have one definition plus exact calls "
+           "from initial sidecar capture and hosted replay.";
+
+    const auto helper = sliceBetween(
+        source,
+        "DeviceGraphOrchestrator::buildDecodeCapturePolicyForGraph(",
+        "bool DeviceGraphOrchestrator::hasHeterogeneousCollectiveExecutionDomain()");
+    const auto compact_helper =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(helper));
+    EXPECT_NE(
+        compact_helper.find(
+            "DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope("),
+        std::string::npos)
+        << "One typed controller must constrain both indivisible and "
+           "heterogeneous-ticket graph envelopes.";
+    EXPECT_NE(compact_helper.find("graph.nativeCaptureEnvelope()"),
+              std::string::npos);
+    EXPECT_NE(compact_helper.find("returnstd::nullopt;"),
+              std::string::npos)
+        << "An unavailable graph-owned lifecycle must fail instead of weakening policy.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, GraphCaptureControllerLimitsStreamSyncToDiagnostics)
 {
     const auto source = readFile(repoRoot() / "src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp");
@@ -1935,8 +1985,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         const auto compact = removeAsciiWhitespace(
             stripCommentsAndStringLiterals(consumer));
         const size_t dynamic_policy = compact.find(
-            "isMoeRebalancingActive()&&"
-            "usesHomogeneousDeviceResidentMoEOverlayAuthority()");
+            "usesParticipantLocalDeviceMoERebalanceController()");
         const size_t controller_resolution = compact.find(
             "?deviceMoERebalanceControllerStateDevice(");
         ASSERT_NE(dynamic_policy, std::string::npos);
@@ -2096,7 +2145,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSidecarGraphCaptureInstallsLocalTPBo
         << "A sidecar-local enum list can silently force specialized "
            "collectives out of whole-graph capture.";
 
-    const size_t policy_build = sidecar_body.find("auto capture_policy = buildDecodeCapturePolicy(");
+    const size_t policy_build = sidecar_body.find(
+        "auto capture_policy_result = buildDecodeCapturePolicyForGraph(");
     ASSERT_NE(policy_build, std::string::npos)
         << "MTP sidecar execution must continue to build a decode capture policy.";
     const size_t boundary_hook =
@@ -4588,7 +4638,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, PrefixSnapshotsObserveAcceptedSpecPubli
     EXPECT_NE(compact_header.find(
                   "waitForLiveInferenceStateReadyForObservation("
                   "void*observation_stream,constchar*observation_name,"
-                  "DeviceTimelineRoleobservation_role)const"),
+                  "DeviceTimelineRoleobservation_role,"
+                  "boollogical_state_mailbox_already_joined=false)const"),
               std::string::npos)
         << "Host-visible live-state exports must use the shared observation boundary.";
     EXPECT_NE(compact_header.find(
@@ -5896,18 +5947,19 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
     const auto branch_submission = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             device_source,
-            "submitHostScheduledDeviceGenerationAdvance(",
+            "bool DeviceGraphOrchestrator::beginHostScheduledDeviceGenerationAdvance(",
             "bool DeviceGraphOrchestrator::launchDeviceResidentGeneration(")));
     const auto rank_observation = removeAsciiWhitespace(
         stripCommentsAndStringLiterals(sliceBetween(
             rank_source,
             "bool RankOrchestrator::observeDeviceGenerationDispatchTicket(",
             "bool RankOrchestrator::submitHostScheduledDeviceGenerationAdvance(")));
+    const auto raw_rank_submission = sliceBetween(
+        rank_source,
+        "bool RankOrchestrator::submitHostScheduledDeviceGenerationAdvance(",
+        "bool RankOrchestrator::launchDeviceResidentGeneration(");
     const auto rank_submission = removeAsciiWhitespace(
-        stripCommentsAndStringLiterals(sliceBetween(
-            rank_source,
-            "bool RankOrchestrator::submitHostScheduledDeviceGenerationAdvance(",
-            "bool RankOrchestrator::launchDeviceResidentGeneration(")));
+        stripCommentsAndStringLiterals(raw_rank_submission));
 
     const size_t graph_launch = ticket_submission.find("launchOnStream(");
     const size_t ticket_copy =
@@ -5953,7 +6005,27 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         rank_submission.find(
             "submitHostScheduledDeviceGenerationAdvance(rank_hosted_device_generation_tickets_[participant_index])"),
         std::string::npos)
-        << "All participant branches must be submitted before the next ticket wait.";
+        << "Every participant must submit its complete authenticated branch before the next ticket wait.";
+    EXPECT_EQ(
+        rank_submission.find(
+            "submitHostScheduledDeviceGenerationFragment("),
+        std::string::npos)
+        << "The rank layer must not fan out and join once per semantic fragment.";
+    EXPECT_EQ(
+        rank_submission.find(
+            "beginHostScheduledDeviceGenerationAdvance("),
+        std::string::npos)
+        << "Branch admission belongs to the participant-local transaction bundle.";
+    EXPECT_EQ(
+        rank_submission.find(
+            "finishHostScheduledDeviceGenerationAdvance("),
+        std::string::npos)
+        << "Branch completion belongs to the participant-local transaction bundle.";
+    EXPECT_NE(
+        raw_rank_submission.find(
+            "rank_hosted_transaction_bundle_submissions"),
+        std::string::npos)
+        << "PerfStats must prove that one rank fan-out submitted the complete transaction.";
 
     const std::array<const char *, 8> forbidden = {
         "hostToDevice",
@@ -8866,6 +8938,500 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
 }
 
 /**
+ * @brief Keep topology-wide ExpertOverlay reader ownership scoped to one forward.
+ *
+ * A reader held across an entire request prevents an asynchronously published
+ * placement epoch from retiring its old bank while decode continues. A main
+ * forward must therefore own Acquire as a captured root and Release as its sole
+ * terminal after every auxiliary lane. The host records only an immutable
+ * terminal event receipt on the graph's exact stream; launching a separate
+ * release graph can race captured MoE lane work and is forbidden.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     TopologyWideOverlayReaderLeaseIsOneExactForwardSubmission)
+{
+    const auto root = repoRoot();
+    const auto header = readFile(
+        root /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    const auto lifecycle_header = readFile(
+        root /
+        "src/v2/execution/moe/MoEOverlayEpochLeaseLifecycle.h");
+    const auto source = readFile(
+        root /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+
+    const auto compact_header =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(header));
+    const auto compact_lifecycle = removeAsciiWhitespace(
+        stripCommentsAndStringLiterals(lifecycle_header));
+    const auto compact_builder =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "bool DeviceGraphOrchestrator::\n"
+            "        appendCapturedMainForwardMoEOverlayEpochTransaction(",
+            "DeviceMoERebalanceGraphControllerState *")));
+    const auto raw_builder = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::\n"
+        "        appendCapturedMainForwardMoEOverlayEpochTransaction(",
+        "DeviceMoERebalanceGraphControllerState *");
+    const auto compact_build_forward =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "GraphBuildResult DeviceGraphOrchestrator::buildForwardGraph(",
+            "void DeviceGraphOrchestrator::applyCurrentExpertPlacementToGraph(")));
+    const auto compact_prepare =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "bool DeviceGraphOrchestrator::prepareLiveStateForForwardGraphExecution(",
+            "bool DeviceGraphOrchestrator::prepareGraphBuildStateForMaterialization(")));
+    const auto compact_complete =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "bool DeviceGraphOrchestrator::completeLiveStateForForwardGraphExecution(",
+            "const float *DeviceGraphOrchestrator::getAllPositionLogits() const")));
+    const auto compact_maintenance_boundary =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            source,
+            "MoEOverlayInferenceBoundaryStatus DeviceGraphOrchestrator::\n"
+            "        enqueueMoEOverlayDeviceInferenceBoundary(",
+            "bool DeviceGraphOrchestrator::\n"
+            "        submitHostScheduledDeviceMoERebalanceKnownNonDueBoundary()")));
+
+    EXPECT_NE(
+        compact_lifecycle.find(
+            "enumclassMoEOverlayEpochLeaseState:std::uint8_t"),
+        std::string::npos)
+        << "Every reader, forward, and release phase must share one typed lifecycle.";
+    EXPECT_NE(
+        compact_lifecycle.find(
+            "std::atomic<MoEOverlayEpochLeaseState>state_"),
+        std::string::npos)
+        << "Inference and background maintenance must observe one atomic phase.";
+    EXPECT_NE(
+        compact_lifecycle.find("classSubmissionfinal"),
+        std::string::npos)
+        << "Host enqueue and event publication must be one RAII submission recipe.";
+    EXPECT_NE(
+        compact_lifecycle.find("std::unique_lock<std::mutex>lock_"),
+        std::string::npos)
+        << "Concurrent inference and maintenance submissions must not expose partial event edges.";
+    EXPECT_NE(
+        compact_lifecycle.find("void*release_producer_stream_=nullptr;"),
+        std::string::npos)
+        << "The release ordering payload must be owned by the typed lifecycle.";
+    EXPECT_NE(
+        compact_lifecycle.find("publishRelease(void*producer_stream)"),
+        std::string::npos)
+        << "Release state and its exact producer stream must publish atomically.";
+    EXPECT_EQ(
+        compact_header.find("moe_overlay_epoch_release_producer_stream_"),
+        std::string::npos)
+        << "Device orchestration may not shadow the typed release receipt.";
+    EXPECT_EQ(
+        compact_lifecycle.find("AcquirePending"),
+        std::string::npos)
+        << "Half-submitted host operations are not semantic lease states.";
+    EXPECT_EQ(
+        compact_lifecycle.find("ReleaseSubmitting"),
+        std::string::npos)
+        << "A release becomes visible only after its immutable event is recorded.";
+    EXPECT_NE(
+        compact_header.find(
+            "void*moe_overlay_epoch_forward_submission_stream_=nullptr;"),
+        std::string::npos)
+        << "The active forward receipt must retain the exact admitted stream.";
+
+    ASSERT_FALSE(compact_builder.empty());
+    EXPECT_NE(
+        raw_builder.find("moe_overlay_main_forward_epoch_acquire"),
+        std::string::npos);
+    EXPECT_NE(
+        raw_builder.find("moe_overlay_main_forward_epoch_release"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_builder.find(
+            "input.execution_role==ForwardExecutionRole::MainInference"),
+        std::string::npos)
+        << "Only an ordinary main forward receives these boundaries; MTP owns its parent transaction.";
+    EXPECT_NE(
+        compact_builder.find(
+            "graph.addDependency(root,kAcquireNode);"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_builder.find(
+            "graph.addDependency(kReleaseNode,leaf);"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_builder.find("graph.setTerminalNode(kReleaseNode);"),
+        std::string::npos)
+        << "Release must be the sole graph terminal after every original leaf.";
+    EXPECT_NE(
+        compact_build_forward.find(
+            "appendCapturedMainForwardMoEOverlayEpochTransaction("),
+        std::string::npos)
+        << "The production forward builder must install the transaction.";
+
+    const size_t maintenance_join = compact_prepare.find(
+        "waitForPendingDeviceMoERebalanceMaintenance(");
+    const size_t admission_call = compact_prepare.find(
+        "admit_forward_epoch();", maintenance_join);
+    ASSERT_NE(maintenance_join, std::string::npos);
+    ASSERT_NE(admission_call, std::string::npos);
+    EXPECT_LT(maintenance_join, admission_call)
+        << "Admission must join prior maintenance before launching the captured acquire.";
+
+    const auto compact_captured_prepare =
+        sliceBetween(
+            compact_prepare,
+            "if(epoch_submission_policy==Policy::CapturedMainTransaction)",
+            "elseif");
+    ASSERT_FALSE(compact_captured_prepare.empty());
+    EXPECT_NE(
+        compact_captured_prepare.find(
+            "MoEOverlayEpochLeaseState::CapturedMainForward"),
+        std::string::npos);
+    EXPECT_NE(
+        compact_captured_prepare.find("backend->streamWaitEvent("),
+        std::string::npos)
+        << "A later graph must consume the prior immutable terminal receipt.";
+    EXPECT_EQ(
+        compact_captured_prepare.find(
+            "acquireMoEOverlayEpochForExternalTransaction("),
+        std::string::npos)
+        << "The host may not launch an acquire graph beside a captured main transaction.";
+
+    const size_t exact_stream_check = compact_complete.find(
+        "execution_stream!=moe_overlay_epoch_forward_submission_stream_");
+    ASSERT_NE(exact_stream_check, std::string::npos);
+    const auto compact_captured_complete =
+        sliceBetween(compact_complete, "if(captured_main)", "else");
+    ASSERT_FALSE(compact_captured_complete.empty());
+    EXPECT_NE(
+        compact_captured_complete.find("backend->recordEvent("),
+        std::string::npos)
+        << "Completion must publish one terminal receipt on the graph stream.";
+    EXPECT_NE(
+        compact_captured_complete.find(
+            "moe_overlay_epoch_released_event_.get()"),
+        std::string::npos);
+    EXPECT_EQ(
+        compact_captured_complete.find(
+            "releaseMoEOverlayEpochForExternalTransaction("),
+        std::string::npos)
+        << "Completion may not launch a separate release graph.";
+
+    EXPECT_NE(
+        compact_maintenance_boundary.find(
+            "moe_overlay_epoch_released_event_.get()"),
+        std::string::npos)
+        << "Maintenance must consume the immutable completed-forward receipt.";
+    EXPECT_NE(
+        compact_maintenance_boundary.find("backend->streamWaitEvent("),
+        std::string::npos);
+    EXPECT_NE(
+        compact_maintenance_boundary.find(
+            "joined_submission.publishedReleaseProducerStream()"),
+        std::string::npos)
+        << "Maintenance must pin release state and payload under one submission authority.";
+    EXPECT_EQ(
+        compact_maintenance_boundary.find("orderStreamAfterCapture("),
+        std::string::npos)
+        << "Maintenance may not record a late fence on the mutable inference stream.";
+
+    const std::string protocol = compact_builder + compact_prepare +
+                                 compact_complete +
+                                 compact_maintenance_boundary;
+    EXPECT_EQ(protocol.find("synchronizeStream("), std::string::npos);
+    EXPECT_EQ(protocol.find("synchronizeDevice("), std::string::npos);
+    EXPECT_EQ(protocol.find("waitForEvent("), std::string::npos)
+        << "The per-forward inference/maintenance protocol is event-enqueued, "
+           "never host-blocking.";
+    EXPECT_EQ(protocol.find("deviceToHost"), std::string::npos);
+    EXPECT_EQ(protocol.find("hostToDevice"), std::string::npos);
+}
+
+/**
+ * @brief Defer a topology-wide maintenance epoch before any participant graph.
+ *
+ * A hosted MTP parent or device-resident publication may still own the reader
+ * when background maintenance arrives. These intervals are ordinary overlap:
+ * the maintenance worker must retry a typed boundary preflight without
+ * synchronizing inference, and a deferred participant must prevent every
+ * sibling CUDA/ROCm controller graph from launching a partial epoch.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     TopologyWideMaintenanceDefersWholeEpochBehindInferenceWriter)
+{
+    const auto root = repoRoot();
+    const auto binding_header = readFile(
+        root /
+        "src/v2/execution/moe/MoEOverlayDeviceControllerRuntimeBinding.h");
+    const auto dgo_source = readFile(
+        root /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto service_source = readFile(
+        root /
+        "src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp");
+
+    const auto compact_binding =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(binding_header));
+    const auto compact_boundary =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            dgo_source,
+            "MoEOverlayInferenceBoundaryStatus DeviceGraphOrchestrator::\n"
+            "        enqueueMoEOverlayDeviceInferenceBoundary(",
+            "bool DeviceGraphOrchestrator::\n"
+            "        submitHostScheduledDeviceMoERebalanceKnownNonDueBoundary()")));
+    const auto compact_epoch =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+            service_source,
+            "bool MoEOverlayDeviceControllerGraphService::launchDynamicEpoch(",
+            "bool MoEOverlayDeviceControllerGraphService::dynamicTerminalsReady(")));
+
+    EXPECT_NE(
+        compact_binding.find(
+            "enumclassMoEOverlayInferenceBoundaryStatus:std::uint8_t"
+            "{Submitted=0,Deferred=1,Failed=2,};"),
+        std::string::npos)
+        << "Ordinary producer overlap must be distinct from a malformed edge.";
+
+    const size_t atomic_lease_preflight = compact_boundary.find(
+        "constautoinitial_lease_state="
+        "moe_overlay_epoch_lease_lifecycle_->load();");
+    const size_t lease_deferral = compact_boundary.find(
+        "returndefer_for_lease(initial_lease_state);",
+        atomic_lease_preflight);
+    const size_t mailbox_preflight = compact_boundary.find(
+        "waitForDeviceResidentLogicalSequenceStateMailboxForObservation(");
+    const size_t typed_deferral = compact_boundary.find(
+        "returnMoEOverlayInferenceBoundaryStatus::Deferred;",
+        mailbox_preflight);
+    const size_t remaining_live_state_joins = compact_boundary.find(
+        "waitForLiveInferenceStateReadyForObservation(", typed_deferral);
+    ASSERT_NE(atomic_lease_preflight, std::string::npos);
+    ASSERT_NE(lease_deferral, std::string::npos);
+    ASSERT_NE(mailbox_preflight, std::string::npos);
+    ASSERT_NE(typed_deferral, std::string::npos);
+    ASSERT_NE(remaining_live_state_joins, std::string::npos);
+    EXPECT_LT(atomic_lease_preflight, lease_deferral);
+    EXPECT_LT(lease_deferral, mailbox_preflight)
+        << "Every in-flight lease phase must defer maintenance before any stale live-state join is enqueued.";
+    EXPECT_LT(mailbox_preflight, typed_deferral);
+    EXPECT_LT(typed_deferral, remaining_live_state_joins)
+        << "A pending writer must defer before maintenance observes any later live-state owner.";
+
+    const size_t preflight_loop = compact_epoch.find(
+        "while(!boundaries_submitted&&");
+    const size_t boundary_submit = compact_epoch.find(
+        "enqueueMoEOverlayDeviceInferenceBoundary(", preflight_loop);
+    const size_t all_preflights_joined = compact_epoch.find(
+        "for(auto&submission:boundary_submissions)submission.get();",
+        boundary_submit);
+    const size_t participant_graph_launch = compact_epoch.find(
+        "graph->launchOnStream(endpoint.stream)", all_preflights_joined);
+    ASSERT_NE(preflight_loop, std::string::npos);
+    ASSERT_NE(boundary_submit, std::string::npos);
+    ASSERT_NE(all_preflights_joined, std::string::npos);
+    ASSERT_NE(participant_graph_launch, std::string::npos);
+    EXPECT_LT(preflight_loop, boundary_submit);
+    EXPECT_LT(boundary_submit, all_preflights_joined);
+    EXPECT_LT(all_preflights_joined, participant_graph_launch)
+        << "Every participant boundary must be accepted before the first retained controller graph launches.";
+    EXPECT_NE(
+        compact_epoch.find(
+            "status==MoEOverlayInferenceBoundaryStatus::Submitted"),
+        std::string::npos)
+        << "A Deferred participant must force a complete fan-in retry.";
+
+    const std::string protocol = compact_boundary + compact_epoch;
+    EXPECT_EQ(protocol.find("synchronizeStream("), std::string::npos);
+    EXPECT_EQ(protocol.find("synchronizeDevice("), std::string::npos);
+    EXPECT_EQ(protocol.find("waitForEvent("), std::string::npos)
+        << "Deferral is maintenance-thread retry, never an inference wait.";
+}
+
+/**
+ * @brief Keep Dynamic snapshot fan-in as four finite receipt-selected epochs.
+ *
+ * A group root must never wait on-device for a sibling snapshot: that sibling
+ * may be queued behind sparse inference which itself needs progress from the
+ * root. The maintenance scheduler first proves every participant receipt,
+ * then admits the phase-agnostic group reduction, and only then admits the
+ * authority policy graph.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     DynamicSnapshotGroupFanInCannotOccupyADeviceWaitingForInference)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp");
+    const auto compact =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+
+    const auto capture_family = sliceBetween(
+        compact,
+        "constautocapture_decision_family=",
+        "capture(endpoint.dynamic_histogram_rebase_graph,");
+    ASSERT_FALSE(capture_family.empty());
+    EXPECT_NE(
+        capture_family.find("PublishParticipantSnapshot"),
+        std::string::npos);
+    EXPECT_EQ(capture_family.find("PublishGroupSnapshot"), std::string::npos)
+        << "A participant snapshot graph may not contain a peer wait.";
+
+    const auto materialize = sliceBetween(
+        compact,
+        "voidMoEOverlayDeviceControllerGraphService::materializeEndpoint(",
+        "boolMoEOverlayDeviceControllerGraphService::launchAll(");
+    ASSERT_FALSE(materialize.empty());
+    EXPECT_NE(
+        materialize.find(
+            "capture(endpoint.dynamic_group_snapshot_graph,"),
+        std::string::npos);
+    EXPECT_NE(
+        materialize.find("PublishGroupSnapshot"),
+        std::string::npos);
+
+    const auto run_one = sliceBetween(
+        compact,
+        "boolMoEOverlayDeviceControllerGraphService::DynamicWorker::runOne(",
+        "std::size_tMoEOverlayDeviceControllerGraphService::localGraphCount(");
+    ASSERT_FALSE(run_one.empty());
+    const size_t participant_launch = run_one.find(
+        "owner->launchDynamicEpoch(snapshot_epoch,error)");
+    const size_t participant_receipts = run_one.find(
+        "protocol->localSnapshotsReady(decision_transaction)",
+        participant_launch);
+    const size_t group_launch = run_one.find(
+        "owner->launchDynamicEpoch(DynamicGraphEpoch::PublishGroupSnapshot,error)",
+        participant_receipts);
+    const size_t group_receipts = run_one.find(
+        "protocol->allGroupsSnapshotted(decision_transaction)",
+        group_launch);
+    const size_t author_launch = run_one.find(
+        "owner->launchDynamicEpoch(author_epoch,error)",
+        group_receipts);
+    ASSERT_NE(participant_launch, std::string::npos);
+    ASSERT_NE(participant_receipts, std::string::npos);
+    ASSERT_NE(group_launch, std::string::npos);
+    ASSERT_NE(group_receipts, std::string::npos);
+    ASSERT_NE(author_launch, std::string::npos);
+    EXPECT_LT(participant_launch, participant_receipts);
+    EXPECT_LT(participant_receipts, group_launch);
+    EXPECT_LT(group_launch, group_receipts);
+    EXPECT_LT(group_receipts, author_launch);
+}
+
+/**
+ * @brief Require every directly replayed hosted child to join parent acquire.
+ *
+ * Hosted MTP children bypass ForwardExecutionEngine's ordinary live-state
+ * prelude. Their exact executable launch edge must therefore consume the
+ * parent acquire event explicitly, before the ticket authority can publish a
+ * remote transaction. This is an event wait, never a host synchronization.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy,
+     HostedMTPChildrenConsumeParentAcquireAtExecutableLaunch)
+{
+    const auto source = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto header = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    const auto engine = readFile(
+        repoRoot() /
+        "src/v2/execution/local_execution/engine/ForwardExecutionEngine.cpp");
+    const auto compact =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+    const auto compact_header =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(header));
+    const auto compact_engine =
+        removeAsciiWhitespace(stripCommentsAndStringLiterals(engine));
+
+    const auto consume = sliceBetween(
+        compact,
+        "boolDeviceGraphOrchestrator::consumeMoEOverlayEpochForHostedChild(",
+        "boolDeviceGraphOrchestrator::prepareMoEOverlayEpochForInternalParent(");
+    ASSERT_FALSE(consume.empty());
+    EXPECT_NE(consume.find("backend->streamWaitEvent("), std::string::npos);
+    EXPECT_EQ(consume.find("synchronizeStream("), std::string::npos);
+    EXPECT_EQ(consume.find("synchronizeDevice("), std::string::npos);
+    EXPECT_EQ(consume.find("waitForEvent("), std::string::npos);
+
+    const auto sidecar = sliceBetween(
+        compact,
+        "boolDeviceGraphOrchestrator::replayHostedMTPSidecar(",
+        "boolDeviceGraphOrchestrator::replayHostedMTPGroupedVerifier(");
+    const auto verifier = sliceBetween(
+        compact,
+        "boolDeviceGraphOrchestrator::replayHostedMTPGroupedVerifier(",
+        "std::optional<DeviceGraphExecutor::GraphSegmentCache::DeviceLoopGraphTemplateView>");
+    ASSERT_FALSE(sidecar.empty());
+    ASSERT_FALSE(verifier.empty());
+    EXPECT_NE(
+        sidecar.find(
+            "consumeMoEOverlayEpochForHostedChild(execution_stream,"),
+        std::string::npos);
+    EXPECT_NE(
+        verifier.find(
+            "consumeMoEOverlayEpochForHostedChild(execution_stream,"),
+        std::string::npos);
+
+    const size_t sidecar_consume = sidecar.find(
+        "consumeMoEOverlayEpochForHostedChild(execution_stream,");
+    const size_t sidecar_arm = sidecar.find(
+        "graph_scope.armForExecutableLaunch(execution_stream", sidecar_consume);
+    ASSERT_NE(sidecar_consume, std::string::npos);
+    ASSERT_NE(sidecar_arm, std::string::npos);
+    EXPECT_LT(sidecar_consume, sidecar_arm)
+        << "The remote ticket must not precede the local placement reader.";
+
+    EXPECT_NE(
+        sidecar.find(
+            "cache->segment_cache.orderCaptureStreamAfter("
+            "replay_context,loop.stream.get())"),
+        std::string::npos)
+        << "The sidecar must consume scheduler ownership through its own "
+           "retained-cache event.";
+    EXPECT_NE(
+        sidecar.find(
+            "cache->segment_cache.orderStreamAfterCapture("
+            "replay_context,loop.stream.get())"),
+        std::string::npos)
+        << "The scheduler must resume only after the exact sidecar executable.";
+
+    const auto retained_replay = sliceBetween(
+        compact_engine,
+        "boolForwardExecutionEngine::replayRetainedDecodeGraph(",
+        "std::optional<ForwardExecutionEngine::DeviceLoopGraphTemplateView>");
+    ASSERT_FALSE(retained_replay.empty());
+    EXPECT_NE(
+        retained_replay.find(
+            "cache.segment_cache.orderCaptureStreamAfter("
+            "cache.gpu_ctx,transaction_stream)"),
+        std::string::npos);
+    EXPECT_NE(
+        retained_replay.find(
+            "cache.segment_cache.orderStreamAfterCapture("
+            "cache.gpu_ctx,transaction_stream)"),
+        std::string::npos);
+
+    for (const std::string_view obsolete : {
+             "handoff_to_fragment_event",
+             "handoff_from_fragment_event",
+             "beginHostedSemanticFragmentHandoff",
+             "finishHostedSemanticFragmentHandoff"})
+    {
+        EXPECT_EQ(compact.find(obsolete), std::string::npos);
+        EXPECT_EQ(compact_header.find(obsolete), std::string::npos);
+        EXPECT_EQ(compact_engine.find(obsolete), std::string::npos);
+    }
+}
+
+/**
  * @brief Keep the scalar target-to-sidecar transition fully device authoritative.
  *
  * The condition graph advances canonical main KV state before the first target
@@ -9519,10 +10085,14 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
         << "Admission must publish the padded stride in the same geometry epoch as every request length.";
     EXPECT_NE(
         prefill_admission.find(
-            "hostToDeviceOnStream(request_batch_geometry_dev_,"
+            "enqueue_admission_member("
+            ",request_batch_geometry_dev_,"
             "request_batch_geometry_host_.data(),geometry_bytes"),
         std::string::npos)
         << "The complete request geometry must cross H2D as one ordered transfer.";
+    EXPECT_NE(prefill_admission_source.find("\"batch_geometry\""),
+              std::string::npos)
+        << "The single geometry transfer must retain a diagnostic identity.";
     EXPECT_EQ(prefill_admission.find("request_sequence_lengths_host_"),
               std::string::npos)
         << "The retired lengths-only host staging vector must not return.";
@@ -10726,10 +11296,14 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMTPSidecarUsesPersistentDepthScopedM
     EXPECT_NE(compact_ffn.find("device,runtime_table_identity,total_tokens"),
               std::string::npos)
         << "Every runtime-table lookup must consume the typed identity";
-    EXPECT_NE(compact_ffn.find("register_runtime_histogram=!use_mtp_runtime_table"),
+    EXPECT_NE(compact_ffn.find("collect_runtime_histogram=!use_mtp_runtime_table"),
               std::string::npos)
         << "Sidecar routing metadata is transient runtime state and must not "
            "feed request-level decode histograms.";
+    EXPECT_NE(compact_ffn.find("register_runtime_histogram=collect_runtime_histogram"),
+              std::string::npos)
+        << "Runtime-table histogram registration must consume the same typed "
+           "collection decision as the routing stage.";
     EXPECT_NE(graph_source.find("moe_mtp_sidecar_runtime_table_creations"),
               std::string::npos)
         << "Real-model Phase 9.6 integration tests need a perf counter proving "
@@ -11141,11 +11715,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEDeviceRoutedDecodeTableGuardsO
         << "Graph-native tiered overlays use per-participant expert masks even "
            "when the tier domain says routed_compute=apportioned; they must not "
            "receive the full-owner decode runtime table.";
-    EXPECT_NE(compact.find("constbooldecode_runtime_table_eligible="),
+    EXPECT_NE(compact.find("constboolruntime_table_eligible="),
               std::string::npos)
         << "Runtime-table creation must use one explicit eligibility predicate "
            "before MoERoutingStage and MoEExpertComputeStage are built.";
-    EXPECT_NE(compact.find("&&decode_runtime_table_eligible)"),
+    EXPECT_NE(compact.find("&&runtime_table_eligible)"),
               std::string::npos)
         << "Runtime-table creation must be gated before MoERoutingStage and "
            "MoEExpertComputeStage are built; failing later in the expert stage "
@@ -13255,6 +13829,20 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
         << "The shared expert policy should expose the promoted GPU grouped "
            "table route for both CUDA and ROCm.";
     EXPECT_NE(compact_shared.find(
+                  "constboolshared_router_q8_reuse_enabled="
+                  "(shared_device.is_cuda()&&"
+                  "debugEnv().gemm.cuda_moe_reuse_router_q8_hidden)||"
+                  "(shared_device.is_rocm()&&"
+                  "debugEnv().rocm.moe_reuse_router_q8_hidden);"),
+              std::string::npos)
+        << "CUDA and ROCm must derive shared-verifier publication ownership "
+           "from their symmetric backend reuse policies.";
+    EXPECT_NE(compact_shared.find(
+                  "if(shared_requires_router_q8_publication)"),
+              std::string::npos)
+        << "Router Q8 publication must remain optional when deterministic "
+           "execution selects standalone grouped quantization.";
+    EXPECT_NE(compact_shared.find(
                   "shared_params.force_decode_equivalent_verifier_prefill="
                   "(!shared_gpu_table_verifier_prefill&&"
                   "(!shared_grouped_verifier_prefill&&"
@@ -15283,6 +15871,12 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "mtpAllPositionVerifierDeviceLoopGraphTemplate(request_count,physical_verifier_rows_per_request,sampling_mode"),
         std::string::npos)
         << "The retained forward must authenticate the same sampling topology as its parent.";
+    EXPECT_NE(
+        composer.find(
+            "mtpSpeculativeStatePublicationDeviceLoopGraphTemplate(request_count,physical_verifier_rows_per_request"),
+        std::string::npos)
+        << "Accepted-state publication must consume the verifier graph's "
+           "physical padded width, not the smaller logical draft width.";
 
     const std::array<const char *, 18> forbidden = {
         "cudaMalloc",

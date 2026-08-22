@@ -45,6 +45,23 @@ namespace
         return out;
     }
 
+    /// Build a StageDumpInfo::OutputBuffer from exact INT32 data.
+    StageDumpInfo::OutputBuffer makeINT32Output(
+        const char *name,
+        const int32_t *data,
+        size_t rows,
+        size_t cols)
+    {
+        StageDumpInfo::OutputBuffer out;
+        out.name = name;
+        out.data = data;
+        out.rows = rows;
+        out.cols = cols;
+        out.dtype = "INT32";
+        out.element_size = sizeof(int32_t);
+        return out;
+    }
+
     /// Build StageDumpInfo with a single FP32 output
     StageDumpInfo makeSingleOutputDump(
         const char *name,
@@ -124,6 +141,9 @@ TEST(Test__SnapshotCapture_KeyConversion, MoEStages)
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert"), "layer0_MOE_SHARED_EXPERT_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert_allreduce"),
               "layer0_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey(
+                  "layer0_shared_expert_reduce_to_overlay_root"),
+              "layer0_MOE_SHARED_EXPERT_OUTPUT_REDUCED_TO_OVERLAY_ROOT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert_gate"), "layer0_MOE_SHARED_GATE_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_add"), "layer0_MOE_COMBINED_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_combine"), "layer0_MOE_COMBINED_OUTPUT");
@@ -178,6 +198,45 @@ TEST(Test__SnapshotCapture_KeyConversion, PossibleKeysIncludeFusedMoECombinedOut
 }
 
 /**
+ * @brief A fused rooted shared-gate epilogue preserves all three MoE values.
+ *
+ * Heterogeneous LocalTP overlay lowering intentionally defers the routed-only
+ * broadcast and publishes just the final combined row.  The root-owned fused
+ * gate stage is therefore the only real producer boundary at which parity can
+ * observe the complete routed row without adding a test-only graph node.
+ */
+TEST(Test__SnapshotCapture_Capture,
+     FusedSharedGatePublishesRootOwnedRoutedCheckpoint)
+{
+    const std::vector<float> shared = {0.5f, -0.25f};
+    const std::vector<float> routed = {1.0f, 2.0f};
+    const std::vector<float> combined = {1.5f, 1.75f};
+    StageDumpInfo dump;
+    dump.outputs.push_back(
+        makeFP32Output("shared_output", shared.data(), 1, shared.size()));
+    dump.outputs.push_back(
+        makeFP32Output("routed_output", routed.data(), 1, routed.size()));
+    dump.outputs.push_back(
+        makeFP32Output("combined_output", combined.data(), 1, combined.size()));
+
+    const auto possible = SnapshotCapture::possibleKeysForStage(
+        "layer2_shared_expert_gate", dump);
+    EXPECT_NE(
+        std::find(
+            possible.begin(), possible.end(), "layer2_MOE_EXPERT_OUTPUT"),
+        possible.end());
+
+    SnapshotCapture capture;
+    capture.captureStage("layer2_shared_expert_gate", dump);
+    ASSERT_NE(capture.get("layer2_MOE_EXPERT_OUTPUT"), nullptr);
+    ASSERT_NE(capture.get("layer2_MOE_SHARED_GATE_OUTPUT"), nullptr);
+    ASSERT_NE(capture.get("layer2_MOE_COMBINED_OUTPUT"), nullptr);
+    EXPECT_EQ(capture.get("layer2_MOE_EXPERT_OUTPUT")->data, routed);
+    EXPECT_EQ(capture.get("layer2_MOE_SHARED_GATE_OUTPUT")->data, shared);
+    EXPECT_EQ(capture.get("layer2_MOE_COMBINED_OUTPUT")->data, combined);
+}
+
+/**
  * @brief Descriptor-aware filtering follows the concrete canonical producer.
  *
  * LocalTP canonical publication leaves the expert stage name intact while
@@ -216,6 +275,174 @@ TEST(Test__SnapshotCapture_KeyConversion,
                   "layer0_MOE_EXPERT_OUTPUT",
                   "layer0_MOE_SHARED_GATE_OUTPUT",
                   "layer0_MOE_COMBINED_OUTPUT"}));
+}
+
+/**
+ * @brief Mapped sparse reduction publishes both pinned route projections.
+ *
+ * Domain route scratch is reused by later layers, while the global placement
+ * bank may advance independently under RCU. The boundary snapshot therefore
+ * preserves the local schedule, post-filter weights, both durable banks, and
+ * the request selector as exact evidence for the parity artifact API.
+ */
+TEST(Test__SnapshotCapture_KeyConversion,
+     MappedSparseReducerPublishesDeviceRouteAssignmentLedger)
+{
+    const std::vector<float> routed = {1.0f, -2.0f, 3.0f, -4.0f};
+    const std::vector<int32_t> participants = {1, 2, 0, 3};
+    const std::vector<float> runtime_weights = {0.4f, 0.3f, 0.2f, 0.1f};
+    const std::vector<int32_t> bank0 = {4, 5, 6};
+    const std::vector<int32_t> bank1 = {7, 8, 9};
+    const std::vector<int32_t> selected_bank = {1};
+    StageDumpInfo dump;
+    dump.outputs.push_back(
+        makeFP32Output("output", routed.data(), 1, routed.size()));
+    dump.outputs.push_back(
+        makeINT32Output(
+            "domain_route_participant_ids", participants.data(), 2, 2));
+    dump.outputs.push_back(
+        makeFP32Output(
+            "runtime_route_weights", runtime_weights.data(), 2, 2));
+    dump.outputs.push_back(makeINT32Output(
+        "overlay_route_participants_bank0", bank0.data(), 1, bank0.size()));
+    dump.outputs.push_back(makeINT32Output(
+        "overlay_route_participants_bank1", bank1.data(), 1, bank1.size()));
+    dump.outputs.push_back(makeINT32Output(
+        "overlay_route_selected_bank",
+        selected_bank.data(),
+        1,
+        selected_bank.size()));
+
+    const std::string stage =
+        "layer7_moe_overlay_continuation_routes_ordered_reduce";
+    EXPECT_EQ(
+        SnapshotCapture::possibleKeysForStage(stage, dump),
+        (std::vector<std::string>{
+            "layer7_MOE_EXPERT_OUTPUT",
+            "layer7_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
+            "layer7_MOE_RUNTIME_ROUTE_WEIGHTS",
+            "layer7_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+            "layer7_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+            "layer7_MOE_OVERLAY_ROUTE_SELECTED_BANK"}));
+
+    SnapshotCapture capture;
+    capture.captureStage(stage, dump);
+    const auto routed_snapshot =
+        capture.get("layer7_MOE_EXPERT_OUTPUT");
+    const auto assignment_snapshot = capture.get(
+        "layer7_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS");
+    const auto runtime_weight_snapshot = capture.get(
+        "layer7_MOE_RUNTIME_ROUTE_WEIGHTS");
+    const auto bank0_snapshot = capture.get(
+        "layer7_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0");
+    const auto bank1_snapshot = capture.get(
+        "layer7_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1");
+    const auto selected_bank_snapshot = capture.get(
+        "layer7_MOE_OVERLAY_ROUTE_SELECTED_BANK");
+    ASSERT_NE(routed_snapshot, nullptr);
+    ASSERT_NE(assignment_snapshot, nullptr);
+    ASSERT_NE(runtime_weight_snapshot, nullptr);
+    ASSERT_NE(bank0_snapshot, nullptr);
+    ASSERT_NE(bank1_snapshot, nullptr);
+    ASSERT_NE(selected_bank_snapshot, nullptr);
+    EXPECT_EQ(routed_snapshot->data, routed);
+    EXPECT_EQ(
+        assignment_snapshot->data,
+        (std::vector<float>{1.0f, 2.0f, 0.0f, 3.0f}));
+    EXPECT_EQ(runtime_weight_snapshot->data, runtime_weights);
+    EXPECT_EQ(bank0_snapshot->data, (std::vector<float>{4.0f, 5.0f, 6.0f}));
+    EXPECT_EQ(bank1_snapshot->data, (std::vector<float>{7.0f, 8.0f, 9.0f}));
+    EXPECT_EQ(selected_bank_snapshot->data, (std::vector<float>{1.0f}));
+}
+
+/**
+ * @brief Single-continuation mapped return finalizes the same pinned epoch.
+ *
+ * Dispatch precedes grouped domain assignment and must not expose its reusable
+ * scratch. The final return join is the first boundary that owns the complete
+ * routed row, final domain assignment, and request-pinned placement bank.
+ */
+TEST(Test__SnapshotCapture_KeyConversion,
+     MappedReturnPublishesPinnedRouteEpochAfterAssignmentFinalization)
+{
+    const std::vector<float> routed = {1.0f, -2.0f, 3.0f, -4.0f};
+    const std::vector<int32_t> participants = {0, -1, 0, -1};
+    const std::vector<float> runtime_weights = {0.7f, 0.0f, 0.3f, 0.0f};
+    const std::vector<int32_t> bank0 = {0, 1, 0};
+    const std::vector<int32_t> bank1 = {1, 0, 1};
+    const std::vector<int32_t> selected_bank = {0};
+    StageDumpInfo dump;
+    dump.outputs.push_back(
+        makeFP32Output("output", routed.data(), 1, routed.size()));
+    dump.outputs.push_back(
+        makeINT32Output(
+            "domain_route_participant_ids", participants.data(), 2, 2));
+    dump.outputs.push_back(
+        makeFP32Output(
+            "runtime_route_weights", runtime_weights.data(), 2, 2));
+    dump.outputs.push_back(makeINT32Output(
+        "overlay_route_participants_bank0", bank0.data(), 1, bank0.size()));
+    dump.outputs.push_back(makeINT32Output(
+        "overlay_route_participants_bank1", bank1.data(), 1, bank1.size()));
+    dump.outputs.push_back(makeINT32Output(
+        "overlay_route_selected_bank",
+        selected_bank.data(),
+        1,
+        selected_bank.size()));
+
+    const auto premature_dispatch_keys =
+        SnapshotCapture::possibleKeysForStageName(
+            "layer3_moe_overlay_activation_dispatch_pack_batch");
+    EXPECT_EQ(
+        std::find(
+            premature_dispatch_keys.begin(),
+            premature_dispatch_keys.end(),
+            "layer3_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS"),
+        premature_dispatch_keys.end())
+        << "Dispatch precedes the only producer of final domain assignment";
+
+    const std::string stage =
+        "layer3_moe_overlay_activation_return_consume_batch";
+    EXPECT_EQ(
+        SnapshotCapture::possibleKeysForStage(stage, dump),
+        (std::vector<std::string>{
+            "layer3_MOE_EXPERT_OUTPUT",
+            "layer3_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
+            "layer3_MOE_RUNTIME_ROUTE_WEIGHTS",
+            "layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+            "layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+            "layer3_MOE_OVERLAY_ROUTE_SELECTED_BANK"}));
+    EXPECT_EQ(
+        SnapshotCapture::possibleKeysForStageName(stage),
+        (std::vector<std::string>{
+            "layer3_MOE_EXPERT_OUTPUT",
+            "layer3_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
+            "layer3_MOE_RUNTIME_ROUTE_WEIGHTS",
+            "layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+            "layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+            "layer3_MOE_OVERLAY_ROUTE_SELECTED_BANK"}));
+
+    SnapshotCapture capture;
+    capture.captureStage(stage, dump);
+    ASSERT_NE(capture.get("layer3_MOE_EXPERT_OUTPUT"), nullptr);
+    EXPECT_EQ(capture.get("layer3_MOE_EXPERT_OUTPUT")->data, routed);
+    ASSERT_NE(
+        capture.get("layer3_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS"), nullptr);
+    EXPECT_EQ(
+        capture.get("layer3_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS")->data,
+        (std::vector<float>{0.0f, -1.0f, 0.0f, -1.0f}));
+    EXPECT_EQ(
+        capture.get("layer3_MOE_RUNTIME_ROUTE_WEIGHTS")->data,
+        runtime_weights);
+    EXPECT_EQ(
+        capture.get("layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0")->data,
+        (std::vector<float>{0.0f, 1.0f, 0.0f}));
+    EXPECT_EQ(
+        capture.get("layer3_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1")->data,
+        (std::vector<float>{1.0f, 0.0f, 1.0f}));
+    EXPECT_EQ(
+        capture.get("layer3_MOE_OVERLAY_ROUTE_SELECTED_BANK")->data,
+        (std::vector<float>{0.0f}));
 }
 
 /**
@@ -277,6 +504,14 @@ TEST(Test__SnapshotCapture_KeyConversion, PossibleKeysIncludePostCollectiveOutpu
                         "layer14_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"),
               shared_keys.end());
 
+    const auto shared_root_reduce_keys =
+        SnapshotCapture::possibleKeysForStageName(
+            "layer14_shared_expert_reduce_to_overlay_root");
+    EXPECT_EQ(
+        shared_root_reduce_keys,
+        (std::vector<std::string>{
+            "layer14_MOE_SHARED_EXPERT_OUTPUT_REDUCED_TO_OVERLAY_ROOT"}));
+
     const auto routed_keys =
         SnapshotCapture::possibleKeysForStageName("layer14_moe_expert_overlay_fast_allreduce");
     EXPECT_NE(std::find(routed_keys.begin(),
@@ -293,6 +528,46 @@ TEST(Test__SnapshotCapture_KeyConversion, PossibleKeysIncludePostCollectiveOutpu
             overlay_publication_keys.end(),
             "layer14_MOE_EXPERT_OUTPUT_ALLREDUCED"),
         overlay_publication_keys.end());
+}
+
+/**
+ * @brief A rooted overlay collective cannot replace the local TP checkpoint.
+ *
+ * The local shared FFN reports `[tokens,hidden]`, while the rooted collective
+ * reports the same transfer span as `[1,count]`.  Both observations are useful,
+ * but only the former participates in row-parallel parity reconstruction.
+ */
+TEST(Test__SnapshotCapture_Capture,
+     SharedExpertRootReduceDoesNotOverwriteLocalRowParallelSnapshot)
+{
+    const std::vector<float> local = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        5.0f, 6.0f, 7.0f, 8.0f};
+    const std::vector<float> rooted = {
+        11.0f, 12.0f, 13.0f, 14.0f,
+        15.0f, 16.0f, 17.0f, 18.0f};
+
+    SnapshotCapture capture;
+    capture.captureStage(
+        "layer14_shared_expert_ffn",
+        makeSingleOutputDump("output", local.data(), 2, 4));
+    capture.captureStage(
+        "layer14_shared_expert_reduce_to_overlay_root",
+        makeSingleOutputDump("output", rooted.data(), 1, 8));
+
+    const auto *local_snapshot =
+        capture.get("layer14_MOE_SHARED_EXPERT_OUTPUT");
+    ASSERT_NE(local_snapshot, nullptr);
+    EXPECT_EQ(local_snapshot->rows, 2u);
+    EXPECT_EQ(local_snapshot->cols, 4u);
+    EXPECT_EQ(local_snapshot->data, local);
+
+    const auto *rooted_snapshot = capture.get(
+        "layer14_MOE_SHARED_EXPERT_OUTPUT_REDUCED_TO_OVERLAY_ROOT");
+    ASSERT_NE(rooted_snapshot, nullptr);
+    EXPECT_EQ(rooted_snapshot->rows, 1u);
+    EXPECT_EQ(rooted_snapshot->cols, 8u);
+    EXPECT_EQ(rooted_snapshot->data, rooted);
 }
 
 TEST(Test__SnapshotCapture_KeyConversion, MTPSidecarStages)
@@ -815,6 +1090,87 @@ TEST(Test__SnapshotCapture_Capture,
     ASSERT_NE(second_scoped, nullptr);
     EXPECT_EQ(first_scoped->data, first_embedding);
     EXPECT_EQ(second_scoped->data, second_embedding);
+}
+
+/**
+ * @brief Packed route contributions join live slots and discard bucket padding.
+ *
+ * Canonical ExpertOverlay evidence has `top_k` rows per logical token. The
+ * final segmented chunk still occupies the fixed physical bucket, so its
+ * inactive route rows must not survive in the prompt-wide diagnostic tensor.
+ */
+TEST(Test__SnapshotCapture_Capture,
+     SegmentedPrefillAggregationJoinsPackedRouteRowsWithoutPadding)
+{
+    const std::vector<float> first_indices = {0.0f, 1.0f, 2.0f, 3.0f};
+    const std::vector<float> final_indices = {4.0f, 5.0f};
+    const std::vector<float> first_contributions = {
+        1.0f, 2.0f,
+        3.0f, 4.0f,
+        5.0f, 6.0f,
+        7.0f, 8.0f,
+    };
+    const std::vector<float> final_bucket_contributions = {
+        9.0f, 10.0f,
+        11.0f, 12.0f,
+        99.0f, 99.0f,
+        99.0f, 99.0f,
+    };
+
+    SnapshotCapture capture;
+    StageDumpInfo first_routing;
+    first_routing.outputs.push_back(makeFP32Output(
+        "output_indices_tensor", first_indices.data(), 2, 2));
+    capture.captureStage(
+        "prefill_chunk_0::layer0_moe_routing", first_routing);
+    StageDumpInfo final_routing;
+    final_routing.outputs.push_back(makeFP32Output(
+        "output_indices_tensor", final_indices.data(), 1, 2));
+    capture.captureStage(
+        "prefill_chunk_1::layer0_moe_routing", final_routing);
+
+    StageDumpInfo first_experts;
+    first_experts.outputs.push_back(makeFP32Output(
+        "canonical_route_contributions",
+        first_contributions.data(),
+        4,
+        2));
+    capture.captureStage(
+        "prefill_chunk_0::layer0_moe_expert_ffn_overlay_fast",
+        first_experts);
+    StageDumpInfo final_experts;
+    final_experts.outputs.push_back(makeFP32Output(
+        "canonical_route_contributions",
+        final_bucket_contributions.data(),
+        4,
+        2));
+    capture.captureStage(
+        "prefill_chunk_1::layer0_moe_expert_ffn_overlay_fast",
+        final_experts);
+
+    const auto aggregation = capture.aggregateSequentialChunkSnapshots({
+        {.context = "prefill_chunk_0", .logical_rows = 2},
+        {.context = "prefill_chunk_1", .logical_rows = 1},
+    });
+    ASSERT_TRUE(aggregation) << aggregation.error;
+    EXPECT_EQ(aggregation.aggregated_sequence_keys, 2u);
+    EXPECT_EQ(aggregation.terminal_or_nonsequence_keys, 0u);
+
+    const auto *canonical =
+        capture.get("layer0_MOE_CANONICAL_ROUTE_CONTRIBUTIONS");
+    ASSERT_NE(canonical, nullptr);
+    EXPECT_EQ(canonical->rows, 6u);
+    EXPECT_EQ(canonical->cols, 2u);
+    EXPECT_EQ(
+        canonical->data,
+        (std::vector<float>{
+            1.0f, 2.0f,
+            3.0f, 4.0f,
+            5.0f, 6.0f,
+            7.0f, 8.0f,
+            9.0f, 10.0f,
+            11.0f, 12.0f,
+        }));
 }
 
 /**

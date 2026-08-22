@@ -28,27 +28,36 @@
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "execution/compute_stages/stages/MoEOverlayActivationPacketStages.h"
+#include "execution/compute_stages/stages/MoEOverlayEpochBoundaryStage.h"
 #include "execution/compute_stages/stages/MoERankBatchSparseStages.h"
 #include "execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "execution/local_execution/device/WorkspaceAllocator.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
+#include "execution/moe/DeviceMoEExpertDescriptorBuilder.h"
+#include "execution/moe/DeviceMoEOverlayEpochArena.h"
+#include "execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
 #include "execution/moe/MoEOverlayNodeLocalRankBatchTransport.h"
+#include "execution/moe/MoEOverlayInferenceInterferenceProbe.h"
 #include "execution/moe/MoEOverlayRankBatchTransport.h"
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
+#include "execution/moe/MoERuntimeTable.h"
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/WeightManager.h"
 #include "memory/BufferArena.h"
 #include "tensors/Tensors.h"
+#include "transfer/MappedTransferProgressEpoch.h"
 #include "transfer/TransferEngine.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/WeightLoadingProfiler.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -91,6 +100,34 @@ namespace llaminar2
         {
             return std::any_of(
                 mask.begin(), mask.end(), [](bool active) { return active; });
+        }
+
+        /**
+         * @brief Multiply two arena geometry terms while rejecting overflow.
+         *
+         * Persistent graph buffers are part of capacity admission and capture
+         * identity, so wrapping their geometry would bind a smaller allocation
+         * than the captured kernels address.  Reject that configuration before
+         * allocating or materializing any participant graph.
+         *
+         * @param lhs Left-hand geometry term.
+         * @param rhs Right-hand geometry term.
+         * @param what Human-readable allocation component for the diagnostic.
+         * @return The exact product.
+         * @throws std::overflow_error When the product cannot fit in `size_t`.
+         */
+        size_t checkedGeometryProduct(
+            size_t lhs,
+            size_t rhs,
+            const char *what)
+        {
+            if (lhs != 0u && rhs > std::numeric_limits<size_t>::max() / lhs)
+            {
+                throw std::overflow_error(
+                    std::string("MoE overlay participant geometry overflows: ") +
+                    what);
+            }
+            return lhs * rhs;
         }
 
         /**
@@ -227,6 +264,8 @@ namespace llaminar2
             std::shared_ptr<WorkspaceAllocator> workspace_allocator;
             std::unique_ptr<DeviceGraphExecutor> executor;
             std::shared_ptr<MappedLaneAuthority> lane_authority;
+            /** Exact capture-stable lane, retained for terminal diagnostics. */
+            MoEOverlayMappedActivationDeviceLane lane;
             std::shared_ptr<INT32Tensor> active_rows;
             std::vector<std::shared_ptr<TensorBase>> tensor_lifetimes;
             DeviceGraphExecutor::GraphSegmentCache cache;
@@ -255,6 +294,8 @@ namespace llaminar2
             int tier_index = -1;
             int routed_domain_ordinal = -1;
             std::shared_ptr<MappedLaneAuthority> lane_authority;
+            /** Exact CPU alias set used to bind geometry-selected payload views. */
+            MoEOverlayMappedActivationDeviceLane lane;
             std::shared_ptr<MoEOverlaySparseRows> input_rows;
             std::shared_ptr<MoEOverlayReturnRows> output_rows;
             std::vector<MappedCPUFollowerLayer> layers;
@@ -299,6 +340,157 @@ namespace llaminar2
                     return shape.physical_rows == physical_rows;
                 });
             return found == mapped_gpu_shapes.end() ? nullptr : &*found;
+        }
+    };
+
+    /**
+     * @brief Durable execution state and inference boundary for one follower GPU.
+     *
+     * Every retained row shape and graph family for one participant shares the
+     * same runtime table, epoch ticket, route scratch, and exact worker stream.
+     * The placement-policy authority is orthogonal: a heterogeneous host
+     * controller publishes this device state through its retained publisher,
+     * while an all-GPU controller additionally supplies a mapped fabric
+     * binding. A mapped follower has already observed its exact terminal event
+     * before its MPI command can complete, so it publishes an immutable
+     * generation receipt instead of recording a late event on a mutable shared
+     * inference stream.
+     */
+    struct MoEOverlayParticipantGraphRunner::ParticipantGpuRuntime final
+        : public IMoEOverlayDeviceInferenceBoundary
+    {
+        int participant_id = -1;
+        DeviceId device = DeviceId::invalid();
+        std::uint32_t domain_participant_id = 0u;
+        std::uint32_t domain_participant_count = 0u;
+        /** Frozen policy-authority locus; execution state is always on device. */
+        MoEOverlayAuthorityExecutionKind authority_execution =
+            MoEOverlayAuthorityExecutionKind::Unresolved;
+        /** Device-policy receipt lane; absent for host-resident authority. */
+        std::optional<MoEOverlayDeviceControllerParticipantBinding>
+            controller_binding;
+        IWorkerGPUContext *worker = nullptr;
+        std::shared_ptr<DeviceMoESerialRouteScratchArena> route_scratch;
+        std::shared_ptr<DeviceMoEOverlayEpochArena> epoch_arena;
+        std::unique_ptr<DeviceMoERuntimeTable> runtime_table;
+        std::vector<std::uint8_t> initialized_layers;
+        /** Shared finite relay graph launched ahead of follower inference. */
+        std::shared_ptr<MappedTransferProgressEpoch>
+            transfer_progress_epoch;
+
+        /** Exact serial submission/completion receipt for this follower. */
+        MoEOverlayInferenceBoundaryReceipt inference_boundary_receipt;
+
+        /** @copydoc IMoEOverlayDeviceInferenceBoundary::enqueueMoEOverlayDeviceInferenceBoundary */
+        MoEOverlayInferenceBoundaryStatus
+        enqueueMoEOverlayDeviceInferenceBoundary(
+            void *maintenance_stream,
+            MoEOverlayInferenceBoundaryRequest request) override
+        {
+            if (!device.is_gpu() || !worker || !maintenance_stream)
+            {
+                LOG_ERROR(
+                    "[MoEOverlayParticipantGraphRunner] Follower controller "
+                    "boundary has no exact GPU worker or maintenance stream for participant "
+                    << participant_id);
+                return MoEOverlayInferenceBoundaryStatus::Failed;
+            }
+
+            const auto receipt =
+                inference_boundary_receipt.consumeLatestCompleted();
+            if (receipt.newerSubmissionInFlight())
+            {
+                /*
+                 * The participant-local RCU bank can overlap physical
+                 * preparation with a reader, but the topology-wide decision
+                 * graph cannot begin from a completed generation on one GPU
+                 * while another GPU is still executing a newer sparse
+                 * transaction. The leader's mapped fan-in waits can otherwise
+                 * enter a cycle with that transaction's dispatch/return waits.
+                 * Defer only maintenance; the inference producer remains
+                 * completely untouched and publishes the exact receipt when
+                 * its retained terminal is observed.
+                 */
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_controller",
+                    "follower_inference_boundary_deferrals",
+                    1.0,
+                    "maintenance",
+                    device.toString(),
+                    {{"participant", std::to_string(participant_id)},
+                     {"boundary", request.name()},
+                     {"submitted_generation",
+                      std::to_string(receipt.submitted_generation)},
+                     {"completed_generation",
+                      std::to_string(receipt.completed_generation)},
+                     {"reason", "latest_sparse_transaction_in_flight"},
+                     {"blocking_inference", "false"}});
+                return MoEOverlayInferenceBoundaryStatus::Deferred;
+            }
+            if (!receipt.hasCompletedBoundary())
+            {
+                /* No request has acquired this participant's reader yet. */
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_controller",
+                    "follower_inference_boundaries_without_prior_reader",
+                    1.0,
+                    "maintenance",
+                    device.toString(),
+                    {{"participant", std::to_string(participant_id)},
+                     {"blocking", "false"}});
+                return MoEOverlayInferenceBoundaryStatus::Submitted;
+            }
+
+            /*
+             * The completed receipt is stronger than another stream event: the
+             * fixed transaction terminal was already queried successfully and
+             * its captured release kernel has finished.  The generation check
+             * above also proves that no newer follower transaction is live.
+             * Never append a fresh event to the shared follower stream here,
+             * because that event could retarget the completed boundary to work
+             * submitted after this maintenance epoch was admitted.
+             */
+
+            PerfStatsCollector::addCounter(
+                "moe_overlay_controller",
+                "follower_inference_boundary_receipts_consumed",
+                1.0,
+                "maintenance",
+                device.toString(),
+                {{"participant", std::to_string(participant_id)},
+                 {"boundary", request.name()},
+                 {"completed_generation",
+                  std::to_string(receipt.completed_generation)},
+                 {"fresh_completion",
+                  receipt.fresh_completion ? "true" : "false"},
+                 {"newer_submission_in_flight",
+                  "false"},
+                 {"stream_edge", "completed_transaction_receipt"},
+                 {"blocking", "false"},
+                 {"host_epoch_mirror", "false"}});
+            return MoEOverlayInferenceBoundaryStatus::Submitted;
+        }
+
+        /** @copydoc IMoEOverlayDeviceInferenceBoundary::installMoEOverlayTransferProgressEpoch */
+        bool installMoEOverlayTransferProgressEpoch(
+            std::shared_ptr<MappedTransferProgressEpoch> epoch) override
+        {
+            if (!epoch || !device.is_gpu() || epoch->device() != device)
+            {
+                LOG_ERROR(
+                    "[MoEOverlayParticipantGraphRunner] Rejected a retained transfer epoch with mismatched follower ownership for participant "
+                    << participant_id);
+                return false;
+            }
+            if (transfer_progress_epoch && transfer_progress_epoch != epoch)
+            {
+                LOG_ERROR(
+                    "[MoEOverlayParticipantGraphRunner] Rejected replacement of an installed retained transfer epoch for participant "
+                    << participant_id);
+                return false;
+            }
+            transfer_progress_epoch = std::move(epoch);
+            return true;
         }
     };
 
@@ -473,11 +665,36 @@ namespace llaminar2
                 "Production MoE overlay participant runner requires the shared "
                 "residency authority and process-local prepared-bank registry");
         }
-        resolveTopology();
-        resolveGraphFamilies();
-        createSerialCompactBufferArenas();
-        prepareParticipantWeights();
-        createDeviceContexts();
+        {
+            ScopedWeightLoadDetailTimer timer(
+                "overlay.graph.resolve_topology");
+            resolveTopology();
+        }
+        {
+            ScopedWeightLoadDetailTimer timer(
+                "overlay.graph.resolve_families");
+            resolveGraphFamilies();
+        }
+        {
+            ScopedWeightLoadDetailTimer timer(
+                "overlay.graph.create_compact_arenas");
+            createSerialCompactBufferArenas();
+        }
+        {
+            ScopedWeightLoadDetailTimer timer(
+                "overlay.graph.prepare_participant_weights");
+            prepareParticipantWeights();
+        }
+        {
+            ScopedWeightLoadDetailTimer timer(
+                "overlay.graph.create_device_contexts");
+            createDeviceContexts();
+        }
+        {
+            ScopedWeightLoadDetailTimer timer(
+                "overlay.graph.create_participant_gpu_runtimes");
+            createParticipantGpuRuntimes();
+        }
         /*
          * The residency-maintenance service starts immediately after every
          * rank finishes runner construction. Materialize the complete bounded
@@ -493,29 +710,57 @@ namespace llaminar2
             static_cast<size_t>(main_layer_count_));
         for (int layer = 0; layer < main_layer_count_; ++layer)
             main_spec.source_layers.push_back(layer);
-        main_graph_ = buildGraph(main_spec);
+        {
+            ScopedWeightLoadDetailTimer timer(
+                "overlay.graph.build_main_family");
+            main_graph_ = buildGraph(main_spec);
+        }
         if (!main_graph_)
         {
             throw std::runtime_error(
                 "MoE overlay participant main graph construction returned null");
         }
 
-        mtp_sidecar_graphs_.reserve(mtp_source_layers_.size());
-        for (size_t depth = 0; depth < mtp_source_layers_.size(); ++depth)
         {
-            ParticipantGraphBuildSpec mtp_spec;
-            mtp_spec.role = ParticipantGraphFamilyRole::MTPDraft;
-            mtp_spec.source_layers = {mtp_source_layers_[depth]};
-            mtp_spec.mtp_graph_depth = static_cast<int>(depth);
-            mtp_spec.row_capacity = config_.max_decode_activation_rows;
-            auto graph = buildGraph(mtp_spec);
-            if (!graph)
+            ScopedWeightLoadDetailTimer timer(
+                "overlay.graph.build_mtp_families");
+            mtp_sidecar_graphs_.reserve(mtp_source_layers_.size());
+            for (size_t depth = 0; depth < mtp_source_layers_.size(); ++depth)
+            {
+                ParticipantGraphBuildSpec mtp_spec;
+                mtp_spec.role = ParticipantGraphFamilyRole::MTPDraft;
+                mtp_spec.source_layers = {mtp_source_layers_[depth]};
+                mtp_spec.mtp_graph_depth = static_cast<int>(depth);
+                mtp_spec.row_capacity = config_.max_decode_activation_rows;
+                auto graph = buildGraph(mtp_spec);
+                if (!graph)
+                {
+                    throw std::runtime_error(
+                        "MoE overlay participant MTP sidecar graph construction returned null for graph depth " +
+                        std::to_string(depth));
+                }
+                mtp_sidecar_graphs_.push_back(std::move(graph));
+            }
+        }
+        for (const auto &[participant_id, runtime] :
+             participant_gpu_runtimes_)
+        {
+            if (!runtime || !runtime->runtime_table ||
+                runtime->initialized_layers.size() !=
+                    static_cast<std::size_t>(
+                        runtime->runtime_table->layerCount()) ||
+                std::any_of(
+                    runtime->initialized_layers.begin(),
+                    runtime->initialized_layers.end(),
+                    [](std::uint8_t initialized)
+                    {
+                        return initialized == 0u;
+                    }))
             {
                 throw std::runtime_error(
-                    "MoE overlay participant MTP sidecar graph construction returned null for graph depth " +
-                    std::to_string(depth));
+                    "Participant retained graph families did not publish every topology-wide device runtime layer for participant " +
+                    std::to_string(participant_id));
             }
-            mtp_sidecar_graphs_.push_back(std::move(graph));
         }
         if (!config_.participant_residency->allInitialBanksReady())
         {
@@ -545,6 +790,366 @@ namespace llaminar2
     MoEOverlayParticipantGraphRunner::~MoEOverlayParticipantGraphRunner() =
         default;
 
+    ServingGraphPreparationKind
+    MoEOverlayParticipantGraphRunner::servingGraphPreparationKind()
+        const noexcept
+    {
+        if (local_participants_.empty())
+            return ServingGraphPreparationKind::Unresolved;
+
+        bool owns_gpu_endpoint = false;
+        for (const auto *participant : local_participants_)
+        {
+            if (!participant || !participant->device.is_valid())
+                return ServingGraphPreparationKind::Unresolved;
+            owns_gpu_endpoint =
+                owns_gpu_endpoint || participant->device.is_gpu();
+        }
+
+        /* CPU endpoints are already materialized in their retained eager
+         * graph. A mixed follower still reports the stronger native-device
+         * transition because every GPU endpoint must be sealed before the
+         * rank can accept its first authenticated transaction. */
+        return owns_gpu_endpoint
+                   ? ServingGraphPreparationKind::
+                         NativeDeviceExecutableFamily
+                   : ServingGraphPreparationKind::EagerHostGraph;
+    }
+
+    bool MoEOverlayParticipantGraphRunner::
+        installMoEOverlayTransferProgressEpoch(
+            std::shared_ptr<MappedTransferProgressEpoch> epoch)
+    {
+        if (!epoch || !epoch->device().is_gpu() ||
+            serving_graph_family_lifecycle_ ==
+                ServingGraphFamilyLifecycle::Sealed)
+        {
+            LOG_ERROR(
+                "[MoEOverlayParticipantGraphRunner] Transfer-progress epoch installation requires one local GPU before follower graph sealing");
+            return false;
+        }
+        const DeviceId device = epoch->device();
+        const bool owns_device = std::any_of(
+            local_participants_.begin(),
+            local_participants_.end(),
+            [device](const auto *participant)
+            {
+                return participant && participant->device == device;
+            });
+        if (!owns_device)
+        {
+            LOG_ERROR(
+                "[MoEOverlayParticipantGraphRunner] Transfer-progress epoch names a non-local follower device "
+                << device.toString());
+            return false;
+        }
+
+        const auto found = transfer_progress_epochs_.find(device);
+        if (found != transfer_progress_epochs_.end() &&
+            found->second != epoch)
+        {
+            LOG_ERROR(
+                "[MoEOverlayParticipantGraphRunner] Refused to replace the transfer-progress authority on "
+                << device.toString());
+            return false;
+        }
+        transfer_progress_epochs_[device] = epoch;
+
+        /* Every follower GPU owns one execution-state runtime. Transfer
+         * progress is independent of whether host or device policy authors the
+         * next placement, so bind the retained relay epoch to the same exact
+         * inference-boundary owner in both regimes. */
+        for (auto &[participant_id, runtime] : participant_gpu_runtimes_)
+        {
+            (void)participant_id;
+            if (runtime && runtime->device == device &&
+                !runtime->installMoEOverlayTransferProgressEpoch(epoch))
+            {
+                LOG_ERROR(
+                    "[MoEOverlayParticipantGraphRunner] Could not bind transfer progress to a device-controller runtime on "
+                    << device.toString());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool MoEOverlayParticipantGraphRunner::
+        materializeServingGraphFamilyWithoutLaunch(
+            const ServingGraphFamilyMaterializationPlan &plan)
+    {
+        ScopedWeightLoadDetailTimer materialization_timer(
+            "overlay.graph.materialize_serving_family");
+        const auto normalized_buckets =
+            normalizePrefillGraphBuckets(plan.prefill_bucket_rows);
+        if (!plan.valid() || normalized_buckets != plan.prefill_bucket_rows ||
+            normalized_buckets != config_.prefill_graph_row_shapes ||
+            normalized_buckets.back() > config_.max_graph_activation_rows)
+        {
+            LOG_ERROR(
+                "[MoEOverlayParticipantGraphRunner] Follower serving graph setup disagrees with the frozen distributed bucket inventory");
+            return false;
+        }
+
+        const auto branch_factory_for = [](DeviceId)
+        {
+            return GraphCaptureAuxiliaryBranchFactory{};
+        };
+        const auto endpoint_matches_final_identity =
+            [&](const CachedParticipantGraph::MappedGPUFollowerEndpoint &endpoint)
+        {
+            const auto factory = branch_factory_for(endpoint.device);
+            const bool owns_branch =
+                static_cast<bool>(endpoint.cache.auxiliary_branch);
+            return endpoint.cache.initialized &&
+                   endpoint.cache.retained_full_graph_replay.valid() &&
+                   endpoint.cache.executable_submission_state ==
+                       DeviceGraphExecutor::GraphSegmentCache::
+                           ExecutableSubmissionState::MaterializedUnlaunched &&
+                   owns_branch == factory.valid() &&
+                   (!factory.valid() ||
+                    endpoint.cache.auxiliary_branch_authority ==
+                        factory.authority_identity);
+        };
+
+        std::vector<CachedParticipantGraph *> families;
+        if (main_graph_)
+            families.push_back(main_graph_.get());
+        for (auto &sidecar : mtp_sidecar_graphs_)
+        {
+            if (sidecar)
+                families.push_back(sidecar.get());
+        }
+        if (families.empty())
+        {
+            LOG_ERROR(
+                "[MoEOverlayParticipantGraphRunner] Follower serving setup has no declared graph family");
+            return false;
+        }
+
+        if (serving_graph_family_lifecycle_ ==
+            ServingGraphFamilyLifecycle::Sealed)
+        {
+            for (const CachedParticipantGraph *family : families)
+            {
+                if (!family)
+                    return false;
+                for (const auto &shape : family->mapped_gpu_shapes)
+                {
+                    for (const auto &endpoint : shape.endpoints)
+                    {
+                        if (!endpoint ||
+                            !endpoint_matches_final_identity(*endpoint))
+                        {
+                            LOG_ERROR(
+                                "[MoEOverlayParticipantGraphRunner] Repeated follower serving setup found stale graph-branch identity");
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        std::size_t total_native_transactions = 0u;
+        std::size_t total_branch_transactions = 0u;
+        try
+        {
+            for (CachedParticipantGraph *family : families)
+            {
+                if (!family)
+                    throw std::logic_error(
+                        "Follower serving family retained a null graph owner");
+                if (!family->usesMappedActivationEpochs())
+                    continue;
+
+                const std::size_t graph_family_ordinal =
+                    family->role == ParticipantGraphFamilyRole::Main
+                        ? 0u
+                        : static_cast<std::size_t>(
+                              family->mtp_graph_depth + 1);
+                std::size_t family_native_transactions = 0u;
+                std::size_t family_branch_transactions = 0u;
+
+                for (auto &shape : family->mapped_gpu_shapes)
+                {
+                    for (auto &endpoint : shape.endpoints)
+                    {
+                        if (!endpoint || !endpoint->graph ||
+                            !endpoint->executor ||
+                            !endpoint->cache.capture_stream ||
+                            endpoint->cache.initialized)
+                        {
+                            throw std::runtime_error(
+                                "Mapped follower endpoint is not pristine at final serving-graph materialization");
+                        }
+                        const auto context_it =
+                            execution_contexts_.find(endpoint->device);
+                        IWorkerGPUContext *const worker =
+                            participantWorkerContext(endpoint->device);
+                        if (context_it == execution_contexts_.end() ||
+                            !context_it->second || !worker ||
+                            endpoint->graph->nativeCaptureEnvelope() !=
+                                GraphNativeCaptureEnvelope::
+                                    DeviceOwnedTimelineTransaction)
+                        {
+                            throw std::runtime_error(
+                                "Mapped follower could not resolve its final native capture owner");
+                        }
+
+                        const auto branch_factory =
+                            branch_factory_for(endpoint->device);
+                        bool materialized = false;
+                        worker->submitAndWait(
+                            [&]()
+                            {
+                                endpoint->graph->reset();
+                                materialized = endpoint->executor
+                                                   ->executeWithCachedGraphReplay(
+                                                       *endpoint->graph,
+                                                       context_it->second,
+                                                       endpoint->cache,
+                                                       endpoint->cache.capture_stream,
+                                                       worker,
+                                                       /*collective_nodes=*/nullptr,
+                                                       /*collectives_graph_capturable=*/false,
+                                                       /*force_recapture=*/false,
+                                                       /*defer_final_sync=*/true,
+                                                       {},
+                                                       DeviceGraphExecutor::
+                                                           GraphReplayPlanPolicy::
+                                                               RequireFullGraph,
+                                                       {},
+                                                       {},
+                                                       {},
+                                                       DeviceGraphExecutor::
+                                                           GraphInitialSubmissionPolicy::
+                                                               MaterializeWithoutLaunch,
+                                                       branch_factory) &&
+                                               endpoint->cache
+                                                   .prepareCaptureStreamTerminal(
+                                                       worker);
+                            });
+                        if (!materialized ||
+                            !endpoint_matches_final_identity(*endpoint))
+                        {
+                            throw std::runtime_error(
+                                "Mapped follower could not seal its graph-owned transfer branch for participant " +
+                                std::to_string(endpoint->participant_id) +
+                                " rows=" +
+                                std::to_string(shape.physical_rows));
+                        }
+                        ++family_native_transactions;
+                        if (branch_factory.valid())
+                            ++family_branch_transactions;
+                    }
+                }
+
+                /* Every row shape for one participant borrows the same stream.
+                 * One exact event fence per device proves setup left no work in
+                 * front of transaction zero; it is never an inference wait. */
+                std::vector<DeviceId> quiescent_devices;
+                for (auto &shape : family->mapped_gpu_shapes)
+                {
+                    for (auto &endpoint : shape.endpoints)
+                    {
+                        if (!endpoint ||
+                            std::find(
+                                quiescent_devices.begin(),
+                                quiescent_devices.end(),
+                                endpoint->device) != quiescent_devices.end())
+                        {
+                            continue;
+                        }
+                        IWorkerGPUContext *const worker =
+                            participantWorkerContext(endpoint->device);
+                        if (!worker)
+                        {
+                            throw std::runtime_error(
+                                "Mapped follower setup lost its participant worker context");
+                        }
+                        worker->submitAndWait(
+                            [&]()
+                            {
+                                endpoint->cache.waitForCaptureStreamFence(
+                                    DeviceGraphExecutor::GraphSegmentCache::
+                                        HostFenceWaitPolicy::ActiveProgress,
+                                    [device = endpoint->device,
+                                     family_ordinal = graph_family_ordinal,
+                                     rows = endpoint->physical_rows]()
+                                    {
+                                        return
+                                            "final mapped follower graph materialization left queued work on device=" +
+                                            device.toString() +
+                                            " graph_family=" +
+                                            std::to_string(family_ordinal) +
+                                            " rows=" +
+                                            std::to_string(rows);
+                                    });
+                            });
+                        quiescent_devices.push_back(endpoint->device);
+                    }
+                }
+
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_participant_graph",
+                    "mapped_follower_setup_stream_quiescence_proofs",
+                    static_cast<double>(quiescent_devices.size()),
+                    "model_setup",
+                    participantDeviceList(local_participants_),
+                    {{"graph_family", std::to_string(graph_family_ordinal)},
+                     {"ordering", "exact_stream_event"},
+                     {"host_blocking", "setup_only"}});
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_participant_graph",
+                    "materialized_mapped_follower_families",
+                    1.0,
+                    "model_setup",
+                    participantDeviceList(local_participants_),
+                    {{"graph_family", std::to_string(graph_family_ordinal)},
+                     {"row_capacity", std::to_string(family->row_capacity)},
+                     {"setup_materialized_gpu_transactions",
+                      std::to_string(family_native_transactions)},
+                     {"setup_materialized_cpu_endpoints",
+                      std::to_string(
+                          family->mapped_cpu_endpoints.size())},
+                     {"captured_transfer_branches",
+                      std::to_string(family_branch_transactions)},
+                     {"standalone_progress_launch", "false"}});
+                total_native_transactions += family_native_transactions;
+                total_branch_transactions += family_branch_transactions;
+            }
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR(
+                "[MoEOverlayParticipantGraphRunner] Final follower graph materialization failed: "
+                << error.what());
+            return false;
+        }
+        catch (...)
+        {
+            LOG_ERROR(
+                "[MoEOverlayParticipantGraphRunner] Final follower graph materialization threw a non-standard exception");
+            return false;
+        }
+
+        serving_graph_family_lifecycle_ =
+            ServingGraphFamilyLifecycle::Sealed;
+        PerfStatsCollector::addCounter(
+            "moe_overlay_participant_graph",
+            "mapped_follower_serving_graph_family_completions",
+            1.0,
+            "model_setup",
+            participantDeviceList(local_participants_),
+            {{"native_transactions",
+              std::to_string(total_native_transactions)},
+             {"captured_transfer_branches",
+              std::to_string(total_branch_transactions)},
+             {"authority_installation", "before_native_capture"}});
+        return true;
+    }
+
     /**
      * @brief Resolve immutable rank-local endpoint ownership from the topology.
      *
@@ -569,11 +1174,14 @@ namespace llaminar2
             std::make_shared<MoEExpertOverlayExecutionPlan>(
                 buildMoEExpertOverlayExecutionPlan(
                     *runtime_plan_, config_.mpi_context->world_size()));
-        if (execution_plan_->buildsRootGraph())
+        if (!execution_plan_->currentRankPlan()
+                 .usesExpertTransactionFollower())
         {
             throw std::invalid_argument(
-                "Continuation root must use the dense model runner, not the "
-                "expert-only participant runner");
+                "Only an expert-only transaction follower may use the "
+                "retained participant graph runner; resolved execution kind=" +
+                std::string(toString(
+                    execution_plan_->currentRankPlan().execution_kind)));
         }
 
         const auto snapshot = residency_authority_->snapshot();
@@ -832,6 +1440,7 @@ namespace llaminar2
                     "Participant serial compact arena has duplicate logical endpoint p" +
                     std::to_string(participant->participant_id));
             }
+
         }
     }
 
@@ -886,35 +1495,43 @@ namespace llaminar2
             reinterpret_cast<uint64_t>(config_.model_context.get())};
         strategy.devices = participantDevices(local_participants_);
         WeightPlan plan(std::move(strategy));
-        for (const auto *participant : local_participants_)
         {
-            if (!participant)
-                continue;
-            const WeightPlan participant_plan =
-                buildMoEOverlayParticipantWeightPlan(
-                    *config_.model_context,
-                    *execution_plan_,
-                    *owner_map_,
-                    *participant);
-            for (const auto &requirement :
-                 participant_plan.requirements())
+            ScopedWeightLoadDetailTimer timer(
+                "overlay.weights.build_plan");
+            for (const auto *participant : local_participants_)
             {
-                plan.add(requirement);
+                if (!participant)
+                    continue;
+                const WeightPlan participant_plan =
+                    buildMoEOverlayParticipantWeightPlan(
+                        *config_.model_context,
+                        *execution_plan_,
+                        *owner_map_,
+                        *participant);
+                for (const auto &requirement :
+                     participant_plan.requirements())
+                {
+                    plan.add(requirement);
+                }
             }
         }
         const ModelContextId model_id = plan.strategy().model_id;
 
-        prepared_store_ = weight_manager->preparedWeightStoreIfInitialized();
-        if (!prepared_store_)
         {
-            prepared_store_ =
-                std::make_shared<PreparedWeightStore>(model_id);
-            weight_manager->setPreparedWeightStore(prepared_store_);
-        }
-        if (!prepared_store_->bindModelIdIfUnset(model_id))
-        {
-            throw std::runtime_error(
-                "Participant PreparedWeightStore belongs to another model");
+            ScopedWeightLoadDetailTimer timer(
+                "overlay.weights.bind_prepared_store");
+            prepared_store_ = weight_manager->preparedWeightStoreIfInitialized();
+            if (!prepared_store_)
+            {
+                prepared_store_ =
+                    std::make_shared<PreparedWeightStore>(model_id);
+                weight_manager->setPreparedWeightStore(prepared_store_);
+            }
+            if (!prepared_store_->bindModelIdIfUnset(model_id))
+            {
+                throw std::runtime_error(
+                    "Participant PreparedWeightStore belongs to another model");
+            }
         }
 
         if (plan.empty())
@@ -923,8 +1540,12 @@ namespace llaminar2
             return;
         }
 
-        frozen_weights_ = std::make_unique<FrozenModelWeightSet>(
-            weight_manager->materialize(plan));
+        {
+            ScopedWeightLoadDetailTimer timer(
+                "overlay.weights.materialize_plan");
+            frozen_weights_ = std::make_unique<FrozenModelWeightSet>(
+                weight_manager->materialize(plan));
+        }
         for (const DeviceId device : participantDevices(local_participants_))
         {
             if (!weight_manager->prepareMoEExpertOverlayWeights(
@@ -978,6 +1599,258 @@ namespace llaminar2
             }
             execution_contexts_.emplace(device, raw_context);
         }
+    }
+
+    /**
+     * @brief Materialize one shared placement/runtime family per follower GPU.
+     *
+     * Policy ownership and GPU execution-state ownership are different axes.
+     * Every GPU receives a real mirrored runtime table and epoch ticket. Under
+     * host-resident heterogeneous authority, background publication writes its
+     * inactive bank through the table's retained host recipe. Under all-GPU
+     * device authority, the same arena additionally consumes the mapped global
+     * admission word. Row-shape and MTP graphs borrow these addresses; none may
+     * create a private placement generation.
+     */
+    void MoEOverlayParticipantGraphRunner::createParticipantGpuRuntimes()
+    {
+        const auto &loader = config_.model_context->concreteLoader();
+        const std::string &arch = config_.model_context->architecture();
+        const int runtime_layer_count =
+            config_.model_context->totalBlockCount();
+        const int num_experts = loader.getInt(arch + ".expert_count", 0);
+        const int top_k = loader.getInt(arch + ".expert_used_count", 0);
+        const auto authority_execution =
+            config_.placement_plan->authority_execution;
+        if (runtime_layer_count <= 0 || num_experts <= 0 || top_k <= 0 ||
+            authority_execution ==
+                MoEOverlayAuthorityExecutionKind::Unresolved)
+        {
+            throw std::invalid_argument(
+                "Mapped follower GPU runtime has unresolved model geometry or policy authority");
+        }
+
+        const bool device_resident_authority =
+            authority_execution ==
+            MoEOverlayAuthorityExecutionKind::DeviceResident;
+        if (device_resident_authority !=
+            static_cast<bool>(config_.device_controller_fabric))
+        {
+            throw std::invalid_argument(
+                device_resident_authority
+                    ? "Device-resident follower GPU runtime has no topology-wide controller fabric"
+                    : "Host-resident follower GPU runtime unexpectedly received a device-controller fabric");
+        }
+
+        std::vector<int> expected_gpu_participants;
+        for (const auto *participant : local_participants_)
+        {
+            if (participant && participant->device.is_gpu())
+                expected_gpu_participants.push_back(participant->participant_id);
+        }
+        std::sort(
+            expected_gpu_participants.begin(),
+            expected_gpu_participants.end());
+        if (config_.device_controller_fabric)
+        {
+            const auto &layout = config_.device_controller_fabric->layout();
+            const auto &header = layout.header;
+            if (!layout.valid() ||
+                header.num_layers !=
+                    static_cast<std::uint32_t>(runtime_layer_count) ||
+                header.num_experts !=
+                    static_cast<std::uint32_t>(num_experts))
+            {
+                throw std::invalid_argument(
+                    "Mapped follower GPU runtime geometry disagrees with the topology-wide controller fabric");
+            }
+            auto fabric_participants =
+                config_.device_controller_fabric->localParticipantIds();
+            std::sort(
+                fabric_participants.begin(), fabric_participants.end());
+            if (expected_gpu_participants != fabric_participants)
+            {
+                throw std::invalid_argument(
+                    "Mapped follower GPU participants differ from the local controller-fabric membership");
+            }
+        }
+
+        for (const auto *participant : local_participants_)
+        {
+            if (!participant || !participant->device.is_gpu())
+                continue;
+
+            std::optional<MoEOverlayDeviceControllerParticipantBinding>
+                controller_binding;
+            if (config_.device_controller_fabric)
+            {
+                controller_binding =
+                    config_.device_controller_fabric->participantBinding(
+                        participant->participant_id);
+                if (!controller_binding->valid() ||
+                    controller_binding->participant_id !=
+                        participant->participant_id ||
+                    controller_binding->device != participant->device ||
+                    !controller_binding->controller ||
+                    !controller_binding->lifetime)
+                {
+                    throw std::logic_error(
+                        "Mapped follower received an incomplete controller-fabric participant binding");
+                }
+            }
+
+            auto domain_participants =
+                owner_map_->participantIdsForTier(participant->tier_idx);
+            if (domain_participants.empty() ||
+                domain_participants.size() > kDeviceMoEMaxParticipants ||
+                participant->domain_participant_index < 0 ||
+                static_cast<std::size_t>(
+                    participant->domain_participant_index) >=
+                    domain_participants.size())
+            {
+                throw std::invalid_argument(
+                    "Mapped follower domain is outside the device runtime participant ABI");
+            }
+            std::vector<std::uint8_t> dense_domain_ids(
+                domain_participants.size(), 0u);
+            for (const int global_participant_id : domain_participants)
+            {
+                const auto *const member =
+                    owner_map_->participantForId(global_participant_id);
+                if (!member || member->tier_idx != participant->tier_idx ||
+                    member->domain_name != participant->domain_name ||
+                    member->domain_participant_index < 0 ||
+                    static_cast<std::size_t>(
+                        member->domain_participant_index) >=
+                        dense_domain_ids.size() ||
+                    dense_domain_ids[static_cast<std::size_t>(
+                        member->domain_participant_index)] != 0u)
+                {
+                    throw std::invalid_argument(
+                        "Mapped follower tier does not provide a dense unique domain participant namespace");
+                }
+                dense_domain_ids[static_cast<std::size_t>(
+                    member->domain_participant_index)] = 1u;
+            }
+
+            auto runtime = std::make_unique<ParticipantGpuRuntime>();
+            runtime->participant_id = participant->participant_id;
+            runtime->device = participant->device;
+            runtime->domain_participant_id = static_cast<std::uint32_t>(
+                participant->domain_participant_index);
+            runtime->domain_participant_count = static_cast<std::uint32_t>(
+                domain_participants.size());
+            runtime->authority_execution = authority_execution;
+            runtime->controller_binding = controller_binding;
+            runtime->worker = participantWorkerContext(participant->device);
+            if (!runtime->worker)
+            {
+                throw std::runtime_error(
+                    "Mapped follower runtime could not resolve its exact GPU worker");
+            }
+
+            runtime->worker->submitAndWait(
+                [&]
+                {
+                    runtime->route_scratch = std::make_shared<
+                        DeviceMoESerialRouteScratchArena>(
+                        DeviceMoESerialRouteScratchArena::Config{
+                            .device_id = participant->device,
+                            .num_experts = num_experts,
+                            .top_k = top_k,
+                            .token_capacity =
+                                config_.max_graph_activation_rows,
+                        });
+                    DeviceMoEOverlayEpochArena::Config epoch_config{
+                        .device_id = participant->device,
+                        .initial_epoch = 1u,
+                        .initial_bank = 1u,
+                        .request_slot_capacity = 1u,
+                    };
+                    if (controller_binding)
+                    {
+                        epoch_config.external_admission_epoch =
+                            &controller_binding->controller->admission_epoch;
+                        epoch_config.external_admission_lifetime =
+                            controller_binding->lifetime;
+                    }
+                    runtime->epoch_arena = std::make_shared<
+                        DeviceMoEOverlayEpochArena>(
+                        std::move(epoch_config));
+                    runtime->runtime_table = std::make_unique<
+                        DeviceMoERuntimeTable>(
+                        DeviceMoERuntimeTable::Config{
+                            .device_id = participant->device,
+                            .num_layers = runtime_layer_count,
+                            .num_experts = num_experts,
+                            .top_k = top_k,
+                            .mirror_to_device = true,
+                            .collect_overlay_service_telemetry =
+                                config_.durable_maintenance_policy ==
+                                MoEOverlayDurableMaintenancePolicy::
+                                    DynamicPlacement,
+                            .prefill_token_capacity =
+                                config_.max_graph_activation_rows,
+                            .deferred_verifier_token_capacity =
+                                config_.max_decode_activation_rows,
+                            .serial_route_scratch_arena =
+                                runtime->route_scratch,
+                            .overlay_epoch_arena = runtime->epoch_arena,
+                            .overlay_epoch_ticket_slot = 0u,
+                        });
+                });
+            if (!runtime->route_scratch || !runtime->epoch_arena ||
+                !runtime->runtime_table)
+            {
+                throw std::runtime_error(
+                    "Mapped follower runtime allocation returned incomplete model-lifetime state");
+            }
+            runtime->initialized_layers.assign(
+                static_cast<std::size_t>(runtime_layer_count), 0u);
+
+            const auto [_, inserted] =
+                participant_gpu_runtimes_.emplace(
+                    participant->participant_id, std::move(runtime));
+            if (!inserted)
+            {
+                throw std::logic_error(
+                    "Mapped follower constructed duplicate controller runtime authority");
+            }
+
+            PerfStatsCollector::addCounter(
+                "moe_overlay_controller",
+                "follower_runtime_tables_materialized",
+                1.0,
+                "model_setup",
+                participant->device.toString(),
+                {{"participant",
+                  std::to_string(participant->participant_id)},
+                 {"domain_participant",
+                  std::to_string(participant->domain_participant_index)},
+                 {"domain_participants",
+                  std::to_string(domain_participants.size())},
+                 {"layers", std::to_string(runtime_layer_count)},
+                 {"blocking_hot_path", "false"},
+                 {"authority_execution",
+                  std::string(toString(authority_execution))},
+                 {"mapped_device_controller",
+                  controller_binding ? "true" : "false"}});
+        }
+    }
+
+    /** @brief Resolve the exact model-lifetime runtime for one global participant. */
+    MoEOverlayParticipantGraphRunner::ParticipantGpuRuntime &
+    MoEOverlayParticipantGraphRunner::participantGpuRuntimeForParticipant(
+        int participant_id) const
+    {
+        const auto found = participant_gpu_runtimes_.find(participant_id);
+        if (found == participant_gpu_runtimes_.end() || !found->second)
+        {
+            throw std::out_of_range(
+                "Mapped follower has no GPU placement runtime for participant " +
+                std::to_string(participant_id));
+        }
+        return *found->second;
     }
 
     /**
@@ -1265,18 +2138,39 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "Participant rank batch cannot bind an empty group");
             }
-            std::ostringstream key_stream;
-            key_stream << "tier" << tier_index
-                       << "#domain" << routed_domain_ordinal
-                       << "#rank" << source_world_rank << "to"
-                       << local_world_rank << "#p";
-            for (const int participant : participants)
-                key_stream << participant << ',';
-            const std::string key = key_stream.str();
+            const std::string key =
+                makeMoEOverlayRankBatchChannelIdentity(
+                    tier_index,
+                    routed_domain_ordinal,
+                    source_world_rank,
+                    local_world_rank,
+                    participants);
             const auto existing =
                 rank_batch_transports_.find(key);
             if (existing != rank_batch_transports_.end())
                 return existing->second;
+
+            if (resolveMoEOverlayRankBatchTransportKind(
+                    *config_.mpi_context,
+                    source_world_rank,
+                    local_world_rank) ==
+                MoEOverlayRankBatchTransportKind::NodeLocalSharedRows)
+            {
+                if (!config_.rank_batch_transport_registry)
+                {
+                    throw std::logic_error(
+                        "Participant graph has no preflight node-local activation-channel registry for " +
+                        key);
+                }
+                auto transport =
+                    config_.rank_batch_transport_registry->require(
+                        key,
+                        source_world_rank,
+                        local_world_rank,
+                        participants);
+                rank_batch_transports_.emplace(key, transport);
+                return transport;
+            }
 
             const size_t row_multiplier =
                 std::min(top_k_size, participants.size());
@@ -1298,7 +2192,7 @@ namespace llaminar2
                         .top_k = top_k,
                     });
 
-            std::vector<DeviceId> local_devices;
+            std::vector<MoEOverlayActivationLocalLaneBinding> local_lanes;
             for (const int participant_id : participants)
             {
                 const auto *const participant =
@@ -1313,13 +2207,10 @@ namespace llaminar2
                     throw std::logic_error(
                         "Participant activation channel group disagrees with the immutable owner map");
                 }
-                if (std::find(
-                        local_devices.begin(),
-                        local_devices.end(),
-                        participant->device) == local_devices.end())
-                {
-                    local_devices.push_back(participant->device);
-                }
+                local_lanes.push_back({
+                    .participant_id = participant_id,
+                    .device = participant->device,
+                });
             }
             auto transport = createMoEOverlayRankBatchTransport(
                     MoEOverlayRankBatchTransportConfig{
@@ -1346,7 +2237,7 @@ namespace llaminar2
                                 .priority,
                         .activation_graph_families =
                             activation_graph_families,
-                        .local_devices = std::move(local_devices),
+                        .local_lanes = std::move(local_lanes),
                     });
             rank_batch_transports_.emplace(key, transport);
             return transport;
@@ -1518,10 +2409,13 @@ namespace llaminar2
                 endpoint->routed_domain_ordinal =
                     binding.routed_domain_ordinal;
                 endpoint->lane_authority = binding.authority;
+                endpoint->lane = binding.mapped->activationDeviceLane(
+                    endpoint->participant_id,
+                    graph_family_ordinal,
+                    endpoint->device);
                 endpoint->input_rows =
                     std::make_shared<MoEOverlaySparseRows>(
-                        binding.transport->sharedDispatchRows(
-                            endpoint->participant_id));
+                        endpoint->lane.hostDispatchPayload(row_capacity));
                 endpoint->output_rows =
                     std::make_shared<MoEOverlayReturnRows>(
                         binding.transport->sharedReturnRows(
@@ -1698,6 +2592,42 @@ namespace llaminar2
                         throw std::logic_error(
                             "Mapped ExpertOverlay follower could not bind an exact compact tensor family");
                     }
+                    auto canonical_it =
+                        participant_canonical_route_buffers_.find(
+                            endpoint->participant_id);
+                    if (canonical_it ==
+                        participant_canonical_route_buffers_.end())
+                    {
+                        /* Only the node-local mapped GPU path consumes this
+                         * bank. Allocate it on first graph-family materialization
+                         * at the shared transport maximum, then reuse that stable
+                         * address for main, verifier, and every MTP family whose
+                         * executions are scheduler-serialized. */
+                        auto canonical_routes =
+                            std::make_shared<FP32Tensor>(
+                                std::vector<size_t>{
+                                    transport_entry_capacity,
+                                    static_cast<size_t>(d_model)});
+                        canonical_it =
+                            participant_canonical_route_buffers_
+                                .emplace(
+                                    endpoint->participant_id,
+                                    std::move(canonical_routes))
+                                .first;
+                    }
+                    if (canonical_it ==
+                            participant_canonical_route_buffers_.end() ||
+                        !canonical_it->second ||
+                        canonical_it->second->numel() !=
+                            checkedGeometryProduct(
+                                transport_entry_capacity,
+                                static_cast<size_t>(d_model),
+                                "participant canonical route elements"))
+                    {
+                        throw std::logic_error(
+                            "Mapped ExpertOverlay follower has no participant-owned canonical route bank");
+                    }
+                    const auto &canonical_routes = canonical_it->second;
 
                     TransferEngine::allocateDeviceStorage(
                         tensor_family->hidden.get(), target_device);
@@ -1707,6 +2637,8 @@ namespace llaminar2
                         tensor_family->routing_weights.get(), target_device);
                     TransferEngine::allocateDeviceStorage(
                         tensor_family->output.get(), target_device);
+                    TransferEngine::allocateDeviceStorage(
+                        canonical_routes.get(), target_device);
                     TransferEngine::allocateDeviceStorage(
                         endpoint->active_rows.get(), target_device);
                     if (!endpoint->active_rows->gpu_data_ptr())
@@ -1726,7 +2658,10 @@ namespace llaminar2
                             tensor_family->routing_weights.get()) ||
                         !endpoint->arena->registerExternalBuffer(
                             BufferId::MOE_COMBINED_OUTPUT,
-                            tensor_family->output.get()))
+                            tensor_family->output.get()) ||
+                        !endpoint->arena->registerExternalBuffer(
+                            BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS,
+                            canonical_routes.get()))
                     {
                         throw std::runtime_error(
                             "Mapped ExpertOverlay follower could not register its complete arena frontier");
@@ -1737,6 +2672,7 @@ namespace llaminar2
                         tensor_family->routing_indices,
                         tensor_family->routing_weights,
                         tensor_family->output,
+                        canonical_routes,
                     };
 
                     auto lane = binding.mapped->activationDeviceLane(
@@ -1748,6 +2684,59 @@ namespace llaminar2
                         throw std::runtime_error(
                             "Mapped ExpertOverlay follower received an invalid device lane");
                     }
+                    endpoint->lane = lane;
+
+                    ParticipantGpuRuntime *gpu_runtime =
+                        &participantGpuRuntimeForParticipant(
+                            endpoint->participant_id);
+                    std::string epoch_acquire_name;
+                    if (gpu_runtime->device != target_device ||
+                        !gpu_runtime->runtime_table ||
+                        !gpu_runtime->epoch_arena)
+                    {
+                        throw std::logic_error(
+                            "Mapped follower endpoint disagrees with its durable GPU runtime authority");
+                    }
+
+                    epoch_acquire_name =
+                        "mapped_follower_p" +
+                        std::to_string(endpoint->participant_id) +
+                        "_epoch_acquire";
+                    MoEOverlayEpochBoundaryStage::Params acquire_params;
+                    acquire_params.device_id = target_device;
+                    acquire_params.arena = gpu_runtime->epoch_arena;
+                    acquire_params.request_slot = 0u;
+                    acquire_params.operation =
+                        MoEOverlayEpochBoundaryStage::Operation::Acquire;
+                    if (spec.source_layers.empty())
+                    {
+                        throw std::logic_error(
+                            "Mapped follower epoch transaction has no routed layer");
+                    }
+                    const std::uint32_t first_stage_ordinal =
+                        binding.mapped->activationStageOrdinal(
+                            graph_family_ordinal,
+                            spec.source_layers.front());
+                    if (first_stage_ordinal != 0u)
+                    {
+                        throw std::logic_error(
+                            "Mapped follower epoch transaction does not begin at stage zero");
+                    }
+                    acquire_params.peer_epoch_source =
+                        MoEOverlayEpochBoundaryStage::PeerEpochSource{
+                            .mapped_region = lane.mapped_region,
+                            .binding = {
+                                .control = lane.control_device,
+                                .grant = lane.grant_device,
+                                .stage_ordinal = first_stage_ordinal,
+                            },
+                        };
+                    acquire_params.stage_name = epoch_acquire_name;
+                    endpoint->graph->addNode(
+                        epoch_acquire_name,
+                        std::make_unique<MoEOverlayEpochBoundaryStage>(
+                            std::move(acquire_params)),
+                        target_device);
                     std::string previous_layer_return;
                     for (const int layer : spec.source_layers)
                     {
@@ -1765,6 +2754,9 @@ namespace llaminar2
                             consume_params;
                         consume_params.device_id = target_device;
                         consume_params.lane = lane;
+                        consume_params.placement =
+                            gpu_runtime->runtime_table
+                                ->overlayRoutePlacementBinding(layer);
                         consume_params.hidden = tensor_family->hidden.get();
                         consume_params.routing_indices =
                             tensor_family->routing_indices.get();
@@ -1786,6 +2778,11 @@ namespace llaminar2
                         {
                             endpoint->graph->addDependency(
                                 consume_name, previous_layer_return);
+                        }
+                        else if (!epoch_acquire_name.empty())
+                        {
+                            endpoint->graph->addDependency(
+                                consume_name, epoch_acquire_name);
                         }
 
                         const auto expert_mask =
@@ -1819,23 +2816,21 @@ namespace llaminar2
                                 ": " + residency_error);
                         }
                         std::string compute_dependency = consume_name;
+                        std::vector<ITensorGemm *> prepared_gate;
+                        std::vector<ITensorGemm *> prepared_up;
+                        std::vector<ITensorGemm *> prepared_down;
+                        (void)registry.populateExpertEnginesForParticipant(
+                            binding.tier->domain,
+                            target_device,
+                            binding.participant->world_rank,
+                            binding.participant->domain_participant_index,
+                            layer,
+                            num_experts,
+                            prepared_gate,
+                            prepared_up,
+                            prepared_down);
                         if (hasActiveMask(expert_mask))
                         {
-                            std::vector<ITensorGemm *> prepared_gate;
-                            std::vector<ITensorGemm *> prepared_up;
-                            std::vector<ITensorGemm *> prepared_down;
-                            (void)registry.populateExpertEnginesForParticipant(
-                                binding.tier->domain,
-                                target_device,
-                                binding.participant->world_rank,
-                                binding.participant
-                                    ->domain_participant_index,
-                                layer,
-                                num_experts,
-                                prepared_gate,
-                                prepared_up,
-                                prepared_down);
-
                             MoELocalExpertStage::Params validation_params;
                             validation_params.device_id = target_device;
                             validation_params.num_experts = num_experts;
@@ -1862,7 +2857,173 @@ namespace llaminar2
                                     std::to_string(layer) + " participant " +
                                     std::to_string(endpoint->participant_id));
                             }
+                        }
 
+                        if (layer < 0 ||
+                            static_cast<std::size_t>(layer) >=
+                                gpu_runtime->initialized_layers.size())
+                        {
+                            throw std::out_of_range(
+                                "Mapped follower source layer is outside its topology-wide runtime table");
+                        }
+                        auto &initialized =
+                            gpu_runtime->initialized_layers[
+                                static_cast<std::size_t>(layer)];
+                        if (initialized == 0u)
+                        {
+                                    MoEPlacementUpdate update;
+                                    update.epoch = 1u;
+                                    update.expert_count =
+                                        static_cast<std::uint32_t>(
+                                            num_experts);
+                                    update.participant_id =
+                                        gpu_runtime->domain_participant_id;
+                                    update.participant_count =
+                                        gpu_runtime->domain_participant_count;
+                                    update.experts.resize(
+                                        static_cast<std::size_t>(
+                                            num_experts));
+                                    update.local_compute_mask.assign(
+                                        static_cast<std::size_t>(
+                                            num_experts),
+                                        0u);
+                                    update.replica_role.assign(
+                                        static_cast<std::size_t>(
+                                            num_experts),
+                                        static_cast<std::uint8_t>(
+                                            DeviceMoEReplicaRole::None));
+                                    update.resident_participant_mask.assign(
+                                        static_cast<std::size_t>(
+                                            num_experts),
+                                        0u);
+                                    update.overlay_route_participant.assign(
+                                        static_cast<std::size_t>(
+                                            num_experts),
+                                        -1);
+
+                                    for (int expert = 0;
+                                         expert < num_experts;
+                                         ++expert)
+                                    {
+                                        const auto *const owner =
+                                            owner_map_->ownerFor(
+                                                layer, expert);
+                                        if (!owner ||
+                                            owner->owner_participant < 0)
+                                        {
+                                            throw std::logic_error(
+                                                "Mapped follower runtime initialization found an unowned expert");
+                                        }
+
+                                        auto &descriptor =
+                                            update.experts[
+                                                static_cast<std::size_t>(
+                                                    expert)];
+                                        descriptor.logical_expert_id = expert;
+                                        update.overlay_route_participant[
+                                            static_cast<std::size_t>(expert)] =
+                                            owner->owner_participant;
+                                        if (owner->tier_idx ==
+                                            binding.participant->tier_idx)
+                                        {
+                                            if (owner
+                                                        ->domain_participant_index <
+                                                    0 ||
+                                                static_cast<std::uint32_t>(
+                                                    owner
+                                                        ->domain_participant_index) >=
+                                                    update.participant_count)
+                                            {
+                                                throw std::logic_error(
+                                                    "Mapped follower owner has no valid domain-local runtime identity");
+                                            }
+                                            descriptor.owner_participant =
+                                                owner
+                                                    ->domain_participant_index;
+                                            update
+                                                .resident_participant_mask[
+                                                    static_cast<std::size_t>(
+                                                        expert)] =
+                                                1u << static_cast<std::uint32_t>(
+                                                    owner
+                                                        ->domain_participant_index);
+                                        }
+                                        else
+                                        {
+                                            descriptor.owner_participant = -1;
+                                        }
+
+                                        if (owner->owner_participant !=
+                                            endpoint->participant_id)
+                                        {
+                                            continue;
+                                        }
+                                        if (!expert_mask[
+                                                static_cast<std::size_t>(
+                                                    expert)] ||
+                                            !exportDeviceMoEExpertWeightDescriptors(
+                                                prepared_gate[
+                                                    static_cast<std::size_t>(
+                                                        expert)],
+                                                prepared_up[
+                                                    static_cast<std::size_t>(
+                                                        expert)],
+                                                prepared_down[
+                                                    static_cast<std::size_t>(
+                                                        expert)],
+                                                d_model,
+                                                expert_intermediate,
+                                                descriptor))
+                                        {
+                                            throw std::runtime_error(
+                                                "Mapped follower could not export the authoritative prepared expert descriptor");
+                                        }
+                                        descriptor.logical_expert_id = expert;
+                                        descriptor.owner_participant =
+                                            static_cast<std::int32_t>(
+                                                update.participant_id);
+                                        descriptor.local_slot = expert;
+                                        descriptor.flags = toMoEExpertFlags(
+                                            DeviceMoEExpertFlags::Valid |
+                                            DeviceMoEExpertFlags::Resident |
+                                            DeviceMoEExpertFlags::LocalCompute |
+                                            DeviceMoEExpertFlags::PreferredOwner);
+                                        update.local_compute_mask[
+                                            static_cast<std::size_t>(expert)] =
+                                            1u;
+                                        update.replica_role[
+                                            static_cast<std::size_t>(expert)] =
+                                            static_cast<std::uint8_t>(
+                                                DeviceMoEReplicaRole::Primary);
+                                        update
+                                            .resident_participant_mask[
+                                                static_cast<std::size_t>(
+                                                    expert)] |=
+                                            1u << update.participant_id;
+                                    }
+
+                                    void *const publication_stream =
+                                        participantWorkerStream(
+                                            target_device);
+                                    gpu_runtime->worker->submitAndWait(
+                                        [&]
+                                        {
+                                            gpu_runtime
+                                                ->runtime_table
+                                                ->prepareInactiveBank(
+                                                    layer, update);
+                                            gpu_runtime
+                                                ->runtime_table
+                                                ->flipActiveBank(
+                                                    layer,
+                                                    update.epoch,
+                                                    publication_stream);
+                                        });
+                            initialized = 1u;
+                        }
+
+                        if (hasActiveMask(expert_mask))
+                        {
                             MoEExpertComputeStage::Params compute_params;
                             compute_params.device_id = target_device;
                             compute_params.input = tensor_family->hidden.get();
@@ -1880,6 +3041,14 @@ namespace llaminar2
                                 tensor_family->routing_weights.get();
                             compute_params.output =
                                 tensor_family->output.get();
+                            compute_params.canonical_route_contributions =
+                                canonical_routes.get();
+                            compute_params.canonical_route_arithmetic =
+                                MoECanonicalRouteArithmeticPolicy::
+                                    PreweightedContributionThenOrderedAdd;
+                            compute_params.canonical_route_layout =
+                                MoECanonicalRoutePublicationLayout::
+                                    DenseOriginalRouteSlots;
                             compute_params.active_row_count_device =
                                 static_cast<const std::int32_t *>(
                                     endpoint->active_rows->gpu_data_ptr());
@@ -1902,6 +3071,29 @@ namespace llaminar2
                             compute_params.prepared_store =
                                 prepared_store_.get();
                             compute_params.expert_registry = &registry;
+                            compute_params.moe_runtime_table =
+                                gpu_runtime->runtime_table.get();
+                            compute_params
+                                .runtime_service_graph_role_device =
+                                &lane.grant_device->graph_role;
+                            compute_params.use_runtime_row_grouping = true;
+                            compute_params.weight_descriptor_source =
+                                MoEDecodeDescriptorSource::
+                                    RuntimePlacementTable;
+                            compute_params
+                                .runtime_decode_has_explicit_owner_metadata =
+                                true;
+                            compute_params.my_socket_id =
+                                static_cast<int>(
+                                    gpu_runtime->domain_participant_id);
+                            compute_params.participant_count =
+                                static_cast<int>(
+                                    gpu_runtime->domain_participant_count);
+                            compute_params.routed_assignment_policy =
+                                RoutedExpertAssignmentPolicy::StaticOwner;
+                            compute_params.routed_row_execution_policy =
+                                RoutedExpertRowExecutionPolicy::
+                                    ParticipantAssigned;
 
                             auto compute_stage =
                                 std::make_unique<MoEExpertComputeStage>(
@@ -1922,8 +3114,8 @@ namespace llaminar2
                             return_params;
                         return_params.device_id = target_device;
                         return_params.lane = lane;
-                        return_params.local_output =
-                            tensor_family->output.get();
+                        return_params.local_canonical_route_contributions =
+                            canonical_routes.get();
                         return_params.physical_rows = physical_rows;
                         return_params.stage_ordinal = stage_ordinal;
                         return_params.model_layer_index = layer;
@@ -1939,6 +3131,38 @@ namespace llaminar2
                             return_name, compute_dependency);
                         previous_layer_return = return_name;
                     }
+
+                    if (previous_layer_return.empty())
+                    {
+                        throw std::logic_error(
+                            "Mapped follower epoch transaction contains no routed layer to release");
+                    }
+                    const std::string release_name =
+                        "mapped_follower_p" +
+                        std::to_string(endpoint->participant_id) +
+                        "_epoch_release";
+                    MoEOverlayEpochBoundaryStage::Params release_params;
+                    release_params.device_id = target_device;
+                    release_params.arena = gpu_runtime->epoch_arena;
+                    release_params.request_slot = 0u;
+                    release_params.operation =
+                        MoEOverlayEpochBoundaryStage::Operation::Release;
+                    if (config_.durable_maintenance_policy ==
+                            MoEOverlayDurableMaintenancePolicy::
+                                DynamicPlacement &&
+                        gpu_runtime->controller_binding)
+                    {
+                        release_params.retirement_readiness_controller =
+                            *gpu_runtime->controller_binding;
+                    }
+                    release_params.stage_name = release_name;
+                    endpoint->graph->addNode(
+                        release_name,
+                        std::make_unique<MoEOverlayEpochBoundaryStage>(
+                            std::move(release_params)),
+                        target_device);
+                    endpoint->graph->addDependency(
+                        release_name, previous_layer_return);
 
                     auto [workspace_it, workspace_inserted] =
                         mapped_workspace_allocators.try_emplace(
@@ -2005,83 +3229,28 @@ namespace llaminar2
                         throw std::runtime_error(
                             "Mapped ExpertOverlay follower could not bind its exact participant stream");
                     }
+                    worker->submitAndWait(
+                        [&]
+                        {
+                            if (!endpoint->cache.ensureCaptureOutputEvent(worker))
+                            {
+                                throw std::runtime_error(
+                                    "Mapped ExpertOverlay follower could not allocate its setup-owned terminal fence event");
+                            }
+                        });
                     shape.endpoints.push_back(std::move(endpoint));
                 }
                 result->mapped_gpu_shapes.push_back(std::move(shape));
             }
 
-            std::size_t setup_materialized_gpu_transactions = 0u;
-            for (auto &shape : result->mapped_gpu_shapes)
-            {
-                for (auto &endpoint : shape.endpoints)
-                {
-                    if (!endpoint || !endpoint->graph || !endpoint->executor ||
-                        !endpoint->cache.capture_stream)
-                    {
-                        throw std::runtime_error(
-                            "Mapped ExpertOverlay follower lost a graph, executor, or exact stream before setup materialization");
-                    }
-                    const auto context_it =
-                        execution_contexts_.find(endpoint->device);
-                    IWorkerGPUContext *const worker =
-                        participantWorkerContext(endpoint->device);
-                    if (context_it == execution_contexts_.end() ||
-                        !context_it->second || !worker ||
-                        endpoint->graph->nativeCaptureEnvelope() !=
-                            GraphNativeCaptureEnvelope::
-                                DeviceOwnedTimelineTransaction)
-                    {
-                        throw std::runtime_error(
-                            "Mapped ExpertOverlay follower could not resolve its setup-time device context or native timeline envelope");
-                    }
-
-                    /*
-                     * Record and instantiate every admitted endpoint graph before
-                     * request admission. The dispatch-consume kernels are only
-                     * recorded here: no activation epoch exists, no graph is
-                     * launched, and no arena write is published. Consequently an
-                     * authenticated inference ticket can submit a replay
-                     * immediately instead of performing first-use HIP/CUDA graph
-                     * construction while the continuation device is already
-                     * waiting for its remote expert rows.
-                     */
-                    endpoint->graph->reset();
-                    if (!endpoint->executor->executeWithCachedGraphReplay(
-                            *endpoint->graph,
-                            context_it->second,
-                            endpoint->cache,
-                            endpoint->cache.capture_stream,
-                            worker,
-                            /*collective_nodes=*/nullptr,
-                            /*collectives_graph_capturable=*/false,
-                            /*force_recapture=*/false,
-                            /*defer_final_sync=*/true,
-                            {},
-                            DeviceGraphExecutor::GraphReplayPlanPolicy::
-                                RequireFullGraph,
-                            {},
-                            {},
-                            {},
-                            DeviceGraphExecutor::GraphInitialSubmissionPolicy::
-                                MaterializeWithoutLaunch) ||
-                        !endpoint->cache.retained_full_graph_replay.valid() ||
-                        endpoint->cache.executable_submission_state !=
-                            DeviceGraphExecutor::GraphSegmentCache::
-                                ExecutableSubmissionState::
-                                    MaterializedUnlaunched)
-                    {
-                        throw std::runtime_error(
-                            "Mapped ExpertOverlay follower could not seal its setup-owned native timeline transaction without launching it for participant " +
-                            std::to_string(endpoint->participant_id) +
-                            " rows=" + std::to_string(shape.physical_rows));
-                    }
-                    ++setup_materialized_gpu_transactions;
-                }
-            }
-
+            /* Native capture waits for physical-fabric epoch installation.
+             * Graphs, buffers, prepared engines, and borrowed streams are all
+             * durable now; only the final graph-owned transfer branch identity
+             * is intentionally unresolved until orchestration finishes the
+             * topology-accounted lane BOM. */
             PerfStatsCollector::addCounter(
                 "moe_overlay_participant_graph",
-                "materialized_mapped_follower_families",
+                "declared_mapped_follower_families",
                 1.0,
                 "model_setup",
                 participantDeviceList(local_participants_),
@@ -2101,8 +3270,7 @@ namespace llaminar2
                   std::to_string(result->mapped_cpu_endpoints.size())},
                  {"graph_family", std::to_string(graph_family_ordinal)},
                  {"source_layers", std::to_string(spec.source_layers.size())},
-                 {"setup_materialized_gpu_transactions",
-                  std::to_string(setup_materialized_gpu_transactions)},
+                 {"native_capture", "deferred_until_physical_fabric"},
                  {"host_sparse_stages", "0"}});
             return result;
         }
@@ -2165,6 +3333,7 @@ namespace llaminar2
                 }
                 if (participants.empty())
                     continue;
+                std::sort(participants.begin(), participants.end());
 
                 const int routed_domain_ordinal =
                     domain_ordinal(tier.domain);
@@ -2672,13 +3841,32 @@ namespace llaminar2
         const int *tokens,
         int seq_len,
         int logical_step,
-        SparseTransactionPhase phase)
+        SparseTransactionPhase phase,
+        int physical_rows)
     {
         (void)tokens;
+        if (physical_rows < 0)
+            physical_rows = seq_len;
+        const ExpertHistogramSource histogram_source =
+            phase == SparseTransactionPhase::Decode
+                ? ExpertHistogramSource::DecodeToken
+                : (phase == SparseTransactionPhase::Prefill
+                       ? ExpertHistogramSource::PrefillChunk
+                       : ExpertHistogramSource::SyntheticTest);
+        MoEOverlayInferenceInterferenceScope interference_scope(
+            interference_probe_.get(),
+            makeMoEOverlayInferenceWorkloadIdentity(
+                histogram_source,
+                seq_len,
+                physical_rows,
+                /*transaction_count=*/1,
+                /*speculative_depth=*/0));
         try
         {
-            if (seq_len <= 0 || logical_step < 0 || logical_step != position_)
+            if (seq_len <= 0 || physical_rows < seq_len || logical_step < 0 ||
+                logical_step != position_)
             {
+                interference_scope.discard();
                 LOG_ERROR(
                     "[MoEOverlayParticipantGraphRunner] Invalid sparse "
                     "collective request cursor logical_step="
@@ -2688,6 +3876,7 @@ namespace llaminar2
             }
             if (overlay_collective_request_generation_ == 0)
             {
+                interference_scope.discard();
                 LOG_ERROR(
                     "[MoEOverlayParticipantGraphRunner] Refusing sparse "
                     "graph execution before the orchestration layer published "
@@ -2700,7 +3889,10 @@ namespace llaminar2
                     overlay_collective_request_generation_,
                     static_cast<uint64_t>(logical_step),
                     phase))
+            {
+                interference_scope.discard();
                 return false;
+            }
             std::string execution_error;
             const bool ok = executor_.executeRetainedMultiDevice(
                 cached.execution_plan, &execution_error);
@@ -2710,6 +3902,8 @@ namespace llaminar2
                     "[MoEOverlayParticipantGraphRunner] Retained participant schedule failed: "
                     << execution_error);
             }
+            if (!ok)
+                interference_scope.discard();
             if (ok)
             {
                 position_ += seq_len;
@@ -2766,6 +3960,7 @@ namespace llaminar2
         }
         catch (const std::exception &error)
         {
+            interference_scope.discard();
             LOG_ERROR(
                 "[MoEOverlayParticipantGraphRunner] Forward failed on rank "
                 << config_.mpi_context->rank() << ": " << error.what());
@@ -2876,6 +4071,21 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEOverlayParticipantGraphRunner::
+        setMoEOverlayInferenceInterferenceProbe(
+            std::shared_ptr<MoEOverlayInferenceInterferenceProbe> probe)
+    {
+        if (!probe || (interference_probe_ && interference_probe_ != probe))
+        {
+            LOG_ERROR(
+                "[MoEOverlayParticipantGraphRunner] Requires one stable "
+                "non-null ExpertOverlay interference probe");
+            return false;
+        }
+        interference_probe_ = std::move(probe);
+        return true;
+    }
+
     /**
      * @brief Submit all mapped follower parents and retire their shared lease.
      *
@@ -2899,6 +4109,12 @@ namespace llaminar2
                 *error = std::move(message);
             return false;
         };
+        if (serving_graph_family_lifecycle_ !=
+            ServingGraphFamilyLifecycle::Sealed)
+        {
+            return reject(
+                "Mapped ExpertOverlay follower received a ticket before its physical-fabric graph branches were sealed");
+        }
         const uint64_t physical_rows_u64 =
             static_cast<uint64_t>(ticket.request_count) *
             static_cast<uint64_t>(ticket.physical_rows_per_request);
@@ -2918,6 +4134,17 @@ namespace llaminar2
             return reject(
                 "Mapped ExpertOverlay follower has no setup-owned executable for the ticket row geometry");
         }
+
+        LOG_DEBUG(
+            "[MoEOverlayParticipantGraphRunner] Admitted mapped follower "
+            "transaction role="
+            << static_cast<std::uint32_t>(ticket.graph_role)
+            << " command=" << ticket.command_id
+            << " ordinal=" << ticket.transaction_ordinal
+            << " logical_step=" << ticket.logical_step_id
+            << " physical_rows=" << physical_rows_u64
+            << " gpu_endpoints=" << shape->endpoints.size()
+            << " cpu_endpoints=" << cached.mapped_cpu_endpoints.size());
 
         struct ArmedLane
         {
@@ -3005,6 +4232,33 @@ namespace llaminar2
 
         std::size_t captured_gpu_transactions = 0u;
         std::size_t replayed_gpu_transactions = 0u;
+        struct SubmittedInferenceBoundary
+        {
+            ParticipantGpuRuntime *runtime = nullptr;
+            std::uint64_t generation = 0u;
+            bool graph_submitted = false;
+        };
+        struct PreparedGpuSubmission
+        {
+            CachedParticipantGraph::MappedGPUFollowerEndpoint *endpoint =
+                nullptr;
+            IDeviceContext *context = nullptr;
+            IWorkerGPUContext *worker = nullptr;
+            bool had_native_transaction = false;
+        };
+        struct SubmittedGpuTerminal
+        {
+            CachedParticipantGraph::MappedGPUFollowerEndpoint *endpoint =
+                nullptr;
+            DeviceGraphExecutor::GraphSegmentCache::
+                CaptureStreamTerminalTicket ticket;
+        };
+        std::vector<SubmittedInferenceBoundary> submitted_boundaries;
+        submitted_boundaries.reserve(shape->endpoints.size());
+        std::vector<PreparedGpuSubmission> prepared_gpu_submissions;
+        prepared_gpu_submissions.reserve(shape->endpoints.size());
+        std::vector<SubmittedGpuTerminal> submitted_gpu_terminals;
+        submitted_gpu_terminals.reserve(shape->endpoints.size());
         std::uint64_t mapped_dispatch_bytes = 0u;
         std::uint64_t mapped_return_bytes = 0u;
         std::uint64_t mapped_dispatch_rows = 0u;
@@ -3016,7 +4270,12 @@ namespace llaminar2
                 ? "prefill"
                 : "decode";
 
-        /* Queue every complete native GPU transaction before CPU work begins. */
+        /*
+         * Resolve every immutable launch dependency before publishing any
+         * inference admission.  This keeps setup errors exactly reversible:
+         * after the second pass begins, every receipt already protects a real
+         * executable that is ready to enter its backend worker queue.
+         */
         for (const auto &endpoint : shape->endpoints)
         {
             if (!endpoint || !endpoint->graph || !endpoint->executor ||
@@ -3027,8 +4286,7 @@ namespace llaminar2
                 return reject(
                     "Mapped ExpertOverlay follower endpoint lost its retained graph identity");
             }
-            const auto context_it =
-                execution_contexts_.find(endpoint->device);
+            const auto context_it = execution_contexts_.find(endpoint->device);
             IWorkerGPUContext *const worker =
                 participantWorkerContext(endpoint->device);
             if (context_it == execution_contexts_.end() ||
@@ -3041,25 +4299,145 @@ namespace llaminar2
                 return reject(
                     "Mapped ExpertOverlay follower endpoint is missing its device context or native timeline envelope");
             }
-            const bool had_native_transaction =
-                endpoint->cache.retained_full_graph_replay.valid();
-            if (!endpoint->executor->executeWithCachedGraphReplay(
-                    *endpoint->graph,
-                    context_it->second,
-                    endpoint->cache,
-                    endpoint->cache.capture_stream,
-                    worker,
-                    /*collective_nodes=*/nullptr,
-                    /*collectives_graph_capturable=*/false,
-                    /*force_recapture=*/false,
-                    /*defer_final_sync=*/true,
-                    {},
-                    DeviceGraphExecutor::GraphReplayPlanPolicy::
-                        RequireFullGraph,
-                    {},
-                    {},
-                    {}))
+
+            prepared_gpu_submissions.push_back({
+                .endpoint = endpoint.get(),
+                .context = context_it->second,
+                .worker = worker,
+                .had_native_transaction =
+                    endpoint->cache.retained_full_graph_replay.valid(),
+            });
+        }
+
+        const auto cancel_unsubmitted_boundaries = [&]() noexcept
+        {
+            bool cancelled_every_boundary = true;
+            for (auto boundary = submitted_boundaries.rbegin();
+                 boundary != submitted_boundaries.rend();
+                 ++boundary)
             {
+                if (boundary->graph_submitted)
+                    continue;
+                cancelled_every_boundary =
+                    boundary->runtime &&
+                    boundary->runtime->inference_boundary_receipt
+                        .cancelUnsubmitted(boundary->generation) &&
+                    cancelled_every_boundary;
+            }
+            return cancelled_every_boundary;
+        };
+
+        /*
+         * Publish every local follower admission before launching the first
+         * graph.  The controller's topology preflight can therefore observe
+         * either the wholly quiescent prior transaction or an in-flight member
+         * of this transaction; it can never certify a graph that has already
+         * entered a backend queue but is still absent from its receipt.
+         */
+        if (!prepared_gpu_submissions.empty())
+        {
+            for (const auto &prepared : prepared_gpu_submissions)
+            {
+                auto &runtime = participantGpuRuntimeForParticipant(
+                    prepared.endpoint->participant_id);
+                if (runtime.device != prepared.endpoint->device)
+                {
+                    (void)cancel_unsubmitted_boundaries();
+                    abort_armed();
+                    return reject(
+                        "Mapped ExpertOverlay follower prepared a cache on the wrong controller-runtime device");
+                }
+                const std::uint64_t boundary_generation =
+                    runtime.inference_boundary_receipt.beginSubmission();
+                if (boundary_generation == 0u)
+                {
+                    (void)cancel_unsubmitted_boundaries();
+                    abort_armed();
+                    return reject(
+                        "Mapped ExpertOverlay follower exhausted its inference-boundary generation namespace for participant " +
+                        std::to_string(prepared.endpoint->participant_id));
+                }
+                submitted_boundaries.push_back({
+                    .runtime = &runtime,
+                    .generation = boundary_generation,
+                    .graph_submitted = false,
+                });
+            }
+        }
+
+        /* Queue every complete native GPU transaction before CPU work begins. */
+        for (std::size_t submission_index = 0u;
+             submission_index < prepared_gpu_submissions.size();
+             ++submission_index)
+        {
+            const auto &prepared = prepared_gpu_submissions[submission_index];
+            auto *const endpoint = prepared.endpoint;
+            /* Transfer progress is a maintenance-owned retained replay. A
+             * follower inference graph must never join it or share its stream. */
+            const GraphCaptureAuxiliaryBranchFactory branch_factory{};
+            bool submitted = false;
+            DeviceGraphExecutor::GraphSegmentCache::
+                CaptureStreamTerminalTicket terminal_ticket;
+            try
+            {
+                /* The worker queue is the sole submission authority for this
+                 * device. Recording the dedicated terminal in the same closure
+                 * makes it impossible for controller maintenance or another
+                 * graph to interleave stream work between launch and receipt. */
+                prepared.worker->submitAndWait(
+                    [&]()
+                    {
+                        submitted = endpoint->executor
+                                        ->executeWithCachedGraphReplay(
+                                            *endpoint->graph,
+                                            prepared.context,
+                                            endpoint->cache,
+                                            endpoint->cache.capture_stream,
+                                            prepared.worker,
+                                            /*collective_nodes=*/nullptr,
+                                            /*collectives_graph_capturable=*/false,
+                                            /*force_recapture=*/false,
+                                            /*defer_final_sync=*/true,
+                                            {},
+                                            DeviceGraphExecutor::
+                                                GraphReplayPlanPolicy::
+                                                    RequireFullGraph,
+                                            {},
+                                            {},
+                                            {},
+                                            DeviceGraphExecutor::
+                                                GraphInitialSubmissionPolicy::
+                                                    CaptureInstantiateAndLaunch,
+                                            branch_factory);
+                        if (submitted)
+                        {
+                            terminal_ticket = endpoint->cache
+                                                  .publishCaptureStreamTerminal();
+                        }
+                    });
+            }
+            catch (const std::exception &exception)
+            {
+                if (!submitted && !cancel_unsubmitted_boundaries())
+                {
+                    abort_armed();
+                    return reject(
+                        "Mapped ExpertOverlay follower could not roll back an unsubmitted inference boundary after graph submission threw");
+                }
+                abort_armed();
+                return reject(
+                    "Mapped ExpertOverlay follower graph submission threw for participant " +
+                    std::to_string(endpoint->participant_id) + ": " +
+                    exception.what());
+            }
+            if (!submitted || !terminal_ticket.valid())
+            {
+                if (!submitted && !cancel_unsubmitted_boundaries())
+                {
+                    abort_armed();
+                    return reject(
+                        "Mapped ExpertOverlay follower could not roll back an unsubmitted inference boundary after native timeline rejection");
+                }
                 abort_armed();
                 return reject(
                     "Mapped ExpertOverlay follower native timeline submission failed for participant " +
@@ -3072,11 +4450,24 @@ namespace llaminar2
                     "Mapped ExpertOverlay follower submission returned without a sealed native timeline replay identity for participant " +
                         std::to_string(endpoint->participant_id));
             }
-            if (had_native_transaction)
+            submitted_gpu_terminals.push_back({
+                .endpoint = endpoint,
+                .ticket = terminal_ticket,
+            });
+            submitted_boundaries[submission_index].graph_submitted = true;
+            if (prepared.had_native_transaction)
                 ++replayed_gpu_transactions;
             else
                 ++captured_gpu_transactions;
         }
+
+        LOG_DEBUG(
+            "[MoEOverlayParticipantGraphRunner] Submitted every mapped "
+            "follower GPU parent command="
+            << ticket.command_id
+            << " ordinal=" << ticket.transaction_ordinal
+            << " captured=" << captured_gpu_transactions
+            << " replayed=" << replayed_gpu_transactions);
 
         std::size_t cpu_layer_dispatches = 0u;
         for (const auto &endpoint : cached.mapped_cpu_endpoints)
@@ -3089,9 +4480,10 @@ namespace llaminar2
                                         ? execution_contexts_.find(
                                               endpoint->device)
                                         : execution_contexts_.end();
-            if (!endpoint || !endpoint->device.is_cpu() || !lane ||
+                if (!endpoint || !endpoint->device.is_cpu() || !lane ||
                 !endpoint->lane_authority ||
                 !endpoint->lane_authority->protocol ||
+                !endpoint->lane.valid() ||
                 !endpoint->input_rows || !endpoint->output_rows ||
                 context_it == execution_contexts_.end() ||
                 !context_it->second)
@@ -3114,6 +4506,29 @@ namespace llaminar2
                     std::to_string(endpoint->participant_id) + ": " +
                     protocol_error);
             }
+
+            /*
+             * Bind the exact hidden matrix before the first descriptor is
+             * acquired. The object address retained by every CPU local-expert
+             * stage stays fixed; only this typed, ticket-derived view changes.
+             * Metadata aliases are identical across shapes, while the hidden
+             * pointer/layout pair is indivisible and may not be overridden by
+             * a layer or inferred from live descriptor counts.
+             */
+            const auto admitted_payload =
+                endpoint->lane.hostDispatchPayload(
+                    static_cast<std::int32_t>(physical_rows_u64));
+            if (!admitted_payload.hidden_rows_fp32 ||
+                admitted_payload.hidden_row_capacity !=
+                    static_cast<size_t>(physical_rows_u64) ||
+                !isValidMoEOverlayActivationHiddenPayloadLayout(
+                    admitted_payload.hidden_payload_layout))
+            {
+                abort_armed();
+                return reject(
+                    "Mapped ExpertOverlay CPU follower could not bind the exact ticket-selected activation payload view");
+            }
+            *endpoint->input_rows = admitted_payload;
 
             for (const auto &layer : endpoint->layers)
             {
@@ -3147,13 +4562,61 @@ namespace llaminar2
                     &protocol_error);
                 if (!descriptor)
                 {
+                    /*
+                     * This is a terminal-only snapshot of the shared protocol.
+                     * It adds no steady-path polling, but distinguishes an
+                     * expired watchdog from an illegal timeline regression or
+                     * a continuation graph that never opened its generation.
+                     */
+                    const auto now = std::chrono::steady_clock::now();
+                    const auto remaining_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            deadline - now)
+                            .count();
+                    const auto active_identity = protocol.activeIdentity();
+                    const auto continuation = protocol.endpointStatus(
+                        MoEOverlayActivationEndpoint::Continuation);
+                    const auto follower = protocol.endpointStatus(
+                        MoEOverlayActivationEndpoint::Follower);
+                    std::ostringstream diagnostic;
+                    diagnostic
+                        << "Mapped ExpertOverlay CPU follower could not consume layer "
+                        << layer.model_layer_index
+                        << " for participant " << endpoint->participant_id
+                        << ": " << protocol_error
+                        << "; terminal_snapshot={timeline="
+                        << protocol.dispatchTimeline(bank)
+                        << ",expected=" << expected_timeline
+                        << ",deadline_remaining_us=" << remaining_us
+                        << ",admission="
+                        << static_cast<std::uint32_t>(
+                               protocol.admissionState())
+                        << ",active_generation="
+                        << active_identity.epoch_generation
+                        << ",active_placement_floor="
+                        << active_identity.placement_epoch_floor
+                        << ",continuation_state=" << continuation.state
+                        << ",continuation_code=" << continuation.code
+                        << ",continuation_operation="
+                        << continuation.operation
+                        << ",continuation_observed="
+                        << continuation.observed_timeline
+                        << ",continuation_diagnostic="
+                        << continuation.failure_diagnostic
+                        << ",continuation_auxiliary="
+                        << continuation.failure_auxiliary
+                        << ",continuation_generation="
+                        << continuation.generation
+                        << ",continuation_published="
+                        << continuation.last_published_stage
+                        << ",follower_state=" << follower.state
+                        << ",follower_code=" << follower.code
+                        << ",follower_operation=" << follower.operation
+                        << ",follower_generation=" << follower.generation
+                        << ",follower_consumed="
+                        << follower.last_consumed_stage << "}";
                     abort_armed();
-                    return reject(
-                        "Mapped ExpertOverlay CPU follower could not consume layer " +
-                        std::to_string(layer.model_layer_index) +
-                        " for participant " +
-                        std::to_string(endpoint->participant_id) + ": " +
-                        protocol_error);
+                    return reject(diagnostic.str());
                 }
 
                 auto &input = *endpoint->input_rows;
@@ -3224,9 +4687,10 @@ namespace llaminar2
                  * CPU GEMM sees any shared bytes. Release publication of the
                  * descriptor is the acquire edge for every payload read below.
                  */
+                const size_t expected_payload_bytes =
+                    compactMoEOverlayDispatchBytes(input);
                 bool valid_packet =
-                    descriptor->payload_bytes ==
-                        compactMoEOverlayDispatchBytes(input) &&
+                    descriptor->payload_bytes == expected_payload_bytes &&
                     input.entry_offsets_host[0] == 0;
                 std::int32_t previous_row = -1;
                 std::int32_t previous_offset = 0;
@@ -3256,9 +4720,29 @@ namespace llaminar2
                                        input.live_entry_count);
                 if (!valid_packet)
                 {
+                    std::ostringstream diagnostic;
+                    diagnostic
+                        << "Mapped ExpertOverlay CPU follower rejected "
+                           "malformed shared dispatch rows"
+                        << " layer=" << layer.model_layer_index
+                        << " participant=" << endpoint->participant_id
+                        << " live_rows=" << input.live_row_count
+                        << " live_entries=" << input.live_entry_count
+                        << " payload_bytes=" << descriptor->payload_bytes
+                        << " expected_payload_bytes="
+                        << expected_payload_bytes
+                        << " initial_offset="
+                        << input.entry_offsets_host[0]
+                        << " final_offset=" << previous_offset;
+                    if (input.live_row_count > 0u)
+                    {
+                        diagnostic
+                            << " first_row_id=" << input.row_ids_host[0]
+                            << " first_row_end="
+                            << input.entry_offsets_host[1u];
+                    }
                     abort_armed();
-                    return reject(
-                        "Mapped ExpertOverlay CPU follower rejected malformed shared dispatch rows");
+                    return reject(diagnostic.str());
                 }
 
                 output.live_row_count = 0u;
@@ -3318,13 +4802,259 @@ namespace llaminar2
             }
         }
 
+        /*
+         * A source parent fans one sparse stage out to every follower before it
+         * can advance.  Waiting endpoint events one at a time means the first
+         * incomplete event is not necessarily the lane withholding a return:
+         * it may be parked behind another participant at the source fan-in.
+         * Capture one topology-wide snapshot for every timeout so the fatal
+         * report identifies the actual protocol frontier without adding any
+         * steady-path polling, transfer, or synchronization.
+         */
+        const auto topology_timeout_diagnostic =
+            [this, shape, &ticket](
+                const CachedParticipantGraph::MappedGPUFollowerEndpoint *
+                    observed_endpoint)
+        {
+            /*
+             * A timed-out resident wait can occupy the backend scheduler in a
+             * way that also prevents a newly submitted diagnostic D2H copy from
+             * making progress. Reading device protocol structs here therefore
+             * risks hanging the fatal path after its bounded terminal timeout.
+             * The activation epoch and controller fabrics are host-mapped by
+             * design, so report their acquire-loaded state directly without
+             * submitting GPU work or introducing a second synchronization
+             * protocol solely for diagnostics.
+             */
+            std::ostringstream out;
+            out << "ticket={" << ticket.toString() << "}"
+                << " physical_rows=" << shape->physical_rows
+                << " gpu_endpoint_count=" << shape->endpoints.size();
+            for (const auto &owned_endpoint : shape->endpoints)
+            {
+                const auto *const endpoint = owned_endpoint.get();
+                out << " endpoint={";
+                if (!endpoint)
+                {
+                    out << "null}";
+                    continue;
+                }
+                out << "observed="
+                    << (endpoint == observed_endpoint ? 1 : 0)
+                    << ",participant=" << endpoint->participant_id
+                    << ",device=" << endpoint->device.toString()
+                    << ",cache_initialized="
+                    << (endpoint->cache.initialized ? 1 : 0)
+                    << ",submission_state="
+                    << static_cast<std::uint32_t>(
+                           endpoint->cache.executable_submission_state)
+                    << ",replay_ready="
+                    << (endpoint->cache.retained_full_graph_replay.valid()
+                            ? 1
+                            : 0);
+                if (!endpoint->lane_authority ||
+                    !endpoint->lane_authority->protocol)
+                {
+                    out << ",protocol=missing}";
+                    continue;
+                }
+
+                const auto &authority = *endpoint->lane_authority;
+                const auto &protocol = *authority.protocol;
+                const auto identity = protocol.activeIdentity();
+                const auto continuation = protocol.endpointStatus(
+                    MoEOverlayActivationEndpoint::Continuation);
+                const auto follower = protocol.endpointStatus(
+                    MoEOverlayActivationEndpoint::Follower);
+                out << ",next_generation="
+                    << authority.next_epoch_generation
+                    << ",active_generation=" << identity.epoch_generation
+                    << ",active_step=" << identity.logical_step_id
+                    << ",active_role=" << identity.graph_role
+                    << ",active_rows="
+                    << identity.physical_rows_per_request
+                    << ",admission="
+                    << static_cast<std::uint32_t>(
+                           protocol.admissionState())
+                    << ",continuation={state=" << continuation.state
+                    << ",code=" << continuation.code
+                    << ",operation=" << continuation.operation
+                    << ",evidence=" << continuation.observed_timeline
+                    << ",diagnostic="
+                    << continuation.failure_diagnostic
+                    << ",auxiliary="
+                    << continuation.failure_auxiliary
+                    << ",consumed="
+                    << continuation.last_consumed_stage
+                    << ",published="
+                    << continuation.last_published_stage << "}"
+                    << ",follower={state=" << follower.state
+                    << ",code=" << follower.code
+                    << ",operation=" << follower.operation
+                    << ",evidence=" << follower.observed_timeline
+                    << ",diagnostic=" << follower.failure_diagnostic
+                    << ",auxiliary=" << follower.failure_auxiliary
+                    << ",consumed=" << follower.last_consumed_stage
+                    << ",published=" << follower.last_published_stage
+                    << "}";
+                for (std::uint32_t bank = 0u;
+                     bank < kMoEOverlayActivationBufferCount;
+                     ++bank)
+                {
+                    out << ",bank" << bank << "={dispatch="
+                        << protocol.dispatchTimeline(bank)
+                        << ",return="
+                        << protocol.returnTimeline(bank) << "}";
+                }
+
+                const auto runtime_it =
+                    participant_gpu_runtimes_.find(
+                        endpoint->participant_id);
+                if (runtime_it != participant_gpu_runtimes_.end() &&
+                    runtime_it->second)
+                {
+                    const auto &receipt =
+                        runtime_it->second->inference_boundary_receipt;
+                    out << ",boundary_receipt={submitted="
+                        << receipt.submittedGeneration()
+                        << ",completed="
+                        << receipt.completedGeneration()
+                        << ",consumed="
+                        << receipt.consumedGeneration() << "}";
+                }
+                const auto progress_it =
+                    transfer_progress_epochs_.find(endpoint->device);
+                if (progress_it != transfer_progress_epochs_.end() &&
+                    progress_it->second)
+                {
+                    const auto progress = progress_it->second->stats();
+                    out << ",transfer_progress={slots="
+                        << progress.slots_reserved
+                        << ",published=" << progress.commands_published
+                        << ",completed=" << progress.commands_completed
+                        << ",bytes=" << progress.bytes_completed
+                        << ",dma_submissions="
+                        << progress.dma_submissions
+                        << ",idle_skips="
+                        << progress.idle_submission_skips
+                        << ",in_flight_observations="
+                        << progress.in_flight_observations
+                        << ",failures=" << progress.command_failures
+                        << "}";
+                }
+                if (config_.device_controller_fabric)
+                {
+                    try
+                    {
+                        const auto binding =
+                            config_.device_controller_fabric
+                                ->participantBinding(
+                                    endpoint->participant_id);
+                        const auto load32 = [](std::uint32_t &value)
+                        {
+                            return std::atomic_ref<std::uint32_t>(value)
+                                .load(std::memory_order_acquire);
+                        };
+                        const auto load64 = [](std::uint64_t &value)
+                        {
+                            return std::atomic_ref<std::uint64_t>(value)
+                                .load(std::memory_order_acquire);
+                        };
+                        if (binding.controller && binding.command)
+                        {
+                            auto &controller = *binding.controller;
+                            auto &command = *binding.command;
+                            out << ",controller={state="
+                                << load32(controller.state)
+                                << ",kind="
+                                << load32(controller.transaction_kind)
+                                << ",error="
+                                << load32(controller.error_code)
+                                << ",transaction="
+                                << load64(controller.transaction_id)
+                                << ",base_epoch="
+                                << load64(controller.base_epoch)
+                                << ",candidate_epoch="
+                                << load64(controller.candidate_epoch)
+                                << ",durable_epoch="
+                                << load64(controller.current_durable_epoch)
+                                << ",admission_transaction="
+                                << load64(controller.admission_transaction)
+                                << ",completed_transaction="
+                                << load64(controller.completed_transaction)
+                                << ",dynamic_layer_cursor="
+                                << load32(controller.dynamic_layer_cursor)
+                                << ",admission_epoch="
+                                << load64(controller.admission_epoch)
+                                << ",command_transaction="
+                                << load64(controller.command_transaction)
+                                << ",commit_transaction="
+                                << load64(controller.commit_transaction)
+                                << ",commands="
+                                << load32(command.command_count) << "}";
+                        }
+                        if (binding.local_participant_record)
+                        {
+                            auto &record =
+                                *binding.local_participant_record;
+                            out << ",controller_participant={status="
+                                << load32(record.status_code)
+                                << ",snapshot="
+                                << load64(record.snapshot_transaction)
+                                << ",prepared="
+                                << load64(record.prepared_transaction)
+                                << ",published="
+                                << load64(record.published_transaction)
+                                << ",retirement_ready="
+                                << load64(record.retirement_ready_epoch)
+                                << ",retired="
+                                << load64(record.retired_epoch) << "}";
+                        }
+                        if (binding.local_group)
+                        {
+                            auto &group = *binding.local_group;
+                            out << ",controller_group={status="
+                                << load32(group.status_code)
+                                << ",snapshot="
+                                << load64(group.snapshot_transaction)
+                                << ",prepared="
+                                << load64(group.prepared_transaction)
+                                << ",published="
+                                << load64(group.published_transaction)
+                                << ",retired="
+                        << load64(group.retired_epoch) << "}";
+                        }
+                    }
+                    catch (const std::exception &diagnostic_error)
+                    {
+                        out << ",controller=<unavailable:"
+                            << diagnostic_error.what() << ">";
+                    }
+                }
+                out << "}";
+            }
+            return out.str();
+        };
+
         try
         {
-            for (const auto &endpoint : shape->endpoints)
+            for (const auto &terminal : submitted_gpu_terminals)
             {
-                endpoint->cache.waitForCaptureStreamFence(
+                if (!terminal.endpoint || !terminal.ticket.valid())
+                {
+                    throw std::logic_error(
+                        "Mapped follower lost an exact GPU terminal ticket");
+                }
+                terminal.endpoint->cache
+                    .waitForPublishedCaptureStreamTerminal(
+                    terminal.ticket,
                     DeviceGraphExecutor::GraphSegmentCache::
-                        HostFenceWaitPolicy::ActiveProgress);
+                        HostFenceWaitPolicy::ActiveProgress,
+                    [&, observed_endpoint = terminal.endpoint]()
+                    {
+                        return topology_timeout_diagnostic(
+                            observed_endpoint);
+                    });
             }
         }
         catch (const std::exception &exception)
@@ -3494,6 +5224,22 @@ namespace llaminar2
             total += value;
             return true;
         };
+        const char *const service_source = [&ticket]() noexcept
+        {
+            switch (ticket.graph_role)
+            {
+            case MoEOverlayInferenceGraphRole::MainPrefill:
+                return "prefill";
+            case MoEOverlayInferenceGraphRole::MainDecode:
+                return "decode";
+            case MoEOverlayInferenceGraphRole::MTPDraft:
+            case MoEOverlayInferenceGraphRole::MTPGroupedVerifier:
+                return "grouped_verifier";
+            case MoEOverlayInferenceGraphRole::None:
+                return "invalid";
+            }
+            return "invalid";
+        }();
         for (const auto &lane : armed)
         {
             std::string traffic_error;
@@ -3578,7 +5324,9 @@ namespace llaminar2
             {
                 PerfStatsCollector::addCounter(
                     "moe_overlay",
-                    authority.device.is_cpu() ? "cpu_rows" : "gpu_rows",
+                    authority.device.is_cpu()
+                        ? "device_epoch_cpu_rows"
+                        : "device_epoch_gpu_rows",
                     static_cast<double>(traffic->return_live_rows),
                     "gn_local_expert",
                     authority.device.to_string(),
@@ -3612,6 +5360,7 @@ namespace llaminar2
                       std::to_string(traffic->return_live_rows)},
                      {"participant",
                       std::to_string(authority.participant_id)},
+                     {"service_source", service_source},
                      {"tier", std::to_string(authority.tier_index)}});
             }
         }
@@ -3652,6 +5401,23 @@ namespace llaminar2
                         std::to_string(
                             lane.authority->participant_id) + ": " +
                         reset_error);
+            }
+        }
+
+        /*
+         * Protocol reset is possible only after every exact GPU terminal event
+         * and both endpoint Complete publications were observed.  Publish each
+         * participant receipt last so a maintenance notification can never
+         * mistake a merely submitted graph for a committed inference boundary.
+         */
+        for (const auto &boundary : submitted_boundaries)
+        {
+            if (!boundary.runtime ||
+                !boundary.runtime->inference_boundary_receipt
+                     .completeSubmission(boundary.generation))
+            {
+                return reject(
+                    "Mapped ExpertOverlay follower could not publish its serial inference-boundary receipt");
             }
         }
 
@@ -3706,8 +5472,12 @@ namespace llaminar2
             timing_enabled ? Clock::now() : Clock::time_point{};
         if (error)
             error->clear();
+        std::optional<MoEOverlayInferenceInterferenceScope>
+            interference_scope;
         const auto fail = [&](std::string diagnostic)
         {
+            if (interference_scope)
+                interference_scope->discard();
             if (error)
                 *error = diagnostic;
             LOG_ERROR(
@@ -3783,6 +5553,40 @@ namespace llaminar2
             return fail("terminal graph role reached the execution authority");
         }
 
+        ExpertHistogramSource calibration_source =
+            ExpertHistogramSource::SyntheticTest;
+        int calibration_depth = 0;
+        if (ticket.graph_role == MoEOverlayInferenceGraphRole::MainPrefill)
+            calibration_source = ExpertHistogramSource::PrefillChunk;
+        else if (ticket.graph_role == MoEOverlayInferenceGraphRole::MainDecode)
+            calibration_source = ExpertHistogramSource::DecodeToken;
+        else if (ticket.graph_role ==
+                 MoEOverlayInferenceGraphRole::MTPGroupedVerifier)
+        {
+            calibration_source = ExpertHistogramSource::GroupedVerifier;
+            calibration_depth = ticket.draft_depth;
+        }
+        if (calibration_source != ExpertHistogramSource::SyntheticTest)
+        {
+            interference_scope.emplace(
+                interference_probe_.get(),
+                makeMoEOverlayInferenceWorkloadIdentity(
+                    calibration_source,
+                    static_cast<int>(logical_rows),
+                    static_cast<int>(physical_rows),
+                    /*transaction_count=*/1,
+                    calibration_depth));
+            if (interference_scope->active())
+            {
+                LOG_DEBUG(
+                    "[ExpertOverlay][Calibration] Follower rank "
+                    << config_.mpi_context->rank()
+                    << " claimed baseline/concurrent sample logical_step="
+                    << ticket.logical_step_id << " rows=" << logical_rows
+                    << '/' << physical_rows);
+            }
+        }
+
         if (!cached || cached->row_capacity <= 0 ||
             (!cached->graph && !cached->usesMappedActivationEpochs()) ||
             physical_rows > static_cast<uint64_t>(cached->row_capacity))
@@ -3820,6 +5624,15 @@ namespace llaminar2
             return fail(
                 "selected retained participant graph execution failed: " +
                 execution_error);
+        }
+        if (interference_scope && interference_scope->active())
+        {
+            LOG_DEBUG(
+                "[ExpertOverlay][Calibration] Follower rank "
+                << config_.mpi_context->rank()
+                << " reached exact retained-graph terminal logical_step="
+                << ticket.logical_step_id << " rows=" << logical_rows
+                << '/' << physical_rows);
         }
         const auto execution_end =
             timing_enabled ? Clock::now() : Clock::time_point{};
@@ -3907,8 +5720,17 @@ namespace llaminar2
              {"transaction_ordinal",
               std::to_string(ticket.transaction_ordinal)},
              {"logical_step", std::to_string(ticket.logical_step_id)},
+             {"logical_step_semantics", "monotonic_transaction"},
              {"logical_rows", std::to_string(logical_rows)},
              {"physical_rows", std::to_string(physical_rows)},
+             {"prefill_schedule_real_rows",
+              std::to_string(ticket.prefill_schedule_real_rows)},
+             {"prefill_schedule_execution_rows",
+              std::to_string(ticket.prefill_schedule_execution_rows)},
+             {"prefill_schedule_transaction_count",
+              std::to_string(ticket.prefill_schedule_transaction_count)},
+             {"prefill_schedule_fingerprint",
+              std::to_string(ticket.prefill_schedule_fingerprint)},
              {"draft_depth", std::to_string(ticket.draft_depth)},
              {"sidecar_ordinal", std::to_string(ticket.sidecar_depth)},
              {"mtp_graph_depth", std::to_string(mtp_graph_depth)},
@@ -4034,7 +5856,8 @@ namespace llaminar2
                     tokens + relative_offset,
                     chunk.real_count,
                     chunk.token_offset,
-                    SparseTransactionPhase::Prefill))
+                    SparseTransactionPhase::Prefill,
+                    chunk.bucket_seq_len))
             {
                 LOG_ERROR(
                     "[MoEOverlayParticipantGraphRunner] Shared prefill chunk "
@@ -4120,6 +5943,90 @@ namespace llaminar2
     size_t MoEOverlayParticipantGraphRunner::cachedGraphCount() const noexcept
     {
         return (main_graph_ ? 1u : 0u) + mtp_sidecar_graphs_.size();
+    }
+
+    std::vector<MoEOverlayDeviceControllerRuntimeBinding>
+    MoEOverlayParticipantGraphRunner::
+        moeOverlayDeviceControllerRuntimeBindings() const
+    {
+        std::vector<int> participant_ids;
+        participant_ids.reserve(participant_gpu_runtimes_.size());
+        for (const auto &[participant_id, runtime] :
+             participant_gpu_runtimes_)
+        {
+            if (!runtime)
+            {
+                throw std::logic_error(
+                    "Mapped follower retained a null device-controller runtime");
+            }
+            participant_ids.push_back(participant_id);
+        }
+        std::sort(participant_ids.begin(), participant_ids.end());
+
+        std::vector<MoEOverlayDeviceControllerRuntimeBinding> bindings;
+        bindings.reserve(participant_ids.size());
+        for (const int participant_id : participant_ids)
+        {
+            const auto &runtime =
+                participantGpuRuntimeForParticipant(participant_id);
+            if (!runtime.runtime_table || !runtime.epoch_arena ||
+                runtime.runtime_table->layerCount() <= 0 ||
+                runtime.initialized_layers.size() !=
+                    static_cast<std::size_t>(
+                        runtime.runtime_table->layerCount()) ||
+                std::any_of(
+                    runtime.initialized_layers.begin(),
+                    runtime.initialized_layers.end(),
+                    [](std::uint8_t initialized)
+                    {
+                        return initialized == 0u;
+                    }))
+            {
+                throw std::logic_error(
+                    "Mapped follower controller binding was requested before every runtime layer became durable");
+            }
+
+            MoEOverlayDeviceControllerRuntimeBinding binding{
+                .device = runtime.device,
+                .runtime_layers_device =
+                    runtime.runtime_table->deviceLayerState(0),
+                .runtime_table_host = runtime.runtime_table.get(),
+                .service_telemetry_device =
+                    runtime.runtime_table
+                        ->deviceOverlayServiceTelemetry(),
+                .service_samples_device =
+                    runtime.runtime_table
+                        ->deviceOverlayServiceTelemetrySample(0),
+                .overlay_participant_id = runtime.participant_id,
+                .domain_participant_id =
+                    runtime.domain_participant_id,
+                .domain_participant_count =
+                    runtime.domain_participant_count,
+                .layer_count = static_cast<std::uint32_t>(
+                    runtime.runtime_table->layerCount()),
+                .expert_count = static_cast<std::uint32_t>(
+                    runtime.runtime_table->expertCount()),
+                .top_k = static_cast<std::uint32_t>(
+                    runtime.runtime_table->topK()),
+                .epoch_control =
+                    runtime.epoch_arena->deviceControlAddress(),
+                .maintenance_epoch =
+                    runtime.epoch_arena
+                        ->deviceMaintenanceEpochAddress(),
+                .maintenance_status =
+                    runtime.epoch_arena
+                        ->deviceMaintenanceStatusAddress(),
+                .inference_boundary = const_cast<
+                    ParticipantGpuRuntime *>(&runtime),
+            };
+            if (!binding.backgroundPublicationValid())
+            {
+                throw std::logic_error(
+                    "Mapped follower produced an incomplete background-publication binding");
+            }
+            bindings.push_back(binding);
+        }
+        return bindings;
     }
 
     MoEOverlayInferenceTransactionProtocol::Config

@@ -83,14 +83,51 @@ namespace llaminar2
     };
 
     /**
+     * @brief Exact slot-flow proof for one immutable migration edge set.
+     *
+     * Thermal direction counts are diagnostic only: a closed three-tier cycle
+     * may contain one direct promotion and two stepwise demotions. Capacity is
+     * preserved when every `(layer, participant)` and `(layer, tier)` vertex
+     * has equal incoming and outgoing expert slots. This typed summary keeps
+     * that graph invariant distinct from priority-direction accounting.
+     */
+    struct MoEOverlayMigrationCapacityEvidence
+    {
+        size_t edges_checked = 0;
+        size_t participant_coordinates_checked = 0;
+        size_t tier_coordinates_checked = 0;
+        size_t malformed_edges = 0;
+        size_t participant_flow_violations = 0;
+        size_t tier_flow_violations = 0;
+
+        /** @return Whether every physical and logical capacity flow balances. */
+        [[nodiscard]] bool capacityPreserved() const noexcept
+        {
+            return malformed_edges == 0 &&
+                   participant_flow_violations == 0 &&
+                   tier_flow_violations == 0;
+        }
+    };
+
+    /**
+     * @brief Prove per-layer participant and tier slot-flow conservation.
+     * @param migrations Complete immutable edge set for one candidate wave.
+     * @return Typed conservation evidence independent of direction counts.
+     */
+    [[nodiscard]] MoEOverlayMigrationCapacityEvidence
+    analyzeMoEOverlayMigrationCapacity(
+        std::span<const MoEOverlayTierMigration> migrations) noexcept;
+
+    /**
      * @brief One closed, capacity-preserving migration cycle within a layer.
      *
      * Indices refer to the enclosing transaction's immutable migration vector.
-     * The destination tier of each indexed edge equals the source tier of the
-     * next edge, including the last-to-first wrap. A one-edge cycle represents
-     * relocation between participants of the same tier. Cycles are the smallest
-     * units that may be selected for a bounded-shadow publication wave without
-     * changing any physical participant's logical expert capacity.
+     * The destination participant of each indexed edge equals the source
+     * participant of the next edge, including the last-to-first wrap. A
+     * one-edge cycle represents a logical relocation whose physical endpoint
+     * is unchanged. Cycles are the smallest units that may be selected for a
+     * bounded-shadow publication wave without changing any physical
+     * participant's logical expert capacity.
      */
     struct MoEOverlayTierMigrationCycle
     {
@@ -348,9 +385,11 @@ namespace llaminar2
      * A wave pins all source engines and owns every inactive destination slot,
      * staging buffer, event, and transport lifetime needed by its transaction.
      * Poll methods query readiness only; they must never synchronize a stream,
-     * wait for a collective, or run work on an inference thread. Commit builds
-     * and authenticates an inactive runtime bank. Only the residency authority
-     * publishes the public epoch after commit readiness is observed.
+     * wait for a collective, or run work on an inference thread. Preparation
+     * builds and authenticates every inactive host/device runtime bank without
+     * changing admission. Publication then flips the already-ready device
+     * selectors. Only after publication readiness is globally observed may the
+     * residency authority advance the public admission floor.
      */
     class IMoEOverlayResidencyWave
     {
@@ -379,18 +418,38 @@ namespace llaminar2
         }
 
         /**
-         * @brief Enqueue publication of a complete inactive destination bank.
+         * @brief Enqueue construction of every inactive destination bank.
          * @param error Receives a precise enqueue/validation failure.
-         * @return Whether commit work was enqueued without blocking.
+         * @return Whether preparation work was enqueued without blocking.
          */
-        virtual bool beginCommit(std::string *error) noexcept = 0;
+        virtual bool beginPrepare(std::string *error) noexcept = 0;
 
         /**
-         * @brief Query inactive-bank commit readiness without waiting.
+         * @brief Query inactive-bank preparation readiness without waiting.
          * @param error Receives a precise diagnostic when `Failed` is returned.
-         * @return Current commit progress.
+         * @return Current preparation progress.
          */
-        virtual MoEOverlayResidencyWaveProgress pollCommit(
+        virtual MoEOverlayResidencyWaveProgress pollPrepare(
+            std::string *error) noexcept = 0;
+
+        /**
+         * @brief Enqueue the inference-visible selector publication fan-out.
+         * @param error Receives a precise enqueue/validation failure.
+         * @return Whether every process-local publication was submitted.
+         *
+         * The candidate epoch is already exact-addressable through the host
+         * authority before this method is called. Once any selector can have
+         * changed, failure is fatal: rollback could invalidate an admitted
+         * device ticket and is therefore not a legal lifecycle transition.
+         */
+        virtual bool beginPublication(std::string *error) noexcept = 0;
+
+        /**
+         * @brief Query selector publication and all-rank consensus readiness.
+         * @param error Receives a precise diagnostic when `Failed` is returned.
+         * @return Current publication progress.
+         */
+        virtual MoEOverlayResidencyWaveProgress pollPublication(
             std::string *error) noexcept = 0;
 
         /** @brief Abort and recycle an unpublished candidate asynchronously. */
@@ -416,14 +475,14 @@ namespace llaminar2
         }
 
         /**
-         * @brief Observe the authority's successful candidate-epoch CAS.
+         * @brief Observe the authority's successful public-floor transition.
          *
          * This control-plane callback runs immediately after publication. It
          * must not launch work, allocate, synchronize, or fail; physical bank
-         * visibility was already proved by `pollCommit()`. Device-free waves
+         * visibility was already proved by `pollPublication()`. Device-free waves
          * need no notification, so the default is intentionally empty.
          */
-        virtual void markPublished() noexcept {}
+        virtual void markAuthorityPublished() noexcept {}
 
         /**
          * @brief Poll the cross-participant lease-drain fence for the old epoch.
@@ -517,8 +576,9 @@ namespace llaminar2
     {
         Started,
         Staging,
-        Committing,
-        Committed,
+        Preparing,
+        Publishing,
+        Published,
         DynamicNoMovement,
         StaticNoMovement,
         Idle,
@@ -526,7 +586,9 @@ namespace llaminar2
         Busy,
         Stale,
         StageFailed,
-        CommitFailed,
+        PreparationFailed,
+        PublicationFailed,
+        RetirementFailed,
     };
 
     struct MoEOverlayResidencyApplyResult
@@ -541,8 +603,9 @@ namespace llaminar2
         {
             return status == MoEOverlayResidencyApplyStatus::Started ||
                    status == MoEOverlayResidencyApplyStatus::Staging ||
-                   status == MoEOverlayResidencyApplyStatus::Committing ||
-                   status == MoEOverlayResidencyApplyStatus::Committed ||
+                   status == MoEOverlayResidencyApplyStatus::Preparing ||
+                   status == MoEOverlayResidencyApplyStatus::Publishing ||
+                   status == MoEOverlayResidencyApplyStatus::Published ||
                    status == MoEOverlayResidencyApplyStatus::DynamicNoMovement ||
                    status == MoEOverlayResidencyApplyStatus::StaticNoMovement ||
                    status == MoEOverlayResidencyApplyStatus::Idle ||
@@ -757,10 +820,12 @@ namespace llaminar2
          * before its pinned ticket reaches the host boundary.  Publication can
          * advance in that interval, so reacquiring "current" would pair the
          * device computation with a different owner map.  This overload pins
-         * either the current publication or the single two-bank retirement
-         * generation without taking the maintenance mutex or waiting for a
-         * stream.  It returns no lease once retirement has closed admission for
-         * that epoch.
+         * the fully prepared successor, current publication, or single two-bank
+         * retirement generation without taking the maintenance mutex or waiting
+         * for a stream. The successor slot closes the bounded interval in which
+         * one GPU has published E+1 while the public host admission floor remains
+         * E. It returns no lease once retirement has closed admission for that
+         * epoch.
          *
          * @param epoch Positive residency epoch copied from the device ticket.
          * @return Exact lease when the epoch remains addressable; otherwise empty.
@@ -1013,6 +1078,16 @@ namespace llaminar2
         Config config_;
         MoERoutedExpertPlacementPlan planning_template_;
         std::atomic<std::shared_ptr<PublishedEpochState>> published_epoch_;
+        /**
+         * Fully prepared successor accepted by exact device-selected tickets.
+         *
+         * This slot becomes visible before any GPU selector may flip and is
+         * removed only after the same state object becomes @ref published_epoch_.
+         * It is not a second policy authority: ordinary host admission never
+         * reads it, while exact heterogeneous tickets may name it during the
+         * bounded selector fan-out interval.
+         */
+        std::atomic<std::shared_ptr<PublishedEpochState>> candidate_epoch_;
         /**
          * One lock-free lookup for the old half of the two-bank RCU pair.
          * The maintenance protocol admits no successor wave until this pointer
