@@ -142,6 +142,14 @@ namespace llaminar2
             {
                 return "Assignment " + std::to_string(i) + " has invalid device";
             }
+            if (assignments_[i].head_count <= 0 ||
+                assignments_[i].kv_head_count <= 0 ||
+                assignments_[i].d_ff_count <= 0 ||
+                assignments_[i].vocab_count <= 0)
+            {
+                return "Assignment " + std::to_string(i) +
+                       " has an empty query, KV, FFN, or vocabulary shard";
+            }
         }
 
         // Check for duplicate devices

@@ -124,10 +124,6 @@ namespace llaminar2
          * unfenced device read: the immutable host ticket has already crossed
          * its one declared captured-to-host boundary.
          */
-        bool requiresHostGraphTicketFence() const override
-        {
-            return false;
-        }
 
         /** @brief Fixed ticket storage supports padded prefill capture preflight. */
         bool supportsPaddedPrefillGraphCapturePreflight() const override

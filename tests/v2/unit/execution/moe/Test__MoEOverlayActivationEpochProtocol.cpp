@@ -120,7 +120,7 @@ namespace llaminar2::test
                 identity, stage, &error);
             ASSERT_TRUE(returned.has_value()) << error;
             EXPECT_EQ(returned->live_rows, dispatch->live_rows);
-            EXPECT_EQ(returned->live_entries, 0u);
+            EXPECT_EQ(returned->live_entries, dispatch->live_entries);
         }
 
         void completeBoth(
@@ -238,7 +238,7 @@ namespace llaminar2::test
         EXPECT_EQ(traffic->dispatch_live_rows, 12u);
         EXPECT_EQ(traffic->return_live_rows, 12u);
         EXPECT_EQ(traffic->dispatch_live_entries, 24u);
-        EXPECT_EQ(traffic->return_live_entries, 0u);
+        EXPECT_EQ(traffic->return_live_entries, 24u);
         EXPECT_EQ(traffic->dispatch_stage_count, 4u);
         EXPECT_EQ(traffic->return_stage_count, 4u);
 

@@ -353,19 +353,25 @@ size_t exactAttentionWorkspaceBytes(
     {
         return 0;
     }
+    const bool has_exact_local_query_heads =
+        geometry.local_query_heads > 0;
     if (geometry.device_compute_units <= 0 || geometry.batch_size <= 0 ||
         geometry.resident_graph_rows <= 0 ||
         geometry.max_context_rows <= 0 || profile.n_heads <= 0 ||
         profile.head_dim <= 0 || geometry.total_shards <= 0 ||
-        profile.n_heads % geometry.total_shards != 0)
+        (!has_exact_local_query_heads &&
+         profile.n_heads % geometry.total_shards != 0))
     {
         throw std::runtime_error(
-            "Attention workspace planning requires positive, evenly sharded "
-            "graph/device geometry including physical SM/CU count");
+            "Attention workspace planning requires positive graph/device "
+            "geometry, physical SM/CU count, and either an exact local query "
+            "head assignment or a uniformly divisible model head count");
     }
 
     const int local_query_heads =
-        profile.n_heads / geometry.total_shards;
+        has_exact_local_query_heads
+            ? geometry.local_query_heads
+            : profile.n_heads / geometry.total_shards;
     size_t partial_output = 0;
     size_t partial_m = 0;
     size_t partial_l = 0;

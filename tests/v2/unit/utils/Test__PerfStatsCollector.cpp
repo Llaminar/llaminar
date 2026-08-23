@@ -224,6 +224,61 @@ namespace
         appendCertifiedHostedTicketParticipant(records, "ROCm:1");
         return records;
     }
+
+    /**
+     * @brief Build the complete ledger for a request terminal on ticket one.
+     *
+     * There is deliberately no continuation-submission record: no such graph
+     * was selected.  Every other counter still proves the one captured
+     * transaction from immutable ticket publication through terminal response.
+     */
+    std::vector<PerfStatRecord> certifiedTerminalOnlyHostedTicketRecords()
+    {
+        auto records = certifiedHostedTicketRecords();
+        std::erase_if(
+            records,
+            [](const PerfStatRecord &record)
+            {
+                return record.name ==
+                           "hosted_device_generation_transaction_submissions" ||
+                       record.name ==
+                           "device_generation_dispatch_tickets_observed";
+            });
+
+        for (PerfStatRecord &record : records)
+        {
+            if (record.name ==
+                    "device_generation_dispatch_ticket_d2h_submissions" ||
+                record.name == "device_generation_terminal_transactions" ||
+                record.name ==
+                    "device_generation_terminal_compact_outcome_reductions")
+            {
+                record.value = 1.0;
+            }
+            else if (record.name ==
+                     "hosted_device_generation_terminal_submissions")
+            {
+                record.tags["transactions"] = "1";
+            }
+        }
+
+        for (const std::string device : {"ROCm:0", "ROCm:1"})
+        {
+            records.push_back(PerfStatRecord{
+                .kind = PerfStatRecord::Kind::Counter,
+                .domain = "mtp",
+                .name = "device_generation_dispatch_tickets_observed",
+                .device = device,
+                .tags = {
+                    {"transaction", "1"},
+                    {"next_depth", "2"},
+                    {"complete", "true"},
+                    {"maintenance_due", "false"}},
+                .value = 1.0,
+            });
+        }
+        return records;
+    }
 }
 
 TEST(Test__PerfStatsCollector, AggregatesCountersAndTimers)
@@ -302,6 +357,39 @@ TEST(Test__ProductionParityEvidence, RecognizesNativeConditionalGenerationParent
         "native_conditional_parent");
 }
 
+TEST(Test__ProductionParityEvidence,
+     DormantGenerationInfrastructureDoesNotImplyControllerExecution)
+{
+    const std::vector<PerfStatRecord> records = {
+        PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_loop_stream_initializations",
+            .phase = "initialization",
+            .device = "ROCm:0",
+            .tags = {{"backend", "HIP"}},
+            .value = 1.0,
+        },
+        PerfStatRecord{
+            .kind = PerfStatRecord::Kind::Counter,
+            .domain = "mtp",
+            .name = "device_generation_loop_stream_initializations",
+            .phase = "initialization",
+            .device = "ROCm:1",
+            .tags = {{"backend", "HIP"}},
+            .value = 1.0,
+        },
+    };
+
+    const auto evidence = collectProductionDeviceGenerationEvidence(records);
+    EXPECT_FALSE(evidence.controller_observed);
+    EXPECT_EQ(
+        evidence.policy,
+        ProductionDeviceGenerationPolicy::NotObserved);
+    EXPECT_FALSE(evidence.hasCertifiedGenerationLoop());
+    EXPECT_EQ(evidence.certification_detail, "not_observed");
+}
+
 TEST(Test__ProductionParityEvidence, DistinguishesHostedCapturedTransactions)
 {
     const std::vector<PerfStatRecord> records = {
@@ -350,6 +438,20 @@ TEST(Test__ProductionParityEvidence, CertifiesMirroredHostedTicketBoundary)
     EXPECT_TRUE(evidence.controller_observed);
     EXPECT_FALSE(evidence.hasNativeParent());
     EXPECT_TRUE(evidence.hosted_ticket_boundary_certified);
+    EXPECT_TRUE(evidence.hasCertifiedGenerationLoop());
+    EXPECT_EQ(
+        evidence.policy,
+        ProductionDeviceGenerationPolicy::HostScheduledCapturedTransactions);
+}
+
+TEST(Test__ProductionParityEvidence, CertifiesTerminalOnlyHostedTicketBoundary)
+{
+    const auto evidence = collectProductionDeviceGenerationEvidence(
+        certifiedTerminalOnlyHostedTicketRecords());
+    EXPECT_TRUE(evidence.controller_observed);
+    EXPECT_FALSE(evidence.hasNativeParent());
+    EXPECT_TRUE(evidence.hosted_ticket_boundary_certified)
+        << evidence.certification_detail;
     EXPECT_TRUE(evidence.hasCertifiedGenerationLoop());
     EXPECT_EQ(
         evidence.policy,

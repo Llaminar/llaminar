@@ -1,299 +1,168 @@
 /**
  * @file Test__Qwen3_SingleDevice_Parity.cpp
- * @brief Single-device Qwen3 parity tests (CPU, CUDA, ROCm)
+ * @brief Generated single-device Qwen3 production-parity matrix.
  *
- * Tests that single-device Qwen3 inference produces results matching
- * PyTorch reference outputs. Validates the QKNormStage integration
- * and the absence of QKV biases.
- *
- * Configurations:
- *   - CPU: Full-precision baseline with FP16, Q8_1, and Q16_1 KV cache
- *   - CUDA: Single NVIDIA GPU
- *   - ROCm: Single AMD GPU
- *
- * @author David Sanftenberg
- * @date 2026
+ * The typed declarations below preserve the established CPU, CUDA, and ROCm
+ * numerical contracts while central expansion owns activation/KV products and
+ * the mandatory fresh/full/partial prefix-restore lifecycle.
  */
+
+#include "Qwen3ModelParityDefinitions.h"
+#include "Qwen3ParityTestBase.h"
+
+#include "backends/GPUDeviceContextPool.h"
+#include "collective/BackendRouter.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
-#include "Qwen3ParityTestBase.h"
-#include "collective/BackendRouter.h"
-#include "backends/GPUDeviceContextPool.h"
+
+#include <iostream>
+#include <iterator>
+#include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
 using namespace llaminar2::test::parity::qwen3;
 
-// =============================================================================
-// Test Configuration Definitions
-// =============================================================================
-
 namespace
 {
-    /*
-     * The Hugging Face oracle retains FP32 K/V. Q8_1 and asymmetric
-     * TQ8-K/TQ4-V deliberately compare a compressed production cache against
-     * that higher-fidelity oracle, so their distribution gate must include the
-     * format's quantization error. Backend implementation correctness remains
-     * independently constrained by every-stage cosine, top-k recall, decode
-     * cosine/KL, and the cache-format kernel parity suites. This is the common
-     * rigorous parity default, not a backend-specific exception.
-     */
-    constexpr float kCompressedKvKlThreshold = 0.15f;
-}
+    /** @return Exact one-participant topology for a production backend. */
+    ModelParityTopologyDefinition singleDeviceTopology(
+        std::string test_id,
+        GlobalDeviceAddress address)
+    {
+        return ModelParityTopologyDefinition{
+            .test_id = std::move(test_id),
+            .kind = ModelParityTopologyKind::SingleDevice,
+            .participants = {{std::move(address), 0}},
+            .collective = Collective::None,
+            .mpi_ranks = 1,
+        };
+    }
 
-static const std::vector<TestConfig> kQwen3SingleDeviceConfigs = {
+    /** @return Typed Qwen3 definitions replacing the legacy record table. */
+    std::vector<ModelParityDefinition> qwen3SingleDeviceDefinitions()
     {
-        .name = "Qwen3_CPU_KV_FP16",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f, // Q8_0 quantized GEMM diverges from FP32 reference
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f,
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "Qwen3_CPU_KV_Q8_1",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f, // Q8_0 quantized GEMM diverges from FP32 reference
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = kCompressedKvKlThreshold,
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::Q8_1,
-    },
-    {
-        .name = "Qwen3_CPU_KV_Q16_1",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f, // Q8_0 quantized GEMM diverges from FP32 reference
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f,
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::Q16_1,
-    },
-    {
-        .name = "Qwen3_CPU_KV_TQ",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f, // Q8_0 quantized GEMM diverges from FP32 reference
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = kCompressedKvKlThreshold,
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::TQ,
-    },
-    {
-        .name = "Qwen3_CUDA_KV_FP16",
-        .devices = {ParityDeviceType::CUDA},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f, // Q8_0 Layer 1 cosine ~0.945 is borderline at 0.95
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f,
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "Qwen3_CUDA_KV_Q8_1",
-        .devices = {ParityDeviceType::CUDA},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f, // Q8_0 Layer 1 cosine ~0.945 is borderline at 0.95
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = kCompressedKvKlThreshold,
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::Q8_1,
-    },
-    {
-        .name = "Qwen3_CUDA_KV_TQ",
-        .devices = {ParityDeviceType::CUDA},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f, // Q8_0 Layer 1 cosine ~0.945 is borderline at 0.95
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = kCompressedKvKlThreshold,
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::TQ,
-    },
-    {
-        .name = "Qwen3_ROCm_KV_FP16",
-        .devices = {ParityDeviceType::ROCm},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f, // Q8_0 quantized GEMM diverges equally across backends
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.04f, // ROCm: rocBLAS/hipblasLt heuristic selection adds run-to-run variance
-            .min_top1_accuracy = 60.0f,
-            .min_top5_accuracy = 60.0f,
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-    {
-        .name = "Qwen3_ROCm_KV_FP32",
-        .devices = {ParityDeviceType::ROCm},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f, // Q8_0 quantized GEMM diverges equally across backends
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.04f, // ROCm: rocBLAS/hipblasLt heuristic selection adds run-to-run variance
-            .min_top1_accuracy = 60.0f,
-            .min_top5_accuracy = 60.0f,
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP32,
-    },
-    {
-        .name = "Qwen3_ROCm_KV_Q8_1",
-        .devices = {ParityDeviceType::ROCm},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f, // Q8_0 quantized GEMM diverges equally across backends
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = kCompressedKvKlThreshold,
-            .min_top1_accuracy = 60.0f,
-            .min_top5_accuracy = 60.0f,
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::Q8_1,
-    },
-    {
-        .name = "Qwen3_ROCm_KV_TQ",
-        .devices = {ParityDeviceType::ROCm},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f, // Q8_0 quantized GEMM diverges equally across backends
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = kCompressedKvKlThreshold,
-            .min_top1_accuracy = 60.0f,
-            .min_top5_accuracy = 60.0f,
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::TQ,
-    },
-};
+        const auto cpu = singleDeviceTopology(
+            "CPU0", GlobalDeviceAddress::cpu());
+        const auto cuda = singleDeviceTopology(
+            "CUDA0", GlobalDeviceAddress::cuda(0));
+        const auto rocm = singleDeviceTopology(
+            "ROCm0", GlobalDeviceAddress::rocm(0));
 
-// =============================================================================
-// Parameterized Test Fixture
-// =============================================================================
+        const auto common = qwen3ParityThresholds(0.01f);
+        const auto compressed =
+            qwen3ParityThresholds(kQwen3CompressedKVKLThreshold);
+        const auto rocm_default = qwen3ParityThresholds(0.04f, 60.0f, 60.0f);
+        const auto rocm_compressed = qwen3ParityThresholds(
+            kQwen3CompressedKVKLThreshold, 60.0f, 60.0f);
 
-class Qwen3SingleDeviceParityTest : public Qwen3ConfigDrivenParityTest<Qwen3SingleDeviceParityTest>,
-                                    public ::testing::WithParamInterface<TestConfig>
+        return {
+            qwen3Q80ParityDefinition(
+                cpu,
+                common,
+                {
+                    KVCachePrecision::FP16,
+                    KVCachePrecision::Q8_1,
+                    KVCachePrecision::Q16_1,
+                    KVCachePrecision::TQ,
+                },
+                {
+                    {ActivationPrecision::FP32,
+                     KVCachePrecision::Q8_1,
+                     compressed},
+                    {ActivationPrecision::FP32,
+                     KVCachePrecision::TQ,
+                     compressed},
+                }),
+            qwen3Q80ParityDefinition(
+                cuda,
+                common,
+                {
+                    KVCachePrecision::FP16,
+                    KVCachePrecision::Q8_1,
+                    KVCachePrecision::TQ,
+                },
+                {
+                    {ActivationPrecision::FP32,
+                     KVCachePrecision::Q8_1,
+                     compressed},
+                    {ActivationPrecision::FP32,
+                     KVCachePrecision::TQ,
+                     compressed},
+                }),
+            qwen3Q80ParityDefinition(
+                rocm,
+                rocm_default,
+                {
+                    KVCachePrecision::FP16,
+                    KVCachePrecision::FP32,
+                    KVCachePrecision::Q8_1,
+                    KVCachePrecision::TQ,
+                },
+                {
+                    {ActivationPrecision::FP32,
+                     KVCachePrecision::Q8_1,
+                     rocm_compressed},
+                    {ActivationPrecision::FP32,
+                     KVCachePrecision::TQ,
+                     rocm_compressed},
+                }),
+        };
+    }
+
+    /** @return Stable generated case storage used by GoogleTest discovery. */
+    const std::vector<ModelParityCase> &qwen3SingleDeviceCases()
+    {
+        static const auto cases = []
+        {
+            std::vector<ModelParityCase> expanded;
+            for (const auto &definition : qwen3SingleDeviceDefinitions())
+            {
+                auto definition_cases =
+                    expandModelParityDefinition(definition);
+                expanded.insert(
+                    expanded.end(),
+                    std::make_move_iterator(definition_cases.begin()),
+                    std::make_move_iterator(definition_cases.end()));
+            }
+            return expanded;
+        }();
+        return cases;
+    }
+} // namespace
+
+class Qwen3SingleDeviceParityTest
+    : public Qwen3ConfigDrivenParityTest<Qwen3SingleDeviceParityTest>,
+      public ModelParityCaseParameter
 {
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
 };
-
-// =============================================================================
-// Test Cases
-// =============================================================================
 
 TEST_P(Qwen3SingleDeviceParityTest, ProductionParity)
 {
     runProductionParityCampaign();
 }
 
-// =============================================================================
-// Test Instantiation
-// =============================================================================
-
 INSTANTIATE_TEST_SUITE_P(
     Qwen3,
     Qwen3SingleDeviceParityTest,
-    ::testing::ValuesIn(kQwen3SingleDeviceConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
-    {
-        return info.param.name;
-    });
-
-// =============================================================================
-// Custom Main with MPI Initialization
-// =============================================================================
+    ::testing::ValuesIn(qwen3SingleDeviceCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
+    { return info.param.testName(); });
 
 int main(int argc, char **argv)
 {
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     ::testing::InitGoogleTest(&argc, argv);
-    int result = RUN_ALL_TESTS();
+    const int result = RUN_ALL_TESTS();
 
-    // CRITICAL: Shutdown GlobalBackendRouter before MPI_Finalize to ensure
-    // NCCLCoordinator cleanup happens while CUDA runtime is still active.
     GlobalBackendRouter::shutdown();
     GPUDeviceContextPool::instance().shutdown();
-
     MPI_Finalize();
 
-    // Skip static destructors — see Test__Qwen2_SingleDevice_Parity.cpp for rationale.
     std::cout.flush();
     std::cerr.flush();
     _exit(result);

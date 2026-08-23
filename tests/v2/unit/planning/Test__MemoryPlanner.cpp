@@ -461,6 +461,44 @@ TEST(Test__MemoryPlanner, ResidentGraphSelection_ChoosesLargestFittingBucket)
         << "resident graph rows must not shrink full KV context capacity";
 }
 
+TEST(Test__MemoryPlanner,
+     ResidentGraphSelection_CoversRetainedMTPRowsOnCUDAAndROCm)
+{
+    constexpr size_t GiB = 1024ULL * 1024ULL * 1024ULL;
+    auto profile = createTestProfile();
+
+    DevicePlanConfig cuda;
+    cuda.device = DeviceId::cuda(0);
+    cuda.device_compute_units = 82;
+    cuda.device_total_bytes = 64ULL * GiB;
+    cuda.device_free_bytes = cuda.device_total_bytes;
+    cuda.batch_size = 1;
+    cuda.max_seq_len = 4096;
+    cuda.activation_seq_len = 9;
+    cuda.kv_precision = "fp16";
+    cuda.mtp_enabled = true;
+    cuda.mtp_target_query_rows = 16;
+
+    DevicePlanConfig rocm = cuda;
+    rocm.device = DeviceId::rocm(0);
+    rocm.device_compute_units = 60;
+
+    const auto selected =
+        MemoryPlanner::planLargestFittingResidentGraphRows(
+            profile,
+            {cuda, rocm},
+            {1, 9});
+
+    ASSERT_TRUE(selected.fits()) << selected.memory_plan.renderTable();
+    EXPECT_EQ(selected.resident_graph_rows, 16)
+        << "The graph identity must cover depth-fifteen's sixteen target rows, "
+           "not only the nine-row exact prefill bucket";
+    ASSERT_EQ(selected.memory_plan.devices.size(), 2u);
+    EXPECT_EQ(selected.memory_plan.devices[0].activation_seq_len, 16);
+    EXPECT_EQ(selected.memory_plan.devices[1].activation_seq_len, 16)
+        << "CUDA and ROCm participants must receive the same retained shape";
+}
+
 TEST(Test__MemoryPlanner, SingleGPU_DoesNotFit)
 {
     auto profile = createTestProfile();
@@ -707,6 +745,65 @@ TEST(Test__MemoryPlanner, TP2_ReducesKVCachePerDevice)
     // (n_kv_heads=2, so TP-2 gives 1 head per shard)
     EXPECT_LT(tp_plan.devices[0].kv_cache_bytes, single_plan.devices[0].kv_cache_bytes);
     EXPECT_LT(tp_plan.devices[1].kv_cache_bytes, single_plan.devices[0].kv_cache_bytes);
+}
+
+/**
+ * @brief Rank-local TP admission must consume the exact uneven GQA assignment.
+ *
+ * Qwen2 has fourteen query heads and two KV heads. TP4 therefore owns uneven
+ * query ranges while replicating both KV heads on every participant. This is
+ * the metadata-only regression for the production ROCm TP4 parity failure:
+ * admission must neither reject 14/4 nor reconstruct one KV head per device.
+ */
+TEST(Test__MemoryPlanner, RankLocalTP4UsesExactUnevenQAndReplicatedKVGeometry)
+{
+    const auto profile = createTestProfile();
+    const std::vector<DeviceId> devices{
+        DeviceId::rocm(0),
+        DeviceId::rocm(1),
+        DeviceId::rocm(2),
+        DeviceId::rocm(3),
+    };
+    const auto assignments = TensorParallelConfig::proportionalSplit(
+        devices,
+        std::vector<float>(devices.size(), 1.0f),
+        profile.n_heads,
+        profile.n_kv_heads,
+        profile.d_ff,
+        profile.vocab_size);
+
+    std::vector<DevicePlanConfig> configs;
+    configs.reserve(devices.size());
+    for (std::size_t rank = 0; rank < devices.size(); ++rank)
+    {
+        DevicePlanConfig config;
+        config.device = devices[rank];
+        config.device_compute_units = 60;
+        config.device_total_bytes = 32ULL * 1024ULL * 1024ULL * 1024ULL;
+        config.device_free_bytes = config.device_total_bytes;
+        config.shard_index = static_cast<int>(rank);
+        config.total_shards = static_cast<int>(devices.size());
+        config.batch_size = 1;
+        config.max_seq_len = 64;
+        config.activation_seq_len = 16;
+        config.kv_precision = "fp16";
+        config.bindTensorParallelAssignment(
+            assignments.forRank(static_cast<int>(rank)));
+        configs.push_back(std::move(config));
+    }
+
+    const auto plan = MemoryPlanner::plan(profile, configs);
+    ASSERT_EQ(plan.devices.size(), devices.size());
+    for (std::size_t rank = 0; rank < devices.size(); ++rank)
+    {
+        EXPECT_EQ(assignments.forRank(static_cast<int>(rank)).kv_head_count, 2);
+        EXPECT_GT(plan.devices[rank].kv_cache_bytes, 0u);
+        EXPECT_GT(plan.devices[rank].activation_bytes, 0u);
+        EXPECT_GT(plan.devices[rank].workspace_bytes, 0u);
+    }
+    EXPECT_GT(plan.devices[0].activation_bytes,
+              plan.devices[3].activation_bytes)
+        << "The two-query-head remainder shard must not be priced as a uniform three-head shard.";
 }
 
 TEST(Test__MemoryPlanner, PP2_SplitsLayersAcrossDevices)

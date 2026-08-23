@@ -8,6 +8,7 @@
  */
 
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 
 #include <gtest/gtest.h>
 
@@ -143,6 +144,11 @@ namespace llaminar2::test
                 .row_capacity_buckets = {2},
                 .d_model = kDModel,
                 .routing_top_k = kTopK,
+                .cpu_grouped_scratch_storage =
+                    MoELocalExpertSerialBufferArena::
+                        CPUGroupedScratchStoragePolicy::RetainSerialMaximum,
+                .num_experts = 2,
+                .expert_intermediate = 8,
                 .logical_participant_id = 3,
                 .debug_name = "unit.serial_compact"});
         ASSERT_NE(arena, nullptr);
@@ -160,6 +166,25 @@ namespace llaminar2::test
             arena->smallestFamilySupporting(3)->row_capacity,
             kRowCapacity);
         EXPECT_EQ(arena->smallestFamilySupporting(kRowCapacity + 1u), nullptr);
+        ASSERT_NE(arena->cpuGroupedWorkspace(), nullptr);
+        EXPECT_TRUE(arena->cpuGroupedWorkspace()->supports(
+            static_cast<int>(kRowCapacity),
+            kTopK,
+            kDModel,
+            /*expert_intermediate=*/8,
+            /*num_experts=*/2));
+        {
+            auto lease = arena->cpuGroupedWorkspace()->acquire(
+                1, 1, kDModel, 8, 2, /*layer_idx=*/0);
+            EXPECT_THROW(
+                (void)arena->cpuGroupedWorkspace()->acquire(
+                    1, 1, kDModel, 8, 2, /*layer_idx=*/1),
+                std::logic_error)
+                << "A serial workspace must reject overlapping graph roles";
+        }
+        EXPECT_NO_THROW(
+            (void)arena->cpuGroupedWorkspace()->acquire(
+                1, 1, kDModel, 8, 2, /*layer_idx=*/1));
 
         MoEOverlayCollectiveWorkspace workspace;
         workspace.ensureCapacity(

@@ -71,8 +71,7 @@ namespace llaminar2
             uint64_t graph_launch_ns = 0; ///< hipGraphLaunch / cudaGraphLaunch
             uint64_t post_launch_ns = 0;  ///< Output-coherence publication.
             uint64_t stream_sync_ns = 0;  ///< synchronizeStream() at end of replay phase
-            uint64_t manual_host_ticket_wait_ns = 0; ///< Explicit captured-ticket readiness wait at a heterogeneous boundary.
-            uint64_t manual_dispatch_ns = 0;         ///< CPU route descriptor/materialization work after ticket readiness.
+            uint64_t manual_dispatch_ns = 0;         ///< Complete CPU ticket-acquire and route descriptor/materialization unit.
             uint64_t manual_sparse_protocol_ns = 0;  ///< Cross-rank sparse dispatch, remote execution completion, and return reduction.
             uint64_t manual_other_ns = 0;            ///< Any remaining manual segment wall time; expected to stay zero in production overlay decode.
         };
@@ -99,7 +98,6 @@ namespace llaminar2
             uint64_t graph_launch_ns = 0;
             uint64_t post_launch_ns = 0;
             uint64_t stream_sync_ns = 0;
-            uint64_t manual_host_ticket_wait_ns = 0;
             uint64_t manual_dispatch_ns = 0;
             uint64_t manual_sparse_protocol_ns = 0;
             uint64_t manual_other_ns = 0;
@@ -112,7 +110,6 @@ namespace llaminar2
             t.graph_launch_ns = 0;
             t.post_launch_ns = 0;
             t.stream_sync_ns = 0;
-            t.manual_host_ticket_wait_ns = 0;
             t.manual_dispatch_ns = 0;
             t.manual_sparse_protocol_ns = 0;
             t.manual_other_ns = 0;
@@ -126,12 +123,6 @@ namespace llaminar2
 
         /// @brief Add stream sync time
         static void addReplayStreamSyncNs(uint64_t ns) { tls_replay_timings().stream_sync_ns += ns; }
-
-        /// @brief Add wall time spent waiting for a captured host ticket to become readable.
-        static void addReplayManualHostTicketWaitNs(uint64_t ns)
-        {
-            tls_replay_timings().manual_host_ticket_wait_ns += ns;
-        }
 
         /// @brief Add CPU dispatch descriptor construction/materialization time.
         static void addReplayManualDispatchNs(uint64_t ns)
@@ -319,11 +310,6 @@ namespace llaminar2
             recordIfNonZero("graph_launch", phase, timings.graph_launch_ns, device_name);
             recordIfNonZero("post_launch", phase, timings.post_launch_ns, device_name);
             recordIfNonZero("stream_sync", phase, timings.stream_sync_ns, device_name);
-            recordIfNonZero(
-                "manual_host_ticket_wait",
-                phase,
-                timings.manual_host_ticket_wait_ns,
-                device_name);
             recordIfNonZero(
                 "manual_dispatch",
                 phase,

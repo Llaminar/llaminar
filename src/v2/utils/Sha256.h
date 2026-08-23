@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace llaminar2
 {
@@ -57,6 +58,28 @@ namespace llaminar2
     std::optional<std::string> sha256FileHexShared(
         const std::filesystem::path &path,
         const std::filesystem::path &cache_directory,
+        std::string *error = nullptr);
+
+    /**
+     * @brief Hash the stable filesystem identity of an ordered artifact set.
+     *
+     * This deliberately does not read file payload bytes. It serializes each
+     * regular file's canonical path, device, inode, size, mtime, and ctime,
+     * then SHA-256 hashes that small descriptor. Ordinary replacement or
+     * in-place mutation therefore selects a new namespace, while prefix-cache
+     * setup remains constant-time even for a multi-hundred-gigabyte model.
+     *
+     * The ordered set supports split GGUF models: every shard participates in
+     * one identity and changing any shard invalidates the complete artifact.
+     * This identity is suitable for runtime caches owned by an already-loaded
+     * model context; it is not a cryptographic attestation of untrusted bytes.
+     *
+     * @param paths Ordered regular files comprising one loaded model artifact.
+     * @param error Optional diagnostic populated when identity capture fails.
+     * @return Sixty-four lowercase hexadecimal characters on success.
+     */
+    std::optional<std::string> sha256FileSetIdentityHex(
+        const std::vector<std::filesystem::path> &paths,
         std::string *error = nullptr);
 
     /**

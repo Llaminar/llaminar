@@ -32,6 +32,7 @@ struct WorkspaceMemoryGeometry
     int resident_graph_rows = 1; ///< Largest token-row capture bucket.
     int max_context_rows = 1; ///< Stable KV-cache capacity in token rows.
     int local_d_ff = 0; ///< Dense FFN output width owned locally.
+    int local_query_heads = 0; ///< Exact participant-local query heads.
     int first_layer = 0; ///< First model layer owned by this participant.
     int last_layer = -1; ///< Last model layer owned by this participant.
     int total_shards = 1; ///< Tensor-parallel degree for local dimensions.

@@ -76,6 +76,28 @@ namespace llaminar2
     };
 
     /**
+     * @brief One-token MTP continuation immediately following prefix restore.
+     *
+     * The restored prefix has already published main-model KV, depth-zero MTP
+     * KV, and its terminal hidden row. The token in this request must therefore
+     * execute with serial-decode arithmetic while one complete production graph
+     * also bridges that restored terminal row into shifted MTP KV. Restricting
+     * the request to one value makes a multi-row or zero-history bridge
+     * unrepresentable at this interface.
+     */
+    struct RestoredPrefixMTPDecodeBridgeRequest
+    {
+        int32_t token_id = 0; ///< Exact uncached suffix token to consume.
+        int restored_prefix_tokens = 0; ///< Positive logical history restored before this transaction.
+
+        /** @return true when the request names a real restored-prefix boundary. */
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return restored_prefix_tokens > 0;
+        }
+    };
+
+    /**
      * @brief Frozen setup contract for the executable serving graph family.
      *
      * The orchestration memory plan is the authority for every physical
@@ -93,6 +115,14 @@ namespace llaminar2
         int prefill_pad_token_id = 0;         ///< Token written to inactive rows in every bucket.
         ServingMainDecodeGraphKind main_decode_graph =
             ServingMainDecodeGraphKind::Unspecified; ///< Required request-opening decode executable.
+        /**
+         * Stable previous-stage activation owner for a non-embedding pipeline
+         * child. The enclosing PP runner installs this per stage during setup;
+         * ordinary single-device/TP roots leave it null. Its device allocation
+         * and address are graph identity and must remain stable for the runner
+         * lifetime.
+         */
+        TensorBase *pipeline_hidden_input = nullptr;
 
         /** @brief True when both prefill and serial-decode inventory are explicit. */
         bool valid() const noexcept
@@ -1142,9 +1172,10 @@ namespace llaminar2
          */
         enum class Boundary
         {
-            Request,       ///< New prompt/session or benchmark iteration.
-            PrefixRestore, ///< Prefix hit import replaces live state.
-            HardReset,     ///< Replay/workspace teardown; no graph preservation.
+            Request,          ///< New prompt/session or benchmark iteration.
+            PrefixRestore,    ///< Prefix hit import replaces live state.
+            ServingGraphSetup, ///< Scrub capture-time state before first admission.
+            HardReset,        ///< Replay/workspace teardown; no graph preservation.
         };
 
         Boundary boundary = Boundary::Request;
@@ -1198,6 +1229,35 @@ namespace llaminar2
             request.reset_logical_sequence = true;
             request.preserve_replay_safe_graphs = true;
             request.reason = why ? why : "prefix-restore";
+            return request;
+        }
+
+        /**
+         * @brief Build the post-capture scrub for a retained serving family.
+         *
+         * Native graph capture invokes the production stage methods. Stateful
+         * stages may consequently advance host-side logical metadata while the
+         * corresponding GPU operations are captured rather than launched. This
+         * boundary restores every request-owned data family to its pristine
+         * state while deliberately preserving the executables just retained.
+         * It is not a synthetic request and must run before ticket authority or
+         * the first real request is admitted.
+         *
+         * @param why Stable diagnostic name for the setup transition.
+         * @return Complete reset request for setup-only capture side effects.
+         */
+        static InferenceStateResetRequest servingGraphSetupBoundary(
+            const char *why)
+        {
+            InferenceStateResetRequest request;
+            request.boundary = Boundary::ServingGraphSetup;
+            request.reset_kv = true;
+            request.reset_gdn = true;
+            request.reset_mtp = true;
+            request.reset_model_runtime = true;
+            request.reset_logical_sequence = true;
+            request.preserve_replay_safe_graphs = true;
+            request.reason = why ? why : "serving-graph-setup";
             return request;
         }
 
@@ -1320,6 +1380,25 @@ namespace llaminar2
         }
 
         /**
+         * @brief Execute the captured restored-prefix MTP decode bridge.
+         *
+         * Implementations must run main-model decode arithmetic and advance the
+         * shifted depth-zero MTP state in the same transaction. The default is
+         * a hard capability failure: silently calling ordinary forward() would
+         * leave MTP state one token behind and make a later prefix checkpoint
+         * internally inconsistent.
+         *
+         * @param request Exact token and positive restored-prefix history.
+         * @return true only after the complete bridge transaction is submitted.
+         */
+        virtual bool forwardRestoredPrefixMTPDecodeBridge(
+            const RestoredPrefixMTPDecodeBridgeRequest &request)
+        {
+            (void)request;
+            return false;
+        }
+
+        /**
          * @brief Report the runner-owned serving preparation transition.
          *
          * Distributed orchestration switches on this value before installing
@@ -1339,10 +1418,10 @@ namespace llaminar2
          * This setup-only operation must not execute model arithmetic, mutate
          * request/KV state, publish sparse tickets, or advance a transaction.
          * GPU implementations retain the resulting native executables so the
-         * first admitted request is an ordinary replay. Eager host follower
-         * implementations certify their already-built CPU endpoints and enter
-         * the same sealed ticket-admission state. Composite runners must invoke
-         * every symmetric LocalTP participant concurrently.
+         * first admitted request is an ordinary replay. Eager host graphs are
+         * already complete by construction and must not be passed to this
+         * native materialization operation. Composite native runners must
+         * invoke every symmetric LocalTP participant concurrently.
          *
          * @param plan Frozen orchestration-owned physical graph inventory.
          * @return True only when every required executable is resident.

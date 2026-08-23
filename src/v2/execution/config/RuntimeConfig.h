@@ -420,14 +420,32 @@ namespace llaminar2
         return (std::filesystem::path(home) / ".llaminar" / "kvcache").string();
     }
 
+    /** Default bounded host-memory capacity for reusable prefix state. */
+    inline constexpr size_t kDefaultPrefixCacheRamBudgetBytes =
+        4ull * 1024ull * 1024ull * 1024ull;
+
+    /** Default bounded accelerator-memory capacity for the hottest prefixes. */
+    inline constexpr size_t kDefaultPrefixCacheDeviceBudgetBytes =
+        256ull * 1024ull * 1024ull;
+
+    /**
+     * Default bounded durable capacity for prefixes evicted from RAM.
+     *
+     * Disk storage is sparse and demand-allocated; this value is a retention
+     * ceiling, not startup allocation. Thirty-two GiB retains useful service
+     * history without allowing an unconfigured server to consume a volume.
+     */
+    inline constexpr size_t kDefaultPrefixCacheDiskBudgetBytes =
+        32ull * 1024ull * 1024ull * 1024ull;
+
     struct PrefixCacheRuntimeConfig
     {
-        bool enabled = false;
+        bool enabled = true;
         PrefixCacheStorageMode storage_mode = PrefixCacheStorageMode::Tiered;
         int block_size = 64;
-        size_t ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
-        size_t device_budget_bytes = 256ull * 1024ull * 1024ull;
-        size_t disk_budget_bytes = 0;
+        size_t ram_budget_bytes = kDefaultPrefixCacheRamBudgetBytes;
+        size_t device_budget_bytes = kDefaultPrefixCacheDeviceBudgetBytes;
+        size_t disk_budget_bytes = kDefaultPrefixCacheDiskBudgetBytes;
         std::string disk_dir = defaultPrefixCacheDiskDirectory();
         PrefixCacheTerminalStateMode terminal_state = PrefixCacheTerminalStateMode::Auto;
         PrefixCacheMoEPolicy moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;

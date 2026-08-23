@@ -33,6 +33,7 @@ from python.reference.qwen35_moe import (
 )
 from python.reference.generate_qwen35_moe_pipeline_snapshots import (
     normalize_mtp_branch_override_batches,
+    promote_mtp_sidecar_metadata,
 )
 
 
@@ -98,6 +99,30 @@ def test_moe_snapshot_generator_help_exposes_diagnostic_snapshot_modes():
     assert "--metadata-only" in result.stdout
     assert "--decode-snapshots-only" in result.stdout
     assert "--mtp-max-draft-depth" in result.stdout
+    assert "--mtp-sidecar-only" in result.stdout
+
+
+def test_sidecar_capacity_promotion_preserves_authenticated_metadata(tmp_path):
+    """A bounded sidecar expansion mutates only its independent capacity."""
+
+    metadata = tmp_path / "metadata.txt"
+    original = [
+        "snapshot_version: 4",
+        "reference_engine: pytorch",
+        "model_sha256: " + "a" * 64,
+        "mtp_sidecar_max_draft_depth: 3",
+        "decode_tokens: 1,2,3,4",
+    ]
+    metadata.write_text("\n".join(original) + "\n", encoding="utf-8")
+
+    promote_mtp_sidecar_metadata(metadata, 15)
+
+    assert metadata.read_text(encoding="utf-8").splitlines() == [
+        *original[:3],
+        "mtp_sidecar_max_draft_depth: 15",
+        original[4],
+    ]
+    assert not list(tmp_path.glob(".metadata.txt.*.tmp"))
 
 
 def test_additive_mtp_branch_replays_only_committed_prefix_and_requested_depth():

@@ -2005,7 +2005,20 @@ namespace llaminar2::test
         EXPECT_NE(local_contents.find("MoELocalExpertSerialBufferArena::routeWidthBucketFor("),
                   std::string::npos)
             << "Production sparse packets must select a retained route-width family from their actual local fan-out";
-        EXPECT_NE(local_contents.find("std::fill_n(routing_indices, compact_routing_elements, -1.0f)"),
+        EXPECT_NE(local_contents.find("const size_t materialized_routing_elements"),
+                  std::string::npos);
+        EXPECT_NE(local_contents.find(
+                      "compact_live_rows * static_cast<size_t>(compact_top_k)"),
+                  std::string::npos)
+            << "CPU packets must clear exactly the live route rectangle";
+        EXPECT_NE(local_contents.find(": compact_routing_elements;"),
+                  std::string::npos)
+            << "Retained GPU families must still invalidate the full padded route bucket";
+        EXPECT_NE(local_contents.find(
+                      "std::fill_n(routing_indices, materialized_routing_elements, -1.0f)"),
+                  std::string::npos);
+        EXPECT_NE(local_contents.find(
+                      "std::fill_n(routing_weights, materialized_routing_elements, 0.0f)"),
                   std::string::npos);
         EXPECT_NE(local_contents.find("compute_params.top_k = compact_top_k;"),
                   std::string::npos);
@@ -2247,6 +2260,22 @@ namespace llaminar2::test
         EXPECT_NE(tensor_contents.find("if (is_mmap_data())\n                unpinHostMemory();"), std::string::npos);
         EXPECT_NE(slice_contents.find("void releaseMmapHostRegistration() override"), std::string::npos);
         EXPECT_NE(slice_contents.find("wrapped->releaseMmapHostRegistration();"), std::string::npos);
+        EXPECT_NE(slice_contents.find("void release_host_weight_data() override"), std::string::npos);
+        EXPECT_NE(slice_contents.find("inner()->release_host_weight_data();"), std::string::npos);
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ProductionMoEWeightReleaseCannotBypassRegistrationRetirement)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path service_path =
+            root / "src/v2/execution/moe/MoEExpertWeightService.cpp";
+        ASSERT_TRUE(fs::exists(service_path)) << service_path;
+        const std::string contents = readFile(service_path);
+        ASSERT_FALSE(contents.empty()) << service_path;
+
+        EXPECT_EQ(contents.find("tensor->release_raw_data();"), std::string::npos)
+            << "Production weight reclamation must use the complete host-release lifecycle";
+        EXPECT_NE(contents.find("tensor->release_host_weight_data();"), std::string::npos);
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, MmapDontneedIsDeferredUntilAfterFirstPrefill)
@@ -3641,31 +3670,29 @@ namespace llaminar2::test
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ParityMovementProofRequiresPayloadCopyBytesAndApply)
     {
         const fs::path root = findRepoRoot();
+        const fs::path framework_path =
+            root / "tests/v2/integration/parity/ModelParityDefinition.h";
         const fs::path parity_base_path =
-            root / "tests/v2/integration/parity/qwen36/Qwen36MoEParityTestBase.h";
-        const fs::path overlay_path =
-            root / "tests/v2/integration/parity/qwen36/"
-                   "Test__Qwen36MoE_ExpertOverlay_MathParity.cpp";
-        const fs::path cpu_path =
-            root / "tests/v2/integration/parity/qwen35moe/"
-                   "Test__Qwen35MoE_NodeTP_Parity.cpp";
+            root / "tests/v2/integration/parity/ParityTestBase.h";
+        ASSERT_TRUE(fs::exists(framework_path)) << framework_path;
         ASSERT_TRUE(fs::exists(parity_base_path)) << parity_base_path;
-        ASSERT_TRUE(fs::exists(overlay_path)) << overlay_path;
-        ASSERT_TRUE(fs::exists(cpu_path)) << cpu_path;
 
+        const std::string framework = readFile(framework_path);
         const std::string parity_base = readFile(parity_base_path);
-        const std::string overlay = readFile(overlay_path);
-        const std::string cpu = readFile(cpu_path);
 
-        const size_t movement_start =
-            parity_base.find("inline void expectMoEExpertMovementPositive(");
-        const size_t movement_end =
-            parity_base.find("inline void expectMoEPrefixCachePerfPath(", movement_start);
+        const size_t movement_start = parity_base.find(
+            "void assertProductionParityMoEMovementEvidence(");
+        const size_t movement_end = parity_base.find(
+            "void assertProductionParityMoEOwnerOrderEvidence(",
+            movement_start);
         ASSERT_NE(movement_start, std::string::npos);
         ASSERT_NE(movement_end, std::string::npos);
         const std::string movement =
             parity_base.substr(movement_start, movement_end - movement_start);
         for (const char *counter : {
+                 "committed_expert_migrations",
+                 "cpu_native_copy_bytes",
+                 "remote_projection_payload_bytes_completed",
                  "weight_transfer_outgoing_entries",
                  "weight_transfer_incoming_entries",
                  "mask_apply_received_entries",
@@ -3679,71 +3706,37 @@ namespace llaminar2::test
             EXPECT_NE(movement.find(counter), std::string::npos)
                 << "Physical movement proof must consume " << counter;
         }
-        EXPECT_NE(movement.find("EXPECT_GT(copied_payloads, 0.0)"),
+        EXPECT_NE(movement.find("EXPECT_GT(global[0], 0.0f)"),
                   std::string::npos);
-        EXPECT_NE(movement.find("EXPECT_GT(payload_bytes, 0.0)"),
+        EXPECT_NE(movement.find("EXPECT_GT(global[1], 0.0f)"),
                   std::string::npos);
-        EXPECT_NE(movement.find("EXPECT_GT(applied_payloads, 0.0)"),
+        EXPECT_NE(movement.find("EXPECT_GT(global[2], 0.0f)"),
                   std::string::npos);
-
-        const size_t rebalance_start =
-            parity_base.find("inline void expectMoERebalancePerfPath(");
-        ASSERT_NE(rebalance_start, std::string::npos);
-        const std::string rebalance = parity_base.substr(rebalance_start, 3200);
-        EXPECT_NE(rebalance.find("expectNoMoEExpertMovement(records, context);"),
+        EXPECT_NE(movement.find("EXPECT_GT(global[3], 0.0f)"),
+                  std::string::npos);
+        EXPECT_NE(movement.find("EXPECT_EQ(movement_total, 0.0f)"),
                   std::string::npos)
-            << "StaticOwner parity must reject every request-time movement counter";
-        EXPECT_GE(
-            countOccurrences(
-                rebalance,
-                "expectMoEExpertMovementPositive(records, context);"),
-            2u)
-            << "Both LLEP and Dynamic parity must require physical payload movement";
+            << "Static ExpertOverlay cells must prove that no movement occurred.";
 
         EXPECT_NE(
-            overlay.find(
-                "expectLLEPExpertPayloadMovementPositive(records, context);"),
-            std::string::npos)
-            << "LLEP campaign parity must require mode-specific payload movement";
-        EXPECT_GE(
-            countOccurrences(
-                overlay,
-                "expectMoEExpertMovementPositive(records, context);"),
-            2u)
-            << "LLEP and Dynamic campaign parity must both require copy/byte/apply evidence";
-        EXPECT_NE(
-            overlay.find("config.moe_rebalance.window_size = 1;"),
-            std::string::npos)
-            << "The bounded campaign must trigger Dynamic maintenance in its authenticated short decode";
-        EXPECT_NE(
-            overlay.find(".llep_enable_balanced_skip = false"),
-            std::string::npos)
-            << "The bounded campaign must force a real LLEP decision instead of relying on a long prompt";
-        EXPECT_NE(
-            overlay.find("expectNoMoEExpertMovement("),
-            std::string::npos)
-            << "Static expert-overlay parity must prove zero movement";
-        EXPECT_NE(
-            cpu.find("cpu_llep_weight_transfer_outgoing_bytes"),
+            framework.find("kCanonicalModelParityExpertOverlayPolicies"),
             std::string::npos);
         EXPECT_NE(
-            cpu.find("cpu_llep_weight_transfer_incoming_bytes"),
+            framework.find("ModelParityMovementEvidence::MovementRequired"),
             std::string::npos)
-            << "CPU LLEP parity must prove real packed expert bytes moved";
-        EXPECT_NE(cpu.find("cpu_native_copy_bytes"), std::string::npos)
-            << "CPU parity must consume the local ExpertOverlay transport byte authority";
+            << "Dynamic generated cells must carry an explicit physical movement contract.";
         EXPECT_NE(
-            cpu.find("remote_projection_payload_bytes_completed"),
+            framework.find("ParityMoEMovementExpectation::PhysicalMovement"),
             std::string::npos)
-            << "CPU parity must consume the cross-participant ExpertOverlay transport byte authority";
-        EXPECT_NE(cpu.find("EXPECT_EQ(copied_bytes, 0.0)"), std::string::npos)
-            << "Static CPU parity must reject every local and remote migration byte";
-        EXPECT_NE(cpu.find("EXPECT_GT(copied_bytes, 0.0)"), std::string::npos)
-            << "Dynamic CPU parity must prove a committed migration copied real expert bytes";
+            << "The typed contract must reach the generic production parity runner.";
         EXPECT_NE(
-            cpu.find("EXPECT_GT(committed_migrations, 0.0)"),
+            framework.find("ParityMoEMovementExpectation::NoMovement"),
             std::string::npos)
-            << "Dynamic CPU parity must prove the destination authority committed the move";
+            << "Static generated cells must carry an explicit immobility contract.";
+        EXPECT_EQ(
+            framework.find("MoERebalanceRuntimeMode::LLEP"),
+            std::string::npos)
+            << "The canonical campaign must not advertise unfinished LLEP coverage.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
@@ -3782,9 +3775,8 @@ namespace llaminar2::test
             root / "tests/v2/integration/parity/ParityTestBase.h";
         const fs::path expert_overlay_parity_path =
             root / "tests/v2/integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_MathParity.cpp";
-        const fs::path expert_overlay_prefix_mtp_path =
-            root / "tests/v2/integration/parity/qwen36/"
-                   "Test__Qwen36MoE_ExpertOverlay_PrefixMTP_Parity.cpp";
+        const fs::path model_parity_definition_path =
+            root / "tests/v2/integration/parity/ModelParityDefinition.h";
         const fs::path server_e2e_path =
             root / "tests/v2/e2e/server/test_server_e2e.sh";
         ASSERT_TRUE(fs::exists(runner_path)) << runner_path;
@@ -3807,8 +3799,8 @@ namespace llaminar2::test
         ASSERT_TRUE(fs::exists(qwen36_parity_path)) << qwen36_parity_path;
         ASSERT_TRUE(fs::exists(generic_parity_path)) << generic_parity_path;
         ASSERT_TRUE(fs::exists(expert_overlay_parity_path)) << expert_overlay_parity_path;
-        ASSERT_TRUE(fs::exists(expert_overlay_prefix_mtp_path))
-            << expert_overlay_prefix_mtp_path;
+        ASSERT_TRUE(fs::exists(model_parity_definition_path))
+            << model_parity_definition_path;
         ASSERT_TRUE(fs::exists(server_e2e_path)) << server_e2e_path;
 
         const std::string runner = readFile(runner_path);
@@ -3831,8 +3823,8 @@ namespace llaminar2::test
         const std::string qwen36_parity = readFile(qwen36_parity_path);
         const std::string generic_parity = readFile(generic_parity_path);
         const std::string expert_overlay_parity = readFile(expert_overlay_parity_path);
-        const std::string expert_overlay_prefix_mtp =
-            readFile(expert_overlay_prefix_mtp_path);
+        const std::string model_parity_definition =
+            readFile(model_parity_definition_path);
         const std::string server_e2e = readFile(server_e2e_path);
         ASSERT_FALSE(runner.empty()) << runner_path;
         ASSERT_FALSE(dgo.empty()) << dgo_path;
@@ -3870,8 +3862,8 @@ namespace llaminar2::test
         ASSERT_FALSE(qwen36_parity.empty()) << qwen36_parity_path;
         ASSERT_FALSE(generic_parity.empty()) << generic_parity_path;
         ASSERT_FALSE(expert_overlay_parity.empty()) << expert_overlay_parity_path;
-        ASSERT_FALSE(expert_overlay_prefix_mtp.empty())
-            << expert_overlay_prefix_mtp_path;
+        ASSERT_FALSE(model_parity_definition.empty())
+            << model_parity_definition_path;
         ASSERT_FALSE(server_e2e.empty()) << server_e2e_path;
 
         EXPECT_NE(iface.find("drainCompletedDecodeBoundaryMaintenanceDiagnostics()"),
@@ -4225,80 +4217,60 @@ namespace llaminar2::test
             generic_due_body.find("request_every_decode_steps"),
             std::string::npos)
             << "Parity maintenance cadence must remain an explicit bounded campaign policy.";
-        const size_t long_context_config_start =
-            expert_overlay_parity.find(
-                "ExpertOverlayParityConfig baseConfig(");
-        ASSERT_NE(long_context_config_start, std::string::npos);
-        const size_t long_context_config_end =
-            expert_overlay_parity.find(
-                "std::vector<ExpertOverlayParityConfig> makeExpertOverlayConfigs()",
-                long_context_config_start);
-        ASSERT_NE(long_context_config_end, std::string::npos);
-        const std::string long_context_config_body =
-            expert_overlay_parity.substr(
-                long_context_config_start,
-                long_context_config_end - long_context_config_start);
+        const size_t overlay_policy_start =
+            model_parity_definition.find(
+                "struct ModelParityExpertOverlayPolicy");
+        ASSERT_NE(overlay_policy_start, std::string::npos);
         EXPECT_NE(
-            long_context_config_body.find(
-                "ExpertOverlayPolicyScenario::DynamicResidencyMaintenance"),
+            model_parity_definition.find(
+                "ModelParityExpertMovement::Dynamic"),
             std::string::npos)
-            << "Only explicit Dynamic residency maintenance should enable "
-               "committed-boundary maintenance coverage.";
+            << "The typed ExpertOverlay policy must explicitly select durable Dynamic movement.";
         EXPECT_EQ(
-            expert_overlay_parity.find("MoERebalanceRuntimeMode::LLEP"),
+            model_parity_definition.find("MoERebalanceRuntimeMode::LLEP"),
             std::string::npos)
-            << "Current-batch LLEP must never reappear as a residency-maintenance mode.";
+            << "Unfinished LLEP must not reappear in the canonical typed matrix.";
         EXPECT_EQ(
-            expert_overlay_parity.find(
+            model_parity_definition.find(
                 "ExpertOverlayPolicyScenario::DynamicOwnership"),
             std::string::npos)
             << "Parity policy names must identify durable residency maintenance, "
                "not the historical composite DynamicOwnership mode.";
         EXPECT_NE(
-            long_context_config_body.find(
-                ".enabled = true,"),
+            model_parity_definition.find(
+                ".request_every_decode_steps = 1"),
             std::string::npos);
-        const size_t long_context_perf_start =
-            expert_overlay_parity.find(
-                "void expectMovementPositiveExpertOverlayPerfPath(");
-        ASSERT_NE(long_context_perf_start, std::string::npos);
-        const size_t long_context_perf_end =
-            expert_overlay_parity.find(
-                "void expectRoutedExpertOwnerSelectionPerfPath(",
-                long_context_perf_start);
-        ASSERT_NE(long_context_perf_end, std::string::npos);
-        const std::string long_context_perf_body =
-            expert_overlay_parity.substr(
-                long_context_perf_start,
-                long_context_perf_end - long_context_perf_start);
+        const size_t movement_evidence_start =
+            generic_parity.find(
+                "void assertProductionParityMoEMovementEvidence(");
+        ASSERT_NE(movement_evidence_start, std::string::npos);
+        const size_t movement_evidence_end =
+            generic_parity.find(
+                "void assertProductionParityMoEOwnerOrderEvidence(",
+                movement_evidence_start);
+        ASSERT_NE(movement_evidence_end, std::string::npos);
+        const std::string movement_evidence_body =
+            generic_parity.substr(
+                movement_evidence_start,
+                movement_evidence_end - movement_evidence_start);
         for (const char *cumulative_counter : {
-                 "device_rebalance_controller_decode_apply_hits",
+                 "committed_expert_migrations",
                  "device_rebalance_wave_copied_arrivals_total",
                  "device_rebalance_wave_applied_arrivals_total",
-                 "device_rebalance_wave_applied_layer_count_total"})
+                 "device_rebalance_request_useful_payload_bytes_lower_bound"})
         {
             EXPECT_NE(
-                long_context_perf_body.find(cumulative_counter),
+                movement_evidence_body.find(cumulative_counter),
                 std::string::npos)
-                << "Long-context movement certification must use cumulative "
+                << "Canonical movement certification must consume cumulative "
                    "request evidence for "
                 << cumulative_counter;
         }
         EXPECT_EQ(
-            long_context_perf_body.find(
-                "expectPerfCounterPositive(\n"
-                "                records,\n"
-                "                \"moe_rebalance\",\n"
-                "                \"device_rebalance_changed_layers\""),
+            movement_evidence_body.find("device_rebalance_changed_layers"),
             std::string::npos)
             << "Per-wave planner status is not a stable request-level movement "
                "certificate; a final economical no-op may follow an applied wave.";
-        EXPECT_NE(
-            qwen36_parity.find(
-                "inline std::string qwen36MoELongNeedleParityPrompt()"),
-            std::string::npos)
-            << "Long-context MoE suites must share one deterministic, "
-               "self-regenerating ledger prompt.";
         EXPECT_EQ(
             expert_overlay_parity.find(
                 "std::string qwen36MoELongNeedleParityPrompt()"),
@@ -4306,76 +4278,31 @@ namespace llaminar2::test
             << "The math parity file must not retain a private copy of the "
                "shared long-ledger builder.";
         EXPECT_NE(
-            qwen36_parity.find(
-                "test_case.minimum_prompt_tokens"),
+            model_parity_definition.find(
+                "Prefix restore is deliberately not a matrix axis"),
             std::string::npos)
-            << "Metadata authentication must include workload geometry, not "
-               "only prompt string identity.";
+            << "Prefix restore must be a mandatory lifecycle inside every generated cell.";
         EXPECT_NE(
-            expert_overlay_prefix_mtp.find(
-                "test_case.prompt = qwen36MoELongNeedleParityPrompt();"),
+            generic_parity.find(
+                "assertProductionParityPartialPrefixRestore()"),
             std::string::npos)
-            << "Phase-split prefix/MTP fixtures must carry the complete ledger "
-               "when metadata regeneration is required.";
-        EXPECT_EQ(
-            expert_overlay_prefix_mtp.find(
-                "test_case.prompt = \"Task: read the ledger"),
-            std::string::npos)
-            << "A header-only long-context fixture can silently regenerate a "
-               "short prompt and invalidate partial-prefix coverage.";
-        EXPECT_NE(
-            expert_overlay_prefix_mtp.find(
-                "test_case.minimum_prompt_tokens = 640;"),
-            std::string::npos);
-        EXPECT_NE(
-            expert_overlay_prefix_mtp.find(
-                "MoEReferenceInputSource::ModelTokenizer"),
-            std::string::npos)
-            << "State-lifetime prefix/MTP tests should use production GGUF "
-               "tokenization instead of regenerating unused PyTorch decode evidence.";
-        EXPECT_NE(
-            qwen36_parity.find(
-                "ModelPayloadAccessPattern::DeviceStaging"),
-            std::string::npos)
-            << "Metadata-only GGUF tokenization must remain demand-paged for "
-               "large GPU fixtures.";
-        EXPECT_NE(
-            qwen36_parity.find(
-                "expected_tokens->clear();"),
-            std::string::npos)
-            << "Model-tokenizer fixtures must not fabricate PyTorch oracle tokens.";
+            << "The generic production campaign must execute the partial restore proof.";
         EXPECT_EQ(
             expert_overlay_parity.find("getOrCreateOverlayModelContext"),
             std::string::npos)
             << "ExpertOverlay parity must not retain a test-owned model-loader cache.";
-        const size_t overlay_runner_start =
+        EXPECT_NE(
             expert_overlay_parity.find(
-                "bool setupProductionOverlayRunner()");
-        ASSERT_NE(overlay_runner_start, std::string::npos);
-        const size_t overlay_runner_end =
+                "expandModelParityDefinition(definition)"),
+            std::string::npos)
+            << "ExpertOverlay parity must use the canonical typed expansion.";
+        EXPECT_NE(
             expert_overlay_parity.find(
-                "bool decodeWorkAvailable()",
-                overlay_runner_start);
-        ASSERT_NE(overlay_runner_end, std::string::npos);
-        const std::string overlay_runner_body =
-            expert_overlay_parity.substr(
-                overlay_runner_start,
-                overlay_runner_end - overlay_runner_start);
-        EXPECT_NE(
-            overlay_runner_body.find(
-                "createOrchestrationRunnerFactory()"),
+                "runProductionParityCampaign();"),
             std::string::npos)
-            << "ExpertOverlay parity must enter the production orchestration factory.";
-        EXPECT_NE(
-            overlay_runner_body.find(
-                "createFromOrchestrationConfig("),
-            std::string::npos)
-            << "The production runner must resolve model loading and active MPI topology.";
-        EXPECT_NE(
-            overlay_runner_body.find("model_ctx_.reset();"),
-            std::string::npos);
+            << "Every typed ExpertOverlay cell must enter the shared production runner surface.";
         EXPECT_EQ(
-            overlay_runner_body.find("ModelContext::create("),
+            expert_overlay_parity.find("ModelContext::create("),
             std::string::npos)
             << "The parity fixture must not bypass production model loading.";
         const size_t generic_assert_helper =
@@ -4428,7 +4355,7 @@ namespace llaminar2::test
             "DecodeParitySummary runTPDecodeParity()",
             "void assertTPParity(");
         expect_final_movement_publication(
-            "DecodeParitySummary runDecodeParity()",
+            "DecodeParitySummary runDecodeParity(",
             "void renderDecodeParityTable(");
         EXPECT_NE(dgo.find("DeviceGraphOrchestrator::maybeApplyDecodeBoundaryMaintenance("),
                   std::string::npos)
@@ -8795,7 +8722,7 @@ namespace llaminar2::test
             << "The router must accept an explicit graph-local producer/consumer owner.";
 
         constexpr std::array<const char *, 6> kStageLocalMoEKernelOwners = {
-            "class MoEExpertComputeStage",
+            "class MoEExpertComputeStage : public IComputeStage",
             "class SharedExpertFFNStage",
             "class SharedExpertGateStage",
             "class MoECanonicalRouteReduceStage",

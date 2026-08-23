@@ -1922,16 +1922,221 @@ namespace llaminar2
             config_.model_metadata,
             options);
 
-        auto full_candidate = buildSnapshot(
+        auto tier_target_candidate = buildSnapshot(
             previous->epoch + 1,
             std::move(planned.planned_plan),
             config_.model_metadata,
             &previous->owner_map);
+
+        const auto build_transaction =
+            [&](std::shared_ptr<const MoEOverlayResidencySnapshot> candidate)
+        {
+            MoEOverlayResidencyTransaction result;
+            result.expected_epoch = previous->epoch;
+            result.histogram_generation = transaction.histogram_generation;
+            result.histogram_window = transaction.histogram_window;
+            result.previous = previous;
+            result.candidate = std::move(candidate);
+            result.migrations = buildMigrations(
+                *previous,
+                *result.candidate,
+                result.histogram_window.get(),
+                planned.memory.routed_expert_bytes_per_expert);
+            result.migration_cycles = buildMigrationCycles(
+                result.migrations);
+            result.shadow_requirements = buildShadowRequirements(
+                result.migrations);
+            if (!result.valid())
+            {
+                throw std::logic_error(
+                    "ExpertOverlay planner produced an invalid residency transaction");
+            }
+            return result;
+        };
+
+        const auto tier_target_transaction =
+            build_transaction(tier_target_candidate);
+
+        /*
+         * Participant makespan is a property of the epoch this bounded wave
+         * can actually publish, not of the tier optimizer's eventual target.
+         * Reserve one cycle for participant placement and materialize the
+         * strongest publishable tier subset first. The participant planner
+         * then observes precisely the owners and demand that will remain after
+         * those tier cycles, so neither axis prices a hypothetical state.
+         */
+        std::shared_ptr<const MoEOverlayResidencySnapshot>
+            participant_base_candidate = tier_target_candidate;
+        std::size_t participant_base_tier_cycles =
+            tier_target_transaction.migration_cycles.size();
+        if (!tier_target_transaction.empty() &&
+            config_.max_concurrent_cycles > 1u)
+        {
+            std::vector<std::size_t> tier_cycle_order(
+                tier_target_transaction.migration_cycles.size());
+            std::iota(
+                tier_cycle_order.begin(),
+                tier_cycle_order.end(),
+                0u);
+            const auto priority_service_score =
+                [&](const std::size_t cycle_index)
+            {
+                long double score = 0.0L;
+                const auto &cycle =
+                    tier_target_transaction.migration_cycles.at(
+                        cycle_index);
+                for (const std::size_t migration_index :
+                     cycle.migration_indices)
+                {
+                    const auto &migration =
+                        tier_target_transaction.migrations.at(
+                            migration_index);
+                    const int source_priority = tierPriority(
+                        *previous->placement_plan,
+                        migration.source.tier_idx);
+                    const int destination_priority = tierPriority(
+                        *tier_target_candidate->placement_plan,
+                        migration.destination.tier_idx);
+                    score +=
+                        static_cast<long double>(
+                            migration.activation_count) *
+                        static_cast<long double>(
+                            source_priority - destination_priority);
+                }
+                return score;
+            };
+            std::stable_sort(
+                tier_cycle_order.begin(),
+                tier_cycle_order.end(),
+                [&](const std::size_t lhs, const std::size_t rhs)
+                {
+                    return priority_service_score(lhs) >
+                           priority_service_score(rhs);
+                });
+
+            const std::size_t tier_cycle_budget =
+                static_cast<std::size_t>(
+                    config_.max_concurrent_cycles - 1u);
+            std::vector<std::size_t> selected_tier_cycles;
+            selected_tier_cycles.reserve(tier_cycle_budget);
+            const auto build_tier_subset =
+                [&](const std::vector<std::size_t> &cycle_indices)
+            {
+                MoERoutedExpertPlacementPlan subset_plan =
+                    *tier_target_candidate->placement_plan;
+                subset_plan.placements =
+                    previous->placement_plan->placements;
+                MoELayeredExpertOwnership subset_ownership =
+                    previous->layered_ownership;
+                for (const std::size_t cycle_index : cycle_indices)
+                {
+                    const auto &cycle =
+                        tier_target_transaction.migration_cycles.at(
+                            cycle_index);
+                    for (const std::size_t migration_index :
+                         cycle.migration_indices)
+                    {
+                        const auto &migration =
+                            tier_target_transaction.migrations.at(
+                                migration_index);
+                        const auto placement = std::find_if(
+                            subset_plan.placements.begin(),
+                            subset_plan.placements.end(),
+                            [&](const auto &entry)
+                            { return entry.layer == migration.layer_idx; });
+                        if (placement == subset_plan.placements.end() ||
+                            migration.expert_id < 0 ||
+                            migration.expert_id >=
+                                static_cast<int>(
+                                    placement->routed_expert_tier.size()))
+                        {
+                            throw std::logic_error(
+                                "ExpertOverlay bounded tier subset references missing placement geometry");
+                        }
+                        placement->routed_expert_tier[
+                            static_cast<std::size_t>(
+                                migration.expert_id)] =
+                            migration.destination.tier_idx;
+                        subset_ownership.assignOwner(
+                            migration.layer_idx,
+                            migration.expert_id,
+                            migration.destination.owner_participant);
+                    }
+                }
+                return buildSnapshot(
+                    previous->epoch + 1,
+                    std::move(subset_plan),
+                    config_.model_metadata,
+                    &previous->owner_map,
+                    &subset_ownership);
+            };
+
+            participant_base_candidate =
+                build_tier_subset(selected_tier_cycles);
+            for (const std::size_t cycle_index : tier_cycle_order)
+            {
+                if (selected_tier_cycles.size() >= tier_cycle_budget)
+                    break;
+                auto trial_cycles = selected_tier_cycles;
+                trial_cycles.push_back(cycle_index);
+                auto trial_candidate = build_tier_subset(trial_cycles);
+                const auto trial_transaction =
+                    build_transaction(trial_candidate);
+                const bool shadow_safe = std::all_of(
+                    trial_transaction.shadow_requirements.begin(),
+                    trial_transaction.shadow_requirements.end(),
+                    [&](const auto &requirement)
+                    {
+                        return config_
+                                       .shadow_slots_per_endpoint_layer ==
+                                   0u ||
+                               requirement.slot_count <=
+                                   config_
+                                       .shadow_slots_per_endpoint_layer;
+                    });
+                if (!shadow_safe)
+                    continue;
+                selected_tier_cycles = std::move(trial_cycles);
+                participant_base_candidate =
+                    std::move(trial_candidate);
+            }
+            participant_base_tier_cycles =
+                selected_tier_cycles.size();
+        }
+
+        MoEOverlayParticipantRebalancePolicy participant_policy =
+            config_.participant_rebalance_policy;
+        if (participant_policy.enabled &&
+            !tier_target_transaction.empty() &&
+            config_.max_concurrent_cycles != 0u)
+        {
+            if (config_.max_concurrent_cycles == 1u)
+            {
+                /*
+                 * One closed-cycle slot cannot advance two independent axes.
+                 * Tier residency is logically prior because it determines the
+                 * service domain against which participant makespan is priced;
+                 * the next epoch can then use its sole slot for participant
+                 * placement if skew remains.
+                 */
+                participant_policy.enabled = false;
+            }
+            else
+            {
+                constexpr std::uint64_t participant_entry_limit = 2u;
+                participant_policy.maximum_plan_entries_per_wave =
+                    static_cast<std::uint32_t>(
+                        std::min<std::uint64_t>(
+                            participant_policy
+                                .maximum_plan_entries_per_wave,
+                            participant_entry_limit));
+            }
+        }
         const auto participant_plan = planOverlayParticipantRebalance(
-            *full_candidate->placement_plan,
-            full_candidate->owner_map,
+            *participant_base_candidate->placement_plan,
+            participant_base_candidate->owner_map,
             *planning_window,
-            config_.participant_rebalance_policy);
+            participant_policy);
         participant_rebalance_checks_.fetch_add(
             participant_plan.evidence.size(),
             std::memory_order_relaxed);
@@ -1942,12 +2147,6 @@ namespace llaminar2
             participant_rebalance_owner_changes_.fetch_add(
                 participant_plan.ownerChanges(),
                 std::memory_order_relaxed);
-            full_candidate = buildSnapshot(
-                previous->epoch + 1,
-                *full_candidate->placement_plan,
-                config_.model_metadata,
-                &previous->owner_map,
-                &participant_plan.ownership);
         }
         for (const auto &evidence : participant_plan.evidence)
         {
@@ -1994,33 +2193,49 @@ namespace llaminar2
                 {{"histogram_generation",
                   std::to_string(transaction.histogram_generation)}});
         }
-        requireCapacityPreserving(*previous, *full_candidate);
-
-        const auto build_transaction =
-            [&](std::shared_ptr<const MoEOverlayResidencySnapshot> candidate)
+        std::shared_ptr<const MoEOverlayResidencySnapshot> full_candidate =
+            tier_target_candidate;
+        if (participant_plan.ownerChanges() != 0u)
         {
-            MoEOverlayResidencyTransaction result;
-            result.expected_epoch = previous->epoch;
-            result.histogram_generation = transaction.histogram_generation;
-            result.histogram_window = transaction.histogram_window;
-            result.previous = previous;
-            result.candidate = std::move(candidate);
-            result.migrations = buildMigrations(
-                *previous,
-                *result.candidate,
-                result.histogram_window.get(),
-                planned.memory.routed_expert_bytes_per_expert);
-            result.migration_cycles = buildMigrationCycles(
-                result.migrations);
-            result.shadow_requirements = buildShadowRequirements(
-                result.migrations);
-            if (!result.valid())
+            const auto participant_changes =
+                participant_plan.ownership.changesFrom(
+                    participant_base_candidate->layered_ownership);
+
+            /*
+             * The base already contains the exact tier subset reserved for
+             * this wave. Overlay the paired participant changes onto that one
+             * immutable state; `buildMigrations()` may fold a newly arrived
+             * expert's tier and participant destinations into one longer
+             * closed cycle without ever representing an intermediate epoch.
+             */
+            MoELayeredExpertOwnership combined_ownership =
+                participant_base_candidate->layered_ownership;
+            for (const auto &change : participant_changes)
             {
-                throw std::logic_error(
-                    "ExpertOverlay planner produced an invalid residency transaction");
+                combined_ownership.assignOwner(
+                    change.layer_idx,
+                    change.expert_id,
+                    change.current_participant);
             }
-            return result;
-        };
+
+            full_candidate = buildSnapshot(
+                previous->epoch + 1,
+                *participant_base_candidate->placement_plan,
+                config_.model_metadata,
+                &previous->owner_map,
+                &combined_ownership);
+            PerfStatsCollector::addCounter(
+                "moe_overlay_residency",
+                "tier_cycles_reserved_before_live_participant_axis",
+                static_cast<double>(participant_base_tier_cycles),
+                "maintenance",
+                config_.perf_device,
+                {{"histogram_generation",
+                  std::to_string(transaction.histogram_generation)},
+                 {"participant_owner_changes",
+                  std::to_string(participant_changes.size())}});
+        }
+        requireCapacityPreserving(*previous, *full_candidate);
 
         auto full_transaction = build_transaction(full_candidate);
         const auto fits_wave_budget = [&](

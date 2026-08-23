@@ -1,12 +1,14 @@
 /**
  * @file DiskPrefixStorageBackend.h
- * @brief Durable, model-addressed prefix-cache archive.
+ * @brief Durable, loaded-model-artifact-addressed prefix-cache archive.
  *
- * A disk cache is one append-only `<model-sha256>.kvcache` file. Each put or
- * delete operation is an independently checksummed record. Complete records
- * survive process restart; an interrupted tail is ignored and removed before
- * the next append. The archive owns capacity eviction and compaction so the
- * configured disk budget remains a real bounded tier.
+ * A disk cache is one append-only `<model-artifact-identity>.kvcache` file.
+ * The identity covers the stable filesystem identity of every GGUF shard in
+ * the already-loaded model context, without rereading model payload bytes.
+ * Each put or delete operation is an independently checksummed record.
+ * Complete records survive process restart; an interrupted tail is ignored
+ * and removed before the next append. The archive owns capacity eviction and
+ * compaction so the configured disk budget remains a real bounded tier.
  */
 
 #pragma once
@@ -43,7 +45,7 @@ namespace llaminar2
         DiskPrefixStorageBackend(
             std::filesystem::path archive_path,
             size_t budget_bytes,
-            std::string model_sha256);
+            std::string model_artifact_identity);
 
         /**
          * @brief Return a process-shared backend for an archive pathname.
@@ -51,7 +53,7 @@ namespace llaminar2
         static std::shared_ptr<DiskPrefixStorageBackend> openShared(
             const std::filesystem::path &archive_path,
             size_t budget_bytes,
-            const std::string &model_sha256,
+            const std::string &model_artifact_identity,
             std::string *error = nullptr);
 
         bool canStore(size_t bytes) const override;
@@ -154,7 +156,7 @@ namespace llaminar2
         std::filesystem::path archive_path_;
         std::filesystem::path lock_path_;
         size_t budget_bytes_ = 0;
-        std::string model_sha256_;
+        std::string model_artifact_identity_;
 
         mutable std::mutex mutex_;
         bool ready_ = false;

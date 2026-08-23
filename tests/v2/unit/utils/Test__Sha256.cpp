@@ -155,4 +155,43 @@ namespace llaminar2::test
                   std::string::npos)
             << error;
     }
+
+    TEST(Test__Sha256, FileSetIdentityCoversEveryShardWithoutReadingPayload)
+    {
+        ScopedTestDirectory directory;
+        const auto first = directory.path() / "model-00001.gguf";
+        const auto second = directory.path() / "model-00002.gguf";
+        writeBytes(first, "first-shard");
+        writeBytes(second, "second-shard");
+
+        std::string error;
+        const auto initial =
+            sha256FileSetIdentityHex({first, second}, &error);
+        ASSERT_TRUE(initial.has_value()) << error;
+        EXPECT_EQ(
+            sha256FileSetIdentityHex({first, second}, &error),
+            initial)
+            << error;
+        EXPECT_NE(
+            sha256FileSetIdentityHex({second, first}, &error),
+            initial)
+            << "Split-file order is part of the loaded artifact identity";
+
+        // A sparse payload this large would make a hidden content scan violate
+        // the fast unit gate; filesystem-identity capture performs only stat.
+        const auto sparse = directory.path() / "model-00003.gguf";
+        writeBytes(sparse, {});
+        std::filesystem::resize_file(sparse, 64ull * 1024ull * 1024ull * 1024ull);
+        const auto with_sparse =
+            sha256FileSetIdentityHex({first, second, sparse}, &error);
+        ASSERT_TRUE(with_sparse.has_value()) << error;
+        EXPECT_NE(with_sparse, initial);
+
+        writeBytes(second, "changed-shard");
+        const auto changed =
+            sha256FileSetIdentityHex({first, second}, &error);
+        ASSERT_TRUE(changed.has_value()) << error;
+        EXPECT_NE(changed, initial)
+            << "Mutating any GGUF shard must select a new archive namespace";
+    }
 } // namespace llaminar2::test

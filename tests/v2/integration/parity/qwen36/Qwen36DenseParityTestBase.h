@@ -12,6 +12,7 @@
 #pragma once
 
 #include "../ParityTestBase.h"
+#include "Qwen36MTPCheckpointSurface.h"
 
 #include <cnpy.h>
 #include <gtest/gtest.h>
@@ -4119,30 +4120,9 @@ namespace llaminar2::test::parity::qwen36
     inline const std::vector<std::string_view> &
     qwen36DenseMTPSidecarStageSuffixes()
     {
-        static const std::vector<std::string_view> suffixes = {
-            "EMBEDDING",
-            "NORM_HIDDEN",
-            "NORM_EMBEDDING",
-            "CONCAT",
-            "FC",
-            "ATTENTION_NORM",
-            "Q_PROJECTION",
-            "FA_GATE",
-            "K_PROJECTION",
-            "V_PROJECTION",
-            "Q_NORM",
-            "K_NORM",
-            "ATTENTION_CONTEXT",
-            "ATTENTION_CONTEXT_GATED",
-            "ATTENTION_OUTPUT",
-            "FFN_NORM",
-            "FFN_GATE",
-            "FFN_UP",
-            "FFN_DOWN",
-            "FFN_RESIDUAL",
-            "FINAL_NORM",
-            "LM_HEAD",
-        };
+        static const std::vector<std::string_view> suffixes(
+            kQwen36DenseMTPModelStageSuffixes.begin(),
+            kQwen36DenseMTPModelStageSuffixes.end());
         return suffixes;
     }
 

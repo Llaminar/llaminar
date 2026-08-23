@@ -21,6 +21,7 @@
 #include <mpi.h>
 #include <unistd.h>
 
+#include "../ModelParityDefinition.h"
 #include "Qwen35MoEParityTestBase.h"
 #include "backends/ComputeBackend.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -61,6 +62,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -117,6 +119,22 @@ namespace
         CudaRocm,
         Cuda2Rocm4,
     };
+
+    /**
+     * @brief Active generated case while one parameterized fixture is alive.
+     *
+     * Legacy focused cells in the companion binary leave this null.  The 122B
+     * canonical matrix binds it before any CRTP configuration lookup, so every
+     * runtime decision reads typed policy rather than recovering intent from a
+     * GoogleTest name.
+     */
+    const ModelParityCase *g_active_model_parity_case = nullptr;
+
+    /** @return The active typed canonical case, or null for legacy focused cells. */
+    const ModelParityCase *activeModelParityCase() noexcept
+    {
+        return g_active_model_parity_case;
+    }
 
     /**
      * @brief Movement axes that the resolved participant catalogue can express.
@@ -181,6 +199,8 @@ namespace
     // tokens. A four-row fixed bucket therefore executes the real production
     // schedule [4, 4, 1] and exercises both replay and padded final segments.
     constexpr int kSegmentedPrefillCaptureRows = 4;
+    /** Cache-key namespace reserved for post-movement A/B timing requests. */
+    constexpr int kConvergedTimingPromptOffset = 100'000;
 
     // Approximate Qwen3.5-35B-A3B metadata for topology-only, model-free planning.
     constexpr int kQwen35MoENumExperts = 256;
@@ -216,6 +236,8 @@ namespace
     /** @return Exact GTest name, or an empty string outside a running cell. */
     std::string activeTestName()
     {
+        if (const auto *test_case = activeModelParityCase())
+            return test_case->testName();
         const auto *info =
             ::testing::UnitTest::GetInstance()->current_test_info();
         return info ? std::string(info->name()) : std::string{};
@@ -224,6 +246,8 @@ namespace
     /** @return Whether this is the production 122B six-GPU campaign. */
     bool isQwen122ProductionTest()
     {
+        if (activeModelParityCase())
+            return true;
         return activeTestName().find("Qwen35_122B_CUDA2_ROCm4") !=
                std::string::npos;
     }
@@ -231,12 +255,16 @@ namespace
     /** @return Model root selected by the active real-weight cell. */
     const char *activeModelPath()
     {
+        if (const auto *test_case = activeModelParityCase())
+            return test_case->model.model_path.c_str();
         return isQwen122ProductionTest() ? kQwen122ModelPath : kModelPath;
     }
 
     /** @return Authenticated reference directory selected by the active cell. */
     const char *activeSnapshotDir()
     {
+        if (const auto *test_case = activeModelParityCase())
+            return test_case->model.reference_directory.c_str();
         return isQwen122ProductionTest() ? kQwen122SnapshotDir : kSnapshotDir;
     }
 
@@ -268,12 +296,20 @@ namespace
     /** @return Whether this case uses current-batch least-loaded assignment. */
     bool isLLEPProductionTest()
     {
+        if (activeModelParityCase())
+            return false;
         return activeTestName().find("_LLEP_") != std::string::npos;
     }
 
     /** @brief Return whether the exact cell exercises persistent tier movement. */
     bool isDynamicResidencyProductionTest()
     {
+        if (const auto *test_case = activeModelParityCase())
+        {
+            return test_case->expert_overlay &&
+                   test_case->expert_overlay->movement ==
+                       ModelParityExpertMovement::Dynamic;
+        }
         const std::string name = activeTestName();
         return name == kDynamicCudaRocmTest ||
                name == kDynamicCudaCpuTest ||
@@ -287,6 +323,12 @@ namespace
     /** @brief Return whether initial expert ownership uses seeded random order. */
     bool isRandomOwnerProductionTest()
     {
+        if (const auto *test_case = activeModelParityCase())
+        {
+            return test_case->expert_overlay &&
+                   test_case->expert_overlay->owner_order ==
+                       RoutedExpertOwnerOrder::Random;
+        }
         const std::string name = activeTestName();
         return name == kDynamicCudaRocmTest ||
                name == kDynamicCudaCpuTest ||
@@ -299,6 +341,8 @@ namespace
     /** @return Fixed MTP depth, or the adaptive policy's maximum depth. */
     int activeMTPDraftDepth()
     {
+        if (const auto *test_case = activeModelParityCase())
+            return test_case->requestedMTPDraftDepth();
         const std::string name = activeTestName();
         // Test the longest spelling first: `MTPDepth15` contains `MTPDepth1`.
         if (name.find("MTPDepth15") != std::string::npos)
@@ -323,6 +367,11 @@ namespace
      */
     int activeMTPGraphCapacityVerifierRows()
     {
+        if (const auto *test_case = activeModelParityCase();
+            test_case && !test_case->mtpEnabled())
+        {
+            return 1;
+        }
         return isQwen122ProductionTest()
                    ? kQwen122MaximumMTPDraftDepth + 1
                    : activeMTPDraftDepth() + 1;
@@ -338,8 +387,12 @@ namespace
     int activeMTPPhysicalVerifierRows()
     {
         const int capacity_rows = activeMTPGraphCapacityVerifierRows();
-        const bool dynamic_depth =
-            activeTestName().find("MTPDynamicDepth") != std::string::npos;
+        const bool dynamic_depth = activeModelParityCase()
+                                       ? activeModelParityCase()
+                                             ->usesDynamicMTPDepth()
+                                       : activeTestName().find(
+                                             "MTPDynamicDepth") !=
+                                             std::string::npos;
         return dynamic_depth
                    ? capacity_rows
                    : mtpVerifierPhysicalRowBucket(
@@ -350,8 +403,18 @@ namespace
     /** @return Whether the production device depth controller is adaptive. */
     bool usesDynamicMTPDepth()
     {
+        if (const auto *test_case = activeModelParityCase())
+            return test_case->usesDynamicMTPDepth();
         return activeTestName().find("MTPDynamicDepth") !=
                std::string::npos;
+    }
+
+    /** @return Whether the active canonical or legacy cell enables MTP. */
+    bool activeMTPEnabled()
+    {
+        if (const auto *test_case = activeModelParityCase())
+            return test_case->mtpEnabled();
+        return isQwen122ProductionTest();
     }
 
     /**
@@ -363,6 +426,8 @@ namespace
      */
     OverlayTopology activeTopology()
     {
+        if (activeModelParityCase())
+            return OverlayTopology::Cuda2Rocm4;
         const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
         if (!info)
             return OverlayTopology::CudaRocmCpu;
@@ -432,15 +497,17 @@ namespace
         throw std::logic_error("Unhandled Qwen3.5 MoE overlay topology");
     }
 
-    RoutedExpertDomain cudaHotDomain()
+    RoutedExpertDomain cudaHotDomain(
+        bool qwen122,
+        bool use_llep)
     {
         RoutedExpertDomain domain;
         domain.name = kCudaHotDomain;
-        domain.scope = isQwen122ProductionTest()
+        domain.scope = qwen122
                            ? ExecutionDomainScope::RANK_LOCAL
                            : ExecutionDomainScope::SINGLE;
         domain.backend = CollectiveBackendType::NCCL;
-        domain.participants = isQwen122ProductionTest()
+        domain.participants = qwen122
                                   ? std::vector<GlobalDeviceAddress>{
                                         GlobalDeviceAddress::cuda(0),
                                         GlobalDeviceAddress::cuda(1)}
@@ -452,21 +519,30 @@ namespace
         domain.routed_decode_assignment_policy =
             RoutedExpertAssignmentPolicy::StaticOwner;
         domain.routed_prefill_assignment_policy =
-            isLLEPProductionTest()
+            use_llep
                 ? RoutedExpertAssignmentPolicy::LeastLoadedResident
                 : RoutedExpertAssignmentPolicy::StaticOwner;
         return domain;
     }
 
-    RoutedExpertDomain rocmWarmDomain()
+    /** @return CUDA domain selected by the active legacy or typed cell. */
+    RoutedExpertDomain cudaHotDomain()
+    {
+        return cudaHotDomain(
+            isQwen122ProductionTest(), isLLEPProductionTest());
+    }
+
+    RoutedExpertDomain rocmWarmDomain(
+        bool qwen122,
+        bool use_llep)
     {
         RoutedExpertDomain domain;
         domain.name = kRocmWarmDomain;
-        domain.scope = isQwen122ProductionTest()
+        domain.scope = qwen122
                            ? ExecutionDomainScope::RANK_LOCAL
                            : ExecutionDomainScope::SINGLE;
         domain.backend = CollectiveBackendType::RCCL;
-        domain.participants = isQwen122ProductionTest()
+        domain.participants = qwen122
                                   ? std::vector<GlobalDeviceAddress>{
                                         GlobalDeviceAddress::rocm(0),
                                         GlobalDeviceAddress::rocm(1),
@@ -480,10 +556,17 @@ namespace
         domain.routed_decode_assignment_policy =
             RoutedExpertAssignmentPolicy::StaticOwner;
         domain.routed_prefill_assignment_policy =
-            isLLEPProductionTest()
+            use_llep
                 ? RoutedExpertAssignmentPolicy::LeastLoadedResident
                 : RoutedExpertAssignmentPolicy::StaticOwner;
         return domain;
+    }
+
+    /** @return ROCm domain selected by the active legacy or typed cell. */
+    RoutedExpertDomain rocmWarmDomain()
+    {
+        return rocmWarmDomain(
+            isQwen122ProductionTest(), isLLEPProductionTest());
     }
 
     /** @brief Declare the ROCm continuation domain for the ROCm/CPU cell. */
@@ -523,6 +606,52 @@ namespace
         t.memory_budget_bytes = 0;
         t.fallback = fallback;
         return t;
+    }
+
+    /**
+     * @brief Build the immutable 122B six-GPU topology blueprint.
+     *
+     * Placement and movement are deliberately left at Ordinal/Static.  The
+     * generated case copies this blueprint and installs those policy axes for
+     * each request.  Automatic zero quotas retain production capacity
+     * accounting as the sole authority for filling both integer-priority tiers.
+     */
+    std::shared_ptr<const MoERoutedExpertPlacementPlan>
+    qwen122Cuda2Rocm4OverlayBlueprint()
+    {
+        static const auto blueprint = []
+        {
+            auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
+            plan->enabled = true;
+            plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+            plan->residency_policy =
+                RoutedExpertResidencyPolicy::StaticById;
+            plan->owner_order = RoutedExpertOwnerOrder::Ordinal;
+            plan->continuation_domain = kCudaHotDomain;
+            plan->base_model_domain = kCudaHotDomain;
+            plan->shared_expert_domain = kCudaHotDomain;
+            plan->continuation_domain_spec.setDensePolicy(
+                DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding);
+            plan->domains = {
+                cudaHotDomain(/*qwen122=*/true, /*use_llep=*/false),
+                rocmWarmDomain(/*qwen122=*/true, /*use_llep=*/false),
+            };
+            plan->routed_tiers = {
+                makeTier(
+                    "priority0",
+                    kCudaHotDomain,
+                    /*priority=*/0,
+                    /*max_experts_per_layer=*/0),
+                makeTier(
+                    "priority1",
+                    kRocmWarmDomain,
+                    /*priority=*/1,
+                    /*max_experts_per_layer=*/0,
+                    /*fallback=*/true),
+            };
+            return std::shared_ptr<const MoERoutedExpertPlacementPlan>{plan};
+        }();
+        return blueprint;
     }
 
     MoERoutedExpertModelMetadata topologyOnlyMetadata()
@@ -589,28 +718,14 @@ namespace
              * every participant to its measured safety margin, then places
              * the exact remainder in the lower-priority fallback tier.
              */
-            plan.continuation_domain = kCudaHotDomain;
-            plan.base_model_domain = kCudaHotDomain;
-            plan.shared_expert_domain = kCudaHotDomain;
-            plan.continuation_domain_spec.setDensePolicy(
-                DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding);
-            plan.domains = {
-                cudaHotDomain(),
-                rocmWarmDomain(),
-            };
-            plan.routed_tiers = {
-                makeTier(
-                    "priority0",
-                    kCudaHotDomain,
-                    /*priority=*/0,
-                    /*max_experts_per_layer=*/0),
-                makeTier(
-                    "priority1",
-                    kRocmWarmDomain,
-                    /*priority=*/1,
-                    /*max_experts_per_layer=*/0,
-                    /*fallback=*/true),
-            };
+            plan = *qwen122Cuda2Rocm4OverlayBlueprint();
+            plan.residency_policy =
+                isDynamicResidencyProductionTest()
+                    ? RoutedExpertResidencyPolicy::RoutedTierRebalanced
+                    : RoutedExpertResidencyPolicy::StaticById;
+            plan.owner_order = isRandomOwnerProductionTest()
+                                   ? RoutedExpertOwnerOrder::Random
+                                   : RoutedExpertOwnerOrder::Ordinal;
             return plan;
 
         case OverlayTopology::CudaCpu:
@@ -951,6 +1066,96 @@ namespace
         }
         return config;
     }
+
+#ifdef LLAMINAR_QWEN122_MATRIX_ONLY
+    /** @return Short-campaign Dynamic economics used by every generated cell. */
+    MoERebalanceRuntimeConfig qwen122DynamicParityEconomics()
+    {
+        MoERebalanceRuntimeConfig config;
+        config.mode = MoERebalanceRuntimeMode::Dynamic;
+        config.window_size = 4;
+        config.max_window_size = 4;
+        config.window_growth_factor = 1.0f;
+        config.migration_max_cycles_per_wave = 2;
+        config.migration_payoff_horizon_tokens = 65'536;
+        config.release_raw_expert_weights = false;
+        config.dynamic_imbalance_threshold_per_mille = 0;
+        config.dynamic_min_improvement_per_mille = 0;
+        config.dynamic_max_swaps_per_layer = 4;
+        config.dynamic_max_plan_entries_per_wave = 32;
+        config.dynamic_min_window_activations = 0;
+        config.device_min_load_spread_improvement = 0;
+        config.device_min_load_spread_improvement_divisor = 0;
+        config.device_min_wave_spread_improvement_per_payload_slot = 0;
+        config.device_min_foreign_rows_per_critical_path_payload_slot = 0;
+        config.device_min_router_spread_improvement_per_payload_slot = 0;
+        config.device_max_post_wave_load_spread_per_mille = 1000;
+        config.device_maintenance_slack_tokens = 0;
+        config.device_min_maintenance_period_tokens = 1;
+        config.device_initial_maintenance_period_tokens = 1;
+        return config;
+    }
+
+    /**
+     * @brief Declare the canonical 122B real-model/six-GPU parity matrix.
+     *
+     * GPU rank ownership is deliberately unresolved.  Production cluster
+     * inventory binds the two CUDA and four ROCm ordinals to whichever of the
+     * two MPI instances currently owns them.  The topology blueprint retains
+     * NCCL/RCCL only inside its named domains; the outer graph is multi-domain,
+     * not a fictitious six-way tensor-parallel collective.
+     */
+    ModelParityDefinition qwen122Cuda2Rocm4ParityDefinition()
+    {
+        ModelParityDefinition definition;
+        definition.model = {
+            .test_id = "Qwen35_122B",
+            .model_path = kQwen122ModelPath,
+            .reference_directory = kQwen122SnapshotDir,
+            .decode_steps = 4,
+            .max_seq_len = 4096,
+            .maximum_mtp_draft_depth = kQwen122MaximumMTPDraftDepth,
+        };
+        definition.topology = {
+            .test_id = "CUDA2_ROCm4_2xMPI_NodeExpertOverlay",
+            .kind = ModelParityTopologyKind::NodeMultiDomain,
+            .participants = {
+                {GlobalDeviceAddress::cuda(0), std::nullopt},
+                {GlobalDeviceAddress::cuda(1), std::nullopt},
+                {GlobalDeviceAddress::rocm(0), std::nullopt},
+                {GlobalDeviceAddress::rocm(1), std::nullopt},
+                {GlobalDeviceAddress::rocm(2), std::nullopt},
+                {GlobalDeviceAddress::rocm(3), std::nullopt},
+            },
+            .collective = Collective::None,
+            .mpi_ranks = 2,
+            .expert_overlay_plan = qwen122Cuda2Rocm4OverlayBlueprint(),
+        };
+        definition.thresholds = {
+            .cosine_threshold = 0.96f,
+            .decode_cosine_threshold = 0.98f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 5,
+            .kl_threshold = 0.03f,
+            .min_top1_accuracy = 0.80f,
+            .min_top5_accuracy = 0.60f,
+            .pytorch_top1_in_topk = 4,
+        };
+        definition.precisions.activation = {ActivationPrecision::FP16};
+        definition.precisions.kv_cache = {KVCachePrecision::FP16};
+        definition.features.mtp = ModelParityAxisProfile::Standard;
+        definition.dynamic_rebalance = qwen122DynamicParityEconomics();
+        return definition;
+    }
+
+    /** @return Exact generated 4 placement/movement x 6 MTP case matrix. */
+    const std::vector<ModelParityCase> &qwen122Cuda2Rocm4ParityCases()
+    {
+        static const auto cases = expandModelParityDefinition(
+            qwen122Cuda2Rocm4ParityDefinition());
+        return cases;
+    }
+#endif
 
     /**
      * @brief One bounded, physical-identity-indexed 122B prepared authority.
@@ -1600,6 +1805,9 @@ namespace
 
 class Qwen35MoEGraphNativeCudaHotRocmWarmCpuCold
     : public Qwen35MoEConfigDrivenParityTest<Qwen35MoEGraphNativeCudaHotRocmWarmCpuCold>
+#ifdef LLAMINAR_QWEN122_MATRIX_ONLY
+      , public ::testing::WithParamInterface<ModelParityCase>
+#endif
 {
 public:
     /**
@@ -1712,10 +1920,14 @@ public:
     static const TestConfig &qwen122Cuda2Rocm4Config()
     {
         static std::map<std::string, TestConfig> configs;
-        const std::string name = activeTestName();
+        const auto *test_case = activeModelParityCase();
+        if (!test_case)
+            throw std::logic_error(
+                "122B parity configuration requested without an active typed case");
+        const std::string name = test_case->testName();
         const auto [it, inserted] = configs.try_emplace(
             name,
-            makeGraphNativeTestConfig(OverlayTopology::Cuda2Rocm4));
+            test_case->toTestConfig());
         (void)inserted;
         return it->second;
     }
@@ -1749,16 +1961,59 @@ public:
 protected:
     using Base = Qwen35MoEConfigDrivenParityTest<Qwen35MoEGraphNativeCudaHotRocmWarmCpuCold>;
 
+    /**
+     * @brief Retain the exact device-owned route epoch consumed by diagnostics.
+     *
+     * The Hugging Face pack authenticates model tensors, but it cannot name
+     * Llaminar's placement-bank selector or final domain schedule. These
+     * additional keys bind each compared routed contribution to the acquired
+     * overlay epoch. Declaring them through the shared typed snapshot policy
+     * makes them part of graph identity before capture; diagnostics never
+     * mutate or recapture the serving graph after setup.
+     */
+    ParityGraphSnapshotPolicy parityGraphSnapshotPolicy(
+        ParityForwardPhase phase) const override
+    {
+        auto policy = Base::parityGraphSnapshotPolicy(phase);
+        auto &required =
+            phase == ParityForwardPhase::Prefill
+                ? policy.required_prefill_snapshot_keys
+                : policy.required_decode_snapshot_keys;
+        constexpr std::array<std::string_view, 6> suffixes{
+            "_MOE_DOMAIN_ROUTE_PARTICIPANT_IDS",
+            "_MOE_RUNTIME_ROUTE_WEIGHTS",
+            "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK0",
+            "_MOE_OVERLAY_ROUTE_PARTICIPANTS_BANK1",
+            "_MOE_OVERLAY_ROUTE_SELECTED_BANK",
+            "_MOE_CANONICAL_ROUTE_CONTRIBUTIONS",
+        };
+        for (int layer = 0; layer < parityLayerCount(); ++layer)
+        {
+            const std::string prefix =
+                "layer" + std::to_string(layer);
+            for (const std::string_view suffix : suffixes)
+            {
+                const std::string key = prefix + std::string(suffix);
+                if (std::find(required.begin(), required.end(), key) ==
+                    required.end())
+                {
+                    required.push_back(key);
+                }
+            }
+        }
+        return policy;
+    }
+
     /** @brief The 122B matrix mathematically compares recursive MTP sidecars. */
     bool requiresMTPSidecarReferenceSnapshots() const override
     {
-        return isQwen122ProductionTest();
+        return isQwen122ProductionTest() && activeMTPEnabled();
     }
 
     /** @return Maximum recurrent sidecar depth admitted by the 122B matrix. */
     int requiredMTPSidecarReferenceDraftDepth() const override
     {
-        return isQwen122ProductionTest()
+        return isQwen122ProductionTest() && activeMTPEnabled()
                    ? kQwen122MaximumMTPDraftDepth
                    : 0;
     }
@@ -1904,10 +2159,11 @@ protected:
     /**
      * @brief Allocation-owning samples for the observed convergence gate.
      *
-     * Baseline values are ordinary production intervals claimed by the
-     * economy controller in its `Baseline` state, before any residency epoch
-     * can publish. Converged values use the identical authenticated request
-     * after at least two profitable epochs. A sample whose surrounding
+     * Baseline values are ordinary production intervals claimed before any
+     * residency epoch can publish. Converged values use the same authenticated
+     * suffix, prompt geometry, boundary transaction, and fixed decode budget
+     * after at least two profitable epochs. Only the valid leading cache
+     * discriminator differs between requests. A sample whose surrounding
      * committed-wave count changes is discarded instead of being attributed
      * to either layout.
      */
@@ -1930,6 +2186,75 @@ protected:
                 std::chrono::steady_clock::now() - start)
                 .count();
         return static_cast<std::uint64_t>(std::max<std::int64_t>(elapsed, 1));
+    }
+
+    /**
+     * @brief Build one cache-distinct, valid-token economy workload.
+     *
+     * Calibration and convergence measurements must execute model compute on
+     * every request after prefix restore became a production default. They
+     * must also leave the authenticated Hugging Face prompt unseen so the
+     * mandatory parity lifecycle begins with a genuine fresh miss. Varying
+     * only valid embedding rows preserves real graph/routing work without
+     * injecting histograms, placements, or expert identities.
+     *
+     * @param request_index Stable request ordinal within the economy corpus.
+     * @return Prompt-sized deterministic token vector distinct per ordinal.
+     */
+    std::vector<int32_t> makeEconomyWorkloadPrompt(int request_index) const
+    {
+        const int vocabulary_size = orch_runner_->vocabSize();
+        if (config_.token_ids.empty() || vocabulary_size <= 4'096)
+        {
+            throw std::logic_error(
+                "Economy workload requires authenticated prompt geometry and a valid vocabulary");
+        }
+
+        std::uint64_t state =
+            0x9e3779b97f4a7c15ULL ^
+            (static_cast<std::uint64_t>(request_index + 1) *
+             0xbf58476d1ce4e5b9ULL);
+        const auto usable_vocabulary =
+            static_cast<std::uint64_t>(vocabulary_size - 2'048);
+        std::vector<int32_t> varied(config_.token_ids.size(), 0);
+        for (auto &token : varied)
+        {
+            state += 0x9e3779b97f4a7c15ULL;
+            std::uint64_t mixed = state;
+            mixed = (mixed ^ (mixed >> 30u)) *
+                    0xbf58476d1ce4e5b9ULL;
+            mixed = (mixed ^ (mixed >> 27u)) *
+                    0x94d049bb133111ebULL;
+            mixed ^= mixed >> 31u;
+            token = static_cast<int32_t>(
+                256u + mixed % usable_vocabulary);
+        }
+        return varied;
+    }
+
+    /**
+     * @brief Preserve the authenticated workload while changing its cache key.
+     *
+     * A unique valid leading token keeps every Hugging Face prompt token in
+     * the measured request, so its sparse demand remains representative, but
+     * prevents the economy workload from publishing the exact reference
+     * prefix. This lets the later correctness phase prove a genuine miss.
+     *
+     * @param request_index Stable request ordinal within the measured corpus.
+     * @return One leading token followed by the exact reference prompt.
+     */
+    std::vector<int32_t> makeReferenceShapedEconomyPrompt(
+        int request_index) const
+    {
+        auto seed = makeEconomyWorkloadPrompt(request_index);
+        std::vector<int32_t> prompt;
+        prompt.reserve(config_.token_ids.size() + 1u);
+        prompt.push_back(seed.front());
+        prompt.insert(
+            prompt.end(),
+            config_.token_ids.begin(),
+            config_.token_ids.end());
+        return prompt;
     }
 
     /** @return Median of a non-empty timing corpus without changing it. */
@@ -1965,6 +2290,11 @@ protected:
 
     void SetUp() override
     {
+#ifdef LLAMINAR_QWEN122_MATRIX_ONLY
+        ASSERT_EQ(g_active_model_parity_case, nullptr)
+            << "A prior generated parity case leaked beyond fixture teardown";
+        g_active_model_parity_case = &GetParam();
+#endif
         int initialized = 0;
         MPI_Initialized(&initialized);
         if (!initialized)
@@ -2020,6 +2350,15 @@ protected:
             std::vector<int>{kSegmentedPrefillCaptureRows})
             << "Segmented parity must override the exact-bucket default with "
                "one explicit fixed capture bucket";
+    }
+
+    /** @brief Retire the typed case only after production runner teardown. */
+    void TearDown() override
+    {
+        Base::TearDown();
+#ifdef LLAMINAR_QWEN122_MATRIX_ONLY
+        g_active_model_parity_case = nullptr;
+#endif
     }
 
     void applyModelOverrides() override
@@ -2535,7 +2874,7 @@ protected:
          * work in the 35B correctness campaign.
          */
         const uint64_t expected_family_materializations =
-            isQwen122ProductionTest() ? 2u : 1u;
+            activeMTPEnabled() ? 2u : 1u;
         EXPECT_EQ(
             global[kFamilyMaterializations],
             expected_family_materializations)
@@ -2577,7 +2916,7 @@ protected:
             EXPECT_GT(global[kMaterializedCpuEndpoints], 0u)
                 << "The mapped follower family retained no typed CPU boundary endpoint";
         }
-        if (isQwen122ProductionTest())
+        if (activeMTPEnabled())
         {
             EXPECT_EQ(global[kMTPFamilyCapacity], 1u)
                 << "The recursive MTP follower family did not retain the shared "
@@ -2595,7 +2934,7 @@ protected:
             << "The mapped family never served the largest root-published live prefill chunk";
         EXPECT_GT(global[kOneRowDecodeSelections], 0u)
             << "Decode never selected its setup-owned one-row retained parent";
-        if (isQwen122ProductionTest())
+        if (activeMTPEnabled())
         {
             EXPECT_GT(global[kSelectedMTPPhysicalRows], 0u)
                 << "No mapped grouped-verifier graph selected the admitted "
@@ -4398,11 +4737,10 @@ protected:
 
         OrchestrationConfig orchestration = OrchestrationConfig::defaults();
         orchestration.model_path = config_.model_path;
-        orchestration.max_seq_len = 4096;
+        orchestration.max_seq_len = activeModelParityCase()
+                                            ? activeModelParityCase()->model.max_seq_len
+                                            : 4096;
         orchestration.batch_size = 1;
-        orchestration.activation_precision =
-            isQwen122ProductionTest() ? "fp16" : "fp32";
-        orchestration.kv_cache_precision = "fp16";
         /*
          * The named MoE domains are the sole placement authority. During
          * normalization they become the production execution-domain inventory,
@@ -4415,27 +4753,41 @@ protected:
         orchestration.tp_degree = 1;
         orchestration.pp_degree = 1;
         orchestration.deterministic = !isQwen122ProductionTest();
-        orchestration.mtp.enabled = isQwen122ProductionTest();
-        orchestration.mtp.draft_tokens = activeMTPDraftDepth();
-        orchestration.mtp.graph_capacity_draft_tokens =
-            isQwen122ProductionTest()
-                ? kQwen122MaximumMTPDraftDepth
-                : 0;
-        orchestration.mtp.verify_mode = MTPVerifyMode::Greedy;
-        if (usesDynamicMTPDepth())
+        if (const auto *test_case = activeModelParityCase())
         {
-            orchestration.mtp.depth_policy.mode =
-                MTPDepthPolicyMode::Dynamic;
-            orchestration.mtp.depth_policy.min_depth = 1;
-            orchestration.mtp.depth_policy.max_depth =
-                kQwen122MaximumMTPDraftDepth;
-            orchestration.mtp.depth_policy.initial_depth =
-                kQwen122MaximumMTPDraftDepth;
-            orchestration.mtp.depth_policy.window_size = 1;
-            orchestration.mtp.depth_policy.min_samples = 1;
-            orchestration.mtp.depth_policy.cooldown_steps = 0;
-            orchestration.mtp.depth_policy.promote_consecutive_windows = 1;
+            test_case->applyRuntimePolicy(orchestration);
         }
+        else
+        {
+            orchestration.activation_precision =
+                isQwen122ProductionTest() ? "fp16" : "fp32";
+            orchestration.kv_cache_precision = "fp16";
+            orchestration.mtp.enabled = isQwen122ProductionTest();
+            orchestration.mtp.draft_tokens = activeMTPDraftDepth();
+            orchestration.mtp.graph_capacity_draft_tokens =
+                isQwen122ProductionTest()
+                    ? kQwen122MaximumMTPDraftDepth
+                    : 0;
+            orchestration.mtp.verify_mode = MTPVerifyMode::Greedy;
+            if (usesDynamicMTPDepth())
+            {
+                orchestration.mtp.depth_policy.mode =
+                    MTPDepthPolicyMode::Dynamic;
+                orchestration.mtp.depth_policy.min_depth = 1;
+                orchestration.mtp.depth_policy.max_depth =
+                    kQwen122MaximumMTPDraftDepth;
+                orchestration.mtp.depth_policy.initial_depth =
+                    kQwen122MaximumMTPDraftDepth;
+                orchestration.mtp.depth_policy.window_size = 1;
+                orchestration.mtp.depth_policy.min_samples = 1;
+                orchestration.mtp.depth_policy.cooldown_steps = 0;
+                orchestration.mtp.depth_policy.promote_consecutive_windows = 1;
+            }
+        }
+        applyProductionParityPrefixRestorePolicy(orchestration);
+        // Inventory binding/adversarial placement has now specialized the
+        // immutable blueprint copied by applyRuntimePolicy. Publish that exact
+        // request as the sole runtime placement authority.
         orchestration.moe_routed_expert_plan = overlay_plan_;
         if (isLLEPProductionTest())
         {
@@ -4458,20 +4810,22 @@ protected:
          * Dynamic cells opt back in below and exercise the complete physical
          * publication path.
          */
-        orchestration.moe_rebalance.mode =
-            MoERebalanceRuntimeMode::Off;
-        if (isDynamicResidencyProductionTest())
+        if (!activeModelParityCase())
         {
-            /*
-             * Eight committed decode rows form one real histogram epoch. This
-             * is deliberately workload policy, not a test-side histogram: the
-             * production local-expert stages remain the only count producers.
-             */
             orchestration.moe_rebalance.mode =
-                MoERebalanceRuntimeMode::Dynamic;
-            orchestration.moe_rebalance.window_size = 8;
-            orchestration.moe_rebalance.max_window_size = 8;
-            orchestration.moe_rebalance.window_growth_factor = 1.0f;
+                MoERebalanceRuntimeMode::Off;
+            if (isDynamicResidencyProductionTest())
+            {
+                /*
+                 * Eight committed decode rows form one real histogram epoch. This
+                 * is deliberately workload policy, not a test-side histogram: the
+                 * production local-expert stages remain the only count producers.
+                 */
+                orchestration.moe_rebalance.mode =
+                    MoERebalanceRuntimeMode::Dynamic;
+                orchestration.moe_rebalance.window_size = 8;
+                orchestration.moe_rebalance.max_window_size = 8;
+                orchestration.moe_rebalance.window_growth_factor = 1.0f;
             /*
              * Select two independent closed cycles per wave in this scenario.
              * The value is deliberately supplied through the same public
@@ -4480,7 +4834,7 @@ protected:
              * Config parser coverage separately exercises other positive
              * values, while this real-model cell proves concurrent staging.
              */
-            orchestration.moe_rebalance.migration_max_cycles_per_wave = 2;
+                orchestration.moe_rebalance.migration_max_cycles_per_wave = 2;
             /*
              * Residency persists across requests. The complete directed-lane
              * calibration on the two-rank GPU/CPU cell puts its remote-lane
@@ -4490,11 +4844,11 @@ protected:
              * while the measured payoff gate still
              * rejects any move whose projected net benefit is non-positive.
              */
-            orchestration.moe_rebalance.migration_payoff_horizon_tokens =
-                65'536;
-            orchestration.moe_rebalance.release_raw_expert_weights = false;
-            if (isQwen122ProductionTest())
-            {
+                orchestration.moe_rebalance.migration_payoff_horizon_tokens =
+                    65'536;
+                orchestration.moe_rebalance.release_raw_expert_weights = false;
+                if (isQwen122ProductionTest())
+                {
                 /*
                  * A short authenticated campaign should expose real movement,
                  * not spend its wall time waiting for a serving-scale
@@ -4516,7 +4870,8 @@ protected:
                 orchestration.moe_rebalance.device_max_post_wave_load_spread_per_mille = 1000;
                 orchestration.moe_rebalance.device_maintenance_slack_tokens = 0;
                 orchestration.moe_rebalance.device_min_maintenance_period_tokens = 1;
-                orchestration.moe_rebalance.device_initial_maintenance_period_tokens = 1;
+                    orchestration.moe_rebalance.device_initial_maintenance_period_tokens = 1;
+                }
             }
         }
 
@@ -4771,11 +5126,12 @@ protected:
             return false;
         }
 
-        const std::vector<int32_t> prompt(
-            config_.token_ids.begin(), config_.token_ids.end());
         for (int request = 0; request < kMaximumRequests; ++request)
         {
             activeClearCache();
+            const std::vector<int32_t> prompt =
+                makeReferenceShapedEconomyPrompt(
+                    kConvergedTimingPromptOffset + request);
 
             const std::uint64_t prefill_waves_before =
                 localCommittedWaveCount();
@@ -4803,8 +5159,14 @@ protected:
                     prefill_waves_before + 1u);
             }
 
-            /* The first call consumes already-produced prefill logits. */
+            /*
+             * Match the baseline protocol exactly: one fixed one-token call
+             * consumes already-produced prefill logits outside the timing
+             * interval, then every measured call admits two output tokens.
+             */
+            orch_runner_->setDecodeStepTokenBudget(1);
             GenerationResult boundary_sample = orch_runner_->decodeStep();
+            orch_runner_->setDecodeStepTokenBudget(0);
             if (!boundary_sample.success() || boundary_sample.tokens.empty())
             {
                 LOG_ERROR(
@@ -4820,10 +5182,12 @@ protected:
             {
                 const std::uint64_t decode_waves_before =
                     localCommittedWaveCount();
+                orch_runner_->setDecodeStepTokenBudget(2);
                 const auto decode_start = std::chrono::steady_clock::now();
                 GenerationResult decoded = orch_runner_->decodeStep();
                 const std::uint64_t decode_ns =
                     elapsedNanoseconds(decode_start);
+                orch_runner_->setDecodeStepTokenBudget(0);
                 const std::uint64_t decode_waves_after =
                     localCommittedWaveCount();
                 if (!decoded.success() || decoded.tokens.empty())
@@ -5067,54 +5431,13 @@ protected:
         const int maximum_service_profile_requests =
             maximum_certified_requests * 2;
 
-        const std::vector<int32_t> prompt(
-            config_.token_ids.begin(), config_.token_ids.end());
         const int vocabulary_size = orch_runner_->vocabSize();
-        if (prompt.empty() || vocabulary_size <= 4'096)
+        if (config_.token_ids.empty() || vocabulary_size <= 4'096)
         {
             LOG_ERROR(
                 "[Qwen3.5 MoE GraphNative] Economy service coverage requires a non-empty authenticated prompt and a valid vocabulary");
             return false;
         }
-        const auto serviceCoveragePrompt =
-            [&prompt, vocabulary_size](int request_index)
-        {
-            if (request_index == 0)
-                return prompt;
-
-            /*
-             * Service certification prices every possible owner, whereas one
-             * deterministic request follows one fixed sparse route set. Use a
-             * bounded deterministic corpus of valid embedding rows to make
-             * ordinary production routing visit otherwise-idle owners. No
-             * route, timing, histogram, placement, or completion value is
-             * injected; the real model graph remains the sole source of every
-             * service observation. The host-authority lifecycle rebases its
-             * demand window when certification becomes actionable, so these
-             * topology-coverage requests cannot train the first movement.
-             */
-            std::uint64_t state =
-                0x9e3779b97f4a7c15ULL ^
-                (static_cast<std::uint64_t>(request_index) *
-                 0xbf58476d1ce4e5b9ULL);
-            const auto usable_vocabulary =
-                static_cast<std::uint64_t>(vocabulary_size - 2'048);
-            std::vector<int32_t> varied(prompt.size(), 0);
-            for (auto &token : varied)
-            {
-                state += 0x9e3779b97f4a7c15ULL;
-                std::uint64_t mixed = state;
-                mixed = (mixed ^ (mixed >> 30u)) *
-                        0xbf58476d1ce4e5b9ULL;
-                mixed = (mixed ^ (mixed >> 27u)) *
-                        0x94d049bb133111ebULL;
-                mixed ^= mixed >> 31u;
-                token = static_cast<int32_t>(
-                    256u + mixed % usable_vocabulary);
-            }
-            return varied;
-        };
-
         std::uint64_t service_profile_forwards = 0;
         int certified_requests = 0;
         const DynamicMovementAxisContract movement_axis_contract =
@@ -5187,7 +5510,7 @@ protected:
          * prepareForInference(). The remaining economy profile is learned from
          * ordinary traffic. Service cost is a topology-wide certificate, so a
          * stationary prompt is insufficient: sparse routing can leave a valid
-         * owner forever idle. The bounded valid-token corpus above supplies
+         * owner forever idle. The bounded valid-token corpus supplies
          * natural production coverage only. Certification publication rebases
          * demand before proposal admission; every later histogram epoch and
          * the Hugging Face comparison therefore describe the stationary
@@ -5200,46 +5523,80 @@ protected:
              localResidencyCounter("economy_certification_complete") == 0.0;
              ++request_index)
         {
+            const bool baseline_request =
+                requiresObservedConvergenceSpeedup() &&
+                convergence_timings_.baseline_prefill_ns.size() < 2u;
+            const std::vector<int32_t> service_prompt =
+                baseline_request
+                    ? makeReferenceShapedEconomyPrompt(request_index)
+                    : makeEconomyWorkloadPrompt(request_index);
+            const std::uint64_t prefill_waves_before =
+                baseline_request ? localCommittedWaveCount() : 0u;
             std::uint64_t prefill_ns = 0;
             if (!runPrefill(
-                    serviceCoveragePrompt(request_index),
-                    requiresObservedConvergenceSpeedup() ? &prefill_ns
-                                                         : nullptr))
+                    service_prompt,
+                    baseline_request ? &prefill_ns : nullptr))
             {
                 return false;
             }
+            const std::uint64_t prefill_waves_after =
+                baseline_request ? localCommittedWaveCount() : 0u;
             ++service_profile_forwards;
-            if (requiresObservedConvergenceSpeedup() && prefill_ns > 0 &&
-                convergence_timings_.baseline_prefill_ns.size() < 2u)
+            if (baseline_request && prefill_ns > 0u &&
+                prefill_waves_before == 0u &&
+                prefill_waves_after == 0u)
             {
                 convergence_timings_.baseline_prefill_ns.push_back(prefill_ns);
             }
 
+            bool request_complete = false;
+            if (baseline_request)
+            {
+                /*
+                 * Consume the prefill-boundary token outside the measured
+                 * interval, exactly as the converged cohort does. This is an
+                 * ordinary fixed-budget production transaction and still
+                 * contributes its real service evidence to certification.
+                 */
+                const auto boundary = runDecode(1);
+                if (!boundary)
+                    return false;
+                ++service_profile_forwards;
+                request_complete = *boundary;
+            }
+
             for (int step = 0;
+                 !request_complete &&
                  step < decode_steps_per_certified_request;
                  ++step)
             {
+                const std::uint64_t decode_waves_before =
+                    baseline_request ? localCommittedWaveCount() : 0u;
                 std::uint64_t decode_ns = 0;
                 const int response_token_budget =
-                    isQwen122ProductionTest() &&
+                    baseline_request
+                        ? 2
+                        : (isQwen122ProductionTest() &&
                             step < decode_steps_per_certified_request / 2
-                        ? 1
-                        : (isQwen122ProductionTest() ? 4 : 2);
+                               ? 1
+                               : (isQwen122ProductionTest() ? 4 : 2));
                 const auto complete = runDecode(
                     response_token_budget,
-                    requiresObservedConvergenceSpeedup() ? &decode_ns
-                                                         : nullptr);
+                    baseline_request ? &decode_ns : nullptr);
                 if (!complete)
                     return false;
+                const std::uint64_t decode_waves_after =
+                    baseline_request ? localCommittedWaveCount() : 0u;
                 ++service_profile_forwards;
-                if (requiresObservedConvergenceSpeedup() && decode_ns > 0 &&
+                if (baseline_request && decode_ns > 0u &&
+                    decode_waves_before == 0u &&
+                    decode_waves_after == 0u &&
                     convergence_timings_.baseline_decode_ns.size() < 2u)
                 {
                     convergence_timings_.baseline_decode_ns.push_back(
                         decode_ns);
                 }
-                if (*complete)
-                    break;
+                request_complete = *complete;
             }
         }
 
@@ -5320,12 +5677,15 @@ protected:
              * Broad traffic exists only to certify every measured service
              * coordinate. Production rebases those calibration histograms at
              * the EconomyCertified transition; every placement epoch after
-             * that boundary must optimize the exact authenticated workload
-             * whose Hugging Face checkpoints certify the published layout.
+             * that boundary must optimize the authenticated reference-shaped
+             * workload whose Hugging Face checkpoints certify the published
+             * layout. Its one-token cache discriminator is excluded from the
+             * later mathematical reference request.
              * A second mixed movement corpus would create two workload
              * authorities and make post-publication use a sampling accident.
              */
-            if (!runPrefill(prompt))
+            if (!runPrefill(makeReferenceShapedEconomyPrompt(
+                    maximum_service_profile_requests + certified_requests)))
                 return false;
             for (int step = 0;
                  step < decode_steps_per_certified_request;
@@ -7152,7 +7512,8 @@ protected:
      */
     void runMTPHuggingFaceCheckpointParity()
     {
-        if (!isQwen122ProductionTest() || !isRootParityRank())
+        if (!isQwen122ProductionTest() || !activeMTPEnabled() ||
+            !isRootParityRank())
             return;
 
         ASSERT_NE(orch_runner_, nullptr);
@@ -8725,9 +9086,15 @@ protected:
                 "all overlay tiers completed");
         }
 
+        const PrefixRuntimeStateSnapshot fresh_prefix_state =
+            activePrefixStateProbe();
         if (isRootParityRank())
         {
             assertParity(prefill);
+            assertProductionParityFreshPrefixSeed(
+                fresh_prefix_state,
+                prefill.overall_passed,
+                prefill.lm_head_cosine);
             if (isSegmentedPrefillProductionTest())
                 assertSegmentedPrefillCheckpointCoverage();
             assertProductionParitySnapshotInfrastructure();
@@ -8741,7 +9108,8 @@ protected:
         DecodeParitySummary decode;
         try
         {
-            decode = runDecodeParity();
+            decode = runDecodeParity(
+                ParityDecodePrefillMode::CompletePrefixRestore);
         }
         catch (const std::exception &e)
         {
@@ -8762,6 +9130,11 @@ protected:
         if (isRootParityRank())
         {
             assertDecodeParity(decode);
+            assertProductionParityCompletePrefixRestore(
+                fresh_prefix_state,
+                decode.overall_passed,
+                decode.avg_cosine);
+            assertProductionParityPartialPrefixRestore();
             assertParityExecutionExercisesPromotedExpert();
         }
 
@@ -8927,39 +9300,23 @@ TEST_F(
 #else
 
 /**
- * @brief Register one exact production 122B policy/owner/depth matrix cell.
+ * @brief Execute one generated production 122B policy cell.
  *
- * Every expansion owns a fresh request runner but shares one process-resident
- * authenticated GGUF/reference corpus. The runner itself still constructs the
- * same two-rank, six-participant graph used by serving.
+ * Every parameter owns a fresh request runner but shares one bounded
+ * process-resident model/prepared-weight authority.  Runtime policy comes from
+ * `GetParam()`; the stable parameter name is diagnostic output only.
  */
-#define LLAMINAR_QWEN122_PARITY_CELL(POLICY, OWNER, DEPTH)                  \
-    TEST_F(                                                               \
-        Qwen35MoEGraphNativeCudaHotRocmWarmCpuCold,                       \
-        ProductionParity_Qwen35_122B_CUDA2_ROCm4_##POLICY##_##OWNER##_##DEPTH) \
-    {                                                                     \
-        runGraphNativeProductionParityBody();                             \
-    }
+TEST_P(Qwen35MoEGraphNativeCudaHotRocmWarmCpuCold, ProductionParity)
+{
+    runGraphNativeProductionParityBody();
+}
 
-#define LLAMINAR_QWEN122_OWNER_DEPTHS(POLICY, OWNER) \
-    LLAMINAR_QWEN122_PARITY_CELL(POLICY, OWNER, MTPDepth1) \
-    LLAMINAR_QWEN122_PARITY_CELL(POLICY, OWNER, MTPDepth2) \
-    LLAMINAR_QWEN122_PARITY_CELL(POLICY, OWNER, MTPDepth3) \
-    LLAMINAR_QWEN122_PARITY_CELL(POLICY, OWNER, MTPDynamicDepth) \
-    LLAMINAR_QWEN122_PARITY_CELL(POLICY, OWNER, MTPDepth15)
-
-LLAMINAR_QWEN122_OWNER_DEPTHS(Static, Ordinal)
-LLAMINAR_QWEN122_OWNER_DEPTHS(Static, Random)
-LLAMINAR_QWEN122_OWNER_DEPTHS(Dynamic, Ordinal)
-LLAMINAR_QWEN122_OWNER_DEPTHS(Dynamic, Random)
-
-/* Current-batch LLEP is intentionally absent from this production campaign.
- * Its device-owned implementation is incomplete; registering a skipped or
- * compatibility cell would misrepresent support. Restore the two owner rows
- * only when the production controller and its economy proof are complete. */
-
-#undef LLAMINAR_QWEN122_OWNER_DEPTHS
-#undef LLAMINAR_QWEN122_PARITY_CELL
+INSTANTIATE_TEST_SUITE_P(
+    Qwen35_122B_CUDA2_ROCm4_2xMPI_NodeExpertOverlay,
+    Qwen35MoEGraphNativeCudaHotRocmWarmCpuCold,
+    ::testing::ValuesIn(qwen122Cuda2Rocm4ParityCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
+    { return info.param.testName(); });
 
 #endif
 

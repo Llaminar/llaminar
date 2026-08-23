@@ -913,6 +913,33 @@ namespace llaminar2
             snapshot_manifest);
     }
 
+    bool DeviceGraphExecutor::recordSetupGraphMaterialization(
+        ComputeGraph &graph,
+        IDeviceContext *ctx,
+        const std::unordered_set<std::string> *collective_nodes,
+        GraphSnapshotManifest *snapshot_manifest)
+    {
+        if (!ctx || !ctx->isGPU())
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Setup graph recording requires an exact GPU context");
+            return false;
+        }
+        if (!isGraphCaptureActive())
+        {
+            LOG_ERROR(
+                "[DeviceGraphExecutor] Setup graph recording is legal only inside native graph capture");
+            return false;
+        }
+
+        return runStages(
+            graph,
+            ctx,
+            StageRunPolicy::setupGraphMaterialization(),
+            collective_nodes,
+            snapshot_manifest);
+    }
+
     bool DeviceGraphExecutor::allocateStageArenaStorageForCapture(
         ComputeNode &node,
         DeviceId capture_device,
@@ -1051,7 +1078,8 @@ namespace llaminar2
         void *capture_stream,
         std::unordered_set<ITensor *> &prepared_inputs,
         std::unordered_set<ITensor *> &prepared_outputs,
-        GraphCaptureInputFrontierPolicy input_policy,
+        GraphCaptureDependencyLedger::ExternalInputAuthority
+            external_input_authority,
         const char *context)
     {
         if (!arena_ || !node.stage)
@@ -1102,8 +1130,9 @@ namespace llaminar2
                 if (!prepared_inputs.insert(tensor).second)
                     continue;
 
-                if (input_policy ==
-                    GraphCaptureInputFrontierPolicy::RequireReadyBytes)
+                if (external_input_authority ==
+                    GraphCaptureDependencyLedger::ExternalInputAuthority::
+                        RequireReadyBytes)
                 {
                     TransferEngine::requireDeviceInput(
                         tensor,
@@ -1189,7 +1218,9 @@ namespace llaminar2
         ComputeGraph &graph,
         IDeviceContext *ctx,
         void *capture_stream,
-        const char *context)
+        const char *context,
+        GraphCaptureDependencyLedger::ExternalInputAuthority
+            external_input_authority)
     {
         if (!arena_)
         {
@@ -1237,7 +1268,7 @@ namespace llaminar2
                     capture_stream,
                     prepared_inputs,
                     prepared_outputs,
-                    GraphCaptureInputFrontierPolicy::RequireReadyBytes,
+                    external_input_authority,
                     context))
             {
                 return false;
@@ -1397,8 +1428,26 @@ namespace llaminar2
         graph_output_indices.reserve(dump_info.outputs.size());
         for (size_t i = 0; i < dump_info.outputs.size(); ++i)
         {
-            if (isDeviceTensorSnapshotOutput(dump_info.outputs[i]))
-                graph_output_indices.push_back(i);
+            if (!isDeviceTensorSnapshotOutput(dump_info.outputs[i]))
+                continue;
+
+            /*
+             * A fused stage may publish several semantic values. Selecting
+             * the stage because one value is in the parity oracle must not
+             * allocate and capture every unrelated scratch publication. Ask
+             * the same descriptor-aware filter about a one-output view so the
+             * graph manifest contains exactly the requested evidence surface.
+             * Empty filters still select every output.
+             */
+            if (config_.snapshot_stage_filter)
+            {
+                StageDumpInfo output_view = dump_info;
+                output_view.outputs.clear();
+                output_view.outputs.push_back(dump_info.outputs[i]);
+                if (!shouldCaptureSnapshotStage(node.name, output_view))
+                    continue;
+            }
+            graph_output_indices.push_back(i);
         }
 
         if (graph_output_indices.empty())
@@ -2435,8 +2484,18 @@ namespace llaminar2
                 ctx->synchronize();
             }
 
-            // Mark stage completed for graph dependency tracking
-            graph.markCompleted(node->name);
+            /*
+             * Setup capture records addresses and native nodes but has not
+             * submitted a model transaction. Publishing host completion here
+             * would create a false shadow of device execution and could suppress
+             * later dependency work. Ordinary runtime policies retain the
+             * existing completion lifecycle.
+             */
+            if (policy.graph_recording_authority ==
+                StageRunPolicy::GraphRecordingAuthority::RuntimeExecution)
+            {
+                graph.markCompleted(node->name);
+            }
 
             if (timeline_active && timeline_gpu_ctx)
                 stage_timeline_.recordStop(i, timeline_gpu_ctx, stage_timeline_stream);
@@ -2473,7 +2532,9 @@ namespace llaminar2
         // After first successful pass, all weight tensors are confirmed on-device.
         // Subsequent graph rebuilds (e.g., after clear_cache) skip per-node
         // weight coherence since weight data never moves between forwards.
-        if (!weights_session_cohered_)
+        if (policy.graph_recording_authority ==
+                StageRunPolicy::GraphRecordingAuthority::RuntimeExecution &&
+            !weights_session_cohered_)
             weights_session_cohered_ = true;
 
         return true;

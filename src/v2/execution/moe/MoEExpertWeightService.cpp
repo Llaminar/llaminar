@@ -1433,7 +1433,11 @@ namespace llaminar2
             else if (!tensor->is_raw_data_released())
             {
                 size_t bytes = tensor->size_bytes();
-                tensor->release_raw_data();
+                /* The public host-release boundary retires any exact CUDA/HIP
+                 * registration before freeing storage. Calling the raw hook
+                 * directly can leave registered pages live when this parent
+                 * tensor was uploaded during multi-tier preparation. */
+                tensor->release_host_weight_data();
                 freed += bytes;
                 LOG_DEBUG("[MoEWeightService] " << name << ": released "
                                                 << (bytes >> 20) << " MB heap data");

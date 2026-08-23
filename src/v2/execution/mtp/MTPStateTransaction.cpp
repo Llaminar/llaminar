@@ -283,6 +283,40 @@ namespace llaminar2
             return mismatch("terminal hidden availability mismatch");
         if (oracle.has_logits != candidate.has_logits)
             return mismatch("terminal logits availability mismatch");
+        if (oracle.terminal_hidden_hash_available !=
+            candidate.terminal_hidden_hash_available)
+        {
+            return mismatch("terminal hidden hash availability mismatch");
+        }
+        if (oracle.terminal_hidden_hash_available &&
+            (oracle.terminal_hidden_bytes != candidate.terminal_hidden_bytes ||
+             oracle.terminal_hidden_hash != candidate.terminal_hidden_hash))
+        {
+            std::ostringstream message;
+            message << "terminal hidden payload mismatch: bytes="
+                    << oracle.terminal_hidden_bytes << "/"
+                    << candidate.terminal_hidden_bytes << " hash="
+                    << oracle.terminal_hidden_hash << "/"
+                    << candidate.terminal_hidden_hash;
+            return mismatch(message.str());
+        }
+        if (oracle.terminal_logits_hash_available !=
+            candidate.terminal_logits_hash_available)
+        {
+            return mismatch("terminal logits hash availability mismatch");
+        }
+        if (oracle.terminal_logits_hash_available &&
+            (oracle.terminal_logits_bytes != candidate.terminal_logits_bytes ||
+             oracle.terminal_logits_hash != candidate.terminal_logits_hash))
+        {
+            std::ostringstream message;
+            message << "terminal logits payload mismatch: bytes="
+                    << oracle.terminal_logits_bytes << "/"
+                    << candidate.terminal_logits_bytes << " hash="
+                    << oracle.terminal_logits_hash << "/"
+                    << candidate.terminal_logits_hash;
+            return mismatch(message.str());
+        }
         if (oracle.gdn_layers.size() != candidate.gdn_layers.size())
             return mismatch("GDN layer count mismatch");
 

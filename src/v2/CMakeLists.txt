@@ -1829,8 +1829,6 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/global/DomainCommunicatorRegistry.cpp
     # StageRunnerFactory (Phase 3: per-domain stage runner construction)
     execution/global/StageRunnerFactory.cpp
-    # GlobalOrchestratorRunner (Phase 4: IOrchestrationRunner adapter)
-    execution/global/GlobalOrchestratorRunner.cpp
     # Parallelism tree (recursive PP/TP composition)
     execution/parallelism_tree/ParallelismTree.cpp
     execution/parallelism_tree/TransferSpec.cpp

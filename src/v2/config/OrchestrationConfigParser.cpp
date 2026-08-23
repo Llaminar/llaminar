@@ -2331,11 +2331,21 @@ namespace llaminar2
         spec.add({
             .long_name = "--prefix-cache",
             .category = "Prefix Cache",
-            .description = "Enable cross-request prefix-state caching",
+            .description = "Enable cross-request prefix-state caching (default)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &)
                 {
                     c.prefix_cache.enabled = true;
+                }),
+        });
+        spec.add({
+            .long_name = "--no-prefix-cache",
+            .category = "Prefix Cache",
+            .description = "Disable cross-request prefix-state caching",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &)
+                {
+                    c.prefix_cache.enabled = false;
                 }),
         });
         spec.add({
@@ -2398,7 +2408,7 @@ namespace llaminar2
             .long_name = "--prefix-cache-disk-budget-mb",
             .category = "Prefix Cache",
             .value_label = "<mb>",
-            .description = "Prefix cache disk budget in MiB (default: 0)",
+            .description = "Prefix cache disk budget in MiB (default: 32768)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {

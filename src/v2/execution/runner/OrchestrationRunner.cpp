@@ -180,17 +180,28 @@ namespace llaminar2
          *
          * @param registry Canonical process-local physical bank authority.
          * @param owner_order Frozen owner-order policy used to build the epoch.
+         * @param main_layer_count Number of ordinary decoder layers. Any
+         *        subsequently indexed bank is an MTP predictor layer, not an
+         *        out-of-range main graph layer.
          */
         void recordInitialMoEOverlayBankSelections(
             const MoEOverlayParticipantResidencyRegistry &registry,
-            RoutedExpertOwnerOrder owner_order)
+            RoutedExpertOwnerOrder owner_order,
+            int main_layer_count)
         {
             if (!PerfStatsCollector::isDomainEnabled("moe_placement"))
                 return;
+            if (main_layer_count <= 0)
+            {
+                throw std::invalid_argument(
+                    "ExpertOverlay bank evidence requires a positive main-layer count");
+            }
 
             for (const auto &selection :
                  registry.initialBankExpertSelections())
             {
+                const bool mtp_predictor_layer =
+                    selection.layer_idx >= main_layer_count;
                 PerfStatsCollector::addCounter(
                     "moe_placement",
                     "routed_expert_weight_selection",
@@ -210,6 +221,10 @@ namespace llaminar2
                              ? "contiguous"
                              : "noncontiguous"},
                         {"publication", "initial_epoch_bank"},
+                        {"layer_role",
+                         mtp_predictor_layer
+                             ? "mtp_predictor"
+                             : "main_transformer"},
                     });
             }
         }
@@ -2478,6 +2493,19 @@ namespace llaminar2
                 return false;
             }
 
+            // Step 4c.5: Prefix/KV consensus belongs only to dense
+            // continuation ranks. Freeze that communicator before request
+            // admission so expert-only followers never enter cache collectives.
+            if (!run_phase(
+                    "initializeMoEContinuationPrefixCoordination",
+                    [&]
+                    {
+                        return initializeMoEContinuationPrefixCoordination();
+                    }))
+            {
+                return false;
+            }
+
             // Step 4d: Create one owner-map authority before any participant
             // graph can bind its dispatch ticket and runtime placement banks.
             if (!run_phase(
@@ -2550,6 +2578,20 @@ namespace llaminar2
             }
 
             /*
+             * Diagnostic D2D copies are part of native graph topology. Apply
+             * the complete caller policy after participant graph construction
+             * but before either ordinary or ExpertOverlay serving families are
+             * captured. A request-time topology change is then a deliberate
+             * reconfiguration, never an accidental parity warmup.
+             */
+            if (!run_phase(
+                    "applyConfiguredSnapshotCaptureSetup",
+                    [&] { return applyConfiguredSnapshotCaptureSetup(); }))
+            {
+                return false;
+            }
+
+            /*
              * Graph construction resolves the only authoritative prepared
              * engine lifetimes. Materialize inactive slots and transfer lanes,
              * install their exact progress epochs, and only then capture every
@@ -2562,6 +2604,24 @@ namespace llaminar2
                     [&]
                     {
                         return initializeMoEExpertOverlayResidencyMaintenance();
+                    }))
+            {
+                return false;
+            }
+
+            /*
+             * Graph-family capture is a setup transition for every GPU runner,
+             * not a first-request side effect. ExpertOverlay performs the same
+             * transition while composing its transfer-progress branch above;
+             * ordinary dense/TP runners enter it here. Keeping this before
+             * request admission prevents graph warmup from publishing a prefix
+             * that changes the semantics of the first real request.
+             */
+            if (!run_phase(
+                    "materializeOrdinaryServingGraphFamilyWithoutLaunch",
+                    [&]
+                    {
+                        return materializeOrdinaryServingGraphFamilyWithoutLaunch();
                     }))
             {
                 return false;
@@ -2758,6 +2818,13 @@ namespace llaminar2
                 }))
             return false;
         if (!run_phase(
+                "initializeMoEContinuationPrefixCoordination",
+                [&]
+                {
+                    return initializeMoEContinuationPrefixCoordination();
+                }))
+            return false;
+        if (!run_phase(
                 "validateMemoryPlan",
                 [&] { return validateMemoryPlan(); }))
             return false;
@@ -2794,7 +2861,10 @@ namespace llaminar2
             moe_overlay_device_controller_fabric_ ||
             moe_expert_overlay_physical_residency_fabric_ ||
             moe_expert_overlay_remote_projection_transport_ ||
-            moe_expert_overlay_maintenance_service_;
+            moe_expert_overlay_maintenance_service_ ||
+            continuation_prefix_comm_ != MPI_COMM_NULL ||
+            prefix_coordination_scope_ !=
+                PrefixCoordinationScope::OrchestrationWorld;
         if (!was_initialized && !has_live_resources)
         {
             return;
@@ -2844,6 +2914,7 @@ namespace llaminar2
         moe_overlay_inference_transaction_follower_.reset();
         moe_overlay_inference_transaction_coordinator_.reset();
         runner_.reset();
+        releaseMoEContinuationPrefixCoordination();
         moe_overlay_rank_batch_transport_registry_.reset();
         moe_overlay_device_controller_graph_service_.reset();
         moe_overlay_device_controller_fabric_.reset();
@@ -2963,15 +3034,27 @@ namespace llaminar2
             exec.gpu_graphs && exec.prefill_graph_buckets &&
             overlay_schedule.enabled() && !buckets.empty() &&
             token_count > 1;
+        const bool native_captured_prefill =
+            local_executes_physical_buckets && exec.gpu_graphs &&
+            exec.prefill_graph_buckets && !buckets.empty();
 
-        if (long_bucketed_prefill || overlay_scheduled_prefill)
+        /*
+         * A native serving family is captured with a device-resident chunk
+         * materializer ahead of every prefill graph. Route every request and
+         * restored-prefix suffix through that same typed scheduler, including a
+         * one-token suffix. Sending short prompts through forwardPrefill() made
+         * the engine independently choose the same bucket without the immutable
+         * materializer binding, so setup executables could never match runtime.
+         */
+        if (long_bucketed_prefill || overlay_scheduled_prefill ||
+            native_captured_prefill)
         {
             if (!runner_->supportsPrefillChunkSchedule(token_count))
             {
                 ++prefill_chunk_stats_.failures;
                 return setError(
                     failure_message +
-                    " (chunked prefill required by activation graph bucket capacity, "
+                    " (prefill schedule required by the retained serving graph family, "
                     "but runner does not support prefill chunk scheduling)");
             }
 
@@ -3417,19 +3500,48 @@ namespace llaminar2
         {
             try
             {
+                if (!continuation_prefix_participant_)
+                {
+                    return setError(
+                        "Expert-only rank attempted to enter continuation prefix-cache admission");
+                }
                 PrefixLookupResult local_hit = runner_->lookupPrefix(prompt_tokens);
                 PrefixParticipantLookup participant = makePrefixParticipantLookup(
                     mpi_ctx_ ? mpi_ctx_->rank() : 0,
                     runner_->primaryDeviceId(),
                     local_hit,
                     {},
-                    runner_->moeRuntimeMovementEpoch());
+                    runner_->moeRuntimeMovementEpoch(),
+                    plan_.usesGlobalTP() ||
+                            plan_.usesPipelineParallel()
+                        ? PrefixFingerprintCoordinationPolicy::
+                              ValidateParticipantLocally
+                        : PrefixFingerprintCoordinationPolicy::
+                              RequireIdentical);
 
                 PrefixCoordinationResult coordination;
-                if (mpi_ctx_ && mpi_ctx_->world_size() > 1 &&
-                    mpi_ctx_->communicator() != MPI_COMM_NULL)
+                MPI_Comm prefix_coordination_comm = MPI_COMM_NULL;
+                switch (prefix_coordination_scope_)
                 {
-                    MPIPrefixCollectiveCoordinator domain_coordinator(mpi_ctx_->communicator());
+                case PrefixCoordinationScope::OrchestrationWorld:
+                    if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+                        prefix_coordination_comm = mpi_ctx_->communicator();
+                    break;
+                case PrefixCoordinationScope::ProcessLocalContinuation:
+                    break;
+                case PrefixCoordinationScope::ContinuationRankGroup:
+                    if (continuation_prefix_comm_ == MPI_COMM_NULL)
+                    {
+                        return setError(
+                            "Continuation rank lost its prefix-cache subgroup communicator");
+                    }
+                    prefix_coordination_comm = continuation_prefix_comm_;
+                    break;
+                }
+                if (prefix_coordination_comm != MPI_COMM_NULL)
+                {
+                    MPIPrefixCollectiveCoordinator domain_coordinator(
+                        prefix_coordination_comm);
                     coordination = coordinatePrefixLookups({participant}, &domain_coordinator);
                 }
                 else
@@ -3535,7 +3647,8 @@ namespace llaminar2
                 }
 
                 if (matched_tokens == static_cast<int>(prompt_tokens.size()) &&
-                    !(common_hit.has_terminal_logits &&
+                    !((!common_hit.requires_terminal_logits ||
+                       common_hit.has_terminal_logits) &&
                       (!mtp_full_hit_requires_terminal_hidden ||
                        common_hit.has_terminal_hidden)))
                 {
@@ -3560,7 +3673,8 @@ namespace llaminar2
                 auto full_terminal_hit_has_restorable_runtime = [&]() -> bool
                 {
                     if (matched_tokens != static_cast<int>(prompt_tokens.size()) ||
-                        !common_hit.has_terminal_logits ||
+                        (common_hit.requires_terminal_logits &&
+                         !common_hit.has_terminal_logits) ||
                         (mtp_full_hit_requires_terminal_hidden &&
                          !common_hit.has_terminal_hidden) ||
                         common_hit.blocks.empty())
@@ -3654,14 +3768,39 @@ namespace llaminar2
 
                 if (suffix_len > 0)
                 {
-                    if (!forwardPrefillTokens(prompt_tokens.data() + suffix_start,
-                                              suffix_len,
-                                              "Forward pass failed during prefix-cache suffix prefill",
-                                              stable_prefix_prefill_segment_tokens))
+                    if (owns_mtp_continuation_authority &&
+                        matched_tokens > 0 && suffix_len == 1)
+                    {
+                        /*
+                         * The one uncached row is mathematically identical to
+                         * serial decode, but MTP also needs the restored
+                         * terminal archive bridged into depth-zero shifted KV.
+                         * The typed runner entry point owns both operations in
+                         * one production transaction; routing this through the
+                         * prefill scheduler would produce different hidden
+                         * bytes and leave no serial-equivalence proof.
+                         */
+                        if (!runner_->forwardRestoredPrefixMTPDecodeBridge(
+                                {.token_id = prompt_tokens[
+                                     static_cast<size_t>(suffix_start)],
+                                 .restored_prefix_tokens = matched_tokens}))
+                        {
+                            return setError(
+                                "Forward pass failed during the restored-prefix MTP decode bridge");
+                        }
+                    }
+                    else if (!forwardPrefillTokens(
+                                 prompt_tokens.data() + suffix_start,
+                                 suffix_len,
+                                 "Forward pass failed during prefix-cache suffix prefill",
+                                 stable_prefix_prefill_segment_tokens))
+                    {
                         return false;
+                    }
                     prefill_logits_ready_ = true;
                 }
-                else if (common_hit.has_terminal_logits &&
+                else if ((!common_hit.requires_terminal_logits ||
+                          common_hit.has_terminal_logits) &&
                          (!mtp_full_hit_requires_terminal_hidden ||
                           common_hit.has_terminal_hidden) &&
                          runner_->restorePrefixTerminalState(common_hit))
@@ -15423,6 +15562,24 @@ namespace llaminar2
 
     void OrchestrationRunner::clearCache()
     {
+        /*
+         * SHUTDOWN is a terminal command-channel transition on every rank.
+         * A request reset after that transition cannot be coordinated because
+         * followers have deliberately left their receive loops. Reject it
+         * before either the root publishes another command or a follower
+         * advances process-local state against an absent authority.
+         */
+        if (mpi_coordinated_mode_ && mpi_ctx_ &&
+            mpi_ctx_->world_size() > 1 &&
+            mpi_worker_command_lifecycle_ ==
+                MPIWorkerCommandLifecycle::ShutdownPublished)
+        {
+            LLAMINAR_UNREACHABLE(
+                "Cannot clear request state after the MPI worker command channel "
+                "has closed; construct a new OrchestrationRunner for the next "
+                "serving session");
+        }
+
         // Request-boundary reset: broadcast to worker ranks so they clear
         // KV/recurrent state in lockstep while preserving reusable graph caches.
         if (mpi_coordinated_mode_ && mpi_ctx_ &&
@@ -17047,6 +17204,170 @@ namespace llaminar2
         return true;
     }
 
+    bool OrchestrationRunner::initializeMoEContinuationPrefixCoordination()
+    {
+        if (continuation_prefix_comm_ != MPI_COMM_NULL ||
+            prefix_coordination_scope_ !=
+                PrefixCoordinationScope::OrchestrationWorld)
+        {
+            return setError(
+                "Continuation prefix coordination is setup-only");
+        }
+
+        continuation_prefix_participant_ = true;
+        const auto overlay_context =
+            moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_
+                                        : mpi_ctx_;
+        const auto execution = resolveOverlayExecutionPlanForRunner(
+            config_.moe_routed_expert_plan,
+            overlay_context);
+        if (!execution)
+            return true;
+        if (!overlay_context ||
+            overlay_context->communicator() == MPI_COMM_NULL ||
+            overlay_context->world_size() <= 0)
+        {
+            return setError(
+                "ExpertOverlay continuation prefix coordination has no valid MPI world");
+        }
+
+        const std::vector<int> continuation_ranks =
+            execution->continuationWorldRanks();
+        if (continuation_ranks.empty() ||
+            !std::binary_search(
+                continuation_ranks.begin(),
+                continuation_ranks.end(),
+                execution->continuation_root_rank) ||
+            continuation_ranks.front() < 0 ||
+            continuation_ranks.back() >= overlay_context->world_size())
+        {
+            return setError(
+                "ExpertOverlay execution plan has an invalid continuation prefix authority set");
+        }
+
+        const int local_rank = overlay_context->rank();
+        continuation_prefix_participant_ = std::binary_search(
+            continuation_ranks.begin(),
+            continuation_ranks.end(),
+            local_rank);
+
+        if (continuation_ranks.size() == 1u)
+        {
+            prefix_coordination_scope_ =
+                PrefixCoordinationScope::ProcessLocalContinuation;
+        }
+        else if (continuation_ranks.size() ==
+                 static_cast<std::size_t>(overlay_context->world_size()))
+        {
+            for (int rank = 0; rank < overlay_context->world_size(); ++rank)
+            {
+                if (continuation_ranks[static_cast<std::size_t>(rank)] != rank)
+                {
+                    return setError(
+                        "ExpertOverlay continuation prefix world is not a total rank set");
+                }
+            }
+            prefix_coordination_scope_ =
+                PrefixCoordinationScope::OrchestrationWorld;
+        }
+        else
+        {
+            MPI_Comm continuation_comm = MPI_COMM_NULL;
+            const int color = continuation_prefix_participant_
+                                  ? 1
+                                  : MPI_UNDEFINED;
+            const int split_status = MPI_Comm_split(
+                overlay_context->communicator(),
+                color,
+                local_rank,
+                &continuation_comm);
+            if (split_status != MPI_SUCCESS)
+            {
+                return setError(
+                    "Failed to create the ExpertOverlay continuation prefix communicator");
+            }
+
+            if (continuation_prefix_participant_)
+            {
+                int continuation_size = 0;
+                if (continuation_comm == MPI_COMM_NULL ||
+                    MPI_Comm_size(
+                        continuation_comm,
+                        &continuation_size) != MPI_SUCCESS ||
+                    continuation_size !=
+                        static_cast<int>(continuation_ranks.size()))
+                {
+                    if (continuation_comm != MPI_COMM_NULL)
+                        MPI_Comm_free(&continuation_comm);
+                    return setError(
+                        "ExpertOverlay continuation prefix communicator has the wrong participant count");
+                }
+                continuation_prefix_comm_ = continuation_comm;
+            }
+            else if (continuation_comm != MPI_COMM_NULL)
+            {
+                MPI_Comm_free(&continuation_comm);
+                return setError(
+                    "Expert-only rank unexpectedly joined the continuation prefix communicator");
+            }
+            prefix_coordination_scope_ =
+                PrefixCoordinationScope::ContinuationRankGroup;
+        }
+
+        const char *scope =
+            prefix_coordination_scope_ ==
+                    PrefixCoordinationScope::ProcessLocalContinuation
+                ? "process_local_continuation"
+                : (prefix_coordination_scope_ ==
+                           PrefixCoordinationScope::ContinuationRankGroup
+                       ? "continuation_rank_group"
+                       : "orchestration_world");
+        PerfStatsCollector::addCounter(
+            "prefix_cache",
+            "coordination_scope_installed",
+            1.0,
+            "model_setup",
+            {},
+            {{"scope", scope},
+             {"continuation_ranks",
+              std::to_string(continuation_ranks.size())},
+             {"participant",
+              continuation_prefix_participant_ ? "true" : "false"},
+             {"expert_only_ranks_excluded",
+              continuation_ranks.size() <
+                      static_cast<std::size_t>(
+                          overlay_context->world_size())
+                  ? "true"
+                  : "false"}});
+        return true;
+    }
+
+    void OrchestrationRunner::releaseMoEContinuationPrefixCoordination() noexcept
+    {
+        if (continuation_prefix_comm_ != MPI_COMM_NULL)
+        {
+            int initialized = 0;
+            int finalized = 0;
+            const bool mpi_live =
+                MPI_Initialized(&initialized) == MPI_SUCCESS && initialized &&
+                MPI_Finalized(&finalized) == MPI_SUCCESS && !finalized;
+            if (!mpi_live)
+            {
+                LOG_ERROR(
+                    "[OrchestrationRunner] Continuation prefix communicator outlived MPI");
+            }
+            else if (MPI_Comm_free(&continuation_prefix_comm_) != MPI_SUCCESS)
+            {
+                LOG_ERROR(
+                    "[OrchestrationRunner] Failed to release continuation prefix communicator");
+            }
+            continuation_prefix_comm_ = MPI_COMM_NULL;
+        }
+        prefix_coordination_scope_ =
+            PrefixCoordinationScope::OrchestrationWorld;
+        continuation_prefix_participant_ = true;
+    }
+
     bool OrchestrationRunner::initializeMoEExpertOverlayResidencyAuthority()
     {
         shutdownMoEExpertOverlayResidencyMaintenance();
@@ -17610,9 +17931,17 @@ namespace llaminar2
                 "ExpertOverlay maintenance requires a valid initial residency snapshot");
         }
 
+        const int raw_layer_count = std::max(
+            model_ctx_->totalBlockCount(),
+            model_ctx_->blockCount());
+        const int main_layer_count = mainLayerCountExcludingMTP(
+            model_ctx_->concreteLoader(),
+            model_ctx_->architecture(),
+            raw_layer_count);
         recordInitialMoEOverlayBankSelections(
             *moe_expert_overlay_participant_residency_,
-            initial_snapshot->placement_plan->owner_order);
+            initial_snapshot->placement_plan->owner_order,
+            main_layer_count);
 
         std::string perf_device;
         for (const auto &tier : initial_snapshot->placement_plan->routed_tiers)
@@ -18932,6 +19261,40 @@ namespace llaminar2
             return cfg;
         };
 
+        /**
+         * Bind the same exact rank-local TP assignment used by graph and
+         * weight construction. Memory admission must not independently divide
+         * model dimensions because GQA KV replication and remainder shards
+         * make that reconstruction lossy.
+         */
+        const auto bindRankLocalTPAssignment = [&profile](
+            DevicePlanConfig &cfg,
+            const std::vector<GlobalDeviceAddress> &participants,
+            const std::vector<float> &configured_weights)
+        {
+            if (participants.size() <= 1u)
+                return;
+
+            std::vector<DeviceId> devices;
+            devices.reserve(participants.size());
+            for (const auto &participant : participants)
+                devices.push_back(participant.toLocalDeviceId());
+
+            std::vector<float> weights = configured_weights;
+            if (weights.empty())
+                weights.assign(devices.size(), 1.0f);
+            const auto assignment =
+                TensorParallelConfig::proportionalSplit(
+                    devices,
+                    weights,
+                    profile.n_heads,
+                    profile.n_kv_heads,
+                    profile.d_ff,
+                    profile.vocab_size);
+            cfg.bindTensorParallelAssignment(
+                assignment.forRank(cfg.shard_index));
+        };
+
         const bool has_expert_overlay =
             config_.moe_routed_expert_plan &&
             config_.moe_routed_expert_plan
@@ -19080,6 +19443,38 @@ namespace llaminar2
                         residency.continuation_first_layer;
                     cfg.last_layer =
                         residency.continuation_last_layer;
+
+                    if (plan_.usesLocalTP())
+                    {
+                        bindRankLocalTPAssignment(
+                            cfg,
+                            plan_.local_tp_devices,
+                            plan_.local_tp_weights);
+                    }
+                    else if (plan_.usesLocalPP())
+                    {
+                        const auto &boundaries =
+                            plan_.local_pp_layer_boundaries;
+                        for (std::size_t stage = 0;
+                             stage < plan_.local_pp_stage_tp_info.size() &&
+                             stage + 1u < boundaries.size();
+                             ++stage)
+                        {
+                            const auto &stage_tp =
+                                plan_.local_pp_stage_tp_info[stage];
+                            if (stage_tp.devices.size() <= 1u ||
+                                boundaries[stage] != cfg.first_layer ||
+                                boundaries[stage + 1u] - 1 != cfg.last_layer)
+                            {
+                                continue;
+                            }
+                            bindRankLocalTPAssignment(
+                                cfg,
+                                stage_tp.devices,
+                                stage_tp.tp_weights);
+                            break;
+                        }
+                    }
                 }
                 /*
                  * Qwen's graph-native overlay declares one serial execution
@@ -19170,6 +19565,10 @@ namespace llaminar2
                         auto cfg = makeConfigForDevice(
                             tp_info.devices[tp_idx].toLocalDeviceId(),
                             tp_idx, tp_degree);
+                        bindRankLocalTPAssignment(
+                            cfg,
+                            tp_info.devices,
+                            tp_info.tp_weights);
                         cfg.first_layer = stage_first;
                         cfg.last_layer = stage_last;
                         device_configs.push_back(cfg);
@@ -19192,10 +19591,15 @@ namespace llaminar2
             device_configs.reserve(plan_.local_tp_devices.size());
             for (int index = 0; index < total_shards; ++index)
             {
-                device_configs.push_back(makeConfigForDevice(
+                auto cfg = makeConfigForDevice(
                     plan_.local_tp_devices[static_cast<size_t>(index)].toLocalDeviceId(),
                     index,
-                    total_shards));
+                    total_shards);
+                bindRankLocalTPAssignment(
+                    cfg,
+                    plan_.local_tp_devices,
+                    plan_.local_tp_weights);
+                device_configs.push_back(std::move(cfg));
             }
         }
         else
@@ -20173,6 +20577,112 @@ namespace llaminar2
     }
 
     bool OrchestrationRunner::
+        materializeOrdinaryServingGraphFamilyWithoutLaunch()
+    {
+        if (!runner_)
+        {
+            return setError(
+                "Ordinary serving graph setup requires a constructed inference runner");
+        }
+
+        const auto &overlay_plan = config_.moe_routed_expert_plan;
+        if (overlay_plan && overlay_plan->usesExpertOverlayAuthority())
+        {
+            /*
+             * Overlay graph capture is inseparable from its exact background
+             * transfer epoch. Its maintenance composer has already sealed the
+             * same runner through the overlay-specific setup transition.
+             */
+            return true;
+        }
+
+        const ServingGraphPreparationKind preparation_kind =
+            runner_->servingGraphPreparationKind();
+        if (preparation_kind == ServingGraphPreparationKind::EagerHostGraph)
+            return true;
+        if (preparation_kind == ServingGraphPreparationKind::Unresolved)
+        {
+            if (!runner_->primaryDeviceId().is_gpu() ||
+                !debugEnv().execution.gpu_graphs)
+            {
+                return true;
+            }
+            return setError(
+                "GPU runner did not declare a serving graph preparation lifecycle");
+        }
+
+        const auto &execution = debugEnv().execution;
+        const std::vector<int> buckets =
+            prefillGraphBucketsAtOrBelowCapacity(
+                execution.prefill_graph_bucket_sizes,
+                plan_.runtime.resident_graph_rows);
+        ServingGraphFamilyMaterializationPlan family_plan{
+            .prefill_bucket_rows = buckets,
+            .prefill_pad_token_id = execution.prefill_graph_pad_token_id,
+            .main_decode_graph =
+                ServingMainDecodeGraphKind::HistoryBearingSerial,
+        };
+        if (!execution.gpu_graphs || !execution.prefill_graph_buckets ||
+            !family_plan.valid())
+        {
+            return setError(
+                "Native GPU serving graph setup has no valid memory-admitted prefill bucket family");
+        }
+        if (!runner_->materializeServingGraphFamilyWithoutLaunch(family_plan))
+        {
+            return setError(
+                "Ordinary GPU runner could not seal its admitted serving graph family");
+        }
+
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "ordinary_serving_family_completions",
+            1.0,
+            "setup",
+            runner_->primaryDeviceId().toString(),
+            {{"prefill_buckets", std::to_string(buckets.size())},
+             {"graph_row_capacity",
+              std::to_string(plan_.runtime.resident_graph_rows)},
+             {"main_decode", "history_bearing_serial"},
+             {"preparation_kind", "native_device_executable_family"},
+             {"request_state_mutations", "0"},
+             {"executable_launches", "0"}});
+        return true;
+    }
+
+    bool OrchestrationRunner::applyConfiguredSnapshotCaptureSetup()
+    {
+        if (!snapshot_capture_setup_.enabled())
+            return true;
+        if (!runner_)
+        {
+            return setError(
+                "Snapshot capture setup requires a constructed inference runner");
+        }
+
+        /*
+         * Install the filter while capture is still disabled, then enable the
+         * callback exactly once. DeviceGraphOrchestrator consequently records
+         * one topology epoch containing the final set of D2D copy nodes; it
+         * never captures an unfiltered intermediate graph.
+         */
+        runner_->setSnapshotCaptureFilter(snapshot_capture_setup_.filter);
+        runner_->enableSnapshotCapture(
+            snapshot_capture_setup_.output_directory);
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "snapshot_topology_installed_before_serving_capture",
+            1.0,
+            "setup",
+            runner_->primaryDeviceId().toString(),
+            {{"filter_mode",
+              snapshot_capture_setup_.filter.empty() ? "all" : "selected"},
+             {"selected_keys",
+              std::to_string(snapshot_capture_setup_.filter.size())}});
+        return true;
+    }
+
+    bool OrchestrationRunner::
         bindMoEOverlayTransferProgressAndMaterializeServingGraphFamily()
     {
         const auto overlay_context =
@@ -20181,15 +20691,19 @@ namespace llaminar2
         const auto execution = resolveOverlayExecutionPlanForRunner(
             config_.moe_routed_expert_plan,
             overlay_context);
-        if (!execution || !overlay_context ||
-            overlay_context->world_size() <= 1)
+        if (!execution)
         {
             return true;
+        }
+        if (!overlay_context)
+        {
+            return setError(
+                "ExpertOverlay serving graph setup lost its MPI/rank context");
         }
         if (!runner_)
         {
             return setError(
-                "Distributed ExpertOverlay serving graph setup requires a built inference runner");
+                "ExpertOverlay serving graph setup requires a built inference runner");
         }
 
         /*
@@ -20219,7 +20733,7 @@ namespace llaminar2
                             std::move(epoch)))
                     {
                         return setError(
-                            "Distributed ExpertOverlay could not bind the physical transfer-progress epoch to its exact inference runner on " +
+                            "ExpertOverlay could not bind the physical transfer-progress epoch to its exact inference runner on " +
                             device.toString());
                     }
                     ++transfer_progress_epoch_count;
@@ -20229,7 +20743,7 @@ namespace llaminar2
             {
                 return setError(
                     std::string(
-                        "Distributed ExpertOverlay transfer-progress inventory binding failed: ") +
+                        "ExpertOverlay transfer-progress inventory binding failed: ") +
                     error.what());
             }
         }
@@ -20240,14 +20754,14 @@ namespace llaminar2
             ServingGraphPreparationKind::Unresolved)
         {
             return setError(
-                "Distributed ExpertOverlay runner did not declare a serving graph preparation lifecycle");
+                "ExpertOverlay runner did not declare a serving graph preparation lifecycle");
         }
         if (preparation_kind ==
                 ServingGraphPreparationKind::EagerHostGraph &&
             transfer_progress_epoch_count != 0u)
         {
             return setError(
-                "Distributed ExpertOverlay eager host graph unexpectedly owns a device transfer-progress epoch");
+                "ExpertOverlay eager host graph unexpectedly owns a device transfer-progress epoch");
         }
 
         const auto &schedule = plan_.runtime.overlay_prefill_schedule;
@@ -20264,17 +20778,25 @@ namespace llaminar2
                 schedule.graph_row_capacity)
         {
             return setError(
-                "Distributed ExpertOverlay serving graph setup requires the frozen common prefill schedule produced by memory admission");
+                "ExpertOverlay serving graph setup requires the frozen common prefill schedule produced by memory admission");
         }
 
-        /* Both preparation kinds enter the same terminal Sealed state. Native
-         * runners instantiate their executable family here; eager host
-         * followers validate their retained CPU endpoints and publish the same
-         * ticket-admission transition without pretending to own GPU capture. */
-        if (!runner_->materializeServingGraphFamilyWithoutLaunch(family_plan))
+        /*
+         * EagerHostGraph is itself the typed proof that construction already
+         * completed the CPU graph. It has no second capture/materialization
+         * transition: probing the native method would route a CPU participant
+         * into GPU-only stream, arena, and executable-cache requirements.
+         * Native runners, by contrast, must instantiate the complete family
+         * here before ticket authority is installed. Both paths validate the
+         * same frozen overlay schedule above and reach this one orchestration
+         * completion edge.
+         */
+        if (preparation_kind ==
+                ServingGraphPreparationKind::NativeDeviceExecutableFamily &&
+            !runner_->materializeServingGraphFamilyWithoutLaunch(family_plan))
         {
             return setError(
-                "Distributed ExpertOverlay runner could not seal its admitted serving graph family");
+                "ExpertOverlay runner could not seal its admitted serving graph family");
         }
         PerfStatsCollector::addCounter(
             "forward_graph",
@@ -20295,6 +20817,10 @@ namespace llaminar2
                   : "eager_host_graph"},
              {"runner_role",
               toString(execution->currentRankPlan().execution_kind)},
+             {"rank_scope",
+              overlay_context->world_size() > 1
+                  ? "cross_rank"
+                  : "rank_local"},
              {"transfer_progress_binding",
               transfer_progress_epoch_count != 0u
                   ? "graph_owned_parallel_branch"
@@ -21236,14 +21762,19 @@ namespace llaminar2
     void OrchestrationRunner::enableSnapshotCapture(const std::string &output_dir)
     {
         snapshot_combined_cache_.clear();
+        snapshot_capture_setup_.mode = SnapshotCaptureSetup::Mode::Enabled;
+        snapshot_capture_setup_.output_directory = output_dir;
         if (runner_)
         {
+            /* Keep the delegated runner aligned with the one retained policy. */
+            runner_->setSnapshotCaptureFilter(snapshot_capture_setup_.filter);
             runner_->enableSnapshotCapture(output_dir);
         }
     }
 
     void OrchestrationRunner::setSnapshotCaptureFilter(const std::vector<std::string> &keys)
     {
+        snapshot_capture_setup_.filter = keys;
         if (runner_)
         {
             runner_->setSnapshotCaptureFilter(keys);
@@ -21253,6 +21784,8 @@ namespace llaminar2
     void OrchestrationRunner::disableSnapshotCapture()
     {
         snapshot_combined_cache_.clear();
+        snapshot_capture_setup_.mode = SnapshotCaptureSetup::Mode::Disabled;
+        snapshot_capture_setup_.output_directory.clear();
         if (runner_)
         {
             runner_->disableSnapshotCapture();
@@ -21806,6 +22339,18 @@ namespace llaminar2
         if (!mpi_coordinated_mode_ || !mpi_ctx_ || mpi_ctx_->world_size() <= 1)
             return;
 
+        if (mpi_ctx_->rank() != mpi_coordinated_root_rank_)
+        {
+            LLAMINAR_UNREACHABLE(
+                "Only the coordinated root may publish an MPI worker command");
+        }
+        if (mpi_worker_command_lifecycle_ !=
+            MPIWorkerCommandLifecycle::AcceptingCommands)
+        {
+            LLAMINAR_UNREACHABLE(
+                "Cannot publish an MPI worker command after terminal SHUTDOWN");
+        }
+
         int32_t tag = static_cast<int32_t>(cmd);
         mpi_ctx_->broadcast_int32(
             &tag, 1, mpi_coordinated_root_rank_);
@@ -21858,6 +22403,16 @@ namespace llaminar2
             (reason.empty() ? "no failure detail was recorded" : reason) +
             "; aborting because further collective order is indeterminate";
         LOG_ERROR(diagnostic);
+
+        /*
+         * A coordinated fatal error is precisely where participant-local
+         * timings are most useful.  MPI_Abort bypasses ordinary runner
+         * teardown, so publish the already-collected, rank-qualified evidence
+         * before terminating the communicator. This performs no recovery and
+         * cannot alter collective order; it only preserves diagnostics when
+         * the caller explicitly configured a PerfStats artifact.
+         */
+        (void)PerfStatsCollector::flushFromEnv();
 
         // A real worker cannot safely receive another root command after a
         // graph-stage failure: a peer may already be waiting in a sparse MoE
@@ -22280,6 +22835,14 @@ namespace llaminar2
             {
                 LOG_DEBUG("[MPIWorkerLoop] Rank " << mpi_ctx_->rank()
                                                   << " received SHUTDOWN");
+                /*
+                 * The collective receive is the follower's terminal protocol
+                 * edge. Publish it locally before draining maintenance so no
+                 * later fixture or server cleanup can mutate request state
+                 * after this rank has left the command channel.
+                 */
+                mpi_worker_command_lifecycle_ =
+                    MPIWorkerCommandLifecycle::ShutdownPublished;
                 shutdownMoEExpertOverlayResidencyMaintenance();
                 return;
             }

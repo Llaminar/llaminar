@@ -1699,6 +1699,32 @@ TEST(Test__PrefillGraphCache, CaptureTransactionUsesExplicitStreamOverload)
     EXPECT_EQ(gpu_ctx.capture_probe_.begin_calls, 1);
     EXPECT_EQ(gpu_ctx.capture_probe_.end_calls, 1);
     EXPECT_EQ(gpu_ctx.capture_probe_.instantiate_calls, 1);
+    EXPECT_TRUE(cache.materializedTransactionZeroPending(key));
+    EXPECT_EQ(cache.replayCount(key), 0);
+
+    EXPECT_TRUE(cache.launch(key));
+    EXPECT_FALSE(cache.materializedTransactionZeroPending(key));
+    EXPECT_EQ(cache.replayCount(key), 1);
+}
+
+TEST(Test__PrefillGraphCache, SetupMaterializationArmsColdEntryWithoutWarmup)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+    const auto key = makeGPUKey(512);
+
+    ASSERT_EQ(cache.phase(key), PrefillGraphPhase::Cold);
+    cache.markInitializedForSetupMaterialization(key);
+
+    EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Initialized);
+    EXPECT_EQ(cache.warmupCount(key), 0);
+    EXPECT_EQ(cache.initializedCount(key), 1);
+    EXPECT_FALSE(cache.hasGraph(key));
+    EXPECT_FALSE(cache.materializedTransactionZeroPending(key));
+
+    cache.markInitializedForSetupMaterialization(key);
+    EXPECT_EQ(cache.initializedCount(key), 1)
+        << "Idempotent setup discovery must not invent another lifecycle transition";
 }
 
 TEST(Test__PrefillGraphCache, CaptureBodyFailureClosesTransactionAndStaysCold)

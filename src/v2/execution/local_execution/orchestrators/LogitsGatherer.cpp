@@ -121,15 +121,18 @@ namespace llaminar2
     {
         if (pinned_ && buffer_)
         {
-            // Use the stored device type from pinForDevice() to select the correct
-            // backend for unpinning. Previously this probed CUDA first, which caused
-            // cudaHostUnregister failures when the buffer was actually pinned via HIP.
-            DeviceId probe{pinned_device_type_, 0};
-            IBackend *backend = resolveBackend(probe);
+            IBackend *backend = resolveBackend(pinned_device_);
             if (backend)
             {
-                backend->unpinHostMemory(buffer_->mutable_data());
-                LOG_DEBUG("LogitsGatherer: Unpinned buffer via " << probe.toString());
+                if (!backend->unpinHostMemory(
+                        buffer_->mutable_data(), pinned_device_.gpu_ordinal()))
+                {
+                    LOG_ERROR("LogitsGatherer: Failed to retire pinned buffer via "
+                              << pinned_device_.toString());
+                    std::terminate();
+                }
+                LOG_DEBUG("LogitsGatherer: Unpinned buffer via "
+                          << pinned_device_.toString());
             }
             pinned_ = false;
         }
@@ -152,10 +155,11 @@ namespace llaminar2
             return;
 
         size_t pin_bytes = pin_elements * sizeof(float);
-        if (backend->pinHostMemory(buffer_->mutable_data(), pin_bytes))
+        if (backend->pinHostMemory(
+                buffer_->mutable_data(), pin_bytes, device.gpu_ordinal()))
         {
             pinned_ = true;
-            pinned_device_type_ = device.type; // Remember which backend pinned it
+            pinned_device_ = device;
             LOG_DEBUG("LogitsGatherer: Pinned decode row prefix (" << (pin_bytes / 1024)
                                                                     << " KB of "
                                                                     << ((buffer_->numel() * sizeof(float)) / 1024)

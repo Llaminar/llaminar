@@ -148,6 +148,50 @@ namespace
 
 } // namespace
 
+/**
+ * @brief Assign exactly one host observer to a captured ticket.
+ *
+ * The first host materializer acquires the ticket-owned mapped timeline. A
+ * downstream sparse stage consuming its immutable dispatch output must retain
+ * the typed materialized role and cannot observe the publication a second time.
+ */
+TEST(Test__MoEOverlayCollectiveWorkspace,
+     MaterializedHostDispatchRetainsSingleTicketObserverRole)
+{
+    auto ticket = std::make_shared<MoEOverlayDispatchTicketStorage>();
+
+    MoESparseDispatchStage::Params direct_params;
+    direct_params.ticket_storage = ticket;
+    MoESparseDispatchStage direct_stage(std::move(direct_params));
+    EXPECT_EQ(
+        direct_stage.params().ticket_observation_role,
+        MoESparseDispatchStage::TicketObservationRole::
+            DirectCapturedProducer);
+
+    auto dispatch_output = std::make_shared<MoEExpertDispatchOutput>();
+    MoESparseDispatchStage::Params materialized_params;
+    materialized_params.ticket_storage = ticket;
+    materialized_params.dispatch_output_lifetime = dispatch_output;
+    materialized_params.ticket_observation_role =
+        MoESparseDispatchStage::TicketObservationRole::
+            MaterializedHostDispatch;
+    MoESparseDispatchStage materialized_stage(
+        std::move(materialized_params));
+    EXPECT_EQ(
+        materialized_stage.params().ticket_observation_role,
+        MoESparseDispatchStage::TicketObservationRole::
+            MaterializedHostDispatch);
+
+    MoESparseDispatchStage::Params invalid_params;
+    invalid_params.ticket_storage = std::move(ticket);
+    invalid_params.ticket_observation_role =
+        MoESparseDispatchStage::TicketObservationRole::
+            MaterializedHostDispatch;
+    EXPECT_THROW(
+        MoESparseDispatchStage(std::move(invalid_params)),
+        std::invalid_argument);
+}
+
 TEST(Test__MoEOverlayCollectiveWorkspace,
      RankBatchTransportCannotRegressToBlockingSendWaits)
 {
@@ -671,8 +715,14 @@ TEST(Test__MoEOverlayCollectiveWorkspace, DispatchTicketRejectsInvalidLogicalPre
 TEST(Test__MoEOverlayCollectiveWorkspace,
      TransportedHiddenRowsPublishCanonicalRouterQ8Bytes)
 {
-    constexpr int rows = 3;
-    constexpr int d_model = 65;
+    /*
+     * This geometry deliberately crosses the production parallel-publication
+     * threshold. A per-row oracle below remains on the serial M=1 path, so the
+     * test proves that distributing independent rows cannot change any Q8_1
+     * payload byte.
+     */
+    constexpr int rows = 64;
+    constexpr int d_model = 2048;
     constexpr int experts = 4;
     constexpr int top_k = 2;
     constexpr int blocks_per_row =
@@ -717,6 +767,33 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
     EXPECT_EQ(std::memcmp(transported, routed, publication_bytes), 0)
         << "The heterogeneous CPU boundary must publish the exact Q8_1 bytes "
            "owned by the ordinary CPU router path.";
+
+    std::vector<Q8_1Block> serial_rows(
+        static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row));
+    CPUMoEKernel serial_kernel;
+    for (int row = 0; row < rows; ++row)
+    {
+        const float *const source =
+            hidden.data() + static_cast<size_t>(row) * d_model;
+        ASSERT_TRUE(serial_kernel.publishTransportedRouterQ8Hidden(
+            source, 1, d_model));
+        const Q8_1Block *const serial =
+            serial_kernel.publishedRouterQ8Hidden(source, 1, d_model);
+        ASSERT_NE(serial, nullptr);
+        std::copy_n(
+            serial,
+            blocks_per_row,
+            serial_rows.data() +
+                static_cast<size_t>(row) * blocks_per_row);
+    }
+    EXPECT_EQ(
+        std::memcmp(
+            transported,
+            serial_rows.data(),
+            publication_bytes),
+        0)
+        << "Parallel transported-row publication must be byte-identical to "
+           "serial M=1 publication in logical row order.";
     EXPECT_EQ(
         transported_kernel.publishedRouterQ8Hidden(
             hidden.data() + 1, rows, d_model),
@@ -727,6 +804,60 @@ TEST(Test__MoEOverlayCollectiveWorkspace,
             hidden.data(), rows, d_model - 1),
         nullptr)
         << "Publication provenance must reject a mismatched hidden width.";
+
+    /*
+     * The production ExpertOverlay endpoint consumes rows in expert-major
+     * order. Prove that direct indexed publication, including a duplicated
+     * source row, emits exactly the same blocks as the canonical row-major
+     * router publication without relying on a second gather pass.
+     */
+    const std::vector<int> expert_major_source_rows = {
+        rows - 1, 0, 7, 7, 12, 1};
+    std::vector<Q8_1Block> expert_major(
+        expert_major_source_rows.size() *
+        static_cast<size_t>(blocks_per_row));
+    CPUMoEKernel expert_major_kernel;
+    ASSERT_TRUE(
+        expert_major_kernel.publishTransportedRouterQ8HiddenExpertMajor(
+            hidden.data(),
+            rows,
+            d_model,
+            expert_major_source_rows,
+            expert_major));
+    for (size_t output_row = 0;
+         output_row < expert_major_source_rows.size();
+         ++output_row)
+    {
+        const size_t source_block =
+            static_cast<size_t>(expert_major_source_rows[output_row]) *
+            static_cast<size_t>(blocks_per_row);
+        const size_t destination_block =
+            output_row * static_cast<size_t>(blocks_per_row);
+        EXPECT_EQ(
+            std::memcmp(
+                expert_major.data() + destination_block,
+                transported + source_block,
+                static_cast<size_t>(blocks_per_row) * sizeof(Q8_1Block)),
+            0)
+            << "Direct expert-major publication diverged at output row "
+            << output_row;
+    }
+
+    const std::vector<int> invalid_source_rows = {0, rows};
+    EXPECT_FALSE(
+        expert_major_kernel.publishTransportedRouterQ8HiddenExpertMajor(
+            hidden.data(),
+            rows,
+            d_model,
+            invalid_source_rows,
+            expert_major));
+    EXPECT_FALSE(
+        expert_major_kernel.publishTransportedRouterQ8HiddenExpertMajor(
+            hidden.data(),
+            rows,
+            d_model,
+            expert_major_source_rows,
+            std::span<Q8_1Block>(expert_major.data(), 1u)));
 }
 
 TEST(Test__MoEOverlayCollectiveWorkspace, MTPCollectiveKeysDoNotAliasMainGraphKeys)

@@ -733,6 +733,9 @@ namespace llaminar2::test
 
         ASSERT_EQ(execution_plan.rank_plans.size(), 2u);
         EXPECT_EQ(execution_plan.continuation_root_rank, 0);
+        EXPECT_EQ(
+            execution_plan.continuationWorldRanks(),
+            (std::vector<int>{0}));
         const auto *rank0 = execution_plan.rankPlanFor(0);
         const auto *rank1 = execution_plan.rankPlanFor(1);
         ASSERT_NE(rank0, nullptr);
@@ -769,6 +772,9 @@ namespace llaminar2::test
             });
 
         ASSERT_EQ(execution_plan.continuation_root_rank, 0);
+        EXPECT_EQ(
+            execution_plan.continuationWorldRanks(),
+            (std::vector<int>{0, 1}));
         const auto *root = execution_plan.rankPlanFor(0);
         const auto *participant = execution_plan.rankPlanFor(1);
         ASSERT_NE(root, nullptr);

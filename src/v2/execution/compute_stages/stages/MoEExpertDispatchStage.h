@@ -235,10 +235,6 @@ namespace llaminar2
         bool isGraphCapturable() const override { return false; }
         /** @return true because heterogeneous ExpertOverlay executes this host descriptor between captured device regions. */
         bool isManualGraphBoundary() const override { return true; }
-        bool requiresHostGraphTicketFence() const override
-        {
-            return params_.ticket_storage != nullptr;
-        }
         bool supportsPaddedPrefillGraphCapturePreflight() const override
         {
             return params_.ticket_storage != nullptr;

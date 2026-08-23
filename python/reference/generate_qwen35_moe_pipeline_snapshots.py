@@ -43,6 +43,10 @@ from python.reference.generate_qwen35_pipeline_snapshots import (
     run_prefill_and_decode,
     write_metadata,
 )
+from python.reference.mtp_sidecar_reference import (
+    normalize_mtp_branch_override_batches,
+    promote_mtp_sidecar_metadata,
+)
 
 
 # Increment whenever an existing snapshot key changes semantic meaning.  The
@@ -61,40 +65,6 @@ MTP_SIDECAR_SNAPSHOT_SCHEMA = QWEN36_MTP_SIDECAR_SNAPSHOT_SCHEMA
 # post-softmax probability distribution retained by the live CUDA/ROCm routing
 # workspace. Packs without this marker used the retired raw linear projection.
 MOE_ROUTER_SNAPSHOT_SCHEMA = 1
-
-
-def normalize_mtp_branch_override_batches(raw_overrides):
-    """Normalize one legacy override map or a campaign batch of maps.
-
-    A single map remains accepted for direct developer use.  The production
-    campaign supplies an array so every branch observed by all matrix cells can
-    share one loaded 122B Hugging Face model.  Each batch intentionally retains
-    at most one branch per decode step because the reference replay API owns one
-    recurrent trajectory per pass.
-    """
-
-    raw_batches = (
-        raw_overrides if isinstance(raw_overrides, list) else [raw_overrides]
-    )
-    if not raw_batches or any(not isinstance(batch, dict) for batch in raw_batches):
-        raise ValueError(
-            "MTP branch overrides must be a JSON object or a non-empty "
-            "array of JSON objects"
-        )
-
-    normalized_batches = []
-    for batch in raw_batches:
-        normalized = {}
-        for step, tokens in batch.items():
-            if not isinstance(tokens, list) or any(
-                isinstance(token, (list, dict)) for token in tokens
-            ):
-                raise ValueError(
-                    "Every MTP branch override must be one flat token array"
-                )
-            normalized[int(step)] = [int(token) for token in tokens]
-        normalized_batches.append(normalized)
-    return normalized_batches
 
 
 def main():
@@ -178,6 +148,14 @@ Examples:
             "snapshots without rewriting the canonical main-model pack"
         ),
     )
+    parser.add_argument(
+        "--mtp-sidecar-only",
+        action="store_true",
+        help=(
+            "Add canonical recursive MTP snapshots to an existing authenticated "
+            "main-model pack using only the bounded sidecar model context"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -194,9 +172,23 @@ Examples:
     print(f"  MTP sidecar snapshots: {args.mtp_sidecar_snapshots}")
     print(f"  MTP maximum draft depth: {args.mtp_max_draft_depth}")
     print(f"  MTP branch overrides: {args.mtp_branch_overrides}")
+    print(f"  MTP sidecar only: {args.mtp_sidecar_only}")
 
     if args.mtp_max_draft_depth < 1 or args.mtp_max_draft_depth > 15:
         raise ValueError("--mtp-max-draft-depth must be in [1, 15]")
+    if args.mtp_sidecar_only and not args.mtp_sidecar_snapshots:
+        raise ValueError("--mtp-sidecar-only requires --mtp-sidecar-snapshots")
+    if args.mtp_sidecar_only and args.metadata_only:
+        raise ValueError("--mtp-sidecar-only is incompatible with --metadata-only")
+    if args.mtp_sidecar_only and args.decode_snapshots_only:
+        raise ValueError(
+            "--mtp-sidecar-only is incompatible with --decode-snapshots-only"
+        )
+    if args.mtp_sidecar_only and args.mtp_branch_overrides is not None:
+        raise ValueError(
+            "--mtp-sidecar-only is canonical generation and cannot be combined "
+            "with branch overrides"
+        )
 
     branch_override_batches = None
     if args.mtp_branch_overrides is not None:
@@ -213,12 +205,16 @@ Examples:
 
     # Create and load model via registry. Additive branch campaigns consume
     # the authenticated main-model trajectory already in ``args.output`` and
-    # therefore load only the graph-external MTP sidecar context. Canonical
-    # pack generation still owns the complete Hugging Face model.
+    # therefore load only the graph-external MTP sidecar context. A typed
+    # sidecar-only repair may also generate the canonical recursive branch from
+    # the exact committed trajectory authenticated by that immutable pack.
     print("\nLoading model...")
+    sidecar_context = (
+        args.mtp_sidecar_only or branch_override_batches is not None
+    )
     reference_kwargs = (
         {"mtp_sidecar_reference_pack": args.output}
-        if branch_override_batches is not None
+        if sidecar_context
         else {}
     )
     model = create_reference_model(
@@ -227,7 +223,7 @@ Examples:
     print("Model loaded successfully")
 
     # Run inference and save snapshots
-    if branch_override_batches is None:
+    if not sidecar_context:
         total, token_ids, decode_tokens = run_prefill_and_decode(
             model,
             args.prompt,
@@ -241,7 +237,7 @@ Examples:
     else:
         if not args.output.is_dir() or not (args.output / "metadata.txt").is_file():
             raise ValueError(
-                "Additive MTP branch generation requires an existing canonical pack"
+                "Sidecar-context generation requires an existing canonical pack"
             )
         total = 0
         token_ids = []
@@ -258,6 +254,7 @@ Examples:
                 max_draft_depth=args.mtp_max_draft_depth,
                 verbose=args.verbose,
                 draft_token_overrides=branch_overrides,
+                reuse_canonical_main_trajectory=args.mtp_sidecar_only,
             )
         total += mtp_total
         (args.output / "mtp_sidecar_snapshot_schema.txt").write_text(
@@ -272,7 +269,7 @@ Examples:
             )
 
     # Write metadata
-    if branch_override_batches is None:
+    if not sidecar_context:
         write_metadata(
             args.output,
             args.model,
@@ -292,6 +289,10 @@ Examples:
                     else []
                 ),
             ],
+        )
+    elif args.mtp_sidecar_only:
+        promote_mtp_sidecar_metadata(
+            args.output / "metadata.txt", args.mtp_max_draft_depth
         )
 
     print(f"\n✓ Done! {total} snapshots saved to: {args.output}")

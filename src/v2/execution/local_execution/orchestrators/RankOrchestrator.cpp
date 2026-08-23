@@ -2548,14 +2548,16 @@ namespace llaminar2
         switch (mode_)
         {
         case ParallelismMode::TP:
-            success = forwardTP(tokens, seq_len, /*force_prefill_phase=*/false);
+            success = forwardTP(
+                tokens, seq_len, MainForwardDispatch::Automatic);
             break;
         case ParallelismMode::PP:
         case ParallelismMode::TP_PP:
             // PP and TP_PP both use sequential stage execution
             // The difference is that TP_PP stages may be nested MDOs (TP domains)
             // but forwardPP() works through IInferenceRunner interface regardless
-            success = forwardPP(tokens, seq_len, /*force_prefill_phase=*/false);
+            success = forwardPP(
+                tokens, seq_len, MainForwardDispatch::Automatic);
             break;
         default:
             LOG_ERROR("RankOrchestrator::forward: Unknown parallelism mode");
@@ -2570,12 +2572,50 @@ namespace llaminar2
         switch (mode_)
         {
         case ParallelismMode::TP:
-            return forwardTP(tokens, seq_len, /*force_prefill_phase=*/true);
+            return forwardTP(
+                tokens, seq_len, MainForwardDispatch::Prefill);
         case ParallelismMode::PP:
         case ParallelismMode::TP_PP:
-            return forwardPP(tokens, seq_len, /*force_prefill_phase=*/true);
+            return forwardPP(
+                tokens, seq_len, MainForwardDispatch::Prefill);
         default:
             LOG_ERROR("RankOrchestrator::forwardPrefill: Unknown parallelism mode");
+            return false;
+        }
+    }
+
+    bool RankOrchestrator::forwardRestoredPrefixMTPDecodeBridge(
+        const RestoredPrefixMTPDecodeBridgeRequest &request)
+    {
+        if (!request.valid() || current_position_ != request.restored_prefix_tokens)
+        {
+            LOG_ERROR(
+                "RankOrchestrator restored-prefix MTP bridge does not match "
+                "the rank-local published history"
+                << " restored=" << request.restored_prefix_tokens
+                << " position=" << current_position_);
+            return false;
+        }
+        const int token = request.token_id;
+        switch (mode_)
+        {
+        case ParallelismMode::TP:
+            return forwardTP(
+                &token,
+                /*seq_len=*/1,
+                MainForwardDispatch::RestoredPrefixMTPDecodeBridge,
+                request.restored_prefix_tokens);
+        case ParallelismMode::PP:
+        case ParallelismMode::TP_PP:
+            return forwardPP(
+                &token,
+                /*seq_len=*/1,
+                MainForwardDispatch::RestoredPrefixMTPDecodeBridge,
+                request.restored_prefix_tokens);
+        default:
+            LOG_ERROR(
+                "RankOrchestrator::forwardRestoredPrefixMTPDecodeBridge: "
+                "Unknown parallelism mode");
             return false;
         }
     }
@@ -2583,42 +2623,159 @@ namespace llaminar2
     ServingGraphPreparationKind
     RankOrchestrator::servingGraphPreparationKind() const noexcept
     {
-        if (mode_ != ParallelismMode::TP ||
-            !pp_stage_runners_.empty() || device_runners_.empty())
+        const auto composite_kind = [](
+                                        const std::vector<
+                                            std::unique_ptr<IInferenceRunner>>
+                                            &runners)
         {
-            return ServingGraphPreparationKind::Unresolved;
-        }
-
-        const ServingGraphPreparationKind first =
-            device_runners_.front()
-                ? device_runners_.front()
-                      ->servingGraphPreparationKind()
-                : ServingGraphPreparationKind::Unresolved;
-        if (first == ServingGraphPreparationKind::Unresolved)
-            return first;
-
-        for (const auto &runner : device_runners_)
-        {
-            if (!runner ||
-                runner->servingGraphPreparationKind() != first)
-            {
-                /*
-                 * One LocalTP graph family must enter setup symmetrically.
-                 * A mixed eager/native child set needs an explicit composite
-                 * protocol rather than silently choosing either lifecycle.
-                 */
+            if (runners.empty())
                 return ServingGraphPreparationKind::Unresolved;
+            bool native_family_required = false;
+            for (const auto &runner : runners)
+            {
+                if (!runner)
+                    return ServingGraphPreparationKind::Unresolved;
+                const auto child_kind =
+                    runner->servingGraphPreparationKind();
+                if (child_kind ==
+                    ServingGraphPreparationKind::Unresolved)
+                {
+                    return child_kind;
+                }
+                native_family_required =
+                    native_family_required ||
+                    child_kind == ServingGraphPreparationKind::
+                                      NativeDeviceExecutableFamily;
             }
+            return native_family_required
+                       ? ServingGraphPreparationKind::
+                             NativeDeviceExecutableFamily
+                       : ServingGraphPreparationKind::EagerHostGraph;
+        };
+
+        if (mode_ == ParallelismMode::TP &&
+            pp_stage_runners_.empty())
+        {
+            if (device_runners_.empty() || !device_runners_.front())
+                return ServingGraphPreparationKind::Unresolved;
+            const auto first =
+                device_runners_.front()->servingGraphPreparationKind();
+            if (first == ServingGraphPreparationKind::Unresolved)
+                return first;
+            for (const auto &runner : device_runners_)
+            {
+                if (!runner ||
+                    runner->servingGraphPreparationKind() != first)
+                {
+                    // A mixed LocalTP tier needs a distinct symmetric graph
+                    // protocol; it cannot inherit PP's sequential composite.
+                    return ServingGraphPreparationKind::Unresolved;
+                }
+            }
+            return first;
         }
-        return first;
+        if ((mode_ == ParallelismMode::PP ||
+             mode_ == ParallelismMode::TP_PP) &&
+            device_runners_.empty())
+        {
+            /*
+             * PP stages are sequential, so a mixed CPU/GPU pipeline reports
+             * the strongest child transition. Materialization below skips
+             * already-built eager children and seals each native stage in
+             * pipeline order. Nested LocalTP stages remain responsible for
+             * their own symmetric participant capture.
+             */
+            return composite_kind(pp_stage_runners_);
+        }
+        return ServingGraphPreparationKind::Unresolved;
     }
 
     bool RankOrchestrator::materializeServingGraphFamilyWithoutLaunch(
         const ServingGraphFamilyMaterializationPlan &plan)
     {
+        if (!plan.valid())
+        {
+            LOG_ERROR(
+                "RankOrchestrator serving graph setup requires a valid frozen family plan");
+            return false;
+        }
+
+        if (mode_ == ParallelismMode::PP ||
+            mode_ == ParallelismMode::TP_PP)
+        {
+            if (!device_runners_.empty() || pp_stage_runners_.empty())
+            {
+                LOG_ERROR(
+                    "RankOrchestrator PP serving graph setup found an invalid composite runner shape");
+                return false;
+            }
+
+            for (std::size_t stage = 0;
+                 stage < pp_stage_runners_.size(); ++stage)
+            {
+                auto &runner = pp_stage_runners_[stage];
+                if (!runner)
+                {
+                    LOG_ERROR(
+                        "RankOrchestrator PP serving graph setup found a missing stage at index "
+                        << stage);
+                    return false;
+                }
+                const auto child_kind =
+                    runner->servingGraphPreparationKind();
+                if (child_kind ==
+                    ServingGraphPreparationKind::Unresolved)
+                {
+                    LOG_ERROR(
+                        "RankOrchestrator PP serving graph setup found an unresolved stage lifecycle at index "
+                        << stage);
+                    return false;
+                }
+                if (child_kind ==
+                    ServingGraphPreparationKind::EagerHostGraph)
+                {
+                    continue;
+                }
+
+                ServingGraphFamilyMaterializationPlan stage_plan = plan;
+                stage_plan.pipeline_hidden_input = nullptr;
+                if (stage > 0u)
+                {
+                    auto *previous = pp_stage_runners_[stage - 1u].get();
+                    stage_plan.pipeline_hidden_input =
+                        previous ? previous->getHiddenState() : nullptr;
+                    if (!stage_plan.pipeline_hidden_input)
+                    {
+                        LOG_ERROR(
+                            "RankOrchestrator PP serving graph setup could not bind the stable activation owner from stage "
+                            << (stage - 1u) << " to stage " << stage);
+                        return false;
+                    }
+                }
+                if (!runner->materializeServingGraphFamilyWithoutLaunch(
+                        stage_plan))
+                {
+                    LOG_ERROR(
+                        "RankOrchestrator PP serving graph setup failed at stage "
+                        << stage);
+                    return false;
+                }
+            }
+
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "serving_graph_family_pipeline_completions",
+                1.0,
+                "setup",
+                "rank",
+                {{"stages", std::to_string(pp_stage_runners_.size())},
+                 {"request_state_mutations", "0"},
+                 {"executable_launches", "0"}});
+            return true;
+        }
+
         if (mode_ != ParallelismMode::TP ||
-            !pp_stage_runners_.empty() || device_runners_.empty() ||
-            !plan.valid())
+            !pp_stage_runners_.empty() || device_runners_.empty())
         {
             LOG_ERROR(
                 "RankOrchestrator serving graph setup requires one flat, "
@@ -3139,6 +3296,15 @@ namespace llaminar2
         if (!advanced)
             return false;
 
+        /*
+         * Every child has consumed and retired its one-shot condition input.
+         * The rank-level bundle is only a typed view over those child handles,
+         * so retaining it would resurrect state that no participant owns.
+         * Canonical child KV becomes the sole post-forward position authority.
+         */
+        invalidateRankResidentLogicalStateAggregate(
+            "resident_main_condition_advance",
+            "condition_input_consumed");
         ++current_position_;
         for (int &length : current_sequence_lengths_)
             ++length;
@@ -3186,18 +3352,15 @@ namespace llaminar2
         if (!advanced)
             return false;
 
-        std::string adoption_error;
-        if (!adoptMirroredLocalTPResidentLogicalStateMailboxes(
-                /*expected_request_count=*/1,
-                "target_sample_main_condition_advance",
-                &adoption_error))
-        {
-            LOG_ERROR(
-                "[RankOrchestrator] Device-target main-condition advance could "
-                "not adopt child publications: "
-                << adoption_error);
-            return false;
-        }
+        /*
+         * Target-sample publication is the condition graph's input, not its
+         * output. Child completion retires those mailboxes; rank orchestration
+         * must likewise expose no aggregate until sampling or verifier
+         * publication creates the next device-owned condition transaction.
+         */
+        invalidateRankResidentLogicalStateAggregate(
+            "target_sample_main_condition_advance",
+            "condition_input_consumed");
         ++current_position_;
         for (int &length : current_sequence_lengths_)
             ++length;
@@ -3385,10 +3548,23 @@ namespace llaminar2
 
     bool RankOrchestrator::supportsPrefillChunkSchedule(int seq_len) const
     {
-        if (mode_ != ParallelismMode::TP || device_runners_.empty())
+        const auto *runners =
+            mode_ == ParallelismMode::TP
+                ? &device_runners_
+                : (mode_ == ParallelismMode::PP ||
+                           mode_ == ParallelismMode::TP_PP
+                       ? &pp_stage_runners_
+                       : nullptr);
+        if (!runners || runners->empty())
             return false;
+        if ((mode_ == ParallelismMode::PP ||
+             mode_ == ParallelismMode::TP_PP) &&
+            !pp_ctx_)
+        {
+            return false;
+        }
 
-        for (const auto &runner : device_runners_)
+        for (const auto &runner : *runners)
         {
             if (!runner || !runner->supportsPrefillChunkSchedule(seq_len))
                 return false;
@@ -3409,18 +3585,229 @@ namespace llaminar2
             return forwardTP(
                 tokens,
                 seq_len,
-                /*force_prefill_phase=*/false,
+                MainForwardDispatch::Automatic,
+                /*restored_prefix_tokens=*/0,
                 &policy,
                 pad_token_id,
                 allow_padded_execution);
         case ParallelismMode::PP:
         case ParallelismMode::TP_PP:
-            LOG_ERROR("RankOrchestrator::forwardPrefillChunkSchedule: chunked prefill is not implemented for PP/TP_PP");
-            return false;
+            return forwardPPPrefillChunkSchedule(
+                tokens,
+                seq_len,
+                policy,
+                pad_token_id,
+                allow_padded_execution);
         default:
             LOG_ERROR("RankOrchestrator::forwardPrefillChunkSchedule: Unknown parallelism mode");
             return false;
         }
+    }
+
+    bool RankOrchestrator::forwardPPPrefillChunkSchedule(
+        const int *tokens,
+        int seq_len,
+        const PrefillChunkSchedulerPolicy &policy,
+        int pad_token_id,
+        bool allow_padded_execution)
+    {
+        if (!tokens || seq_len <= 0 ||
+            pp_stage_runners_.empty() || !pp_ctx_)
+        {
+            LOG_ERROR(
+                "RankOrchestrator PP prefill schedule requires tokens, "
+                "pipeline stages, and a LocalPP transfer context");
+            return false;
+        }
+        if (policy.real_token_start != current_position_ ||
+            policy.real_token_count != seq_len)
+        {
+            LOG_ERROR(
+                "RankOrchestrator PP prefill schedule disagrees with the "
+                "pipeline request cursor"
+                << " schedule_start=" << policy.real_token_start
+                << " position=" << current_position_
+                << " schedule_rows=" << policy.real_token_count
+                << " request_rows=" << seq_len);
+            return false;
+        }
+
+        const PrefillChunkSchedule root_schedule =
+            planPrefillChunkSchedule(policy);
+        if (!root_schedule || root_schedule.chunks.empty())
+        {
+            LOG_ERROR(
+                "RankOrchestrator could not plan its pipeline-wide prefill "
+                "schedule: "
+                << root_schedule.error);
+            return false;
+        }
+
+        last_logits_forward_phase_ = LogitsForwardPhase::Prefill;
+        if (logits_gatherer_)
+            logits_gatherer_->invalidate();
+
+        std::uint64_t transferred_rows = 0u;
+        const std::size_t num_stages = pp_stage_runners_.size();
+        for (const PrefillChunkPlan &chunk : root_schedule.chunks)
+        {
+            const int relative_offset =
+                chunk.token_offset - policy.real_token_start;
+            if (relative_offset < 0 || chunk.real_count <= 0 ||
+                relative_offset > seq_len ||
+                chunk.real_count > seq_len - relative_offset ||
+                chunk.bucket_seq_len < chunk.real_count)
+            {
+                LOG_ERROR(
+                    "RankOrchestrator PP prefill plan contains an invalid "
+                    "chunk"
+                    << " chunk=" << chunk.chunk_index
+                    << " offset=" << relative_offset
+                    << " real_rows=" << chunk.real_count
+                    << " bucket_rows=" << chunk.bucket_seq_len);
+                return false;
+            }
+
+            /*
+             * A preceding transfer may leave TensorBase's current-device
+             * metadata naming the destination. The retained stage-0 graph
+             * still owns its original allocation, so make that allocation the
+             * selected producer again before the next chunk writes it.
+             */
+            if (num_stages > 1u)
+            {
+                TensorBase *const stage0_hidden =
+                    pp_stage_runners_.front()->getHiddenState();
+                if (stage0_hidden)
+                {
+                    const DeviceId stage0_device =
+                        pp_ctx_->deviceForStage(0).toLocalDeviceId();
+                    const auto current_device =
+                        stage0_hidden->current_device();
+                    if (current_device && *current_device != stage0_device)
+                        stage0_hidden->allocateOnDevice(stage0_device);
+                }
+            }
+
+            for (std::size_t stage = 0; stage < num_stages; ++stage)
+            {
+                auto &runner = pp_stage_runners_[stage];
+                if (!runner)
+                {
+                    LOG_ERROR(
+                        "RankOrchestrator PP prefill schedule found a missing "
+                        "stage at index "
+                        << stage);
+                    return false;
+                }
+
+                if (stage > 0u)
+                {
+                    TensorBase *const hidden =
+                        pp_stage_runners_[stage - 1u]->getHiddenState();
+                    if (!hidden)
+                    {
+                        LOG_ERROR(
+                            "RankOrchestrator PP prefill stage "
+                            << (stage - 1u)
+                            << " produced no activation owner");
+                        return false;
+                    }
+
+                    /*
+                     * GPU children replay a fixed-width captured graph. Copy
+                     * the complete physical bucket so every downstream row is
+                     * initialized; only real_count is allowed to advance KV
+                     * and request state.
+                     */
+                    const std::size_t active_bytes =
+                        pp_activation_contract_
+                            ? pp_activation_contract_
+                                  ->transfer(static_cast<int>(stage - 1u))
+                                  .activeBytes(chunk.bucket_seq_len)
+                            : static_cast<std::size_t>(
+                                  chunk.bucket_seq_len) *
+                                  model_ctx_->embeddingLength() *
+                                  sizeof(float);
+                    if (!pp_ctx_->transfer(
+                            hidden,
+                            static_cast<int>(stage - 1u),
+                            static_cast<int>(stage),
+                            active_bytes))
+                    {
+                        LOG_ERROR(
+                            "RankOrchestrator PP prefill activation transfer "
+                            "failed from stage "
+                            << (stage - 1u) << " to " << stage
+                            << " for " << chunk.bucket_seq_len
+                            << " physical rows");
+                        return false;
+                    }
+                    transferred_rows += static_cast<std::uint64_t>(
+                        chunk.bucket_seq_len);
+                    runner->setHiddenState(hidden);
+                }
+
+                /*
+                 * The root owns chunk boundaries and maintenance decisions.
+                 * Each child receives exactly one fixed-width transaction at
+                 * its own canonical cursor, preventing independent child
+                 * schedulers from splitting a pipeline chunk differently.
+                 */
+                PrefillChunkSchedulerPolicy child_policy;
+                child_policy.bucket_sizes = {chunk.bucket_seq_len};
+                child_policy.fixed_chunk_real_tokens =
+                    chunk.bucket_seq_len;
+                child_policy.real_token_start = runner->get_position();
+                child_policy.real_token_count = chunk.real_count;
+
+                const bool child_ok = runner->forwardPrefillChunkSchedule(
+                    tokens + relative_offset,
+                    chunk.real_count,
+                    child_policy,
+                    pad_token_id,
+                    allow_padded_execution);
+                if (stage > 0u)
+                    runner->clearHiddenStateInput();
+                if (!child_ok)
+                {
+                    LOG_ERROR(
+                        "RankOrchestrator PP prefill transaction failed at "
+                        "stage "
+                        << stage << " chunk=" << chunk.chunk_index);
+                    return false;
+                }
+            }
+        }
+
+        if (!skip_logits_gather_prefill_)
+        {
+            if (!logits_gatherer_)
+            {
+                logits_gatherer_ = std::make_unique<LogitsGatherer>(
+                    0, 0, logits_backend_resolver_);
+                applyLogitsGatherSkipFlags();
+            }
+            logits_gatherer_->copyFromStage(
+                *pp_stage_runners_.back(),
+                0,
+                config_.batch_size,
+                config_.max_seq_len);
+        }
+
+        current_position_ += seq_len;
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "pipeline_prefill_chunk_transactions",
+            static_cast<double>(root_schedule.chunks.size()),
+            "prefill",
+            "rank",
+            {{"stages", std::to_string(num_stages)},
+             {"logical_rows", std::to_string(seq_len)},
+             {"transferred_physical_rows",
+              std::to_string(transferred_rows)},
+             {"boundary_authority", "pipeline_root"}});
+        return true;
     }
 
     // =========================================================================
@@ -3435,7 +3822,8 @@ namespace llaminar2
     bool RankOrchestrator::forwardTP(
         const int *tokens,
         int seq_len,
-        bool force_prefill_phase,
+        MainForwardDispatch dispatch,
+        int restored_prefix_tokens,
         const PrefillChunkSchedulerPolicy *chunk_schedule_policy,
         int chunk_schedule_pad_token_id,
         bool chunk_schedule_allow_padded_execution)
@@ -3445,9 +3833,25 @@ namespace llaminar2
             LOG_ERROR("RankOrchestrator::forwardTP: No device runners available");
             return false;
         }
+        const bool restored_prefix_bridge =
+            dispatch == MainForwardDispatch::RestoredPrefixMTPDecodeBridge;
+        if ((restored_prefix_bridge &&
+             (!tokens || seq_len != 1 || restored_prefix_tokens <= 0)) ||
+            (!restored_prefix_bridge && restored_prefix_tokens != 0) ||
+            (chunk_schedule_policy &&
+             dispatch != MainForwardDispatch::Automatic))
+        {
+            LOG_ERROR(
+                "RankOrchestrator::forwardTP received an invalid typed main-forward dispatch"
+                << " dispatch=" << static_cast<int>(dispatch)
+                << " seq_len=" << seq_len
+                << " restored=" << restored_prefix_tokens
+                << " chunked=" << (chunk_schedule_policy != nullptr));
+            return false;
+        }
 
         const LogitsForwardPhase logits_phase =
-            (force_prefill_phase || seq_len != 1)
+            (dispatch == MainForwardDispatch::Prefill || seq_len != 1)
                 ? LogitsForwardPhase::Prefill
                 : LogitsForwardPhase::Decode;
         last_logits_forward_phase_ = logits_phase;
@@ -3591,16 +3995,31 @@ namespace llaminar2
                          << i << " running synchronously");
                 try
                 {
-                    const bool ok = chunk_schedule_policy
-                                        ? runner_iface->forwardPrefillChunkSchedule(
-                                              tokens,
-                                              seq_len,
-                                              *chunk_schedule_policy,
-                                              chunk_schedule_pad_token_id,
-                                              chunk_schedule_allow_padded_execution)
-                                        : (force_prefill_phase
-                                               ? runner_iface->forwardPrefill(tokens, seq_len)
-                                               : runner_iface->forward(tokens, seq_len));
+                    bool ok = false;
+                    if (chunk_schedule_policy)
+                    {
+                        ok = runner_iface->forwardPrefillChunkSchedule(
+                            tokens,
+                            seq_len,
+                            *chunk_schedule_policy,
+                            chunk_schedule_pad_token_id,
+                            chunk_schedule_allow_padded_execution);
+                    }
+                    else if (restored_prefix_bridge)
+                    {
+                        ok = runner_iface->forwardRestoredPrefixMTPDecodeBridge(
+                            {.token_id = tokens[0],
+                             .restored_prefix_tokens =
+                                 restored_prefix_tokens});
+                    }
+                    else if (dispatch == MainForwardDispatch::Prefill)
+                    {
+                        ok = runner_iface->forwardPrefill(tokens, seq_len);
+                    }
+                    else
+                    {
+                        ok = runner_iface->forward(tokens, seq_len);
+                    }
                     if (!ok)
                     {
                         LOG_ERROR("RankOrchestrator::forwardTP: Device "
@@ -3707,7 +4126,9 @@ namespace llaminar2
             [this,
              tokens,
              seq_len,
-             force_prefill_phase,
+             dispatch,
+             restored_prefix_tokens,
+             restored_prefix_bridge,
              chunk_schedule_policy,
              chunk_schedule_pad_token_id,
              chunk_schedule_allow_padded_execution,
@@ -3741,16 +4162,33 @@ namespace llaminar2
                     }
                     try
                     {
-                        const bool ok = chunk_schedule_policy
-                                            ? runner_iface->forwardPrefillChunkSchedule(
-                                                  tokens,
-                                                  seq_len,
-                                                  *chunk_schedule_policy,
-                                                  chunk_schedule_pad_token_id,
-                                                  chunk_schedule_allow_padded_execution)
-                                            : (force_prefill_phase
-                                                   ? runner_iface->forwardPrefill(tokens, seq_len)
-                                                   : runner_iface->forward(tokens, seq_len));
+                        bool ok = false;
+                        if (chunk_schedule_policy)
+                        {
+                            ok = runner_iface->forwardPrefillChunkSchedule(
+                                tokens,
+                                seq_len,
+                                *chunk_schedule_policy,
+                                chunk_schedule_pad_token_id,
+                                chunk_schedule_allow_padded_execution);
+                        }
+                        else if (restored_prefix_bridge)
+                        {
+                            ok = runner_iface
+                                     ->forwardRestoredPrefixMTPDecodeBridge(
+                                         {.token_id = tokens[0],
+                                          .restored_prefix_tokens =
+                                              restored_prefix_tokens});
+                        }
+                        else if (dispatch == MainForwardDispatch::Prefill)
+                        {
+                            ok = runner_iface->forwardPrefill(
+                                tokens, seq_len);
+                        }
+                        else
+                        {
+                            ok = runner_iface->forward(tokens, seq_len);
+                        }
                         if (debugEnv().tp_collective_contract_trace)
                         {
                             LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_leave"
@@ -4059,7 +4497,11 @@ namespace llaminar2
     // =========================================================================
     // PP Mode Forward Implementation (sequential pipeline execution)
     // =========================================================================
-    bool RankOrchestrator::forwardPP(const int *tokens, int seq_len, bool force_prefill_phase)
+    bool RankOrchestrator::forwardPP(
+        const int *tokens,
+        int seq_len,
+        MainForwardDispatch dispatch,
+        int restored_prefix_tokens)
     {
         if (pp_stage_runners_.empty())
         {
@@ -4073,8 +4515,22 @@ namespace llaminar2
             return false;
         }
 
+        const bool restored_prefix_bridge =
+            dispatch == MainForwardDispatch::RestoredPrefixMTPDecodeBridge;
+        if ((restored_prefix_bridge &&
+             (!tokens || seq_len != 1 || restored_prefix_tokens <= 0)) ||
+            (!restored_prefix_bridge && restored_prefix_tokens != 0))
+        {
+            LOG_ERROR(
+                "RankOrchestrator::forwardPP received an invalid typed main-forward dispatch"
+                << " dispatch=" << static_cast<int>(dispatch)
+                << " seq_len=" << seq_len
+                << " restored=" << restored_prefix_tokens);
+            return false;
+        }
+
         const LogitsForwardPhase logits_phase =
-            (force_prefill_phase || seq_len != 1)
+            (dispatch == MainForwardDispatch::Prefill || seq_len != 1)
                 ? LogitsForwardPhase::Prefill
                 : LogitsForwardPhase::Decode;
         last_logits_forward_phase_ = logits_phase;
@@ -4120,9 +4576,20 @@ namespace llaminar2
         }
 
         LOG_DEBUG("RankOrchestrator::forwardPP: Executing stage 0 (embedding)");
-        if (!(force_prefill_phase
-                  ? stage0_runner->forwardPrefill(tokens, seq_len)
-                  : stage0_runner->forward(tokens, seq_len)))
+        const auto execute_stage =
+            [&](IInferenceRunner &runner, const int *stage_tokens)
+        {
+            if (restored_prefix_bridge)
+            {
+                return runner.forwardRestoredPrefixMTPDecodeBridge(
+                    {.token_id = tokens[0],
+                     .restored_prefix_tokens = restored_prefix_tokens});
+            }
+            if (dispatch == MainForwardDispatch::Prefill)
+                return runner.forwardPrefill(stage_tokens, seq_len);
+            return runner.forward(stage_tokens, seq_len);
+        };
+        if (!execute_stage(*stage0_runner, tokens))
         {
             LOG_ERROR("RankOrchestrator::forwardPP: Stage 0 forward failed");
             return false;
@@ -4185,9 +4652,7 @@ namespace llaminar2
              */
             const int *stage_tokens =
                 curr_runner.get() == finalPPSidecarRunner() ? tokens : nullptr;
-            if (!(force_prefill_phase
-                      ? curr_runner->forwardPrefill(stage_tokens, seq_len)
-                      : curr_runner->forward(stage_tokens, seq_len)))
+            if (!execute_stage(*curr_runner, stage_tokens))
             {
                 LOG_ERROR("RankOrchestrator::forwardPP: Stage " << stage_idx << " forward failed");
                 return false;
@@ -15618,9 +16083,11 @@ namespace llaminar2
         int block_size = 0;
         int participant_id = 0;
 
-        auto query_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners,
+        auto query_runners = [&](
+                                 std::vector<std::unique_ptr<IInferenceRunner>> &runners,
                                  std::vector<PrefixLookupResult> &hits,
-                                 bool fingerprint_must_match)
+                                 PrefixFingerprintCoordinationPolicy
+                                     fingerprint_policy)
         {
             for (auto &runner : runners)
             {
@@ -15642,8 +16109,8 @@ namespace llaminar2
                     runner->primaryDeviceId(),
                     hit,
                     {},
-                    runner->moePlacementEpoch());
-                participant.fingerprint_must_match = fingerprint_must_match;
+                    runner->moePlacementEpoch(),
+                    fingerprint_policy);
                 participants.push_back(std::move(participant));
                 hits.push_back(hit);
                 if (block_size <= 0 && hit.block_size > 0)
@@ -15655,8 +16122,14 @@ namespace llaminar2
         // fingerprints can legitimately differ. Each child lookup has already
         // validated its own fingerprint; the rank aggregate only clamps to the
         // common restorable token count.
-        query_runners(device_runners_, last_device_prefix_hits_, /*fingerprint_must_match=*/false);
-        query_runners(pp_stage_runners_, last_pp_prefix_hits_, /*fingerprint_must_match=*/false);
+        query_runners(
+            device_runners_,
+            last_device_prefix_hits_,
+            PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally);
+        query_runners(
+            pp_stage_runners_,
+            last_pp_prefix_hits_,
+            PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally);
 
         if (participants.empty())
             return aggregate;
@@ -15774,8 +16247,18 @@ namespace llaminar2
     bool RankOrchestrator::restorePrefixTerminalState(const PrefixLookupResult &hit)
     {
         const int common_tokens = std::max(0, hit.cached_tokens);
-        if (common_tokens <= 0 || !hit.has_terminal_logits)
+        if (common_tokens <= 0 ||
+            (hit.requires_terminal_logits && !hit.has_terminal_logits))
             return false;
+
+        /*
+         * A nested LocalTP domain can be one non-head PP stage. Its children
+         * own KV/runtime prefix payloads but intentionally own no terminal
+         * logits. Requiring logits at this composite boundary made the outer
+         * pipeline fail even though its final stage had restored the sole
+         * authoritative terminal row. The typed requirement bit, rather than
+         * orchestration depth, decides whether absence is an error.
+         */
 
         auto restore_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners,
                                    const std::vector<PrefixLookupResult> &hits)

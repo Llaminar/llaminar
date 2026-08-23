@@ -267,6 +267,7 @@ namespace llaminar2
 
     Q8_KTensor::~Q8_KTensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
         // during implicit member destruction of large 3D MoE expert weight tensors.
         // See Q4_KTensor teardown investigation for details.

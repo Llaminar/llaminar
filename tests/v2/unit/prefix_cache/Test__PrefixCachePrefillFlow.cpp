@@ -95,9 +95,29 @@ namespace
             return forward(tokens.data(), static_cast<int>(tokens.size()));
         }
 
+        bool forwardRestoredPrefixMTPDecodeBridge(
+            const RestoredPrefixMTPDecodeBridgeRequest &request) override
+        {
+            if (!mtp_enabled || !request.valid() ||
+                position != request.restored_prefix_tokens)
+            {
+                return false;
+            }
+            ++restored_prefix_bridge_calls;
+            restored_prefix_bridge_requests.push_back(request);
+            const int token = request.token_id;
+            return forward(&token, 1);
+        }
+
         bool supportsPrefillChunkSchedule(int seq_len) const override
         {
             return supports_chunk_schedule && seq_len > 0;
+        }
+
+        ServingGraphPreparationKind
+        servingGraphPreparationKind() const noexcept override
+        {
+            return serving_graph_preparation_kind;
         }
 
         bool forwardPrefillChunkSchedule(
@@ -421,6 +441,8 @@ namespace
         bool mtp_verifier_plan_installed = false;
         bool supports_chunk_schedule = false;
         bool chunk_schedule_ok = true;
+        ServingGraphPreparationKind serving_graph_preparation_kind =
+            ServingGraphPreparationKind::Unresolved;
         std::vector<float> logits_buffer = std::vector<float>(16, -1.0f);
         std::vector<float> mtp_logits;
         std::vector<float> all_position_logits;
@@ -432,6 +454,7 @@ namespace
         int verify_argmax_token = 11;
         size_t decode_argmax_index = 0;
         int forward_calls = 0;
+        int restored_prefix_bridge_calls = 0;
         int chunk_schedule_calls = 0;
         int forward_mtp_calls = 0;
         int chained_mtp_calls = 0;
@@ -469,6 +492,8 @@ namespace
         std::vector<int32_t> lookup_tokens;
         std::vector<int32_t> harvested_tokens;
         std::vector<int> populated_tokens;
+        std::vector<RestoredPrefixMTPDecodeBridgeRequest>
+            restored_prefix_bridge_requests;
 
     private:
         void syncShiftedRowsToPosition()
@@ -969,6 +994,63 @@ TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixUsesChunkScheduleWhenRunnerSu
     EXPECT_EQ(probe.prefill_chunk_failures, 0u);
 }
 
+TEST(Test__PrefixCachePrefillFlow,
+     NativeCapturedOneTokenPrefixSuffixUsesRetainedGraphSchedule)
+{
+    ScopedPrefillChunkScheduleEnv env;
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->supports_chunk_schedule = true;
+    mock_ptr->serving_graph_preparation_kind =
+        ServingGraphPreparationKind::NativeDeviceExecutableFamily;
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 2;
+
+    auto runner = makeRunner(std::move(mock));
+    ASSERT_TRUE(runner->prefill({1, 2, 3})) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->chunk_schedule_calls, 1);
+    EXPECT_THAT(mock_ptr->last_chunk_schedule_tokens, ElementsAre(3));
+    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.real_token_start, 2);
+    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.real_token_count, 1);
+    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.fixed_chunk_real_tokens, 0);
+    EXPECT_THAT(mock_ptr->last_chunk_schedule_policy.bucket_sizes, ElementsAre(2));
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_EQ(probe.prefill_chunk_schedules, 1u);
+    EXPECT_EQ(probe.prefill_chunk_successful_schedules, 1u);
+    EXPECT_EQ(probe.prefill_chunks, 1u);
+    EXPECT_EQ(probe.prefill_chunk_real_tokens, 1u);
+    EXPECT_EQ(probe.prefill_chunk_padded_tokens, 1u);
+    EXPECT_EQ(probe.prefill_chunk_failures, 0u);
+}
+
+TEST(Test__PrefixCachePrefillFlow,
+     NativeCapturedShortPrefillFailsWithoutRetainedGraphScheduleSupport)
+{
+    ScopedPrefillChunkScheduleEnv env;
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->serving_graph_preparation_kind =
+        ServingGraphPreparationKind::NativeDeviceExecutableFamily;
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 0;
+
+    auto runner = makeRunner(std::move(mock));
+    ASSERT_FALSE(runner->prefill({1, 2}));
+    EXPECT_THAT(
+        runner->lastError(),
+        HasSubstr("runner does not support prefill chunk scheduling"));
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->chunk_schedule_calls, 0);
+    EXPECT_EQ(mock_ptr->harvest_calls, 0);
+}
+
 TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixFailsWhenChunkScheduleUnsupported)
 {
     ScopedPrefillChunkScheduleEnv env;
@@ -1043,6 +1125,34 @@ TEST(Test__PrefixCachePrefillFlow, MTPPartialHitWithoutTerminalHiddenRecomputesB
     EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(2));
     EXPECT_EQ(mock_ptr->forward_calls, 1);
     EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3, 4, 5));
+}
+
+TEST(Test__PrefixCachePrefillFlow,
+     OneTokenMTPPartialHitUsesTypedRestoredPrefixDecodeBridge)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 4;
+    mock_ptr->lookup_result.has_terminal_hidden = true;
+
+    auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true);
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}))
+        << runner->lastError();
+
+    ASSERT_EQ(mock_ptr->restored_prefix_bridge_calls, 1);
+    ASSERT_EQ(mock_ptr->restored_prefix_bridge_requests.size(), 1u);
+    EXPECT_EQ(mock_ptr->restored_prefix_bridge_requests.front().token_id, 5);
+    EXPECT_EQ(
+        mock_ptr->restored_prefix_bridge_requests.front()
+            .restored_prefix_tokens,
+        4);
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(5));
+    EXPECT_EQ(mock_ptr->position, 5);
+    EXPECT_EQ(mock_ptr->shifted_mtp_rows, 4);
 }
 
 TEST(Test__PrefixCachePrefillFlow, FullHitWithTerminalLogitsSkipsForward)

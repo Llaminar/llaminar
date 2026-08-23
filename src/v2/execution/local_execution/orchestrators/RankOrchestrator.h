@@ -519,6 +519,9 @@ namespace llaminar2
          */
         bool forward(const int *tokens, int seq_len) override;
         bool forwardPrefill(const int *tokens, int seq_len) override;
+        /** @copydoc IInferenceRunner::forwardRestoredPrefixMTPDecodeBridge */
+        bool forwardRestoredPrefixMTPDecodeBridge(
+            const RestoredPrefixMTPDecodeBridgeRequest &request) override;
         /** @copydoc IInferenceRunner::servingGraphPreparationKind */
         ServingGraphPreparationKind
         servingGraphPreparationKind() const noexcept override;
@@ -1654,10 +1657,19 @@ namespace llaminar2
          * @param seq_len Sequence length
          * @return true if forward pass succeeded on all devices
          */
+        /** @brief Rank-local dispatch policy for one symmetric main forward. */
+        enum class MainForwardDispatch : uint8_t
+        {
+            Automatic = 0, ///< Invoke each child's ordinary forward entry point.
+            Prefill, ///< Invoke each child's explicit prefill entry point.
+            RestoredPrefixMTPDecodeBridge, ///< Invoke each child's typed bridge entry point.
+        };
+
         bool forwardTP(
             const int *tokens,
             int seq_len,
-            bool force_prefill_phase = false,
+            MainForwardDispatch dispatch = MainForwardDispatch::Automatic,
+            int restored_prefix_tokens = 0,
             const PrefillChunkSchedulerPolicy *chunk_schedule_policy = nullptr,
             int chunk_schedule_pad_token_id = 0,
             bool chunk_schedule_allow_padded_execution = false);
@@ -1672,7 +1684,33 @@ namespace llaminar2
          * @param seq_len Sequence length
          * @return true if forward pass succeeded
          */
-        bool forwardPP(const int *tokens, int seq_len, bool force_prefill_phase = false);
+        bool forwardPP(
+            const int *tokens,
+            int seq_len,
+            MainForwardDispatch dispatch = MainForwardDispatch::Automatic,
+            int restored_prefix_tokens = 0);
+
+        /**
+         * @brief Execute one root-planned bucket schedule across PP stages.
+         *
+         * Each physical chunk traverses every stage before the next chunk is
+         * admitted. This preserves pipeline KV cursors and transfers the full
+         * padded activation bucket while advancing logical state only by live
+         * rows. Nested TP stages retain their own concurrent child dispatch.
+         *
+         * @param tokens Complete live-token range owned by this schedule.
+         * @param seq_len Number of live tokens in @p tokens.
+         * @param policy Root-authored bucket and logical-position policy.
+         * @param pad_token_id Padding token captured by the retained family.
+         * @param allow_padded_execution Whether GPU stages may execute padding.
+         * @return True after every chunk crosses every stage exactly once.
+         */
+        bool forwardPPPrefillChunkSchedule(
+            const int *tokens,
+            int seq_len,
+            const PrefillChunkSchedulerPolicy &policy,
+            int pad_token_id,
+            bool allow_padded_execution);
 
         /**
          * @brief Worker join timeout for TP runner operations.

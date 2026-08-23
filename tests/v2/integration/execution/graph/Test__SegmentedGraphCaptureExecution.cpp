@@ -134,6 +134,9 @@ namespace
             complete_ = false;
             if (!ctx || !storage_ || !storage_->hasValidBoundIdentity())
                 return false;
+            std::string publication_error;
+            if (!storage_->awaitCapturedPublication(&publication_error))
+                return false;
             auto &ticket = storage_->ticket();
             if (!ticket.isValid())
                 return false;
@@ -179,7 +182,6 @@ namespace
         bool supportsBackend(ComputeBackendType) const override { return true; }
         bool isGraphCapturable() const override { return false; }
         bool isManualGraphBoundary() const override { return true; }
-        bool requiresHostGraphTicketFence() const override { return true; }
         bool manualGraphBoundaryComplete() const override { return complete_; }
         bool supportsPaddedPrefillGraphCapturePreflight() const override
         {
@@ -748,7 +750,7 @@ TEST_F(CachedGraphReplayExecutionTest,
     EXPECT_TRUE(cold_publish.supportsGraphCaptureAfterLaunchPreparation());
     EXPECT_EQ(
         cold_publish.graphLaunchPreparationPolicy(),
-        GraphLaunchPreparationPolicy::CaptureOnly);
+        GraphLaunchPreparationPolicy::CaptureAndReplay);
     EXPECT_FALSE(cold_publish.isGraphCapturable());
     EXPECT_FALSE(cold_publish.supportsPaddedPrefillGraphCapturePreflight())
         << "Padded capture additionally requires the device-owned live-row scalar";
@@ -960,7 +962,7 @@ TEST_F(CachedGraphReplayExecutionTest,
         segment_cache.segments[0].capture.get();
     const auto *const consume_capture =
         segment_cache.segments[2].capture.get();
-    EXPECT_EQ(segment_cache.host_ticket_fence_count, 1u);
+    EXPECT_TRUE(ticket_storage->hasCapturedPublicationContract());
     ASSERT_EQ(manual_probe->callCount(), 1u);
     EXPECT_EQ(manual_probe->observedRows(0), 3);
     expect_output(/*logical_rows=*/3, /*base=*/1.0f);
@@ -985,40 +987,12 @@ TEST_F(CachedGraphReplayExecutionTest,
 
     EXPECT_EQ(segment_cache.segments[0].capture.get(), publish_capture);
     EXPECT_EQ(segment_cache.segments[2].capture.get(), consume_capture);
-    EXPECT_EQ(segment_cache.host_ticket_fence_count, 2u);
     ASSERT_EQ(manual_probe->callCount(), 2u);
     EXPECT_EQ(manual_probe->observedRows(1), 1);
     EXPECT_EQ(ticket_storage->ticket().header, ticket_header);
     EXPECT_EQ(ticket_storage->ticket().hidden_rows_fp32, ticket_hidden);
     EXPECT_EQ(ticket_storage->ticket().return_rows_fp32, ticket_return);
     expect_output(/*logical_rows=*/1, /*base=*/4.0f);
-
-    double ticket_fence_count = 0.0;
-    bool saw_capture_fence = false;
-    bool saw_replay_fence = false;
-    for (const auto &record :
-         PerfStatsCollector::snapshot({"forward_graph"}))
-    {
-        if (record.name != "heterogeneous_host_ticket_fences")
-            continue;
-        const auto authority = record.tags.find("authority");
-        const auto consumer = record.tags.find("consumer_stage");
-        if (authority == record.tags.end() ||
-            authority->second != "captured_pinned_ticket" ||
-            consumer == record.tags.end() ||
-            consumer->second != "cpu_ticket_participant")
-        {
-            continue;
-        }
-        ticket_fence_count += record.value;
-        saw_capture_fence =
-            saw_capture_fence || record.phase == "capture";
-        saw_replay_fence =
-            saw_replay_fence || record.phase == "replay";
-    }
-    EXPECT_DOUBLE_EQ(ticket_fence_count, 2.0);
-    EXPECT_TRUE(saw_capture_fence);
-    EXPECT_TRUE(saw_replay_fence);
 
     /*
      * Server readiness seals every graph before request admission. Reset the

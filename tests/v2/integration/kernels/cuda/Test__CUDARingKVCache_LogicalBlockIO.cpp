@@ -173,6 +173,119 @@ TEST(Test__CUDARingKVCache_LogicalBlockIO, Q8ShardedLayoutReportsDeviceResidentB
 }
 
 /**
+ * @brief Reproduce the Qwen3.5-4B LocalTP pageable-host probe geometry.
+ *
+ * Production parity hashes every full-attention KV payload after prefill.  A
+ * Qwen3.5-4B TP participant owns two 256-wide KV heads, so one FP16 logical row
+ * is 1024 bytes and the nine-token probe is backed by an ordinary pageable
+ * `std::vector`.  CUDA logical-block Host mode promises completed bytes for
+ * exactly that storage class; it must not rely on page-locked-only async-copy
+ * behavior.  The round trip also locks down the symmetric Host import contract.
+ */
+TEST(Test__CUDARingKVCache_LogicalBlockIO,
+     FP16Qwen35LocalTPPageableHostProbeRoundTripsEveryFALayer)
+{
+    if (!hasCUDADevice())
+    {
+        GTEST_SKIP() << "CUDA device unavailable";
+    }
+
+    constexpr int FA_LAYERS = 8;
+    constexpr int TOKENS = 9;
+    constexpr int GLOBAL_KV_HEADS = 4;
+    constexpr int LOCAL_KV_HEADS = 2;
+    constexpr int HEAD_DIM = 256;
+    constexpr int LOCAL_KV_DIM = LOCAL_KV_HEADS * HEAD_DIM;
+    constexpr size_t PAYLOAD_BYTES =
+        static_cast<size_t>(TOKENS) * LOCAL_KV_DIM * sizeof(uint16_t);
+
+    CUDARingKVCacheFP16 source(
+        FA_LAYERS,
+        /*batch_size=*/1,
+        /*max_seq_len=*/4096,
+        GLOBAL_KV_HEADS,
+        LOCAL_KV_HEADS,
+        /*kv_head_start=*/0,
+        HEAD_DIM,
+        /*device_id=*/0);
+    CUDARingKVCacheFP16 target(
+        /*n_layers=*/1,
+        /*batch_size=*/1,
+        /*max_seq_len=*/4096,
+        GLOBAL_KV_HEADS,
+        LOCAL_KV_HEADS,
+        /*kv_head_start=*/0,
+        HEAD_DIM,
+        /*device_id=*/0);
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+    void *device_k = nullptr;
+    void *device_v = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&device_k, PAYLOAD_BYTES));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&device_v, PAYLOAD_BYTES));
+    ASSERT_EQ(cudaSuccess, cudaMemsetAsync(device_k, 0x2a, PAYLOAD_BYTES, stream));
+    ASSERT_EQ(cudaSuccess, cudaMemsetAsync(device_v, 0x5c, PAYLOAD_BYTES, stream));
+
+    for (int layer = 0; layer < FA_LAYERS; ++layer)
+    {
+        ASSERT_TRUE(source.append(
+            layer,
+            /*seq_idx=*/0,
+            device_k,
+            device_v,
+            TOKENS,
+            stream));
+    }
+
+    std::vector<uint8_t> exported_k(PAYLOAD_BYTES);
+    std::vector<uint8_t> exported_v(PAYLOAD_BYTES);
+    for (int layer = 0; layer < FA_LAYERS; ++layer)
+    {
+        IKVCache::KVCacheLogicalBlockDescriptor descriptor{
+            layer,
+            /*seq_idx=*/0,
+            /*logical_token_start=*/0,
+            TOKENS,
+            stream};
+        ASSERT_TRUE(source.exportLogicalBlock(
+            descriptor,
+            exported_k.data(),
+            exported_v.data()))
+            << "layer=" << layer;
+        EXPECT_TRUE(std::all_of(
+            exported_k.begin(), exported_k.end(),
+            [](uint8_t byte) { return byte == 0x2a; }));
+        EXPECT_TRUE(std::all_of(
+            exported_v.begin(), exported_v.end(),
+            [](uint8_t byte) { return byte == 0x5c; }));
+    }
+
+    IKVCache::KVCacheLogicalBlockDescriptor target_descriptor{
+        /*layer=*/0,
+        /*seq_idx=*/0,
+        /*logical_token_start=*/0,
+        TOKENS,
+        stream};
+    ASSERT_TRUE(target.importLogicalBlock(
+        target_descriptor,
+        exported_k.data(),
+        exported_v.data()));
+    std::vector<uint8_t> roundtrip_k(PAYLOAD_BYTES);
+    std::vector<uint8_t> roundtrip_v(PAYLOAD_BYTES);
+    ASSERT_TRUE(target.exportLogicalBlock(
+        target_descriptor,
+        roundtrip_k.data(),
+        roundtrip_v.data()));
+    EXPECT_EQ(roundtrip_k, exported_k);
+    EXPECT_EQ(roundtrip_v, exported_v);
+
+    ASSERT_EQ(cudaSuccess, cudaFree(device_k));
+    ASSERT_EQ(cudaSuccess, cudaFree(device_v));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+/**
  * @brief Prove oldest-row eviction is one device-owned metadata mutation.
  *
  * The production call returns after enqueueing work. The test synchronizes only

@@ -358,49 +358,29 @@ TEST(Test__HybridAllreducePrecision, SchemaOverrideAliasPreservesPopulatedLayerM
     EXPECT_EQ(config.getAllreducePrecisionForLayer(3), "fp16");
 }
 
-TEST(Test__HybridAllreducePrecision, Qwen36ExpertOverlayParityCasesPreserveSchemaOverride)
+TEST(Test__HybridAllreducePrecision, Qwen36TypedParityDefinitionsPreserveSchemaOverride)
 {
-    const std::string math_fixture =
-        readTextFile(LLAMINAR_QWEN36_MOE_EXPERT_OVERLAY_MATH_PARITY_SOURCE);
-    const std::string parity_base =
-        readTextFile(LLAMINAR_QWEN36_MOE_PARITY_BASE_SOURCE);
-    ASSERT_FALSE(math_fixture.empty());
-    ASSERT_FALSE(parity_base.empty());
+    const std::string definitions =
+        readTextFile(LLAMINAR_QWEN36_MODEL_PARITY_DEFINITIONS_SOURCE);
+    const std::string typed_framework =
+        readTextFile(LLAMINAR_MODEL_PARITY_DEFINITION_SOURCE);
+    ASSERT_FALSE(definitions.empty());
+    ASSERT_FALSE(typed_framework.empty());
 
     EXPECT_NE(
-        math_fixture.find("config.tp_allreduce_precision_override = \"schema\";"),
+        definitions.find(
+            "definition.tp_allreduce_precision_override = \"schema\";"),
         std::string::npos);
     EXPECT_EQ(
-        math_fixture.find("config.tp_allreduce_precision_override = \"fp16\";"),
+        definitions.find(
+            "definition.tp_allreduce_precision_override = \"fp16\";"),
         std::string::npos);
-
-    const size_t case_builder = parity_base.find(
-        "inline MoEPrefixRestoreParityCase qwen36MoEPrefixParityCase");
-    ASSERT_NE(case_builder, std::string::npos);
-
-    auto expectHotOnlyCasePreservesSchema = [&](const char *case_marker)
-    {
-        const size_t case_pos = parity_base.find(case_marker, case_builder);
-        ASSERT_NE(case_pos, std::string::npos) << case_marker;
-        size_t next_case = parity_base.find("case MoEPrefixParityTopology::", case_pos + 1);
-        if (next_case == std::string::npos)
-            next_case = parity_base.size();
-
-        const std::string block = parity_base.substr(case_pos, next_case - case_pos);
-        EXPECT_NE(
-            block.find("test_case.tp_allreduce_precision_override = \"schema\";"),
-            std::string::npos)
-            << case_marker;
-        EXPECT_EQ(
-            block.find("test_case.tp_allreduce_precision_override = \"fp16\";"),
-            std::string::npos)
-            << case_marker;
-    };
-
-    expectHotOnlyCasePreservesSchema(
-        "case MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly:");
-    expectHotOnlyCasePreservesSchema(
-        "case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly:");
+    EXPECT_NE(
+        typed_framework.find(
+            "config.tp_allreduce_precision_override =\n"
+            "                tp_allreduce_precision_override;"),
+        std::string::npos)
+        << "Every generated typed case must project the model/topology collective precision into the live production configuration.";
 }
 
 TEST(Test__HybridAllreducePrecision, ConfigOverrideCanonicalizesShortPrecisionAlias)

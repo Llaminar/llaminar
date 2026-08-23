@@ -260,7 +260,8 @@ namespace llaminar2::test
 
         /** @brief One accelerator tier above a two-participant CPU tier. */
         MoERoutedExpertPlacementPlan twoTierNodeLocalPlan(
-            RoutedExpertOwnerOrder owner_order)
+            RoutedExpertOwnerOrder owner_order,
+            int accelerator_capacity = 2)
         {
             MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
@@ -292,7 +293,11 @@ namespace llaminar2::test
                 RoutedExpertComputePolicy::Apportioned;
             plan.domains.push_back(std::move(cpu));
             plan.routed_tiers = {
-                tier("priority_0", "accelerator", 0, 2),
+                tier(
+                    "priority_0",
+                    "accelerator",
+                    0,
+                    accelerator_capacity),
                 tier("priority_1", "cpu_nodelocal", 1, 0, true),
             };
             return plan;
@@ -305,7 +310,8 @@ namespace llaminar2::test
          * ownership swap form separate closed cycles. That geometry is needed
          * to prove bounded scheduling fairness between the two Dynamic axes.
          */
-        MoERoutedExpertPlacementPlan twoTierThreeCpuParticipantPlan()
+        MoERoutedExpertPlacementPlan twoTierThreeCpuParticipantPlan(
+            int accelerator_capacity = 2)
         {
             MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
@@ -338,7 +344,11 @@ namespace llaminar2::test
                 RoutedExpertComputePolicy::Apportioned;
             plan.domains.push_back(std::move(cpu));
             plan.routed_tiers = {
-                tier("priority_0", "accelerator", 0, 2),
+                tier(
+                    "priority_0",
+                    "accelerator",
+                    0,
+                    accelerator_capacity),
                 tier("priority_1", "cpu_nodelocal", 1, 0, true),
             };
             return plan;
@@ -349,6 +359,14 @@ namespace llaminar2::test
         {
             auto metadata = modelMetadata();
             metadata.num_experts = 8;
+            return metadata;
+        }
+
+        /** @brief Geometry whose bounded target retains live CPU demand. */
+        MoERoutedExpertModelMetadata twelveExpertMetadata()
+        {
+            auto metadata = modelMetadata();
+            metadata.num_experts = 12;
             return metadata;
         }
 
@@ -450,6 +468,27 @@ namespace llaminar2::test
                 1,
                 4,
                 {0, 0, 1, 1, 2, 2, 3, 3});
+            return std::make_unique<DecodeExpertHistogram>(config);
+        }
+
+        /** @brief Six accelerator and two three-expert CPU owner buckets. */
+        std::unique_ptr<DecodeExpertHistogram>
+        threeParticipantTwelveExpertHistogram()
+        {
+            DecodeExpertHistogramConfig config;
+            config.num_layers = 1;
+            config.num_experts = 12;
+            config.top_k = 2;
+            config.window_size = 4;
+            config.sockets = {
+                DeviceId::cuda(0),
+                DeviceId::cpu(),
+                DeviceId::cpu(),
+            };
+            config.ownership = MoELayeredExpertOwnership::uniform(
+                1,
+                3,
+                {0, 0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2});
             return std::make_unique<DecodeExpertHistogram>(config);
         }
 
@@ -2386,6 +2425,104 @@ namespace llaminar2::test
             axis_admission->tags.at(
                 "independent_axis_reservation_active"),
             "true");
+    }
+
+    TEST(
+        Test__MoEOverlayResidencyAuthority,
+        BoundedDynamicWavePricesParticipantSkewFromPublishedEpoch)
+    {
+        ScopedPerfStats perf;
+        auto histogram = threeParticipantTwelveExpertHistogram();
+        MoEOverlayResidencyAuthority authority({
+            .initial_plan = twoTierNodeLocalPlan(
+                RoutedExpertOwnerOrder::Ordinal,
+                /*accelerator_capacity=*/6),
+            .model_metadata = twelveExpertMetadata(),
+            .maintenance_mode = MoERebalanceRuntimeMode::Dynamic,
+            .histogram = histogram.get(),
+            .phase_service_profile = twoTierServiceProfile(),
+            .migration_cost_profile =
+                threeParticipantMigrationProfile(
+                    /*transfer_and_repack_ns=*/1,
+                    /*inference_interference_ns=*/1),
+            .migration_economy_policy =
+                MoEOverlayMigrationEconomyPolicy{
+                    .historical_window_weight = 0,
+                    .current_window_weight = 1,
+                    .payoff_horizon_tokens = 1'000,
+                    .minimum_net_benefit_ns = 0,
+                    .minimum_residency_generations = 0,
+                },
+            .participant_rebalance_policy = {
+                .enabled = true,
+                .imbalance_threshold_per_mille = 1001,
+                .minimum_improvement_per_mille = 1,
+                .maximum_swaps_per_layer = 4,
+                .maximum_plan_entries_per_wave = 16,
+                .minimum_window_activations = 1,
+            },
+            .shadow_slots_per_endpoint_layer = 2,
+            .max_concurrent_cycles = 2,
+            .perf_device = "published-epoch-two-axis-dynamic",
+        });
+
+        /*
+         * The unbounded tier target can place all six active CPU experts on
+         * the accelerator and leaves only zero-demand experts in the CPU tier.
+         * A two-cycle publication cannot perform all six exchanges, however,
+         * so after its first tier exchange the first CPU owner still carries
+         * two hot experts while the other owns three much colder experts. A
+         * paired swap reduces the live makespan. Pricing against the eventual
+         * target incorrectly reports zero participant load and starves that
+         * axis forever.
+         */
+        const auto transaction =
+            authority.proposeFromFrozenHistogramWindow(
+                frozenWindow(
+                    1,
+                    {0, 0, 0, 0, 0, 0,
+                     100, 90, 80, 10, 9, 8}));
+        ASSERT_TRUE(transaction.valid());
+        ASSERT_EQ(transaction.migration_cycles.size(), 2u);
+
+        bool admitted_tier_placement = false;
+        bool admitted_participant_rebalance = false;
+        for (const auto &cycle : transaction.migration_cycles)
+        {
+            const bool pure_same_tier = std::all_of(
+                cycle.migration_indices.begin(),
+                cycle.migration_indices.end(),
+                [&](const std::size_t migration_index)
+                {
+                    return !transaction.migrations[migration_index]
+                                .crossesTier();
+                });
+            admitted_participant_rebalance |= pure_same_tier;
+            admitted_tier_placement |= !pure_same_tier;
+        }
+        EXPECT_TRUE(admitted_tier_placement);
+        EXPECT_TRUE(admitted_participant_rebalance)
+            << "participant skew must be priced from the epoch that will "
+               "actually remain live after a bounded publication";
+        EXPECT_GT(
+            authority.stats().participant_rebalance_owner_changes,
+            0u);
+
+        const auto records = PerfStatsCollector::snapshot(
+            {"moe_overlay_residency"});
+        const auto *axis_admission = findRecord(
+            records, "cycle_axis_admission");
+        ASSERT_NE(axis_admission, nullptr);
+        EXPECT_NE(
+            axis_admission->tags.at(
+                "eligible_participant_placement_cycles"),
+            "0");
+        const auto *reserved = findRecord(
+            records,
+            "tier_cycles_reserved_before_live_participant_axis");
+        ASSERT_NE(reserved, nullptr);
+        EXPECT_GT(reserved->value, 0.0)
+            << "participant skew must be planned after a real tier subset";
     }
 
     TEST(

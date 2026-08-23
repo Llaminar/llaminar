@@ -48,45 +48,6 @@ QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, MTPGreedyDynamicDept
     runDenseDynamicMTPParity(QWEN36_DENSE_PREFIX_MTP_CASE(), false);
 }
 
-/*
- * ProductionParity_ is an aggregate registration contract.  Discovery groups
- * these exact cells into one process per backend so the immutable 27B prepared
- * weights are amortized while every depth retains a fresh runner, captured
- * graph, controller, request lifecycle, checkpoint comparison, and CSV set.
- */
-QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, ProductionParity_MTPCheckpointFixedDepth1)
-{
-    runDenseMTPCheckpointProductionParity(
-        QWEN36_DENSE_PREFIX_MTP_CASE(),
-        /*decode_token_budget=*/4,
-        /*mtp_draft_tokens=*/1);
-}
-
-QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, ProductionParity_MTPCheckpointFixedDepth2)
-{
-    runDenseMTPCheckpointProductionParity(
-        QWEN36_DENSE_PREFIX_MTP_CASE(),
-        /*decode_token_budget=*/4,
-        /*mtp_draft_tokens=*/2);
-}
-
-QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, ProductionParity_MTPCheckpointFixedDepth3)
-{
-    runDenseMTPCheckpointProductionParity(
-        QWEN36_DENSE_PREFIX_MTP_CASE(),
-        /*decode_token_budget=*/4,
-        /*mtp_draft_tokens=*/3);
-}
-
-QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, ProductionParity_MTPCheckpointDynamicDepth)
-{
-    runDenseMTPCheckpointProductionParity(
-        QWEN36_DENSE_PREFIX_MTP_CASE(),
-        /*decode_token_budget=*/4,
-        /*mtp_draft_tokens=*/3,
-        qwen36DenseStochasticDynamicDepthPolicy(3));
-}
-
 QWEN36_DENSE_PREFIX_MTP_TEST(QWEN36_DENSE_PREFIX_MTP_SUITE, PrefixCacheMTPRestore)
 {
     runDenseMTPParity(QWEN36_DENSE_PREFIX_MTP_CASE(), true);

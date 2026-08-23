@@ -105,6 +105,18 @@ namespace llaminar2
 
         /** @return Whether all retained-family bounds are self-consistent. */
         [[nodiscard]] bool valid() const noexcept;
+
+        /**
+         * @brief Return the model-global layer slots addressable by this family.
+         *
+         * Main decoder layers occupy the dense interval beginning at zero.
+         * Routed NextN graphs keep their raw GGUF source-layer identities, so
+         * the runtime table must extend through the greatest retained source
+         * layer rather than blindly using the model's raw block count.
+         *
+         * @return Positive layer-slot capacity for a valid family, otherwise zero.
+         */
+        [[nodiscard]] int routedLayerCapacity() const noexcept;
     };
 
     /**

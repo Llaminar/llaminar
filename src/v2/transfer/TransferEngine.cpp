@@ -228,7 +228,8 @@ namespace llaminar2
             throw std::logic_error(
                 "PinnedHostTransferBuffer external registration cannot be rebound");
         }
-        if (!backend->pinHostMemory(allocation, bytes_))
+        if (!backend->pinHostMemory(
+                allocation, bytes_, registration_device_.gpu_ordinal()))
         {
             throw std::runtime_error(
                 "PinnedHostTransferBuffer external registration failed for " +
@@ -252,11 +253,13 @@ namespace llaminar2
             }
             else if (ownership_ == Ownership::ExternalRegistration)
             {
-                if (!backend_->unpinHostMemory(allocation_))
+                if (!backend_->unpinHostMemory(
+                        allocation_, registration_device_.gpu_ordinal()))
                 {
                     LOG_ERROR(
                         "PinnedHostTransferBuffer could not unregister external pages for "
                         << registration_device_.toString());
+                    std::terminate();
                 }
             }
         }

@@ -846,6 +846,26 @@ namespace llaminar2::test::parity::qwen2
         std::unique_ptr<RankOrchestrator> multi_orch_;
 
         /**
+         * @brief Project the typed model's optimized recursive checkpoint cut.
+         * @return Explicit model surface, or empty for reference-pack discovery.
+         */
+        std::vector<std::string>
+        productionParityDeclaredMTPCheckpointSurface() const override
+        {
+            if constexpr (requires(const Derived &fixture)
+                          {
+                              fixture.modelParityCase()
+                                  .model.mtp_checkpoint_surface;
+                          })
+            {
+                return static_cast<const Derived *>(this)
+                    ->modelParityCase()
+                    .model.mtp_checkpoint_surface;
+            }
+            return {};
+        }
+
+        /**
          * @brief One bounded non-overlay model authority retained by a process campaign.
          *
          * The slot is template-local, so unrelated fixtures/topologies never
@@ -1037,6 +1057,13 @@ namespace llaminar2::test::parity::qwen2
                               CrossRankPartials);
             config_.uses_cross_rank_pipeline = cfg().is_cross_rank_pp();
             config_.moe_rebalance_exercise = cfg().moe_rebalance_exercise;
+            config_.moe_movement_expectation =
+                cfg().moe_movement_expectation;
+            config_.mtp_expectation = cfg().mtp_expectation;
+            config_.mtp_expected_draft_depth =
+                cfg().mtp_expected_draft_depth;
+            config_.mtp_expected_graph_capacity =
+                cfg().mtp_expected_graph_capacity;
             config_.graph_snapshot_policy = cfg().graph_snapshot_policy;
         }
 
@@ -1171,6 +1198,56 @@ namespace llaminar2::test::parity::qwen2
         }
 
         /**
+         * @brief Require the first authenticated request to seed the cache.
+         *
+         * @param state Deep runtime snapshot captured after fresh prefill.
+         * @param checkpoint_passed Whether the full Hugging Face prefill proof passed.
+         * @param checkpoint_cosine Fresh prefill LM-head cosine for CSV evidence.
+         */
+        void assertFreshPrefixRestoreSeed(
+            const PrefixRuntimeStateSnapshot &state,
+            bool checkpoint_passed,
+            float checkpoint_cosine)
+        {
+            assertProductionParityFreshPrefixSeed(
+                state,
+                checkpoint_passed,
+                checkpoint_cosine);
+        }
+
+        /**
+         * @brief Prove the decode prefill restored the complete fresh state.
+         *
+         * @param fresh_state Byte-hashed state after the initial prefill.
+         * @param checkpoint_passed Whether restored-state decode parity passed.
+         * @param checkpoint_cosine Mean restored-state decode cosine.
+         */
+        void assertFullPrefixRestore(
+            const PrefixRuntimeStateSnapshot &fresh_state,
+            bool checkpoint_passed,
+            float checkpoint_cosine)
+        {
+            assertProductionParityCompletePrefixRestore(
+                fresh_state,
+                checkpoint_passed,
+                checkpoint_cosine);
+        }
+
+        /**
+         * @brief Prove a cached prompt plus one authenticated token is partial.
+         *
+         * The ordinary decode comparison has already certified every stage for
+         * the same prompt-plus-token state against Hugging Face. This replay
+         * checks that suffix prefill reaches the byte-identical KV/terminal
+         * state and independently compares its live LM-head checkpoint with the
+         * authenticated decode-step-zero tensor.
+         */
+        void assertPartialPrefixRestore()
+        {
+            assertProductionParityPartialPrefixRestore();
+        }
+
+        /**
          * @brief Run the complete real-weight parity contract in one runner session.
          *
          * The former PrefillParity, DecodeParity, and SnapshotInfrastructure
@@ -1184,26 +1261,27 @@ namespace llaminar2::test::parity::qwen2
         void runProductionParityCampaign()
         {
             beginProductionParityEvidence();
-            ASSERT_TRUE(setupPipeline()) << "Production parity pipeline setup failed";
+            ASSERT_TRUE(setupProductionParityPipeline())
+                << "Production parity pipeline setup failed";
+            ASSERT_TRUE(hasOrchestrationRunner())
+                << "Production parity must enter through the server-facing runner";
 
-            /*
-             * Legacy dense LocalTP exposes participant snapshots through its
-             * RankOrchestrator. A routed model normalized by the production
-             * OrchestrationRunner exposes semantic post-collective snapshots,
-             * exactly like the HTTP surface, so it uses the ordinary complete
-             * checkpoint comparator instead of reaching into child runners.
-             */
-            const bool inspect_legacy_tp_partials =
-                cfg().is_local_tp() && !hasOrchestrationRunner();
-            if (inspect_legacy_tp_partials)
+            const auto prefill = runPrefillParity();
+            assertParity(prefill);
+
+            const PrefixRuntimeStateSnapshot fresh_prefix_state =
+                activePrefixStateProbe();
+            assertFreshPrefixRestoreSeed(
+                fresh_prefix_state,
+                prefill.overall_passed,
+                prefill.lm_head_cosine);
+
+            if (config_.moe_rebalance_exercise.request_after_prefill)
             {
-                const auto prefill = runTPPrefillParity();
-                assertTPParity(prefill);
-            }
-            else
-            {
-                const auto prefill = runPrefillParity();
-                assertParity(prefill);
+                ASSERT_TRUE(driveParityMoERebalanceMaintenance(
+                    "prefill",
+                    static_cast<std::uint64_t>(config_.token_ids.size())))
+                    << "Production ExpertOverlay rejected post-prefill maintenance";
             }
 
             assertProductionParitySnapshotInfrastructure();
@@ -1213,11 +1291,8 @@ namespace llaminar2::test::parity::qwen2
             activeClearSnapshots();
             activeClearCache();
 
-            DecodeParitySummary decode;
-            if (inspect_legacy_tp_partials)
-                decode = runTPDecodeParity();
-            else
-                decode = runDecodeParity();
+            DecodeParitySummary decode = runDecodeParity(
+                ParityDecodePrefillMode::CompletePrefixRestore);
 
             if (decode.steps_total == 0)
             {
@@ -1226,8 +1301,23 @@ namespace llaminar2::test::parity::qwen2
             }
             else
             {
+                /*
+                 * Teacher-forced serial rows prove main-model arithmetic but
+                 * intentionally do not run predictor sampling or grouped
+                 * verification. Reuse this exact production runner now to
+                 * exercise the generated MTP policy and append every recursive
+                 * checkpoint to the same decode artifact before assertions
+                 * serialize it.
+                 */
+                runProductionParityMTPProof(decode);
                 assertDecodeParity(decode);
             }
+
+            assertFullPrefixRestore(
+                fresh_prefix_state,
+                decode.overall_passed,
+                decode.avg_cosine);
+            assertPartialPrefixRestore();
 
             finishProductionParityEvidence();
         }
@@ -1312,6 +1402,521 @@ namespace llaminar2::test::parity::qwen2
         }
 
         /**
+         * @brief Project the canonical production-campaign policy into a runner.
+         *
+         * Prefix restore is mandatory for every production parity cell and is
+         * therefore installed even while older suites are being migrated to
+         * the typed definition adapter. A typed case, when present, remains
+         * the sole authority for precision, MTP, and ExpertOverlay policy.
+         *
+         * @param config Mutable production configuration immediately before
+         *        runner construction.
+         */
+        void applyCanonicalProductionRuntimePolicy(
+            OrchestrationConfig &config) const
+        {
+            applyProductionParityPrefixRestorePolicy(config);
+
+            if constexpr (requires(
+                              const Derived &fixture,
+                              OrchestrationConfig &runtime)
+                          {
+                              fixture.modelParityCase().applyRuntimePolicy(
+                                  runtime);
+                          })
+            {
+                static_cast<const Derived *>(this)
+                    ->modelParityCase()
+                    .applyRuntimePolicy(config);
+            }
+        }
+
+        /** @brief Install deterministic greedy sampling on the active production runner. */
+        void installProductionParitySampling()
+        {
+            ASSERT_NE(orch_runner_.get(), nullptr);
+            SamplingParams greedy;
+            greedy.temperature = 0.0f;
+            greedy.top_k = 1;
+            greedy.top_p = 1.0f;
+            greedy.seed = 1;
+            orch_runner_->setSamplingParams(greedy);
+        }
+
+        /**
+         * @brief Enter production through one generated typed model-parity case.
+         *
+         * The case owns model, topology, precision, prefix, MTP, and routed
+         * policy.  The fixture contributes only the resolved/staged GGUF path
+         * and current MPI rank, then enables the same greedy request policy
+         * used by every reference comparison.
+         */
+        bool setupTypedProductionOrchestrationPipeline()
+        {
+            if constexpr (requires(const Derived &fixture)
+                          {
+                              fixture.modelParityCase().makeOrchestrationConfig(
+                                  std::string{}, 0);
+                          })
+            {
+                const auto &test_case =
+                    static_cast<const Derived *>(this)->modelParityCase();
+                OrchestrationConfig config =
+                    test_case.makeOrchestrationConfig(
+                        config_.model_path, mpiRank());
+
+                /*
+                 * The typed definition owns the production prefix policy,
+                 * while the campaign harness owns artifact isolation. Apply
+                 * the latter after the typed projection so ordinary service
+                 * archives can never turn another cell's mandatory fresh
+                 * request into a restore hit. The rank suffix also prevents
+                 * TP participants with different KV shards from sharing one
+                 * durable archive.
+                 */
+                applyProductionParityPrefixRestorePolicy(config);
+                config.deterministic = requiresUniversalMoEAuthority();
+                if (!setupOrchestrationRunner(config))
+                    return false;
+                installProductionParitySampling();
+                return true;
+            }
+            else
+            {
+                LOG_ERROR(
+                    "[Parity] Typed production setup requested by a fixture without ModelParityCase");
+                return false;
+            }
+        }
+
+        /** @return Legacy participant addresses without reconstructing topology elsewhere. */
+        std::vector<GlobalDeviceAddress> legacyParticipantAddresses(
+            bool cross_rank) const
+        {
+            std::vector<GlobalDeviceAddress> addresses;
+            addresses.reserve(cfg().devices.size());
+            int cuda_ordinal = 0;
+            int rocm_ordinal = 0;
+            int cpu_ordinal = 0;
+            for (const auto device : cfg().devices)
+            {
+                switch (device)
+                {
+                case ParityDeviceType::CPU:
+                    addresses.push_back(
+                        cross_rank
+                            ? GlobalDeviceAddress::cpu(cpu_ordinal++)
+                            : GlobalDeviceAddress::cpu());
+                    break;
+                case ParityDeviceType::CUDA:
+                    addresses.push_back(
+                        GlobalDeviceAddress::cuda(cuda_ordinal++));
+                    break;
+                case ParityDeviceType::ROCm:
+                    addresses.push_back(
+                        GlobalDeviceAddress::rocm(rocm_ordinal++));
+                    break;
+                }
+            }
+            return addresses;
+        }
+
+        /**
+         * @brief Build legacy-declared local PP through the production runner.
+         *
+         * This compatibility bridge is intentionally confined to declarations
+         * not yet migrated to `ModelParityCase`. It projects their explicit
+         * stage grouping once into named domains; all execution, prefix lookup,
+         * graph capture, transfer, and snapshots are still production-owned.
+         */
+        bool setupLegacyLocalPPProductionOrchestrationPipeline()
+        {
+            TensorFactory metadata_tensor_factory(*mpi_ctx_);
+            ModelLoader metadata_loader(&metadata_tensor_factory);
+            try
+            {
+                metadata_loader.loadModel(config_.model_path);
+            }
+            catch (const std::exception &error)
+            {
+                LOG_ERROR(
+                    "[Parity] Failed to read model metadata for local PP: "
+                    << error.what());
+                return false;
+            }
+
+            const auto addresses = legacyParticipantAddresses(false);
+            const std::vector<int> stage_sizes =
+                cfg().pp_stage_sizes.empty()
+                    ? std::vector<int>(addresses.size(), 1)
+                    : cfg().pp_stage_sizes;
+            if (stage_sizes.empty() ||
+                std::accumulate(
+                    stage_sizes.begin(), stage_sizes.end(), 0) !=
+                    static_cast<int>(addresses.size()))
+            {
+                LOG_ERROR(
+                    "[Parity] Local PP stage groups must cover every participant exactly once");
+                return false;
+            }
+            const int layer_count = static_cast<int>(
+                metadata_loader.getModel().block_count);
+            if (layer_count < static_cast<int>(stage_sizes.size()))
+            {
+                LOG_ERROR(
+                    "[Parity] Local PP has more stages than transformer layers");
+                return false;
+            }
+
+            std::vector<int> stage_layer_counts(stage_sizes.size(), 0);
+            if (cfg().pp_weights.empty())
+            {
+                const int base = layer_count /
+                                 static_cast<int>(stage_sizes.size());
+                const int extra = layer_count %
+                                  static_cast<int>(stage_sizes.size());
+                for (std::size_t stage = 0;
+                     stage < stage_sizes.size(); ++stage)
+                {
+                    stage_layer_counts[stage] = base +
+                        (static_cast<int>(stage) < extra ? 1 : 0);
+                }
+            }
+            else
+            {
+                if (cfg().pp_weights.size() != stage_sizes.size())
+                {
+                    LOG_ERROR(
+                        "[Parity] Local PP weights must match the stage count");
+                    return false;
+                }
+                const float total_weight = std::accumulate(
+                    cfg().pp_weights.begin(), cfg().pp_weights.end(), 0.0f);
+                if (!(total_weight > 0.0f))
+                {
+                    LOG_ERROR("[Parity] Local PP weights must sum positive");
+                    return false;
+                }
+                int assigned = 0;
+                for (std::size_t stage = 0;
+                     stage < stage_sizes.size(); ++stage)
+                {
+                    if (stage + 1u == stage_sizes.size())
+                    {
+                        stage_layer_counts[stage] = layer_count - assigned;
+                        break;
+                    }
+                    int count = std::max(
+                        1,
+                        static_cast<int>(
+                            cfg().pp_weights[stage] / total_weight *
+                                layer_count +
+                            0.5f));
+                    count = std::min(
+                        count,
+                        layer_count - assigned -
+                            static_cast<int>(stage_sizes.size() - stage - 1u));
+                    stage_layer_counts[stage] = count;
+                    assigned += count;
+                }
+            }
+
+            OrchestrationConfig config = OrchestrationConfig::defaults();
+            config.model_path = config_.model_path;
+            config.max_seq_len = 4096;
+            config.batch_size = 1;
+            config.tp_degree = 1;
+            config.pp_degree = static_cast<int>(stage_sizes.size());
+            config.pp_split = PPSplitMode::MANUAL;
+            config.device_mode = DeviceAssignmentMode::AUTO;
+            config.deterministic = false;
+            config.tp_allreduce_precision_override =
+                cfg().tp_allreduce_precision_override;
+
+            std::size_t participant_offset = 0u;
+            int layer_offset = 0;
+            for (std::size_t stage = 0; stage < stage_sizes.size(); ++stage)
+            {
+                DomainDefinition domain;
+                domain.name = "parity_stage_" + std::to_string(stage);
+                domain.scope = TPScope::RANK_LOCAL;
+                domain.owner_rank = mpiRank();
+                for (int member = 0; member < stage_sizes[stage]; ++member)
+                {
+                    domain.devices.push_back(
+                        addresses.at(participant_offset++));
+                }
+                if (domain.devices.size() > 1u)
+                {
+                    domain.backend =
+                        toCollectiveBackend(cfg().tp_collective);
+                    domain.weights.assign(
+                        domain.devices.size(),
+                        1.0f / static_cast<float>(domain.devices.size()));
+                }
+                config.domain_definitions.push_back(std::move(domain));
+                config.pp_stage_definitions.push_back(PPStageDefinition{
+                    .stage_id = static_cast<int>(stage),
+                    .domain_name =
+                        "parity_stage_" + std::to_string(stage),
+                    .first_layer = layer_offset,
+                    .last_layer =
+                        layer_offset + stage_layer_counts[stage] - 1,
+                });
+                layer_offset += stage_layer_counts[stage];
+            }
+            applyCanonicalProductionRuntimePolicy(config);
+            if (!setupOrchestrationRunner(config))
+                return false;
+            installProductionParitySampling();
+            return true;
+        }
+
+        /**
+         * @brief Build legacy cross-rank TP/PP through the serving runner.
+         *
+         * Every rank receives one explicit primary participant. Cross-rank TP
+         * selects node/global scope while PP retains the production equal-split
+         * planner. This removes the test-owned GlobalOrchestrator lifecycle
+         * from canonical campaigns without changing focused collective tests.
+         */
+        bool setupLegacyCrossRankProductionOrchestrationPipeline()
+        {
+            const auto addresses = legacyParticipantAddresses(true);
+            if (addresses.size() !=
+                static_cast<std::size_t>(cfg().mpi_ranks))
+            {
+                LOG_ERROR(
+                    "[Parity] Cross-rank production topology requires exactly one participant per MPI rank");
+                return false;
+            }
+
+            OrchestrationConfig config = OrchestrationConfig::defaults();
+            config.model_path = config_.model_path;
+            config.max_seq_len = 4096;
+            config.batch_size = 1;
+            config.device_mode = DeviceAssignmentMode::EXPLICIT;
+            config.default_backend = toCollectiveBackend(cfg().collective);
+            config.tp_allreduce_precision_override =
+                cfg().tp_allreduce_precision_override;
+            config.deterministic = false;
+            for (int rank = 0; rank < cfg().mpi_ranks; ++rank)
+            {
+                const auto &address =
+                    addresses.at(static_cast<std::size_t>(rank));
+                config.device_map.emplace_back(rank, address);
+                config.device_map_numa_explicit.emplace_back(
+                    rank, address.hasValidNuma());
+            }
+
+            if (cfg().is_cross_rank_tp())
+            {
+                config.tp_degree = cfg().mpi_ranks;
+                config.tp_scope = cfg().is_node_tp()
+                                      ? TPScope::NODE_LOCAL
+                                      : TPScope::GLOBAL;
+                config.pp_degree = 1;
+                config.shard_weights = true;
+            }
+            else if (cfg().is_cross_rank_pp())
+            {
+                config.tp_degree = 1;
+                config.pp_degree = cfg().mpi_ranks;
+                config.pp_split = PPSplitMode::EQUAL;
+            }
+            else
+            {
+                LOG_ERROR(
+                    "[Parity] Cross-rank production setup received a rank-local topology");
+                return false;
+            }
+            applyCanonicalProductionRuntimePolicy(config);
+            if (!setupOrchestrationRunner(config))
+                return false;
+            installProductionParitySampling();
+            return true;
+        }
+
+        /**
+         * @brief Select the one production runner lifecycle for a campaign cell.
+         *
+         * Typed cases are authoritative. Legacy declarations enter explicit
+         * compatibility projections only until their source records are
+         * migrated; no production campaign falls back to a direct runner tree.
+         */
+        bool setupProductionParityPipeline()
+        {
+            if constexpr (requires(const Derived &fixture)
+                          {
+                              fixture.modelParityCase().makeOrchestrationConfig(
+                                  std::string{}, 0);
+                          })
+            {
+                return setupTypedProductionOrchestrationPipeline();
+            }
+
+            if (cfg().moe_routed_expert_plan &&
+                cfg().moe_routed_expert_plan->usesExpertOverlayAuthority())
+            {
+                return setupExpertOverlayMoEOrchestrationPipeline();
+            }
+            if (requiresUniversalMoEAuthority() && cfg().is_local_tp())
+                return setupImplicitLocalTPMoEOrchestrationPipeline();
+            if (cfg().moe_rebalance.mode ==
+                MoERebalanceRuntimeMode::Dynamic)
+            {
+                LOG_ERROR(
+                    "[Parity] Dynamic MoE production parity requires an ExpertOverlay authority");
+                return false;
+            }
+            if (cfg().is_cross_rank())
+                return setupLegacyCrossRankProductionOrchestrationPipeline();
+            if (cfg().is_single_device())
+                return setupSingleDeviceOrchestrationPipeline();
+            if (cfg().is_local_tp())
+                return setupRankLocalTPOrchestrationPipeline();
+            if (cfg().is_local_pp())
+                return setupLegacyLocalPPProductionOrchestrationPipeline();
+            LOG_ERROR("[Parity] Unsupported production parity topology");
+            return false;
+        }
+
+        /**
+         * @brief Build one single-device runner through the server-facing API.
+         *
+         * The legacy direct `IInferenceRunner::forward()` surface cannot own a
+         * cross-request prefix lookup. Canonical parity therefore enters the
+         * same `OrchestrationRunner::prefill()` lifecycle used by HTTP serving,
+         * while retaining graph snapshots and exact precision policy.
+         *
+         * @return True after the production runner is initialized.
+         */
+        bool setupSingleDeviceOrchestrationPipeline()
+        {
+            OrchestrationConfig config = OrchestrationConfig::defaults();
+            config.model_path = config_.model_path;
+            config.max_seq_len = 4096;
+            config.batch_size = 1;
+            config.activation_precision =
+                orchestrationActivationPrecisionValue(
+                    cfg().activation_precision);
+            config.kv_cache_precision =
+                orchestrationKVCachePrecisionValue(
+                    cfg().kv_cache_precision);
+            config.tp_allreduce_precision_override =
+                cfg().tp_allreduce_precision_override;
+            config.device_mode = DeviceAssignmentMode::AUTO;
+            config.device_for_this_rank =
+                GlobalDeviceAddress::fromLocalDeviceId(getDevice());
+            config.tp_degree = 1;
+            config.pp_degree = 1;
+            config.deterministic = false;
+            applyCanonicalProductionRuntimePolicy(config);
+
+            if (!setupOrchestrationRunner(config))
+                return false;
+
+            SamplingParams greedy;
+            greedy.temperature = 0.0f;
+            greedy.top_k = 1;
+            greedy.top_p = 1.0f;
+            greedy.seed = 1;
+            orch_runner_->setSamplingParams(greedy);
+            return true;
+        }
+
+        /**
+         * @brief Build rank-local tensor parallelism through the serving API.
+         *
+         * The former tree-compiled test runner had no cross-request prefix
+         * authority. OrchestrationRunner owns the production TP graph,
+         * collective, prefix lifecycle, and semantic post-collective snapshot
+         * surface used by serving.
+         *
+         * @return True after the production TP runner is initialized.
+         */
+        bool setupRankLocalTPOrchestrationPipeline()
+        {
+            OrchestrationConfig config = OrchestrationConfig::defaults();
+            config.model_path = config_.model_path;
+            config.max_seq_len = 4096;
+            config.batch_size = 1;
+            config.activation_precision =
+                orchestrationActivationPrecisionValue(
+                    cfg().activation_precision);
+            config.kv_cache_precision =
+                orchestrationKVCachePrecisionValue(
+                    cfg().kv_cache_precision);
+            config.tp_allreduce_precision_override =
+                cfg().tp_allreduce_precision_override;
+            config.device_mode = DeviceAssignmentMode::AUTO;
+            config.tp_scope = TPScope::RANK_LOCAL;
+            config.default_backend =
+                toCollectiveBackend(cfg().collective);
+            config.pp_degree = 1;
+            config.deterministic = false;
+
+            if constexpr (requires(const Derived &fixture)
+                          { fixture.modelParityCase(); })
+            {
+                for (const auto &participant :
+                     static_cast<const Derived *>(this)
+                         ->modelParityCase()
+                         .topology.participants)
+                {
+                    if (!participant.world_rank ||
+                        *participant.world_rank == mpiRank())
+                    {
+                        config.tp_devices.push_back(participant.address);
+                    }
+                }
+            }
+            else
+            {
+                int cuda_ordinal = 0;
+                int rocm_ordinal = 0;
+                for (const auto device : cfg().devices)
+                {
+                    switch (device)
+                    {
+                    case ParityDeviceType::CPU:
+                        config.tp_devices.push_back(
+                            GlobalDeviceAddress::cpu());
+                        break;
+                    case ParityDeviceType::CUDA:
+                        config.tp_devices.push_back(
+                            GlobalDeviceAddress::cuda(cuda_ordinal++));
+                        break;
+                    case ParityDeviceType::ROCm:
+                        config.tp_devices.push_back(
+                            GlobalDeviceAddress::rocm(rocm_ordinal++));
+                        break;
+                    }
+                }
+            }
+            if (config.tp_devices.size() < 2u)
+            {
+                LOG_ERROR(
+                    "[Parity] Rank-local TP topology resolved fewer than two participants");
+                return false;
+            }
+            config.tp_degree =
+                static_cast<int>(config.tp_devices.size());
+            applyCanonicalProductionRuntimePolicy(config);
+
+            if (!setupOrchestrationRunner(config))
+                return false;
+
+            SamplingParams greedy;
+            greedy.temperature = 0.0f;
+            greedy.top_k = 1;
+            greedy.top_p = 1.0f;
+            greedy.seed = 1;
+            orch_runner_->setSamplingParams(greedy);
+            return true;
+        }
+
+        /**
          * @brief Build the production runner for one authoritative ExpertOverlay plan.
          *
          * Every enabled routed-expert placement plan selects ExpertOverlay,
@@ -1390,6 +1995,7 @@ namespace llaminar2::test::parity::qwen2
             config.moe_routed_prefill = cfg().moe_routed_prefill;
             config.moe_rebalance = cfg().moe_rebalance;
             config.moe_routed_expert_plan = cfg().moe_routed_expert_plan;
+            applyCanonicalProductionRuntimePolicy(config);
 
             /*
              * Let the production runner own model loading, plan resolution,
@@ -1485,6 +2091,7 @@ namespace llaminar2::test::parity::qwen2
             config.moe_hot_expert_cache = cfg().moe_hot_expert_cache;
             config.moe_routed_prefill = cfg().moe_routed_prefill;
             config.moe_rebalance = cfg().moe_rebalance;
+            applyCanonicalProductionRuntimePolicy(config);
 
             /*
              * The implicit authority is synthesized from live model metadata.
@@ -1543,12 +2150,15 @@ namespace llaminar2::test::parity::qwen2
             if (cfg().is_cross_rank())
                 return setupGlobalOrchestratorPipeline();
 
-            // Single device also uses old path (no tree needed)
+            // A production campaign must exercise the server-facing prefix
+            // lifecycle rather than the direct runner forward adapter.
             if (cfg().is_single_device())
-                return ParityTestBase::setupPipeline();
+                return setupSingleDeviceOrchestrationPipeline();
+            if (cfg().is_local_tp())
+                return setupRankLocalTPOrchestrationPipeline();
 
             // ============================================================
-            // Tree-based path: LocalTP, LocalPP, HybridPP+TP
+            // Tree-based path: LocalPP and HybridPP+TP
             // ============================================================
             return setupTreePipeline();
         }

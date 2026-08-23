@@ -26,6 +26,7 @@ namespace llaminar2
     class IBackend;
     class IDeviceContext;
     class IMPIContext;
+    class MappedHostTransferRegion;
 
     /**
      * @brief Fixed ABI header for one captured heterogeneous MoE dispatch.
@@ -88,10 +89,14 @@ namespace llaminar2
     /**
      * @brief Model-lifetime owner for one immutable-address dispatch ticket.
      *
-     * GPU sources require backend-pinned storage because native graph replay
-     * records fixed asynchronous D2H destinations.  CPU sources use ordinary
-     * aligned storage as their first-class implementation.  Capacity is bound
-     * exactly once; rebinding a live ticket is a fatal topology error.
+     * GPU sources require backend-pinned payload storage because native graph
+     * replay records fixed asynchronous D2H destinations. They additionally
+     * own one isolated mapped timeline word: the producer release-publishes it
+     * immediately after the payload copies, and the CPU consumer acquires that
+     * exact edge without waiting for unrelated work at the graph terminal.
+     * CPU sources use ordinary aligned storage as their first-class
+     * implementation. Capacity is bound exactly once; rebinding a live ticket
+     * is a fatal topology error.
      */
     class MoEOverlayDispatchTicketStorage final
     {
@@ -130,6 +135,47 @@ namespace llaminar2
         /** @brief Validate mutable host memory against the separately retained binding identity. */
         bool hasValidBoundIdentity() const noexcept;
 
+        /**
+         * @brief Reset the GPU-to-host publication edge before one graph launch.
+         *
+         * A ticket is consumed within its layer before the serial transaction
+         * can launch the same graph again. Resetting this data word therefore
+         * performs no device work, synchronization, or topology change.
+         *
+         * @param error Optional exact contract diagnostic.
+         * @return True for a valid GPU publication contract or a CPU no-op.
+         */
+        bool armCapturedPublication(std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Enqueue the ticket's system-release publication on @p stream.
+         *
+         * Publication follows every preceding D2H payload copy on the same
+         * exact stream and is graph-capturable on CUDA and ROCm.
+         *
+         * @param stream Exact non-null producer stream.
+         * @param error Optional exact enqueue diagnostic.
+         * @return True after enqueue, or for a CPU ticket that needs no edge.
+         */
+        bool enqueueCapturedPublication(
+            void *stream,
+            std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Acquire the exact captured payload publication on the host.
+         *
+         * This bounded wait observes only the isolated timeline word. It never
+         * synchronizes a GPU stream or device, so later GPU work remains
+         * concurrent with CPU expert execution.
+         *
+         * @param error Optional timeout or protocol diagnostic.
+         * @return True when the payload is visible, or for a CPU ticket.
+         */
+        bool awaitCapturedPublication(std::string *error = nullptr) noexcept;
+
+        /** @return Whether this GPU ticket owns a complete mapped publication edge. */
+        bool hasCapturedPublicationContract() const noexcept;
+
     private:
         void release() noexcept;
 
@@ -137,6 +183,10 @@ namespace llaminar2
         size_t allocation_bytes_ = 0;
         IBackend *backend_ = nullptr;
         bool backend_pinned_ = false;
+        /** Isolated mapped cache line used only for GPU-to-host readiness. */
+        std::shared_ptr<MappedHostTransferRegion> publication_region_;
+        /** Stable host alias at byte zero of @ref publication_region_. */
+        std::uint64_t *publication_timeline_ = nullptr;
         DeviceId source_device_ = DeviceId::cpu();
         int layer_idx_ = -1;
         int bucket_rows_ = 0;

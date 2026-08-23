@@ -750,12 +750,6 @@ namespace llaminar2
         }
     }
 
-    void DeviceGraphExecutor::GraphSegmentCache::waitForManualHostTicketFence()
-    {
-        waitForCaptureStreamFence();
-        ++host_ticket_fence_count;
-    }
-
     void DeviceGraphExecutor::GraphSegmentCache::destroyCaptureStream()
     {
         if (!capture_stream)
@@ -1284,8 +1278,7 @@ namespace llaminar2
                 return false;
             }
             if (node->stage->isCollectiveStage() ||
-                node->stage->isManualGraphBoundary() ||
-                node->stage->requiresHostGraphTicketFence())
+                node->stage->isManualGraphBoundary())
             {
                 LOG_ERROR("[DeviceGraphExecutor] " << capture_context
                                                     << " stage '" << name
@@ -1826,14 +1819,22 @@ namespace llaminar2
         }
         if (materialize_without_launch &&
             (segment_cache.initialized || launch_dependency ||
-             !event_published_outputs.empty() || config_.snapshot_callback))
+             !event_published_outputs.empty()))
         {
             LOG_ERROR(
                 "[DeviceGraphExecutor] Setup-only materialization requires one "
-                "pristine cache and cannot publish launch, snapshot, or output "
+                "pristine cache and cannot publish launch or output "
                 "side effects");
             return false;
         }
+
+        /*
+         * A snapshot callback requests persistent D2D copy nodes and storage;
+         * it is graph topology, not a setup-time publication side effect. The
+         * setup capture policy disables host callbacks and the controller does
+         * not launch the executable, so the manifest may be sealed here while
+         * its first values remain unpublished until transaction zero executes.
+         */
         if (segment_cache.initialized &&
             segment_cache.graph_replay_plan_policy != plan_policy)
         {
@@ -2652,8 +2653,10 @@ namespace llaminar2
                     prepared_inputs,
                     prepared_outputs,
                     materialize_without_launch
-                        ? GraphCaptureInputFrontierPolicy::BindAddressesOnly
-                        : GraphCaptureInputFrontierPolicy::RequireReadyBytes,
+                        ? GraphCaptureDependencyLedger::ExternalInputAuthority::
+                              BindDeclaredAddressesOnly
+                        : GraphCaptureDependencyLedger::ExternalInputAuthority::
+                              RequireReadyBytes,
                     "cached_graph_segment"))
             {
                 return false;

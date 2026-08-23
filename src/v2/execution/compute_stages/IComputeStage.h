@@ -1137,19 +1137,6 @@ namespace llaminar2
         virtual bool isManualGraphBoundary() const { return false; }
 
         /**
-         * @brief Whether host execution must observe the preceding captured ticket.
-         *
-         * A heterogeneous graph may end a captured device segment with an
-         * asynchronous D2H copy into fixed pinned storage.  The first manual
-         * consumer of that storage declares this contract so the replay
-         * controller records and waits for one preallocated completion event
-         * at the explicit device/host boundary.  This is not a general manual
-         * stage synchronization switch and is invalid unless
-         * @ref isManualGraphBoundary also returns true.
-         */
-        virtual bool requiresHostGraphTicketFence() const { return false; }
-
-        /**
          * @brief True when the last manual boundary execution completed globally.
          *
          * Only meaningful when isManualGraphBoundary() is true. Direct normal

@@ -2162,6 +2162,22 @@ namespace llaminar2
         bool ensureHostPinned();
 
         /**
+         * @brief Close host-transfer ownership before derived storage is freed.
+         *
+         * C++ destroys a concrete tensor's vector members before entering the
+         * TensorBase destructor.  Every concrete destructor therefore calls
+         * this method first, while its registered host allocation is still
+         * alive.  The transition waits only the exact outstanding H2D event and
+         * then unregisters the pages; repeated calls from TensorBase teardown
+         * are idempotent.
+         *
+         * Failure is fatal because freeing an in-flight or still-registered
+         * allocation leaves the CUDA/HIP runtime pointing at recycled heap
+         * pages and corrupts unrelated transfers.
+         */
+        void retireHostTransferLifetimeBeforeStorageDestruction() noexcept;
+
+        /**
          * @brief Unregister host buffer from pinned memory
          *
          * Called automatically by destructor or when releasing GPU resources.
@@ -2599,9 +2615,25 @@ namespace llaminar2
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
-        // Memory management - FP16 doesn't have separate raw data to release
-        void release_raw_data() override { /* no-op: FP16 has no separate raw block data */ }
-        bool is_raw_data_released() const override { return false; /* FP16 always has its data */ }
+        /**
+         * @brief Release owned FP16 host storage after device preparation.
+         *
+         * Floating-point model weights use their native element vector as raw
+         * storage. Treating this as a no-op retained the entire host copy and
+         * made the common weight-release contract format-dependent.
+         */
+        void release_raw_data() override
+        {
+            if (!is_view_)
+            {
+                decltype(host_fp16_data_) empty;
+                std::swap(host_fp16_data_, empty);
+            }
+            raw_data_released_ = true;
+        }
+
+        /** @return True after this tensor's host-weight release transition. */
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         void release_host_weight_data() override
         {
@@ -2756,6 +2788,7 @@ namespace llaminar2
 
         void *device_data_;                          // Device-side storage
         mutable AlignedVector<float> dequant_cache_; // For data() calls (64-byte aligned)
+        bool raw_data_released_ = false;              ///< Host weight bytes were retired.
 
         bool sync_to_device();
         bool sync_from_device();
@@ -2830,9 +2863,19 @@ namespace llaminar2
 
         std::unique_ptr<ITensorGemm> createGemm() override;
 
-        // Memory management - BF16 doesn't have separate raw data to release
-        void release_raw_data() override { /* no-op: BF16 has no separate raw block data */ }
-        bool is_raw_data_released() const override { return false; /* BF16 always has its data */ }
+        /** @brief Release owned BF16 host storage after device preparation. */
+        void release_raw_data() override
+        {
+            if (!is_view_)
+            {
+                decltype(host_bf16_data_) empty;
+                std::swap(host_bf16_data_, empty);
+            }
+            raw_data_released_ = true;
+        }
+
+        /** @return True after this tensor's host-weight release transition. */
+        bool is_raw_data_released() const override { return raw_data_released_; }
 
         void release_host_weight_data() override
         {
@@ -2973,6 +3016,7 @@ namespace llaminar2
 
         void *device_data_;                          // Device-side storage
         mutable AlignedVector<float> dequant_cache_; // For data() calls (64-byte aligned)
+        bool raw_data_released_ = false;              ///< Host weight bytes were retired.
 
         bool sync_to_device();
         bool sync_from_device();
@@ -3025,7 +3069,7 @@ namespace llaminar2
                    float scale);
         INT8Tensor(const std::vector<size_t> &shape,
                    const std::vector<float> &fp32_data);
-        ~INT8Tensor() override = default;
+        ~INT8Tensor() override;
 
         // TensorBase interface
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -3046,6 +3090,36 @@ namespace llaminar2
 
         // TensorBase pure virtual - required implementation
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        /** @brief Release the native INT8 host-weight vector after preparation. */
+        void release_raw_data() override
+        {
+            decltype(host_int8_data_) empty;
+            std::swap(host_int8_data_, empty);
+            raw_data_released_ = true;
+        }
+
+        /** @return True after this tensor's host-weight release transition. */
+        bool is_raw_data_released() const override { return raw_data_released_; }
+
+        /**
+         * @brief Retire registration and all host-only INT8 weight metadata.
+         *
+         * Prepared GEMM state owns the execution copy before this method is
+         * called; per-column/row scales and diagnostic FP32 materialization are
+         * therefore no longer live inputs.
+         */
+        void release_host_weight_data() override
+        {
+            unpinHostMemory();
+            release_raw_data();
+            decltype(col_scales_) empty_col_scales;
+            std::swap(col_scales_, empty_col_scales);
+            decltype(row_scales_cache_) empty_row_scales;
+            std::swap(row_scales_cache_, empty_row_scales);
+            decltype(dequant_cache_) empty_dequant;
+            std::swap(dequant_cache_, empty_dequant);
+        }
 
         bool from_int32_with_scales(
             const int32_t *accum,
@@ -3122,6 +3196,7 @@ namespace llaminar2
         mutable std::vector<float> row_scales_cache_; ///< Cached per-row scales (computed on-demand)
         void *device_data_ = nullptr;
         mutable AlignedVector<float> dequant_cache_; // 64-byte aligned dequant buffer
+        bool raw_data_released_ = false;             ///< Host weight bytes were retired.
 
         bool sync_to_device();
         bool sync_from_device();
@@ -3172,7 +3247,7 @@ namespace llaminar2
         INT32Tensor(const std::vector<size_t> &shape,
                     const std::vector<float> &fp32_data,
                     float scale);
-        ~INT32Tensor() override = default;
+        ~INT32Tensor() override;
 
         // TensorBase interface
         const std::vector<size_t> &shape() const override { return shape_; }
@@ -3192,6 +3267,28 @@ namespace llaminar2
         bool copyFrom(const TensorBase *src) override;
 
         std::unique_ptr<ITensorGemm> createGemm() override;
+
+        /** @brief Release the native INT32 host vector after device preparation. */
+        void release_raw_data() override
+        {
+            decltype(host_int32_data_) empty;
+            std::swap(host_int32_data_, empty);
+            raw_data_released_ = true;
+        }
+
+        /** @return True after this tensor's host-weight release transition. */
+        bool is_raw_data_released() const override { return raw_data_released_; }
+
+        /** @brief Retire registration and all host-only INT32 materialization. */
+        void release_host_weight_data() override
+        {
+            unpinHostMemory();
+            release_raw_data();
+            decltype(row_scales_) empty_row_scales;
+            std::swap(row_scales_, empty_row_scales);
+            decltype(dequant_cache_) empty_dequant;
+            std::swap(dequant_cache_, empty_dequant);
+        }
 
         bool from_int32_with_scales(
             const int32_t *accum,
@@ -3261,6 +3358,7 @@ namespace llaminar2
         std::vector<float> row_scales_;          ///< Per-row scales (optional)
         void *device_data_ = nullptr;
         mutable AlignedVector<float> dequant_cache_; ///< Cached FP32 dequantization (64-byte aligned)
+        bool raw_data_released_ = false;             ///< Host bytes were retired.
 
         bool sync_to_device();
         bool sync_from_device();

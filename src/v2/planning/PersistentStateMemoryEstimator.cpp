@@ -74,6 +74,7 @@ namespace llaminar2
 
         RecurrentGeometry recurrentGeometry(
             const ModelMemoryProfile &profile,
+            int local_query_heads,
             int total_shards)
         {
             RecurrentGeometry geometry;
@@ -97,7 +98,9 @@ namespace llaminar2
 
             const int shards = std::max(1, total_shards);
             const int local_attention_heads =
-                std::max(1, profile.n_heads / shards);
+                local_query_heads > 0
+                    ? local_query_heads
+                    : std::max(1, profile.n_heads / shards);
             int local_k_heads = full_k_heads;
             int local_v_heads = full_v_heads;
             const bool modular_repeat = full_v_heads > full_k_heads;
@@ -190,6 +193,7 @@ namespace llaminar2
         int batch_size,
         int max_seq_len,
         int local_kv_heads,
+        int local_query_heads,
         int total_shards,
         int first_layer,
         int last_layer,
@@ -252,7 +256,7 @@ namespace llaminar2
             device);
 
         const RecurrentGeometry geometry =
-            recurrentGeometry(profile, total_shards);
+            recurrentGeometry(profile, local_query_heads, total_shards);
         if (device.is_gpu())
         {
             const size_t bytes_per_gdn_layer =

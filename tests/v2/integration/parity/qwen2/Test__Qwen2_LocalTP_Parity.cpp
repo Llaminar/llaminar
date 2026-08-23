@@ -18,9 +18,16 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
+#include "Qwen2ModelParityDefinitions.h"
 #include "Qwen2ParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
+
+#include <array>
+#include <iterator>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
@@ -41,75 +48,91 @@ static const std::vector<std::string> kTPExcludedStages = {
 // Test Configuration Definitions
 // =============================================================================
 
-static const std::vector<TestConfig> kLocalTPConfigs = {
-    {
-        .name = "LocalTP_NCCL_2xCUDA",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
-        .parallelism = Parallelism::LocalTP,
-        .collective = Collective::NCCL,
-        .thresholds = {
-            .cosine_threshold = 0.90f,
-            .decode_cosine_threshold = 0.90f,
+/** @return One typed rank-local TP definition. */
+static ModelParityDefinition makeLocalTPDefinition(
+    std::string topology_id,
+    std::vector<ModelParityParticipant> participants,
+    Collective collective,
+    float cosine_threshold,
+    float kl_threshold)
+{
+    return qwen2Q40ParityDefinition(
+        ModelParityTopologyDefinition{
+            .test_id = std::move(topology_id),
+            .kind = ModelParityTopologyKind::RankLocalTensorParallel,
+            .participants = std::move(participants),
+            .collective = collective,
+            .mpi_ranks = 1,
+        },
+        BackendThresholds{
+            .cosine_threshold = cosine_threshold,
+            .decode_cosine_threshold = cosine_threshold,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.35f, // INT8 CUTLASS GEMM + column-parallel TP adds quantization variance
+            .kl_threshold = kl_threshold,
             .excluded_stages = kTPExcludedStages,
-        },
-    },
+        });
+}
+
+/** @return Canonically expanded local-TP topology cases. */
+static const std::vector<ModelParityCase> &qwen2LocalTPCases()
+{
+    static const auto cases = []
     {
-        .name = "LocalTP_RCCL_2xROCm",
-        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalTP,
-        .collective = Collective::RCCL,
-        .thresholds = {
-            .cosine_threshold = 0.90f,
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.40f, // Relaxed - RCCL with host staging adds variance
-            .excluded_stages = kTPExcludedStages,
-        },
-    },
-    {
-        .name = "LocalTP_RCCL_4xROCm",
-        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm, ParityDeviceType::ROCm, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalTP,
-        .collective = Collective::RCCL,
-        .thresholds = {
-            .cosine_threshold = 0.96f,        // Observed: 0.999 prefill cosine
-            .decode_cosine_threshold = 0.96f, // Observed: 0.999 avg decode cosine
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.02f, // Observed: 0.001 prefill KL (was 0.50 = 500x over-relaxed)
-            .excluded_stages = kTPExcludedStages,
-        },
-    },
-    {
-        .name = "LocalTP_HETEROGENEOUS_CUDA_ROCm",
-        .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm}, // Heterogeneous!
-        .parallelism = Parallelism::LocalTP,
-        .collective = Collective::HETEROGENEOUS,
-        .thresholds = {
-            .cosine_threshold = 0.90f,
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.50f, // Relaxed - heterogeneous TP with HOST backend adds variance
-            .excluded_stages = kTPExcludedStages,
-        },
-    },
-};
+        const std::array definitions = {
+            makeLocalTPDefinition(
+                "LocalTP_NCCL_2xCUDA",
+                {{GlobalDeviceAddress::cuda(0), 0},
+                 {GlobalDeviceAddress::cuda(1), 0}},
+                Collective::NCCL,
+                0.90f,
+                0.35f),
+            makeLocalTPDefinition(
+                "LocalTP_RCCL_2xROCm",
+                {{GlobalDeviceAddress::rocm(0), 0},
+                 {GlobalDeviceAddress::rocm(1), 0}},
+                Collective::RCCL,
+                0.90f,
+                0.40f),
+            makeLocalTPDefinition(
+                "LocalTP_RCCL_4xROCm",
+                {{GlobalDeviceAddress::rocm(0), 0},
+                 {GlobalDeviceAddress::rocm(1), 0},
+                 {GlobalDeviceAddress::rocm(2), 0},
+                 {GlobalDeviceAddress::rocm(3), 0}},
+                Collective::RCCL,
+                0.96f,
+                0.02f),
+            makeLocalTPDefinition(
+                "LocalTP_Heterogeneous_CUDA_ROCm",
+                {{GlobalDeviceAddress::cuda(0), 0},
+                 {GlobalDeviceAddress::rocm(0), 0}},
+                Collective::HETEROGENEOUS,
+                0.90f,
+                0.50f),
+        };
+        std::vector<ModelParityCase> expanded;
+        for (const auto &definition : definitions)
+        {
+            auto definition_cases =
+                expandModelParityDefinition(definition);
+            expanded.insert(
+                expanded.end(),
+                std::make_move_iterator(definition_cases.begin()),
+                std::make_move_iterator(definition_cases.end()));
+        }
+        return expanded;
+    }();
+    return cases;
+}
 
 // =============================================================================
 // Parameterized Test Fixture
 // =============================================================================
 
 class Qwen2LocalTPParityTest : public ConfigDrivenParityTest<Qwen2LocalTPParityTest>,
-                               public ::testing::WithParamInterface<TestConfig>
-{
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
-};
+                               public ModelParityCaseParameter
+{};
 
 // =============================================================================
 // Test Cases
@@ -127,10 +150,10 @@ TEST_P(Qwen2LocalTPParityTest, ProductionParity)
 INSTANTIATE_TEST_SUITE_P(
     Qwen2,
     Qwen2LocalTPParityTest,
-    ::testing::ValuesIn(kLocalTPConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
+    ::testing::ValuesIn(qwen2LocalTPCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {
-        return info.param.name;
+        return info.param.testName();
     });
 
 // =============================================================================

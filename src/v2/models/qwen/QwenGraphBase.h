@@ -419,6 +419,28 @@ namespace llaminar2
             const ForwardInput &input,
             const std::string &dependency_node,
             DeviceId device);
+
+        /**
+         * @brief Append the typed MTP main-decode terminal-hidden publication.
+         *
+         * The publication copies the main model's one decoded hidden row per
+         * request into the persistent MTP terminal archive inside the same
+         * graph that produced the logits.  It is absent from prefill, whose
+         * shifted-MTP transaction already owns terminal archival, and from
+         * grouped verification, whose accepted-state publisher owns the
+         * canonical row transition.
+         *
+         * @param graph Main-model graph receiving the publication stage.
+         * @param input Complete typed forward input.
+         * @param dependency_node Existing graph terminal after logits/outcome.
+         * @param device Participant executing the graph.
+         * @return New terminal node, or dependency_node when no binding exists.
+         */
+        std::string maybeAddMTPMainTerminalHiddenPublication(
+            ComputeGraph &graph,
+            const ForwardInput &input,
+            const std::string &dependency_node,
+            DeviceId device);
         bool needsTPAllreduce() const;
         bool denseTPAllreduceEnabledForCurrentGraph() const;
         bool hasActiveExpertMask(const std::vector<bool> &expert_mask) const;
@@ -808,6 +830,25 @@ namespace llaminar2
             TensorBase *logits,
             int verifier_row_count,
             DeviceId device) const;
+
+        /**
+         * @brief Seal the terminal unit of one complete inference transaction.
+         *
+         * Main forward graphs and retained MTP sidecars use the same terminal
+         * lifecycle. Ordinary and device-owned graphs only record their logical
+         * terminal. A heterogeneous ticket graph additionally names that final
+         * captured unit with a cross-participant identity, allowing authority
+         * and follower plans to prove the same captured/manual/captured shape.
+         * Keeping this transition here prevents individual graph builders from
+         * forgetting the terminal contract when they append a new suffix.
+         *
+         * @param graph Complete participant-local graph being sealed.
+         * @param terminal_node Existing node that completes the transaction.
+         * @throws std::out_of_range when @p terminal_node is absent.
+         */
+        void sealInferenceTransactionGraph(
+            ComputeGraph &graph,
+            const std::string &terminal_node) const;
 
         [[noreturn]] void failMissingGpuExpertGemmEngines(
             DeviceId device,

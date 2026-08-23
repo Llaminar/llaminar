@@ -8,6 +8,7 @@
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <chrono>
@@ -157,6 +158,13 @@ namespace llaminar2
             params_.dispatch_output = params_.dispatch_output_lifetime.get();
         if (!params_.inbound_rows && params_.inbound_rows_lifetime)
             params_.inbound_rows = params_.inbound_rows_lifetime.get();
+        if (params_.ticket_observation_role ==
+                TicketObservationRole::MaterializedHostDispatch &&
+            (!params_.ticket_storage || !params_.dispatch_output))
+        {
+            throw std::invalid_argument(
+                "MoESparseDispatchStage materialized-host ticket role requires both ticket storage and its authoritative dispatch output");
+        }
     }
 
     /**
@@ -355,6 +363,29 @@ namespace llaminar2
         const MoEOverlayDispatchTicket *captured_ticket = nullptr;
         if (params_.ticket_storage)
         {
+            if (params_.ticket_observation_role ==
+                TicketObservationRole::DirectCapturedProducer)
+            {
+                PerfStatsCollector::ScopedTimer publication_wait(
+                    "moe_overlay_endpoint",
+                    "captured_ticket_publication_wait",
+                    params_.seq_len == 1 ? "decode" : "prefill",
+                    params_.ticket_storage->sourceDevice().toString(),
+                    {{"consumer", "sparse_dispatch"},
+                     {"layer", std::to_string(runtime_key.layer_idx)},
+                     {"ordering", "mapped_system_release_acquire"},
+                     {"stream_synchronize", "false"}});
+                std::string publication_error;
+                if (!params_.ticket_storage->awaitCapturedPublication(
+                        &publication_error))
+                {
+                    LOG_ERROR(
+                        "[MoESparseDispatchStage] Captured ticket publication "
+                        "was not observable: "
+                        << publication_error);
+                    return false;
+                }
+            }
             captured_ticket = &params_.ticket_storage->ticket();
             if (!params_.ticket_storage->hasValidBoundIdentity() ||
                 !captured_ticket->isValid() ||

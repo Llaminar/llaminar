@@ -2763,6 +2763,64 @@ namespace llaminar2
         auto *out_k = static_cast<uint8_t *>(dst_k);
         auto *out_v = static_cast<uint8_t *>(dst_v);
 
+        /*
+         * A failed logical export is a fatal archive-boundary defect, and the
+         * bare CUDA status does not distinguish an invalid stream from a KV
+         * allocation owned by another LocalTP participant.  Capture the
+         * pointer and stream ownership only on failure; the successful parity
+         * and production paths pay no extra CUDA calls.
+         */
+        auto log_copy_failure = [&](const char *payload,
+                                    cudaError_t copy_error,
+                                    const void *destination,
+                                    const void *source,
+                                    size_t bytes)
+        {
+            int current_device = -1;
+            const cudaError_t current_device_status =
+                cudaGetDevice(&current_device);
+            cudaPointerAttributes source_attributes{};
+            const cudaError_t source_status =
+                cudaPointerGetAttributes(&source_attributes, source);
+            cudaPointerAttributes destination_attributes{};
+            const cudaError_t destination_status =
+                cudaPointerGetAttributes(&destination_attributes, destination);
+            const cudaError_t stream_status = cudaStreamQuery(stream);
+            LOG_ERROR("[CUDARingKVCache::exportLogicalBlock] "
+                      << payload << " copy failed: "
+                      << cudaGetErrorString(copy_error)
+                      << " cache_device=" << device_id_
+                      << " current_device=" << current_device
+                      << " current_device_status="
+                      << cudaGetErrorString(current_device_status)
+                      << " stream=" << static_cast<void *>(stream)
+                      << " stream_status="
+                      << cudaGetErrorString(stream_status)
+                      << " bytes=" << bytes
+                      << " source=" << source
+                      << " source_query="
+                      << cudaGetErrorString(source_status)
+                      << " source_type="
+                      << (source_status == cudaSuccess
+                              ? static_cast<int>(source_attributes.type)
+                              : -1)
+                      << " source_device="
+                      << (source_status == cudaSuccess
+                              ? source_attributes.device
+                              : -1)
+                      << " destination=" << destination
+                      << " destination_query="
+                      << cudaGetErrorString(destination_status)
+                      << " destination_type="
+                      << (destination_status == cudaSuccess
+                              ? static_cast<int>(destination_attributes.type)
+                              : -1)
+                      << " destination_device="
+                      << (destination_status == cudaSuccess
+                              ? destination_attributes.device
+                              : -1));
+        };
+
         for (int i = 0; i < desc.token_count; ++i)
         {
             const int logical = desc.logical_token_start + i;
@@ -2777,8 +2835,12 @@ namespace llaminar2
                                               stream);
             if (err != cudaSuccess)
             {
-                LOG_ERROR("[CUDARingKVCache::exportLogicalBlock] K copy failed: "
-                          << cudaGetErrorString(err));
+                log_copy_failure(
+                    "K",
+                    err,
+                    out_k + dst_offset,
+                    entry.d_K + src_offset,
+                    row_bytes);
                 return false;
             }
             err = cudaMemcpyAsync(out_v + dst_offset,
@@ -2788,8 +2850,12 @@ namespace llaminar2
                                   stream);
             if (err != cudaSuccess)
             {
-                LOG_ERROR("[CUDARingKVCache::exportLogicalBlock] V copy failed: "
-                          << cudaGetErrorString(err));
+                log_copy_failure(
+                    "V",
+                    err,
+                    out_v + dst_offset,
+                    entry.d_V + src_offset,
+                    row_bytes);
                 return false;
             }
         }

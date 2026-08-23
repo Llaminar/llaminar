@@ -11,8 +11,10 @@
  * as pinned memory. CUDA's tracking of pinned regions became inconsistent, causing
  * all subsequent device memory operations to fail.
  *
- * **Fix verified**: release_host_weight_data() now calls unpinHostMemory() before
- * release_raw_data() in all 26 tensor type implementations.
+ * **Fix verified**: host-storage release and every concrete tensor destructor
+ * retire the exact registration in its owning GPU context before storage can
+ * disappear. The exhaustive matrix below covers every loader-visible
+ * quantized codebook plus floating, integer, Q16, and TurboQuant storage.
  *
  * @see src/v2/tensors/TensorClasses.h - release_host_weight_data() implementations
  * @author David Sanftenberg
@@ -24,6 +26,7 @@
 
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
+#include "tensors/TensorSlice.h"
 #include "backends/ComputeBackend.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #ifdef HAVE_CUDA
@@ -32,8 +35,10 @@
 
 // Test utils
 #include "../../../utils/CUDATestUtils.h"
+#include "../../../utils/QuantizedVerifierFormats.h"
 #include "../../../utils/ScopedGPUStream.h"
 
+#include <functional>
 #include <vector>
 #include <cstring>
 #include <random>
@@ -48,6 +53,8 @@ using namespace llaminar2::test::cuda;
 class Test__HostReleaseAfterGpuUpload : public CUDATestBase
 {
 protected:
+    using TensorCreator = std::function<std::unique_ptr<TensorBase>()>;
+
     std::mt19937 rng_{42};
     std::uniform_real_distribution<float> dist_{-1.0f, 1.0f};
 
@@ -59,6 +66,38 @@ protected:
             data[i] = start + static_cast<float>(i) * step;
         }
     }
+
+#ifdef HAVE_CUDA
+    /**
+     * @brief Assert that CUDA no longer owns a host registration at an address.
+     *
+     * CUDA may report ordinary malloc storage either as
+     * `cudaMemoryTypeUnregistered` or with `cudaErrorInvalidValue`, depending
+     * on runtime version. A live `cudaMemoryTypeHost` result is the defect:
+     * freeing that allocation would leave a DMA mapping over recyclable heap
+     * pages.
+     */
+    void expectCudaHostAddressUnregistered(
+        const void *address,
+        const char *format_label)
+    {
+        cudaPointerAttributes attributes{};
+        const cudaError_t status =
+            cudaPointerGetAttributes(&attributes, address);
+        if (status == cudaSuccess)
+        {
+            EXPECT_NE(attributes.type, cudaMemoryTypeHost)
+                << format_label << " left address " << address
+                << " registered as CUDA host memory";
+            return;
+        }
+
+        EXPECT_EQ(status, cudaErrorInvalidValue)
+            << format_label << " pointer query failed unexpectedly: "
+            << cudaGetErrorString(status);
+        (void)cudaGetLastError();
+    }
+#endif
 };
 
 // ============================================================================
@@ -425,5 +464,163 @@ TEST_F(Test__HostReleaseAfterGpuUpload, Q8_0Tensor_ReleaseAfterUpload_NoCudaCorr
         << cudaGetErrorString(err);
     if (test_ptr)
         cudaFree(test_ptr);
+#endif
+}
+
+/**
+ * @brief Destroy every concrete host-storage family while another CUDA device
+ *        is current and prove no registration survives.
+ *
+ * The production LocalTP failure was device-order dependent: a tensor was
+ * registered by CUDA:0, teardown ran while CUDA:1 was current, and an ignored
+ * unregister failure left the freed pages pinned. Prefix-cache vectors later
+ * reused a mixture of registered and pageable pages, making an otherwise valid
+ * D2H return `cudaErrorInvalidValue`. This sweep reproduces that ownership
+ * transition for every model codebook and every non-codebook tensor storage
+ * family that can travel through TransferEngine.
+ */
+TEST_F(Test__HostReleaseAfterGpuUpload, EveryFormatDestructorRetiresOwningDeviceRegistration)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "Built without CUDA support";
+#else
+    if (device_count_ < 2)
+        GTEST_SKIP() << "Cross-device registration retirement requires two CUDA devices";
+
+    std::vector<std::pair<const char *, TensorCreator>> cases;
+    for (const auto &format : llaminar2::test::quantizedVerifierFormats())
+    {
+        cases.emplace_back(
+            format.label,
+            [creator = format.create]()
+            {
+                return creator({1u, 256u}, 0x51a7u);
+            });
+    }
+
+    cases.emplace_back("FP32", []()
+                       { return llaminar2::test::TestTensorFactory::createFP32Random({1u, 256u}); });
+    cases.emplace_back("FP16", []()
+                       { return llaminar2::test::TestTensorFactory::createFP16Random({1u, 256u}); });
+    cases.emplace_back("BF16", []()
+                       { return llaminar2::test::TestTensorFactory::createBF16Random({1u, 256u}); });
+    cases.emplace_back("INT8", []()
+                       { return std::make_unique<INT8Tensor>(std::vector<size_t>{1u, 256u}); });
+    cases.emplace_back("INT32", []()
+                       { return std::make_unique<INT32Tensor>(std::vector<size_t>{1u, 256u}); });
+    cases.emplace_back("Q16_1", []()
+                       { return llaminar2::test::TestTensorFactory::createQ16_1Random({1u, 256u}); });
+    cases.emplace_back("TQ4", []()
+                       { return std::make_unique<TQ4Tensor>(std::vector<size_t>{1u, 256u}, 64); });
+    cases.emplace_back("TQ8", []()
+                       { return std::make_unique<TQ8Tensor>(std::vector<size_t>{1u, 256u}, 64); });
+
+    llaminar2::test::ScopedGPUStream upload_stream(gpu_device_);
+    for (const auto &[label, create] : cases)
+    {
+        SCOPED_TRACE(label);
+        std::unique_ptr<TensorBase> tensor = create();
+        ASSERT_NE(tensor, nullptr);
+        const void *const registered_address = tensor->raw_data();
+        ASSERT_NE(registered_address, nullptr);
+        ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_, upload_stream.get()));
+
+        ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+        tensor.reset();
+        expectCudaHostAddressUnregistered(registered_address, label);
+    }
+#endif
+}
+
+/**
+ * @brief Release every loader-visible weight format while a foreign CUDA
+ *        device is current and prove the live tensor no longer owns pinned pages.
+ *
+ * This complements destructor coverage by exercising the earlier production
+ * reclamation boundary used after persistent device weights are prepared.
+ */
+TEST_F(Test__HostReleaseAfterGpuUpload, EveryWeightFormatReleaseRetiresOwningDeviceRegistration)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "Built without CUDA support";
+#else
+    if (device_count_ < 2)
+        GTEST_SKIP() << "Cross-device registration retirement requires two CUDA devices";
+
+    std::vector<std::pair<const char *, TensorCreator>> cases;
+    for (const auto &format : llaminar2::test::quantizedVerifierFormats())
+    {
+        cases.emplace_back(
+            format.label,
+            [creator = format.create]()
+            {
+                return creator({1u, 256u}, 0x6e91u);
+            });
+    }
+    cases.emplace_back("FP32", []()
+                       { return llaminar2::test::TestTensorFactory::createFP32Random({1u, 256u}); });
+    cases.emplace_back("FP16", []()
+                       { return llaminar2::test::TestTensorFactory::createFP16Random({1u, 256u}); });
+    cases.emplace_back("BF16", []()
+                       { return llaminar2::test::TestTensorFactory::createBF16Random({1u, 256u}); });
+    cases.emplace_back("INT8", []()
+                       { return std::make_unique<INT8Tensor>(std::vector<size_t>{1u, 256u}); });
+    cases.emplace_back("INT32", []()
+                       { return std::make_unique<INT32Tensor>(std::vector<size_t>{1u, 256u}); });
+    cases.emplace_back("Q16_1", []()
+                       { return llaminar2::test::TestTensorFactory::createQ16_1Random({1u, 256u}); });
+    cases.emplace_back("TQ4", []()
+                       { return std::make_unique<TQ4Tensor>(std::vector<size_t>{1u, 256u}, 64); });
+    cases.emplace_back("TQ8", []()
+                       { return std::make_unique<TQ8Tensor>(std::vector<size_t>{1u, 256u}, 64); });
+
+    llaminar2::test::ScopedGPUStream upload_stream(gpu_device_);
+    for (const auto &[label, create] : cases)
+    {
+        SCOPED_TRACE(label);
+        std::unique_ptr<TensorBase> tensor = create();
+        ASSERT_NE(tensor, nullptr);
+        const void *const registered_address = tensor->raw_data();
+        ASSERT_NE(registered_address, nullptr);
+        ASSERT_TRUE(tensor->ensureOnDevice(gpu_device_, upload_stream.get()));
+
+        ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+        tensor->release_host_weight_data();
+        EXPECT_TRUE(tensor->is_raw_data_released());
+        expectCudaHostAddressUnregistered(registered_address, label);
+    }
+#endif
+}
+
+/**
+ * @brief Reproduce the LocalTP failure through the real TensorSlice delegation.
+ *
+ * TensorSlice owns no host bytes itself: ensureOnDevice registers its inner
+ * tensor. Host release must therefore delegate the entire transition to that
+ * same inner owner, including event retirement and unregistration, before the
+ * inner FP32 vector is reclaimed.
+ */
+TEST_F(Test__HostReleaseAfterGpuUpload, TensorSliceReleaseRetiresInnerRegistrationOnOwningDevice)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "Built without CUDA support";
+#else
+    if (device_count_ < 2)
+        GTEST_SKIP() << "Cross-device registration retirement requires two CUDA devices";
+
+    auto inner = llaminar2::test::TestTensorFactory::createFP32Random(
+        {8u, 3072u});
+    const void *const registered_address = inner->raw_data();
+    const SliceMetadata metadata = SliceMetadata::forRowParallel(
+        8u, 3072u, 1, 2, true);
+    std::unique_ptr<TensorBase> inner_storage = std::move(inner);
+    TensorSlice slice(std::move(inner_storage), metadata);
+    llaminar2::test::ScopedGPUStream upload_stream(gpu_device_);
+    ASSERT_TRUE(slice.ensureOnDevice(gpu_device_, upload_stream.get()));
+
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    slice.release_host_weight_data();
+    EXPECT_TRUE(slice.is_raw_data_released());
+    expectCudaHostAddressUnregistered(registered_address, "TensorSlice<FP32>");
 #endif
 }

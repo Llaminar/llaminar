@@ -241,6 +241,48 @@ namespace llaminar2
             std::string *error = nullptr);
         uint64_t moePlacementEpochAll() const;
         uint64_t moeRuntimeMovementEpochAll() const;
+        /**
+         * @brief Coordinate one prefix lookup across every local PP stage.
+         *
+         * Each stage owns a distinct payload/fingerprint but all stages must
+         * restore the same logical token boundary. The registry retains each
+         * child result so later population and terminal-state restoration use
+         * the exact handles returned by that child.
+         *
+         * @param tokens Complete request prefix token sequence.
+         * @return Common locally restorable prefix and typed terminal requirements.
+         */
+        PrefixLookupResult lookupPrefixAll(const std::vector<int32_t> &tokens);
+        /**
+         * @brief Restore the coordinated prefix into every local PP stage.
+         * @param hit Aggregate result returned by @ref lookupPrefixAll.
+         * @param seq_idx Sequence slot receiving the restored state.
+         * @return True after every child imports its own clamped payload.
+         */
+        bool populatePrefixAll(const PrefixLookupResult &hit, int seq_idx = 0);
+        /**
+         * @brief Archive one completed prefix in every local PP stage cache.
+         * @param tokens Complete prompt token sequence.
+         * @param prompt_token_count Number of live prompt tokens.
+         * @return True after every child publishes its stage-owned payload.
+         */
+        bool harvestPrefixAll(
+            const std::vector<int32_t> &tokens,
+            int prompt_token_count);
+        /**
+         * @brief Restore stage-specific terminal state for a full prefix hit.
+         * @param hit Aggregate coordinated hit naming the common token boundary.
+         * @return True when every child satisfies its typed terminal contract.
+         */
+        bool restorePrefixTerminalStateAll(const PrefixLookupResult &hit);
+        /**
+         * @brief Return the local PP participant runtime-state observation.
+         *
+         * A single local stage is returned verbatim. Multiple local stages are
+         * folded in stable pipeline order so cache inventories and terminal
+         * evidence remain complete without inventing a second state authority.
+         */
+        PrefixRuntimeStateSnapshot prefixStateProbeAll() const;
         PrefixStateSnapshot captureLivePrefixStateAll(int seq_idx = 0) const;
         PrefixStateSnapshot captureLivePrefixCheckpointAll(
             const PrefixCheckpointCaptureRequest &request) const;
@@ -248,6 +290,9 @@ namespace llaminar2
         bool truncateLivePrefixStateAll(int cached_tokens, int seq_idx = 0);
         std::string mtpDecodeUnsupportedReasonAll() const;
         void enableSnapshotCaptureAll(const std::string &output_dir);
+        /** @brief Install one immutable capture filter on every local stage. */
+        void setSnapshotCaptureFilterAll(
+            const std::vector<std::string> &keys);
         void disableSnapshotCaptureAll();
         void clearSnapshotsAll();
         const float *getSnapshot(const std::string &key, size_t &out_size) const;
@@ -257,6 +302,9 @@ namespace llaminar2
     private:
         std::vector<StageRunnerEntry> entries_;
         std::unique_ptr<IInferenceRunner> compatibility_runner_;
+        /** Child-owned lookup handles retained until this prefix transaction ends. */
+        std::vector<PrefixLookupResult> last_prefix_hits_;
+        std::optional<PrefixLookupResult> compatibility_prefix_hit_;
     };
 
     /**
@@ -460,6 +508,20 @@ namespace llaminar2
         bool supportsMTPTokenCoordination() const override;
         uint64_t moePlacementEpoch() const override;
         uint64_t moeRuntimeMovementEpoch() const override;
+        /** @brief Coordinate prefix lookup across the local stages on this rank. */
+        PrefixLookupResult lookupPrefix(
+            const std::vector<int32_t> &tokens) override;
+        /** @brief Populate every local stage from its retained lookup handles. */
+        bool populatePrefix(
+            const PrefixLookupResult &hit,
+            int seq_idx = 0) override;
+        /** @brief Harvest one prefix payload from every local stage. */
+        bool harvestPrefix(
+            const std::vector<int32_t> &tokens,
+            int prompt_token_count) override;
+        /** @brief Restore typed terminal state on every local stage. */
+        bool restorePrefixTerminalState(
+            const PrefixLookupResult &hit) override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
         int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
@@ -467,6 +529,8 @@ namespace llaminar2
             const PrefixCheckpointCaptureRequest &request) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
+        /** @brief Observe the complete rank-local pipeline prefix state. */
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
 
         // =================================================================
         // IInferenceRunner — GPU-side Sampling
@@ -522,6 +586,9 @@ namespace llaminar2
         // =================================================================
 
         void enableSnapshotCapture(const std::string &output_dir) override;
+        /** @brief Forward the graph-identity snapshot filter to local stages. */
+        void setSnapshotCaptureFilter(
+            const std::vector<std::string> &keys) override;
         void disableSnapshotCapture() override;
         void clearSnapshots() override;
         const float *getSnapshot(const std::string &key, size_t &out_size) const override;

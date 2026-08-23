@@ -623,21 +623,96 @@ namespace llaminar2
         router_q8_hidden_.resize(
             static_cast<size_t>(rows) * static_cast<size_t>(blocks_per_row));
 
+        if (!quantizeRouterQ8Rows(
+                source,
+                rows,
+                d_model,
+                /*source_row_indices=*/nullptr,
+                rows,
+                router_q8_hidden_.data(),
+                router_q8_hidden_.size()))
+        {
+            return false;
+        }
+
+        router_q8_hidden_source_ = source;
+        router_q8_hidden_rows_ = rows;
+        router_q8_hidden_d_model_ = d_model;
+        router_q8_hidden_valid_ = true;
+        PerfStatsCollector::addCounter(
+            "kernel",
+            "cpu_moe_router_q8_hidden_publication_calls",
+            1.0,
+            "moe",
+            "cpu",
+            {{"rows", std::to_string(rows)},
+             {"d_model", std::to_string(d_model)}});
+        return true;
+    }
+
+    bool CPUMoEKernel::quantizeRouterQ8Rows(
+        const float *source,
+        int source_rows,
+        int d_model,
+        const int *source_row_indices,
+        int output_rows,
+        Q8_1Block *destination,
+        size_t destination_blocks)
+    {
+        if (!source || source_rows < 1 || d_model <= 0 ||
+            output_rows < 1 || !destination)
+        {
+            return false;
+        }
+
+        const int blocks_per_row =
+            (d_model + Q8_1Block::BLOCK_SIZE - 1) /
+            Q8_1Block::BLOCK_SIZE;
+        if (static_cast<size_t>(output_rows) >
+            std::numeric_limits<size_t>::max() /
+                static_cast<size_t>(blocks_per_row))
+        {
+            return false;
+        }
+        const size_t required_blocks =
+            static_cast<size_t>(output_rows) *
+            static_cast<size_t>(blocks_per_row);
+        if (required_blocks > destination_blocks)
+            return false;
+        if (source_row_indices)
+        {
+            for (int output_row = 0; output_row < output_rows; ++output_row)
+            {
+                const int source_row = source_row_indices[output_row];
+                if (source_row < 0 || source_row >= source_rows)
+                    return false;
+            }
+        }
+
         /*
-         * Quantize each row with the serial-decode block primitive. The outer
-         * row loop is intentionally direct: the activation batch is small even
-         * at deep speculative settings, and introducing a second OpenMP region
-         * here would compete with the grouped expert projection work that
-         * follows immediately.
+         * Every row is arithmetically independent, so distributing complete
+         * rows cannot change a Q8_1 byte. Keep MTP-sized publications serial:
+         * there is too little work to repay an OpenMP fork. A transported
+         * prefill packet can contain hundreds of rows, however, and the old
+         * serial loop left the other physical cores idle before every CPU
+         * expert layer. Require at least 16384 FP32 values (64 KiB) per useful
+         * worker before opening a team; this derives the crossover from both
+         * runtime geometry and the configured physical-core budget instead of
+         * baking in one model-specific row threshold.
          */
         const bool rows_are_block_aligned = (d_model % Q8_1Block::BLOCK_SIZE) == 0;
-        for (int row = 0; row < rows; ++row)
+        auto quantize_row = [&](int output_row)
         {
+            const int source_row = source_row_indices
+                                       ? source_row_indices[output_row]
+                                       : output_row;
             const float *row_source =
-                source + static_cast<size_t>(row) * static_cast<size_t>(d_model);
+                source + static_cast<size_t>(source_row) *
+                             static_cast<size_t>(d_model);
             Q8_1Block *row_q8 =
-                router_q8_hidden_.data() +
-                static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row);
+                destination +
+                static_cast<size_t>(output_row) *
+                    static_cast<size_t>(blocks_per_row);
             int block = 0;
 #if defined(__AVX512F__)
             if (rows_are_block_aligned)
@@ -661,20 +736,33 @@ namespace llaminar2
                         static_cast<int>(Q8_1Block::BLOCK_SIZE),
                         d_model - block_start));
             }
-        }
+        };
 
-        router_q8_hidden_source_ = source;
-        router_q8_hidden_rows_ = rows;
-        router_q8_hidden_d_model_ = d_model;
-        router_q8_hidden_valid_ = true;
-        PerfStatsCollector::addCounter(
-            "kernel",
-            "cpu_moe_router_q8_hidden_publication_calls",
-            1.0,
-            "moe",
-            "cpu",
-            {{"rows", std::to_string(rows)},
-             {"d_model", std::to_string(d_model)}});
+        constexpr size_t kMinimumValuesPerWorker = 16384u;
+        const int useful_workers =
+            std::min(output_rows, omp_get_max_threads());
+        const size_t total_values =
+            static_cast<size_t>(output_rows) * static_cast<size_t>(d_model);
+        const bool use_parallel_rows =
+            useful_workers > 1 &&
+            total_values >=
+                static_cast<size_t>(useful_workers) *
+                    kMinimumValuesPerWorker;
+        if (use_parallel_rows)
+        {
+            auto quantize_rows = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int row = 0; row < output_rows; ++row)
+                    quantize_row(row);
+            };
+            OMP_WORKSHARE_REGION(quantize_rows);
+        }
+        else
+        {
+            for (int row = 0; row < output_rows; ++row)
+                quantize_row(row);
+        }
         return true;
     }
 
@@ -703,6 +791,62 @@ namespace llaminar2
         int d_model)
     {
         return publishRouterQ8Hidden(source, rows, d_model);
+    }
+
+    bool CPUMoEKernel::publishTransportedRouterQ8HiddenExpertMajor(
+        const float *source,
+        int source_rows,
+        int d_model,
+        std::span<const int> expert_major_source_rows,
+        std::span<Q8_1Block> destination)
+    {
+        invalidateRouterQ8HiddenPublication();
+        if (expert_major_source_rows.empty() ||
+            expert_major_source_rows.size() >
+                static_cast<size_t>(std::numeric_limits<int>::max()))
+            return false;
+        const bool published = quantizeRouterQ8Rows(
+            source,
+            source_rows,
+            d_model,
+            expert_major_source_rows.data(),
+            static_cast<int>(expert_major_source_rows.size()),
+            destination.data(),
+            destination.size());
+        if (published)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cpu_moe_transport_router_q8_expert_major_publication_calls",
+                1.0,
+                "moe",
+                "cpu",
+                {{"source_rows", std::to_string(source_rows)},
+                 {"route_rows",
+                  std::to_string(expert_major_source_rows.size())},
+                 {"d_model", std::to_string(d_model)}});
+        }
+        return published;
+    }
+
+    bool CPUMoEKernel::reserveRouterQ8HiddenCapacity(
+        int rows,
+        int d_model)
+    {
+        invalidateRouterQ8HiddenPublication();
+        if (rows <= 0 || d_model <= 0)
+            return false;
+        const size_t blocks_per_row =
+            (static_cast<size_t>(d_model) + Q8_1Block::BLOCK_SIZE - 1u) /
+            Q8_1Block::BLOCK_SIZE;
+        if (static_cast<size_t>(rows) >
+            std::numeric_limits<size_t>::max() / blocks_per_row)
+        {
+            return false;
+        }
+        router_q8_hidden_.resize(
+            static_cast<size_t>(rows) * blocks_per_row);
+        return true;
     }
 
     bool CPUMoEKernel::route(

@@ -65,14 +65,16 @@ step plus native/reference token IDs and exact/Top-3/Top-5 token matches. Find
 the first bad decode step. A later-only failure often implicates KV indexing,
 position/rope state, cache reset, sampling state, or MTP advancement.
 
-For an MTP cell, inspect `mtp_sidecar_token_trace.csv` at the same time. Every
-call with positive `selected_depth` must have an equally sized
-`production_verifier_draft_tokens` vector, and
-`verifier_identity_transaction_count` / `verifier_identity_depth` must agree
-with that call's committed device-controller transaction. These fields come
-from the persistent identity copied by the fused response/state commit, not
-from reusable proposal or verifier-input scratch. A later row containing the
-prior transaction's draft vector is stale publication; an empty vector on a
+For an MTP cell, inspect `mtp_transactions.csv` and, when the specialized
+long-horizon campaign emits it, `mtp_sidecar_token_trace.csv`. Every speculative
+transaction must have an equally sized `production_verifier_draft_tokens`
+vector, and `verifier_identity_transaction_count` /
+`verifier_identity_depth` must agree with its committed device-controller
+transaction. These fields come from the persistent identity copied by the fused
+response/state commit, not from reusable proposal or verifier-input scratch.
+They also identify the exact forced-branch Hugging Face oracle when quantized
+predictor argmax leaves the canonical reference branch. A later row containing
+the prior transaction's draft vector is stale publication; an empty vector on a
 speculative row is missing publication. A terminal absorbing row may retain the
 last committed identity while selecting depth zero because it commits no new
 verifier transaction.

@@ -543,6 +543,108 @@ namespace llaminar2
             }
         }
 
+        /**
+         * @brief Collect the stages whose launch inputs change without rebuilding a graph.
+         *
+         * Decode setup, first execution, and replay must prepare exactly the same
+         * stage set. Keeping discovery here prevents setup-only capture from
+         * accidentally omitting an input producer merely because it does not run
+         * the request-scoped live-state prelude.
+         *
+         * @param graph Stable compute graph whose stages will be captured or run.
+         * @return Execution-order-preserving list of dynamic-input consumers.
+         */
+        std::vector<IComputeStage *> collectDynamicParamStages(
+            ComputeGraph &graph)
+        {
+            std::vector<IComputeStage *> stages;
+            for (const auto &node_name : graph.getExecutionOrder())
+            {
+                ComputeNode *node = graph.getNode(node_name);
+                if (node && node->stage && node->stage->hasDynamicParams())
+                    stages.push_back(node->stage.get());
+            }
+            return stages;
+        }
+
+        /**
+         * @brief Publish one forward invocation's dynamic inputs to graph stages.
+         *
+         * The caller binds every GPU stage to its exact non-null execution stream
+         * before entering this helper. Embedding uses that stream to preload host
+         * token rows outside native capture; RoPE consumes the explicit host or
+         * device position authority; the remaining stages stamp their stable
+         * device parameter buffers. The same arithmetic-free prelude is therefore
+         * valid for setup materialization, first execution, and cached replay.
+         *
+         * @param input Typed token/position geometry for the upcoming submission.
+         * @param stages Dynamic stages collected in graph execution order.
+         * @param host_position_ids Host position authority, or null when positions
+         *        are device-owned or represented by a contiguous scalar offset.
+         * @param boundary Short diagnostic name for the calling lifecycle edge.
+         * @return True after every stage accepted the typed position authority.
+         */
+        bool updateDynamicParamStages(
+            const ForwardInput &input,
+            const std::vector<IComputeStage *> &stages,
+            const int *host_position_ids,
+            const char *boundary)
+        {
+            const int position_row_count = forwardPositionRowCount(input);
+            if ((input.position_ids_device || host_position_ids) &&
+                position_row_count <= 0)
+            {
+                LOG_ERROR(
+                    "[ForwardExecutionEngine] "
+                    << (boundary ? boundary : "dynamic input preparation")
+                    << " received invalid flattened position geometry: batch="
+                    << input.batch_size << " seq_len=" << input.seq_len);
+                return false;
+            }
+
+            for (auto *stage : stages)
+            {
+                if (!stage)
+                    continue;
+
+                if (input.position_ids_device)
+                {
+                    if (!stage->supportsDeviceResidentDynamicPositionReplay())
+                    {
+                        LOG_ERROR(
+                            "[ForwardExecutionEngine] Stage "
+                            << stage->name() << " cannot consume device-resident "
+                            << "positions during "
+                            << (boundary ? boundary
+                                         : "dynamic input preparation"));
+                        return false;
+                    }
+                    stage->updateDynamicDevicePositionIds(
+                        input.position_ids_device,
+                        position_row_count);
+                    /*
+                     * RoPE consumes the explicit device rows directly. Calling
+                     * its scalar update afterward would clear that pointer. Other
+                     * stages use the device-position hook as an ownership marker
+                     * and still need their non-position launch values stamped.
+                     */
+                    if (stage->type() == ComputeStageType::ROPE)
+                        continue;
+                }
+
+                stage->updateDynamicParams(
+                    input.position_offset,
+                    input.seq_len);
+                if (host_position_ids)
+                {
+                    stage->updateDynamicPositionIds(
+                        host_position_ids,
+                        position_row_count);
+                }
+            }
+            return true;
+        }
+
         /** @brief Build the explicit wire identity for one MoE overlay graph execution. */
         IComputeStage::MoEOverlayCollectiveRuntimeParams
         makeMoEOverlayCollectiveRuntimeParams(const ForwardInput &input)
@@ -1632,13 +1734,39 @@ namespace llaminar2
          * whose capture identity includes the finalized generation may cross
          * this boundary.
          */
+        const bool shifted_main_prefill =
+            input.execution_role == ForwardExecutionRole::MainInference &&
+            input.execution_phase == ForwardExecutionPhase::Prefill &&
+            input.state_transaction == ForwardStateTransaction::Ordinary;
+        const bool shifted_restored_prefix_decode =
+            input.execution_role == ForwardExecutionRole::MTPCondition &&
+            input.execution_phase == ForwardExecutionPhase::Decode &&
+            input.state_transaction ==
+                ForwardStateTransaction::RestoredPrefixMTPDecodeBridge &&
+            input.batch_size == 1 && input.seq_len == 1;
         if (input.shifted_mtp_prefill &&
-            !input.shifted_mtp_prefill->executableForRequestCount(
-                input.batch_size))
+            (!input.shifted_mtp_prefill->executableForRequestCount(
+                 input.batch_size) ||
+             (!shifted_main_prefill &&
+              !shifted_restored_prefix_decode)))
         {
             LOG_ERROR(
                 "[ForwardExecutionEngine] Refusing a declaration-only or "
                 "incomplete shifted-MTP prefill binding");
+            return false;
+        }
+        if (input.mtp_main_terminal_hidden &&
+            (!input.mtp_main_terminal_hidden->executableForRequestCount(
+                 input.batch_size) ||
+             input.shifted_mtp_prefill.has_value() ||
+             input.state_transaction != ForwardStateTransaction::Ordinary ||
+             input.execution_phase != ForwardExecutionPhase::Decode ||
+             (input.execution_role != ForwardExecutionRole::MainInference &&
+              input.execution_role != ForwardExecutionRole::MTPCondition)))
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Refusing an incomplete or "
+                "mis-scoped MTP main terminal-hidden binding");
             return false;
         }
 
@@ -1883,6 +2011,7 @@ namespace llaminar2
                 .batch_size = effective_input.batch_size,
                 .device = effective_input.device,
                 .execution_role = effective_input.execution_role,
+                .state_transaction = effective_input.state_transaction,
                 .decode = is_decode,
                 .decode_has_history = decode_has_history,
                 .all_position_logits = all_position_logits,
@@ -1906,6 +2035,11 @@ namespace llaminar2
                 .shifted_mtp_prefill_capture_identity =
                     effective_input.shifted_mtp_prefill
                         ? effective_input.shifted_mtp_prefill->capture_identity
+                        : uint64_t{0},
+                .mtp_main_terminal_hidden_capture_identity =
+                    effective_input.mtp_main_terminal_hidden
+                        ? effective_input.mtp_main_terminal_hidden
+                              ->capture_identity
                         : uint64_t{0},
                 .standard_path = is_standard_path,
                 .pp_stage_enabled = config_.pp_stage_config.has_value(),
@@ -1932,6 +2066,48 @@ namespace llaminar2
         const bool use_cached_forward = forward_cache_eligible &&
                                         active_forward_cache &&
                                         active_forward_cache->valid;
+
+        if (forward_cache_eligible)
+        {
+            LOG_TRACE(
+                "[ForwardGraphCacheIdentity] result="
+                << (use_cached_forward ? "hit" : "miss")
+                << " submission="
+                << (setup_materialization ? "setup_materialize" : "runtime")
+                << " seq_len=" << forward_signature.seq_len
+                << " batch=" << forward_signature.batch_size
+                << " device=" << forward_signature.device.toString()
+                << " role="
+                << static_cast<int>(forward_signature.execution_role)
+                << " decode=" << boolTag(forward_signature.decode)
+                << " history="
+                << boolTag(forward_signature.decode_has_history)
+                << " all_logits="
+                << boolTag(forward_signature.all_position_logits)
+                << " device_tokens="
+                << boolTag(forward_signature.uses_device_token_ids)
+                << " device_positions="
+                << boolTag(forward_signature.uses_device_position_ids)
+                << " position_policy="
+                << static_cast<int>(forward_signature.position_policy)
+                << " device_lengths="
+                << boolTag(forward_signature.uses_device_sequence_lengths)
+                << " chunk_identity="
+                << forward_signature.device_prefill_chunk_capture_identity
+                << " shifted_mtp_identity="
+                << forward_signature.shifted_mtp_prefill_capture_identity
+                << " mtp_terminal_hidden_identity="
+                << forward_signature
+                       .mtp_main_terminal_hidden_capture_identity
+                << " bucketed="
+                << boolTag(forward_signature.is_bucketed_prefill)
+                << " bucket_rows=" << forward_signature.bucket_seq_len
+                << " prefix_rehydrate="
+                << boolTag(
+                       forward_signature.rehydrate_prefix_runtime_on_device)
+                << " placement_epoch="
+                << forward_signature.moe_placement_epoch);
+        }
 
         if (live_mtp_request_batch_condition &&
             debugEnv().runtime_debug.mtp_condition_graph_contract_trace)
@@ -1982,7 +2158,10 @@ namespace llaminar2
             }
             if (success)
             {
-                recordLastExecutedForwardGraph(forward_signature, /*cache_hit=*/true);
+                recordLastExecutedForwardGraph(
+                    forward_signature,
+                    /*cache_hit=*/true,
+                    output.execution.stream);
             }
             if (success && !forward_signature.decode)
                 enforcePrefillForwardCapacity(&forward_signature);
@@ -2044,7 +2223,10 @@ namespace llaminar2
                 << " success=" << boolTag(success));
         }
         if (success && build_cache && build_cache->valid)
-            recordLastExecutedForwardGraph(forward_signature, /*cache_hit=*/false);
+            recordLastExecutedForwardGraph(
+                forward_signature,
+                /*cache_hit=*/false,
+                output.execution.stream);
         if (setup_materialization)
         {
             if (success && !forward_signature.decode)
@@ -2064,11 +2246,13 @@ namespace llaminar2
 
     void ForwardExecutionEngine::recordLastExecutedForwardGraph(
         const ForwardGraphSignature &signature,
-        bool cache_hit)
+        bool cache_hit,
+        void *producer_stream)
     {
         last_executed_forward_graph_.valid = true;
         last_executed_forward_graph_.signature = signature;
         last_executed_forward_graph_.cache_hit = cache_hit;
+        last_executed_forward_graph_.producer_stream = producer_stream;
         if (signature.execution_role ==
                 ForwardExecutionRole::GroupedMTPVerifier &&
             signature.decode &&
@@ -2077,6 +2261,8 @@ namespace llaminar2
             last_all_position_verifier_graph_.valid = true;
             last_all_position_verifier_graph_.signature = signature;
             last_all_position_verifier_graph_.cache_hit = cache_hit;
+            last_all_position_verifier_graph_.producer_stream =
+                producer_stream;
         }
     }
 
@@ -2438,9 +2624,7 @@ namespace llaminar2
         view.graph = it->second.graph.get();
         view.signature = state.signature;
         view.device = view.signature.device;
-        view.stream = it->second.outputProducerStream(
-            state.signature.decode,
-            /*used_graph_replay=*/state.signature.decode);
+        view.stream = state.producer_stream;
         view.cache_hit = state.cache_hit;
         view.is_decode = view.signature.decode;
         view.all_position_logits = view.signature.all_position_logits;
@@ -2597,7 +2781,7 @@ namespace llaminar2
                 "dependencies");
             return false;
         }
-        if (forward_cache.segment_cache.initialized &&
+        if (is_decode && forward_cache.segment_cache.initialized &&
             !forward_cache.segment_cache.needs_capture &&
             forward_cache.segment_cache.executable_submission_state !=
                 DeviceGraphExecutor::GraphSegmentCache::
@@ -2616,16 +2800,11 @@ namespace llaminar2
         IDeviceContext *const ctx = host.getDeviceContext(input.device);
         IWorkerGPUContext *const gpu_ctx =
             ctx ? host.getWorkerGPUContext(ctx->deviceId()) : nullptr;
-        if (!ctx || !gpu_ctx ||
-            !forward_cache.segment_cache.ensureCaptureStream(
-                gpu_ctx, ctx->deviceId()) ||
-            !forward_cache.segment_cache.ensureCaptureInputEvent(gpu_ctx) ||
-            !forward_cache.segment_cache.ensureCaptureOutputEvent(gpu_ctx) ||
-            !forward_cache.segment_cache.capture_stream)
+        if (!ctx || !gpu_ctx)
         {
             LOG_ERROR(
                 "[ForwardExecutionEngine] Setup graph materialization could "
-                "not establish its exact device context and capture stream on "
+                "not establish its exact device context on "
                 << input.device.toString());
             return false;
         }
@@ -2636,26 +2815,6 @@ namespace llaminar2
             LOG_ERROR(
                 "[ForwardExecutionEngine] Setup graph materialization resolved "
                 "a null worker stream on "
-                << input.device.toString());
-            return false;
-        }
-
-        /*
-         * Setup capture intentionally skips the ordinary live-state prelude: it
-         * has no admitted request and launches no model work. Graph construction
-         * can nevertheless publish immutable device descriptors. Join that one
-         * producer on the exact capture stream now, before recording the native
-         * executable, so the publication event can be reused by the next bucket
-         * without a host or device synchronization.
-         */
-        if (!host.prepareGraphBuildStateForMaterialization(
-                input,
-                forward_cache.segment_cache.capture_stream,
-                ctx->deviceId()))
-        {
-            LOG_ERROR(
-                "[ForwardExecutionEngine] Setup graph materialization could not "
-                "consume graph-build device-state readiness on "
                 << input.device.toString());
             return false;
         }
@@ -2672,7 +2831,39 @@ namespace llaminar2
                 ctx,
                 host,
                 &used_graph_replay,
+                nullptr,
                 kMaterialize);
+        }
+
+        if (!forward_cache.segment_cache.ensureCaptureStream(
+                gpu_ctx, ctx->deviceId()) ||
+            !forward_cache.segment_cache.ensureCaptureInputEvent(gpu_ctx) ||
+            !forward_cache.segment_cache.ensureCaptureOutputEvent(gpu_ctx) ||
+            !forward_cache.segment_cache.capture_stream)
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Setup decode graph materialization "
+                "could not establish its exact capture stream on "
+                << input.device.toString());
+            return false;
+        }
+
+        /*
+         * Setup capture has no admitted request and launches no model work.
+         * Graph construction may nevertheless publish immutable device
+         * descriptors. Join that producer on the exact decode capture stream so
+         * the same event-owned state is visible to every graph in the family.
+         */
+        if (!host.prepareGraphBuildStateForMaterialization(
+                input,
+                forward_cache.segment_cache.capture_stream,
+                ctx->deviceId()))
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Setup decode graph materialization "
+                "could not consume graph-build device-state readiness on "
+                << input.device.toString());
+            return false;
         }
 
         DeviceGraphExecutor::DecodeCapturePolicy capture_policy =
@@ -3097,10 +3288,36 @@ namespace llaminar2
                       << " applied_stream=" << forward_cache.applied_stream);
         }
 
+        // Discovery is topology-owned and shared by setup capture and every
+        // request execution. Only the small resulting list is walked per launch.
+        if (!forward_cache.dynamic_param_stages_cached)
+        {
+            forward_cache.dynamic_param_stages =
+                collectDynamicParamStages(*forward_cache.graph);
+            forward_cache.dynamic_param_stages_cached = true;
+        }
+
         if (input.graph_submission_intent ==
             ForwardGraphSubmissionIntent::
                 MaterializeExecutableWithoutLaunch)
         {
+            /*
+             * Setup capture intentionally skips mutable request admission, but
+             * native capture still requires every stable input slot to be ready.
+             * In particular, host-token decode must enqueue its sentinel H2D copy
+             * before beginCapture(); the embedding kernel correctly rejects an
+             * H2D operation discovered from inside capture.
+             */
+            const int *setup_position_ids =
+                selectForwardReplayHostPositionIds(forward_cache, input);
+            if (!updateDynamicParamStages(
+                    input,
+                    forward_cache.dynamic_param_stages,
+                    setup_position_ids,
+                    "setup graph materialization"))
+            {
+                return false;
+            }
             return materializeCachedExecutableWithoutLaunch(
                 input,
                 forward_cache,
@@ -3150,22 +3367,6 @@ namespace llaminar2
             }
         }
 
-        // Update position-dependent params using cached stage pointers.
-        // Only ~4 stages override updateDynamicParams() — avoids iterating
-        // all ~339 stages with hash lookups on every decode step.
-        if (!forward_cache.dynamic_param_stages_cached)
-        {
-            forward_cache.dynamic_param_stages.clear();
-            const auto &order = forward_cache.graph->getExecutionOrder();
-            for (const auto &node_name : order)
-            {
-                ComputeNode *node = forward_cache.graph->getNode(node_name);
-                if (node && node->stage && node->stage->hasDynamicParams())
-                    forward_cache.dynamic_param_stages.push_back(node->stage.get());
-            }
-            forward_cache.dynamic_param_stages_cached = true;
-        }
-
         if (!forward_cache.prefill_replay_param_stages_cached)
         {
             forward_cache.prefill_replay_param_stages.clear();
@@ -3193,49 +3394,13 @@ namespace llaminar2
             forward_cache.moe_overlay_collective_runtime_stages);
         const int *replay_position_ids =
             selectForwardReplayHostPositionIds(forward_cache, input);
-        const int position_row_count = forwardPositionRowCount(input);
-        if ((input.position_ids_device || replay_position_ids) &&
-            position_row_count <= 0)
+        if (!updateDynamicParamStages(
+                input,
+                forward_cache.dynamic_param_stages,
+                replay_position_ids,
+                "cached graph replay"))
         {
-            LOG_ERROR("[ForwardExecutionEngine] Cached graph replay received invalid flattened position geometry: batch="
-                      << input.batch_size << " seq_len=" << input.seq_len);
             return false;
-        }
-        for (auto *stage : forward_cache.dynamic_param_stages)
-        {
-            if (input.position_ids_device)
-            {
-                if (!stage->supportsDeviceResidentDynamicPositionReplay())
-                {
-                    LOG_ERROR("[ForwardExecutionEngine] Stage "
-                              << stage->name()
-                              << " cannot consume device-resident replay positions without host scalar state");
-                    return false;
-                }
-                stage->updateDynamicDevicePositionIds(
-                    input.position_ids_device,
-                    position_row_count);
-                /*
-                 * RoPE consumes device position rows directly.  Calling the
-                 * scalar update afterward would clear its device pointer.
-                 * Other dynamic stages use this hook as a resident-state marker
-                 * and still need their non-position replay scalars stamped.
-                 */
-                if (stage->type() == ComputeStageType::ROPE)
-                    continue;
-                stage->updateDynamicParams(input.position_offset, input.seq_len);
-            }
-            else if (replay_position_ids)
-            {
-                stage->updateDynamicParams(input.position_offset, input.seq_len);
-                stage->updateDynamicPositionIds(
-                    replay_position_ids,
-                    position_row_count);
-            }
-            else
-            {
-                stage->updateDynamicParams(input.position_offset, input.seq_len);
-            }
         }
 
         if (profiling_setup)
@@ -3284,6 +3449,7 @@ namespace llaminar2
         // admit collective-only segmentation through the topology policy.
         // Prefill uses its separate bucketed graph-cache state machine below.
         bool used_graph_replay = false;
+        void *prefill_producer_stream = nullptr;
         bool requested_deferred_all_position_sync = false;
         bool requested_deferred_main_decode_sync = false;
         bool executed_deferred_all_position_sync = false;
@@ -3307,7 +3473,8 @@ namespace llaminar2
                     forward_cache,
                     ctx,
                     host,
-                    &used_graph_replay);
+                    &used_graph_replay,
+                    &prefill_producer_stream);
             }
             else
             {
@@ -3637,12 +3804,16 @@ namespace llaminar2
          * asynchronously enqueued GPU work, and that work retains ownership
          * until its exact stream reaches this event publication.
          */
+        void *const exact_output_producer_stream = success
+            ? (is_decode
+                   ? forward_cache.decodeOutputProducerStream(
+                         used_graph_replay
+                             ? ForwardGraphCache::DecodeLaunchPath::CapturedReplay
+                             : ForwardGraphCache::DecodeLaunchPath::Direct)
+                   : prefill_producer_stream)
+            : dynamic_param_stream;
         void *const live_state_completion_stream =
-            success
-                ? forward_cache.outputProducerStream(
-                      is_decode,
-                      used_graph_replay)
-                : dynamic_param_stream;
+            exact_output_producer_stream;
         live_state_read.complete(live_state_completion_stream);
 
         if (success && !is_decode && !input.device.is_gpu() &&
@@ -3731,9 +3902,7 @@ namespace llaminar2
             publishForwardOutputProvenance(
                 output,
                 input.device,
-                forward_cache.outputProducerStream(
-                    is_decode,
-                    used_graph_replay),
+                exact_output_producer_stream,
                 input.execution_role,
                 is_decode,
                 host.computeAllPositionLogitsEnabled(),
@@ -3897,8 +4066,6 @@ namespace llaminar2
             timings.graph_launch_ns = replay_timings.graph_launch_ns;
             timings.post_launch_ns = replay_timings.post_launch_ns;
             timings.stream_sync_ns = replay_timings.stream_sync_ns;
-            timings.manual_host_ticket_wait_ns =
-                replay_timings.manual_host_ticket_wait_ns;
             timings.manual_dispatch_ns =
                 replay_timings.manual_dispatch_ns;
             timings.manual_sparse_protocol_ns =
@@ -3929,11 +4096,18 @@ namespace llaminar2
         IDeviceContext *ctx,
         IForwardExecutionHost &host,
         bool *used_graph_replay,
+        void **out_producer_stream,
         DeviceGraphExecutor::GraphInitialSubmissionPolicy
             initial_submission)
     {
         if (used_graph_replay)
             *used_graph_replay = false;
+        if (out_producer_stream)
+            *out_producer_stream = nullptr;
+        const bool materialize_without_launch =
+            initial_submission ==
+            DeviceGraphExecutor::GraphInitialSubmissionPolicy::
+                MaterializeWithoutLaunch;
         // Initialize prefill graph cache on first use
         if (!forward_cache.prefill_graph_cache)
         {
@@ -4148,18 +4322,6 @@ namespace llaminar2
             uses_retained_sparse_parent ||
             uses_device_timeline_transaction ||
             uses_heterogeneous_ticket_transaction;
-        if (initial_submission ==
-                DeviceGraphExecutor::GraphInitialSubmissionPolicy::
-                    MaterializeWithoutLaunch &&
-            !prefill_heterogeneous_segmentation_admitted)
-        {
-            LOG_ERROR(
-                "[ForwardExecutionEngine] Setup-only prefill materialization "
-                "currently requires the explicit heterogeneous/retained sparse "
-                "graph path; monolithic PrefillGraphCache has an independent "
-                "lifecycle");
-            return false;
-        }
         bool padded_preflight_checked = false;
         PrefillGraphRejectReason padded_preflight_reason = PrefillGraphRejectReason::None;
         std::string padded_reject_stage_name;
@@ -4452,6 +4614,20 @@ namespace llaminar2
                 forward_cache.segment_cache.initialized &&
                 !forward_cache.segment_cache.needs_capture;
 
+            if (materialize_without_launch && !was_initialized &&
+                !host.prepareGraphBuildStateForMaterialization(
+                    input,
+                    stream,
+                    ctx->deviceId()))
+            {
+                LOG_ERROR(
+                    "[ForwardExecutionEngine] Setup segmented prefill "
+                    "materialization could not consume graph-build device-state "
+                    "readiness on "
+                    << input.device.toString());
+                return false;
+            }
+
             auto capture_boundary =
                 [&host, &input](
                     const std::string &boundary_name,
@@ -4489,9 +4665,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (initial_submission ==
-                DeviceGraphExecutor::GraphInitialSubmissionPolicy::
-                    MaterializeWithoutLaunch)
+            if (materialize_without_launch)
             {
                 PerfStatsCollector::addCounter(
                     "forward_graph",
@@ -4540,6 +4714,8 @@ namespace llaminar2
 
             if (used_graph_replay)
                 *used_graph_replay = true;
+            if (out_producer_stream)
+                *out_producer_stream = stream;
             PerfStatsCollector::addCounter(
                 "forward_graph",
                 "prefill_heterogeneous_segmented_graph",
@@ -4565,6 +4741,42 @@ namespace llaminar2
             return true;
         }
 
+        /*
+         * Setup owns a direct Cold -> Initialized transition. It has already
+         * built the exact graph topology and permanent storage family, so an
+         * eager synthetic request would add payload side effects without
+         * establishing any additional capture invariant.
+         */
+        if (materialize_without_launch && phase == PrefillGraphPhase::Cold)
+        {
+            cache.markInitializedForSetupMaterialization(key);
+            phase = PrefillGraphPhase::Initialized;
+        }
+
+        if (materialize_without_launch &&
+            phase == PrefillGraphPhase::Ready && cache.hasGraph(key))
+        {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "setup_materialized_graph_reuses",
+                1.0,
+                "setup",
+                input.device.toString(),
+                {{"context", "monolithic_prefill"},
+                 {"bucket_seq_len", std::to_string(bucket_seq_len)},
+                 {"transaction_zero_pending",
+                  cache.materializedTransactionZeroPending(key) ? "true"
+                                                                : "false"}});
+            publishPrefillGraphObservation(
+                forward_cache,
+                input,
+                key,
+                PrefillGraphPhase::Ready,
+                "materialized_without_launch",
+                "monolithic_prefill_reuse");
+            return true;
+        }
+
         if (phase == PrefillGraphPhase::Ready && !host_prefill_graph_disabled)
         {
             // === REPLAY PATH ===
@@ -4577,13 +4789,44 @@ namespace llaminar2
             }
             bindPrefillStreamToStages(stream);
 
+            const bool transaction_zero_after_setup =
+                cache.materializedTransactionZeroPending(key);
+            if (transaction_zero_after_setup &&
+                !executor_.prepareGraphStorageForCapture(
+                    *forward_cache.graph,
+                    ctx,
+                    stream,
+                    "prefill_graph_transaction_zero_frontier",
+                    GraphCaptureDependencyLedger::ExternalInputAuthority::
+                        RequireReadyBytes))
+            {
+                LOG_ERROR(
+                    "[ForwardExecutionEngine] Setup-materialized prefill graph "
+                    "could not validate its live transaction-zero input frontier");
+                return false;
+            }
+
             if (!preparePrefillGraphLaunchMetadata(
                     stream,
                     GraphLaunchPreparationPhase::Replay,
                     "replay"))
                 return false;
 
-            if (!launchPrefillGraph(gpu_ctx, stream, "replay", PrefillGraphPhase::Ready, "replay", "none"))
+            const char *const launch_kind =
+                transaction_zero_after_setup
+                    ? "transaction_zero_after_setup"
+                    : "replay";
+            const std::string replay_reason =
+                transaction_zero_after_setup
+                    ? "setup_materialized_transaction_zero"
+                    : "none";
+            if (!launchPrefillGraph(
+                    gpu_ctx,
+                    stream,
+                    "replay",
+                    PrefillGraphPhase::Ready,
+                    launch_kind,
+                    replay_reason))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph replay FAILED for seq_len=" << input.seq_len);
                 return false;
@@ -4615,7 +4858,11 @@ namespace llaminar2
                 key,
                 PrefillGraphPhase::Ready,
                 "replay",
-                "none");
+                replay_reason);
+            if (used_graph_replay)
+                *used_graph_replay = true;
+            if (out_producer_stream)
+                *out_producer_stream = stream;
             return true;
         }
 
@@ -4635,7 +4882,9 @@ namespace llaminar2
                 input,
                 snapshots_active,
                 moe_rebalancing_active,
-                PrefillGraphPreflightMode::CaptureReady,
+                materialize_without_launch
+                    ? PrefillGraphPreflightMode::Default
+                    : PrefillGraphPreflightMode::CaptureReady,
                 prefill_collectives_graph_capturable,
                 prefill_heterogeneous_segmentation_admitted,
                 moe_rebalancing_graph_stable,
@@ -4661,8 +4910,21 @@ namespace llaminar2
              * stream order therefore supplies the complete producer-to-capture
              * dependency; a host stream drain here would only serialize the
              * Warmup -> Capture transition.
-             */
+            */
             bindPrefillStreamToStages(stream);
+            if (materialize_without_launch &&
+                !host.prepareGraphBuildStateForMaterialization(
+                    input,
+                    stream,
+                    ctx->deviceId()))
+            {
+                LOG_ERROR(
+                    "[ForwardExecutionEngine] Setup monolithic prefill "
+                    "materialization could not consume graph-build device-state "
+                    "readiness on "
+                    << input.device.toString());
+                return false;
+            }
             if (!executor_.allocateGraphStorageForCapture(
                     *forward_cache.graph,
                     ctx,
@@ -4677,6 +4939,41 @@ namespace llaminar2
                     GraphLaunchPreparationPhase::Capture,
                     "capture"))
                 return false;
+
+            if (materialize_without_launch)
+            {
+                capture_ready_reason = preflightPrefillGraph(
+                    cache,
+                    *forward_cache.graph,
+                    key,
+                    forward_cache.collective_nodes,
+                    input,
+                    snapshots_active,
+                    moe_rebalancing_active,
+                    PrefillGraphPreflightMode::CaptureReady,
+                    prefill_collectives_graph_capturable,
+                    prefill_heterogeneous_segmentation_admitted,
+                    moe_rebalancing_graph_stable,
+                    host_prefill_graph_disabled,
+                    &capture_ready_reject_stage_name,
+                    &capture_ready_reject_stage_type);
+                if (capture_ready_reason != PrefillGraphRejectReason::None)
+                {
+                    LOG_ERROR(
+                        "[ForwardExecutionEngine] Setup monolithic prefill "
+                        "capture readiness rejected after launch preparation: "
+                        << toString(capture_ready_reason)
+                        << (capture_ready_reject_stage_name.empty()
+                                ? ""
+                                : " stage=")
+                        << capture_ready_reject_stage_name
+                        << (capture_ready_reject_stage_type.empty()
+                                ? ""
+                                : " type=")
+                        << capture_ready_reject_stage_type);
+                    return false;
+                }
+            }
             if (!executor_.prepareSnapshotsForGraphCapture(
                     *forward_cache.graph,
                     ctx,
@@ -4700,7 +4997,12 @@ namespace llaminar2
                     *forward_cache.graph,
                     ctx,
                     stream,
-                    "prefill_graph_capture"))
+                    "prefill_graph_capture",
+                    materialize_without_launch
+                        ? GraphCaptureDependencyLedger::ExternalInputAuthority::
+                              BindDeclaredAddressesOnly
+                        : GraphCaptureDependencyLedger::ExternalInputAuthority::
+                              RequireReadyBytes))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph storage preparation failed for seq_len="
                           << input.seq_len);
@@ -4715,7 +5017,13 @@ namespace llaminar2
                     prefill_capture_order.data(), prefill_capture_order.size()),
                 input.device,
                 stream,
-                "prefill_graph_capture");
+                "prefill_graph_capture",
+                std::span<const BufferId>{},
+                materialize_without_launch
+                    ? GraphCaptureDependencyLedger::ExternalInputAuthority::
+                          BindDeclaredAddressesOnly
+                    : GraphCaptureDependencyLedger::ExternalInputAuthority::
+                          RequireReadyBytes);
             if (!dependency_ledger)
             {
                 LOG_ERROR(
@@ -4752,6 +5060,14 @@ namespace llaminar2
                     stream,
                     [&]() -> bool
                     {
+                        if (materialize_without_launch)
+                        {
+                            return executor_.recordSetupGraphMaterialization(
+                                *forward_cache.graph,
+                                ctx,
+                                &forward_cache.collective_nodes,
+                                &forward_cache.snapshot_manifest);
+                        }
                         return executor_.executeFastDecode(
                             *forward_cache.graph,
                             ctx,
@@ -4764,6 +5080,27 @@ namespace llaminar2
                     "[ForwardExecutionEngine] Mandatory prefill graph capture transaction failed for seq_len="
                     << input.seq_len);
                 return false;
+            }
+
+            if (materialize_without_launch)
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "prefill_graph_materialized_without_launch",
+                    1.0,
+                    "setup",
+                    input.device.toString(),
+                    {{"bucket_seq_len", std::to_string(bucket_seq_len)},
+                     {"replay_plan", "monolithic_prefill"},
+                     {"transaction_zero_pending", "true"}});
+                publishPrefillGraphObservation(
+                    forward_cache,
+                    input,
+                    key,
+                    PrefillGraphPhase::Ready,
+                    "materialized_without_launch",
+                    "monolithic_prefill");
+                return true;
             }
 
             const std::string capture_launch_boundary =
@@ -4822,6 +5159,8 @@ namespace llaminar2
                 PrefillGraphPhase::Ready,
                 "capture",
                 recapture_reason);
+            if (out_producer_stream)
+                *out_producer_stream = stream;
             return true;
         }
 
@@ -4955,6 +5294,10 @@ namespace llaminar2
         {
             return false;
         }
+
+        if (out_producer_stream)
+            *out_producer_stream =
+                forward_cache.prefill_capture_stream.stream;
 
         // After successful warmup, check if graph capture is eligible
         if (cold_phase)
@@ -5249,6 +5592,19 @@ namespace llaminar2
                         bucketed_prefill_reject_stage_type);
                 }
 
+                std::string rejected_stage_readiness;
+                if (!bucketed_prefill_reject_stage_name.empty())
+                {
+                    const auto *rejected_node =
+                        graph.getNode(bucketed_prefill_reject_stage_name);
+                    if (rejected_node && rejected_node->stage)
+                    {
+                        rejected_stage_readiness =
+                            rejected_node->stage
+                                ->graphCaptureReadinessDebugString();
+                    }
+                }
+
                 LOG_ERROR("[ForwardExecutionEngine] Bucketed prefill graph rejected by preflight before execution: "
                           << toString(bucketed_prefill_reject_reason)
                           << (bucketed_prefill_reject_stage_name.empty() ? "" : " stage=")
@@ -5257,6 +5613,11 @@ namespace llaminar2
                           << bucketed_prefill_reject_stage_type
                           << " real_seq_len=" << effectiveRealSeqLen(effective_input)
                           << " bucket_seq_len=" << effectiveBucketSeqLen(effective_input)
+                          << (rejected_stage_readiness.empty()
+                                  ? ""
+                                  : " readiness={")
+                          << rejected_stage_readiness
+                          << (rejected_stage_readiness.empty() ? "" : "}")
                           << "; refusing eager prefill fallback");
                 return false;
             }
@@ -5327,6 +5688,9 @@ namespace llaminar2
          */
         const bool atomic_gpu_graph_first_use =
             is_decode ||
+            effective_input.graph_submission_intent ==
+                ForwardGraphSubmissionIntent::
+                    MaterializeExecutableWithoutLaunch ||
             bucketed_prefill_heterogeneous_segmented_candidate;
         if (should_cache && build_cache && atomic_gpu_graph_first_use &&
             effective_input.device.is_gpu())
@@ -5379,7 +5743,13 @@ namespace llaminar2
             LOG_DEBUG(
                 "[ForwardExecutionEngine] Atomically materialized first-use "
                 "GPU graph [kind="
-                << (is_decode ? "decode" : "heterogeneous_prefill")
+                << (is_decode
+                        ? "decode"
+                        : effective_input.graph_submission_intent ==
+                                  ForwardGraphSubmissionIntent::
+                                      MaterializeExecutableWithoutLaunch
+                              ? "setup_prefill"
+                              : "heterogeneous_prefill")
                 << ", seq_len="
                 << signature.seq_len
                 << ", batch_size=" << signature.batch_size
@@ -5387,6 +5757,17 @@ namespace llaminar2
                 << ", all_position_logits="
                 << signature.all_position_logits << "]");
             return true;
+        }
+
+        if (effective_input.graph_submission_intent ==
+            ForwardGraphSubmissionIntent::
+                MaterializeExecutableWithoutLaunch)
+        {
+            LOG_ERROR(
+                "[ForwardExecutionEngine] Setup-owned GPU graph family was not "
+                "admitted to the stable forward cache; refusing to execute its "
+                "model payload eagerly");
+            return false;
         }
 
         bool success = false;
@@ -5491,15 +5872,14 @@ namespace llaminar2
                     return false;
                 }
 
-                const auto &order = graph.getExecutionOrder();
-                for (const auto &node_name : order)
+                cache_miss_dynamic_param_stages =
+                    collectDynamicParamStages(graph);
+                for (const auto &node_name : graph.getExecutionOrder())
                 {
                     ComputeNode *node = graph.getNode(node_name);
                     if (!node || !node->stage)
                         continue;
                     node->stage->setGPUStream(execution_stream);
-                    if (node->stage->hasDynamicParams())
-                        cache_miss_dynamic_param_stages.push_back(node->stage.get());
                 }
 
                 if (!is_decode)
@@ -5557,58 +5937,13 @@ namespace llaminar2
                 }
             }
 
-            const int position_row_count =
-                forwardPositionRowCount(effective_input);
-            if ((effective_input.position_ids_device ||
-                 effective_input.position_ids) &&
-                position_row_count <= 0)
+            if (!updateDynamicParamStages(
+                    effective_input,
+                    cache_miss_dynamic_param_stages,
+                    effective_input.position_ids,
+                    "cache-miss graph execution"))
             {
-                LOG_ERROR("[ForwardExecutionEngine] Cache-miss graph received invalid flattened position geometry: batch="
-                          << effective_input.batch_size
-                          << " seq_len=" << effective_input.seq_len);
                 return false;
-            }
-            for (auto *stage : cache_miss_dynamic_param_stages)
-            {
-                /*
-                 * Cache misses can still enter executor-side graph capture.
-                 * Refresh explicit position rows after stream binding so RoPE
-                 * captures the current request/chunk positions, not only the
-                 * scalar offset baked into the graph build.
-                 */
-                if (effective_input.position_ids_device)
-                {
-                    if (!stage->supportsDeviceResidentDynamicPositionReplay())
-                    {
-                        LOG_ERROR("[ForwardExecutionEngine] Stage "
-                                  << stage->name()
-                                  << " cannot consume device-resident replay positions without host scalar state");
-                        return false;
-                    }
-                    stage->updateDynamicDevicePositionIds(
-                        effective_input.position_ids_device,
-                        position_row_count);
-                    if (stage->type() == ComputeStageType::ROPE)
-                        continue;
-                    stage->updateDynamicParams(
-                        effective_input.position_offset,
-                        effective_input.seq_len);
-                }
-                else if (effective_input.position_ids)
-                {
-                    stage->updateDynamicParams(
-                        effective_input.position_offset,
-                        effective_input.seq_len);
-                    stage->updateDynamicPositionIds(
-                        effective_input.position_ids,
-                        position_row_count);
-                }
-                else
-                {
-                    stage->updateDynamicParams(
-                        effective_input.position_offset,
-                        effective_input.seq_len);
-                }
             }
 
             if (!host.waitBeforeForwardGraphExecution(

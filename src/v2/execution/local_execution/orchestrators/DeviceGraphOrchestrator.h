@@ -1088,10 +1088,27 @@ namespace llaminar2
         /// @return Total bytes freed (or already DONTNEED'd)
         size_t releaseRawExpertWeights();
 
-        /// Build and discard a forward graph for the requested shape without executing it.
-        /// This is used to force graph-build-time weight materialization, including
-        /// Qwen3.5 MoE expert GEMM preparation, before host weight data is released.
-        bool materializeForwardGraphForShape(int seq_len, int batch_size = 1);
+        /**
+         * @brief Materialize the complete serial workspace family without inference.
+         *
+         * The requested shape supplies the representative decode participant;
+         * the implementation also declares the maximum admitted prefill,
+         * grouped verifier, MTP sidecar, and maintenance participants before it
+         * publishes one immutable workspace generation. Repeated calls are
+         * idempotent and reject a changed generation. This also forces
+         * graph-build-time expert preparation before raw host weights may be
+         * released.
+         *
+         * @param seq_len Positive representative forward width.
+         * @param batch_size Positive configured request capacity.
+         * @param pipeline_hidden_input Stable previous-stage activation owner
+         *        required by a non-embedding PP graph; null for graph roots.
+         * @return True once the complete family owns stable workspace addresses.
+         */
+        bool materializeForwardGraphForShape(
+            int seq_len,
+            int batch_size = 1,
+            TensorBase *pipeline_hidden_input = nullptr);
 
         /**
          * @brief Prepare CPU MoE expert slabs used only by MTP/nextn sidecars.
@@ -2555,6 +2572,10 @@ namespace llaminar2
 
         bool forwardPrefill(const int *tokens, int seq_len) override;
 
+        /** @copydoc IInferenceRunner::forwardRestoredPrefixMTPDecodeBridge */
+        bool forwardRestoredPrefixMTPDecodeBridge(
+            const RestoredPrefixMTPDecodeBridgeRequest &request) override;
+
         /** @copydoc IInferenceRunner::servingGraphPreparationKind */
         ServingGraphPreparationKind
         servingGraphPreparationKind() const noexcept override
@@ -3310,18 +3331,21 @@ namespace llaminar2
                 request.boundary == InferenceStateResetRequest::Boundary::Request;
             const bool prefix_restore_boundary =
                 request.boundary == InferenceStateResetRequest::Boundary::PrefixRestore;
+            const bool serving_graph_setup_boundary =
+                request.boundary ==
+                InferenceStateResetRequest::Boundary::ServingGraphSetup;
             if (!request.resetsAllLiveRequestOwners())
             {
                 throw std::invalid_argument(
                     "DeviceGraphOrchestrator::resetInferenceState requires KV, GDN, MTP, "
                     "and logical sequence owners to cross the reset boundary together");
             }
-            if (request_boundary)
+            if (request_boundary || serving_graph_setup_boundary)
             {
                 if (!request.reset_model_runtime || !request.preserve_replay_safe_graphs)
                 {
                     throw std::invalid_argument(
-                        "DeviceGraphOrchestrator::resetInferenceState request boundary must "
+                        "DeviceGraphOrchestrator::resetInferenceState request/setup boundary must "
                         "reset model runtime state and preserve replay-safe graph captures");
                 }
             }
@@ -4240,6 +4264,9 @@ namespace llaminar2
          * and therefore cannot safely serve as asynchronous admission input.
          * `execution_role` is mandatory because graph shape does not distinguish
          * prefill, grouped verification, and request-batched decode.
+         * `invocation` is the single typed phase/state policy; in particular,
+         * RestoredPrefixMTPDecodeBridge selects decode math and the additional
+         * shifted-MTP transaction without an invalid pair of force booleans.
          * `remote_prefill_geometry` is supplied only when an eager CPU graph
          * executes exact rows while its retained remote follower uses the
          * scheduler's larger physical bucket.
@@ -4250,8 +4277,8 @@ namespace llaminar2
             int seq_len,
             int batch_size,
             ForwardExecutionRole execution_role,
-            bool force_prefill_phase = false,
-            bool force_decode_phase = false,
+            ForwardInvocationKind invocation =
+                ForwardInvocationKind::Automatic,
             const void *position_ids_device_override = nullptr,
             const int32_t *sequence_lengths_device_override = nullptr,
             std::span<const int> request_real_lengths = {},
@@ -4326,6 +4353,29 @@ namespace llaminar2
             BufferId buffer_id,
             size_t rows,
             size_t columns) const;
+
+        /**
+         * @brief Bind the sole all-position logits surface for a graph role.
+         *
+         * GPU MTP condition and grouped-verifier graphs must reuse the
+         * schema-owned maximum-row logits family allocated before capture.
+         * CPU and non-MTP diagnostic graphs may retain an exact row-count
+         * owner.  This method performs both selection and arena publication so
+         * setup-only materialization and live execution cannot construct
+         * different output topologies.
+         *
+         * @param execution_role Typed producer role for the graph.
+         * @param rows Number of logical logits rows written by the graph.
+         * @param logits_output Receives the full-vocabulary output owner.
+         * @param logits_local_output Receives the vocabulary-local owner when
+         *        the graph writes a sharded LM-head result.
+         * @return true when every required stable owner is allocated and bound.
+         */
+        bool bindAllPositionLogitsOutputs(
+            ForwardExecutionRole execution_role,
+            size_t rows,
+            TensorBase *&logits_output,
+            TensorBase *&logits_local_output);
 
         /**
          * @brief Return whether stable epoch tickets decouple placement from graph identity.
@@ -6534,6 +6584,27 @@ namespace llaminar2
                 ShiftedMTPPrefillGraphBinding::Purpose::RuntimeExecution);
 
         /**
+         * @brief Bind graph-integrated terminal-hidden publication for MTP decode.
+         *
+         * Main prefill already archives its terminal row through
+         * @ref bindShiftedMTPPrefillTransaction. Grouped verification retains
+         * candidate rows until accepted-state publication. This method binds
+         * the remaining canonical transition: one main decoded row per request
+         * copied into the persistent terminal archive by the same forward graph.
+         *
+         * @param input Forward input whose typed role/phase determines whether
+         *        the binding is required.
+         * @param request_count Number of decoded request rows.
+         * @param purpose Runtime execution or declaration-only workspace sizing.
+         * @return true when the binding is absent by policy or complete.
+         */
+        bool bindMTPMainTerminalHiddenTransaction(
+            ForwardInput &input,
+            int request_count,
+            MTPMainTerminalHiddenGraphBinding::Purpose purpose =
+                MTPMainTerminalHiddenGraphBinding::Purpose::RuntimeExecution);
+
+        /**
          * @brief Construct the one canonical captured prefill-chunk binding.
          *
          * Setup materialization and live request scheduling both call this
@@ -6550,6 +6621,24 @@ namespace llaminar2
         makeDevicePrefillChunkGraphBinding(
             int bucket_seq_len,
             int pad_token_id);
+
+        /**
+         * @brief Publish setup-only request rows before native family capture.
+         *
+         * Native capture records kernels that read the production request bank,
+         * even though the retained executable is not launched. This method
+         * initializes that graph frontier with model-lifetime sentinel bytes
+         * and publishes their exact producer event before the engine performs
+         * its pre-capture dependency pass. It does not admit a request or alter
+         * KV, prefix, sampler, cursor, or response state.
+         *
+         * @param row_count Physical bucket rows about to be captured.
+         * @param producer_stream Exact non-null setup publication stream.
+         * @return True when all request-frontier members are device-valid.
+         */
+        bool prepareServingGraphSetupInputs(
+            int row_count,
+            void *producer_stream);
 
         /**
          * @brief Record the hidden-state ownership produced by main forward.
@@ -8195,6 +8284,12 @@ namespace llaminar2
         /// Standalone workspace allocator
         std::unique_ptr<WorkspaceAllocator> workspace_allocator_;
 
+        /// Whether the complete serial graph family has published its workspace.
+        bool forward_workspace_family_materialized_ = false;
+
+        /// Immutable GPU workspace generation certified by that family manifest.
+        uint64_t forward_workspace_family_generation_ = 0;
+
         /// Unified buffer arena — owns and tracks coherence for all activation buffers
         std::unique_ptr<BufferArena> arena_;
 
@@ -8369,6 +8464,8 @@ namespace llaminar2
          * allocation.
         */
         std::vector<int32_t> request_padding_token_ids_host_;
+        /** Stable zero rows used only to initialize setup-capture positions. */
+        std::vector<int32_t> request_setup_zero_rows_host_;
         DeviceRequestBatchGeometryLayout request_batch_geometry_layout_; ///< Typed model-lifetime layout of REQUEST_BATCH_GEOMETRY.
         void *request_batch_geometry_dev_ = nullptr; ///< Base of the arena-owned lengths-plus-stride record.
         void *request_sequence_lengths_dev_ = nullptr; ///< First INT32 request length in REQUEST_BATCH_GEOMETRY.
@@ -8389,6 +8486,17 @@ namespace llaminar2
         void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 stable compact verifier token row/matrix.
         sampling_math::MTPCommittedVerifierIdentityRecord *
             mtp_committed_verifier_identity_dev_ = nullptr; ///< Device-owned identity coupled to the last response/state commit.
+        /**
+         * @brief CPU-owned identities coupled to grouped verifier publication.
+         *
+         * CPU execution has no device generation-controller ledger. Its typed
+         * speculative step publisher commits these records only after KV,
+         * recurrent state, terminal hidden, and histogram publication all
+         * succeed. One persistent slot per admitted request avoids allocating
+         * diagnostic state in the inference path.
+         */
+        std::vector<sampling_math::MTPCommittedVerifierIdentityRecord>
+            mtp_committed_verifier_identities_host_;
         void *mtp_verifier_stop_tokens_dev_ = nullptr; ///< INT32 fixed-width stop-token controls read inside captured reducers.
         void *mtp_greedy_penalty_policy_dev_ = nullptr; ///< Graph-stable MTPGreedyPenaltyPolicy written on the exact verifier stream.
         void *mtp_generated_token_counts_dev_ = nullptr; ///< INT32 [vocab], device-authoritative generated-token histogram.
@@ -9114,6 +9222,7 @@ namespace llaminar2
         {
             RequestBatchConditionAdvance,
             TargetSampleInitialization,
+            RestoredPrefixDecodeBridgeInitialization,
             AcceptedSpecState,
             MainBatchSampleInitialization,
         };
@@ -10514,6 +10623,27 @@ namespace llaminar2
         /// Drop any stale device logical-state mailbox after request/session mutation.
         void clearDeviceResidentLogicalSequenceStateMailbox();
 
+        /**
+         * @brief Retire a logical-state input consumed by one MTP condition graph.
+         *
+         * Every resident MTP-condition mailbox describes the token, position,
+         * and sequence length at the graph's input boundary. Once that graph is
+         * submitted, canonical device KV owns the post-forward token count and
+         * the input mailbox must not masquerade as the resulting live state.
+         * The transition is metadata-only: the access epoch retains the exact
+         * reader-completion event so a later writer can safely reuse the arena
+         * rows without blocking the host.
+         *
+         * @param completed_stream Exact stream that submitted the condition graph.
+         * @param publication_generation Exact mailbox generation admitted by
+         *        that graph's forward prelude.
+         * @return true when the matching publication and reader completion were
+         *         present and the consumed input handle was retired.
+         */
+        bool retireConsumedMTPConditionInputMailbox(
+            void *completed_stream,
+            uint64_t publication_generation);
+
         /// Retire the request-scoped device MTP transaction at a true session boundary.
         void retireDeviceResidentMTPTransaction();
 
@@ -10598,6 +10728,31 @@ namespace llaminar2
         bool publishDeviceResidentLogicalSequenceStateFromTargetSample(
             int target_sample_slot,
             const int32_t *live_position_device);
+
+        /**
+         * @brief Initialize the durable logical-state mailbox from device rows.
+         *
+         * The caller owns source readiness on @p producer_stream. This helper
+         * orders reuse of the single arena-backed mailbox, derives the next
+         * position/length and condition token with the canonical backend
+         * kernel, and event-publishes the resulting rows. It performs no host
+         * copy, allocation, synchronization, or graph launch.
+         *
+         * @param condition_token_device Device row containing one token per request.
+         * @param live_position_device Canonical pre-forward KV count per request.
+         * @param request_count Number of logical requests in the source rows.
+         * @param producer_stream Exact stream on which both sources are ready.
+         * @param publication_kind Typed provenance for the resulting mailbox.
+         * @param source Stable diagnostic name for the source transaction.
+         * @return true after initialization and mailbox publication are enqueued.
+         */
+        bool publishDeviceResidentLogicalSequenceStateFromDeviceRows(
+            const int32_t *condition_token_device,
+            const int32_t *live_position_device,
+            int request_count,
+            void *producer_stream,
+            DeviceResidentLogicalStatePublicationKind publication_kind,
+            const char *source);
 
         /// Record an event-fenced view of the arena-owned logical-state rows.
         bool recordDeviceResidentLogicalSequenceStateMailbox(

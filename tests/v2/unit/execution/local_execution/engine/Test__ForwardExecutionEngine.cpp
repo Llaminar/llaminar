@@ -170,6 +170,96 @@ namespace
     };
 
     /**
+     * @brief Dynamic GPU stage that records whether setup inputs precede capture.
+     *
+     * Native graph capture must never discover a host-to-device token upload.
+     * This probe models the embedding stage's dynamic-input contract without
+     * touching physical hardware: both position binding and scalar/token
+     * preparation require the executor-selected stream, while the latter records
+     * whether the mock worker had already entered its capture interval.
+     */
+    class SetupDynamicInputProbeStage final
+        : public llaminar2::testing::MockComputeStage
+    {
+    public:
+        /**
+         * @brief Construct one externally observable dynamic-input consumer.
+         * @param name Graph stage name.
+         * @param device Logical GPU owning the stage.
+         * @param dynamic_updates Receives scalar/token preparation calls.
+         * @param device_position_updates Receives device-position binding calls.
+         * @param dynamic_update_during_capture Set when preparation runs too late.
+         * @param executions Receives model-stage executions recorded by capture.
+         */
+        SetupDynamicInputProbeStage(
+            std::string name,
+            DeviceId device,
+            int *dynamic_updates,
+            int *device_position_updates,
+            bool *dynamic_update_during_capture,
+            int *executions)
+            : MockComputeStage(
+                  ComputeStageType::ATTENTION,
+                  std::move(name),
+                  device),
+              dynamic_updates_(dynamic_updates),
+              device_position_updates_(device_position_updates),
+              dynamic_update_during_capture_(dynamic_update_during_capture),
+              executions_(executions)
+        {
+            setOnExecute(
+                [this](IDeviceContext *)
+                {
+                    if (executions_)
+                        ++*executions_;
+                });
+        }
+
+        /** @return true because this probe owns replay-time inputs. */
+        bool hasDynamicParams() const override { return true; }
+
+        /** @return true because the probe accepts the persistent device row. */
+        bool supportsDeviceResidentDynamicPositionReplay() const override
+        {
+            return true;
+        }
+
+        /** @brief Record the device-position authority on the bound stream. */
+        void updateDynamicDevicePositionIds(
+            const void *position_ids_device,
+            int seq_len) override
+        {
+            EXPECT_NE(position_ids_device, nullptr);
+            EXPECT_GT(seq_len, 0);
+            (void)requireGPUStream();
+            if (device_position_updates_)
+                ++*device_position_updates_;
+        }
+
+        /** @brief Record scalar/token preparation and its capture phase. */
+        void updateDynamicParams(int pos_offset, int seq_len) override
+        {
+            EXPECT_GE(pos_offset, 0);
+            EXPECT_GT(seq_len, 0);
+            (void)requireGPUStream();
+            if (dynamic_updates_)
+                ++*dynamic_updates_;
+            if (dynamic_update_during_capture_)
+            {
+                *dynamic_update_during_capture_ =
+                    llaminar2::testing::sharedMockWorkerGPUContext()
+                        .isDeviceGraphCaptureActive();
+            }
+        }
+
+    private:
+        int *dynamic_updates_ = nullptr;
+        int *device_position_updates_ = nullptr;
+        bool *dynamic_update_during_capture_ = nullptr;
+        int *executions_ = nullptr;
+    };
+
+    /**
      * @brief Minimal mock for IForwardExecutionHost.
      *
      * Tracks which callbacks are invoked and returns configurable results.
@@ -789,6 +879,7 @@ TEST(ForwardExecutionEngineSourceScan,
         reinterpret_cast<TensorBase *>(std::uintptr_t{0x2000});
     binding.request_token_ids_device = address(0x3000);
     binding.request_position_ids_device = address(0x4000);
+    binding.request_segment_lengths_device = address(0x4800);
     binding.shifted_token_ids_device = address(0x5000);
     binding.shifted_position_ids_device = address(0x6000);
     binding.append_lengths_device = address(0x7000);
@@ -812,6 +903,40 @@ TEST(ForwardExecutionEngineSourceScan,
     EXPECT_NE(
         source.find(
             "input.shifted_mtp_prefill->executableForRequestCount("),
+        std::string::npos)
+        << "ForwardExecutionEngine must enforce the typed execution gate.";
+}
+
+/**
+ * @brief Main-decode terminal publication has the same declaration/runtime split.
+ *
+ * The archive pointer participates in graph identity before workspace sizing,
+ * but a declaration binding must never be accepted as an inference input.
+ */
+TEST(ForwardExecutionEngineSourceScan,
+     MTPMainTerminalHiddenWorkspaceDeclarationCannotEnterExecution)
+{
+    MTPMainTerminalHiddenGraphBinding binding{
+        .terminal_hidden_archive =
+            reinterpret_cast<TensorBase *>(std::uintptr_t{0x2000}),
+        .request_count = 1,
+        .capture_identity = UINT64_MAX,
+        .purpose = MTPMainTerminalHiddenGraphBinding::Purpose::
+            WorkspaceFamilyDeclaration,
+    };
+
+    ASSERT_TRUE(binding.validForRequestCount(1));
+    EXPECT_FALSE(binding.executableForRequestCount(1));
+    binding.purpose =
+        MTPMainTerminalHiddenGraphBinding::Purpose::RuntimeExecution;
+    EXPECT_TRUE(binding.executableForRequestCount(1));
+
+    const std::string source =
+        readTextFile(LLAMINAR_FORWARD_EXECUTION_ENGINE_SOURCE);
+    ASSERT_FALSE(source.empty());
+    EXPECT_NE(
+        source.find(
+            "input.mtp_main_terminal_hidden->executableForRequestCount("),
         std::string::npos)
         << "ForwardExecutionEngine must enforce the typed execution gate.";
 }
@@ -2544,6 +2669,78 @@ TEST_F(
     EXPECT_EQ(host.build_forward_graph_calls, 1);
     EXPECT_GT(host.build_decode_policy_calls, 0)
         << "Typed MTP rows must bypass the ordinary decode_seq_len heuristic.";
+}
+
+/**
+ * @brief Setup-only decode prepares host-token inputs before native capture.
+ *
+ * Serving setup intentionally omits request admission and model launch, but it
+ * still records the exact production decode graph. A host-token embedding must
+ * therefore preload its cache-owned row on the selected capture stream before
+ * beginCapture(); returning directly to materialization used to skip that
+ * prelude and made CUDA/ROCm embedding fail from inside capture.
+ */
+TEST_F(
+    Test__ForwardExecutionEngine,
+    SetupDecodeMaterializationPreparesDynamicInputsBeforeCapture)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(
+        DeviceId::cuda(0),
+        ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.mock_capture_policy.allow_fast_decode = true;
+    host.mock_capture_policy.allow_cached_graph_replay = true;
+
+    int dynamic_updates = 0;
+    int device_position_updates = 0;
+    bool dynamic_update_during_capture = false;
+    int executions = 0;
+    host.graph_stage_factories.push_back(
+        [&](const std::string &name, DeviceId device)
+            -> std::unique_ptr<IComputeStage>
+        {
+            return std::make_unique<SetupDynamicInputProbeStage>(
+                name,
+                device,
+                &dynamic_updates,
+                &device_position_updates,
+                &dynamic_update_during_capture,
+                &executions);
+        });
+
+    int token = 42;
+    int host_position_shadow = 1;
+    int device_position_row = 1;
+    auto input = makeTestInput(
+        /*seq_len=*/1,
+        /*batch_size=*/1,
+        DeviceId::cuda(0),
+        &token,
+        &host_position_shadow);
+    input.position_ids = nullptr;
+    input.position_ids_device = &device_position_row;
+    input.position_offset = 1;
+    input.execution_phase = ForwardExecutionPhase::Decode;
+    input.graph_submission_intent =
+        ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+
+    const int capture_count_before =
+        llaminar2::testing::sharedMockWorkerGPUContext()
+            .graphCaptureCreateCount();
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(input, output, host));
+
+    EXPECT_EQ(dynamic_updates, 1);
+    EXPECT_EQ(device_position_updates, 1);
+    EXPECT_FALSE(dynamic_update_during_capture)
+        << "Dynamic host inputs must be ready before beginCapture().";
+    EXPECT_EQ(executions, 1)
+        << "The model body should be recorded exactly once without replay.";
+    EXPECT_EQ(
+        llaminar2::testing::sharedMockWorkerGPUContext()
+            .graphCaptureCreateCount(),
+        capture_count_before + 1);
 }
 
 /**

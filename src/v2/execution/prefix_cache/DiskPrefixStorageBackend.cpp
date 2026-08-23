@@ -419,11 +419,11 @@ namespace llaminar2
     DiskPrefixStorageBackend::DiskPrefixStorageBackend(
         std::filesystem::path archive_path,
         size_t budget_bytes,
-        std::string model_sha256)
+        std::string model_artifact_identity)
         : archive_path_(std::move(archive_path)),
           lock_path_(archive_path_.string() + ".lock"),
           budget_bytes_(budget_bytes),
-          model_sha256_(std::move(model_sha256))
+          model_artifact_identity_(std::move(model_artifact_identity))
     {
         std::string error;
         ready_ = initialize(&error);
@@ -433,7 +433,7 @@ namespace llaminar2
     std::shared_ptr<DiskPrefixStorageBackend> DiskPrefixStorageBackend::openShared(
         const std::filesystem::path &archive_path,
         size_t budget_bytes,
-        const std::string &model_sha256,
+        const std::string &model_artifact_identity,
         std::string *error)
     {
         static std::mutex registry_mutex;
@@ -459,7 +459,7 @@ namespace llaminar2
         auto backend = std::make_shared<DiskPrefixStorageBackend>(
             archive_path,
             budget_bytes,
-            model_sha256);
+            model_artifact_identity);
         if (!backend->ready())
         {
             if (error)
@@ -506,16 +506,17 @@ namespace llaminar2
 
     bool DiskPrefixStorageBackend::initialize(std::string *error)
     {
-        if (!isLowerHexDigest(model_sha256_))
+        if (!isLowerHexDigest(model_artifact_identity_))
         {
             if (error)
-                *error = "model SHA-256 must be 64 lowercase hexadecimal characters";
+                *error = "model artifact identity must be 64 lowercase hexadecimal characters";
             return false;
         }
-        if (archive_path_.filename() != model_sha256_ + ".kvcache")
+        if (archive_path_.filename() !=
+            model_artifact_identity_ + ".kvcache")
         {
             if (error)
-                *error = "prefix archive filename must be <model-sha256>.kvcache";
+                *error = "prefix archive filename must be <model-artifact-identity>.kvcache";
             return false;
         }
 
@@ -567,7 +568,10 @@ namespace llaminar2
             std::memcpy(header.data(), kArchiveMagic.data(), kArchiveMagic.size());
             storeU32(header.data() + 8, kArchiveVersion);
             storeU32(header.data() + 12, static_cast<uint32_t>(kArchiveHeaderBytes));
-            std::memcpy(header.data() + 16, model_sha256_.data(), model_sha256_.size());
+            std::memcpy(
+                header.data() + 16,
+                model_artifact_identity_.data(),
+                model_artifact_identity_.size());
             if (!writeAll(archive.get(), header.data(), header.size()) ||
                 ::fsync(archive.get()) != 0)
             {
@@ -608,10 +612,11 @@ namespace llaminar2
             loadU32(header.data() + 12) != kArchiveHeaderBytes ||
             std::string(
                 reinterpret_cast<const char *>(header.data() + 16),
-                model_sha256_.size()) != model_sha256_)
+                model_artifact_identity_.size()) !=
+                model_artifact_identity_)
         {
             if (error)
-                *error = "prefix archive header or model SHA-256 mismatch";
+                *error = "prefix archive header or model artifact identity mismatch";
             return false;
         }
 

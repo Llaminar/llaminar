@@ -771,6 +771,21 @@ namespace llaminar2
         return &*it;
     }
 
+    std::vector<int>
+    MoEExpertOverlayExecutionPlan::continuationWorldRanks() const
+    {
+        std::vector<int> ranks;
+        ranks.reserve(rank_plans.size());
+        for (const auto &rank_plan : rank_plans)
+        {
+            if (rank_plan.ownsContinuationGraph())
+                ranks.push_back(rank_plan.world_rank);
+        }
+        std::sort(ranks.begin(), ranks.end());
+        ranks.erase(std::unique(ranks.begin(), ranks.end()), ranks.end());
+        return ranks;
+    }
+
     MoEExpertOverlayExecutionPlan buildMoEExpertOverlayExecutionPlan(
         const MoEExpertOverlayRuntimePlan &runtime_plan,
         int requested_world_size)

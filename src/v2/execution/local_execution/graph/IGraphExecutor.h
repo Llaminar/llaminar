@@ -65,6 +65,10 @@ namespace llaminar2
      * policy-selected stages can publish different named outputs while retaining
      * the same graph node name. Requiring the immutable output descriptor here
      * prevents a filter from selecting a stale or merely possible producer.
+     * GPU graph preparation first receives the complete stage view and then a
+     * one-output view for every device tensor selected into immutable capture
+     * storage. Implementations must therefore decide from the supplied
+     * descriptors rather than depending on sibling-output presence.
      */
     using StageSnapshotFilter = std::function<bool(
         const std::string &node_name,

@@ -99,6 +99,7 @@ namespace llaminar2
 
     BF16Tensor::~BF16Tensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // TODO: Free device memory when device support is added
     }
 

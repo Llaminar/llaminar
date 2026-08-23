@@ -75,6 +75,7 @@
 #include <typeindex>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace llaminar2
@@ -1140,6 +1141,227 @@ namespace llaminar2
         }
     } // anonymous namespace
 
+    CPUGroupedMoESerialWorkspace::InvocationLease::~InvocationLease()
+    {
+        release();
+    }
+
+    CPUGroupedMoESerialWorkspace::InvocationLease::InvocationLease(
+        InvocationLease &&other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr))
+    {
+    }
+
+    CPUGroupedMoESerialWorkspace::InvocationLease &
+    CPUGroupedMoESerialWorkspace::InvocationLease::operator=(
+        InvocationLease &&other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            owner_ = std::exchange(other.owner_, nullptr);
+        }
+        return *this;
+    }
+
+    void CPUGroupedMoESerialWorkspace::InvocationLease::release() noexcept
+    {
+        if (!owner_)
+            return;
+        owner_->invocation_active_.clear(std::memory_order_release);
+        owner_ = nullptr;
+    }
+
+    CPUGroupedMoESerialWorkspace::CPUGroupedMoESerialWorkspace(Config config)
+        : row_capacity_(config.row_capacity),
+          d_model_(config.d_model),
+          expert_intermediate_(config.expert_intermediate),
+          num_experts_(config.num_experts),
+          routing_top_k_(config.routing_top_k),
+          debug_name_(config.debug_name.empty()
+                          ? "cpu_grouped_moe_serial_workspace"
+                          : std::move(config.debug_name))
+    {
+        if (row_capacity_ == 0 || d_model_ <= 0 ||
+            expert_intermediate_ <= 0 || num_experts_ <= 0 ||
+            routing_top_k_ <= 0 || routing_top_k_ > num_experts_)
+        {
+            throw std::invalid_argument(
+                "CPU grouped-MoE serial workspace requires complete positive geometry");
+        }
+        const auto checked_multiply = [](size_t left,
+                                         size_t right,
+                                         const char *what)
+        {
+            if (left != 0u &&
+                right > std::numeric_limits<size_t>::max() / left)
+            {
+                throw std::overflow_error(
+                    std::string("CPU grouped-MoE serial workspace overflow sizing ") +
+                    what);
+            }
+            return left * right;
+        };
+        const auto checked_add = [](size_t left,
+                                    size_t right,
+                                    const char *what)
+        {
+            if (right > std::numeric_limits<size_t>::max() - left)
+            {
+                throw std::overflow_error(
+                    std::string("CPU grouped-MoE serial workspace overflow summing ") +
+                    what);
+            }
+            return left + right;
+        };
+
+        route_capacity_ = checked_multiply(
+            row_capacity_,
+            static_cast<size_t>(routing_top_k_),
+            "route capacity");
+        if (route_capacity_ >
+            static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            throw std::overflow_error(
+                "CPU grouped-MoE serial workspace route capacity exceeds int range");
+        }
+
+        scratch_batch_ = makeScratchFP32(
+            row_capacity_, static_cast<size_t>(d_model_), DeviceId::cpu());
+        scratch_gate_ = makeScratchFP32(
+            route_capacity_,
+            static_cast<size_t>(expert_intermediate_),
+            DeviceId::cpu());
+        scratch_up_ = makeScratchFP32(
+            route_capacity_,
+            static_cast<size_t>(expert_intermediate_),
+            DeviceId::cpu());
+        scratch_out_ = makeScratchFP32(
+            route_capacity_, static_cast<size_t>(d_model_), DeviceId::cpu());
+
+        const size_t router_blocks_per_row =
+            (static_cast<size_t>(d_model_) + Q8_1Block::BLOCK_SIZE - 1u) /
+            Q8_1Block::BLOCK_SIZE;
+        const size_t swiglu_blocks_per_row =
+            (static_cast<size_t>(expert_intermediate_) +
+             Q8_1Block::BLOCK_SIZE - 1u) /
+            Q8_1Block::BLOCK_SIZE;
+        router_q8_.resize(checked_multiply(
+            route_capacity_, router_blocks_per_row, "router Q8 blocks"));
+        swiglu_q8_.resize(checked_multiply(
+            route_capacity_, swiglu_blocks_per_row, "SwiGLU Q8 blocks"));
+        route_outputs_.resize(checked_multiply(
+            route_capacity_, static_cast<size_t>(d_model_),
+            "floating route outputs"));
+        const size_t kernel_router_publication_bytes = checked_multiply(
+            checked_multiply(
+                row_capacity_,
+                router_blocks_per_row,
+                "kernel router publication blocks"),
+            sizeof(Q8_1Block),
+            "kernel router publication bytes");
+
+        moe_kernel_ = KernelFactory::createMoEKernel(DeviceId::cpu());
+        auto *const cpu_kernel =
+            dynamic_cast<CPUMoEKernel *>(moe_kernel_.get());
+        if (!cpu_kernel ||
+            !cpu_kernel->reserveRouterQ8HiddenCapacity(
+                static_cast<int>(row_capacity_), d_model_))
+        {
+            throw std::runtime_error(
+                "CPU grouped-MoE serial workspace could not prepare its canonical router publication");
+        }
+
+        allocation_bytes_ = checked_add(
+            scratch_batch_->size_bytes(),
+            scratch_gate_->size_bytes(),
+            "FP32 scratch");
+        allocation_bytes_ = checked_add(
+            allocation_bytes_, scratch_up_->size_bytes(), "FP32 scratch");
+        allocation_bytes_ = checked_add(
+            allocation_bytes_, scratch_out_->size_bytes(), "FP32 scratch");
+        allocation_bytes_ = checked_add(
+            allocation_bytes_,
+            checked_multiply(
+                router_q8_.size(), sizeof(Q8_1Block), "router Q8 bytes"),
+            "router Q8 bytes");
+        allocation_bytes_ = checked_add(
+            allocation_bytes_,
+            checked_multiply(
+                swiglu_q8_.size(), sizeof(Q8_1Block), "SwiGLU Q8 bytes"),
+            "SwiGLU Q8 bytes");
+        allocation_bytes_ = checked_add(
+            allocation_bytes_,
+            checked_multiply(
+                route_outputs_.size(), sizeof(float), "route output bytes"),
+            "route output bytes");
+        allocation_bytes_ = checked_add(
+            allocation_bytes_,
+            kernel_router_publication_bytes,
+            "kernel router publication bytes");
+
+        PerfStatsCollector::addCounter(
+            "memory",
+            "cpu_grouped_moe_serial_workspace_bytes",
+            static_cast<double>(allocation_bytes_),
+            "model_setup",
+            "CPU",
+            {{"debug_name", debug_name_},
+             {"row_capacity", std::to_string(row_capacity_)},
+             {"route_capacity", std::to_string(route_capacity_)},
+             {"d_model", std::to_string(d_model_)},
+             {"expert_intermediate", std::to_string(expert_intermediate_)},
+             {"num_experts", std::to_string(num_experts_)},
+             {"routing_top_k", std::to_string(routing_top_k_)},
+             {"ownership", "per_cpu_participant_serial_graph_family"},
+             {"first_touched_during_setup", "true"}});
+    }
+
+    CPUGroupedMoESerialWorkspace::~CPUGroupedMoESerialWorkspace()
+    {
+        if (invocation_active_.test(std::memory_order_acquire))
+            std::terminate();
+    }
+
+    bool CPUGroupedMoESerialWorkspace::supports(
+        int rows,
+        int route_width,
+        int d_model,
+        int expert_intermediate,
+        int num_experts) const noexcept
+    {
+        return rows > 0 && static_cast<size_t>(rows) <= row_capacity_ &&
+               route_width > 0 && route_width <= routing_top_k_ &&
+               d_model == d_model_ &&
+               expert_intermediate == expert_intermediate_ &&
+               num_experts == num_experts_;
+    }
+
+    CPUGroupedMoESerialWorkspace::InvocationLease
+    CPUGroupedMoESerialWorkspace::acquire(
+        int rows,
+        int route_width,
+        int d_model,
+        int expert_intermediate,
+        int num_experts,
+        int layer_idx)
+    {
+        if (!supports(
+                rows, route_width, d_model, expert_intermediate, num_experts))
+        {
+            throw std::invalid_argument(
+                "CPU grouped-MoE invocation exceeds serial workspace plan at layer " +
+                std::to_string(layer_idx));
+        }
+        if (invocation_active_.test_and_set(std::memory_order_acquire))
+        {
+            throw std::logic_error(
+                "CPU grouped-MoE serial workspace was acquired concurrently at layer " +
+                std::to_string(layer_idx));
+        }
+        return InvocationLease(this);
+    }
+
     // =========================================================================
     // MoEExpertComputeStage — Unified Router + Expert FFN + Combine
     // =========================================================================
@@ -1147,6 +1369,21 @@ namespace llaminar2
     MoEExpertComputeStage::MoEExpertComputeStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        /*
+         * Capture the immutable upper bound before a serial CPU endpoint starts
+         * rebinding smaller live route widths. GPU graph families never mutate
+         * this scalar, but sharing the proof makes the binding API total for
+         * both ownership regimes.
+         */
+        sparse_overlay_route_width_capacity_ = params_.top_k;
+        if (params_.expert_weight_resolution_policy ==
+                MoEExpertWeightResolutionPolicy::PreparedRegistryOnly &&
+            (params_.gate_exps || params_.up_exps || params_.down_exps))
+        {
+            throw std::invalid_argument(
+                "[MoEExpertComputeStage] registry-only expert resolution forbids raw parent bindings");
+        }
+
         if (params_.routed_row_execution_policy ==
             RoutedExpertRowExecutionPolicy::FullyReplicatedLocal)
         {
@@ -1214,6 +1451,62 @@ namespace llaminar2
         params_.prepared_gate_gemm.resize(expert_count, nullptr);
         params_.prepared_up_gemm.resize(expert_count, nullptr);
         params_.prepared_down_gemm.resize(expert_count, nullptr);
+        const bool invocation_published_registry_bank =
+            params_.prepared_engine_binding_lifecycle ==
+            MoEPreparedEngineBindingLifecycle::
+                SparseOverlayInvocationPublished;
+        const bool empty_explicit_setup_mask =
+            params_.expert_mask.size() == expert_count &&
+            std::none_of(
+                params_.expert_mask.begin(),
+                params_.expert_mask.end(),
+                [](bool enabled) { return enabled; });
+        if (invocation_published_registry_bank &&
+            (params_.expert_weight_resolution_policy !=
+                 MoEExpertWeightResolutionPolicy::PreparedRegistryOnly ||
+             !params_.device_id.is_cpu() ||
+             params_.cpu_router_q8_input_publication !=
+                 CPURouterQ8InputPublicationPolicy::PublishTransportedRows ||
+             !params_.cpu_grouped_serial_workspace ||
+             !empty_explicit_setup_mask))
+        {
+            throw std::invalid_argument(
+                "[MoEExpertComputeStage] invocation-published prepared engines require an empty setup-primed serial CPU ExpertOverlay endpoint");
+        }
+        if (params_.cpu_grouped_serial_workspace &&
+            (!params_.device_id.is_cpu() ||
+             params_.cpu_router_q8_input_publication !=
+                 CPURouterQ8InputPublicationPolicy::PublishTransportedRows ||
+             !params_.cpu_grouped_serial_workspace->supports(
+                 params_.seq_len,
+                 params_.top_k,
+                 params_.d_model,
+                 params_.expert_intermediate,
+                 params_.num_experts)))
+        {
+            throw std::invalid_argument(
+                "CPU grouped-MoE serial workspace does not match the transported overlay stage");
+        }
+        if (params_.device_id.is_cpu() &&
+            params_.cpu_router_q8_input_publication ==
+                CPURouterQ8InputPublicationPolicy::PublishTransportedRows)
+        {
+            if (params_.seq_len <= 0)
+            {
+                throw std::invalid_argument(
+                    "CPU transported-row expert execution requires a positive setup row capacity");
+            }
+            sparse_overlay_cpu_compact_to_source_row_.resize(
+                static_cast<size_t>(params_.seq_len), -1);
+        }
+        if (params_.expert_weight_resolution_policy ==
+                MoEExpertWeightResolutionPolicy::PreparedRegistryOnly &&
+            !invocation_published_registry_bank &&
+            !hasPreparedExpertGemmEnginesForLocalOwnership())
+        {
+            throw std::invalid_argument(
+                "[MoEExpertComputeStage] registry-only expert resolution requires a complete prepared triplet for every locally executable expert");
+        }
         invalidateFixedTopologyMaskPublication();
 
         DeviceMoEOverlayServiceTelemetryBinding service_telemetry =
@@ -1296,6 +1589,7 @@ namespace llaminar2
          * implementation and therefore does not need grouped-row scratch.
          */
         if (params_.device_id.is_cpu() &&
+            !params_.cpu_grouped_serial_workspace &&
             params_.force_decode_equivalent_verifier_prefill &&
             params_.seq_len > 1 &&
             params_.top_k > 0 && params_.top_k <= 16 &&
@@ -1919,7 +2213,19 @@ namespace llaminar2
     {
         if (!moe_kernel_)
         {
-            if (params_.routed_pipeline_kernel_owner)
+            if (params_.cpu_grouped_serial_workspace)
+            {
+                if (!params_.device_id.is_cpu() ||
+                    !params_.cpu_grouped_serial_workspace->moe_kernel_)
+                {
+                    LOG_ERROR(
+                        "[MoEExpertComputeStage] Serial grouped-MoE workspace has no CPU kernel");
+                    return nullptr;
+                }
+                moe_kernel_ =
+                    params_.cpu_grouped_serial_workspace->moe_kernel_.get();
+            }
+            else if (params_.routed_pipeline_kernel_owner)
             {
                 if (!params_.routed_pipeline_kernel_owner->kernel)
                 {
@@ -2581,10 +2887,18 @@ namespace llaminar2
             return executeDecodeEquivalentVerifierPrefill(ctx);
         }
 
-        // Fast path for ordinary decode (seq_len=1): eliminates gather/scatter
-        // overhead. MTP verifier rows that need the serial-decode oracle are
-        // handled above before this ordinary decode shortcut can bypass them.
-        if (params_.seq_len == 1 && !params_.force_grouped_verifier_prefill_for_decode)
+        /*
+         * M=1 retains its latency-specialized routing/publication front end.
+         * Transported CPU execution consolidates the projection phases inside
+         * executeSingleToken(), without paying the general CSR scheduler used
+         * for M>1 packets.
+         */
+        const bool cpu_host_packet =
+            !is_gpu &&
+            sparse_overlay_binding_kind_ ==
+                SparseOverlayBindingKind::HostPacketPublication;
+        if (params_.seq_len == 1 &&
+            !params_.force_grouped_verifier_prefill_for_decode)
         {
             return executeSingleToken(ctx);
         }
@@ -2737,9 +3051,28 @@ namespace llaminar2
          * It shares the same arithmetic implementation as MTP verification,
          * while ordinary-prefill ownership remains static and explicit.
          */
-        return executeCPUGroupedDecodeEquivalentRows(
-            ctx,
-            CPUGroupedRowsPurpose::OrdinaryPrefill);
+        CPUGroupedRowsPurpose cpu_purpose =
+            CPUGroupedRowsPurpose::OrdinaryPrefill;
+        if (cpu_host_packet)
+        {
+            switch (sparse_overlay_service_phase_)
+            {
+            case MoEOverlayServicePhaseHint::Decode:
+                cpu_purpose = CPUGroupedRowsPurpose::Decode;
+                break;
+            case MoEOverlayServicePhaseHint::Prefill:
+                cpu_purpose = CPUGroupedRowsPurpose::OrdinaryPrefill;
+                break;
+            case MoEOverlayServicePhaseHint::GroupedVerifier:
+                cpu_purpose = CPUGroupedRowsPurpose::MTPVerifier;
+                break;
+            case MoEOverlayServicePhaseHint::Auto:
+                LOG_ERROR(
+                    "[MoEExpertComputeStage] CPU host packet has no authenticated inference phase");
+                return false;
+            }
+        }
+        return executeCPUGroupedDecodeEquivalentRows(ctx, cpu_purpose);
     }
 
     // =========================================================================
@@ -2813,6 +3146,13 @@ namespace llaminar2
                 params_.canonical_route_layout ==
                     MoECanonicalRoutePublicationLayout::
                         PackedIndexedRouteRows;
+            const bool host_packet_dense_canonical =
+                params_.canonical_route_contributions &&
+                params_.canonical_route_layout ==
+                    MoECanonicalRoutePublicationLayout::
+                        DenseOriginalRouteSlots &&
+                sparse_overlay_binding_kind_ ==
+                    SparseOverlayBindingKind::HostPacketPublication;
             if (packed_canonical_records)
             {
                 float *const records = publication->mutable_data();
@@ -2835,7 +3175,7 @@ namespace llaminar2
                     return false;
                 }
             }
-            else
+            else if (!host_packet_dense_canonical)
             {
                 const size_t publication_rows =
                     params_.canonical_route_contributions
@@ -3418,8 +3758,8 @@ namespace llaminar2
                                   << params_.layer_idx);
                         return false;
                     }
-                    projected =
-                        native_gate->multiply_fused_router_q8_hidden_grouped_decode_equivalent(
+                    projected = native_gate->
+                        multiply_fused_router_q8_hidden_grouped_decode_equivalent(
                             published_router_q8,
                             batch_projections_,
                             /*m=*/1,
@@ -3688,93 +4028,124 @@ namespace llaminar2
                 }
             };
 
-            // Ensure per-expert output buffers for fused approach
-            if (static_cast<int>(scratch_down_batch_.size()) < num_active)
+            // Ensure per-expert output buffers for the standalone CPU decode
+            // implementation.
             {
-                scratch_down_batch_.resize(num_active);
-                for (int i = 0; i < num_active; ++i)
+                if (static_cast<int>(scratch_down_batch_.size()) < num_active)
                 {
-                    if (!scratch_down_batch_[i])
-                        scratch_down_batch_[i] = makeScratchFP32(1, d_model, params_.device_id);
-                }
-            }
-
-            // Validate down GEMM engines
-            for (int i = 0; i < num_active; ++i)
-            {
-                if (!cached_down_gemm_[active_experts[i].expert_id])
-                {
-                    LOG_ERROR("[MoEExpertComputeStage] FATAL: Null down GEMM engine for expert "
-                              << active_experts[i].expert_id << " (layer " << params_.layer_idx << ")");
-                    MPI_Abort(MPI_COMM_WORLD, 1);
-                }
-            }
-
-            // Phase 2a: Apply SwiGLU for all experts (serial, ~0.1µs each)
-            for (int i = 0; i < num_active; ++i)
-            {
-                const auto &info = active_experts[i];
-                const float *gate_fp32 = scratch_gate_batch_[info.batch_idx]->data();
-                const float *up_fp32 = scratch_up_batch_[info.batch_idx]->data();
-                swiglu_scratch_batch_.resize(std::max(swiglu_scratch_batch_.size(),
-                                                      static_cast<size_t>(num_active)));
-                if (static_cast<int>(swiglu_scratch_batch_[i].size()) < intermediate)
-                    swiglu_scratch_batch_[i].resize(intermediate);
-
-                primitives::compute_swiglu_serial(gate_fp32, up_fp32,
-                                                  swiglu_scratch_batch_[i].data(), intermediate);
-            }
-
-            // Phase 2b: Try fused multi-input down projections
-            bool fused_ok = false;
-            if (num_active >= 2)
-            {
-                ITensorGemm::FusedExpertDownDesc down_descs[16];
-                for (int i = 0; i < num_active && i < 16; ++i)
-                {
-                    const auto &info = active_experts[i];
-                    down_descs[i].kernel = cached_down_gemm_[info.expert_id];
-                    down_descs[i].input = swiglu_scratch_batch_[i].data();
-                    down_descs[i].output = scratch_down_batch_[i]->mutable_data();
-                    down_descs[i].n = d_model;
-                }
-                fused_ok = cached_down_gemm_[active_experts[0].expert_id]
-                               ->multiply_fused_expert_down(down_descs, num_active, 1, intermediate);
-            }
-
-            if (fused_ok)
-            {
-                // Phase 2c: Publish every completed route through the selected
-                // graph arithmetic contract.
-                for (int i = 0; i < num_active; ++i)
-                {
-                    const auto &info = active_experts[i];
-                    publish_route(info, scratch_down_batch_[i]->data());
-                }
-            }
-            else
-            {
-                // Fallback: sequential per-expert SwiGLU + Down + accumulate
-                float *scratch_out_ptr = scratch_out_->mutable_data();
-                for (int i = 0; i < num_active; ++i)
-                {
-                    const auto &info = active_experts[i];
-                    ITensorGemm *down_gemm = cached_down_gemm_[info.expert_id];
-
-                    if (!fusedSwigluDown(
-                            *this,
-                            scratch_gate_batch_[info.batch_idx].get(),
-                            scratch_up_batch_[info.batch_idx].get(),
-                            scratch_out_.get(),
-                            down_gemm, /*m=*/1, d_model, intermediate,
-                            getWorkspace()))
+                    scratch_down_batch_.resize(num_active);
+                    for (int i = 0; i < num_active; ++i)
                     {
-                        LOG_ERROR("[MoEExpertComputeStage] Decode SwiGLU/down projection failed for expert "
-                                  << info.expert_id << " layer " << params_.layer_idx);
-                        return false;
+                        if (!scratch_down_batch_[i])
+                        {
+                            scratch_down_batch_[i] = makeScratchFP32(
+                                1, d_model, params_.device_id);
+                        }
+                    }
+                }
+
+                // Validate down GEMM engines
+                for (int i = 0; i < num_active; ++i)
+                {
+                    if (!cached_down_gemm_[active_experts[i].expert_id])
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage] FATAL: Null down GEMM engine for expert "
+                                  << active_experts[i].expert_id << " (layer " << params_.layer_idx << ")");
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                    }
+                }
+
+                // Phase 2a: Apply SwiGLU for all experts.
+                for (int i = 0; i < num_active; ++i)
+                {
+                    const auto &info = active_experts[i];
+                    const float *gate_fp32 =
+                        scratch_gate_batch_[info.batch_idx]->data();
+                    const float *up_fp32 =
+                        scratch_up_batch_[info.batch_idx]->data();
+                    swiglu_scratch_batch_.resize(
+                        std::max(
+                            swiglu_scratch_batch_.size(),
+                            static_cast<size_t>(num_active)));
+                    if (static_cast<int>(swiglu_scratch_batch_[i].size()) <
+                        intermediate)
+                    {
+                        swiglu_scratch_batch_[i].resize(intermediate);
                     }
 
-                    publish_route(info, scratch_out_ptr);
+                    primitives::compute_swiglu_serial(
+                        gate_fp32,
+                        up_fp32,
+                        swiglu_scratch_batch_[i].data(),
+                        intermediate);
+                }
+
+                // Phase 2b: Try fused multi-input down projections.
+                bool fused_ok = false;
+                if (num_active >= 2)
+                {
+                    ITensorGemm::FusedExpertDownDesc down_descs[16];
+                    for (int i = 0; i < num_active && i < 16; ++i)
+                    {
+                        const auto &info = active_experts[i];
+                        down_descs[i].kernel =
+                            cached_down_gemm_[info.expert_id];
+                        down_descs[i].input =
+                            swiglu_scratch_batch_[i].data();
+                        down_descs[i].output =
+                            scratch_down_batch_[i]->mutable_data();
+                        down_descs[i].n = d_model;
+                    }
+                    fused_ok =
+                        cached_down_gemm_[active_experts[0].expert_id]
+                            ->multiply_fused_expert_down(
+                                down_descs,
+                                num_active,
+                                1,
+                                intermediate);
+                }
+
+                if (fused_ok)
+                {
+                    // Phase 2c: Publish every completed route through the
+                    // selected graph arithmetic contract.
+                    for (int i = 0; i < num_active; ++i)
+                    {
+                        const auto &info = active_experts[i];
+                        publish_route(
+                            info,
+                            scratch_down_batch_[i]->data());
+                    }
+                }
+                else
+                {
+                    // Standalone non-transaction CPU decode retains the exact
+                    // per-expert SwiGLU/down implementation.
+                    float *scratch_out_ptr = scratch_out_->mutable_data();
+                    for (int i = 0; i < num_active; ++i)
+                    {
+                        const auto &info = active_experts[i];
+                        ITensorGemm *down_gemm =
+                            cached_down_gemm_[info.expert_id];
+
+                        if (!fusedSwigluDown(
+                                *this,
+                                scratch_gate_batch_[info.batch_idx].get(),
+                                scratch_up_batch_[info.batch_idx].get(),
+                                scratch_out_.get(),
+                                down_gemm,
+                                /*m=*/1,
+                                d_model,
+                                intermediate,
+                                getWorkspace()))
+                        {
+                            LOG_ERROR("[MoEExpertComputeStage] Decode SwiGLU/down projection failed for expert "
+                                      << info.expert_id << " layer " << params_.layer_idx);
+                            return false;
+                        }
+
+                        publish_route(info, scratch_out_ptr);
+                    }
                 }
             }
 
@@ -3843,6 +4214,65 @@ namespace llaminar2
             return false;
         }
 
+        const bool borrowed_transport_hidden =
+            sparse_overlay_binding_kind_ ==
+                SparseOverlayBindingKind::HostPacketPublication &&
+            sparse_overlay_cpu_hidden_source_ != nullptr &&
+            sparse_overlay_cpu_hidden_source_row_capacity_ > 0 &&
+            sparse_overlay_cpu_compact_to_source_row_.size() >=
+                static_cast<size_t>(seq_len);
+        if (sparse_overlay_binding_kind_ ==
+                SparseOverlayBindingKind::HostPacketPublication &&
+            !borrowed_transport_hidden)
+        {
+            LOG_ERROR(
+                "[MoEExpertComputeStage] CPU host packet has no complete borrowed hidden-row binding");
+            return false;
+        }
+
+        CPUGroupedMoESerialWorkspace::InvocationLease serial_workspace_lease;
+        CPUGroupedMoESerialWorkspace *const serial_workspace =
+            params_.cpu_grouped_serial_workspace.get();
+        if (serial_workspace)
+        {
+            serial_workspace_lease = serial_workspace->acquire(
+                seq_len,
+                top_k,
+                d_model,
+                intermediate,
+                num_experts,
+                params_.layer_idx);
+        }
+
+        auto &grouped_scratch_batch =
+            serial_workspace
+                ? serial_workspace->scratch_batch_
+                : scratch_batch_;
+        auto &grouped_scratch_gate =
+            serial_workspace
+                ? serial_workspace->scratch_gate_
+                : scratch_gate_;
+        auto &grouped_scratch_up =
+            serial_workspace
+                ? serial_workspace->scratch_up_
+                : scratch_up_;
+        auto &grouped_scratch_out =
+            serial_workspace
+                ? serial_workspace->scratch_out_
+                : scratch_out_;
+        auto &grouped_router_q8 =
+            serial_workspace
+                ? serial_workspace->router_q8_
+                : cpu_grouped_router_q8_;
+        auto &grouped_swiglu_q8 =
+            serial_workspace
+                ? serial_workspace->swiglu_q8_
+                : cpu_grouped_swiglu_q8_;
+        auto &grouped_route_outputs =
+            serial_workspace
+                ? serial_workspace->route_outputs_
+                : cpu_grouped_route_outputs_;
+
         IMoEKernel *kernel = ensureMoEKernel();
         if (!kernel)
             return false;
@@ -3868,6 +4298,11 @@ namespace llaminar2
 
         const bool verifier_rows =
             purpose == CPUGroupedRowsPurpose::MTPVerifier;
+        const bool decode_rows =
+            purpose == CPUGroupedRowsPurpose::Decode;
+        const char *const grouped_phase = verifier_rows
+            ? "verifier"
+            : (decode_rows ? "decode" : "prefill");
         const bool has_replicas = params_.replica_set.num_replicated > 0;
         const bool has_prefill_mask =
             !params_.replica_set.prefill_mask.empty();
@@ -3907,9 +4342,24 @@ namespace llaminar2
          * PerfStats does not recreate one heap object per expert invocation.
          */
         const bool record_route_distribution =
-            !verifier_rows &&
+            purpose == CPUGroupedRowsPurpose::OrdinaryPrefill &&
             PerfStatsCollector::isDomainEnabled("moe_static_apportionment") &&
             params_.my_socket_id == 0;
+        if (borrowed_transport_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "moe_overlay",
+                "cpu_transport_hidden_borrowed_rows",
+                static_cast<double>(seq_len),
+                grouped_phase,
+                params_.device_id.toString(),
+                {{"layer", std::to_string(params_.layer_idx)},
+                 {"source_row_capacity",
+                  std::to_string(
+                      sparse_overlay_cpu_hidden_source_row_capacity_)},
+                 {"materialized_compact_rows", "0"},
+                 {"ownership", "synchronous_host_packet"}});
+        }
         if (record_route_distribution)
         {
             cpu_grouped_routed_rows_by_expert_.assign(
@@ -3961,7 +4411,28 @@ namespace llaminar2
                 }
             }
 
-            if (verifier_rows && has_replicas)
+            if (borrowed_transport_hidden)
+            {
+                /*
+                 * The sparse collective already authenticated and filtered
+                 * this participant's routes. Reapplying prefill masks or
+                 * replica assignment here would create a second placement
+                 * authority and could silently discard an admitted route.
+                 */
+                for (int route = 0; route < top_k; ++route)
+                {
+                    if (row_weights[route] == 0.0f)
+                    {
+                        compute_here[route] = false;
+                        continue;
+                    }
+                    const int expert_id = routing_int_indices[route];
+                    compute_here[route] =
+                        params_.expert_mask.empty() ||
+                        params_.expert_mask[static_cast<size_t>(expert_id)];
+                }
+            }
+            else if (verifier_rows && has_replicas)
             {
                 params_.replica_set.assignForToken(
                     routing_int_indices,
@@ -4074,9 +4545,18 @@ namespace llaminar2
             max_batch = std::max(max_batch, count);
         }
         cpu_grouped_expert_write_offsets_ = cpu_grouped_expert_offsets_;
-        cpu_grouped_expert_local_slots_.resize(cpu_grouped_route_slots_.size());
-        cpu_grouped_local_to_expert_position_.resize(
-            cpu_grouped_route_slots_.size());
+        if (cpu_grouped_expert_local_slots_.size() <
+            cpu_grouped_route_slots_.size())
+        {
+            cpu_grouped_expert_local_slots_.resize(
+                cpu_grouped_route_slots_.size());
+        }
+        if (cpu_grouped_local_to_expert_position_.size() <
+            cpu_grouped_route_slots_.size())
+        {
+            cpu_grouped_local_to_expert_position_.resize(
+                cpu_grouped_route_slots_.size());
+        }
         for (size_t local_slot = 0;
              local_slot < cpu_grouped_route_slots_.size();
              ++local_slot)
@@ -4089,6 +4569,35 @@ namespace llaminar2
             cpu_grouped_expert_local_slots_[static_cast<size_t>(destination)] =
                 static_cast<int>(local_slot);
             cpu_grouped_local_to_expert_position_[local_slot] = destination;
+        }
+
+        /*
+         * Materialize the exact expert-major source-row schedule once. The
+         * transported CPU publication consumes this map directly, while the
+         * floating path reuses the same storage for per-expert FP32 gathers.
+         * The vector is grow-only and therefore allocates only when a graph
+         * family first observes a larger certified route prefix.
+         */
+        if (cpu_grouped_token_indices_.size() <
+            cpu_grouped_route_slots_.size())
+        {
+            cpu_grouped_token_indices_.resize(
+                cpu_grouped_route_slots_.size());
+        }
+        for (size_t expert_position = 0;
+             expert_position < cpu_grouped_route_slots_.size();
+             ++expert_position)
+        {
+            const int local_slot =
+                cpu_grouped_expert_local_slots_[expert_position];
+            const int compact_row =
+                cpu_grouped_route_slots_[
+                    static_cast<size_t>(local_slot)].row;
+            cpu_grouped_token_indices_[expert_position] =
+                borrowed_transport_hidden
+                    ? sparse_overlay_cpu_compact_to_source_row_[
+                          static_cast<size_t>(compact_row)]
+                    : compact_row;
         }
 
         if (!ensureGemmEnginesForExperts(cpu_grouped_active_experts_))
@@ -4111,6 +4620,10 @@ namespace llaminar2
             params_.canonical_route_contributions
                 ? output_bytes * static_cast<size_t>(top_k)
                 : output_bytes;
+        const auto publication_prepare_start =
+            record_cpu_moe_phase_timings
+                ? PerfStatsCollector::Clock::now()
+                : PerfStatsCollector::Clock::time_point{};
         if (packed_canonical_records)
         {
             float *const packed_records = publication->mutable_data();
@@ -4184,19 +4697,30 @@ namespace llaminar2
                 }
             }
         }
-        else
+        else if (!(params_.canonical_route_contributions &&
+                   params_.canonical_route_layout ==
+                       MoECanonicalRoutePublicationLayout::
+                           DenseOriginalRouteSlots &&
+                   sparse_overlay_binding_kind_ ==
+                       SparseOverlayBindingKind::HostPacketPublication))
         {
             kernel->zeroBuffer(publication, publication_bytes);
         }
+        const auto publication_prepare_finish =
+            record_cpu_moe_phase_timings
+                ? PerfStatsCollector::Clock::now()
+                : PerfStatsCollector::Clock::time_point{};
         if (cpu_grouped_route_slots_.empty())
         {
             PerfStatsCollector::addCounter(
-                verifier_rows ? "mtp" : "prefill",
+                verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill"),
                 verifier_rows
                     ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
-                    : "moe_routed_grouped_decode_equivalent_prefill_rows",
+                    : (decode_rows
+                           ? "moe_routed_grouped_decode_rows"
+                           : "moe_routed_grouped_decode_equivalent_prefill_rows"),
                 static_cast<double>(seq_len),
-                verifier_rows ? "verifier" : "prefill",
+                grouped_phase,
                 params_.device_id.toString(),
                 {{"stage", "routed_expert"},
                  {"route", "cpu_expert_slot_grouped"},
@@ -4247,61 +4771,64 @@ namespace llaminar2
             return false;
         }
 
+        const int local_route_rows =
+            static_cast<int>(cpu_grouped_route_slots_.size());
         const Q8_1Block *published_router_q8 = nullptr;
+        CPUMoEKernel *cpu_moe_kernel = nullptr;
+        const float *input_rows = nullptr;
+        const bool direct_transport_publication =
+            all_native_bundles &&
+            params_.cpu_router_q8_input_publication ==
+                CPURouterQ8InputPublicationPolicy::PublishTransportedRows;
         const int router_q8_blocks_per_row =
             (d_model + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
         if (all_native_bundles)
         {
-            auto *cpu_moe_kernel = dynamic_cast<CPUMoEKernel *>(kernel);
-            const float *input_rows = params_.input->data();
+            cpu_moe_kernel = dynamic_cast<CPUMoEKernel *>(kernel);
+            input_rows = borrowed_transport_hidden
+                             ? sparse_overlay_cpu_hidden_source_
+                             : params_.input->data();
             if (!cpu_moe_kernel || !input_rows)
             {
                 LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped-row execution "
                           "requires the production CPUMoEKernel router");
                 return false;
             }
-            if (params_.cpu_router_q8_input_publication ==
-                CPURouterQ8InputPublicationPolicy::PublishTransportedRows)
+            if (!direct_transport_publication)
             {
-                if (!cpu_moe_kernel->publishTransportedRouterQ8Hidden(
+                published_router_q8 =
+                    cpu_moe_kernel->publishedRouterQ8Hidden(
                         input_rows,
                         seq_len,
-                        d_model))
+                        d_model);
+                if (!published_router_q8)
                 {
-                    LOG_ERROR(
-                        "[MoEExpertComputeStage] CPU ExpertOverlay transport "
-                        "failed to publish canonical router Q8_1 rows for layer "
-                        << params_.layer_idx << " seq_len=" << seq_len
-                        << " d_model=" << d_model);
+                    LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped-row execution "
+                              "is missing the matching router Q8_1 publication for layer "
+                              << params_.layer_idx << " seq_len=" << seq_len
+                              << " d_model=" << d_model);
                     return false;
                 }
-                PerfStatsCollector::addCounter(
-                    "moe_overlay",
-                    "cpu_transport_router_q8_publications",
-                    1.0,
-                    verifier_rows ? "verifier" : "prefill",
-                    params_.device_id.toString(),
-                    {{"layer", std::to_string(params_.layer_idx)},
-                     {"rows", std::to_string(seq_len)},
-                     {"d_model", std::to_string(d_model)},
-                     {"source", "fixed_capacity_ticket"}});
-            }
-            published_router_q8 = cpu_moe_kernel->publishedRouterQ8Hidden(
-                input_rows,
-                seq_len,
-                d_model);
-            if (!published_router_q8)
-            {
-                LOG_ERROR("[MoEExpertComputeStage] CPU NativeVNNI grouped-row execution "
-                          "is missing the matching router Q8_1 publication for layer "
-                          << params_.layer_idx << " seq_len=" << seq_len
-                          << " d_model=" << d_model);
-                return false;
             }
         }
-
-        const int local_route_rows =
-            static_cast<int>(cpu_grouped_route_slots_.size());
+        auto record_cpu_moe_phase_ns =
+            [&](const char *name, uint64_t duration_ns)
+        {
+            if (!record_cpu_moe_phase_timings)
+                return;
+            PerfStatsCollector::recordTimingNs(
+                "cpu_moe_grouped_rows",
+                name,
+                duration_ns,
+                grouped_phase,
+                params_.device_id.toString(),
+                {{"layer", std::to_string(params_.layer_idx)},
+                 {"seq_len", std::to_string(seq_len)},
+                 {"local_route_rows", std::to_string(local_route_rows)},
+                 {"active_experts",
+                  std::to_string(cpu_grouped_active_experts_.size())},
+                 {"purpose", grouped_phase}});
+        };
         auto record_cpu_moe_phase =
             [&](const char *name,
                 PerfStatsCollector::Clock::time_point start)
@@ -4312,22 +4839,31 @@ namespace llaminar2
             const auto duration_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     finish - start).count();
-            PerfStatsCollector::recordTimingNs(
-                "cpu_moe_grouped_rows",
+            record_cpu_moe_phase_ns(
                 name,
-                static_cast<uint64_t>(duration_ns),
-                verifier_rows ? "verifier" : "prefill",
-                params_.device_id.toString(),
-                {{"layer", std::to_string(params_.layer_idx)},
-                 {"seq_len", std::to_string(seq_len)},
-                 {"local_route_rows", std::to_string(local_route_rows)},
-                 {"active_experts",
-                  std::to_string(cpu_grouped_active_experts_.size())},
-                 {"purpose", verifier_rows ? "verifier" : "prefill"}});
+                static_cast<uint64_t>(duration_ns));
         };
-        record_cpu_moe_phase(
-            "route_schedule_and_bundle_validation",
-            route_schedule_start);
+        if (record_cpu_moe_phase_timings)
+        {
+            const auto route_schedule_finish =
+                PerfStatsCollector::Clock::now();
+            const auto complete_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    route_schedule_finish - route_schedule_start).count();
+            const auto publication_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    publication_prepare_finish -
+                    publication_prepare_start).count();
+            record_cpu_moe_phase_ns(
+                "route_schedule_and_bundle_validation",
+                static_cast<uint64_t>(
+                    std::max<int64_t>(
+                        0,
+                        complete_ns - publication_ns)));
+            record_cpu_moe_phase_ns(
+                "publication_prepare",
+                static_cast<uint64_t>(publication_ns));
+        }
 
         const auto workspace_prepare_start = record_cpu_moe_phase_timings
                                                  ? PerfStatsCollector::Clock::now()
@@ -4336,9 +4872,15 @@ namespace llaminar2
             all_native_bundles ? local_route_rows : max_batch;
         if (!all_native_bundles)
         {
-            cpu_grouped_route_outputs_.resize(
+            const size_t required_route_output_elements =
                 static_cast<size_t>(local_route_rows) *
-                static_cast<size_t>(d_model));
+                static_cast<size_t>(d_model);
+            if (grouped_route_outputs.size() <
+                required_route_output_elements)
+            {
+                grouped_route_outputs.resize(
+                    required_route_output_elements);
+            }
         }
 
         auto scratch_has_shape = [](const std::shared_ptr<FP32Tensor> &tensor,
@@ -4354,29 +4896,30 @@ namespace llaminar2
         };
 
         if (!all_native_bundles &&
-            !scratch_has_shape(scratch_batch_, max_batch, d_model))
+            !scratch_has_shape(grouped_scratch_batch, max_batch, d_model))
         {
-            scratch_batch_ = makeScratchFP32(
+            grouped_scratch_batch = makeScratchFP32(
                 max_batch, d_model, params_.device_id);
         }
-        if (!scratch_has_shape(scratch_gate_, scratch_rows, intermediate))
+        if (!scratch_has_shape(grouped_scratch_gate, scratch_rows, intermediate))
         {
-            scratch_gate_ = makeScratchFP32(
+            grouped_scratch_gate = makeScratchFP32(
                 scratch_rows, intermediate, params_.device_id);
         }
-        if (!scratch_has_shape(scratch_up_, scratch_rows, intermediate))
+        if (!scratch_has_shape(grouped_scratch_up, scratch_rows, intermediate))
         {
-            scratch_up_ = makeScratchFP32(
+            grouped_scratch_up = makeScratchFP32(
                 scratch_rows, intermediate, params_.device_id);
         }
-        if (!scratch_has_shape(scratch_out_, scratch_rows, d_model))
+        if (!scratch_has_shape(grouped_scratch_out, scratch_rows, d_model))
         {
-            scratch_out_ = makeScratchFP32(
+            grouped_scratch_out = makeScratchFP32(
                 scratch_rows, d_model, params_.device_id);
         }
         scratch_capacity_ = std::max(scratch_capacity_, scratch_rows);
-        if ((!all_native_bundles && !scratch_batch_) ||
-            !scratch_gate_ || !scratch_up_ || !scratch_out_)
+        if ((!all_native_bundles && !grouped_scratch_batch) ||
+            !grouped_scratch_gate || !grouped_scratch_up ||
+            !grouped_scratch_out)
         {
             LOG_ERROR("[MoEExpertComputeStage] CPU grouped-row scratch allocation failed");
             return false;
@@ -4384,19 +4927,28 @@ namespace llaminar2
 
         if (all_native_bundles)
         {
-            cpu_grouped_router_q8_.resize(
+            const size_t required_router_q8_blocks =
                 static_cast<size_t>(local_route_rows) *
-                static_cast<size_t>(router_q8_blocks_per_row));
+                static_cast<size_t>(router_q8_blocks_per_row);
+            if (grouped_router_q8.size() < required_router_q8_blocks)
+                grouped_router_q8.resize(required_router_q8_blocks);
             const int swiglu_q8_blocks_per_row =
                 (intermediate + Q8_1Block::BLOCK_SIZE - 1) /
                 Q8_1Block::BLOCK_SIZE;
-            cpu_grouped_swiglu_q8_.resize(
+            const size_t required_swiglu_q8_blocks =
                 static_cast<size_t>(local_route_rows) *
-                static_cast<size_t>(swiglu_q8_blocks_per_row));
+                static_cast<size_t>(swiglu_q8_blocks_per_row);
+            if (grouped_swiglu_q8.size() < required_swiglu_q8_blocks)
+                grouped_swiglu_q8.resize(required_swiglu_q8_blocks);
         }
         else
         {
-            cpu_grouped_token_indices_.resize(static_cast<size_t>(max_batch));
+            if (cpu_grouped_token_indices_.size() <
+                static_cast<size_t>(max_batch))
+            {
+                cpu_grouped_token_indices_.resize(
+                    static_cast<size_t>(max_batch));
+            }
         }
         batch_projections_.clear();
         batch_projections_.reserve(2u);
@@ -4407,45 +4959,93 @@ namespace llaminar2
         if (all_native_bundles)
         {
             /*
-             * Gather every locally owned route into one expert-major Q8_1
-             * matrix. The router is the sole hidden-state quantizer; this copy
-             * changes only row order and therefore cannot perturb arithmetic.
+             * A transported CPU endpoint publishes directly into expert-major
+             * storage because its route schedule is already authoritative.
+             * An ordinary CPU graph instead consumes the row-major Q8_1 bytes
+             * published by its router and performs the required permutation.
+             * Both branches use the same source-row schedule and therefore
+             * produce byte-identical NativeVNNI inputs.
              */
-            const auto router_q8_gather_start =
+            const auto router_q8_prepare_start =
                 record_cpu_moe_phase_timings
                     ? PerfStatsCollector::Clock::now()
                     : PerfStatsCollector::Clock::time_point{};
-            auto gather_router_rows = [&]()
+            if (direct_transport_publication)
             {
-#pragma omp for schedule(static)
-                for (int expert_position = 0;
-                     expert_position < local_route_rows;
-                     ++expert_position)
+                const size_t required_router_q8_blocks =
+                    static_cast<size_t>(local_route_rows) *
+                    static_cast<size_t>(router_q8_blocks_per_row);
+                if (!cpu_moe_kernel->
+                        publishTransportedRouterQ8HiddenExpertMajor(
+                            input_rows,
+                            borrowed_transport_hidden
+                                ? sparse_overlay_cpu_hidden_source_row_capacity_
+                                : seq_len,
+                            d_model,
+                            std::span<const int>(
+                                cpu_grouped_token_indices_.data(),
+                                static_cast<size_t>(local_route_rows)),
+                            std::span<Q8_1Block>(
+                                grouped_router_q8.data(),
+                                required_router_q8_blocks)))
                 {
-                    const int local_slot =
-                    cpu_grouped_expert_local_slots_[
-                            static_cast<size_t>(expert_position)];
-                    const int token_row =
-                        cpu_grouped_route_slots_[
-                            static_cast<size_t>(local_slot)].row;
-                    const Q8_1Block *source_row =
-                        published_router_q8 +
-                        static_cast<size_t>(token_row) *
-                            static_cast<size_t>(router_q8_blocks_per_row);
-                    Q8_1Block *destination_row =
-                        cpu_grouped_router_q8_.data() +
-                        static_cast<size_t>(expert_position) *
-                            static_cast<size_t>(router_q8_blocks_per_row);
-                    std::copy_n(
-                        source_row,
-                        router_q8_blocks_per_row,
-                        destination_row);
+                    LOG_ERROR(
+                        "[MoEExpertComputeStage] CPU ExpertOverlay transport "
+                        "failed to publish expert-major canonical Q8_1 rows for layer "
+                        << params_.layer_idx << " seq_len=" << seq_len
+                        << " local_route_rows=" << local_route_rows
+                        << " d_model=" << d_model);
+                    return false;
                 }
-            };
-            OMP_WORKSHARE_REGION(gather_router_rows);
-            record_cpu_moe_phase(
-                "router_q8_expert_major_gather",
-                router_q8_gather_start);
+                PerfStatsCollector::addCounter(
+                    "moe_overlay",
+                    "cpu_transport_router_q8_publications",
+                    1.0,
+                    grouped_phase,
+                    params_.device_id.toString(),
+                    {{"layer", std::to_string(params_.layer_idx)},
+                     {"source_rows",
+                      std::to_string(
+                          sparse_overlay_cpu_hidden_source_row_capacity_)},
+                     {"route_rows", std::to_string(local_route_rows)},
+                     {"d_model", std::to_string(d_model)},
+                     {"layout", "expert_major"},
+                     {"source", "fixed_capacity_ticket"}});
+                record_cpu_moe_phase(
+                    "transported_router_q8_expert_major_publication",
+                    router_q8_prepare_start);
+            }
+            else
+            {
+                auto gather_router_rows = [&]()
+                {
+#pragma omp for schedule(static)
+                    for (int expert_position = 0;
+                         expert_position < local_route_rows;
+                         ++expert_position)
+                    {
+                        const int token_row =
+                            cpu_grouped_token_indices_[
+                            static_cast<size_t>(expert_position)];
+                        const Q8_1Block *source_row =
+                            published_router_q8 +
+                            static_cast<size_t>(token_row) *
+                                static_cast<size_t>(router_q8_blocks_per_row);
+                        Q8_1Block *destination_row =
+                            grouped_router_q8.data() +
+                            static_cast<size_t>(expert_position) *
+                                static_cast<size_t>(router_q8_blocks_per_row);
+                        std::copy_n(
+                            source_row,
+                            router_q8_blocks_per_row,
+                            destination_row);
+                    }
+                };
+                OMP_WORKSHARE_REGION(gather_router_rows);
+                record_cpu_moe_phase(
+                    "router_q8_expert_major_gather",
+                    router_q8_prepare_start);
+            }
 
             using BatchedProjection =
                 CPUNativeVNNIGemmKernel::BatchedPrequantizedProjectionDesc;
@@ -4459,9 +5059,9 @@ namespace llaminar2
                 down_projection_descriptors = {};
             int gate_up_projection_count = 0;
             int down_projection_count = 0;
-            float *gate_rows = scratch_gate_->mutable_data();
-            float *up_rows = scratch_up_->mutable_data();
-            float *down_rows = scratch_out_->mutable_data();
+            float *gate_rows = grouped_scratch_gate->mutable_data();
+            float *up_rows = grouped_scratch_up->mutable_data();
+            float *down_rows = grouped_scratch_out->mutable_data();
             if (!gate_rows || !up_rows || !down_rows)
                 return false;
 
@@ -4500,7 +5100,7 @@ namespace llaminar2
                 }
 
                 const Q8_1Block *expert_input =
-                    cpu_grouped_router_q8_.data() +
+                    grouped_router_q8.data() +
                     static_cast<size_t>(expert_begin) *
                         static_cast<size_t>(router_q8_blocks_per_row);
                 gate_up_projection_descriptors[
@@ -4530,7 +5130,7 @@ namespace llaminar2
                 down_projection_descriptors[
                     static_cast<size_t>(down_projection_count++)] = {
                     .kernel = native_down,
-                    .input_q8 = cpu_grouped_swiglu_q8_.data() +
+                    .input_q8 = grouped_swiglu_q8.data() +
                         static_cast<size_t>(expert_begin) *
                             static_cast<size_t>(swiglu_q8_blocks_per_row),
                     .output = down_rows +
@@ -4553,7 +5153,7 @@ namespace llaminar2
                         d_model,
                         gate_rows,
                         up_rows,
-                        cpu_grouped_swiglu_q8_.data(),
+                        grouped_swiglu_q8.data(),
                         local_route_rows,
                         intermediate,
                         swiglu_q8_blocks_per_row,
@@ -4573,7 +5173,7 @@ namespace llaminar2
                 "kernel",
                 "cpu_moe_native_vnni_layer_batched_expert_calls",
                 1.0,
-                verifier_rows ? "verifier" : "prefill",
+                grouped_phase,
                 "cpu",
                 {{"layer", std::to_string(params_.layer_idx)},
                  {"active_experts",
@@ -4605,39 +5205,53 @@ namespace llaminar2
                     return false;
                 }
 
-                for (int expert_row = 0; expert_row < expert_rows; ++expert_row)
+                if (borrowed_transport_hidden)
                 {
-                    const int local_slot =
-                        cpu_grouped_expert_local_slots_[
-                            static_cast<size_t>(expert_begin + expert_row)];
-                    cpu_grouped_token_indices_[
-                        static_cast<size_t>(expert_row)] =
-                        cpu_grouped_route_slots_[
-                            static_cast<size_t>(local_slot)].row;
+                    kernel->gatherTokenBatch(
+                        sparse_overlay_cpu_hidden_source_,
+                        grouped_scratch_batch->mutable_data(),
+                        cpu_grouped_token_indices_.data() + expert_begin,
+                        expert_rows,
+                        d_model);
                 }
-                kernel->gatherTokenBatchFromTensors(
-                    params_.input,
-                    scratch_batch_.get(),
-                    cpu_grouped_token_indices_.data(),
-                    expert_rows,
-                    d_model);
+                else
+                {
+                    for (int expert_row = 0;
+                         expert_row < expert_rows;
+                         ++expert_row)
+                    {
+                        const int local_slot =
+                            cpu_grouped_expert_local_slots_[
+                                static_cast<size_t>(expert_begin + expert_row)];
+                        cpu_grouped_token_indices_[
+                            static_cast<size_t>(expert_row)] =
+                            cpu_grouped_route_slots_[
+                                static_cast<size_t>(local_slot)].row;
+                    }
+                    kernel->gatherTokenBatchFromTensors(
+                        params_.input,
+                        grouped_scratch_batch.get(),
+                        cpu_grouped_token_indices_.data(),
+                        expert_rows,
+                        d_model);
+                }
 
                 batch_projections_.clear();
                 batch_projections_.push_back(
-                    {gate_gemm, scratch_gate_.get(), intermediate, nullptr, "gate"});
+                    {gate_gemm, grouped_scratch_gate.get(), intermediate, nullptr, "gate"});
                 batch_projections_.push_back(
-                    {up_gemm, scratch_up_.get(), intermediate, nullptr, "up"});
+                    {up_gemm, grouped_scratch_up.get(), intermediate, nullptr, "up"});
 
                 const bool projected = verifier_rows && expert_rows > 1
                     ? gate_gemm->multiply_fused_verifier_rows_decode_equivalent(
-                          scratch_batch_.get(),
+                          grouped_scratch_batch.get(),
                           batch_projections_,
                           expert_rows,
                           d_model,
                           nullptr,
                           getWorkspace())
                     : gate_gemm->multiply_fused_tensor(
-                          scratch_batch_.get(),
+                          grouped_scratch_batch.get(),
                           batch_projections_,
                           expert_rows,
                           d_model,
@@ -4655,9 +5269,9 @@ namespace llaminar2
                 const bool down_ok = verifier_rows && expert_rows > 1
                     ? down_gemm->
                           multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
-                              scratch_gate_.get(),
-                              scratch_up_.get(),
-                              scratch_out_.get(),
+                              grouped_scratch_gate.get(),
+                              grouped_scratch_up.get(),
+                              grouped_scratch_out.get(),
                               expert_rows,
                               d_model,
                               intermediate,
@@ -4666,9 +5280,9 @@ namespace llaminar2
                               getWorkspace())
                     : fusedSwigluDown(
                           *this,
-                          scratch_gate_.get(),
-                          scratch_up_.get(),
-                          scratch_out_.get(),
+                          grouped_scratch_gate.get(),
+                          grouped_scratch_up.get(),
+                          grouped_scratch_out.get(),
                           down_gemm,
                           expert_rows,
                           d_model,
@@ -4683,7 +5297,7 @@ namespace llaminar2
                     return false;
                 }
 
-                const float *expert_down_rows = scratch_out_->data();
+                const float *expert_down_rows = grouped_scratch_out->data();
                 if (!expert_down_rows)
                     return false;
                 for (int expert_row = 0;
@@ -4698,7 +5312,7 @@ namespace llaminar2
                             static_cast<size_t>(expert_row) *
                                 static_cast<size_t>(d_model),
                         d_model,
-                        cpu_grouped_route_outputs_.data() +
+                        grouped_route_outputs.data() +
                             static_cast<size_t>(local_slot) *
                                 static_cast<size_t>(d_model));
                 }
@@ -4714,7 +5328,7 @@ namespace llaminar2
             (params_.canonical_route_contributions && !canonical_routes))
             return false;
         const float *native_down_rows =
-            all_native_bundles ? scratch_out_->data() : nullptr;
+            all_native_bundles ? grouped_scratch_out->data() : nullptr;
         if (all_native_bundles && !native_down_rows)
             return false;
 
@@ -4757,7 +5371,7 @@ namespace llaminar2
                         ? native_down_rows +
                               static_cast<size_t>(output_position) *
                                   static_cast<size_t>(d_model)
-                        : cpu_grouped_route_outputs_.data() +
+                        : grouped_route_outputs.data() +
                               static_cast<size_t>(output_position) *
                                   static_cast<size_t>(d_model);
                     if (canonical_routes)
@@ -4800,12 +5414,14 @@ namespace llaminar2
             accumulate_start);
 
         PerfStatsCollector::addCounter(
-            verifier_rows ? "mtp" : "prefill",
+            verifier_rows ? "mtp" : (decode_rows ? "decode" : "prefill"),
             verifier_rows
                 ? "moe_routed_grouped_decode_equivalent_verifier_prefill_rows"
-                : "moe_routed_grouped_decode_equivalent_prefill_rows",
+                : (decode_rows
+                       ? "moe_routed_grouped_decode_rows"
+                       : "moe_routed_grouped_decode_equivalent_prefill_rows"),
             static_cast<double>(seq_len),
-            verifier_rows ? "verifier" : "prefill",
+            grouped_phase,
             params_.device_id.toString(),
             {{"stage", "routed_expert"},
              {"route", "cpu_expert_slot_grouped"},
@@ -4819,7 +5435,9 @@ namespace llaminar2
                 "kernel",
                 verifier_rows
                     ? "cpu_moe_grouped_verifier_router_q8_reuse_calls"
-                    : "cpu_moe_prefill_router_q8_reuse_calls",
+                    : (decode_rows
+                           ? "cpu_moe_grouped_decode_router_q8_reuse_calls"
+                           : "cpu_moe_prefill_router_q8_reuse_calls"),
                 1.0,
                 "moe",
                 "cpu",
@@ -4827,7 +5445,7 @@ namespace llaminar2
                  {"top_k", std::to_string(top_k)},
                  {"active_experts", std::to_string(cpu_grouped_active_experts_.size())},
                  {"route", "cpu_expert_slot_grouped"},
-                 {"purpose", verifier_rows ? "verifier" : "prefill"}});
+                 {"purpose", grouped_phase}});
         }
         return true;
     }
@@ -7240,12 +7858,14 @@ namespace llaminar2
         return true;
     }
 
-    bool MoEExpertComputeStage::isDeviceRoutedDecodeGraphCapturable() const
+    bool MoEExpertComputeStage::
+        supportsDeviceRoutedOneRowGraphCapturePreflight() const
     {
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
         return supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+               !params_.force_grouped_verifier_prefill_for_decode &&
                !params_.require_device_routing_tensor_decode &&
                params_.seq_len == 1 &&
                params_.d_model > 0 &&
@@ -7256,9 +7876,19 @@ namespace llaminar2
                params_.top_k <= params_.num_experts &&
                params_.input &&
                params_.output &&
+               params_.moe_runtime_table &&
+               params_.layer_idx >= 0;
+#endif
+    }
+
+    bool MoEExpertComputeStage::isDeviceRoutedDecodeGraphCapturable() const
+    {
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
+        return false;
+#else
+        return supportsDeviceRoutedOneRowGraphCapturePreflight() &&
                moe_kernel_ &&
                runtime_grouped_decode_launch_state_prepared_ &&
-               params_.moe_runtime_table &&
                moe_runtime_layer_ &&
                moe_runtime_table_initialized_ &&
                runtimeTableHasActiveGroupedDecodeBank();
@@ -7804,11 +8434,17 @@ namespace llaminar2
             return true;
 #if defined(HAVE_CUDA)
         case ComputeBackendType::GPU_CUDA:
-            return !params_.expert_gate_views.empty();
+            return !params_.expert_gate_views.empty() ||
+                   (params_.expert_weight_resolution_policy ==
+                        MoEExpertWeightResolutionPolicy::PreparedRegistryOnly &&
+                    hasPreparedExpertGemmEnginesForLocalOwnership());
 #endif
 #if defined(HAVE_ROCM)
         case ComputeBackendType::GPU_ROCM:
-            return !params_.expert_gate_views.empty();
+            return !params_.expert_gate_views.empty() ||
+                   (params_.expert_weight_resolution_policy ==
+                        MoEExpertWeightResolutionPolicy::PreparedRegistryOnly &&
+                    hasPreparedExpertGemmEnginesForLocalOwnership());
 #endif
         default:
             return false;
@@ -7904,6 +8540,17 @@ namespace llaminar2
             << " kernel=" << perfBool(moe_kernel_ != nullptr)
             << " fixed_preflight=" << perfBool(fixed_preflight)
             << " fixed_engines=" << perfBool(fixed_engines_ready)
+            << " fixed_expert_count=" << fixed_experts.size()
+            << " active_rows="
+            << perfBool(params_.active_row_count_device != nullptr)
+            << " require_device_routes="
+            << perfBool(params_.require_device_routing_tensor_decode)
+            << " routing_indices=" << perfBool(params_.routing_indices != nullptr)
+            << " routing_weights=" << perfBool(params_.routing_weights != nullptr)
+            << " replica_count=" << params_.replica_set.num_replicated
+            << " expert_mask_size=" << params_.expert_mask.size()
+            << " runtime_descriptors="
+            << perfBool(usesRuntimePlacementWeightDescriptors())
             << " fixed_mask_consumed="
             << perfBool(usesPublishedFixedTopologyMaskGrouping())
             << " fixed_mask_publication=" << mask_publication
@@ -7930,23 +8577,10 @@ namespace llaminar2
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
-        const bool runtime_decode_supported =
-            !params_.force_grouped_verifier_prefill_for_decode &&
-            !params_.require_device_routing_tensor_decode &&
-            supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
-            params_.seq_len == 1 &&
-            params_.d_model > 0 &&
-            params_.expert_intermediate > 0 &&
-            params_.num_experts > 0 &&
-            params_.top_k > 0 &&
-            params_.top_k <= 16 &&
-            params_.top_k <= params_.num_experts &&
-            params_.input &&
-            params_.output &&
-            params_.moe_runtime_table &&
-            params_.layer_idx >= 0;
+        const bool one_row_device_routed_supported =
+            supportsDeviceRoutedOneRowGraphCapturePreflight();
 
-        return runtime_decode_supported ||
+        return one_row_device_routed_supported ||
                supportsExplicitRoutingDecodeGraphCapturePreflight() ||
                supportsFixedTopologyPrefillGraphCapturePreflight();
 #endif
@@ -7954,7 +8588,20 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::supportsLazyPrefillGraphCapturePreflight() const
     {
-        return supportsFixedTopologyPrefillGraphCapturePreflight();
+        /*
+         * A restored prefix may leave exactly one uncached token. Its routed
+         * expert arithmetic is one of the ordinary production one-row paths:
+         * a locally routed runtime-table graph, or an explicit-routing graph
+         * used by a heterogeneous continuation participant.  The stable
+         * device row-count pointer proves that the enclosing transaction is
+         * prefill rather than an inferred decode.  Keep both route authorities
+         * behind that same proof so a one-row bucket cannot be rejected merely
+         * because its routes cross an ExpertOverlay domain boundary.
+         */
+        return supportsFixedTopologyPrefillGraphCapturePreflight() ||
+               (params_.active_row_count_device != nullptr &&
+                (supportsDeviceRoutedOneRowGraphCapturePreflight() ||
+                 supportsExplicitRoutingDecodeGraphCapturePreflight()));
     }
 
     bool MoEExpertComputeStage::supportsPaddedPrefillGraphCapturePreflight() const
@@ -7985,11 +8632,9 @@ namespace llaminar2
                 return false;
             }
 
-            const bool runtime_decode =
-                !params_.force_grouped_verifier_prefill_for_decode &&
-                !params_.require_device_routing_tensor_decode &&
-                params_.seq_len == 1 && params_.moe_runtime_table;
-            if (runtime_decode)
+            const bool one_row_device_routed =
+                supportsDeviceRoutedOneRowGraphCapturePreflight();
+            if (one_row_device_routed)
             {
                 IMoEKernel *kernel = ensureMoEKernel();
                 const MoEDecodeDescriptorSource descriptor_source =
@@ -8534,14 +9179,68 @@ namespace llaminar2
     {
         const size_t expert_count =
             static_cast<size_t>(std::max(params_.num_experts, 0));
-        const bool valid_binding_identity =
+        const bool host_packet_binding =
             invocation.binding_kind ==
-                    SparseOverlayBindingKind::SetupPriming
-                ? invocation.engine_binding_generation == 0 &&
-                      !sparse_overlay_invocation_bound_
-                : invocation.binding_kind ==
-                          SparseOverlayBindingKind::ResidencyPublication &&
-                      invocation.engine_binding_generation != 0;
+            SparseOverlayBindingKind::HostPacketPublication;
+        const bool production_service_phase =
+            invocation.service_phase ==
+                MoEOverlayServicePhaseHint::Decode ||
+            invocation.service_phase ==
+                MoEOverlayServicePhaseHint::Prefill ||
+            invocation.service_phase ==
+                MoEOverlayServicePhaseHint::GroupedVerifier;
+        const bool valid_service_phase = host_packet_binding
+            ? production_service_phase
+            : invocation.service_phase ==
+                  MoEOverlayServicePhaseHint::Auto;
+        bool valid_cpu_hidden_binding =
+            invocation.cpu_transported_hidden.empty();
+        if (host_packet_binding)
+        {
+            const auto &hidden = invocation.cpu_transported_hidden;
+            valid_cpu_hidden_binding =
+                params_.device_id.is_cpu() &&
+                params_.cpu_router_q8_input_publication ==
+                    CPURouterQ8InputPublicationPolicy::
+                        PublishTransportedRows &&
+                hidden.source != nullptr &&
+                hidden.source_row_capacity > 0 &&
+                hidden.compact_to_source_row.size() ==
+                    static_cast<size_t>(invocation.live_rows);
+            if (valid_cpu_hidden_binding)
+            {
+                valid_cpu_hidden_binding = std::all_of(
+                    hidden.compact_to_source_row.begin(),
+                    hidden.compact_to_source_row.end(),
+                    [&](int source_row)
+                    {
+                        return source_row >= 0 &&
+                               source_row < hidden.source_row_capacity;
+                    });
+            }
+        }
+        bool valid_binding_identity = false;
+        switch (invocation.binding_kind)
+        {
+        case SparseOverlayBindingKind::SetupPriming:
+            valid_binding_identity =
+                invocation.engine_binding_generation == 0 &&
+                !sparse_overlay_invocation_bound_;
+            break;
+        case SparseOverlayBindingKind::ResidencyPublication:
+            valid_binding_identity =
+                invocation.engine_binding_generation != 0;
+            break;
+        case SparseOverlayBindingKind::HostPacketPublication:
+            valid_binding_identity =
+                params_.device_id.is_cpu() &&
+                invocation.engine_binding_generation != 0;
+            break;
+        }
+        const int route_width =
+            invocation.route_width > 0
+                ? invocation.route_width
+                : params_.top_k;
         const auto tensorHolds = [](const TensorBase *tensor,
                                     size_t required_elements)
         {
@@ -8550,11 +9249,18 @@ namespace llaminar2
         };
 
         if (isGraphCaptureActive() || !params_.device_id.is_valid() ||
-            params_.top_k <= 0 || params_.top_k > 16 ||
-            params_.top_k > params_.num_experts ||
+            sparse_overlay_route_width_capacity_ <= 0 ||
+            sparse_overlay_route_width_capacity_ > 16 ||
+            sparse_overlay_route_width_capacity_ > params_.num_experts ||
+            route_width <= 0 ||
+            route_width > sparse_overlay_route_width_capacity_ ||
+            (!host_packet_binding && invocation.route_width > 0 &&
+             route_width != params_.top_k) ||
             params_.num_experts <= 0 ||
             params_.d_model <= 0 || invocation.live_rows <= 0 ||
             !valid_binding_identity ||
+            !valid_service_phase ||
+            !valid_cpu_hidden_binding ||
             !invocation.expert_mask ||
             params_.expert_mask.size() != expert_count ||
             invocation.expert_mask->size() != expert_count ||
@@ -8571,7 +9277,7 @@ namespace llaminar2
         if (rows > std::numeric_limits<size_t>::max() /
                        static_cast<size_t>(params_.d_model) ||
             rows > std::numeric_limits<size_t>::max() /
-                       static_cast<size_t>(params_.top_k))
+                       static_cast<size_t>(route_width))
         {
             LOG_ERROR(
                 "[MoEExpertComputeStage] Sparse-overlay invocation element count overflows size_t");
@@ -8579,7 +9285,7 @@ namespace llaminar2
         }
         const size_t hidden_elements = rows * static_cast<size_t>(params_.d_model);
         const size_t routing_elements =
-            rows * static_cast<size_t>(params_.top_k);
+            rows * static_cast<size_t>(route_width);
         if (!tensorHolds(invocation.input, hidden_elements) ||
             !tensorHolds(invocation.routing_indices, routing_elements) ||
             !tensorHolds(invocation.routing_weights, routing_elements) ||
@@ -8591,12 +9297,13 @@ namespace llaminar2
         }
 
         const bool first_binding = !sparse_overlay_invocation_bound_;
-        if (!first_binding &&
+        if (!first_binding && !host_packet_binding &&
             (params_.input != invocation.input ||
              params_.routing_indices != invocation.routing_indices ||
              params_.routing_weights != invocation.routing_weights ||
              params_.output != invocation.output ||
-             params_.seq_len != invocation.live_rows))
+             params_.seq_len != invocation.live_rows ||
+             params_.top_k != route_width))
         {
             LOG_ERROR(
                 "[MoEExpertComputeStage] Sparse-overlay replay attempted to change a captured tensor-family identity");
@@ -8609,7 +9316,7 @@ namespace llaminar2
                 invocation.engine_binding_generation;
         bool mask_changed = false;
         bool engines_changed = false;
-        if (binding_generation_changed)
+        if (binding_generation_changed || host_packet_binding)
         {
             mask_changed =
                 !std::equal(
@@ -8644,7 +9351,25 @@ namespace llaminar2
         params_.routing_weights = invocation.routing_weights;
         params_.output = invocation.output;
         params_.seq_len = invocation.live_rows;
-        if (binding_generation_changed)
+        params_.top_k = route_width;
+        if (host_packet_binding)
+        {
+            if (sparse_overlay_cpu_compact_to_source_row_.size() < rows)
+            {
+                LOG_ERROR(
+                    "[MoEExpertComputeStage] CPU transported hidden-row map exceeds setup capacity");
+                return false;
+            }
+            sparse_overlay_cpu_hidden_source_ =
+                invocation.cpu_transported_hidden.source;
+            sparse_overlay_cpu_hidden_source_row_capacity_ =
+                invocation.cpu_transported_hidden.source_row_capacity;
+            std::copy(
+                invocation.cpu_transported_hidden.compact_to_source_row.begin(),
+                invocation.cpu_transported_hidden.compact_to_source_row.end(),
+                sparse_overlay_cpu_compact_to_source_row_.begin());
+        }
+        if (binding_generation_changed || mask_changed || engines_changed)
         {
             std::copy(
                 invocation.expert_mask->begin(),
@@ -8676,6 +9401,8 @@ namespace llaminar2
             cached_up_gemm_.size() != expert_count ||
             cached_down_gemm_.size() != expert_count;
         sparse_overlay_invocation_bound_ = true;
+        sparse_overlay_binding_kind_ = invocation.binding_kind;
+        sparse_overlay_service_phase_ = invocation.service_phase;
         sparse_overlay_engine_binding_generation_ =
             invocation.engine_binding_generation;
         if (first_binding || engines_changed || mask_changed ||
@@ -8688,7 +9415,8 @@ namespace llaminar2
             grouped_down_desc_table_dirty_ = true;
             runtime_grouped_decode_launch_state_prepared_ = false;
             invalidateFixedTopologyMaskPublication();
-            sparse_overlay_launch_metadata_dirty_ = true;
+            sparse_overlay_launch_metadata_dirty_ =
+                !host_packet_binding;
         }
         return true;
     }
@@ -9720,8 +10448,15 @@ namespace llaminar2
 
     bool SharedExpertFFNStage::supportsLazyPrefillGraphCapturePreflight() const
     {
+        /*
+         * Physical M=1 is a valid exact-shape prefill bucket. This occurs when
+         * prefix restore leaves one uncached token. The shared FFN has no
+         * position-dependent arithmetic, so its prepared one-row production
+         * kernel is equally valid in decode and prefill transactions; the
+         * enclosing graph owns the lifecycle distinction.
+         */
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
-               params_.seq_len > 1 &&
+               params_.seq_len >= 1 &&
                params_.d_model > 0 &&
                params_.intermediate > 0 &&
                params_.input &&
@@ -10242,14 +10977,20 @@ namespace llaminar2
 
     bool SharedExpertGateStage::supportsLazyPrefillGraphCapturePreflight() const
     {
+        /*
+         * Prefix restore may produce a one-row exact-shape prefill. Shared
+         * gating is row-local, and its M=1 launch is the same stable device
+         * kernel used by decode. The serving graph, not physical row count,
+         * supplies the prefill lifecycle identity.
+         */
         if (!ownsGateArithmetic())
         {
             return supportsGroupedPrefillGraphCaptureBackend(
                        params_.device_id) &&
-                   params_.seq_len > 1;
+                   params_.seq_len >= 1;
         }
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
-               params_.seq_len > 1 &&
+               params_.seq_len >= 1 &&
                params_.d_model > 0 &&
                params_.input &&
                params_.gate_inp &&

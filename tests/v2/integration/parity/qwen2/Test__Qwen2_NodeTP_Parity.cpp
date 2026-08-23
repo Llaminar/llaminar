@@ -14,7 +14,6 @@
  *
  * Test configurations:
  *   - NodeTP_2xMPI_CPU: 2 MPI ranks, each using CPU (UPI backend)
- *   - NodeTP_4xMPI_CPU: 4 MPI ranks (requires 4 NUMA nodes)
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -23,6 +22,7 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
+#include "Qwen2ModelParityDefinitions.h"
 #include "Qwen2ParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -51,55 +51,31 @@ static const std::vector<std::string> kNodeTPExcludedStages = {
     // These also have sharded intermediate states
     "ATTN_RESIDUAL", "FFN_RESIDUAL"};
 
-/**
- * @brief NodeTP test configurations
- *
- * Each config specifies:
- * - devices: What device type each rank uses (typically CPU for NodeTP)
- * - parallelism: Parallelism::NodeTP
- * - collective: Collective::MPI
- * - mpi_ranks: Required number of MPI ranks
- */
-static const std::vector<TestConfig> kNodeTPTestConfigs = {
-    // =========================================================================
-    // NodeTP with CPU (UPI interconnect)
-    // =========================================================================
-    // 2-way Node-Local TP with CPU devices using MPI collectives
-    // This is the primary use case: CPU-only tensor parallelism
-    // across NUMA nodes connected via UPI (~50 GB/s)
-    {
-        .name = "NodeTP_2xMPI_CPU",
-        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU},
-        .parallelism = Parallelism::NodeTP,
-        .collective = Collective::MPI,
-        .thresholds = {
-            .cosine_threshold = 0.99f,
-            .decode_cosine_threshold = 0.98f,
-            .early_layers_count = 4,
-            .min_early_layers_passed = 3,
-            .kl_threshold = 0.008f, // Observed: 0.002 prefill KL (was 0.20 = 128x over-relaxed)
-            .excluded_stages = kNodeTPExcludedStages,
-        },
-        .mpi_ranks = 2,
-    },
-
-    // 4-way Node-Local TP with CPU (for larger models, if 4 NUMA nodes available)
-    {
-        .name = "NodeTP_4xMPI_CPU",
-        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU, ParityDeviceType::CPU, ParityDeviceType::CPU},
-        .parallelism = Parallelism::NodeTP,
-        .collective = Collective::MPI,
-        .thresholds = {
-            .cosine_threshold = 0.98f,
-            .decode_cosine_threshold = 0.95f,
-            .early_layers_count = 4,
-            .min_early_layers_passed = 3,
-            .kl_threshold = 0.30f, // More variance with 4-way sharding
-            .excluded_stages = kNodeTPExcludedStages,
-        },
-        .mpi_ranks = 4,
-    },
-};
+/** @return Canonically expanded two-rank CPU NodeTP case. */
+static const std::vector<ModelParityCase> &qwen2NodeTPCases()
+{
+    static const auto cases = expandModelParityDefinition(
+        qwen2Q40ParityDefinition(
+            ModelParityTopologyDefinition{
+                .test_id = "NodeTP_2xMPI_CPU",
+                .kind = ModelParityTopologyKind::NodeTensorParallel,
+                .participants = {
+                    {GlobalDeviceAddress::cpu(0), 0},
+                    {GlobalDeviceAddress::cpu(1), 1},
+                },
+                .collective = Collective::MPI,
+                .mpi_ranks = 2,
+            },
+            BackendThresholds{
+                .cosine_threshold = 0.99f,
+                .decode_cosine_threshold = 0.98f,
+                .early_layers_count = 4,
+                .min_early_layers_passed = 3,
+                .kl_threshold = 0.008f,
+                .excluded_stages = kNodeTPExcludedStages,
+            }));
+    return cases;
+}
 
 // =============================================================================
 // Parameterized Test Fixture
@@ -112,11 +88,8 @@ static const std::vector<TestConfig> kNodeTPTestConfigs = {
  * including MPI context creation and NodeTP context initialization.
  */
 class Qwen2NodeTPParityTest : public ConfigDrivenParityTest<Qwen2NodeTPParityTest>,
-                                   public ::testing::WithParamInterface<TestConfig>
-{
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
-};
+                               public ModelParityCaseParameter
+{};
 
 // =============================================================================
 // Test Cases
@@ -259,10 +232,10 @@ TEST_P(Qwen2NodeTPParityTest, ProductionParity)
 INSTANTIATE_TEST_SUITE_P(
     Qwen2NodeTP,
     Qwen2NodeTPParityTest,
-    ::testing::ValuesIn(kNodeTPTestConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
+    ::testing::ValuesIn(qwen2NodeTPCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {
-        return info.param.name;
+        return info.param.testName();
     });
 
 // =============================================================================

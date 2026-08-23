@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
+#include <exception>
 
 // Forward declare the copy functions that are implemented in runtime-specific files
 namespace llaminar2
@@ -27,15 +28,15 @@ namespace llaminar2
 #ifdef HAVE_CUDA
         bool cudaCopyToHost(void *host_dst, const void *device_src, int device_ordinal, size_t bytes, void *stream);
         bool cudaCopyFromHost(void *device_dst, const void *host_src, int device_ordinal, size_t bytes, void *stream);
-        bool cudaHostRegisterBuffer(void *ptr, size_t size);
-        void cudaHostUnregisterBuffer(void *ptr);
+        bool cudaHostRegisterBuffer(void *ptr, size_t size, int device_ordinal);
+        bool cudaHostUnregisterBuffer(void *ptr, int device_ordinal);
 #endif
 
 #ifdef HAVE_ROCM
         bool hipCopyToHost(void *host_dst, const void *device_src, int device_ordinal, size_t bytes, void *stream);
         bool hipCopyFromHost(void *device_dst, const void *host_src, int device_ordinal, size_t bytes, void *stream);
-        bool hipHostRegisterBuffer(void *ptr, size_t size);
-        void hipHostUnregisterBuffer(void *ptr);
+        bool hipHostRegisterBuffer(void *ptr, size_t size, int device_ordinal);
+        bool hipHostUnregisterBuffer(void *ptr, int device_ordinal);
 #endif
 
     } // namespace host_backend_detail
@@ -54,6 +55,13 @@ namespace llaminar2
         LOG_DEBUG("HostBackend: Created");
     }
 
+    /**
+     * @brief Retire every runtime registration before freeing staging storage.
+     *
+     * CUDA and HIP retain page mappings independently of the C++ allocation.
+     * Freeing a buffer after an unregister failure lets a future allocation
+     * reuse pages still exposed to device DMA, so retirement failure is fatal.
+     */
     HostBackend::~HostBackend()
     {
         if (initialized_)
@@ -66,11 +74,25 @@ namespace llaminar2
         {
 #ifdef HAVE_CUDA
             if (staging_registered_cuda_)
-                host_backend_detail::cudaHostUnregisterBuffer(staging_buffer_);
+            {
+                if (!host_backend_detail::cudaHostUnregisterBuffer(
+                        staging_buffer_, cuda_device_.gpu_ordinal()))
+                {
+                    LOG_ERROR("HostBackend: failed to unregister CUDA staging buffer");
+                    std::terminate();
+                }
+            }
 #endif
 #ifdef HAVE_ROCM
             if (staging_registered_rocm_)
-                host_backend_detail::hipHostUnregisterBuffer(staging_buffer_);
+            {
+                if (!host_backend_detail::hipHostUnregisterBuffer(
+                        staging_buffer_, rocm_device_.gpu_ordinal()))
+                {
+                    LOG_ERROR("HostBackend: failed to unregister ROCm staging buffer");
+                    std::terminate();
+                }
+            }
 #endif
             std::free(staging_buffer_);
             staging_buffer_ = nullptr;
@@ -819,14 +841,24 @@ namespace llaminar2
 #ifdef HAVE_CUDA
             if (staging_registered_cuda_)
             {
-                host_backend_detail::cudaHostUnregisterBuffer(staging_buffer_);
+                if (!host_backend_detail::cudaHostUnregisterBuffer(
+                        staging_buffer_, cuda_device_.gpu_ordinal()))
+                {
+                    LOG_ERROR("HostBackend: failed to unregister superseded CUDA staging buffer");
+                    return false;
+                }
                 staging_registered_cuda_ = false;
             }
 #endif
 #ifdef HAVE_ROCM
             if (staging_registered_rocm_)
             {
-                host_backend_detail::hipHostUnregisterBuffer(staging_buffer_);
+                if (!host_backend_detail::hipHostUnregisterBuffer(
+                        staging_buffer_, rocm_device_.gpu_ordinal()))
+                {
+                    LOG_ERROR("HostBackend: failed to unregister superseded ROCm staging buffer");
+                    return false;
+                }
                 staging_registered_rocm_ = false;
             }
 #endif
@@ -851,7 +883,8 @@ namespace llaminar2
 #ifdef HAVE_CUDA
         if (has_cuda_)
         {
-            if (!host_backend_detail::cudaHostRegisterBuffer(staging_buffer_, alloc_size))
+            if (!host_backend_detail::cudaHostRegisterBuffer(
+                    staging_buffer_, alloc_size, cuda_device_.gpu_ordinal()))
             {
                 LOG_WARN("HostBackend: cudaHostRegister failed");
             }
@@ -864,7 +897,8 @@ namespace llaminar2
 #ifdef HAVE_ROCM
         if (has_rocm_)
         {
-            if (!host_backend_detail::hipHostRegisterBuffer(staging_buffer_, alloc_size))
+            if (!host_backend_detail::hipHostRegisterBuffer(
+                    staging_buffer_, alloc_size, rocm_device_.gpu_ordinal()))
             {
                 LOG_WARN("HostBackend: hipHostRegister failed");
             }

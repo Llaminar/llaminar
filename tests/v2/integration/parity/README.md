@@ -189,15 +189,19 @@ artifacts:
 - `decode_layers.csv`
 - `decode_stages.csv`
 
-MTP cells additionally write `mtp_sidecar_token_trace.csv`. Its committed
-verifier columns (`verifier_identity_transaction_count`,
+Every typed MTP cell additionally writes `mtp_transactions.csv`; specialized
+long-horizon campaigns may also write `mtp_sidecar_token_trace.csv`. Their
+committed verifier columns (`verifier_identity_transaction_count`,
 `verifier_identity_depth`, and `production_verifier_draft_tokens`) come from
 the device-owned identity published by the same fused response/state commit
 that advances the generation controller. They must agree with the transaction
-delta and selected depth for every speculative call; reusable proposal or
-verifier-input scratch is not admissible post-transaction evidence. A terminal
-absorbing call may retain the preceding committed identity while selecting
-depth zero, because it does not claim a new verifier transaction.
+delta and selected depth for every speculative call. The token vector also
+selects a branch-qualified Hugging Face sidecar oracle whenever quantized
+predictor argmax leaves the canonical HF branch; comparing that row with the
+unqualified tensor is invalid. Reusable proposal or verifier-input scratch is
+not admissible post-transaction evidence. A terminal absorbing call may retain
+the preceding committed identity while selecting depth zero, because it does
+not claim a new verifier transaction.
 
 Cross-rank pipeline cells first write rank-local diagnostic fragments, then
 merge them into the same canonical files. The merged result must contain every

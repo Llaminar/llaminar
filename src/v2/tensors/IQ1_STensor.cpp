@@ -232,6 +232,7 @@ namespace llaminar2
 
     IQ1_STensor::~IQ1_STensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
         // during implicit member destruction of large 3D MoE expert weight tensors.
         // See Q4_KTensor teardown investigation for details.

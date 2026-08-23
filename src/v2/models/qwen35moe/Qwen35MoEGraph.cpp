@@ -3301,6 +3301,15 @@ namespace llaminar2
                 planned_row_capacity);
         arena_config.d_model = config_.d_model;
         arena_config.routing_top_k = config_.moe.top_k;
+        if (device.is_cpu())
+        {
+            arena_config.cpu_grouped_scratch_storage =
+                MoELocalExpertSerialBufferArena::
+                    CPUGroupedScratchStoragePolicy::RetainSerialMaximum;
+            arena_config.num_experts = config_.moe.num_experts;
+            arena_config.expert_intermediate =
+                config_.moe.intermediate_size;
+        }
         arena_config.logical_participant_id = participant;
         arena_config.debug_name =
             "moe_overlay_serial_compact." + key;
@@ -6825,6 +6834,7 @@ namespace llaminar2
         };
         std::optional<DeferredOverlayCombinedPublication>
             deferred_overlay_combined_publication;
+        std::string captured_overlay_routed_unit_terminal;
 
         {
             auto makeExpertParams = [&](TensorBase *output,
@@ -6961,19 +6971,32 @@ namespace llaminar2
                     return placement_context + ": " + reason;
                 };
 
-                // Extract per-expert 2D views from 3D packed tensors (required)
-                if (!MoEExpertComputeStage::extractExpertViews(expert_params))
-                {
-                    LOG_ERROR("[Qwen35MoEGraph] Failed to extract expert views for layer " << layer_idx);
-                    return false;
-                }
-
                 // Set expert_registry for dynamic rebalancing registry updates
                 if (model_ctx_)
                 {
                     auto weight_mgr = model_ctx_->concreteWeightManager();
                     if (weight_mgr)
                         expert_params.expert_registry = &weight_mgr->expertGemmRegistry();
+                }
+
+                /*
+                 * A graph-native overlay owns participant-scoped prepared
+                 * engines. Its generic model-weight accessor is intentionally
+                 * not an expert-slice authority: on a rank that also owns a CPU
+                 * endpoint, the same canonical tensor name may denote that
+                 * endpoint's much smaller packed slice. Resolve the registry
+                 * first and make raw fallback structurally impossible.
+                 */
+                const bool registry_only_overlay =
+                    stage_device.is_gpu() && !registry_domain_name.empty();
+
+                // Standalone paths still derive their prepared engines from
+                // the exact raw parent bound to this graph device.
+                if (!registry_only_overlay &&
+                    !MoEExpertComputeStage::extractExpertViews(expert_params))
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] Failed to extract expert views for layer " << layer_idx);
+                    return false;
                 }
 
                 // CPU prepares engines inline. GPU graph construction must consume the
@@ -7059,6 +7082,19 @@ namespace llaminar2
                                                             << (domain_scoped ? " domain=" + registry_domain_name : std::string())
                                                             << " complete_layer=" << complete_layer
                                                             << " active_masked_expert=" << has_active_masked_expert);
+                    }
+
+                    if (registry_only_overlay)
+                    {
+                        expert_params.gate_exps = nullptr;
+                        expert_params.up_exps = nullptr;
+                        expert_params.down_exps = nullptr;
+                        expert_params.expert_gate_views.clear();
+                        expert_params.expert_up_views.clear();
+                        expert_params.expert_down_views.clear();
+                        expert_params.expert_weight_resolution_policy =
+                            MoEExpertWeightResolutionPolicy::
+                                PreparedRegistryOnly;
                     }
                 }
                 else
@@ -8319,8 +8355,17 @@ namespace llaminar2
                             buffers.idFor(BufferId::MOE_EXPERT_INDICES);
                         ticket_params.routing_weights_buffer_id =
                             buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS);
+                        /*
+                         * A decode graph always owns one activation row even
+                         * though sequence_lengths_device contains the growing
+                         * KV position.  Only a padded multi-row prefill bucket
+                         * needs that scalar to distinguish real prompt rows
+                         * from physical padding.
+                         */
                         ticket_params.active_row_count_device =
-                            batch_size == 1 ? sequence_lengths_device : nullptr;
+                            batch_size == 1 && total_tokens > 1
+                                ? sequence_lengths_device
+                                : nullptr;
                         ticket_params.layer_idx = layer_idx;
                         ticket_params.bucket_rows = total_tokens;
                         ticket_params.top_k = config_.moe.top_k;
@@ -8624,14 +8669,29 @@ namespace llaminar2
                          * lifecycle explicitly so replay policy cannot infer it
                          * from mutable placement masks or broad topology flags.
                          */
-                        graph.setNativeCaptureEnvelope(
-                            !sparse_graph_contract
-                                 .ownsDispatchAuthority() ||
-                                    mapped_activation_local_participants.empty()
-                                ? GraphNativeCaptureEnvelope::
-                                      DeviceOwnedTimelineTransaction
-                                : GraphNativeCaptureEnvelope::
-                                      HeterogeneousTicketTransaction);
+                        if (mapped_activation_local_participants.empty())
+                        {
+                            graph.setNativeCaptureEnvelope(
+                                GraphNativeCaptureEnvelope::
+                                    DeviceOwnedTimelineTransaction);
+                        }
+                        else
+                        {
+                            /*
+                             * The CPU ticket cuts the continuation domain's
+                             * native timeline, not just the logical root's
+                             * graph. The root owns the manual ticket boundary;
+                             * every LocalTP sibling follows the same segmented
+                             * wave schedule without executing host work.
+                             */
+                            graph.setNativeCaptureEnvelope(
+                                sparse_graph_contract
+                                        .ownsDispatchAuthority()
+                                    ? GraphNativeCaptureEnvelope::
+                                          HeterogeneousTicketAuthorityTransaction
+                                    : GraphNativeCaptureEnvelope::
+                                          HeterogeneousTicketFollowerTransaction);
+                        }
                         mapped_activation_dispatch_wave_identities.reserve(
                             mapped_activation_remote_participants.size());
                         mapped_activation_return_wave_identities.reserve(
@@ -9881,6 +9941,14 @@ namespace llaminar2
                                     sparse_dispatch_params.routing_weights_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS);
                                 }
                                 sparse_dispatch_params.dispatch_output_lifetime = dispatch_output_lifetime;
+                                if (dispatch_ticket_storage)
+                                {
+                                    sparse_dispatch_params
+                                        .ticket_observation_role =
+                                        MoESparseDispatchStage::
+                                            TicketObservationRole::
+                                                MaterializedHostDispatch;
+                                }
                             }
 
                             const std::string sparse_dispatch_name = prefix + "moe_sparse_dispatch_" +
@@ -10664,22 +10732,6 @@ namespace llaminar2
                         mapped_activation_return_nodes.back();
                     first_return_scatter = false;
 
-                    if (!rank_local_ticket_return_terminal.empty())
-                    {
-                        /*
-                         * Keep the complete mapped fork/local-compute/join
-                         * transaction in the captured producer unit. The
-                         * following CPU dispatch is ordered after that unit is
-                         * submitted, but its authenticated ticket fence waits
-                         * only for the early ticket publication event. CPU
-                         * sparse work therefore overlaps the already-launched
-                         * mapped GPU transaction without trying to import a
-                         * capture-scoped lane event into a second executable.
-                         */
-                        graph.addDependency(
-                            dispatch_name,
-                            last_return_reduce);
-                    }
                 }
 
                 if (last_return_reduce.empty() &&
@@ -11125,6 +11177,8 @@ namespace llaminar2
                     graph.addDependency(
                         ordered_reduce_name,
                         ordered_reduce_dependency);
+                    captured_overlay_routed_unit_terminal =
+                        ordered_reduce_name;
                     GraphCaptureWaveContract ordered_reduce_capture_wave{
                         .identity =
                             captured_overlay_outbound_wave,
@@ -11145,6 +11199,43 @@ namespace llaminar2
                     graph.setGraphCaptureWaveContract(
                         ordered_reduce_name,
                         std::move(ordered_reduce_capture_wave));
+                    if (requiresHeterogeneousTicketSegmentation(
+                            graph.nativeCaptureEnvelope()))
+                    {
+                        /*
+                         * Close exactly one symmetric captured GPU unit on the
+                         * common ordered reduction.  The continuation root may
+                         * also own a colocated CPU ticket, but that manual work
+                         * cannot split the matching NCCL/RCCL operation across
+                         * two capture units: doing so leaves the root waiting
+                         * inside the first executable while its peer waits for
+                         * the next capture rendezvous.  The exact ticket
+                         * publication edge, rather than another unit boundary,
+                         * is what permits CPU work to overlap this GPU tail.
+                         */
+                        graph.setHeterogeneousTicketUnitContract(
+                            ordered_reduce_name,
+                            GraphHeterogeneousTicketUnitContract{
+                                .identity =
+                                    prefix +
+                                    "moe_overlay_ordered_reduce_unit",
+                            });
+
+                        if (!rank_local_ticket_return_terminal.empty())
+                        {
+                            /*
+                             * Declaratively place the root's host ticket unit
+                             * after the same captured terminal used by every
+                             * continuation participant.  This is submission
+                             * order only; the ticket consumer observes its
+                             * earlier exact publication edge and need not wait
+                             * for unrelated work at this terminal.
+                             */
+                            graph.addDependency(
+                                dispatch_name,
+                                ordered_reduce_name);
+                        }
+                    }
                     if (sparse_graph_contract.ownsDispatchAuthority())
                     {
                         /*
@@ -11361,6 +11452,45 @@ namespace llaminar2
                     graph.addDependency(
                         ordered_reduce_name,
                         ordered_reduce_dependency);
+
+                    captured_overlay_routed_unit_terminal =
+                        ordered_reduce_name;
+                    if (requiresHeterogeneousTicketSegmentation(
+                            graph.nativeCaptureEnvelope()))
+                    {
+                        /*
+                         * The single-device continuation has the same typed
+                         * lifecycle as a LocalTP continuation: finish every
+                         * mapped/local GPU route in one captured producer,
+                         * submit the colocated CPU ticket as one manual unit,
+                         * then capture the merge that consumes its returned
+                         * route slots.  Without this explicit cut, a valid DAG
+                         * order can interleave the four host-side ticket stages
+                         * with independent GPU work and accidentally create
+                         * four inferred segments instead of one transaction.
+                         */
+                        graph.setHeterogeneousTicketUnitContract(
+                            ordered_reduce_name,
+                            GraphHeterogeneousTicketUnitContract{
+                                .identity =
+                                    prefix +
+                                    "moe_overlay_ordered_reduce_unit",
+                            });
+
+                        if (!rank_local_ticket_return_terminal.empty())
+                        {
+                            /*
+                             * This is a submission-order edge, not a data
+                             * dependency on the ticket publication itself.
+                             * The host consumer reads the earlier authenticated
+                             * publication record while the captured producer's
+                             * remaining GPU work runs asynchronously.
+                             */
+                            graph.addDependency(
+                                dispatch_name,
+                                ordered_reduce_name);
+                        }
+                    }
 
                     std::string publication_dependency =
                         ordered_reduce_name;
@@ -12260,6 +12390,23 @@ namespace llaminar2
                 {
                     graph.addNode(ar_name, std::move(allreduce_stage), shared_device);
                     graph.addDependency(ar_name, prefix + "shared_expert_ffn");
+                    if (rooted_overlay_shared_reduction &&
+                        !captured_overlay_routed_unit_terminal.empty())
+                    {
+                        /*
+                         * The routed and shared branches remain independent
+                         * until this final join. Their rooted collectives must
+                         * nevertheless inhabit the same captured unit on every
+                         * LocalTP participant. Without this edge, a valid
+                         * topological sort can place the shared reduction after
+                         * the ticket cut on one sibling and before it on the
+                         * other, producing a cold-capture rendezvous cycle even
+                         * though steady replay happens to queue both graphs.
+                         */
+                        graph.addDependency(
+                            captured_overlay_routed_unit_terminal,
+                            ar_name);
+                    }
                     if (current_batch_llep_plan_params.has_value())
                     {
                         if (current_batch_llep_plan_node.empty() ||

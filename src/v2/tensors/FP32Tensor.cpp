@@ -142,6 +142,7 @@ namespace llaminar2
 
     FP32Tensor::~FP32Tensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // Mapped memory cleanup is handled by TensorBase destructor
         // Nothing tensor-specific to clean up here
     }

@@ -473,7 +473,7 @@ namespace llaminar2
         // Prefix Cache and MTP
         // =========================================================================
 
-        PrefixCacheRuntimeConfig prefix_cache; ///< Disabled-by-default prefix-state cache settings
+        PrefixCacheRuntimeConfig prefix_cache; ///< Enabled bounded tiered prefix-state cache settings
         MTPRuntimeConfig mtp;                  ///< Disabled-by-default multi-token prediction settings
 
         // =========================================================================

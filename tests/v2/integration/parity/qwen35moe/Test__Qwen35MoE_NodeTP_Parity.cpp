@@ -7,7 +7,7 @@
  *
  * ExpertOverlay strategy for MoE:
  *   - One homogeneous CPU tier spans both NUMA participants and remains the
- *     sole authority for Static, Dynamic, and current-batch LLEP execution.
+ *     sole authority for Static and Dynamic execution.
  *   - Sparse routed rows return to one logical continuation root, which
  *     broadcasts the complete active output before dense execution resumes.
  *   - Attention and shared-expert row-parallel outputs use the ordinary
@@ -30,6 +30,7 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
+#include "Qwen35MoEModelParityDefinitions.h"
 #include "Qwen35MoEParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -94,13 +95,6 @@ static const std::vector<std::string> kNodeTPMoECollectiveStages = {
 
 namespace
 {
-    enum class CPUExpertPolicyScenario
-    {
-        StaticOwnership,
-        DynamicResidencyMaintenance,
-        CurrentBatchLLEP,
-    };
-
     BackendThresholds nodeTPMoEThresholds()
     {
         return {
@@ -117,218 +111,16 @@ namespace
         };
     }
 
-    /**
-     * @brief Build the one-tier CPU NodeTP ExpertOverlay authority.
-     *
-     * The typed participants express CPU NUMA intent while production hardware
-     * binding chooses their MPI owners. No rank or socket is privileged by the
-     * fixture. Static-owner prefill is used by durable Dynamic maintenance;
-     * least-loaded-resident prefill selects the graph-owned current-batch LLEP
-     * transaction without changing the dense NodeTP continuation graph.
-     */
-    std::shared_ptr<MoERoutedExpertPlacementPlan> cpuNodeTPExpertPlan(
-        RoutedExpertOwnerOrder owner_order,
-        RoutedExpertAssignmentPolicy prefill_assignment_policy)
+    /** @return Canonical Static/Dynamic x Ordinal/Random CPU NodeTP cells. */
+    const std::vector<ModelParityCase> &nodeTPMoECases()
     {
-        constexpr const char *kDomain = "cpu_node_tp";
-
-        RoutedExpertDomain routed_domain;
-        routed_domain.name = kDomain;
-        routed_domain.scope = ExecutionDomainScope::NODE_LOCAL;
-        routed_domain.backend = CollectiveBackendType::MPI;
-        routed_domain.participants = {
-            GlobalDeviceAddress::cpu(0),
-            GlobalDeviceAddress::cpu(1),
-        };
-        routed_domain.routed_compute_policy =
-            RoutedExpertComputePolicy::Apportioned;
-        routed_domain.routed_phase_policy =
-            RoutedExpertPhasePolicy::Uniform;
-        routed_domain.routed_decode_assignment_policy =
-            RoutedExpertAssignmentPolicy::StaticOwner;
-        routed_domain.routed_prefill_assignment_policy =
-            prefill_assignment_policy;
-
-        auto plan = std::make_shared<MoERoutedExpertPlacementPlan>();
-        plan->enabled = true;
-        plan->topology = RoutedExpertPlacementTopology::SingleDomain;
-        plan->continuation_domain = kDomain;
-        plan->base_model_domain = kDomain;
-        plan->shared_expert_domain = kDomain;
-        plan->continuation_domain_spec.domain = kDomain;
-        plan->continuation_domain_spec.logical_root_participant = 0;
-        plan->continuation_domain_spec.setDensePolicy(
-            DenseParallelPolicy::TensorParallel);
-        plan->continuation_domain_spec.hidden_layout =
-            MoEContinuationActivationLayout::ReplicatedHidden;
-        plan->residency_policy = RoutedExpertResidencyPolicy::StaticById;
-        plan->owner_order = owner_order;
-        plan->dense_domains = {
-            routed_domain.toExecutionDomainDefinition(),
-        };
-        plan->domains = {routed_domain};
-        plan->routed_tiers = {{
-            .name = "all_routed_experts",
-            .domain = kDomain,
-            .priority = 0,
-            .max_experts_per_layer = 0,
-            .memory_budget_bytes = 0,
-            .fallback = true,
-        }};
-
-        const auto validation = validateMoERoutedExpertPlacementPlan(*plan);
-        if (!validation.ok())
-        {
-            std::string error =
-                "invalid CPU NodeTP routed-expert parity plan";
-            for (const auto &entry : validation.errors)
-                error += "\n - " + entry;
-            throw std::logic_error(error);
-        }
-        return plan;
+        static const auto cases = expandModelParityDefinition(
+            qwen35MoEParityDefinition(
+                qwen35MoE35BQ4KXLParityModel(),
+                qwen35MoECPU2NodeTPTopology(),
+                nodeTPMoEThresholds()));
+        return cases;
     }
-
-    TestConfig nodeTPMoEConfig(
-        CPUExpertPolicyScenario scenario,
-        RoutedExpertOwnerOrder owner_order)
-    {
-        const std::string policy_name =
-            scenario == CPUExpertPolicyScenario::StaticOwnership
-                ? "Static"
-                : scenario ==
-                          CPUExpertPolicyScenario::DynamicResidencyMaintenance
-                      ? "DynamicMaintenance"
-                      : "CurrentBatchLLEP";
-        const std::string order_name =
-            owner_order == RoutedExpertOwnerOrder::Ordinal
-                ? "OrdinalOwners"
-                : "RandomOwners";
-
-        TestConfig config;
-        config.name = "NodeTP_2xMPI_CPU_35B_MoE_" + policy_name +
-                      "_" + order_name + "_FP32_FP16KV";
-        config.devices = {
-            ParityDeviceType::CPU,
-            ParityDeviceType::CPU,
-        };
-        config.parallelism = Parallelism::NodeTP;
-        config.collective = Collective::MPI;
-        config.thresholds = nodeTPMoEThresholds();
-        config.collective_evidence_source =
-            ParityCollectiveEvidenceSource::PostCollectiveSnapshot;
-        config.mpi_ranks = 2;
-        config.model_path =
-            "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf";
-        config.snapshot_dir = "pytorch_qwen35_moe_snapshots";
-        config.activation_precision = ActivationPrecision::FP32;
-        config.kv_cache_precision = KVCachePrecision::FP16;
-        /*
-         * Three decode observations include the terminal-prefill sample and
-         * real incremental forwards. Movement policies use a one-row
-         * production window below, so five repeated full-model CPU forwards
-         * add runtime without adding a distinct correctness boundary.
-         */
-        config.decode_steps = 3;
-        config.routed_expert_compute_policy =
-            RoutedExpertComputePolicy::Apportioned;
-        config.routed_expert_owner_order = owner_order;
-        config.moe_rebalance.mode =
-            scenario ==
-                    CPUExpertPolicyScenario::DynamicResidencyMaintenance
-                ? MoERebalanceRuntimeMode::Dynamic
-                : MoERebalanceRuntimeMode::Off;
-        config.moe_rebalance.release_raw_expert_weights = false;
-        config.moe_routed_expert_plan = cpuNodeTPExpertPlan(
-            owner_order,
-            scenario == CPUExpertPolicyScenario::CurrentBatchLLEP
-                ? RoutedExpertAssignmentPolicy::LeastLoadedResident
-                : RoutedExpertAssignmentPolicy::StaticOwner);
-
-        if (scenario ==
-            CPUExpertPolicyScenario::DynamicResidencyMaintenance)
-        {
-            config.moe_rebalance.window_size = 1;
-            config.moe_rebalance.max_window_size = 1;
-            config.moe_rebalance.window_growth_factor = 1.0f;
-            /*
-             * A max/min load ratio cannot be below 1.0.  Use the most
-             * aggressive coherent trigger so this proof cell proposes every
-             * strictly imbalanced same-priority layout without bypassing the
-             * production policy validator.
-             */
-            config.moe_rebalance.dynamic_imbalance_threshold_per_mille = 1000;
-            config.moe_rebalance.dynamic_min_improvement_per_mille = 0;
-            config.moe_rebalance.dynamic_max_swaps_per_layer = 20;
-            config.moe_rebalance.dynamic_max_plan_entries_per_wave = 20;
-            config.moe_rebalance.dynamic_min_window_activations = 0;
-            /*
-             * This is a persistent model-server residency proof, not a
-             * short-lived batch. A complete cross-socket pair-swap wave costs
-             * tens of milliseconds on this topology, so the ordinary
-             * 2k-token default correctly rejects the first stationary windows.
-             * Declare the same 64k routed-token lifetime used by heterogeneous
-             * convergence campaigns: the production economy gate remains
-             * authoritative and must still prove positive net benefit from its
-             * measured profiles. No fixture constant substitutes for the live
-             * transfer and interference certificate.
-             */
-            config.moe_rebalance.migration_payoff_horizon_tokens = 65'536;
-            config.moe_rebalance_exercise = {
-                .enabled = true,
-                .require_production_overlay_authority = true,
-                .request_after_prefill = false,
-                .request_every_decode_steps = 1,
-                .min_decode_steps = 2,
-                /*
-                 * This fixture completes production economy certification and
-                 * a committed migration before collecting parity checkpoints.
-                 * The generic three-token parity epilogue must not demand a
-                 * second, unrelated residency epoch; the policy-specific
-                 * PerfStats gate below proves the already-completed movement.
-                 */
-                .require_movement_epoch_advance = false,
-                .min_movement_epoch_delta = 1,
-            };
-        }
-
-        if (scenario == CPUExpertPolicyScenario::CurrentBatchLLEP)
-        {
-            config.moe_routed_prefill =
-                RoutedExpertPrefillRuntimeConfig{
-                    .assignment_window_tokens = 0,
-                    .least_loaded_min_routed_rows = 0,
-                    .llep_alpha_numerator = 9,
-                    .llep_alpha_denominator = 10,
-                    .llep_lambda_numerator = 13,
-                    .llep_lambda_denominator = 10,
-                    .llep_enable_balanced_skip = false,
-            };
-        }
-        return config;
-    }
-
-    std::vector<TestConfig> makeNodeTPMoEConfigs()
-    {
-        std::vector<TestConfig> configs;
-        for (const auto owner_order : {
-                 RoutedExpertOwnerOrder::Ordinal,
-                 RoutedExpertOwnerOrder::Random})
-        {
-            configs.push_back(nodeTPMoEConfig(
-                CPUExpertPolicyScenario::StaticOwnership,
-                owner_order));
-            configs.push_back(nodeTPMoEConfig(
-                CPUExpertPolicyScenario::DynamicResidencyMaintenance,
-                owner_order));
-            configs.push_back(nodeTPMoEConfig(
-                CPUExpertPolicyScenario::CurrentBatchLLEP,
-                owner_order));
-        }
-        return configs;
-    }
-
-    const std::vector<TestConfig> kNodeTPMoETestConfigs =
-        makeNodeTPMoEConfigs();
 
     double perfCounterTotal(
         const std::vector<PerfStatRecord> &records,
@@ -388,12 +180,10 @@ namespace
 // Parameterized Test Fixture
 // =============================================================================
 
-class Qwen35MoENodeTPParityTest : public Qwen35MoEConfigDrivenParityTest<Qwen35MoENodeTPParityTest>,
-                                       public ::testing::WithParamInterface<TestConfig>
+class Qwen35MoENodeTPParityTest
+    : public Qwen35MoEConfigDrivenParityTest<Qwen35MoENodeTPParityTest>,
+      public ModelParityCaseParameter
 {
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
-
 protected:
     void SetUp() override
     {
@@ -524,13 +314,15 @@ protected:
 
         const auto routing_corpus_prompt = [&](int request_index)
         {
-            if (request_index == 0)
-                return reference_prompt;
-
             /*
              * These are deterministic valid embedding rows, not injected
              * routing data. Broad ordinary traffic ensures both CPU
              * participants naturally publish service samples for every layer.
+             * The first token is a request-unique sentinel which is guaranteed
+             * to differ from the authenticated parity prompt. Prefix caching
+             * may therefore remain enabled exactly as it is in production,
+             * while service observation cannot contaminate the later
+             * mandatory fresh-prefix proof even with one-token cache blocks.
              */
             std::uint64_t state =
                 0x9e3779b97f4a7c15ULL ^
@@ -551,8 +343,27 @@ protected:
                 token = static_cast<int32_t>(
                     256u + mixed % usable_vocabulary);
             }
+
+            const auto sentinel_offset =
+                static_cast<std::uint64_t>(request_index) %
+                usable_vocabulary;
+            prompt.front() = static_cast<int32_t>(256u + sentinel_offset);
+            if (prompt.front() == reference_prompt.front())
+            {
+                prompt.front() = static_cast<int32_t>(
+                    256u + (sentinel_offset + 1u) % usable_vocabulary);
+            }
             return prompt;
         };
+
+        /*
+         * Use one corpus member not consumed by the broad certification pass
+         * as the stable post-certification population. Repeating it proves
+         * movement is histogram-driven without ever caching the mathematical
+         * oracle's request prefix.
+         */
+        const std::vector<int32_t> stationary_prompt =
+            routing_corpus_prompt(kMaximumServiceProfileRequests + 1);
 
         const auto wake_maintenance = [&](const char *phase,
                                           uint64_t committed_tokens)
@@ -643,7 +454,7 @@ protected:
              request < kMaximumHistogramRequests;
              ++request)
         {
-            if (!run_prefill(reference_prompt))
+            if (!run_prefill(stationary_prompt))
                 return false;
             for (int step = 0;
                  step < kDecodeStepsPerRequest;
@@ -686,43 +497,14 @@ protected:
      * All ranks execute the identical reduction sequence. Static must publish
      * an explicit no-movement check and no migration edge. Dynamic must commit
      * a same-priority participant migration and transfer real packed bytes.
-     * LLEP remains a current-batch transaction and must move a non-owner expert
-     * before restoring the durable owner map.
      */
     void assertPolicyMovementEvidenceAfterWorkerShutdown()
     {
         const auto records = PerfStatsCollector::snapshot(
             {"moe_rebalance", "moe_placement", "moe_overlay_residency"});
-        const bool current_batch_llep =
-            cfg().moe_routed_expert_plan &&
-            std::any_of(
-                cfg().moe_routed_expert_plan->domains.begin(),
-                cfg().moe_routed_expert_plan->domains.end(),
-                [](const RoutedExpertDomain &domain)
-                {
-                    return domain.routed_prefill_assignment_policy ==
-                           RoutedExpertAssignmentPolicy::LeastLoadedResident;
-                });
         const bool dynamic_maintenance =
             cfg().moe_rebalance.mode ==
             MoERebalanceRuntimeMode::Dynamic;
-
-        const double llep_begin = globalPerfCounterTotal(
-            records, "moe_rebalance", "cpu_llep_plan_calls");
-        const double llep_restore = globalPerfCounterTotal(
-            records, "moe_rebalance", "cpu_llep_restore_calls");
-        const double llep_transfers = globalPerfCounterTotal(
-            records, "moe_rebalance", "cpu_llep_weight_transfers");
-        const double llep_bytes = globalPerfCounterTotal(
-                                      records,
-                                      "moe_rebalance",
-                                      "cpu_llep_weight_transfer_outgoing_bytes") +
-                                  globalPerfCounterTotal(
-                                      records,
-                                      "moe_rebalance",
-                                      "cpu_llep_weight_transfer_incoming_bytes");
-        const double llep_non_owner_rows = globalPerfCounterTotal(
-            records, "moe_rebalance", "cpu_llep_non_owner_rows");
 
         const double static_checks = globalPerfCounterTotal(
             records,
@@ -789,27 +571,6 @@ protected:
 
         if (isRootParityRank())
         {
-            if (current_batch_llep)
-            {
-                EXPECT_GT(llep_begin, 0.0)
-                    << "CPU LLEP parity did not execute the production begin stage";
-                EXPECT_EQ(llep_restore, llep_begin)
-                    << "Every CPU LLEP transaction must restore durable residency";
-                EXPECT_GT(llep_transfers, 0.0)
-                    << "Movement-positive CPU LLEP parity moved no packed expert";
-                EXPECT_GT(llep_bytes, 0.0)
-                    << "Movement-positive CPU LLEP parity transferred no bytes";
-                EXPECT_GT(llep_non_owner_rows, 0.0)
-                    << "Movement-positive CPU LLEP parity assigned no non-owner rows";
-                EXPECT_EQ(committed_migrations, 0.0)
-                    << "Current-batch LLEP must not mutate durable residency";
-            }
-            else
-            {
-                EXPECT_EQ(llep_begin, 0.0)
-                    << "Static/Dynamic cells must not silently enter LLEP";
-            }
-
             if (dynamic_maintenance)
             {
                 EXPECT_GT(transport_profile_complete, 0.0)
@@ -839,7 +600,7 @@ protected:
                 EXPECT_GT(published_epoch, 0.0)
                     << "Dynamic ExpertOverlay did not publish a later epoch";
             }
-            else if (!current_batch_llep)
+            else
             {
                 EXPECT_GT(static_checks, 0.0)
                     << "Static ExpertOverlay did not publish its immobility proof";
@@ -867,7 +628,7 @@ protected:
     void runExpertOverlayProductionParityCampaign()
     {
         beginProductionParityEvidence();
-        const bool setup_ok = setupPipeline();
+        const bool setup_ok = setupProductionParityPipeline();
         ASSERT_TRUE(synchronizeRanksOk(setup_ok))
             << "ExpertOverlay pipeline setup failed on one or more ranks";
         ASSERT_NE(orch_runner_, nullptr);
@@ -893,6 +654,12 @@ protected:
 
         try
         {
+            if (!orch_runner_->prepareForInference())
+            {
+                throw std::runtime_error(
+                    "production inference readiness failed: " +
+                    orch_runner_->lastError());
+            }
             if (!driveDynamicEconomyAndMovement())
             {
                 throw std::runtime_error(
@@ -900,7 +667,10 @@ protected:
             }
 
             /*
-             * Calibration traffic is deliberately not reference evidence.
+             * Ordinary service-evidence traffic is deliberately not reference
+             * evidence. Production readiness has already completed the bounded
+             * topology profile; these requests only exercise the public serving
+             * surface until the background authority has enough live timings.
              * Reset request data and diagnostic buffers, retain the migrated
              * residency epoch, then compare the complete production graph at
              * every authenticated checkpoint after movement.
@@ -910,6 +680,24 @@ protected:
 
             const auto prefill = runPrefillParity();
             assertParity(prefill);
+            const PrefixRuntimeStateSnapshot fresh_prefix_state =
+                activePrefixStateProbe();
+            assertFreshPrefixRestoreSeed(
+                fresh_prefix_state,
+                prefill.overall_passed,
+                prefill.lm_head_cosine);
+
+            if (config_.moe_rebalance_exercise.request_after_prefill)
+            {
+                if (!driveParityMoERebalanceMaintenance(
+                        "prefill",
+                        static_cast<std::uint64_t>(
+                            config_.token_ids.size())))
+                {
+                    throw std::runtime_error(
+                        "production ExpertOverlay rejected post-prefill maintenance");
+                }
+            }
             assertProductionParitySnapshotInfrastructure();
 
             // This is a request-data reset. The ExpertOverlay authority,
@@ -918,7 +706,8 @@ protected:
             activeClearSnapshots();
             activeClearCache();
 
-            const auto decode = runDecodeParity();
+            const auto decode = runDecodeParity(
+                ParityDecodePrefillMode::CompletePrefixRestore);
             if (decode.steps_total == 0)
             {
                 ADD_FAILURE()
@@ -928,6 +717,11 @@ protected:
             {
                 assertDecodeParity(decode);
             }
+            assertFullPrefixRestore(
+                fresh_prefix_state,
+                decode.overall_passed,
+                decode.avg_cosine);
+            assertPartialPrefixRestore();
         }
         catch (const std::exception &error)
         {
@@ -952,49 +746,6 @@ protected:
 // =============================================================================
 
 /**
- * @brief Verify NodeTP infrastructure initialization for MoE
- */
-TEST_P(Qwen35MoENodeTPParityTest, NodeTPContextInitialization)
-{
-    ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-
-    ASSERT_NE(mpi_ctx_, nullptr) << "MPI context should be initialized";
-    EXPECT_GE(mpi_ctx_->world_size(), cfg().mpi_ranks)
-        << "World size should be at least " << cfg().mpi_ranks;
-
-    if (hasOrchestrationRunner())
-    {
-        ASSERT_NE(orch_runner_, nullptr);
-        const auto &plan = orch_runner_->executionPlan();
-        EXPECT_TRUE(plan.usesGlobalTP());
-        EXPECT_EQ(plan.tp_scope, TPScope::NODE_LOCAL);
-        EXPECT_EQ(plan.global_tp_domain_size, mpi_ctx_->world_size());
-        EXPECT_EQ(plan.global_tp_rank_in_domain, mpi_ctx_->rank());
-        EXPECT_TRUE(plan.primary_device.isCPU());
-        EXPECT_EQ(plan.primary_device.numa_node, mpi_ctx_->rank());
-        EXPECT_TRUE(plan.hasResolvedPrimaryDeviceNuma());
-        EXPECT_EQ(
-            plan.runtime.activation_precision,
-            cfg().activation_precision);
-        EXPECT_EQ(
-            plan.runtime.kv_cache_precision,
-            cfg().kv_cache_precision)
-            << "The production execution plan must consume the precision named by the parity cell";
-    }
-    else
-    {
-        ASSERT_NE(global_tp_ctx_, nullptr)
-            << "NodeTP context should be created";
-        EXPECT_EQ(global_tp_ctx_->degree(), mpi_ctx_->world_size())
-            << "TP degree should match world size";
-        EXPECT_EQ(global_tp_ctx_->myIndex(), mpi_ctx_->rank())
-            << "TP index should match MPI rank";
-    }
-
-    LOG_INFO("[NodeTP Qwen3.5 MoE] Rank " << mpi_ctx_->rank() << " verified TPContext");
-}
-
-/**
  * @brief Full real-weight production parity for cross-rank MoE tensor parallelism.
  */
 TEST_P(Qwen35MoENodeTPParityTest, ProductionParity)
@@ -1009,10 +760,10 @@ TEST_P(Qwen35MoENodeTPParityTest, ProductionParity)
 INSTANTIATE_TEST_SUITE_P(
     Qwen35MoENodeTP,
     Qwen35MoENodeTPParityTest,
-    ::testing::ValuesIn(kNodeTPMoETestConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
+    ::testing::ValuesIn(nodeTPMoECases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {
-        return info.param.name;
+        return info.param.testName();
     });
 
 // =============================================================================

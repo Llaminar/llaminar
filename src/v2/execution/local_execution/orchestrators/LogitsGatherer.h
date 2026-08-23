@@ -221,7 +221,7 @@ namespace llaminar2
         size_t vocab_size_ = 0;
         BackendResolver backend_resolver_ = nullptr; ///< Optional test hook for backend selection.
         bool pinned_ = false;
-        DeviceType pinned_device_type_ = DeviceType::CPU; ///< Backend type used for pinning (for correct unpin)
+        DeviceId pinned_device_ = DeviceId::invalid(); ///< Exact backend/device registration owner.
         bool skip_decode_ = false;
         bool skip_prefill_ = false;
         size_t last_gathered_size_ = 0;

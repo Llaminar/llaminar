@@ -23,6 +23,7 @@
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <stdexcept>
 #include <sstream>
 #include <cstring>
@@ -362,7 +363,14 @@ namespace llaminar2
                 if (valid_)
                 {
                     // Restore the HIP device and synchronize HipDeviceGuard tracking
-                    HipDeviceGuard::forceSetDevice(saved_device_);
+                    if (static_cast<hipError_t>(
+                            HipDeviceGuard::forceSetDevice(saved_device_)) !=
+                        hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmBackend] Could not restore owning HIP device "
+                                  << saved_device_);
+                        std::terminate();
+                    }
                 }
             }
 
@@ -536,25 +544,43 @@ namespace llaminar2
         return completed;
     }
 
-    bool ROCmBackend::pinHostMemory(void *ptr, size_t bytes)
+    bool ROCmBackend::pinHostMemory(void *ptr, size_t bytes, int device_id)
     {
+        HipDeviceSaveRestore device_guard;
+        if (!ptr || bytes == 0 || device_id < 0 || device_id >= device_count_ ||
+            static_cast<hipError_t>(HipDeviceGuard::forceSetDevice(device_id)) != hipSuccess)
+        {
+            LOG_WARN("[ROCmBackend::pinHostMemory] invalid registration for ROCm:"
+                     << device_id << " ptr=" << ptr << " bytes=" << bytes);
+            return false;
+        }
         hipError_t err = hipHostRegister(ptr, bytes, hipHostRegisterDefault);
         if (err != hipSuccess)
         {
             LOG_WARN("[ROCmBackend::pinHostMemory] hipHostRegister failed for "
-                     << bytes << " bytes: " << hipGetErrorString(err));
+                     << bytes << " bytes on ROCm:" << device_id << ": "
+                     << hipGetErrorString(err));
             return false;
         }
         return true;
     }
 
-    bool ROCmBackend::unpinHostMemory(void *ptr)
+    bool ROCmBackend::unpinHostMemory(void *ptr, int device_id)
     {
+        HipDeviceSaveRestore device_guard;
+        if (!ptr || device_id < 0 || device_id >= device_count_ ||
+            static_cast<hipError_t>(HipDeviceGuard::forceSetDevice(device_id)) != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::unpinHostMemory] invalid retirement for ROCm:"
+                      << device_id << " ptr=" << ptr);
+            return false;
+        }
         hipError_t err = hipHostUnregister(ptr);
         if (err != hipSuccess)
         {
             LOG_WARN("[ROCmBackend::unpinHostMemory] hipHostUnregister failed: "
-                     << hipGetErrorString(err));
+                     << hipGetErrorString(err) << " owner=ROCm:" << device_id
+                     << " ptr=" << ptr);
             return false;
         }
         return true;

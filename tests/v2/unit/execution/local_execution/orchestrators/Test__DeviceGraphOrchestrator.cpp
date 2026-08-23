@@ -1827,16 +1827,29 @@ TEST_F(Test__DeviceGraphOrchestrator, ReplicatedDenseVerifierUsesFullAllPosition
     EXPECT_EQ(predicate_body.find("config.tp_ctx->degree() > 1"), std::string::npos)
         << "Degree-based local shard advertisement reintroduces the serial-logit mismatch.";
 
-    const auto forward_pos = source.find("const float *DeviceGraphOrchestrator::forwardImpl");
-    const auto model_buffers_pos = source.find("ModelBuffers model_buffers", forward_pos);
-    ASSERT_NE(forward_pos, std::string::npos);
-    ASSERT_NE(model_buffers_pos, std::string::npos);
-    const std::string forward_setup = source.substr(forward_pos, model_buffers_pos - forward_pos);
-    EXPECT_NE(forward_setup.find("allPositionVerifierGraphWritesLocalLogits(total_tokens)"),
-              std::string::npos);
-    EXPECT_NE(forward_setup.find("state_.all_position_logits_local.reset()"),
-              std::string::npos)
+    const auto binding_pos = source.find(
+        "bool DeviceGraphOrchestrator::bindAllPositionLogitsOutputs");
+    const auto release_pos = source.find(
+        "void DeviceGraphOrchestrator::releaseBuffers", binding_pos);
+    ASSERT_NE(binding_pos, std::string::npos);
+    ASSERT_NE(release_pos, std::string::npos);
+    const std::string binding_body =
+        source.substr(binding_pos, release_pos - binding_pos);
+    EXPECT_NE(
+        binding_body.find("allPositionVerifierGraphWritesLocalLogits("),
+        std::string::npos);
+    EXPECT_NE(
+        binding_body.find("state_.all_position_logits_local.reset()"),
+        std::string::npos)
         << "Replicated dense decode must clear stale local all-position logits before RankOrchestrator samples.";
+
+    const auto forward_pos = source.find(
+        "const float *DeviceGraphOrchestrator::forwardImpl");
+    ASSERT_NE(forward_pos, std::string::npos);
+    EXPECT_NE(
+        source.find("bindAllPositionLogitsOutputs(", forward_pos),
+        std::string::npos)
+        << "forwardImpl must enter the typed all-position output binder.";
 
     const auto has_local_pos = header.find("bool hasAllPositionLogitsLocal() const override");
     ASSERT_NE(has_local_pos, std::string::npos);
@@ -2784,7 +2797,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ForwardImplPublishesLogicalTokenOffsetAtRe
            "an ambiguous request boundary.";
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, TPPrefixFingerprintIsDomainLevelAcrossParticipants)
+TEST_F(Test__DeviceGraphOrchestrator, TPPrefixFingerprintNamesEachLogicalPayloadShard)
 {
     const auto tp = std::make_shared<TensorParallelConfig>(
         TensorParallelConfig::equalSplit(
@@ -2837,9 +2850,23 @@ TEST_F(Test__DeviceGraphOrchestrator, TPPrefixFingerprintIsDomainLevelAcrossPart
     ASSERT_TRUE(hit0.supported) << hit0.bypass_reason;
     ASSERT_TRUE(hit1.supported) << hit1.bypass_reason;
     ASSERT_NE(hit0.fingerprint_key, 0u);
-    EXPECT_EQ(hit0.fingerprint_key, hit1.fingerprint_key)
-        << "TP prefix participants must use one domain-level logical key; "
-           "local payload layout still guards shard compatibility.";
+    EXPECT_NE(hit0.fingerprint_key, hit1.fingerprint_key)
+        << "TP participants share lookup coordination but require distinct "
+           "durable keys so one KV/logit payload shard cannot overwrite another.";
+}
+
+TEST(InferenceStateResetRequest, ServingGraphSetupScrubsAllOwnersAndPreservesExecutables)
+{
+    const InferenceStateResetRequest request =
+        InferenceStateResetRequest::servingGraphSetupBoundary("unit-setup");
+
+    EXPECT_EQ(
+        request.boundary,
+        InferenceStateResetRequest::Boundary::ServingGraphSetup);
+    EXPECT_TRUE(request.resetsAllLiveRequestOwners());
+    EXPECT_TRUE(request.reset_model_runtime);
+    EXPECT_TRUE(request.preserve_replay_safe_graphs);
+    EXPECT_STREQ(request.reason, "unit-setup");
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochIsTrackedWithoutRekeyingPrefix)

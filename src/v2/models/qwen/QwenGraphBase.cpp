@@ -38,6 +38,7 @@
 #include <chrono>
 #include <chrono>
 #include <cstring>
+#include <numeric>
 #include <stdexcept>
 
 namespace llaminar2
@@ -1606,6 +1607,40 @@ namespace llaminar2
         return params.stage_name;
     }
 
+    void QwenGraphBase::sealInferenceTransactionGraph(
+        ComputeGraph &graph,
+        const std::string &terminal_node) const
+    {
+        if (!graph.getNode(terminal_node))
+        {
+            throw std::out_of_range(
+                "Cannot seal inference transaction at missing graph node '" +
+                terminal_node + "'");
+        }
+
+        graph.setTerminalNode(terminal_node);
+        if (!requiresHeterogeneousTicketSegmentation(
+                graph.nativeCaptureEnvelope()))
+        {
+            return;
+        }
+
+        /*
+         * Authority and follower suffixes may start at different local nodes
+         * after CPU work, but both finish this same logical transaction. The
+         * terminal disposition names the final captured unit without creating
+         * an empty successor segment.
+         */
+        graph.setHeterogeneousTicketUnitContract(
+            terminal_node,
+            GraphHeterogeneousTicketUnitContract{
+                .identity = "heterogeneous_ticket_transaction_terminal",
+                .disposition =
+                    GraphHeterogeneousTicketUnitDisposition::
+                        TransactionTerminal,
+            });
+    }
+
     std::string QwenGraphBase::maybeAddShiftedMTPPrefillTransaction(
         ComputeGraph &graph,
         const ForwardInput &input,
@@ -1617,18 +1652,28 @@ namespace llaminar2
 
         const auto &binding = *input.shifted_mtp_prefill;
         const int total_tokens = input.batch_size * input.seq_len;
+        const bool main_prefill =
+            input.execution_phase == ForwardExecutionPhase::Prefill &&
+            input.state_transaction == ForwardStateTransaction::Ordinary;
+        const bool restored_prefix_decode_bridge =
+            input.execution_phase == ForwardExecutionPhase::Decode &&
+            input.state_transaction ==
+                ForwardStateTransaction::RestoredPrefixMTPDecodeBridge &&
+            input.batch_size == 1 && input.seq_len == 1;
         if (!device.is_gpu() ||
-            input.execution_role != ForwardExecutionRole::MainInference ||
-            input.execution_phase != ForwardExecutionPhase::Prefill ||
+            (input.execution_role != ForwardExecutionRole::MainInference &&
+             !(restored_prefix_decode_bridge &&
+               input.execution_role ==
+                   ForwardExecutionRole::MTPCondition)) ||
+            (!main_prefill && !restored_prefix_decode_bridge) ||
             total_tokens <= 0 ||
             !binding.validForRequestCount(input.batch_size) ||
-            !input.sequence_lengths_device ||
             config_.mtp_shifted_prefill_hidden_publication !=
                 MTPShiftedPrefillHiddenPublicationPolicy::
                     GraphIntegratedKVTransaction)
         {
             throw std::runtime_error(
-                "Qwen GPU shifted MTP prefill requires a complete graph-integrated main-prefill binding");
+                "Qwen GPU shifted MTP transaction requires a complete typed main-prefill or restored-prefix decode binding");
         }
         if (weight_bindings_.mtp.empty() ||
             weight_bindings_.mtp.depths.empty())
@@ -1661,7 +1706,7 @@ namespace llaminar2
                 HiddenStateRowsSelectStage::DeviceRowIndexSource::
                     ShiftedPrefillTransaction,
             .request_sequence_lengths_device =
-                input.sequence_lengths_device,
+                binding.request_segment_lengths_device,
             .request_row_stride_source =
                 HiddenStateRowsSelectStage::RequestRowStrideSource::
                     ExternalDeviceScalar,
@@ -1731,6 +1776,75 @@ namespace llaminar2
         graph.merge(std::move(mtp_kv_graph), prepare_node);
         graph.setTerminalNode(transaction_terminal);
         return transaction_terminal;
+    }
+
+    std::string QwenGraphBase::maybeAddMTPMainTerminalHiddenPublication(
+        ComputeGraph &graph,
+        const ForwardInput &input,
+        const std::string &dependency_node,
+        DeviceId device)
+    {
+        if (!input.mtp_main_terminal_hidden.has_value())
+            return dependency_node;
+
+        const auto &binding = *input.mtp_main_terminal_hidden;
+        const int total_tokens = input.batch_size * input.seq_len;
+        if (input.shifted_mtp_prefill.has_value() ||
+            input.execution_phase != ForwardExecutionPhase::Decode ||
+            (input.execution_role != ForwardExecutionRole::MainInference &&
+             input.execution_role != ForwardExecutionRole::MTPCondition) ||
+            !binding.validForRequestCount(input.batch_size) ||
+            binding.source_row_start + binding.request_count > total_tokens ||
+            !buffers_.current_hidden ||
+            buffers_.current_hidden->native_type() != TensorType::FP32 ||
+            buffers_.current_hidden->rows() <
+                static_cast<size_t>(total_tokens) ||
+            binding.terminal_hidden_archive->native_type() !=
+                TensorType::FP32 ||
+            binding.terminal_hidden_archive->rows() <
+                static_cast<size_t>(binding.request_count) ||
+            binding.terminal_hidden_archive->cols() <
+                static_cast<size_t>(config_.d_model))
+        {
+            throw std::runtime_error(
+                "Qwen MTP main decode requires a complete graph-integrated "
+                "terminal-hidden publication binding");
+        }
+
+        std::vector<int> selected_rows(
+            static_cast<size_t>(binding.request_count));
+        std::iota(
+            selected_rows.begin(),
+            selected_rows.end(),
+            binding.source_row_start);
+        HiddenStateRowsSelectStage::Params params{
+            .device_id = device,
+            .input = buffers_.current_hidden,
+            .output = binding.terminal_hidden_archive,
+            .seq_len = total_tokens,
+            .d_model = config_.d_model,
+            .selected_row_count = binding.request_count,
+            .selected_row_indices = std::move(selected_rows),
+            .input_buffer_id = BufferId::HIDDEN_STATE,
+            .output_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN,
+            .device_row_index_source =
+                device.is_gpu()
+                    ? HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                          FixedContiguousRange
+                    : HiddenStateRowsSelectStage::DeviceRowIndexSource::
+                          StageOwnedIndices,
+            .fixed_contiguous_row_start = binding.source_row_start,
+        };
+        constexpr const char *publication_node =
+            "mtp_main_terminal_hidden_publish";
+        graph.addNode(
+            publication_node,
+            ComputeStageFactory::createHiddenStateRowsSelect(
+                std::move(params)),
+            device);
+        graph.addDependency(publication_node, dependency_node);
+        graph.setTerminalNode(publication_node);
+        return publication_node;
     }
 
     ComputeGraph QwenGraphBase::buildFullForwardGraph(
@@ -2015,7 +2129,12 @@ namespace llaminar2
             input,
             prev_node,
             device);
-        graph.setTerminalNode(prev_node);
+        prev_node = maybeAddMTPMainTerminalHiddenPublication(
+            graph,
+            input,
+            prev_node,
+            device);
+        sealInferenceTransactionGraph(graph, prev_node);
 
         // Set output
         output.logits = graphLMHeadOutput(use_column_parallel);

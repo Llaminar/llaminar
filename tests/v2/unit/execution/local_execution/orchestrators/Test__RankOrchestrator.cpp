@@ -4761,6 +4761,48 @@ TEST_F(Test__RankOrchestrator, TopLevelRunnerCannotPublishLegacyMoEPlacement)
         std::string::npos);
 }
 
+/**
+ * @brief Rank-local ExpertOverlay seals the same serving graph family as MPI.
+ *
+ * ExpertOverlay is the topology authority even when its entire domain lives in
+ * one process. A world-size guard here used to skip setup-only bucket capture,
+ * causing the first production request to execute an eager warmup and making a
+ * one-token prefix suffix permanently uncapturable.
+ */
+TEST_F(
+    Test__RankOrchestrator,
+    RankLocalExpertOverlayCannotSkipServingFamilyMaterialization)
+{
+    const std::string source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto begin = source.find(
+        "bool OrchestrationRunner::\n"
+        "        bindMoEOverlayTransferProgressAndMaterializeServingGraphFamily()");
+    const auto end = source.find(
+        "bool OrchestrationRunner::initializeMoEOverlayInferenceTransactions()",
+        begin);
+    ASSERT_NE(begin, std::string::npos);
+    ASSERT_NE(end, std::string::npos);
+    const std::string method = source.substr(begin, end - begin);
+
+    EXPECT_EQ(method.find("world_size() <= 1"), std::string::npos)
+        << "Rank-local overlay must not bypass its native graph lifecycle.";
+    EXPECT_NE(
+        method.find("runner_->materializeServingGraphFamilyWithoutLaunch"),
+        std::string::npos);
+    EXPECT_NE(
+        method.find(
+            "preparation_kind ==\n"
+            "                ServingGraphPreparationKind::NativeDeviceExecutableFamily"),
+        std::string::npos)
+        << "Only native device families may enter GPU graph materialization.";
+    EXPECT_NE(method.find("\"rank_local\""), std::string::npos)
+        << "PerfStats must identify the rank-local setup path.";
+}
+
 TEST_F(Test__RankOrchestrator, RequestResetCannotPublishOrDiscardExpertPlacement)
 {
     const std::string runner_source =
@@ -5527,6 +5569,71 @@ TEST_F(Test__RankOrchestrator, PrefixLookupAllowsTerminalLogitsOnOnlyOwningPPSta
     ASSERT_TRUE(orchestrator->restorePrefixTerminalState(hit));
     EXPECT_EQ(runner0_ptr->terminal_restored_tokens(), std::vector<int>({4}));
     EXPECT_EQ(runner1_ptr->terminal_restored_tokens(), std::vector<int>({4}));
+}
+
+TEST_F(Test__RankOrchestrator,
+       PrefixTerminalRestoreAllowsNestedNonHeadTPPipelineStage)
+{
+    auto shard0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *shard0_ptr = shard0.get();
+    shard0_ptr->set_prefix_lookup_result(makePrefixHit(
+        /*cached_tokens=*/4,
+        /*terminal_logits=*/false,
+        /*supported=*/true,
+        /*include_blocks=*/false,
+        /*include_mtp_state=*/false,
+        /*requires_terminal_logits=*/false,
+        /*requires_terminal_hidden=*/false));
+
+    auto shard1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *shard1_ptr = shard1.get();
+    shard1_ptr->set_prefix_lookup_result(makePrefixHit(
+        /*cached_tokens=*/4,
+        /*terminal_logits=*/false,
+        /*supported=*/true,
+        /*include_blocks=*/false,
+        /*include_mtp_state=*/false,
+        /*requires_terminal_logits=*/false,
+        /*requires_terminal_hidden=*/false));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> shards;
+    shards.push_back(std::move(shard0));
+    shards.push_back(std::move(shard1));
+    auto non_head_tp_stage = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(shards),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    auto final_stage = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *final_stage_ptr = final_stage.get();
+    final_stage_ptr->set_prefix_lookup_result(makePrefixHit(
+        /*cached_tokens=*/4,
+        /*terminal_logits=*/true,
+        /*supported=*/true,
+        /*include_blocks=*/false,
+        /*include_mtp_state=*/false,
+        /*requires_terminal_logits=*/true,
+        /*requires_terminal_hidden=*/false));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> stages;
+    stages.push_back(std::move(non_head_tp_stage));
+    stages.push_back(std::move(final_stage));
+    auto pipeline = RankOrchestrator::createForTestWithPipelineStages(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(stages),
+        makeRankConfigForRunnerCount(2));
+
+    const PrefixLookupResult hit =
+        pipeline->lookupPrefix({1, 2, 3, 4});
+    ASSERT_TRUE(hit.has_terminal_logits);
+    ASSERT_TRUE(pipeline->restorePrefixTerminalState(hit));
+    EXPECT_EQ(shard0_ptr->terminal_restored_tokens(),
+              std::vector<int>({4}));
+    EXPECT_EQ(shard1_ptr->terminal_restored_tokens(),
+              std::vector<int>({4}));
+    EXPECT_EQ(final_stage_ptr->terminal_restored_tokens(),
+              std::vector<int>({4}));
 }
 
 TEST_F(Test__RankOrchestrator, PrefixLookupChildMissClampsAllChildrenToZero)

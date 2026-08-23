@@ -27,6 +27,7 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
+#include "Qwen3ModelParityDefinitions.h"
 #include "Qwen3ParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -39,39 +40,33 @@ using namespace llaminar2::test::parity::qwen3;
 // Test Configuration Definitions
 // =============================================================================
 
-static const std::vector<TestConfig> kNodeLocalPPTestConfigs = {
-    // =========================================================================
-    // Qwen3-0.6B (Q8_0) — 2-way Node-Local PP with CPU
-    // =========================================================================
-    {
-        .name = "NodeLocalPP_2xMPI_CPU",
-        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU},
-        .parallelism = Parallelism::NodeLocalPP,
-        .collective = Collective::None, // PP uses MPI send/recv, not collectives
-        .thresholds = {
-            .cosine_threshold = 0.94f,
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.012f,
-        },
-        .mpi_ranks = 2,
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-};
+/** @return Canonically generated two-rank CPU pipeline case. */
+static const std::vector<ModelParityCase> &qwen3NodePipelineCases()
+{
+    static const auto cases = expandModelParityDefinition(
+        qwen3Q80ParityDefinition(
+            ModelParityTopologyDefinition{
+                .test_id = "NodePP_2xMPI_CPU",
+                .kind = ModelParityTopologyKind::NodePipelineParallel,
+                .participants = {
+                    {GlobalDeviceAddress::cpu(0), 0},
+                    {GlobalDeviceAddress::cpu(1), 1},
+                },
+                .collective = Collective::None,
+                .mpi_ranks = 2,
+                .pipeline_stage_sizes = {1, 1},
+            },
+            qwen3ParityThresholds(0.012f)));
+    return cases;
+}
 
 // =============================================================================
 // Parameterized Test Fixture
 // =============================================================================
 
 class Qwen3NodeLocalPPParityTest : public Qwen3ConfigDrivenParityTest<Qwen3NodeLocalPPParityTest>,
-                                   public ::testing::WithParamInterface<TestConfig>
+                                   public ModelParityCaseParameter
 {
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
 };
 
 // =============================================================================
@@ -128,10 +123,10 @@ TEST_P(Qwen3NodeLocalPPParityTest, ProductionParity)
 INSTANTIATE_TEST_SUITE_P(
     Qwen3NodeLocalPP,
     Qwen3NodeLocalPPParityTest,
-    ::testing::ValuesIn(kNodeLocalPPTestConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
+    ::testing::ValuesIn(qwen3NodePipelineCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {
-        return info.param.name;
+        return info.param.testName();
     });
 
 // =============================================================================

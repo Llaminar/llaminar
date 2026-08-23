@@ -2923,6 +2923,48 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_TypeAndName)
 }
 
 /**
+ * @brief A graph-native overlay can be GPU-capable without raw tensor views.
+ *
+ * CPU and GPU tier participants may bind different packed slices under the
+ * same canonical GGUF tensor name. The production overlay therefore lowers an
+ * exact registry triplet and removes raw parents before constructing the
+ * stage. This regression proves backend validation accepts that sole-authority
+ * form instead of forcing the graph to inspect an unrelated packed slice.
+ */
+TEST_F(
+    MoEExpertComputeStageTest,
+    RegistryOnlyPreparedExpertTripletSupportsGPUWithoutRawViews)
+{
+    constexpr int kExperts = 4;
+    StreamCapturingGemm gate;
+    StreamCapturingGemm up;
+    StreamCapturingGemm down;
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.num_experts = kExperts;
+    params.top_k = 1;
+    params.expert_intermediate = 16;
+    params.seq_len = 1;
+    params.d_model = 16;
+    params.expert_mask = {false, true, false, false};
+    params.prepared_gate_gemm.assign(kExperts, nullptr);
+    params.prepared_up_gemm.assign(kExperts, nullptr);
+    params.prepared_down_gemm.assign(kExperts, nullptr);
+    params.prepared_gate_gemm[1] = &gate;
+    params.prepared_up_gemm[1] = &up;
+    params.prepared_down_gemm[1] = &down;
+    params.expert_weight_resolution_policy =
+        MoEExpertWeightResolutionPolicy::PreparedRegistryOnly;
+
+    MoEExpertComputeStage stage(std::move(params));
+    EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::GPU_CUDA));
+#if defined(HAVE_ROCM)
+    EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::GPU_ROCM));
+#endif
+}
+
+/**
  * @brief Prove routed-expert scratch follows later and family-wide row counts.
  *
  * A live server sequence first admitted 39 rows and then 68 rows.  After the

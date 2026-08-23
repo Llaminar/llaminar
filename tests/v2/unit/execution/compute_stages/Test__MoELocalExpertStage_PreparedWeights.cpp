@@ -17,6 +17,7 @@
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/ExpertSlabTypes.h"
 #include "mocks/MockComputeStage.h"
+#include "tensors/Tensors.h"
 
 #include <gtest/gtest.h>
 
@@ -110,6 +111,213 @@ namespace
     private:
         DeviceNativeVNNIMatrixDesc desc_;
         DeviceWorkspaceManager *workspace_ = nullptr;
+    };
+
+    /**
+     * @brief Deterministic prepared expert used to prove canonical route wiring.
+     *
+     * Gate/up projections merely satisfy the grouped CPU pipeline. The down
+     * projection publishes an expert-specific FP32 row, making the expected
+     * original-slot and router-weight mapping exact and easy to inspect.
+     */
+    class CanonicalRouteTestGemm final : public ITensorGemm
+    {
+    public:
+        CanonicalRouteTestGemm(int expert_id, bool down_projection)
+            : expert_id_(expert_id), down_projection_(down_projection)
+        {
+        }
+
+        bool supports_device(int) const override { return true; }
+
+        bool multiply_tensor(
+            const TensorBase *, TensorBase *output,
+            int m, int n, int,
+            bool = true,
+            float = 1.0f, float = 0.0f,
+            const TensorBase * = nullptr,
+            const IMPIContext * = nullptr,
+            int = -1,
+            DeviceWorkspaceManager * = nullptr,
+            int = 0) override
+        {
+            if (!output || m <= 0 || n <= 0)
+                return false;
+            float *const values = output->mutable_data();
+            if (!values)
+                return false;
+            std::fill_n(
+                values,
+                static_cast<size_t>(m) * static_cast<size_t>(n),
+                1.0f);
+            return true;
+        }
+
+        bool multiply_tensor_with_fused_swiglu(
+            const TensorBase *, const TensorBase *, TensorBase *output,
+            int m, int n, int,
+            float = 1.0f, float = 0.0f,
+            DeviceWorkspaceManager * = nullptr) override
+        {
+            if (!down_projection_ || !output || m <= 0 || n <= 0)
+                return false;
+            float *const values = output->mutable_data();
+            if (!values)
+                return false;
+            for (int row = 0; row < m; ++row)
+            {
+                for (int col = 0; col < n; ++col)
+                {
+                    values[static_cast<size_t>(row) *
+                               static_cast<size_t>(n) +
+                           static_cast<size_t>(col)] =
+                        static_cast<float>((expert_id_ + 1) * 16 + col);
+                }
+            }
+            return true;
+        }
+
+        bool multiply_fused_tensor(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const IMPIContext *mpi_context = nullptr,
+            DeviceWorkspaceManager *workspace = nullptr) override
+        {
+            for (const auto &projection : projections)
+            {
+                if (!projection.kernel || !projection.output ||
+                    !projection.kernel->multiply_tensor(
+                        input,
+                        projection.output,
+                        m,
+                        projection.n,
+                        k,
+                        true,
+                        1.0f,
+                        0.0f,
+                        projection.bias,
+                        mpi_context,
+                        -1,
+                        workspace))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool weights_converted() const override { return true; }
+
+    private:
+        int expert_id_ = -1;
+        bool down_projection_ = false;
+    };
+
+    /**
+     * @brief Floating test GEMM that preserves its borrowed activation row.
+     *
+     * Gate and up roles copy the gathered input; the down role copies the gate
+     * row through the fused SwiGLU/down interface. The intentionally simple
+     * arithmetic isolates compact-to-physical row mapping from expert math.
+     */
+    class BorrowedHiddenEchoGemm final : public ITensorGemm
+    {
+    public:
+        explicit BorrowedHiddenEchoGemm(bool down_projection)
+            : down_projection_(down_projection)
+        {
+        }
+
+        bool supports_device(int) const override { return true; }
+
+        bool multiply_tensor(
+            const TensorBase *input,
+            TensorBase *output,
+            int m,
+            int n,
+            int k,
+            bool = true,
+            float = 1.0f,
+            float = 0.0f,
+            const TensorBase * = nullptr,
+            const IMPIContext * = nullptr,
+            int = -1,
+            DeviceWorkspaceManager * = nullptr,
+            int = 0) override
+        {
+            if (down_projection_ || !input || !output || m <= 0 ||
+                n <= 0 || k != n || !input->data() ||
+                !output->mutable_data())
+            {
+                return false;
+            }
+            std::copy_n(
+                input->data(),
+                static_cast<size_t>(m) * static_cast<size_t>(n),
+                output->mutable_data());
+            return true;
+        }
+
+        bool multiply_tensor_with_fused_swiglu(
+            const TensorBase *gate,
+            const TensorBase *,
+            TensorBase *output,
+            int m,
+            int n,
+            int intermediate,
+            float = 1.0f,
+            float = 0.0f,
+            DeviceWorkspaceManager * = nullptr) override
+        {
+            if (!down_projection_ || !gate || !output || m <= 0 ||
+                n <= 0 || intermediate != n || !gate->data() ||
+                !output->mutable_data())
+            {
+                return false;
+            }
+            std::copy_n(
+                gate->data(),
+                static_cast<size_t>(m) * static_cast<size_t>(n),
+                output->mutable_data());
+            return true;
+        }
+
+        bool multiply_fused_tensor(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m,
+            int k,
+            const IMPIContext *mpi_context = nullptr,
+            DeviceWorkspaceManager *workspace = nullptr) override
+        {
+            for (const auto &projection : projections)
+            {
+                if (!projection.kernel || !projection.output ||
+                    !projection.kernel->multiply_tensor(
+                        input,
+                        projection.output,
+                        m,
+                        projection.n,
+                        k,
+                        true,
+                        1.0f,
+                        0.0f,
+                        projection.bias,
+                        mpi_context,
+                        -1,
+                        workspace))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool weights_converted() const override { return true; }
+
+    private:
+        bool down_projection_ = false; ///< Select the fused down role.
     };
 
     DeviceNativeVNNIMatrixDesc nativeDesc(int expert_id, int role, int n, int k)
@@ -264,6 +472,475 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     std::string err;
     EXPECT_TRUE(stage.validatePreparedWeights(&err));
     EXPECT_TRUE(err.empty());
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     CPUCanonicalRouteArenaRejectsGPUAndMissingStorageContracts)
+{
+    constexpr int kDModel = 8;
+    constexpr int kTopK = 2;
+    EXPECT_THROW(
+        ([&]
+         {
+             (void)MoELocalExpertSerialBufferArena{
+                 MoELocalExpertSerialBufferArena::Config{
+                     .device_id = DeviceId::cuda(0),
+                     .row_capacity = 2,
+                     .d_model = kDModel,
+                     .routing_top_k = kTopK,
+                     .cpu_canonical_route_storage =
+                         MoELocalExpertSerialBufferArena::
+                             CPUCanonicalRouteStoragePolicy::
+                                 RetainSerialMaximum,
+                 }};
+         }()),
+        std::invalid_argument);
+
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(2, 4, kDModel, kTopK, DeviceId::cpu());
+    auto input = workspace.localExpertInput(0, 0);
+    auto output = workspace.localExpertOutput(0, 0);
+    std::vector<std::int32_t> original_slots(4, 0);
+    std::vector<std::int32_t> compact_slots(4, 0);
+    std::vector<float> canonical_rows(4 * kDModel, 0.0f);
+
+    auto params = makePreparedVectorParams(2);
+    params.device_id = DeviceId::cpu();
+    params.input_rows = &input;
+    params.output_rows = &output;
+    params.d_model = kDModel;
+    params.top_k = kTopK;
+    params.cpu_canonical_route_return =
+        MoELocalExpertStage::CPUCanonicalRouteReturnBinding{
+            .original_route_slots = original_slots.data(),
+            .compact_route_slots = compact_slots.data(),
+            .preweighted_route_contributions = canonical_rows.data(),
+            .route_slot_capacity = original_slots.size(),
+        };
+    EXPECT_THROW(
+        (void)MoELocalExpertStage{params},
+        std::invalid_argument)
+        << "A mapped route destination without its serial raw-route arena is an invalid lifecycle state";
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     CPUCanonicalReturnPublishesPreweightedOriginalRouteSlots)
+{
+    constexpr int kExperts = 2;
+    constexpr int kRows = 2;
+    constexpr int kDModel = 8;
+    constexpr int kTopK = 2;
+    constexpr size_t kMappedRouteCapacity = 6;
+
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(
+        kRows, kRows * kTopK, kDModel, kTopK, DeviceId::cpu());
+    auto input = workspace.localExpertInput(0, 0);
+    auto output = workspace.localExpertOutput(0, 0);
+    input.residency_epoch = 1;
+    input.source_participant = 0;
+    input.target_participant = 3;
+    input.live_row_count = kRows;
+    input.live_entry_count = 3;
+    input.row_ids_host[0] = 2;
+    input.row_ids_host[1] = 5;
+    input.entry_offsets_host[0] = 0;
+    input.entry_offsets_host[1] = 2;
+    input.entry_offsets_host[2] = 3;
+    input.expert_ids_host[0] = 0;
+    input.expert_ids_host[1] = 1;
+    input.expert_ids_host[2] = 1;
+    input.route_weights_host[0] = 0.25f;
+    input.route_weights_host[1] = 0.75f;
+    input.route_weights_host[2] = 0.5f;
+    for (int row = 0; row < kRows; ++row)
+    {
+        for (int col = 0; col < kDModel; ++col)
+        {
+            input.hidden_rows_fp32[
+                static_cast<size_t>(row) * kDModel + col] =
+                static_cast<float>(row * kDModel + col + 1);
+        }
+    }
+
+    std::vector<std::int32_t> original_slots(
+        kMappedRouteCapacity, -1);
+    std::vector<std::int32_t> compact_slots(
+        kMappedRouteCapacity, -1);
+    original_slots[0] = 1;
+    original_slots[1] = 3;
+    original_slots[2] = 4;
+    compact_slots[0] = 0;
+    compact_slots[1] = 1;
+    compact_slots[2] = 2;
+    constexpr float kUntouched = -777.0f;
+    std::vector<float> canonical_rows(
+        kMappedRouteCapacity * kDModel, kUntouched);
+
+    auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
+        MoELocalExpertSerialBufferArena::Config{
+            .device_id = DeviceId::cpu(),
+            .row_capacity = kRows,
+            .row_capacity_buckets = {kRows},
+            .d_model = kDModel,
+            .routing_top_k = kTopK,
+            .cpu_canonical_route_storage =
+                MoELocalExpertSerialBufferArena::
+                    CPUCanonicalRouteStoragePolicy::RetainSerialMaximum,
+            .logical_participant_id = 3,
+            .debug_name = "unit.cpu_canonical_route_return",
+        });
+
+    std::vector<std::unique_ptr<CanonicalRouteTestGemm>> engines;
+    std::vector<ITensorGemm *> gate(kExperts, nullptr);
+    std::vector<ITensorGemm *> up(kExperts, nullptr);
+    std::vector<ITensorGemm *> down(kExperts, nullptr);
+    for (int expert = 0; expert < kExperts; ++expert)
+    {
+        engines.push_back(std::make_unique<CanonicalRouteTestGemm>(
+            expert, false));
+        gate[expert] = engines.back().get();
+        engines.push_back(std::make_unique<CanonicalRouteTestGemm>(
+            expert, false));
+        up[expert] = engines.back().get();
+        engines.push_back(std::make_unique<CanonicalRouteTestGemm>(
+            expert, true));
+        down[expert] = engines.back().get();
+    }
+
+    MoELocalExpertStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input_rows = &input;
+    params.output_rows = &output;
+    params.serial_compact_buffer_arena = arena;
+    params.graph_row_capacity = kRows;
+    params.cpu_canonical_route_return =
+        MoELocalExpertStage::CPUCanonicalRouteReturnBinding{
+            .original_route_slots = original_slots.data(),
+            .compact_route_slots = compact_slots.data(),
+            .preweighted_route_contributions = canonical_rows.data(),
+            .route_slot_capacity = kMappedRouteCapacity,
+        };
+    params.num_experts = kExperts;
+    params.top_k = kTopK;
+    params.d_model = kDModel;
+    params.expert_intermediate = 16;
+    params.layer_idx = 0;
+    params.runtime_participant_index = 3;
+    params.expert_mask.assign(kExperts, true);
+    params.prepared_gate_gemm = gate;
+    params.prepared_up_gemm = up;
+    params.prepared_down_gemm = down;
+
+    MoELocalExpertStage stage(params);
+    llaminar2::testing::MockDeviceContext context(
+        DeviceId::cpu(), ComputeBackendType::CPU);
+    ASSERT_TRUE(stage.execute(&context));
+    ASSERT_EQ(output.live_row_count, static_cast<size_t>(kRows));
+    EXPECT_EQ(output.row_ids_host[0], input.row_ids_host[0]);
+    EXPECT_EQ(output.row_ids_host[1], input.row_ids_host[1]);
+
+    const auto expect_route = [&](size_t slot, int expert, float weight)
+    {
+        for (int col = 0; col < kDModel; ++col)
+        {
+            EXPECT_FLOAT_EQ(
+                canonical_rows[slot * kDModel + col],
+                weight * static_cast<float>((expert + 1) * 16 + col));
+        }
+    };
+    expect_route(1, 0, 0.25f);
+    expect_route(3, 1, 0.75f);
+    expect_route(4, 1, 0.5f);
+    for (const size_t untouched_slot : {size_t{0}, size_t{2}, size_t{5}})
+    {
+        for (int col = 0; col < kDModel; ++col)
+        {
+            EXPECT_FLOAT_EQ(
+                canonical_rows[untouched_slot * kDModel + col],
+                kUntouched);
+        }
+    }
+}
+
+/**
+ * @brief Stable single-pass admission preserves row and route order after filtering.
+ *
+ * Each source row deliberately mixes resident, non-resident, and zero-weight
+ * routes.  The compact packet must omit empty row 11, retain the other logical
+ * row ids in source order, and accumulate each surviving route exactly once.
+ */
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     CPUCompactAdmissionPreservesFilteredRouteOrder)
+{
+    constexpr int kExperts = 4;
+    constexpr int kRows = 4;
+    constexpr int kDModel = 8;
+    constexpr int kTopK = 3;
+
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(
+        kRows, kRows * kTopK, kDModel, kTopK, DeviceId::cpu());
+    auto input = workspace.localExpertInput(0, 0);
+    auto output = workspace.localExpertOutput(0, 0);
+    input.residency_epoch = 1;
+    input.live_row_count = kRows;
+    input.live_entry_count = 10;
+    const std::int32_t row_ids[kRows] = {10, 11, 12, 13};
+    const std::int32_t offsets[kRows + 1] = {0, 3, 5, 8, 10};
+    std::copy_n(row_ids, kRows, input.row_ids_host);
+    std::copy_n(offsets, kRows + 1, input.entry_offsets_host);
+    const std::int32_t experts[10] = {1, 0, 2, 1, 3, 2, 0, 1, 3, 0};
+    const float weights[10] = {
+        1.0f, 0.25f, 0.5f,
+        0.5f, 0.5f,
+        0.75f, 0.0f, 1.0f,
+        0.25f, 1.0f};
+    std::copy_n(experts, 10, input.expert_ids_host);
+    std::copy_n(weights, 10, input.route_weights_host);
+    for (int row = 0; row < kRows; ++row)
+    {
+        for (int col = 0; col < kDModel; ++col)
+        {
+            input.hidden_rows_fp32[
+                static_cast<size_t>(row) * kDModel + col] =
+                static_cast<float>(row * kDModel + col + 1);
+        }
+    }
+
+    auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
+        MoELocalExpertSerialBufferArena::Config{
+            .device_id = DeviceId::cpu(),
+            .row_capacity = kRows,
+            .row_capacity_buckets = {1, 2, kRows},
+            .d_model = kDModel,
+            .routing_top_k = kTopK,
+            .logical_participant_id = 2,
+            .debug_name = "unit.cpu_single_pass_compaction",
+        });
+
+    std::vector<std::unique_ptr<CanonicalRouteTestGemm>> engines;
+    std::vector<ITensorGemm *> gate(kExperts, nullptr);
+    std::vector<ITensorGemm *> up(kExperts, nullptr);
+    std::vector<ITensorGemm *> down(kExperts, nullptr);
+    for (int expert = 0; expert < kExperts; ++expert)
+    {
+        engines.push_back(std::make_unique<CanonicalRouteTestGemm>(
+            expert, false));
+        gate[expert] = engines.back().get();
+        engines.push_back(std::make_unique<CanonicalRouteTestGemm>(
+            expert, false));
+        up[expert] = engines.back().get();
+        engines.push_back(std::make_unique<CanonicalRouteTestGemm>(
+            expert, true));
+        down[expert] = engines.back().get();
+    }
+
+    MoELocalExpertStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input_rows = &input;
+    params.output_rows = &output;
+    params.serial_compact_buffer_arena = arena;
+    params.graph_row_capacity = kRows;
+    params.num_experts = kExperts;
+    params.top_k = kTopK;
+    params.d_model = kDModel;
+    params.expert_intermediate = 16;
+    params.layer_idx = 0;
+    params.runtime_participant_index = 2;
+    params.expert_mask = {true, false, true, false};
+    params.prepared_gate_gemm = gate;
+    params.prepared_up_gemm = up;
+    params.prepared_down_gemm = down;
+
+    MoELocalExpertStage stage(params);
+    llaminar2::testing::MockDeviceContext context(
+        DeviceId::cpu(), ComputeBackendType::CPU);
+    ASSERT_TRUE(stage.execute(&context));
+    ASSERT_EQ(output.live_row_count, 3u);
+    EXPECT_EQ(output.row_ids_host[0], 10);
+    EXPECT_EQ(output.row_ids_host[1], 12);
+    EXPECT_EQ(output.row_ids_host[2], 13);
+
+    const auto expect_row = [&](size_t row, float expert_zero_weight,
+                                float expert_two_weight)
+    {
+        for (int col = 0; col < kDModel; ++col)
+        {
+            const float expected =
+                expert_zero_weight * static_cast<float>(16 + col) +
+                expert_two_weight * static_cast<float>(48 + col);
+            EXPECT_FLOAT_EQ(
+                output.output_rows_fp32[row * kDModel + col], expected);
+        }
+    };
+    expect_row(0, 0.25f, 0.5f);
+    expect_row(1, 0.0f, 0.75f);
+    expect_row(2, 1.0f, 0.0f);
+
+    /*
+     * Reuse the same stage and durable residency epoch with a narrower live
+     * packet. This proves the retained CPU executor changes only its live
+     * dimensions: tensor identity and prepared engines remain setup-owned,
+     * while stale rows and the previous two-route stride cannot leak forward.
+     */
+    input.live_row_count = 2;
+    input.live_entry_count = 3;
+    input.row_ids_host[0] = 20;
+    input.row_ids_host[1] = 21;
+    input.entry_offsets_host[0] = 0;
+    input.entry_offsets_host[1] = 1;
+    input.entry_offsets_host[2] = 3;
+    input.expert_ids_host[0] = 2;
+    input.expert_ids_host[1] = 1;
+    input.expert_ids_host[2] = 0;
+    input.route_weights_host[0] = 0.5f;
+    input.route_weights_host[1] = 1.0f;
+    input.route_weights_host[2] = 0.75f;
+    std::fill_n(
+        output.output_rows_fp32,
+        static_cast<size_t>(kRows) * kDModel,
+        -99.0f);
+
+    ASSERT_TRUE(stage.execute(&context));
+    ASSERT_EQ(output.live_row_count, 2u);
+    EXPECT_EQ(output.row_ids_host[0], 20);
+    EXPECT_EQ(output.row_ids_host[1], 21);
+    expect_row(0, 0.0f, 0.5f);
+    expect_row(1, 0.75f, 0.0f);
+}
+
+/**
+ * @brief A CPU endpoint consumes shared physical transport rows without a copy.
+ *
+ * Row ids intentionally reverse and sparsify the physical activation order.
+ * The floating expert path must gather those authenticated rows directly and
+ * return them in compact packet order; reading the stale compact tensor would
+ * make this regression fail deterministically.
+ */
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     CPUTransportedHiddenBindingPreservesSharedPhysicalRowIdentity)
+{
+    constexpr int kRows = 2;
+    constexpr int kPhysicalRows = 5;
+    constexpr int kDModel = 8;
+    constexpr int kExperts = 1;
+    constexpr int kTopK = 1;
+
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(
+        kRows,
+        kRows * kTopK,
+        kDModel,
+        kTopK,
+        DeviceId::cpu());
+    auto input = workspace.localExpertInput(0, 0);
+    auto output = workspace.localExpertOutput(0, 0);
+    std::vector<float> physical_hidden(
+        static_cast<size_t>(kPhysicalRows) * kDModel);
+    for (int row = 0; row < kPhysicalRows; ++row)
+    {
+        for (int column = 0; column < kDModel; ++column)
+        {
+            physical_hidden[
+                static_cast<size_t>(row) * kDModel + column] =
+                static_cast<float>(row * 100 + column);
+        }
+    }
+
+    input.residency_epoch = 1;
+    input.live_row_count = kRows;
+    input.live_entry_count = kRows;
+    input.row_ids_host[0] = 4;
+    input.row_ids_host[1] = 1;
+    input.entry_offsets_host[0] = 0;
+    input.entry_offsets_host[1] = 1;
+    input.entry_offsets_host[2] = 2;
+    input.expert_ids_host[0] = 0;
+    input.expert_ids_host[1] = 0;
+    input.route_weights_host[0] = 1.0f;
+    input.route_weights_host[1] = 1.0f;
+    input.hidden_rows_fp32 = physical_hidden.data();
+    input.hidden_row_capacity = kPhysicalRows;
+    input.hidden_payload_layout =
+        MoEOverlayActivationHiddenPayloadLayout::SharedPhysicalRows;
+
+    auto arena = std::make_shared<MoELocalExpertSerialBufferArena>(
+        MoELocalExpertSerialBufferArena::Config{
+            .device_id = DeviceId::cpu(),
+            .row_capacity = kRows,
+            .d_model = kDModel,
+            .routing_top_k = kTopK,
+            .logical_participant_id = 2,
+            .debug_name = "unit.cpu_borrowed_physical_hidden",
+        });
+    BorrowedHiddenEchoGemm gate(/*down_projection=*/false);
+    BorrowedHiddenEchoGemm up(/*down_projection=*/false);
+    BorrowedHiddenEchoGemm down(/*down_projection=*/true);
+
+    MoELocalExpertStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input_rows = &input;
+    params.output_rows = &output;
+    params.serial_compact_buffer_arena = arena;
+    params.graph_row_capacity = kRows;
+    params.num_experts = kExperts;
+    params.top_k = kTopK;
+    params.d_model = kDModel;
+    params.expert_intermediate = kDModel;
+    params.layer_idx = 0;
+    params.runtime_participant_index = 2;
+    params.expert_mask = {true};
+    params.prepared_gate_gemm = {&gate};
+    params.prepared_up_gemm = {&up};
+    params.prepared_down_gemm = {&down};
+
+    MoELocalExpertStage stage(std::move(params));
+    llaminar2::testing::MockDeviceContext context(
+        DeviceId::cpu(), ComputeBackendType::CPU);
+    ASSERT_TRUE(stage.execute(&context));
+    ASSERT_EQ(output.live_row_count, static_cast<size_t>(kRows));
+    for (int compact_row = 0; compact_row < kRows; ++compact_row)
+    {
+        const int physical_row = input.row_ids_host[compact_row];
+        EXPECT_EQ(output.row_ids_host[compact_row], physical_row);
+        for (int column = 0; column < kDModel; ++column)
+        {
+            EXPECT_FLOAT_EQ(
+                output.output_rows_fp32[
+                    static_cast<size_t>(compact_row) * kDModel + column],
+                physical_hidden[
+                    static_cast<size_t>(physical_row) * kDModel + column]);
+        }
+    }
+
+    /*
+     * Rebind the retained stage to a serial decode packet. M=1 deliberately
+     * uses the specialized serial FFN contract, while M>1 uses the grouped
+     * executor above; both contracts must preserve the same authenticated
+     * physical-row identity at the transport boundary.
+     */
+    input.live_row_count = 1;
+    input.live_entry_count = 1;
+    input.row_ids_host[0] = 3;
+    input.entry_offsets_host[0] = 0;
+    input.entry_offsets_host[1] = 1;
+    input.expert_ids_host[0] = 0;
+    input.route_weights_host[0] = 1.0f;
+    std::fill_n(
+        output.output_rows_fp32,
+        static_cast<size_t>(kRows) * kDModel,
+        -99.0f);
+
+    ASSERT_TRUE(stage.execute(&context));
+    ASSERT_EQ(output.live_row_count, 1u);
+    EXPECT_EQ(output.row_ids_host[0], 3);
+    for (int column = 0; column < kDModel; ++column)
+    {
+        EXPECT_FLOAT_EQ(
+            output.output_rows_fp32[column],
+            physical_hidden[static_cast<size_t>(3) * kDModel + column]);
+    }
 }
 
 TEST(Test__MoELocalExpertStage_PreparedWeights,

@@ -717,6 +717,22 @@ namespace
     }
 
     TEST_F(Test__MPICoordinatedMode,
+           RootRejectsRequestResetAfterWorkerShutdown)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        runner->shutdownMPIWorkers();
+        ASSERT_EQ(mpi->broadcastCount(), 1u);
+
+        EXPECT_THROW(runner->clearCache(), AssertionError);
+        EXPECT_EQ(mpi->broadcastCount(), 1u)
+            << "A rejected post-shutdown reset must not publish another command";
+        EXPECT_EQ(mock->clearCacheCount(), 0)
+            << "A rejected post-shutdown reset must not mutate root-local state";
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
            ShutdownPublishesTerminalAdmissionBeforeCollectiveDrain)
     {
         /* This is an architecture sanitizer for a real MPI deadlock: worker
@@ -1107,6 +1123,23 @@ namespace
         runner->runMPIWorkerLoop();
 
         EXPECT_EQ(mock->clearCacheCount(), 1);
+    }
+
+    TEST_F(Test__MPICoordinatedMode,
+           WorkerShutdownClosesLocalRequestAdmission)
+    {
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32(
+            {static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
+
+        auto [runner, mock, mpi] = createWorkerRunner(scripted);
+        runner->runMPIWorkerLoop();
+
+        EXPECT_THROW(runner->clearCache(), AssertionError);
+        EXPECT_EQ(mock->clearCacheCount(), 0)
+            << "A follower cannot mutate request state after leaving its loop";
+        EXPECT_EQ(mpi->scriptPosition(), 1u)
+            << "No command receive may occur after terminal SHUTDOWN";
     }
 
     TEST_F(Test__MPICoordinatedMode, WorkerLoopDispatchesPrefill)

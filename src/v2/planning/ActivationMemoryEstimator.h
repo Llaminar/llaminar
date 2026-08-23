@@ -31,6 +31,7 @@ struct ActivationGraphMemoryGeometry
     int local_d_ff = 0;             ///< Participant-local dense FFN width.
     int local_n_heads = 0;          ///< Participant-local query head count.
     int local_n_kv_heads = 0;       ///< Participant-local KV head count.
+    int local_vocab = 0;            ///< Participant-local vocabulary slice.
     int first_layer = 0;            ///< First main-model layer assigned here.
     int last_layer = -1;            ///< Last main-model layer assigned here.
     int total_shards = 1;           ///< Dense tensor-parallel participant count.

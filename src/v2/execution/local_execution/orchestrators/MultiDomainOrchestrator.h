@@ -139,6 +139,11 @@ namespace llaminar2
          * @return true if forward succeeded
          */
         bool forward(const int *tokens, int seq_len) override;
+        /** @copydoc IInferenceRunner::forwardPrefill */
+        bool forwardPrefill(const int *tokens, int seq_len) override;
+        /** @copydoc IInferenceRunner::forwardRestoredPrefixMTPDecodeBridge */
+        bool forwardRestoredPrefixMTPDecodeBridge(
+            const RestoredPrefixMTPDecodeBridgeRequest &request) override;
 
         /** @brief Forward the sparse MoE request generation to the owned graph runner. */
         bool setMoEOverlayCollectiveRequestGeneration(

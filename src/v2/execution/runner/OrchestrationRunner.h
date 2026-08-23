@@ -442,6 +442,27 @@ namespace llaminar2
         bool freezeMoEExpertOverlayPlanForLoadedModel();
 
         /**
+         * @brief Freeze the MPI scope that owns continuation prefix/KV state.
+         *
+         * Heterogeneous overlays may contain expert-only ranks that follow
+         * retained sparse transactions but own no prefix cache.  This setup
+         * phase creates a persistent communicator containing only dense
+         * continuation ranks, before any request enters the hot path.
+         *
+         * @return False when the frozen execution plan cannot produce one
+         *         valid continuation-state authority set.
+         */
+        bool initializeMoEContinuationPrefixCoordination();
+
+        /**
+         * @brief Release an owned continuation-prefix communicator.
+         *
+         * This runs after inference and worker-loop admission have closed.
+         * World and process-local scopes own no communicator and are inert.
+         */
+        void releaseMoEContinuationPrefixCoordination() noexcept;
+
+        /**
          * @brief Create the one process-local RCU authority for a tiered overlay.
          *
          * This runs after model-aware placement is frozen and before any root or
@@ -488,6 +509,40 @@ namespace llaminar2
          * typed no-op.
          */
         bool startMoEExpertOverlayResidencyMaintenance();
+
+        /**
+         * @brief Seal an ordinary GPU runner's admitted serving graph family.
+         *
+         * Dense and non-overlay GPU execution needs the same setup guarantee as
+         * ExpertOverlay: every admitted prefill bucket and the history-bearing
+         * decode graph must be captured and instantiated without executing a
+         * synthetic request. This leaves KV, prefix, sampler, and response
+         * state untouched, so the first admitted request is both a genuine
+         * cache miss and an optimized graph replay.
+         *
+         * ExpertOverlay is excluded because its serving family is composed
+         * atomically with transfer-progress epochs by
+         * bindMoEOverlayTransferProgressAndMaterializeServingGraphFamily(). CPU
+         * runners have no native executable family and are a typed no-op.
+         *
+         * @return True when no ordinary native family is required or when the
+         *         complete admitted family has entered its sealed state.
+         */
+        bool materializeOrdinaryServingGraphFamilyWithoutLaunch();
+
+        /**
+         * @brief Apply the caller-declared diagnostic topology before capture.
+         *
+         * Snapshot copies are native graph nodes, so enabling them after a
+         * serving executable has been materialized changes graph identity.
+         * Public snapshot configuration calls made before initialize() are
+         * retained in @ref snapshot_capture_setup_ and installed by this
+         * initialization phase immediately after the participant graph exists.
+         *
+         * @return True when diagnostics are disabled or the complete retained
+         *         policy was installed on the constructed inference runner.
+         */
+        bool applyConfiguredSnapshotCaptureSetup();
 
         /**
          * @brief Bind physical transfer epochs and seal every serving graph.
@@ -998,6 +1053,26 @@ namespace llaminar2
         std::unique_ptr<IExecutionPlanBuilder> plan_builder_;
         std::shared_ptr<IMPIContext> mpi_ctx_;
         std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx_;
+        /**
+         * @brief Typed scope for prefix/KV consensus during request admission.
+         *
+         * `OrchestrationWorld` is the ordinary TP/PP policy.
+         * `ProcessLocalContinuation` means one rank already aggregates every
+         * continuation device. `ContinuationRankGroup` owns an MPI
+         * communicator excluding expert-only followers.
+         */
+        enum class PrefixCoordinationScope : std::uint8_t
+        {
+            OrchestrationWorld,
+            ProcessLocalContinuation,
+            ContinuationRankGroup,
+        };
+        PrefixCoordinationScope prefix_coordination_scope_{
+            PrefixCoordinationScope::OrchestrationWorld};
+        /** Persistent subgroup communicator, owned only in group scope. */
+        MPI_Comm continuation_prefix_comm_{MPI_COMM_NULL};
+        /** Whether this rank owns continuation state in the frozen scope. */
+        bool continuation_prefix_participant_{true};
         /** Shared route evidence retained by authority and every child graph. */
         std::shared_ptr<DecodeExpertHistogram>
             moe_expert_overlay_decode_histogram_;
@@ -1112,6 +1187,36 @@ namespace llaminar2
 
         // Execution infrastructure
         std::unique_ptr<IInferenceRunner> runner_;
+
+        /**
+         * @brief Typed setup policy for graph-resident diagnostic copies.
+         *
+         * A caller is allowed to configure snapshots before initialize(). The
+         * policy therefore cannot live only on `runner_`, which is constructed
+         * part-way through initialization. Keeping enablement, filter, and
+         * destination in one value prevents a filter from being silently lost
+         * or applied after serving graphs have already captured another
+         * topology. Runtime calls update this same authority before delegating.
+         */
+        struct SnapshotCaptureSetup
+        {
+            /** Legal diagnostic topology requested for this runner. */
+            enum class Mode
+            {
+                Disabled, ///< No diagnostic D2D copies belong to graph identity.
+                Enabled,  ///< The retained filter belongs to graph identity.
+            };
+
+            Mode mode = Mode::Disabled;
+            std::string output_directory;
+            std::vector<std::string> filter;
+
+            /** @return Whether graph-resident snapshot nodes are requested. */
+            [[nodiscard]] bool enabled() const noexcept
+            {
+                return mode == Mode::Enabled;
+            }
+        } snapshot_capture_setup_;
         /** Rank-wide source authority; null on remote and non-overlay ranks. */
         std::shared_ptr<MoEOverlayInferenceTransactionCoordinator>
             moe_overlay_inference_transaction_coordinator_;

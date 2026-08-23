@@ -762,7 +762,7 @@ namespace llaminar2
                 endpoint_status,
                 payload_bytes,
                 dispatch.live_rows,
-                /*live_entries=*/0u))
+                dispatch.live_entries))
         {
             return reject(
                 endpoint,
@@ -780,7 +780,7 @@ namespace llaminar2
              * scheduler's immutable floor. */
             .placement_epoch = dispatch.placement_epoch,
             .live_rows = dispatch.live_rows,
-            .live_entries = 0u,
+            .live_entries = dispatch.live_entries,
             .payload_bytes = payload_bytes,
             .stage_ordinal = stage_ordinal,
             .model_layer_index = layer,
@@ -789,7 +789,7 @@ namespace llaminar2
             endpoint_status,
             payload_bytes,
             dispatch.live_rows,
-            /*live_entries=*/0u);
+            dispatch.live_entries);
         atomicValue(buffer.return_signal.value).store(
             timeline, std::memory_order_release);
         atomicValue(endpoint_status.last_published_stage).store(
@@ -867,8 +867,8 @@ namespace llaminar2
         const auto dispatch = buffer.dispatch_descriptor;
         if (observed != timeline ||
             !validDescriptor(descriptor, identity, stage_ordinal, timeline) ||
-            descriptor.live_entries != 0u ||
             descriptor.live_rows != dispatch.live_rows ||
+            descriptor.live_entries != dispatch.live_entries ||
             descriptor.placement_epoch != dispatch.placement_epoch)
         {
             reject(
@@ -1259,12 +1259,7 @@ namespace llaminar2
                 ? continuation.published_live_entries == 0u
                 : continuation.published_live_entries >=
                       continuation.published_live_rows;
-        /* CPU followers still publish one compact dense row and therefore no
-         * route-entry count. CUDA/ROCm mapped followers publish one canonical
-         * contribution for every dispatched entry. Both are first-class wire
-         * layouts; any partial entry total is malformed. */
         const bool return_entry_geometry_valid =
-            follower.published_live_entries == 0u ||
             follower.published_live_entries ==
                 continuation.published_live_entries;
         const bool entry_geometry_valid =

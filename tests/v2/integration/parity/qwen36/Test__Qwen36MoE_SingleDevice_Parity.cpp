@@ -2,9 +2,10 @@
  * @file Test__Qwen36MoE_SingleDevice_Parity.cpp
  * @brief Single-device Qwen3.6 MoE parity tests (CPU, CUDA, ROCm)
  *
- * Mirrors the Qwen3.5 MoE layer-by-layer parity harness so Qwen3.6 MoE
- * divergences produce the usual snapshot CSV diagnostics from one production
- * prefill/decode runner lifetime.
+ * The shared typed matrix expands MTP off, fixed depths 1/2/3/15, and dynamic
+ * depth while every case proves fresh, full, and partial prefix restore. Qwen3.6
+ * MoE divergences retain the standard snapshot CSV diagnostics from one live
+ * production runner lifetime.
  */
 
 #include <gtest/gtest.h>
@@ -12,70 +13,68 @@
 #include <unistd.h>
 
 #include "../qwen35moe/Qwen35MoEParityTestBase.h"
+#include "Qwen36ModelParityDefinitions.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
+
+#include <array>
+#include <iterator>
+#include <string>
+#include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
 using namespace llaminar2::test::parity::qwen35moe;
+using namespace llaminar2::test::parity::qwen36;
 
 namespace
 {
-    static const auto kQwen36MoE35BStrictSingleDeviceThresholds = BackendThresholds{
-        .cosine_threshold = 0.96f,
-        .decode_cosine_threshold = 0.98f,
-        .early_layers_count = 6,
-        .min_early_layers_passed = 5,
-        .kl_threshold = 0.03f,
-        .min_top1_accuracy = 80.0f,
-        .min_top5_accuracy = 60.0f,
-        .pytorch_top1_in_topk = 3,
-    };
-
-    static const std::vector<TestConfig> kQwen36MoESingleDeviceConfigs = {
+    /** @return Canonically expanded CPU, CUDA, and ROCm cases. */
+    const std::vector<ModelParityCase> &qwen36MoESingleDeviceCases()
+    {
+        static const auto cases = []
         {
-            .name = "Qwen36MoE_35B_CPU_KV_FP16",
-            .devices = {ParityDeviceType::CPU},
-            .parallelism = Parallelism::None,
-            .collective = Collective::None,
-            .thresholds = kQwen36MoE35BStrictSingleDeviceThresholds,
-            .model_path = "/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
-            .snapshot_dir = "pytorch_qwen36_moe_singledevice_cpu_snapshots",
-            .activation_precision = ActivationPrecision::FP32,
-            .kv_cache_precision = KVCachePrecision::FP16,
-        },
-        {
-            .name = "Qwen36MoE_35B_CUDA_KV_FP16",
-            .devices = {ParityDeviceType::CUDA},
-            .parallelism = Parallelism::None,
-            .collective = Collective::None,
-            .thresholds = kQwen36MoE35BStrictSingleDeviceThresholds,
-            .model_path = "/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
-            .snapshot_dir = "pytorch_qwen36_moe_singledevice_cuda_snapshots",
-            .activation_precision = ActivationPrecision::FP32,
-            .kv_cache_precision = KVCachePrecision::FP16,
-        },
-        {
-            .name = "Qwen36MoE_35B_ROCm_KV_FP16",
-            .devices = {ParityDeviceType::ROCm},
-            .parallelism = Parallelism::None,
-            .collective = Collective::None,
-            .thresholds = kQwen36MoE35BStrictSingleDeviceThresholds,
-            .model_path = "/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf",
-            .snapshot_dir = "pytorch_qwen36_moe_singledevice_rocm_snapshots",
-            .activation_precision = ActivationPrecision::FP32,
-            .kv_cache_precision = KVCachePrecision::FP16,
-        },
-    };
+            const std::array definitions = {
+                qwen36MoEParityDefinition(
+                    qwen36SingleDeviceTopology(
+                        "CPU0",
+                        GlobalDeviceAddress::cpu()),
+                    "pytorch_qwen36_moe_singledevice_cpu_snapshots",
+                    qwen36MoESingleDeviceThresholds()),
+                qwen36MoEParityDefinition(
+                    qwen36SingleDeviceTopology(
+                        "CUDA0",
+                        GlobalDeviceAddress::cuda(0)),
+                    "pytorch_qwen36_moe_singledevice_cuda_snapshots",
+                    qwen36MoESingleDeviceThresholds()),
+                qwen36MoEParityDefinition(
+                    qwen36SingleDeviceTopology(
+                        "ROCm0",
+                        GlobalDeviceAddress::rocm(0)),
+                    "pytorch_qwen36_moe_singledevice_rocm_snapshots",
+                    qwen36MoESingleDeviceThresholds()),
+            };
+            std::vector<ModelParityCase> expanded;
+            for (const auto &definition : definitions)
+            {
+                auto definition_cases =
+                    expandModelParityDefinition(definition);
+                expanded.insert(
+                    expanded.end(),
+                    std::make_move_iterator(definition_cases.begin()),
+                    std::make_move_iterator(definition_cases.end()));
+            }
+            return expanded;
+        }();
+        return cases;
+    }
 }
 
 class Qwen36MoESingleDeviceParityTest
     : public Qwen35MoEConfigDrivenParityTest<Qwen36MoESingleDeviceParityTest>,
-      public ::testing::WithParamInterface<TestConfig>
-{
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
-};
+      public ModelParityCaseParameter
+{};
 
 TEST_P(Qwen36MoESingleDeviceParityTest, ProductionParity)
 {
@@ -85,10 +84,10 @@ TEST_P(Qwen36MoESingleDeviceParityTest, ProductionParity)
 INSTANTIATE_TEST_SUITE_P(
     Qwen36MoE,
     Qwen36MoESingleDeviceParityTest,
-    ::testing::ValuesIn(kQwen36MoESingleDeviceConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
+    ::testing::ValuesIn(qwen36MoESingleDeviceCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {
-        return info.param.name;
+        return info.param.testName();
     });
 
 int main(int argc, char **argv)

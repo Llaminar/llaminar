@@ -209,6 +209,17 @@ namespace llaminar2::test::parity
              */
             bool certified(bool distributed_launch_certified) const
             {
+                /*
+                 * A request that completes in its first captured transaction
+                 * has no non-terminal graph to submit.  Absence of the
+                 * continuation counter is therefore the canonical zero value,
+                 * not missing evidence.  Once a continuation exists, its
+                 * tagged submission record remains mandatory and fail-closed.
+                 */
+                const bool continuation_submissions_certified =
+                    transaction_submissions == 0.0 ||
+                    (transaction_submission_observed &&
+                     transaction_submissions_valid);
                 return materialization_observed && materializations_valid &&
                        ((launch_observed && launches_valid &&
                          launches == terminal_response_bridges) ||
@@ -216,8 +227,7 @@ namespace llaminar2::test::parity
                        ticket_observed &&
                        tickets_valid && observation_observed &&
                        observations_valid &&
-                       transaction_submission_observed &&
-                       transaction_submissions_valid &&
+                       continuation_submissions_certified &&
                        terminal_submission_observed &&
                        terminal_submissions_valid &&
                        compact_reducer_observed && compact_reducers_valid &&
@@ -599,13 +609,16 @@ namespace llaminar2::test::parity
     /**
      * @brief Infer outer-loop ownership from request-local MTP PerfStats.
      *
-     * Every positive `mtp.device_generation_*` counter proves that the device
-     * generation controller participated.  Materialization, reuse, launch, and
-     * terminal-reduction records publish an `execution`, `execution_policy`, or
-     * `policy` tag.  All observed policy-bearing records must agree.  A future
-     * producer that omits or invents a spelling becomes `Unclassified`, while
-     * simultaneous native and hosted evidence becomes `Inconsistent`; neither
-     * state can accidentally certify a homogeneous production campaign.
+     * Every positive request-lifecycle `mtp.device_generation_*` counter proves
+     * that the device generation controller participated. Setup-only stream and
+     * storage initialization is deliberately excluded: ordinary MTP-off decode
+     * may construct persistent infrastructure without admitting a controller.
+     * Materialization, reuse, launch, and terminal-reduction records publish an
+     * `execution`, `execution_policy`, or `policy` tag. All observed
+     * policy-bearing records must agree. A future producer that omits or invents
+     * a spelling becomes `Unclassified`, while simultaneous native and hosted
+     * evidence becomes `Inconsistent`; neither state can accidentally certify a
+     * homogeneous production campaign.
      *
      * @param records PerfStats snapshot containing the `mtp` domain.
      * @return Typed controller-presence and outer-loop authority evidence.
@@ -622,7 +635,8 @@ namespace llaminar2::test::parity
         {
             if (record.kind != PerfStatRecord::Kind::Counter ||
                 record.domain != "mtp" || record.value <= 0.0 ||
-                !std::string_view(record.name).starts_with("device_generation_"))
+                !std::string_view(record.name).starts_with("device_generation_") ||
+                record.phase == "initialization")
             {
                 continue;
             }

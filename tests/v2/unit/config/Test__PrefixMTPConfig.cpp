@@ -73,16 +73,22 @@ namespace
     };
 } // namespace
 
-TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
+TEST(Test__PrefixMTPConfig, PrefixRestoreDefaultsToBoundedTieredStorage)
 {
     OrchestrationConfig config;
 
-    EXPECT_FALSE(config.prefix_cache.enabled);
+    EXPECT_TRUE(config.prefix_cache.enabled);
     EXPECT_EQ(config.prefix_cache.storage_mode, PrefixCacheStorageMode::Tiered);
     EXPECT_EQ(config.prefix_cache.block_size, 64);
-    EXPECT_EQ(config.prefix_cache.ram_budget_bytes, 4ull * 1024ull * 1024ull * 1024ull);
-    EXPECT_EQ(config.prefix_cache.device_budget_bytes, 256ull * 1024ull * 1024ull);
-    EXPECT_EQ(config.prefix_cache.disk_budget_bytes, 0u);
+    EXPECT_EQ(
+        config.prefix_cache.ram_budget_bytes,
+        kDefaultPrefixCacheRamBudgetBytes);
+    EXPECT_EQ(
+        config.prefix_cache.device_budget_bytes,
+        kDefaultPrefixCacheDeviceBudgetBytes);
+    EXPECT_EQ(
+        config.prefix_cache.disk_budget_bytes,
+        kDefaultPrefixCacheDiskBudgetBytes);
     const char *home = std::getenv("HOME");
     ASSERT_NE(home, nullptr);
     EXPECT_EQ(
@@ -113,6 +119,26 @@ TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 1.0);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.30);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.55);
+}
+
+TEST(Test__PrefixMTPConfig, CommandLineCanExplicitlyDisableDefaultPrefixRestore)
+{
+    ArgvHelper args({"llaminar2", "--no-prefix-cache"});
+
+    auto parser = createOrchestrationConfigParser();
+    const auto config = parser->parseArgs(args.argc(), args.argv());
+
+    EXPECT_FALSE(config.prefix_cache.enabled);
+    EXPECT_EQ(config.prefix_cache.storage_mode, PrefixCacheStorageMode::Tiered);
+    EXPECT_EQ(
+        config.prefix_cache.ram_budget_bytes,
+        kDefaultPrefixCacheRamBudgetBytes);
+    EXPECT_EQ(
+        config.prefix_cache.device_budget_bytes,
+        kDefaultPrefixCacheDeviceBudgetBytes);
+    EXPECT_EQ(
+        config.prefix_cache.disk_budget_bytes,
+        kDefaultPrefixCacheDiskBudgetBytes);
 }
 
 TEST(Test__PrefixMTPConfig, ROCmTopKSmallKPartialBlockOverrideIsValidated)

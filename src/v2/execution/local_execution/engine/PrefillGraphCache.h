@@ -63,6 +63,20 @@ namespace llaminar2
         Ready        ///< Graph instantiated, ready for replay
     };
 
+    /**
+     * @brief Submission lifecycle of one instantiated prefill executable.
+     *
+     * Capture and instantiation do not execute kernels. The first subsequent
+     * launch is transaction zero and must be distinguishable from steady
+     * replay so setup can seal graphs without pretending inference occurred.
+     */
+    enum class PrefillGraphExecutableSubmissionState
+    {
+        Empty,                  ///< No complete executable is owned.
+        MaterializedUnlaunched, ///< Instantiated executable awaits transaction zero.
+        ReplayReady,            ///< At least one successful launch completed.
+    };
+
     /// Controls how preflight treats padded-bucket stages that warm lazily.
     enum class PrefillGraphPreflightMode
     {
@@ -128,6 +142,8 @@ namespace llaminar2
         uint64_t capture_timestamp_ns = 0;         ///< When capture completed
         int replay_count = 0;                      ///< Number of successful replays
         uint64_t last_access_tick = 0;             ///< Monotonic LRU timestamp
+        PrefillGraphExecutableSubmissionState submission_state =
+            PrefillGraphExecutableSubmissionState::Empty; ///< Exact executable launch lifecycle.
     };
 
     /// Lifetime counters for a bucket key, retained even if the graph entry is evicted.
@@ -178,6 +194,23 @@ namespace llaminar2
 
         /// Mark warmup complete for a key. Transitions Cold → Warmup (arms capture).
         void markWarmedUp(const PrefillGraphCacheKey &key);
+
+        /**
+         * @brief Arm a cold entry for setup-only capture without eager inference.
+         *
+         * Serving-family setup has already allocated persistent graph storage
+         * and prepared immutable launch descriptors. It therefore transitions
+         * Cold directly to Initialized rather than executing a synthetic model
+         * request merely to enter Warmup.
+         *
+         * Repeating the call for an Initialized entry is idempotent. Any other
+         * state is a lifecycle violation because setup and request execution
+         * would then have competing ownership.
+         *
+         * @param key Exact admitted physical prefill bucket identity.
+         */
+        void markInitializedForSetupMaterialization(
+            const PrefillGraphCacheKey &key);
 
         /**
          * @brief Record and instantiate one prefill graph as an indivisible transaction.
@@ -260,6 +293,10 @@ namespace llaminar2
 
         /// Get replay count for an entry.
         int replayCount(const PrefillGraphCacheKey &key) const;
+
+        /** @return Whether a sealed executable still awaits transaction zero. */
+        bool materializedTransactionZeroPending(
+            const PrefillGraphCacheKey &key) const;
 
         /// Get number of entries evicted due to the configured cache cap.
         uint64_t evictionCount() const { return eviction_count_; }

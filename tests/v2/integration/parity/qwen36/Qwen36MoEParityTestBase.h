@@ -452,6 +452,189 @@ namespace llaminar2::test::parity::qwen36
         std::string old_deterministic_env_;
     };
 
+    /**
+     * @brief Own one production-shaped coordinated MPI inference session.
+     *
+     * A heterogeneous ExpertOverlay has exactly one frontend: the
+     * inventory-resolved continuation authority.  Every other MPI rank must
+     * remain in @ref IOrchestrationRunner::runMPIWorkerLoop while that
+     * authority issues public inference calls.  Having every parity process
+     * call `generate()` directly creates two frontends and bypasses the
+     * retained transaction-follower protocol that production actually uses.
+     *
+     * This scope makes that role split explicit and owns the terminal
+     * `SHUTDOWN` command.  Both sides retire their local runner before the
+     * final test-only barrier, so a following runner cannot enter setup while
+     * a peer still owns graphs or backend resources from this session.
+     */
+    class ScopedMoEParityCoordinatedSession
+    {
+    public:
+        /**
+         * @brief Admit all ranks to one coordinated serving session.
+         *
+         * @param runner Fully initialized production orchestration runner.
+         * @throws std::runtime_error when MPI is unavailable or the resolved
+         *         continuation authority is outside the active world.
+         */
+        explicit ScopedMoEParityCoordinatedSession(
+            IOrchestrationRunner &runner)
+            : runner_(runner)
+        {
+            int initialized = 0;
+            if (MPI_Initialized(&initialized) != MPI_SUCCESS || !initialized)
+            {
+                throw std::runtime_error(
+                    "Coordinated MoE parity requires an initialized MPI world");
+            }
+            if (MPI_Comm_rank(MPI_COMM_WORLD, &world_rank_) != MPI_SUCCESS ||
+                MPI_Comm_size(MPI_COMM_WORLD, &world_size_) != MPI_SUCCESS ||
+                world_size_ <= 1)
+            {
+                throw std::runtime_error(
+                    "Coordinated MoE parity requires more than one MPI rank");
+            }
+
+            authority_rank_ = runner_.coordinatedRootRank();
+            if (authority_rank_ < 0 || authority_rank_ >= world_size_)
+            {
+                throw std::runtime_error(
+                    "Coordinated MoE parity resolved an invalid continuation authority rank");
+            }
+
+            runner_.setMPICoordinatedMode(true);
+            if (MPI_Barrier(MPI_COMM_WORLD) != MPI_SUCCESS)
+            {
+                runner_.setMPICoordinatedMode(false);
+                throw std::runtime_error(
+                    "Coordinated MoE parity admission barrier failed");
+            }
+            active_ = true;
+        }
+
+        ScopedMoEParityCoordinatedSession(
+            const ScopedMoEParityCoordinatedSession &) = delete;
+        ScopedMoEParityCoordinatedSession &operator=(
+            const ScopedMoEParityCoordinatedSession &) = delete;
+
+        /** @return Whether this process owns continuation and public requests. */
+        [[nodiscard]] bool isAuthority() const noexcept
+        {
+            return world_rank_ == authority_rank_;
+        }
+
+        /** @return Inventory-resolved authority used by evidence broadcasts. */
+        [[nodiscard]] int authorityRank() const noexcept
+        {
+            return authority_rank_;
+        }
+
+        /**
+         * @brief Serve production commands until the authority closes the lane.
+         *
+         * Only a non-authority rank may enter this method.  It returns after
+         * observing the typed terminal command, retires local resources, and
+         * joins the same session-retirement barrier as the authority.
+         */
+        void serveFollowerAndFinish()
+        {
+            if (!active_ || isAuthority())
+            {
+                throw std::logic_error(
+                    "Only an active non-authority parity rank may serve the worker loop");
+            }
+            runner_.runMPIWorkerLoop();
+            finishLocal(/*publish_shutdown=*/false);
+        }
+
+        /**
+         * @brief Publish the terminal command and retire the authority runner.
+         */
+        void finishAuthority()
+        {
+            if (!active_ || !isAuthority())
+            {
+                throw std::logic_error(
+                    "Only an active parity authority may close the worker loop");
+            }
+            finishLocal(/*publish_shutdown=*/true);
+        }
+
+        /**
+         * @brief Ensure fatal GoogleTest exits still release every follower.
+         *
+         * Normal code calls @ref finishAuthority explicitly.  Assertions can
+         * return from the enclosing helper, so the authority destructor owns
+         * the same terminal transition as a last-resort test lifecycle guard.
+         */
+        ~ScopedMoEParityCoordinatedSession() noexcept
+        {
+            if (!active_ || !isAuthority())
+                return;
+            try
+            {
+                finishLocal(/*publish_shutdown=*/true);
+            }
+            catch (const std::exception &error)
+            {
+                std::cerr
+                    << "Failed to retire coordinated MoE parity session: "
+                    << error.what() << '\n';
+            }
+        }
+
+    private:
+        /**
+         * @brief Retire process-local state and rendezvous after graph teardown.
+         *
+         * @param publish_shutdown True only on the continuation authority.
+         */
+        void finishLocal(bool publish_shutdown)
+        {
+            if (publish_shutdown)
+                runner_.shutdownMPIWorkers();
+            runner_.setMPICoordinatedMode(false);
+            runner_.shutdown();
+            if (MPI_Barrier(MPI_COMM_WORLD) != MPI_SUCCESS)
+            {
+                throw std::runtime_error(
+                    "Coordinated MoE parity retirement barrier failed");
+            }
+            active_ = false;
+        }
+
+        IOrchestrationRunner &runner_;
+        int world_rank_ = -1;
+        int world_size_ = 0;
+        int authority_rank_ = -1;
+        bool active_ = false;
+    };
+
+    /**
+     * @brief Publish one authority-owned stage result to every parity rank.
+     *
+     * @param authority_rank Inventory-resolved continuation authority.
+     * @param authority_value Value supplied by that rank; ignored elsewhere.
+     * @return The exact authority value on every rank.
+     */
+    inline bool broadcastMoEParityAuthorityResult(
+        int authority_rank,
+        bool authority_value)
+    {
+        int value = authority_value ? 1 : 0;
+        if (MPI_Bcast(
+                &value,
+                1,
+                MPI_INT,
+                authority_rank,
+                MPI_COMM_WORLD) != MPI_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Coordinated MoE parity result broadcast failed");
+        }
+        return value != 0;
+    }
+
     class ScopedMoEPrefixCaseEnvironment
     {
     public:
@@ -652,6 +835,40 @@ namespace llaminar2::test::parity::qwen36
          * accelerators' current NUMA placement so moving cards between sockets
          * never requires changing a model topology fixture.
          */
+        domain.owner_rank = -1;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        domain.routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
+        domain.routed_decode_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        domain.routed_prefill_assignment_policy =
+            RoutedExpertAssignmentPolicy::StaticOwner;
+        return domain;
+    }
+
+    /**
+     * @brief Build one node-wide apportioned routed-expert domain.
+     *
+     * Participant addresses express hardware intent while the inventory
+     * binder resolves their MPI owners at runtime.  Keeping `world_ranks`
+     * empty here is deliberate: CPU socket ownership follows the launcher and
+     * NUMA placement rather than a fixture-hardcoded rank number.
+     *
+     * @param name Stable logical domain name.
+     * @param backend Node-local collective backend used by the domain.
+     * @param participants Physical CPU or accelerator addresses to bind.
+     * @return A NodeTP domain with whole-expert apportionment and static-owner
+     *         prefill/decode row assignment.
+     */
+    inline RoutedExpertDomain nodeTPMoEDomain(
+        const std::string &name,
+        CollectiveBackendType backend,
+        std::vector<GlobalDeviceAddress> participants)
+    {
+        RoutedExpertDomain domain;
+        domain.name = name;
+        domain.scope = ExecutionDomainScope::NODE_LOCAL;
+        domain.backend = backend;
+        domain.participants = std::move(participants);
         domain.owner_rank = -1;
         domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         domain.routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
@@ -1087,7 +1304,7 @@ namespace llaminar2::test::parity::qwen36
                 kRocmHotDomain,
                 CollectiveBackendType::RCCL,
                 {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}),
-            localTPMoEDomain(
+            nodeTPMoEDomain(
                 kCpuColdDomain,
                 CollectiveBackendType::UPI,
                 {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)}),
@@ -1633,20 +1850,13 @@ namespace llaminar2::test::parity::qwen36
         const MoEPrefixRestoreParityCase &test_case)
     {
         const int world_size = mpiWorldSize();
-        if (test_case.topology == MoEPrefixParityTopology::NodeTP)
+        if (world_size != test_case.mpi_ranks)
         {
-            if (world_size != test_case.mpi_ranks)
-            {
-                std::ostringstream oss;
-                oss << test_case.name << " requires exactly "
-                    << test_case.mpi_ranks << " MPI rank(s), got "
-                    << world_size;
-                return oss.str();
-            }
-        }
-        else if (world_size != 1)
-        {
-            return test_case.name + " is a local topology test and must run with one MPI rank";
+            std::ostringstream oss;
+            oss << test_case.name << " requires exactly "
+                << test_case.mpi_ranks << " MPI rank(s), got "
+                << world_size;
+            return oss.str();
         }
 
         if (test_case.required_cuda_devices > 0 || test_case.required_rocm_devices > 0)
@@ -1888,6 +2098,7 @@ namespace llaminar2::test::parity::qwen36
             };
             test_case.required_rocm_devices = 2;
             test_case.required_cpu_sockets = 2;
+            test_case.mpi_ranks = 2;
             test_case.moe_routed_expert_plan =
                 qwen36MoEOverlayPlanRocm2TPHotCpu2LocalTPCold();
             break;
@@ -4124,23 +4335,97 @@ namespace llaminar2::test::parity::qwen36
         phase_start = parityPhaseStart();
         ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
         logMoEParityPhase(test_case, "mtp-baseline.initialize", phase_start);
+        GenerationResult baseline_result;
+        PrefixRuntimeStateSnapshot baseline_snapshot;
+        bool baseline_authority = true;
+        int baseline_authority_rank = 0;
         phase_start = parityPhaseStart();
-        auto baseline_result = baseline->generate(prompt_tokens, test_case.decode_steps, greedy);
-        logMoEParityPhase(test_case, "mtp-baseline.generate", phase_start);
-        const auto baseline_snapshot = baseline->prefixStateProbe();
-        baseline->shutdown();
-
-        ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
-        ASSERT_EQ(
-            baseline_result.tokens.size(),
-            static_cast<size_t>(test_case.decode_steps));
-        if (test_case.reference_input_source ==
-            MoEReferenceInputSource::PyTorchMetadata)
+        if (test_case.mpi_ranks > 1)
         {
-            ASSERT_EQ(baseline_result.tokens.size(), expected_tokens.size());
+            ScopedMoEParityCoordinatedSession baseline_session(*baseline);
+            baseline_authority = baseline_session.isAuthority();
+            baseline_authority_rank = baseline_session.authorityRank();
+            if (baseline_authority)
+            {
+                baseline_result = baseline->generate(
+                    prompt_tokens,
+                    test_case.decode_steps,
+                    greedy);
+                baseline_snapshot = baseline->prefixStateProbe();
+                baseline_session.finishAuthority();
+            }
+            else
+            {
+                baseline_session.serveFollowerAndFinish();
+            }
+
+            std::string baseline_failure;
+            if (baseline_authority)
+            {
+                if (!baseline_result.error.empty())
+                {
+                    baseline_failure = baseline_result.error;
+                }
+                else if (baseline_result.tokens.size() !=
+                         static_cast<size_t>(test_case.decode_steps))
+                {
+                    baseline_failure =
+                        "baseline returned " +
+                        std::to_string(baseline_result.tokens.size()) +
+                        " tokens, expected " +
+                        std::to_string(test_case.decode_steps);
+                }
+                else if (test_case.reference_input_source ==
+                             MoEReferenceInputSource::PyTorchMetadata &&
+                         baseline_result.tokens.size() !=
+                             expected_tokens.size())
+                {
+                    baseline_failure =
+                        "baseline token count disagrees with authenticated PyTorch metadata";
+                }
+            }
+            const bool baseline_ok = broadcastMoEParityAuthorityResult(
+                baseline_authority_rank,
+                baseline_authority && baseline_failure.empty());
+            if (!baseline_ok)
+            {
+                if (baseline_authority)
+                {
+                    ADD_FAILURE()
+                        << "Coordinated MoE baseline generation failed: "
+                        << baseline_failure;
+                }
+                return;
+            }
         }
-        EXPECT_EQ(baseline_snapshot.prefix_cache_hits, 0u);
-        EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
+        else
+        {
+            baseline_result = baseline->generate(
+                prompt_tokens,
+                test_case.decode_steps,
+                greedy);
+            baseline_snapshot = baseline->prefixStateProbe();
+            baseline->shutdown();
+            ASSERT_TRUE(baseline_result.error.empty())
+                << baseline_result.error;
+            ASSERT_EQ(
+                baseline_result.tokens.size(),
+                static_cast<size_t>(test_case.decode_steps));
+            if (test_case.reference_input_source ==
+                MoEReferenceInputSource::PyTorchMetadata)
+            {
+                ASSERT_EQ(
+                    baseline_result.tokens.size(),
+                    expected_tokens.size());
+            }
+        }
+        logMoEParityPhase(test_case, "mtp-baseline.generate", phase_start);
+
+        if (baseline_authority)
+        {
+            EXPECT_EQ(baseline_snapshot.prefix_cache_hits, 0u);
+            EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
+        }
 
         // MTP greedy verification must preserve the main-model Llaminar greedy
         // stream exactly. PyTorch layer/logit tolerances are enforced by the
@@ -4159,6 +4444,38 @@ namespace llaminar2::test::parity::qwen36
         phase_start = parityPhaseStart();
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
         logMoEParityPhase(test_case, "mtp.initialize", phase_start);
+
+        /*
+         * Prefix-cache initialization can materialize the retained decode and
+         * verifier graph families before the first request. Backend dispatch
+         * counters are emitted when those graphs select their kernels; replay
+         * correctly does not re-enter the host dispatcher. Preserve that
+         * immutable selection evidence across the request-local PerfStats
+         * reset, but use it only for the kernel-path assertion below.
+         */
+        const auto mtp_graph_selection_records =
+            PerfStatsCollector::snapshot({"kernel", "forward_graph"});
+
+        std::unique_ptr<ScopedMoEParityCoordinatedSession>
+            mtp_coordinated_session;
+        if (test_case.mpi_ranks > 1)
+        {
+            mtp_coordinated_session =
+                std::make_unique<ScopedMoEParityCoordinatedSession>(*mtp);
+            if (!mtp_coordinated_session->isAuthority())
+            {
+                mtp_coordinated_session->serveFollowerAndFinish();
+                PerfStatsCollector::reset();
+                return;
+            }
+        }
+        const auto finish_mtp_runner = [&]()
+        {
+            if (mtp_coordinated_session)
+                mtp_coordinated_session->finishAuthority();
+            else
+                mtp->shutdown();
+        };
 
         /*
          * A decode graph's first invocation is its allocation-free warmup; the
@@ -4235,6 +4552,11 @@ namespace llaminar2::test::parity::qwen36
         const auto after_first = mtp->prefixStateProbe();
         const auto first_records = PerfStatsCollector::snapshot(
             {"mtp", "prefix_cache", "moe_rebalance", "kernel", "forward_graph"});
+        auto first_kernel_path_records = mtp_graph_selection_records;
+        first_kernel_path_records.insert(
+            first_kernel_path_records.end(),
+            first_records.begin(),
+            first_records.end());
         ASSERT_TRUE(first.error.empty()) << first.error;
         ASSERT_EQ(first.tokens.size(), reference_tokens.size());
         EXPECT_EQ(first.tokens, reference_tokens);
@@ -4247,7 +4569,7 @@ namespace llaminar2::test::parity::qwen36
             test_case.name + " first request");
         expectMoEBackendKernelPerfPath(
             test_case,
-            first_records,
+            first_kernel_path_records,
             test_case.name + " first request");
         expectMoERebalancePerfPath(
             test_case,
@@ -4260,7 +4582,7 @@ namespace llaminar2::test::parity::qwen36
 
         if (!enable_prefix_cache)
         {
-            mtp->shutdown();
+            finish_mtp_runner();
             PerfStatsCollector::reset();
             return;
         }
@@ -4277,7 +4599,7 @@ namespace llaminar2::test::parity::qwen36
         const auto after_second = mtp->prefixStateProbe();
         const auto second_records = PerfStatsCollector::snapshot(
             {"mtp", "prefix_cache", "moe_rebalance", "kernel", "forward_graph"});
-        mtp->shutdown();
+        finish_mtp_runner();
 
         ASSERT_TRUE(second.error.empty()) << second.error;
         ASSERT_EQ(second.tokens.size(), reference_tokens.size());

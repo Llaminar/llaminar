@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <cstdint>
+#include <exception>
 
 namespace llaminar2
 {
@@ -1122,30 +1123,84 @@ namespace llaminar2
 
     // ── pinHostMemory / unpinHostMemory ────────────────────────────────────
 
-    bool CUDABackend::pinHostMemory(void *ptr, size_t bytes)
+    bool CUDABackend::pinHostMemory(void *ptr, size_t bytes, int device_id)
     {
-        cudaError_t err = cudaHostRegister(ptr, bytes, cudaHostRegisterDefault);
+        int previous_device = -1;
+        cudaError_t err = cudaGetDevice(&previous_device);
+        if (!ptr || bytes == 0 || device_id < 0 ||
+            err != cudaSuccess || cudaSetDevice(device_id) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            LOG_WARN("[CUDABackend::pinHostMemory] invalid registration for CUDA:"
+                     << device_id << " ptr=" << ptr << " bytes=" << bytes);
+            return false;
+        }
+
+        err = cudaHostRegister(ptr, bytes, cudaHostRegisterPortable);
         if (err != cudaSuccess)
         {
             LOG_WARN("[CUDABackend::pinHostMemory] cudaHostRegister failed for "
-                     << bytes << " bytes: " << cudaGetErrorString(err));
+                     << bytes << " bytes on CUDA:" << device_id << ": "
+                     << cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            if (previous_device != device_id)
+                (void)cudaSetDevice(previous_device);
             return false;
+        }
+        if (previous_device != device_id &&
+            cudaSetDevice(previous_device) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            LOG_ERROR("[CUDABackend::pinHostMemory] could not restore CUDA:"
+                      << previous_device << " after registering on CUDA:"
+                      << device_id);
+            /* The failed restore leaves the registration context current, so
+             * retire the mapping before terminating. Continuing would expose
+             * both a leaked registration and an unknown current device. */
+            if (cudaHostUnregister(ptr) != cudaSuccess)
+            {
+                (void)cudaGetLastError();
+            }
+            std::terminate();
         }
         return true;
     }
 
-    bool CUDABackend::unpinHostMemory(void *ptr)
+    bool CUDABackend::unpinHostMemory(void *ptr, int device_id)
     {
-        cudaError_t err = cudaHostUnregister(ptr);
+        int previous_device = -1;
+        cudaError_t err = cudaGetDevice(&previous_device);
+        if (!ptr || device_id < 0 || err != cudaSuccess ||
+            cudaSetDevice(device_id) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            LOG_ERROR("[CUDABackend::unpinHostMemory] invalid retirement for CUDA:"
+                      << device_id << " ptr=" << ptr);
+            return false;
+        }
+
+        err = cudaHostUnregister(ptr);
         if (err != cudaSuccess)
         {
             LOG_WARN("[CUDABackend::unpinHostMemory] cudaHostUnregister failed: "
-                     << cudaGetErrorString(err));
+                     << cudaGetErrorString(err) << " owner=CUDA:" << device_id
+                     << " ptr=" << ptr);
             // Clear the sticky CUDA error so it doesn't contaminate subsequent
             // CUDA operations (kernel launches, memcpy, etc.).  This commonly
             // happens during teardown when mmap pages are already unmapped.
             (void)cudaGetLastError();
+            if (previous_device != device_id)
+                (void)cudaSetDevice(previous_device);
             return false;
+        }
+        if (previous_device != device_id &&
+            cudaSetDevice(previous_device) != cudaSuccess)
+        {
+            (void)cudaGetLastError();
+            LOG_ERROR("[CUDABackend::unpinHostMemory] could not restore CUDA:"
+                      << previous_device << " after retiring registration on CUDA:"
+                      << device_id);
+            std::terminate();
         }
         return true;
     }

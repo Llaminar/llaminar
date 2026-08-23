@@ -494,6 +494,40 @@ namespace llaminar2
             return config;
         };
 
+        /**
+         * Install the graph/weight authority's exact local TP assignment into
+         * auto-capacity accounting. This is deliberately shared through
+         * TensorParallelConfig rather than reimplementing remainder or GQA
+         * replication rules in the capacity planner.
+         */
+        const auto bindRankLocalTPAssignment = [&profile](
+            DevicePlanConfig &config,
+            const std::vector<GlobalDeviceAddress> &participants,
+            const std::vector<float> &configured_weights)
+        {
+            if (participants.size() <= 1u)
+                return;
+
+            std::vector<DeviceId> devices;
+            devices.reserve(participants.size());
+            for (const auto &participant : participants)
+                devices.push_back(participant.toLocalDeviceId());
+            std::vector<float> weights = configured_weights;
+            if (weights.empty())
+                weights.assign(devices.size(), 1.0f);
+
+            const auto assignments =
+                TensorParallelConfig::proportionalSplit(
+                    devices,
+                    weights,
+                    profile.n_heads,
+                    profile.n_kv_heads,
+                    profile.d_ff,
+                    profile.vocab_size);
+            config.bindTensorParallelAssignment(
+                assignments.forRank(config.shard_index));
+        };
+
         for (const auto &shard : continuationShards(
                  rank_plan, input.rank_execution_kind))
         {
@@ -504,6 +538,37 @@ namespace llaminar2
                 DeviceExecutionMemoryRole::ContinuationGraph);
             config.first_layer = shard.first_layer;
             config.last_layer = shard.last_layer;
+            if (rank_plan.usesLocalTP())
+            {
+                bindRankLocalTPAssignment(
+                    config,
+                    rank_plan.local_tp_devices,
+                    rank_plan.local_tp_weights);
+            }
+            else if (rank_plan.usesLocalPP())
+            {
+                const auto &boundaries =
+                    rank_plan.local_pp_layer_boundaries;
+                for (std::size_t stage = 0;
+                     stage < rank_plan.local_pp_stage_tp_info.size() &&
+                     stage + 1u < boundaries.size();
+                     ++stage)
+                {
+                    const auto &stage_tp =
+                        rank_plan.local_pp_stage_tp_info[stage];
+                    if (stage_tp.devices.size() <= 1u ||
+                        boundaries[stage] != config.first_layer ||
+                        boundaries[stage + 1u] - 1 != config.last_layer)
+                    {
+                        continue;
+                    }
+                    bindRankLocalTPAssignment(
+                        config,
+                        stage_tp.devices,
+                        stage_tp.tp_weights);
+                    break;
+                }
+            }
             resource_devices.insert(config.device);
             configs.push_back(std::move(config));
         }

@@ -51,7 +51,7 @@ namespace llaminar2
             if (ec)
             {
                 if (error)
-                    *error = "failed to canonicalize file for SHA-256 identity: " +
+                    *error = "failed to canonicalize file identity: " +
                              path.string() + ": " + ec.message();
                 return {};
             }
@@ -60,14 +60,14 @@ namespace llaminar2
             if (::stat(canonical.c_str(), &status) != 0)
             {
                 if (error)
-                    *error = "failed to stat file for SHA-256 identity: " +
+                    *error = "failed to stat file identity: " +
                              canonical.string() + ": " + std::strerror(errno);
                 return {};
             }
             if (!S_ISREG(status.st_mode))
             {
                 if (error)
-                    *error = "SHA-256 identity requires a regular file: " +
+                    *error = "file identity requires a regular file: " +
                              canonical.string();
                 return {};
             }
@@ -558,6 +558,52 @@ namespace llaminar2
             return std::nullopt;
         }
         return computed.digest;
+    }
+
+    std::optional<std::string> sha256FileSetIdentityHex(
+        const std::vector<std::filesystem::path> &paths,
+        std::string *error)
+    {
+        if (error)
+            error->clear();
+        if (paths.empty())
+        {
+            if (error)
+                *error = "model artifact identity requires at least one file";
+            return std::nullopt;
+        }
+
+        std::string material = "llaminar-model-artifact-filesystem-v1\n";
+        material += std::to_string(paths.size()) + "\n";
+        for (std::size_t index = 0; index < paths.size(); ++index)
+        {
+            std::string identity_error;
+            const std::string identity =
+                fileIdentityKey(paths[index], &identity_error);
+            if (identity.empty())
+            {
+                if (error)
+                {
+                    *error = "failed to capture model artifact file " +
+                             std::to_string(index) + ": " + identity_error;
+                }
+                return std::nullopt;
+            }
+
+            /*
+             * Length-prefix every descriptor so path newlines and adjacent
+             * split identities cannot produce an ambiguous concatenation.
+             */
+            material += std::to_string(index) + "\n";
+            material += std::to_string(identity.size()) + "\n";
+            material += identity;
+            material += '\n';
+        }
+
+        const DigestResult digest = computeBytesDigest(material);
+        if (error)
+            *error = digest.error;
+        return digest.digest;
     }
 
     std::optional<std::string> sha256BytesHex(

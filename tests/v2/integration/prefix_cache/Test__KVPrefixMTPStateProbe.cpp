@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include "backends/BackendManager.h"
 #include "backends/ComputeBackend.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -28,6 +29,8 @@
 #include "loaders/ModelLoader.h"
 #include "models/qwen/QwenStandardGraph.h"
 #include "models/qwen35/Qwen35Graph.h"
+#include "loaders/WeightPlan.h"
+#include "transfer/TransferEngine.h"
 #include "utils/MPIContext.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/Sampler.h"
@@ -1373,7 +1376,7 @@ namespace
 
     void prepareDenseForwardWeights(
         const DeviceGraphOrchestrator &orchestrator,
-        QwenStandardGraph &graph_builder,
+        IGraphBuilder &graph_builder,
         PreparedWeightStore &store,
         DeviceId device)
     {
@@ -1382,9 +1385,7 @@ namespace
 
         for (const auto &source_binding : frozen->bindings())
         {
-            if (!source_binding.tensor ||
-                source_binding.tensor->shape().size() != 2 ||
-                source_binding.identity.role == WeightRole::Embedding)
+            if (!source_binding.tensor)
             {
                 continue;
             }
@@ -1393,7 +1394,15 @@ namespace
             binding.residency.home_device = device;
             binding.residency.resident_device = device;
             ASSERT_TRUE(binding.tensor->ensureOnDevice(device));
-            store.prepareGemm(binding);
+            if (binding.identity.role == WeightRole::Embedding)
+            {
+                /* FP32 embeddings execute directly from their resident table. */
+                continue;
+            }
+            else if (binding.tensor->shape().size() == 2)
+            {
+                store.prepareGemm(binding);
+            }
         }
 
         graph_builder.setPreparedWeightStore(&store);
@@ -4123,6 +4132,8 @@ namespace
             std::unique_ptr<FP32Tensor> wk;
             std::unique_ptr<FP32Tensor> wv;
             std::unique_ptr<FP32Tensor> wo;
+            std::unique_ptr<FP32Tensor> q_norm;
+            std::unique_ptr<FP32Tensor> k_norm;
             std::unique_ptr<FP32Tensor> ffn_norm;
             std::unique_ptr<FP32Tensor> gate_proj;
             std::unique_ptr<FP32Tensor> up_proj;
@@ -4135,6 +4146,10 @@ namespace
         std::unique_ptr<FP32Tensor> embedding_table;
         std::unique_ptr<FP32Tensor> final_norm;
         std::unique_ptr<FP32Tensor> lm_head;
+        std::unique_ptr<FP32Tensor> mtp_fc;
+        std::unique_ptr<FP32Tensor> mtp_pre_hidden_norm;
+        std::unique_ptr<FP32Tensor> mtp_pre_embedding_norm;
+        std::unique_ptr<FP32Tensor> mtp_final_norm;
         std::vector<LayerTensors> layers;
 
         explicit TinyQwenForwardFixture(DeviceId device)
@@ -4156,6 +4171,19 @@ namespace
             config.use_graph_buffer_management = true;
             config.mtp.enabled = true;
             config.mtp.draft_tokens = 1;
+            config.mtp_request_terminal_hidden_publication =
+                MTPRequestTerminalHiddenPublicationPolicy::
+                    GraphCapturedDeviceGeometry;
+            config.mtp_shifted_prefill_hidden_publication =
+                MTPShiftedPrefillHiddenPublicationPolicy::
+                    GraphIntegratedKVTransaction;
+            config.partial_rotary_factor = 1.0f;
+            config.layer_types = {"full_attention"};
+            config.gdn.conv_kernel_size = 4;
+            config.gdn.state_size = config.head_dim;
+            config.gdn.inner_size = config.d_model;
+            config.gdn.group_count = config.n_kv_heads;
+            config.gdn.time_step_rank = config.n_heads;
 
             const size_t d = static_cast<size_t>(config.d_model);
             const size_t q_dim = static_cast<size_t>(config.n_heads * config.head_dim);
@@ -4166,16 +4194,27 @@ namespace
             embedding_table = TestTensorFactory::createFP32Random({vocab, d}, -0.02f, 0.02f, 201);
             final_norm = TestTensorFactory::createFP32Ones({d});
             lm_head = TestTensorFactory::createFP32Random({vocab, d}, -0.02f, 0.02f, 202);
+            mtp_fc = TestTensorFactory::createFP32Random({d, d * 2}, -0.02f, 0.02f, 203);
+            mtp_pre_hidden_norm = TestTensorFactory::createFP32Ones({d});
+            mtp_pre_embedding_norm = TestTensorFactory::createFP32Ones({d});
+            mtp_final_norm = TestTensorFactory::createFP32Ones({d});
 
             layers.resize(static_cast<size_t>(config.n_layers));
             for (int i = 0; i < config.n_layers; ++i)
             {
                 auto &layer = layers[static_cast<size_t>(i)];
                 layer.attn_norm = TestTensorFactory::createFP32Ones({d});
-                layer.wq = TestTensorFactory::createFP32Random({q_dim, d}, -0.02f, 0.02f, 210 + i);
+                /*
+                 * Qwen3.5 full-attention projects one query row and one gate
+                 * row per head.  This real model layout also selects the
+                 * Qwen3.5 schema that owns the MTP scratch capacities below.
+                 */
+                layer.wq = TestTensorFactory::createFP32Random({q_dim * 2, d}, -0.02f, 0.02f, 210 + i);
                 layer.wk = TestTensorFactory::createFP32Random({kv_dim, d}, -0.02f, 0.02f, 220 + i);
                 layer.wv = TestTensorFactory::createFP32Random({kv_dim, d}, -0.02f, 0.02f, 230 + i);
                 layer.wo = TestTensorFactory::createFP32Random({d, q_dim}, -0.02f, 0.02f, 240 + i);
+                layer.q_norm = TestTensorFactory::createFP32Ones({static_cast<size_t>(config.head_dim)});
+                layer.k_norm = TestTensorFactory::createFP32Ones({static_cast<size_t>(config.head_dim)});
                 layer.ffn_norm = TestTensorFactory::createFP32Ones({d});
                 layer.gate_proj = TestTensorFactory::createFP32Random({ff, d}, -0.02f, 0.02f, 250 + i);
                 layer.up_proj = TestTensorFactory::createFP32Random({ff, d}, -0.02f, 0.02f, 260 + i);
@@ -4183,25 +4222,75 @@ namespace
             }
         }
 
-        ModelWeights modelWeights()
+        /**
+         * @brief Build the immutable main-plus-depth-zero weight authority.
+         *
+         * The shifted-prefill transaction is part of the serving graph family,
+         * so a valid probe must declare its MTP weights before setup capture.
+         * Reusing the tiny main attention/FFN tensors under distinct MTP binding
+         * identities keeps the fixture small without weakening that lifecycle.
+         */
+        std::unique_ptr<FrozenModelWeightSet> frozenWeightSet() const
         {
-            ModelWeights weights;
-            weights.embedding_table = embedding_table.get();
-            weights.final_norm = final_norm.get();
-            weights.lm_head = lm_head.get();
-            weights.get_layer_weights = [this](int layer_idx)
+            InferenceStrategy strategy;
+            strategy.mode = WeightInferenceMode::SingleDevice;
+            strategy.devices.push_back(config.default_device);
+
+            ModelWeightSetBuilder builder(strategy);
+            auto add = [&](const std::string &name,
+                           TensorBase *tensor,
+                           WeightRole role)
             {
-                const auto &src = layers.at(static_cast<size_t>(layer_idx));
-                LayerWeights layer;
-                layer.attn_norm = src.attn_norm.get();
-                layer.wq = src.wq.get();
-                layer.wk = src.wk.get();
-                layer.wv = src.wv.get();
-                layer.wo = src.wo.get();
-                layer.ffn_norm = src.ffn_norm.get();
-                return layer;
+                WeightBinding binding;
+                binding.identity.canonical_name = name;
+                binding.identity.role = role;
+                binding.identity.layer = inferWeightLayer(name);
+                binding.identity.logical_id = stableWeightLogicalId(name);
+                binding.residency.home_device = config.default_device;
+                binding.residency.resident_device = config.default_device;
+                binding.tensor = tensor;
+                binding.immutable = true;
+                builder.addBinding(std::move(binding));
             };
-            return weights;
+
+            add("token_embd.weight", embedding_table.get(), WeightRole::Embedding);
+            add("output_norm.weight", final_norm.get(), WeightRole::OutputNorm);
+            add("output.weight", lm_head.get(), WeightRole::LMHead);
+
+            const LayerTensors &layer = layers.front();
+            add("blk.0.attn_norm.weight", layer.attn_norm.get(), WeightRole::Norm);
+            add("blk.0.attn_q.weight", layer.wq.get(), WeightRole::AttentionQ);
+            add("blk.0.attn_k.weight", layer.wk.get(), WeightRole::AttentionK);
+            add("blk.0.attn_v.weight", layer.wv.get(), WeightRole::AttentionV);
+            add("blk.0.attn_output.weight", layer.wo.get(), WeightRole::AttentionWO);
+            add("blk.0.attn_q_norm.weight", layer.q_norm.get(), WeightRole::Norm);
+            add("blk.0.attn_k_norm.weight", layer.k_norm.get(), WeightRole::Norm);
+            add("blk.0.post_attention_norm.weight", layer.ffn_norm.get(), WeightRole::Norm);
+            add("blk.0.ffn_gate.weight", layer.gate_proj.get(), WeightRole::FFNGate);
+            add("blk.0.ffn_up.weight", layer.up_proj.get(), WeightRole::FFNUp);
+            add("blk.0.ffn_down.weight", layer.down_proj.get(), WeightRole::FFNDown);
+
+            add("mtp.fc.weight", mtp_fc.get(), WeightRole::Other);
+            add("mtp.pre_fc_norm_hidden.weight", mtp_pre_hidden_norm.get(), WeightRole::Norm);
+            add("mtp.pre_fc_norm_embedding.weight", mtp_pre_embedding_norm.get(), WeightRole::Norm);
+            add("mtp.norm.weight", mtp_final_norm.get(), WeightRole::Norm);
+            add("mtp.layers.0.input_layernorm.weight", layer.attn_norm.get(), WeightRole::Norm);
+            add("mtp.layers.0.self_attn.q_proj.weight", layer.wq.get(), WeightRole::AttentionQ);
+            add("mtp.layers.0.self_attn.k_proj.weight", layer.wk.get(), WeightRole::AttentionK);
+            add("mtp.layers.0.self_attn.v_proj.weight", layer.wv.get(), WeightRole::AttentionV);
+            add("mtp.layers.0.self_attn.o_proj.weight", layer.wo.get(), WeightRole::AttentionWO);
+            add("mtp.layers.0.self_attn.q_norm.weight", layer.q_norm.get(), WeightRole::Norm);
+            add("mtp.layers.0.self_attn.k_norm.weight", layer.k_norm.get(), WeightRole::Norm);
+            add("mtp.layers.0.post_attention_layernorm.weight", layer.ffn_norm.get(), WeightRole::Norm);
+            add("mtp.layers.0.mlp.gate_proj.weight", layer.gate_proj.get(), WeightRole::FFNGate);
+            add("mtp.layers.0.mlp.up_proj.weight", layer.up_proj.get(), WeightRole::FFNUp);
+            add("mtp.layers.0.mlp.down_proj.weight", layer.down_proj.get(), WeightRole::FFNDown);
+
+            auto frozen = std::make_unique<FrozenModelWeightSet>(
+                strategy,
+                builder.freezeBindings());
+            frozen->validateForGraph();
+            return frozen;
         }
     };
 
@@ -4419,6 +4508,14 @@ namespace
             {
                 ASSERT_NE(tensor, nullptr);
                 ASSERT_TRUE(tensor->allocateOnDevice(device));
+                /*
+                 * These fixture tensors stand in for BufferArena-owned graph
+                 * activations. Publish that ownership explicitly so every
+                 * downstream stage consumes the preceding graph writer on the
+                 * retained execution stream, rather than treating the unused
+                 * host allocation as an external authoritative input.
+                 */
+                TransferEngine::publishGraphOwnedDeviceWrite(tensor, device);
             }
         }
 
@@ -4474,6 +4571,9 @@ TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_ResetStateInventory)
         GTEST_SKIP() << "No CUDA or ROCm GPU available for prefix-cache state probe";
     }
 
+    ScopedDebugEnv logical_state_probe({
+        {"LLAMINAR_PREFIX_PROBE_CAPTURE_DEVICE_LOGICAL_STATE", "1"},
+    });
     auto factory = createOrchestrationRunnerFactory();
     auto runner = factory->createFromOrchestrationConfig(makeSingleGpuConfig(*device_spec));
     ASSERT_NE(runner, nullptr);
@@ -4540,6 +4640,9 @@ TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_GPUCacheFlagPreservesGreedyInferen
         GTEST_SKIP() << "No CUDA or ROCm GPU available for prefix-cache GPU integration probe";
     }
 
+    ScopedDebugEnv logical_state_probe({
+        {"LLAMINAR_PREFIX_PROBE_CAPTURE_DEVICE_LOGICAL_STATE", "1"},
+    });
     auto factory = createOrchestrationRunnerFactory();
     auto runner = factory->createFromOrchestrationConfig(makeSingleGpuPrefixCacheConfig(*device_spec));
     ASSERT_NE(runner, nullptr);
@@ -4734,6 +4837,8 @@ TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_CPUPrefixCacheFullHitRecordsReuse)
     auto baseline_result = baseline->generate(prompt, 1, greedy);
     ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
     ASSERT_EQ(baseline_result.tokens.size(), 1u);
+    baseline->shutdown();
+    baseline.reset();
 
     auto cached = factory->createFromOrchestrationConfig(makeSingleCpuConfig(true));
     ASSERT_NE(cached, nullptr);
@@ -4758,6 +4863,7 @@ TEST(Test__KVPrefixMTPStateProbe, DenseQwen25_CPUPrefixCacheFullHitRecordsReuse)
     EXPECT_GE(after_second.prefix_cache_hits, 2u)
         << "Second full prompt should reuse both cached 2-token dense prefix blocks";
     EXPECT_EQ(after_second.current_position, static_cast<int>(prompt.size()));
+    cached->shutdown();
 }
 
 TEST(Test__KVPrefixMTPStateProbe, MTP_ModelInventoryWhenAvailable)
@@ -7450,19 +7556,34 @@ TEST(Test__KVPrefixMTPStateProbe, MTP_ShiftedCacheCountProbeOnGPU)
         GTEST_SKIP() << "No CUDA or ROCm GPU available for MTP shifted-cache probe";
     }
 
+    ScopedDebugEnv logical_state_probe({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFIX_PROBE_CAPTURE_DEVICE_LOGICAL_STATE", "1"},
+    });
     TinyQwenForwardFixture fixture(*device);
-    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
     DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
 
     ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
         /*batch_size=*/1,
         fixture.config.max_seq_len,
         *device));
-    orchestrator.setWeights(fixture.modelWeights());
+    orchestrator.setFrozenWeightSet(fixture.frozenWeightSet());
     PreparedWeightStore prepared_store;
     ASSERT_NO_THROW(prepareDenseForwardWeights(orchestrator, *graph_builder, prepared_store, *device));
 
     const std::vector<int> prefix_tokens = {1, 2, 3, 4};
+    const ServingGraphFamilyMaterializationPlan serving_family{
+        .prefill_bucket_rows = {
+            static_cast<int>(prefix_tokens.size()),
+        },
+        .prefill_pad_token_id = 0,
+        .main_decode_graph =
+            ServingMainDecodeGraphKind::HistoryBearingSerial,
+    };
+    ASSERT_TRUE(
+        orchestrator.materializeServingGraphFamilyWithoutLaunch(
+            serving_family));
     ASSERT_NE(orchestrator.forward(prefix_tokens.data(), static_cast<int>(prefix_tokens.size()), 1), nullptr);
 
     const auto after_prefill = orchestrator.prefixStateProbe();
@@ -7501,16 +7622,6 @@ TEST(Test__KVPrefixMTPStateProbe, MTP_SidecarOneTokenExecutesOnGPU)
     graph_builder.setWeights(toLegacyModelWeights(fixture.bindings));
     graph_builder.setPreparedWeightStore(&prepared_store);
 
-    auto input = fixture.input();
-    auto output = fixture.output();
-    ComputeGraph graph = graph_builder.buildMTPGraph(
-        /*depth_idx=*/0,
-        fixture.mtp_depth_bindings,
-        input,
-        output);
-    ASSERT_GT(graph.size(), 0u);
-    EXPECT_EQ(graph.terminalNode(), "mtp0_lm_head");
-
     auto &pool = GPUDeviceContextPool::instance();
     IWorkerGPUContext *ctx = nullptr;
     if (device->is_cuda())
@@ -7522,6 +7633,23 @@ TEST(Test__KVPrefixMTPStateProbe, MTP_SidecarOneTokenExecutesOnGPU)
         ctx = &pool.getAMDContext(device->rocm_ordinal());
     }
     ASSERT_NE(ctx, nullptr);
+
+    auto input = fixture.input();
+    auto output = fixture.output();
+    ComputeGraph graph;
+    ctx->submitAndWait([&]
+                       {
+                           input.device_state_publication_stream =
+                               ctx->defaultStream();
+                           graph = graph_builder.buildMTPGraph(
+                               /*depth_idx=*/0,
+                               fixture.mtp_depth_bindings,
+                               input,
+                               output);
+                       });
+    ASSERT_GT(graph.size(), 0u);
+    EXPECT_EQ(graph.terminalNode(), "mtp0_lm_head");
+
     auto device_ctx = IDeviceContext::create(*device, 1);
     ASSERT_NE(device_ctx, nullptr);
 
@@ -7569,6 +7697,15 @@ int main(int argc, char **argv)
 {
     int provided = 0;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+
+    /*
+     * This standalone integration binary does not enter the application MPI
+     * bootstrap.  Declare its one aggregate host-memory domain explicitly so
+     * CPU arena/workspace allocations use the same backend contract as a
+     * bootstrapped production rank.
+     */
+    if (!hasCPUBackend())
+        initCPUBackend(-1);
 
     ::testing::InitGoogleTest(&argc, argv);
     const int result = RUN_ALL_TESTS();

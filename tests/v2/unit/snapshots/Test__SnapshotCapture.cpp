@@ -605,6 +605,56 @@ TEST(Test__SnapshotCapture_Capture, SharedExpertGateFusedOutputsUseSemanticKeys)
     EXPECT_EQ(combined_snap->data, combined);
 }
 
+TEST(Test__SnapshotCapture_Capture,
+     ContextQualifiedMTPNormPublishesExactTerminalHiddenInput)
+{
+    const std::vector<float> normalized = {0.5f, 1.0f, 1.5f, 2.0f};
+    const std::vector<float> terminal_hidden = {4.0f, 3.0f, 2.0f, 1.0f};
+
+    StageDumpInfo dump;
+    dump.outputs.push_back(
+        makeFP32Output("output", normalized.data(), 1, 4));
+    dump.outputs.push_back(makeFP32Output(
+        "mtp_terminal_hidden_input",
+        terminal_hidden.data(),
+        1,
+        4));
+
+    const auto possible = SnapshotCapture::possibleKeysForStage(
+        "MTP0_norm_hidden",
+        dump);
+    EXPECT_NE(
+        std::find(
+            possible.begin(),
+            possible.end(),
+            "MTP0_NORM_HIDDEN"),
+        possible.end());
+    EXPECT_NE(
+        std::find(
+            possible.begin(),
+            possible.end(),
+            "MTP_TERMINAL_HIDDEN_ROW_SELECT"),
+        possible.end());
+
+    SnapshotCapture capture;
+    capture.captureStage(
+        "mtp_decode_sidecar_device_target_token_live_position::"
+        "MTP0_norm_hidden",
+        dump);
+
+    const auto *norm = capture.get(
+        "MTP_DECODE_SIDECAR_DEVICE_TARGET_TOKEN_LIVE_POSITION_"
+        "MTP0_NORM_HIDDEN");
+    ASSERT_NE(norm, nullptr);
+    EXPECT_EQ(norm->data, normalized);
+
+    const auto *selector = capture.get(
+        "MTP_DECODE_SIDECAR_DEVICE_TARGET_TOKEN_LIVE_POSITION_"
+        "MTP_TERMINAL_HIDDEN_ROW_SELECT");
+    ASSERT_NE(selector, nullptr);
+    EXPECT_EQ(selector->data, terminal_hidden);
+}
+
 TEST(Test__SnapshotCapture_Capture, ConcurrentStageCallbacksDoNotRaceSnapshotStorage)
 {
     constexpr int kThreads = 8;

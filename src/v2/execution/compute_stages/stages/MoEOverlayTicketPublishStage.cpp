@@ -145,6 +145,16 @@ namespace llaminar2
             LOG_ERROR("[MoEOverlayTicketPublishStage] Failed to enqueue fixed-capacity ticket payload publication");
             return false;
         }
+        std::string publication_error;
+        if (!params_.ticket_storage->enqueueCapturedPublication(
+                stream, &publication_error))
+        {
+            LOG_ERROR(
+                "[MoEOverlayTicketPublishStage] Failed to enqueue the exact "
+                "GPU-to-host ticket publication edge: "
+                << publication_error);
+            return false;
+        }
         return true;
     }
 
@@ -208,6 +218,16 @@ namespace llaminar2
                 "[MoEOverlayTicketPublishStage] Graph executor did not prebind "
                 "the fixed arena endpoints before launch preparation: "
                 << graphCaptureReadinessDebugString());
+            return false;
+        }
+        std::string publication_error;
+        if (!params_.ticket_storage->armCapturedPublication(
+                &publication_error))
+        {
+            LOG_ERROR(
+                "[MoEOverlayTicketPublishStage] Could not arm the exact "
+                "GPU-to-host ticket publication edge: "
+                << publication_error);
             return false;
         }
         return true;

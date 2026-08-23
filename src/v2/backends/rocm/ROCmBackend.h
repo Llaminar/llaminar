@@ -51,8 +51,8 @@ namespace llaminar2
         bool setDevice(int device_id) override;
 
         // Host memory pinning for async DMA
-        bool pinHostMemory(void *ptr, size_t bytes) override;
-        bool unpinHostMemory(void *ptr) override;
+        bool pinHostMemory(void *ptr, size_t bytes, int device_id) override;
+        bool unpinHostMemory(void *ptr, int device_id) override;
         bool registerExternalMappedHostMemory(
             void *ptr,
             size_t bytes,

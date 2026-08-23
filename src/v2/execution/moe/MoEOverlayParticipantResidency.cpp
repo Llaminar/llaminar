@@ -1087,6 +1087,8 @@ namespace llaminar2
                             ? "ExpertOverlay could not install an initially empty participant bank"
                             : error);
                 }
+                assembly.publication_state =
+                    InitialPublicationState::Completed;
             }
             endpoints_.emplace(participant_id, std::move(assembly));
         }
@@ -1140,15 +1142,24 @@ namespace llaminar2
             return false;
         }
 
-        const auto existing =
-            assembly.endpoint->acquire(config_.initial_epoch);
-        if (existing)
+        /*
+         * Initial publication is a one-way setup transition, not a proxy for
+         * current residency.  Dynamic maintenance legitimately retires the
+         * bootstrap epoch.  A later graph-cache variant may certify the same
+         * prepared identities, but allowing it to reinstall epoch one would
+         * occupy the inactive RCU slot beside the live epoch and permanently
+         * prevent the next maintenance wave.
+         */
+        if (assembly.publication_state ==
+            InitialPublicationState::Completed)
         {
-            if (!existing->layers[static_cast<std::size_t>(layer_idx)]
-                     .sameIdentity(supplied_layer))
+            if (!expected_layer.sameIdentity(supplied_layer))
             {
                 if (error)
-                    *error = "Cached graph resolved different engines for an installed initial epoch";
+                {
+                    *error =
+                        "Cached graph resolved different engines after initial publication completed";
+                }
                 return false;
             }
             return true;
@@ -1179,9 +1190,14 @@ namespace llaminar2
             return false;
         const auto status = assembly.endpoint->installReadyBank(
             std::move(*prepared), error);
-        return status == MoEOverlayParticipantBankInstallStatus::Installed ||
-               status ==
-                   MoEOverlayParticipantBankInstallStatus::AlreadyInstalled;
+        if (status != MoEOverlayParticipantBankInstallStatus::Installed &&
+            status !=
+                MoEOverlayParticipantBankInstallStatus::AlreadyInstalled)
+        {
+            return false;
+        }
+        assembly.publication_state = InitialPublicationState::Completed;
+        return true;
     }
 
     std::shared_ptr<MoEOverlayParticipantResidency>
@@ -1212,10 +1228,10 @@ namespace llaminar2
         return std::all_of(
             endpoints_.begin(),
             endpoints_.end(),
-            [this](const auto &entry)
+            [](const auto &entry)
             {
-                return entry.second.endpoint->acquire(
-                           config_.initial_epoch) != nullptr;
+                return entry.second.publication_state ==
+                       InitialPublicationState::Completed;
             });
     }
 
@@ -1307,7 +1323,8 @@ namespace llaminar2
         incomplete.reserve(endpoints_.size());
         for (const auto &[participant_id, assembly] : endpoints_)
         {
-            if (assembly.endpoint->acquire(config_.initial_epoch))
+            if (assembly.publication_state ==
+                InitialPublicationState::Completed)
                 continue;
 
             IncompleteInitialBank deficit;

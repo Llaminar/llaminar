@@ -179,10 +179,16 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
-         * @brief Follower publication of the exact stage's compact return packet.
-         * @param payload_bytes Compact dense-row bytes; zero only for an empty
-         *        dispatch. Device-owned canonical-route publishers write their
-         *        entry geometry directly into the shared ABI.
+         * @brief Publish one canonical contribution for every dispatched route.
+         *
+         * The follower inherits the exact row and route-entry geometry from
+         * the authenticated dispatch descriptor. Both host-owned CPU followers
+         * and device-owned GPU followers publish preweighted contributions in
+         * original router-slot order; an aggregated dense-row return is not a
+         * valid mapped activation transaction.
+         *
+         * @param payload_bytes Canonical route-contribution bytes; zero only
+         *        for an empty dispatch.
          */
         bool publishReturn(
             const MoEOverlayActivationEpochIdentity &identity,

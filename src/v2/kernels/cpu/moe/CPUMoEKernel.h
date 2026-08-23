@@ -13,6 +13,7 @@
 #include "../CPUKernelBase.h"
 #include "../../../tensors/BlockStructures.h"
 
+#include <span>
 #include <vector>
 
 namespace llaminar2
@@ -194,6 +195,49 @@ namespace llaminar2
             int rows,
             int d_model);
 
+        /**
+         * @brief Publish transported rows directly in expert-major route order.
+         *
+         * A heterogeneous CPU endpoint already knows its stable expert-major
+         * route schedule before it prepares NativeVNNI input. Materializing a
+         * row-major Q8_1 tensor and then gathering those same bytes performs an
+         * avoidable second activation pass. This transport-specific operation
+         * applies the canonical Q8_1 transform directly into caller-owned
+         * expert-major storage. Repeated source indices deliberately produce
+         * repeated byte-identical rows; no quantized value is shared or
+         * arithmetically combined.
+         *
+         * This method revokes any ordinary row-major publication owned by this
+         * kernel. It is not a fallback for a missing CPU router publication;
+         * only a stage with the typed transported-row policy may call it.
+         *
+         * @param source Authoritative contiguous transported FP32 rows.
+         * @param source_rows Number of valid rows in @p source.
+         * @param d_model Logical FP32 values per source row.
+         * @param expert_major_source_rows Source row index for each output row.
+         * @param destination Caller-owned expert-major Q8_1 block storage.
+         * @return True after every selected row is published exactly once.
+         */
+        bool publishTransportedRouterQ8HiddenExpertMajor(
+            const float *source,
+            int source_rows,
+            int d_model,
+            std::span<const int> expert_major_source_rows,
+            std::span<Q8_1Block> destination);
+
+        /**
+         * @brief Reserve and first-touch transported-router publication storage.
+         *
+         * Serial ExpertOverlay graph families know their maximum compact row
+         * geometry during setup. Reserving here prevents the first production
+         * request from changing the CPU kernel's memory topology.
+         *
+         * @param rows Maximum positive compact row count.
+         * @param d_model Positive hidden width.
+         * @return True when the complete Q8_1 publication fits the reservation.
+         */
+        bool reserveRouterQ8HiddenCapacity(int rows, int d_model);
+
         // =================================================================
         // ITensorKernel interface
         // =================================================================
@@ -223,6 +267,27 @@ namespace llaminar2
             const float *source,
             int rows,
             int d_model);
+
+        /**
+         * @brief Quantize contiguous or indexed rows into an exact Q8_1 target.
+         *
+         * @param source Contiguous FP32 source-row base.
+         * @param source_rows Number of addressable source rows.
+         * @param d_model Logical values per source row.
+         * @param source_row_indices Optional output-to-source row map; null is identity.
+         * @param output_rows Number of Q8_1 rows to write.
+         * @param destination Destination block base.
+         * @param destination_blocks Available destination block count.
+         * @return True when the complete validated publication was written.
+         */
+        bool quantizeRouterQ8Rows(
+            const float *source,
+            int source_rows,
+            int d_model,
+            const int *source_row_indices,
+            int output_rows,
+            Q8_1Block *destination,
+            size_t destination_blocks);
 
         std::vector<Q8_1Block> router_q8_hidden_; ///< Canonical contiguous verifier rows.
         const float *router_q8_hidden_source_ = nullptr; ///< FP32 producer identity.

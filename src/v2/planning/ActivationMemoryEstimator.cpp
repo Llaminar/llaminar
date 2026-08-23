@@ -197,7 +197,8 @@ size_t ActivationMemoryEstimator::estimate(
 {
     if (geometry.batch_size <= 0 || geometry.resident_graph_rows <= 0 ||
         geometry.local_d_ff < 0 || geometry.local_n_heads < 0 ||
-        geometry.local_n_kv_heads < 0 || geometry.total_shards <= 0 ||
+        geometry.local_n_kv_heads < 0 || geometry.local_vocab < 0 ||
+        geometry.total_shards <= 0 ||
         geometry.mtp_target_query_rows <= 0)
     {
         throw std::invalid_argument(
@@ -237,9 +238,11 @@ size_t ActivationMemoryEstimator::estimate(
         static_cast<size_t>(std::max(0, profile.n_kv_heads)),
         static_cast<size_t>(std::max(0, profile.head_dim)),
         "full KV columns");
-    const size_t local_vocab = shardColumns(
-        static_cast<size_t>(std::max(0, profile.vocab_size)),
-        geometry.total_shards);
+    const size_t local_vocab = geometry.local_vocab > 0
+        ? static_cast<size_t>(geometry.local_vocab)
+        : shardColumns(
+              static_cast<size_t>(std::max(0, profile.vocab_size)),
+              geometry.total_shards);
 
     /* The model schema registers a participant-local terminal-logit shard. */
     bytes = checkedAdd(

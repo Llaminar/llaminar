@@ -510,6 +510,43 @@ namespace llaminar2
             return;
         }
 
+        /*
+         * The predictor's first RMSNorm publishes its exact read-only input as
+         * a typed diagnostic view.  That stage executes inside the sidecar's
+         * snapshot context, unlike the earlier mailbox publication that made
+         * the row current.  Naming the view here therefore binds the terminal
+         * hidden checkpoint to the precise transaction that consumed it while
+         * preserving one device-owned value and one producer/consumer event
+         * chain.
+         */
+        if (name.find("_norm_hidden") != std::string::npos)
+        {
+            bool published_terminal_hidden = false;
+            bool published_norm = false;
+            const std::string norm_key =
+                convertStageNameToSnapshotKey(name);
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                if (output_name == "output" && output.data)
+                {
+                    storeOutput(norm_key, output);
+                    published_norm = true;
+                }
+                else if (output_name == "mtp_terminal_hidden_input" &&
+                         output.data)
+                {
+                    storeOutput(
+                        "MTP_TERMINAL_HIDDEN_ROW_SELECT",
+                        output);
+                    published_terminal_hidden = true;
+                }
+            }
+            if (published_terminal_hidden || published_norm)
+                return;
+        }
+
         // Handle fused MoE FFN stage — split into expert output + routing data
         if (name.find("_moe_ffn") != std::string::npos && dump.outputs.size() >= 4)
         {
@@ -1477,6 +1514,29 @@ namespace llaminar2
             }
             return keys;
         };
+
+        if (stage_name.find("_norm_hidden") != std::string::npos)
+        {
+            std::vector<std::string> keys;
+            keys.reserve(dump_info.outputs.size());
+            for (const auto &output : dump_info.outputs)
+            {
+                const std::string output_name =
+                    output.name ? output.name : "";
+                if (output_name == "output")
+                {
+                    keys.push_back(
+                        convertStageNameToSnapshotKey(stage_name));
+                }
+                else if (output_name == "mtp_terminal_hidden_input")
+                {
+                    keys.emplace_back(
+                        "MTP_TERMINAL_HIDDEN_ROW_SELECT");
+                }
+            }
+            if (!keys.empty())
+                return keys;
+        }
 
         if (stage_name.find("_moe_canonical_publication_finalize") !=
             std::string::npos)

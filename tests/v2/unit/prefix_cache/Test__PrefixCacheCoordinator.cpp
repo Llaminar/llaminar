@@ -340,8 +340,10 @@ TEST(Test__PrefixCacheCoordinator, IgnoresFingerprintMismatchWhenParticipantsOwn
                               /*fingerprint_key=*/0x2000,
                               /*requires_terminal_logits=*/true,
                               /*requires_terminal_hidden=*/false);
-    stage0.fingerprint_must_match = false;
-    stage1.fingerprint_must_match = false;
+    stage0.fingerprint_policy =
+        PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally;
+    stage1.fingerprint_policy =
+        PrefixFingerprintCoordinationPolicy::ValidateParticipantLocally;
 
     auto result = coordinatePrefixLookups({stage0, stage1});
 

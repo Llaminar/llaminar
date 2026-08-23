@@ -537,6 +537,8 @@ namespace llaminar2
             ServingGraphFamilyLifecycle::Built;
         /** @brief Main decoder layer count after excluding trailing NextN blocks. */
         int main_layer_count_ = 0;
+        /** @brief Model-global placement/runtime slots retained by this family. */
+        int routed_layer_capacity_ = 0;
         /** @brief Routed NextN GGUF source layer for each retained graph depth. */
         std::vector<int> mtp_source_layers_;
         /** @brief Pointer-independent identity shared with the continuation rank. */

@@ -35,6 +35,12 @@ namespace
         snapshot.current_position = logical_tokens;
         snapshot.has_hidden = true;
         snapshot.has_logits = true;
+        snapshot.terminal_hidden_hash_available = true;
+        snapshot.terminal_hidden_bytes = 256;
+        snapshot.terminal_hidden_hash = 0x11112222;
+        snapshot.terminal_logits_hash_available = true;
+        snapshot.terminal_logits_bytes = 512;
+        snapshot.terminal_logits_hash = 0x33334444;
         snapshot.positions = {logical_tokens};
         snapshot.sequence_lengths = {logical_tokens};
 
@@ -285,6 +291,23 @@ TEST(Test__MTPStateTransaction, RuntimeSnapshotEquivalenceRejectsShiftedKVDrift)
     auto result = compareMTPRuntimeStateSnapshots(oracle, candidate);
     ASSERT_FALSE(result);
     EXPECT_NE(result.reason.find("shifted MTP"), std::string::npos);
+}
+
+TEST(Test__MTPStateTransaction, RuntimeSnapshotEquivalenceRejectsTerminalPayloadDrift)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    candidate.terminal_logits_hash ^= 0x1;
+
+    auto result = compareMTPRuntimeStateSnapshots(oracle, candidate);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("terminal logits payload"), std::string::npos);
+
+    candidate = oracle;
+    candidate.terminal_hidden_bytes += 4;
+    result = compareMTPRuntimeStateSnapshots(oracle, candidate);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("terminal hidden payload"), std::string::npos);
 }
 
 TEST(Test__MTPStateTransaction, RuntimeSnapshotSerialOracleCanIgnoreShiftedMTPKV)

@@ -534,10 +534,12 @@ namespace
                     grouped_down_projection();
                 else if (profile_phase == "complete")
                     grouped_complete();
+                else if (profile_phase == "persistent")
+                    grouped_complete_persistent();
                 else
                     throw std::invalid_argument(
                         "LLAMINAR_CPU_MOE_EXPERT_PROFILE_PHASE must be "
-                        "gate_up, swiglu_q8, down, or complete");
+                        "gate_up, swiglu_q8, down, complete, or persistent");
             }
             const float checksum =
                 profile_phase == "gate_up"

@@ -140,6 +140,14 @@ namespace llaminar2
          */
         const std::string &path() const override { return model_path_; }
 
+        /** @brief Return the complete ordered GGUF shard set loaded by this context. */
+        std::vector<std::string> artifactPaths() const override
+        {
+            const auto &paths = loader_.getModel().split_paths;
+            return paths.empty() ? std::vector<std::string>{model_path_}
+                                 : paths;
+        }
+
         /**
          * @brief Get GGUF model metadata
          */

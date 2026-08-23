@@ -197,6 +197,7 @@ namespace llaminar2
         TensorBase *terminal_hidden_archive = nullptr; ///< One persistent terminal hidden row per request.
         const int32_t *request_token_ids_device = nullptr; ///< Stable admitted request-token bank.
         const int32_t *request_position_ids_device = nullptr; ///< Stable admitted absolute-position bank.
+        const int32_t *request_segment_lengths_device = nullptr; ///< Real rows in this shifted-MTP segment, distinct from main attention history.
         int32_t *shifted_token_ids_device = nullptr; ///< Packed shifted condition-token rows.
         int32_t *shifted_position_ids_device = nullptr; ///< Packed positions paired with shifted tokens.
         int32_t *append_lengths_device = nullptr; ///< Real append width for each padded request row.
@@ -219,6 +220,7 @@ namespace llaminar2
         {
             return request_count > 0 && kv_cache && terminal_hidden_archive &&
                    request_token_ids_device && request_position_ids_device &&
+                   request_segment_lengths_device &&
                    shifted_token_ids_device && shifted_position_ids_device &&
                    append_lengths_device && request_row_stride_device &&
                    capture_identity != 0 &&
@@ -243,6 +245,64 @@ namespace llaminar2
         {
             return purpose == Purpose::RuntimeExecution &&
                    validForRequestCount(request_count);
+        }
+    };
+
+    /**
+     * @brief Immutable-address contract for main-decode terminal-hidden publication.
+     *
+     * Every MTP main-model decode produces the hidden row that conditions the
+     * next depth-zero sidecar.  The row is part of the live speculative state,
+     * so GPU execution publishes it inside the same captured graph as the main
+     * logits instead of launching a later row-select graph or retaining a
+     * host-side freshness guess.  Decode contributes exactly one physical row
+     * per request; the graph therefore copies the fixed contiguous request row
+     * range into the persistent terminal archive.
+     *
+     * The archive pointer and workspace generation are graph identity.  Live
+     * token, position, and cache values remain device-owned inputs elsewhere in
+     * @ref ForwardInput and are deliberately absent from this binding.
+     */
+    struct MTPMainTerminalHiddenGraphBinding
+    {
+        /** @brief Lifecycle in which the immutable pointer set may be used. */
+        enum class Purpose
+        {
+            RuntimeExecution, ///< Finalized workspace generation; executable.
+            WorkspaceFamilyDeclaration, ///< Topology sizing only; never executable.
+        };
+
+        TensorBase *terminal_hidden_archive = nullptr; ///< One FP32 terminal row per request.
+        int request_count = 0; ///< Fixed number of rows published by this graph.
+        int source_row_start = 0; ///< First immutable decoded row copied to the archive.
+        uint64_t capture_identity = 0; ///< Complete pointer/generation identity.
+        Purpose purpose = Purpose::RuntimeExecution; ///< Permitted lifecycle.
+
+        /**
+         * @brief Validate the complete graph-execution contract.
+         *
+         * @param expected_request_count Request count carried by ForwardInput.
+         * @return true when this binding can enter graph construction/execution.
+         */
+        [[nodiscard]] bool validForRequestCount(
+            int expected_request_count) const noexcept
+        {
+            return terminal_hidden_archive != nullptr && request_count > 0 &&
+                   request_count == expected_request_count &&
+                   source_row_start >= 0 && capture_identity != 0;
+        }
+
+        /**
+         * @brief Return whether this complete binding may enter inference.
+         *
+         * @param expected_request_count Request count carried by ForwardInput.
+         * @return true only for a complete runtime binding.
+         */
+        [[nodiscard]] bool executableForRequestCount(
+            int expected_request_count) const noexcept
+        {
+            return purpose == Purpose::RuntimeExecution &&
+                   validForRequestCount(expected_request_count);
         }
     };
 
@@ -449,6 +509,23 @@ namespace llaminar2
     };
 
     /**
+     * @brief Persistent-state transaction owned by one main forward graph.
+     *
+     * Most main forwards update only the state naturally owned by their
+     * mathematical phase. A one-token suffix after an MTP prefix restore is a
+     * deliberate exception: its main-model arithmetic must be serial-decode
+     * equivalent, while the same captured transaction must bridge the restored
+     * terminal hidden row into depth-zero shifted MTP KV. Naming that lifecycle
+     * here prevents a caller from reconstructing it with a prefill-shaped graph
+     * or a post-forward sidecar.
+     */
+    enum class ForwardStateTransaction : uint8_t
+    {
+        Ordinary = 0, ///< No additional restored-prefix state transition.
+        RestoredPrefixMTPDecodeBridge, ///< Decode plus shifted-MTP KV/archive bridge.
+    };
+
+    /**
      * @brief Submission lifecycle requested for one forward graph.
      *
      * Production inference normally builds and launches the graph atomically.
@@ -477,6 +554,7 @@ namespace llaminar2
     enum class ForwardCompletionScope : uint8_t
     {
         ModelForwardOnly, ///< Ordinary model forward outputs and live-state writes.
+        GraphIntegratedMTPTerminalHidden, ///< Main decode plus terminal-hidden archive publication.
         GraphIntegratedShiftedMTPPrefill, ///< Model forward plus shifted MTP KV/archive writes.
     };
 
@@ -536,6 +614,8 @@ namespace llaminar2
             ForwardExecutionRole::MainInference; ///< Semantic owner of this invocation.
         ForwardExecutionPhase execution_phase =
             ForwardExecutionPhase::Prefill; ///< Typed math/topology phase; never inferred from M.
+        ForwardStateTransaction state_transaction =
+            ForwardStateTransaction::Ordinary; ///< Typed persistent-state transition embedded by this graph.
         ForwardGraphSubmissionIntent graph_submission_intent =
             ForwardGraphSubmissionIntent::Execute; ///< Whether this call executes or only seals native graph units.
         int batch_size = 1;                ///< Number of sequences
@@ -682,6 +762,17 @@ namespace llaminar2
         std::optional<ShiftedMTPPrefillGraphBinding> shifted_mtp_prefill;
 
         /**
+         * @brief Optional graph-integrated MTP main-decode terminal publication.
+         *
+         * This binding is present for an MTP-enabled main-model decode and is
+         * mutually exclusive with @ref shifted_mtp_prefill.  Its presence
+         * guarantees that completion of the forward graph also publishes the
+         * exact hidden row needed by prefix checkpoints and the next sidecar.
+         */
+        std::optional<MTPMainTerminalHiddenGraphBinding>
+            mtp_main_terminal_hidden;
+
+        /**
          * @brief Optional captured materialization of one admitted prefill chunk.
          *
          * When present, `token_ids_device`, `position_ids_device`, and
@@ -733,9 +824,11 @@ namespace llaminar2
     [[nodiscard]] inline constexpr ForwardCompletionScope
     forwardCompletionScopeForInput(const ForwardInput &input) noexcept
     {
-        return input.shifted_mtp_prefill.has_value()
-                   ? ForwardCompletionScope::GraphIntegratedShiftedMTPPrefill
-                   : ForwardCompletionScope::ModelForwardOnly;
+        if (input.shifted_mtp_prefill.has_value())
+            return ForwardCompletionScope::GraphIntegratedShiftedMTPPrefill;
+        if (input.mtp_main_terminal_hidden.has_value())
+            return ForwardCompletionScope::GraphIntegratedMTPTerminalHidden;
+        return ForwardCompletionScope::ModelForwardOnly;
     }
 
     /**

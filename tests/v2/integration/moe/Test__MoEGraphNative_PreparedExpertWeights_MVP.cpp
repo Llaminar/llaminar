@@ -556,7 +556,6 @@ namespace llaminar2::test
         dispatch_params.routed_tiers = {routedTier("local", "local")};
         dispatch_params.output = &dispatch;
         MoEExpertDispatchStage dispatch_stage(std::move(dispatch_params));
-        ASSERT_TRUE(dispatch_stage.requiresHostGraphTicketFence());
         ASSERT_TRUE(dispatch_stage.bufferContract().inputs.empty());
 
         auto inbound_dispatch = workspace.dispatchReceive(kLayer, 0);
@@ -575,10 +574,12 @@ namespace llaminar2::test
         sparse_params.d_model = kDModel;
         sparse_params.tier_index = 0;
         sparse_params.ticket_storage = ticket_storage;
+        sparse_params.ticket_observation_role =
+            MoESparseDispatchStage::TicketObservationRole::
+                MaterializedHostDispatch;
         sparse_params.dispatch_output = &dispatch;
         sparse_params.inbound_rows = &inbound_dispatch;
         MoESparseDispatchStage sparse_stage(std::move(sparse_params));
-        ASSERT_TRUE(sparse_stage.requiresHostGraphTicketFence());
         ASSERT_TRUE(sparse_stage.bufferContract().inputs.empty());
 
         MoEExpertComputeStage::Params prep;

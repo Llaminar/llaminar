@@ -202,7 +202,10 @@ namespace llaminar2
         auto it = entries_.find(key);
         if (it == entries_.end())
             return false;
-        return it->second.phase == PrefillGraphPhase::Ready;
+        return it->second.phase == PrefillGraphPhase::Ready &&
+               it->second.submission_state !=
+                   PrefillGraphExecutableSubmissionState::Empty &&
+               it->second.capture && it->second.capture->hasExecutable();
     }
 
     /**
@@ -331,6 +334,8 @@ namespace llaminar2
         entry.key = key;
         entry.capture.reset();
         entry.phase = PrefillGraphPhase::Warmup;
+        entry.submission_state =
+            PrefillGraphExecutableSubmissionState::Empty;
         lifecycle_stats_[key].warmup_count++;
         touchEntry(entry);
         enforceCapacity(&key);
@@ -343,6 +348,30 @@ namespace llaminar2
                      << " participant=" << key.participant_id
                      << " → armed for capture");
         }
+    }
+
+    void PrefillGraphCache::markInitializedForSetupMaterialization(
+        const PrefillGraphCacheKey &key)
+    {
+        auto &entry = entries_[key];
+        if (entry.phase == PrefillGraphPhase::Initialized)
+            return;
+        if (entry.phase != PrefillGraphPhase::Cold)
+        {
+            terminatePrefillGraphLifecycle(
+                "markInitializedForSetupMaterialization", key);
+        }
+
+        entry.key = key;
+        entry.capture.reset();
+        entry.phase = PrefillGraphPhase::Initialized;
+        entry.submission_state =
+            PrefillGraphExecutableSubmissionState::Empty;
+        entry.node_count = 0;
+        entry.replay_count = 0;
+        lifecycle_stats_[key].initialized_count++;
+        touchEntry(entry);
+        enforceCapacity(&key);
     }
 
     bool PrefillGraphCache::captureAndInstantiate(
@@ -441,6 +470,8 @@ namespace llaminar2
                 << " seq_len=" << key.seq_len);
             entry.phase = PrefillGraphPhase::Cold;
             entry.capture.reset();
+            entry.submission_state =
+                PrefillGraphExecutableSubmissionState::Empty;
             entry.node_count = 0;
             entry.replay_count = 0;
             return false;
@@ -457,6 +488,8 @@ namespace llaminar2
         entry.node_count = pending_capture->nodeCount();
         entry.capture = std::move(pending_capture);
         entry.phase = PrefillGraphPhase::Ready;
+        entry.submission_state =
+            PrefillGraphExecutableSubmissionState::MaterializedUnlaunched;
         entry.replay_count = 0;
         lifecycle_stats_[key].capture_count++;
 
@@ -487,6 +520,13 @@ namespace llaminar2
             LOG_ERROR("[PrefillGraphCache] launch() called but no executable graph");
             return false;
         }
+        if (entry.submission_state ==
+            PrefillGraphExecutableSubmissionState::Empty)
+        {
+            LOG_ERROR(
+                "[PrefillGraphCache] launch() found an executable with no submission lifecycle");
+            return false;
+        }
 
         if (!entry.capture->launch())
         {
@@ -495,6 +535,8 @@ namespace llaminar2
         }
 
         entry.replay_count++;
+        entry.submission_state =
+            PrefillGraphExecutableSubmissionState::ReplayReady;
         return true;
     }
 
@@ -508,6 +550,8 @@ namespace llaminar2
 
             entry.phase = PrefillGraphPhase::Cold;
             entry.capture.reset();
+            entry.submission_state =
+                PrefillGraphExecutableSubmissionState::Empty;
             entry.node_count = 0;
             entry.replay_count = 0;
         }
@@ -556,6 +600,8 @@ namespace llaminar2
 
                 entry.phase = PrefillGraphPhase::Initialized;
                 entry.capture.reset();
+                entry.submission_state =
+                    PrefillGraphExecutableSubmissionState::Empty;
                 entry.node_count = 0;
                 entry.replay_count = 0;
                 lifecycle_stats_[key].initialized_count++;
@@ -570,6 +616,8 @@ namespace llaminar2
                 // graph object and replay counters from the previous prompt.
                 entry.phase = PrefillGraphPhase::Initialized;
                 entry.capture.reset();
+                entry.submission_state =
+                    PrefillGraphExecutableSubmissionState::Empty;
                 entry.node_count = 0;
                 entry.replay_count = 0;
                 lifecycle_stats_[key].initialized_count++;
@@ -579,6 +627,8 @@ namespace llaminar2
 
             entry.phase = PrefillGraphPhase::Cold;
             entry.capture.reset();
+            entry.submission_state =
+                PrefillGraphExecutableSubmissionState::Empty;
             entry.node_count = 0;
             entry.replay_count = 0;
             ++summary.dropped;
@@ -616,6 +666,8 @@ namespace llaminar2
 
         it->second.phase = PrefillGraphPhase::Cold;
         it->second.capture.reset();
+        it->second.submission_state =
+            PrefillGraphExecutableSubmissionState::Empty;
         it->second.node_count = 0;
         it->second.replay_count = 0;
 
@@ -644,6 +696,18 @@ namespace llaminar2
         if (it == entries_.end())
             return 0;
         return it->second.replay_count;
+    }
+
+    bool PrefillGraphCache::materializedTransactionZeroPending(
+        const PrefillGraphCacheKey &key) const
+    {
+        const auto it = entries_.find(key);
+        return it != entries_.end() &&
+               it->second.phase == PrefillGraphPhase::Ready &&
+               it->second.capture && it->second.capture->hasExecutable() &&
+               it->second.submission_state ==
+                   PrefillGraphExecutableSubmissionState::
+                       MaterializedUnlaunched;
     }
 
     uint64_t PrefillGraphCache::warmupCount(const PrefillGraphCacheKey &key) const

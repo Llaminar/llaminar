@@ -1,6 +1,13 @@
 /**
  * @file RMSNormStage.cpp
- * @brief Implementation of RMSNormStage
+ * @brief Cross-backend RMSNorm execution and graph-stable diagnostic metadata.
+ *
+ * Kernel dispatch preserves the tensor's native device authority and exact
+ * producer stream.  Dump metadata describes persistent tensor addresses used
+ * by asynchronous snapshot copies; it never performs a transfer itself.  The
+ * MTP-only input publication is a read-only alias of the terminal-hidden tensor
+ * consumed by the norm, allowing parity to observe that boundary at no extra
+ * arithmetic cost.
  */
 
 #include "RMSNormStage.h"
@@ -221,6 +228,22 @@ namespace llaminar2
 
         // Output - use TensorBase* overload
         info.addOutput("output", params_.output, seq_len, hidden_dim);
+
+        if (params_.diagnostic_input_publication ==
+            DiagnosticInputPublication::MTPTerminalHidden)
+        {
+            /*
+             * The snapshot engine records tensor-backed outputs after the
+             * stage on the same captured stream. RMSNorm does not mutate its
+             * input, so this read-only alias is still the exact value consumed
+             * by the kernel. No identity stage or host observation is needed.
+             */
+            info.addOutput(
+                "mtp_terminal_hidden_input",
+                params_.input,
+                seq_len,
+                hidden_dim);
+        }
 
         // Scalar params
         info.addScalarInt("seq_len", seq_len);

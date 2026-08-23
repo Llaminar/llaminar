@@ -349,6 +349,7 @@ namespace llaminar2
             profile.n_heads = 4;
             profile.n_kv_heads = 2;
             profile.head_dim = 16;
+            profile.vocab_size = 256;
             profile.max_seq_len = 32;
             profile.expert_count = 4;
             profile.expert_used_count = 2;

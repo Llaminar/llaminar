@@ -52,6 +52,8 @@ namespace llaminar2
          * @param batch_size Maximum simultaneously live request count.
          * @param max_seq_len Full KV horizon, independent of graph row buckets.
          * @param local_kv_heads Participant-local full-attention KV heads.
+         * @param local_query_heads Exact participant-local query heads used by
+         *        recurrent/GDN state sharding.
          * @param total_shards Tensor-parallel participant count.
          * @param first_layer First main-model layer owned by this participant.
          * @param last_layer Last main-model layer owned by this participant.
@@ -64,6 +66,7 @@ namespace llaminar2
             int batch_size,
             int max_seq_len,
             int local_kv_heads,
+            int local_query_heads,
             int total_shards,
             int first_layer,
             int last_layer,

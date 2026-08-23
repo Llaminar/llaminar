@@ -309,75 +309,6 @@ namespace llaminar2
             return out.str();
         }
 
-        bool manualSegmentRequiresHostTicketFence(
-            ComputeGraph &graph,
-            const DeviceGraphExecutor::GraphSegment &segment,
-            std::string *consumer_stage)
-        {
-            if (consumer_stage)
-                consumer_stage->clear();
-            if (segment.capturable)
-                return false;
-            for (const auto &stage_name : segment.stage_names)
-            {
-                const auto *node = graph.getNode(stage_name);
-                if (!node || !node->stage ||
-                    !node->stage->requiresHostGraphTicketFence())
-                {
-                    continue;
-                }
-                if (!node->stage->isManualGraphBoundary())
-                {
-                    throw std::logic_error(
-                        "Stage '" + stage_name +
-                        "' requests a host graph-ticket fence without declaring a manual graph boundary");
-                }
-                if (consumer_stage)
-                    *consumer_stage = stage_name;
-                return true;
-            }
-            return false;
-        }
-
-        void awaitManualHostTicketBoundary(
-            ComputeGraph &graph,
-            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
-            size_t segment_index,
-            const char *phase,
-            const DeviceId &device)
-        {
-            if (segment_index >= segment_cache.segments.size())
-                throw std::out_of_range("Host ticket boundary segment index is invalid");
-
-            std::string consumer_stage;
-            const auto &segment = segment_cache.segments[segment_index];
-            if (!manualSegmentRequiresHostTicketFence(
-                    graph,
-                    segment,
-                    &consumer_stage))
-            {
-                return;
-            }
-            if (segment_index == 0 ||
-                !segment_cache.segments[segment_index - 1].capturable)
-            {
-                throw std::runtime_error(
-                    "Manual host ticket consumer '" + consumer_stage +
-                    "' is not immediately preceded by a captured producer segment");
-            }
-
-            segment_cache.waitForManualHostTicketFence();
-            PerfStatsCollector::addCounter(
-                "forward_graph",
-                "heterogeneous_host_ticket_fences",
-                1.0,
-                phase,
-                device.toString(),
-                {{"consumer_stage", consumer_stage},
-                 {"context", segment_cache.perf_context},
-                 {"authority", "captured_pinned_ticket"}});
-        }
-
         /**
          * @brief Materialize one frozen stage-order ledger before beginCapture().
          *
@@ -1155,7 +1086,10 @@ namespace llaminar2
             policy.retained_parent_composer = {};
             policy.defer_final_sync = true;
             return true;
-        case GraphNativeCaptureEnvelope::HeterogeneousTicketTransaction:
+        case GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction:
+        case GraphNativeCaptureEnvelope::
+            HeterogeneousTicketFollowerTransaction:
             if (!policy.allow_cached_graph_replay ||
                 !policy.heterogeneous_segmented_enabled)
             {
@@ -1273,6 +1207,10 @@ namespace llaminar2
         const bool heterogeneous_ticket_transaction =
             requiresHeterogeneousTicketSegmentation(
                 native_capture_envelope);
+        const bool heterogeneous_ticket_authority =
+            ownsHeterogeneousTicketBoundary(native_capture_envelope);
+        const bool heterogeneous_ticket_follower =
+            followsHeterogeneousTicketBoundary(native_capture_envelope);
         if (device_owned_timeline_transaction &&
             plan_policy !=
                 DeviceGraphExecutor::GraphReplayPlanPolicy::RequireFullGraph)
@@ -1310,6 +1248,8 @@ namespace llaminar2
         bool current_capturable = false;
         bool first = true;
         bool force_new_segment = false;
+        size_t heterogeneous_ticket_unit_boundaries = 0u;
+        size_t heterogeneous_ticket_terminal_units = 0u;
 
         for (const auto &name : order)
         {
@@ -1325,6 +1265,17 @@ namespace llaminar2
                         node->graph_capture_wave
                     ? &*node->graph_capture_wave
                     : nullptr;
+            const auto *const ticket_unit_contract =
+                node->heterogeneous_ticket_unit_contract
+                    ? &*node->heterogeneous_ticket_unit_contract
+                    : nullptr;
+            if (ticket_unit_contract &&
+                !heterogeneous_ticket_transaction)
+            {
+                throw std::logic_error(
+                    "Graph node '" + name +
+                    "' declares a heterogeneous ticket-unit boundary outside a heterogeneous ticket envelope");
+            }
             if (wave_contract &&
                 wave_contract->participation ==
                     GraphCaptureWaveParticipation::Passive)
@@ -1432,21 +1383,6 @@ namespace llaminar2
                 // Explicit allowlist mode: only allowlisted stages are capturable
                 stage_capturable = stage_in_collective_allowlist(name);
             }
-            if (node->stage->requiresHostGraphTicketFence())
-            {
-                if (!node->stage->isManualGraphBoundary())
-                {
-                    throw std::logic_error(
-                        "Stage '" + name +
-                        "' requests a host graph-ticket fence without declaring a manual graph boundary");
-                }
-                if (stage_capturable)
-                {
-                    throw std::logic_error(
-                        "Stage '" + name +
-                        "' requests a host graph-ticket fence but was classified as capturable");
-                }
-            }
             // Otherwise: trust each stage's isGraphCapturable() declaration.
             // Stages that need per-step updates either return false or report
             // segment boundaries around themselves when they can be captured
@@ -1551,9 +1487,60 @@ namespace llaminar2
                         {.ordinal = 0, .identity = passive_identity});
                 }
             }
-            force_new_segment =
-                stage_capturable &&
-                node->stage->requiresGraphCaptureSegmentBoundaryAfter();
+            if (ticket_unit_contract)
+            {
+                if (!stage_capturable ||
+                    segment_cache.segments.empty() ||
+                    !segment_cache.segments.back().capturable)
+                {
+                    throw std::logic_error(
+                        "Heterogeneous ticket-unit boundary '" +
+                        ticket_unit_contract->identity + "' on node '" +
+                        name + "' does not close captured device work");
+                }
+                auto &segment = segment_cache.segments.back();
+                if (!segment.capture_wave_identity.empty() &&
+                    segment.capture_wave_identity !=
+                        ticket_unit_contract->identity)
+                {
+                    throw std::logic_error(
+                        "Captured segment combines heterogeneous ticket-unit identity '" +
+                        ticket_unit_contract->identity +
+                        "' with capture-wave identity '" +
+                        segment.capture_wave_identity + "'");
+                }
+                segment.capture_wave_identity =
+                    ticket_unit_contract->identity;
+                switch (ticket_unit_contract->disposition)
+                {
+                case GraphHeterogeneousTicketUnitDisposition::
+                    BeforeManualBoundary:
+                    ++heterogeneous_ticket_unit_boundaries;
+                    /* The next participant-local operation belongs to the
+                     * unit after the authority's CPU work, even on a follower
+                     * graph with no manual stage of its own. */
+                    force_new_segment = true;
+                    break;
+                case GraphHeterogeneousTicketUnitDisposition::
+                    TransactionTerminal:
+                    if (graph.terminalNode() != name)
+                    {
+                        throw std::logic_error(
+                            "Heterogeneous ticket terminal-unit identity '" +
+                            ticket_unit_contract->identity + "' is attached "
+                            "to non-terminal node '" + name + "'");
+                    }
+                    ++heterogeneous_ticket_terminal_units;
+                    force_new_segment = false;
+                    break;
+                }
+            }
+            else
+            {
+                force_new_segment =
+                    stage_capturable &&
+                    node->stage->requiresGraphCaptureSegmentBoundaryAfter();
+            }
         }
 
         const int max_stages = debugEnv().execution.gpu_graph_max_stages;
@@ -1675,29 +1662,6 @@ namespace llaminar2
                 passive_wave.ordinal = next_capture_wave_ordinal++;
         }
 
-        size_t host_ticket_boundary_segments = 0u;
-        for (size_t segment_index = 0;
-             segment_index < segment_cache.segments.size();
-             ++segment_index)
-        {
-            std::string consumer_stage;
-            if (!manualSegmentRequiresHostTicketFence(
-                    graph,
-                    segment_cache.segments[segment_index],
-                    &consumer_stage))
-            {
-                continue;
-            }
-            if (segment_index == 0 ||
-                !segment_cache.segments[segment_index - 1].capturable)
-            {
-                throw std::runtime_error(
-                    "Manual host ticket consumer '" + consumer_stage +
-                    "' is not immediately preceded by a captured producer segment");
-            }
-            ++host_ticket_boundary_segments;
-        }
-
         size_t capturable_segments = 0, manual_segments = 0;
         size_t capturable_stages = 0, manual_stages = 0;
         size_t max_capturable_segment_stages = 0;
@@ -1788,15 +1752,79 @@ namespace llaminar2
             throw std::runtime_error(diagnostic.str());
         }
 
-        if (heterogeneous_ticket_transaction &&
-            (capturable_segments < 2u || manual_segments == 0u ||
-             host_ticket_boundary_segments == 0u ||
+        if (heterogeneous_ticket_authority &&
+            (capturable_segments !=
+                 heterogeneous_ticket_unit_boundaries + 1u ||
+             manual_segments !=
+                 heterogeneous_ticket_unit_boundaries ||
+             heterogeneous_ticket_terminal_units != 1u ||
+             manual_segments == 0u ||
              segment_cache.segments.empty() ||
              !segment_cache.segments.front().capturable ||
              !segment_cache.segments.back().capturable))
         {
-            throw std::runtime_error(
-                "Heterogeneous ticket capture must lower to captured producer and consumer units separated by an authenticated manual ticket boundary");
+            std::ostringstream diagnostic;
+            diagnostic
+                << "Heterogeneous ticket authority must lower to captured "
+                   "producer/consumer units separated by authenticated manual "
+                   "ticket boundaries"
+                << ": capturable_segments=" << capturable_segments
+                << " manual_segments=" << manual_segments
+                << " unit_boundaries="
+                << heterogeneous_ticket_unit_boundaries
+                << " terminal_units="
+                << heterogeneous_ticket_terminal_units;
+            const size_t diagnostic_segments =
+                std::min<size_t>(segment_cache.segments.size(), 8u);
+            for (size_t segment_index = 0u;
+                 segment_index < diagnostic_segments;
+                 ++segment_index)
+            {
+                const auto &segment =
+                    segment_cache.segments[segment_index];
+                diagnostic << " segment[" << segment_index << "]={"
+                           << (segment.capturable ? "captured" : "manual")
+                           << ",identity="
+                           << (segment.capture_wave_identity.empty()
+                                   ? "<implicit>"
+                                   : segment.capture_wave_identity)
+                           << ",first="
+                           << (segment.stage_names.empty()
+                                   ? "<empty>"
+                                   : segment.stage_names.front())
+                           << ",last="
+                           << (segment.stage_names.empty()
+                                   ? "<empty>"
+                                   : segment.stage_names.back())
+                           << '}';
+            }
+            throw std::runtime_error(diagnostic.str());
+        }
+
+        if (heterogeneous_ticket_follower)
+        {
+            if (heterogeneous_ticket_unit_boundaries == 0u ||
+                capturable_segments !=
+                    heterogeneous_ticket_unit_boundaries + 1u ||
+                manual_segments != 0u ||
+                heterogeneous_ticket_terminal_units != 1u ||
+                segment_cache.segments.empty() ||
+                !segment_cache.segments.front().capturable ||
+                !segment_cache.segments.back().capturable)
+            {
+                std::ostringstream diagnostic;
+                diagnostic
+                    << "Heterogeneous ticket follower must contain only "
+                       "captured device units separated by typed "
+                       "authority-aligned cutpoints"
+                    << ": capturable_segments=" << capturable_segments
+                    << " manual_segments=" << manual_segments
+                    << " unit_boundaries="
+                    << heterogeneous_ticket_unit_boundaries
+                    << " terminal_units="
+                    << heterogeneous_ticket_terminal_units;
+                throw std::runtime_error(diagnostic.str());
+            }
         }
 
         if (heterogeneous_ticket_transaction)
@@ -1810,8 +1838,18 @@ namespace llaminar2
                 {{"capturable_segments",
                   std::to_string(capturable_segments)},
                  {"manual_segments", std::to_string(manual_segments)},
-                 {"ticket_boundaries",
-                  std::to_string(host_ticket_boundary_segments)}});
+                 {"ticket_publication_authority",
+                  "stage_owned_mapped_timeline"},
+                 {"unit_boundaries",
+                  std::to_string(
+                      heterogeneous_ticket_unit_boundaries)},
+                 {"terminal_units",
+                  std::to_string(
+                      heterogeneous_ticket_terminal_units)},
+                 {"role",
+                  heterogeneous_ticket_authority
+                      ? "authority"
+                      : "follower"}});
         }
 
         if (plan_policy ==
@@ -3890,6 +3928,35 @@ namespace llaminar2
         for (size_t segment_index = 0; segment_index < segment_cache.segments.size(); ++segment_index)
         {
             auto &seg = segment_cache.segments[segment_index];
+            if (debugEnv().execution.gpu_graph_trace_replay)
+            {
+                /* Capture-time stalls precede replay and therefore cannot be
+                 * localized by the replay trace below.  Emit the same compact
+                 * unit identity here so a retained device wait can be tied to
+                 * the exact declarative frontier without dumping every stage
+                 * or perturbing normal execution. */
+                LOG_DEBUG(
+                    "[CaptureTrace] "
+                    << ctx->deviceId().toString()
+                    << " step=" << current_step
+                    << " seg=" << segment_index << "/"
+                    << segment_cache.segments.size()
+                    << " [" << (seg.capturable ? "GRAPH" : "MANUAL")
+                    << "] stages=" << seg.stage_names.size()
+                    << " first="
+                    << (seg.stage_names.empty()
+                            ? std::string("<empty>")
+                            : seg.stage_names.front())
+                    << " last="
+                    << (seg.stage_names.empty()
+                            ? std::string("<empty>")
+                            : seg.stage_names.back())
+                    << " identity="
+                    << (seg.capture_wave_identity.empty()
+                            ? std::string("<implicit>")
+                            : seg.capture_wave_identity)
+                    << " stage_list=" << describeSegmentStages(seg));
+            }
             if (seg.capturable)
             {
                 // Capturable path: prepared stream -> begin capture -> record
@@ -4187,15 +4254,9 @@ namespace llaminar2
                  * every neighbouring executable but cannot submit manual model
                  * arithmetic before request admission. The first ordinary replay
                  * executes this unit in its declared position.
-                 */
+                */
                 if (!materialize_without_launch)
                 {
-                    awaitManualHostTicketBoundary(
-                        graph,
-                        segment_cache,
-                        segment_index,
-                        "capture",
-                        ctx->deviceId());
                     const bool manual_capture_ok =
                         executeCapturePhaseManualSegment(
                             graph,
@@ -4433,29 +4494,6 @@ namespace llaminar2
             }
 
             const auto segment_t0 = std::chrono::high_resolution_clock::now();
-            uint64_t manual_ticket_wait_ns = 0;
-            if (!seg.capturable)
-            {
-                const auto ticket_wait_t0 =
-                    std::chrono::high_resolution_clock::now();
-                awaitManualHostTicketBoundary(
-                    graph,
-                    segment_cache,
-                    static_cast<size_t>(seg_idx),
-                    "replay",
-                    ctx->deviceId());
-                if (profiling)
-                {
-                    const auto ticket_wait_t1 =
-                        std::chrono::high_resolution_clock::now();
-                    manual_ticket_wait_ns = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            ticket_wait_t1 - ticket_wait_t0)
-                            .count());
-                    ForwardPassProfiler::addReplayManualHostTicketWaitNs(
-                        manual_ticket_wait_ns);
-                }
-            }
             // Segment execution picks capturable or manual behavior based on
             // segment metadata prepared during capture setup.
             const DeviceGraphExecutor::GraphLaunchDependencyHook
@@ -4496,9 +4534,7 @@ namespace llaminar2
                             manual_segment_t1 - segment_t0)
                             .count());
                 const uint64_t manual_execution_ns =
-                    manual_segment_total_ns >= manual_ticket_wait_ns
-                        ? manual_segment_total_ns - manual_ticket_wait_ns
-                        : 0;
+                    manual_segment_total_ns;
 
                 bool has_dispatch_descriptor = false;
                 bool has_sparse_rank_protocol = false;

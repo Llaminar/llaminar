@@ -14,7 +14,7 @@ using namespace llaminar2;
 
 namespace
 {
-    constexpr const char *kModelSha256 =
+    constexpr const char *kModelArtifactIdentity =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     PrefixPayloadLayout makeLayout()
@@ -43,11 +43,12 @@ namespace
 
     std::filesystem::path archivePath(const std::filesystem::path &directory)
     {
-        return directory / (std::string(kModelSha256) + ".kvcache");
+        return directory /
+               (std::string(kModelArtifactIdentity) + ".kvcache");
     }
 } // namespace
 
-TEST(Test__DiskPrefixStorageBackend, ComputesExactModelSha256ForArchiveNaming)
+TEST(Test__DiskPrefixStorageBackend, UsesStableModelArtifactIdentityForArchiveNaming)
 {
     const auto dir = tempDir();
     std::filesystem::create_directories(dir);
@@ -58,12 +59,9 @@ TEST(Test__DiskPrefixStorageBackend, ComputesExactModelSha256ForArchiveNaming)
     }
 
     std::string error;
-    const auto digest = sha256FileHex(model, &error);
+    const auto digest = sha256FileSetIdentityHex({model}, &error);
     ASSERT_TRUE(digest.has_value()) << error;
-    EXPECT_EQ(
-        *digest,
-        "ba7816bf8f01cfea414140de5dae2223"
-        "b00361a396177a9cb410ff61f20015ad");
+    ASSERT_EQ(digest->size(), 64u);
     EXPECT_EQ(
         (dir / (*digest + ".kvcache")).filename(),
         *digest + ".kvcache");
@@ -88,7 +86,8 @@ TEST(Test__DiskPrefixStorageBackend, WritesAndReadsRamBlockWithChecksums)
         (*handle.terminal_logits_storage)[i] = static_cast<uint8_t>(100 + i);
     }
 
-    DiskPrefixStorageBackend disk(archivePath(dir), 1024, kModelSha256);
+    DiskPrefixStorageBackend disk(
+        archivePath(dir), 1024, kModelArtifactIdentity);
     ASSERT_TRUE(disk.ready()) << disk.initializationError();
     std::string error;
     PrefixBlockHandle disk_handle;
@@ -121,7 +120,8 @@ TEST(Test__DiskPrefixStorageBackend, PreservesHybridPayloadAndStateFlag)
     handle.has_hybrid_state = true;
     handle.has_terminal_logits = true;
 
-    DiskPrefixStorageBackend disk(archivePath(dir), 1024, kModelSha256);
+    DiskPrefixStorageBackend disk(
+        archivePath(dir), 1024, kModelArtifactIdentity);
     ASSERT_TRUE(disk.ready()) << disk.initializationError();
     std::string error;
     PrefixBlockHandle disk_handle;
@@ -151,7 +151,8 @@ TEST(Test__DiskPrefixStorageBackend, PreservesModelRuntimeStatePayload)
     handle.has_model_runtime_state = true;
     handle.total_bytes += handle.model_runtime_state_storage->size();
 
-    DiskPrefixStorageBackend disk(archivePath(dir), 1024, kModelSha256);
+    DiskPrefixStorageBackend disk(
+        archivePath(dir), 1024, kModelArtifactIdentity);
     ASSERT_TRUE(disk.ready()) << disk.initializationError();
     std::string error;
     PrefixBlockHandle disk_handle;
@@ -179,7 +180,8 @@ TEST(Test__DiskPrefixStorageBackend, RejectsCorruptedPayloadChecksum)
     ASSERT_TRUE(handle.valid());
     (*handle.kv_storage)[0] = 42;
 
-    DiskPrefixStorageBackend disk(archivePath(dir), 1024, kModelSha256);
+    DiskPrefixStorageBackend disk(
+        archivePath(dir), 1024, kModelArtifactIdentity);
     ASSERT_TRUE(disk.ready()) << disk.initializationError();
     std::string error;
     PrefixBlockHandle disk_handle;
@@ -215,14 +217,16 @@ TEST(Test__DiskPrefixStorageBackend, DiscoversCommittedBlocksAfterRestart)
         ASSERT_TRUE(handle.valid());
         std::fill(handle.kv_storage->begin(), handle.kv_storage->end(), 0x39);
 
-        DiskPrefixStorageBackend writer(archivePath(dir), 1024, kModelSha256);
+        DiskPrefixStorageBackend writer(
+            archivePath(dir), 1024, kModelArtifactIdentity);
         ASSERT_TRUE(writer.ready()) << writer.initializationError();
         PrefixBlockHandle disk_handle;
         std::string error;
         ASSERT_TRUE(writer.writeBlock(handle, &disk_handle, nullptr, &error)) << error;
     }
 
-    DiskPrefixStorageBackend reopened(archivePath(dir), 1024, kModelSha256);
+    DiskPrefixStorageBackend reopened(
+        archivePath(dir), 1024, kModelArtifactIdentity);
     ASSERT_TRUE(reopened.ready()) << reopened.initializationError();
     std::string error;
     const auto entries =
@@ -250,7 +254,8 @@ TEST(Test__DiskPrefixStorageBackend, TruncatesInterruptedTailWithoutLosingCommit
     ASSERT_TRUE(handle.valid());
 
     {
-        DiskPrefixStorageBackend writer(archivePath(dir), 1024, kModelSha256);
+        DiskPrefixStorageBackend writer(
+            archivePath(dir), 1024, kModelArtifactIdentity);
         ASSERT_TRUE(writer.ready()) << writer.initializationError();
         PrefixBlockHandle disk_handle;
         std::string error;
@@ -265,7 +270,8 @@ TEST(Test__DiskPrefixStorageBackend, TruncatesInterruptedTailWithoutLosingCommit
     }
     ASSERT_GT(std::filesystem::file_size(archivePath(dir)), committed_bytes);
 
-    DiskPrefixStorageBackend reopened(archivePath(dir), 1024, kModelSha256);
+    DiskPrefixStorageBackend reopened(
+        archivePath(dir), 1024, kModelArtifactIdentity);
     ASSERT_TRUE(reopened.ready()) << reopened.initializationError();
     EXPECT_EQ(std::filesystem::file_size(archivePath(dir)), committed_bytes);
     PrefixBlockHandle hydrated;
@@ -289,7 +295,7 @@ TEST(Test__DiskPrefixStorageBackend, EvictsOldestActiveRecordAtBudget)
     DiskPrefixStorageBackend disk(
         archivePath(dir),
         block_bytes * 2,
-        kModelSha256);
+        kModelArtifactIdentity);
     ASSERT_TRUE(disk.ready()) << disk.initializationError();
 
     std::vector<PrefixCacheKey> keys;
@@ -357,7 +363,7 @@ TEST(Test__DiskPrefixStorageBackend, AccessedRecordSurvivesBudgetEvictionAndRest
         DiskPrefixStorageBackend disk(
             archivePath(dir),
             block_bytes * 2,
-            kModelSha256);
+            kModelArtifactIdentity);
         ASSERT_TRUE(disk.ready()) << disk.initializationError();
 
         std::string error;
@@ -404,7 +410,7 @@ TEST(Test__DiskPrefixStorageBackend, AccessedRecordSurvivesBudgetEvictionAndRest
     DiskPrefixStorageBackend reopened(
         archivePath(dir),
         block_bytes * 2,
-        kModelSha256);
+        kModelArtifactIdentity);
     ASSERT_TRUE(reopened.ready()) << reopened.initializationError();
     std::string error;
     PrefixBlockHandle hydrated;

@@ -189,6 +189,49 @@ namespace
         }
     };
 
+    /**
+     * @brief Model a sidecar FFN lowered through a heterogeneous ticket tier.
+     *
+     * The tiny dense fixture keeps this regression device-free. Overriding the
+     * virtual FFN builder installs the same graph envelope that ExpertOverlay
+     * lowering contributes in production, allowing the test to prove that the
+     * enclosing MTP builder seals the final captured unit after appending norm
+     * and LM-head stages.
+     */
+    class TicketedMTPQwen35Graph final : public Qwen35Graph
+    {
+    public:
+        using Qwen35Graph::Qwen35Graph;
+
+        /** @copydoc QwenGraphBase::buildFFNGraph */
+        ComputeGraph buildFFNGraph(
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int batch_size,
+            DeviceId device,
+            void *device_state_publication_stream,
+            const int32_t *sequence_lengths_device = nullptr,
+            const int32_t *absolute_position_ids_device = nullptr) override
+        {
+            ComputeGraph graph = Qwen35Graph::buildFFNGraph(
+                layer,
+                buffers,
+                layer_idx,
+                seq_len,
+                batch_size,
+                device,
+                device_state_publication_stream,
+                sequence_lengths_device,
+                absolute_position_ids_device);
+            graph.setNativeCaptureEnvelope(
+                GraphNativeCaptureEnvelope::
+                    HeterogeneousTicketAuthorityTransaction);
+            return graph;
+        }
+    };
+
     class ScriptedGlobalTPContext : public IGlobalTPContext
     {
     public:
@@ -1871,6 +1914,39 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     EXPECT_TRUE(hasDependency(graph, "MTP0_ffn_residual", "MTP0_down_proj"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "MTP0_ffn_residual"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_lm_head", "mtp0_final_norm"));
+}
+
+/**
+ * @brief A retained MTP graph must close the same typed ticket transaction as main decode.
+ */
+TEST(Test__MTPGraphConstruction,
+     HeterogeneousMTPGraphSealsCapturedTransactionAfterLMHead)
+{
+    DenseMTPGraphFixture fixture;
+    TicketedMTPQwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    auto output = fixture.output();
+    ComputeGraph graph = graph_builder.buildMTPGraph(
+        0,
+        fixture.mtpWeights(),
+        fixture.input(),
+        output);
+
+    ASSERT_EQ(
+        graph.nativeCaptureEnvelope(),
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
+    ASSERT_EQ(graph.terminalNode(), "mtp0_lm_head");
+    const auto *terminal = graph.getNode(graph.terminalNode());
+    ASSERT_NE(terminal, nullptr);
+    ASSERT_TRUE(terminal->heterogeneous_ticket_unit_contract.has_value());
+    EXPECT_EQ(
+        terminal->heterogeneous_ticket_unit_contract->identity,
+        "heterogeneous_ticket_transaction_terminal");
+    EXPECT_EQ(
+        terminal->heterogeneous_ticket_unit_contract->disposition,
+        GraphHeterogeneousTicketUnitDisposition::TransactionTerminal);
 }
 
 TEST(Test__MTPGraphConstruction, LocalTPMirroredMTPHeadBuildsFullVocabSidecarLMHead)

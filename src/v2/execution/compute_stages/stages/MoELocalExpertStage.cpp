@@ -42,6 +42,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include <omp.h>
+
 namespace llaminar2
 {
     namespace
@@ -141,6 +143,23 @@ namespace llaminar2
                 return "synthetic_test";
             }
             return "invalid";
+        }
+
+        /** @brief Convert packet histogram identity to the grouped CPU phase. */
+        MoEOverlayServicePhaseHint servicePhaseHint(
+            ExpertHistogramSource source) noexcept
+        {
+            switch (source)
+            {
+            case ExpertHistogramSource::DecodeToken:
+            case ExpertHistogramSource::SyntheticTest:
+                return MoEOverlayServicePhaseHint::Decode;
+            case ExpertHistogramSource::PrefillChunk:
+                return MoEOverlayServicePhaseHint::Prefill;
+            case ExpertHistogramSource::GroupedVerifier:
+                return MoEOverlayServicePhaseHint::GroupedVerifier;
+            }
+            return MoEOverlayServicePhaseHint::Auto;
         }
 
         /**
@@ -608,6 +627,21 @@ namespace llaminar2
                 "MoELocalExpertSerialBufferArena requires a valid device, positive "
                 "row capacity, d_model, routing_top_k, and non-negative participant id");
         }
+        if (config.cpu_canonical_route_storage ==
+                CPUCanonicalRouteStoragePolicy::RetainSerialMaximum &&
+            !device_id_.is_cpu())
+        {
+            throw std::invalid_argument(
+                "MoELocalExpertSerialBufferArena canonical route storage is CPU-only");
+        }
+        if (config.cpu_grouped_scratch_storage ==
+                CPUGroupedScratchStoragePolicy::RetainSerialMaximum &&
+            (!device_id_.is_cpu() || config.num_experts <= 0 ||
+             config.expert_intermediate <= 0))
+        {
+            throw std::invalid_argument(
+                "MoELocalExpertSerialBufferArena retained grouped scratch requires CPU execution and complete expert geometry");
+        }
 
         const std::string prefix =
             config.debug_name.empty()
@@ -717,8 +751,54 @@ namespace llaminar2
                 "MoELocalExpertSerialBufferArena failed to materialize its maximum family");
         }
 
+        size_t canonical_route_bytes = 0u;
+        if (config.cpu_canonical_route_storage ==
+                CPUCanonicalRouteStoragePolicy::RetainSerialMaximum)
+        {
+            const size_t route_rows = checkedMultiply(
+                row_capacity_, routing_top_k, "canonical route rows");
+            const size_t route_elements = checkedMultiply(
+                route_rows, d_model, "canonical route elements");
+            canonical_route_bytes = checkedMultiply(
+                route_elements, sizeof(float), "canonical route bytes");
+            cpu_canonical_routes_ = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{route_rows, d_model});
+            cpu_canonical_routes_->setDebugName(
+                prefix + ".cpu_canonical_route_rows");
+            allocation_bytes_ = checkedAdd(
+                allocation_bytes_,
+                canonical_route_bytes,
+                "canonical route arena bytes");
+        }
+
+        size_t cpu_grouped_scratch_bytes = 0u;
+        if (config.cpu_grouped_scratch_storage ==
+            CPUGroupedScratchStoragePolicy::RetainSerialMaximum)
+        {
+            cpu_grouped_workspace_ =
+                std::make_shared<CPUGroupedMoESerialWorkspace>(
+                    CPUGroupedMoESerialWorkspace::Config{
+                        .row_capacity = row_capacity_,
+                        .d_model = d_model_,
+                        .expert_intermediate = config.expert_intermediate,
+                        .num_experts = config.num_experts,
+                        .routing_top_k = routing_top_k_,
+                        .debug_name = prefix + ".cpu_grouped_scratch",
+                    });
+            cpu_grouped_scratch_bytes =
+                cpu_grouped_workspace_->allocationBytes();
+            allocation_bytes_ = checkedAdd(
+                allocation_bytes_,
+                cpu_grouped_scratch_bytes,
+                "CPU grouped scratch arena bytes");
+        }
+
         const PerfStatsCollector::Tags tags{
             {"bytes", std::to_string(allocation_bytes_)},
+            {"cpu_canonical_route_bytes",
+             std::to_string(canonical_route_bytes)},
+            {"cpu_grouped_scratch_bytes",
+             std::to_string(cpu_grouped_scratch_bytes)},
             {"d_model", std::to_string(d_model_)},
             {"family_count", std::to_string(families_.size())},
             {"immutable", "true"},
@@ -765,6 +845,10 @@ namespace llaminar2
                 " row_capacity=" + std::to_string(row_capacity_) +
                 " d_model=" + std::to_string(d_model_) +
                 " routing_top_k=" + std::to_string(routing_top_k_) +
+                " cpu_canonical_route_bytes=" +
+                std::to_string(canonical_route_bytes) +
+                " cpu_grouped_scratch_bytes=" +
+                std::to_string(cpu_grouped_scratch_bytes) +
                 " pinned_transfer_bytes=" +
                 std::to_string(pinned_transfer_bytes_) +
                 " " + vramBomBytes(allocation_bytes_));
@@ -830,6 +914,19 @@ namespace llaminar2
                 throw std::invalid_argument(
                     "MoELocalExpertStage graph entry capacity exceeds its fixed packet view");
             }
+            if (params_.cpu_canonical_route_return)
+            {
+                const auto &binding = *params_.cpu_canonical_route_return;
+                if (!params_.device_id.is_cpu() || !binding.valid() ||
+                    binding.route_slot_capacity < packet_entry_capacity ||
+                    !params_.serial_compact_buffer_arena ||
+                    !params_.serial_compact_buffer_arena
+                         ->cpuCanonicalRoutes())
+                {
+                    throw std::invalid_argument(
+                        "MoELocalExpertStage mapped canonical return requires CPU execution, exact route-slot storage, and a canonical serial arena");
+                }
+            }
             if (!ensureCompactCapacity(row_capacity, params_.top_k))
             {
                 throw std::runtime_error(
@@ -839,10 +936,8 @@ namespace llaminar2
             route_admission_capacity_ = entry_capacity;
             row_admission_capacity_ = row_capacity;
             active_routes_.reserve(route_admission_capacity_);
-            row_output_slot_.resize(row_admission_capacity_, -1);
-            validated_input_rows_.resize(row_admission_capacity_, 0u);
             output_input_rows_.reserve(row_admission_capacity_);
-            compact_row_route_counts_.resize(row_admission_capacity_, 0u);
+            compact_hidden_source_rows_.reserve(row_admission_capacity_);
         }
         if (params_.moe_runtime_table && params_.layer_idx >= 0)
             (void)refreshRuntimePlacement();
@@ -864,6 +959,12 @@ namespace llaminar2
             invocation_up_engines_.resize(expert_count, nullptr);
             invocation_down_engines_.resize(expert_count, nullptr);
             invocation_expert_mask_.resize(expert_count, false);
+        }
+
+        if (params_.device_id.is_cpu() && params_.input_rows &&
+            params_.output_rows && params_.num_experts > 0)
+        {
+            createRetainedCPUExecutor();
         }
 
         if (params_.completion_policy ==
@@ -959,6 +1060,119 @@ namespace llaminar2
                               replay->compute_stage
                                   ->hasOverlayServiceTelemetryForTesting();
                    });
+    }
+
+    void MoELocalExpertStage::createRetainedCPUExecutor()
+    {
+        if (!params_.device_id.is_cpu() || !compact_hidden_ ||
+            !compact_routing_indices_ || !compact_routing_weights_ ||
+            !compact_output_ || compact_capacity_ == 0 ||
+            compact_capacity_ >
+                static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            params_.top_k <= 0 || params_.num_experts <= 0 ||
+            invocation_expert_mask_.size() !=
+                static_cast<size_t>(params_.num_experts))
+        {
+            throw std::invalid_argument(
+                "Retained CPU MoELocalExpertStage requires complete setup-owned packet geometry");
+        }
+
+        MoEExpertComputeStage::Params compute_params;
+        const bool registry_only =
+            params_.expert_weight_resolution_policy ==
+            ExpertWeightResolutionPolicy::RegistryOnly;
+        compute_params.device_id = params_.device_id;
+        compute_params.input = compact_hidden_.get();
+        compute_params.seq_len = static_cast<int>(compact_capacity_);
+        compute_params.d_model = params_.d_model;
+        compute_params.num_experts = params_.num_experts;
+        compute_params.top_k = params_.top_k;
+        compute_params.gate_exps = registry_only ? nullptr : params_.gate_exps;
+        compute_params.up_exps = registry_only ? nullptr : params_.up_exps;
+        compute_params.down_exps = registry_only ? nullptr : params_.down_exps;
+        compute_params.expert_intermediate = params_.expert_intermediate;
+        compute_params.layer_idx = params_.layer_idx;
+        compute_params.expert_mask = invocation_expert_mask_;
+        compute_params.routing_indices = compact_routing_indices_.get();
+        compute_params.routing_weights = compact_routing_weights_.get();
+        compute_params.output = compact_output_.get();
+        if (params_.cpu_canonical_route_return)
+        {
+            if (!compact_canonical_routes_)
+            {
+                throw std::invalid_argument(
+                    "Retained CPU canonical-route executor has no setup-owned publication tensor");
+            }
+            compute_params.canonical_route_contributions =
+                compact_canonical_routes_.get();
+            compute_params.canonical_route_arithmetic =
+                MoECanonicalRouteArithmeticPolicy::
+                    UnweightedExpertRowThenOrderedFMA;
+            compute_params.canonical_route_layout =
+                MoECanonicalRoutePublicationLayout::
+                    DenseOriginalRouteSlots;
+        }
+        compute_params.output_registered_in_arena = false;
+        compute_params.cpu_router_q8_input_publication =
+            CPURouterQ8InputPublicationPolicy::PublishTransportedRows;
+        compute_params.cpu_grouped_serial_workspace =
+            params_.serial_compact_buffer_arena
+                ? params_.serial_compact_buffer_arena->cpuGroupedWorkspace()
+                : nullptr;
+        compute_params.expert_weight_resolution_policy =
+            registry_only
+                ? MoEExpertWeightResolutionPolicy::PreparedRegistryOnly
+                : MoEExpertWeightResolutionPolicy::RawOrPrepared;
+        compute_params.prepared_engine_binding_lifecycle =
+            registry_only
+                ? MoEPreparedEngineBindingLifecycle::
+                      SparseOverlayInvocationPublished
+                : MoEPreparedEngineBindingLifecycle::
+                      CompleteAtConstruction;
+        if (registry_only &&
+            !compute_params.cpu_grouped_serial_workspace)
+        {
+            throw std::invalid_argument(
+                "Registry-owned CPU ExpertOverlay requires setup-owned serial grouped scratch");
+        }
+        compute_params.prepared_gate_gemm = invocation_gate_engines_;
+        compute_params.prepared_up_gemm = invocation_up_engines_;
+        compute_params.prepared_down_gemm = invocation_down_engines_;
+        compute_params.prepared_store = params_.prepared_store;
+        compute_params.expert_registry = params_.expert_registry;
+        compute_params.moe_runtime_table =
+            params_.overlay_participant_residency
+                ? nullptr
+                : params_.moe_runtime_table;
+        compute_params.overlay_service_telemetry =
+            params_.overlay_service_telemetry;
+        compute_params.gate_slab_ref = params_.gate_slab_ref;
+        compute_params.up_slab_ref = params_.up_slab_ref;
+        compute_params.down_slab_ref = params_.down_slab_ref;
+
+        retained_cpu_compute_stage_ =
+            std::make_unique<MoEExpertComputeStage>(
+                std::move(compute_params));
+        retained_cpu_compute_stage_->releaseRawExpertWeights();
+        if (!retained_cpu_compute_stage_->bindSparseOverlayInvocation(
+                MoEExpertComputeStage::SparseOverlayInvocation{
+                    .input = compact_hidden_.get(),
+                    .routing_indices = compact_routing_indices_.get(),
+                    .routing_weights = compact_routing_weights_.get(),
+                    .output = compact_output_.get(),
+                    .live_rows = static_cast<int>(compact_capacity_),
+                    .binding_kind =
+                        MoEExpertComputeStage::SparseOverlayBindingKind::
+                            SetupPriming,
+                    .expert_mask = &invocation_expert_mask_,
+                    .gate_engines = invocation_gate_engines_,
+                    .up_engines = invocation_up_engines_,
+                    .down_engines = invocation_down_engines_,
+                }))
+        {
+            throw std::runtime_error(
+                "Retained CPU MoELocalExpertStage could not prime its serial executor");
+        }
     }
 
     void MoELocalExpertStage::createDeferredReplayFamilies()
@@ -2113,10 +2327,16 @@ namespace llaminar2
             compact_routing_indices_ = family->routing_indices;
             compact_routing_weights_ = family->routing_weights;
             compact_output_ = family->output;
+            compact_canonical_routes_ =
+                params_.cpu_canonical_route_return
+                    ? arena.cpuCanonicalRoutes()
+                    : nullptr;
             compact_capacity_ = family->row_capacity;
             compact_routing_top_k_ = arena.routingTopK();
             return compact_hidden_ && compact_routing_indices_ &&
-                   compact_routing_weights_ && compact_output_;
+                   compact_routing_weights_ && compact_output_ &&
+                   (!params_.cpu_canonical_route_return ||
+                    compact_canonical_routes_);
         }
 
         if (compact_capacity_ >= capacity &&
@@ -2134,6 +2354,7 @@ namespace llaminar2
         compact_routing_indices_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(routing_top_k)});
         compact_routing_weights_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(routing_top_k)});
         compact_output_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(params_.d_model)});
+        compact_canonical_routes_.reset();
         compact_capacity_ = capacity;
         compact_routing_top_k_ = routing_top_k;
         return true;
@@ -2389,8 +2610,8 @@ namespace llaminar2
 
         active_routes_.clear();
         output_input_rows_.clear();
-        std::fill_n(row_output_slot_.begin(), input.live_row_count, -1);
-        std::fill_n(validated_input_rows_.begin(), input.live_row_count, 0u);
+        compact_hidden_source_rows_.clear();
+        size_t maximum_local_routes_per_row = 0;
 
         for (size_t row = 0; row < input.live_row_count; ++row)
         {
@@ -2412,6 +2633,8 @@ namespace llaminar2
                 return false;
             }
 
+            size_t local_route_count = 0;
+            size_t compact_row = 0;
             for (int32_t entry = entry_begin; entry < entry_end; ++entry)
             {
                 const int expert_id = input.expert_ids_host[entry];
@@ -2439,7 +2662,7 @@ namespace llaminar2
                 if (weight == 0.0f || !expert_is_active)
                     continue;
 
-                if (validate_finite_values && !validated_input_rows_[row])
+                if (local_route_count == 0)
                 {
                     const float *hidden_row =
                         input.hiddenRowForCompactIndex(row);
@@ -2459,30 +2682,53 @@ namespace llaminar2
                                    input.hidden_payload_layout));
                         return false;
                     }
-                    for (int col = 0; col < params_.d_model; ++col)
+                    if (validate_finite_values)
                     {
-                        if (!std::isfinite(hidden_row[col]))
+                        for (int col = 0; col < params_.d_model; ++col)
                         {
-                            LOG_ERROR("[MoELocalExpertStage] Non-finite sparse hidden value for layer "
-                                      << params_.layer_idx
-                                      << " participant=" << params_.runtime_participant_index
-                                      << " compact_row=" << row
-                                      << " row_id=" << row_id
-                                      << " col=" << col);
-                            return false;
+                            if (!std::isfinite(hidden_row[col]))
+                            {
+                                LOG_ERROR("[MoELocalExpertStage] Non-finite sparse hidden value for layer "
+                                          << params_.layer_idx
+                                          << " participant=" << params_.runtime_participant_index
+                                          << " compact_row=" << row
+                                          << " row_id=" << row_id
+                                          << " col=" << col);
+                                return false;
+                            }
                         }
                     }
-                    validated_input_rows_[row] = 1u;
-                }
-
-                if (row_output_slot_[row] < 0)
-                {
-                    row_output_slot_[row] =
-                        static_cast<int>(output_input_rows_.size());
+                    compact_row = output_input_rows_.size();
                     output_input_rows_.push_back(row);
+                    const size_t hidden_source_row =
+                        input.hidden_payload_layout ==
+                                MoEOverlayActivationHiddenPayloadLayout::
+                                    SharedPhysicalRows
+                            ? static_cast<size_t>(row_id)
+                            : row;
+                    if (hidden_source_row >
+                        static_cast<size_t>(
+                            std::numeric_limits<int>::max()))
+                    {
+                        LOG_ERROR(
+                            "[MoELocalExpertStage] CPU transported hidden-row index exceeds int range"
+                            << " layer=" << params_.layer_idx
+                            << " row=" << hidden_source_row);
+                        return false;
+                    }
+                    compact_hidden_source_rows_.push_back(
+                        static_cast<int>(hidden_source_row));
                 }
-                active_routes_.push_back(ActiveRoute{row, expert_id, weight});
+                active_routes_.push_back(ActiveRoute{
+                    .compact_row = compact_row,
+                    .route_offset = local_route_count,
+                    .expert_id = expert_id,
+                    .weight = weight,
+                });
+                ++local_route_count;
             }
+            maximum_local_routes_per_row =
+                std::max(maximum_local_routes_per_row, local_route_count);
         }
 
         if (active_routes_.empty())
@@ -2494,40 +2740,18 @@ namespace llaminar2
         }
 
         const size_t compact_live_rows = output_input_rows_.size();
-        if (compact_live_rows == 0)
+        if (compact_live_rows == 0 ||
+            compact_hidden_source_rows_.size() != compact_live_rows ||
+            input.hidden_row_capacity >
+                static_cast<size_t>(std::numeric_limits<int>::max()))
             return false;
 
         /*
-         * Count routes using the already established compact-row mapping, then
-         * choose one setup-created 1/2/4/.../top-k graph. The route order inside
-         * each row is unchanged; only invalid tail slots disappear from the
-         * captured launch geometry. Tensor allocation retains the full model
-         * top-k so every graph variant borrows the same stable addresses.
+         * Admission computed the exact stable local width while visiting each
+         * source CSR row. Select one setup-created 1/2/4/.../top-k family
+         * without a second route scan. Tensor allocation retains full model
+         * top-k storage so every graph variant borrows stable addresses.
          */
-        std::fill_n(
-            compact_row_route_counts_.begin(), compact_live_rows, size_t{0});
-        size_t maximum_local_routes_per_row = 0;
-        for (const auto &route : active_routes_)
-        {
-            const int compact_row = row_output_slot_[route.input_row];
-            if (compact_row < 0 ||
-                static_cast<size_t>(compact_row) >= compact_live_rows)
-            {
-                LOG_ERROR(
-                    "[MoELocalExpertStage] Active route lost its compact-row slot while selecting launch width");
-                return false;
-            }
-            const size_t route_count =
-                ++compact_row_route_counts_[static_cast<size_t>(compact_row)];
-            if (route_count > static_cast<size_t>(params_.top_k))
-            {
-                LOG_ERROR(
-                    "[MoELocalExpertStage] Participant-local routes exceed model top_k while selecting launch width");
-                return false;
-            }
-            maximum_local_routes_per_row =
-                std::max(maximum_local_routes_per_row, route_count);
-        }
         const int compact_top_k =
             MoELocalExpertSerialBufferArena::routeWidthBucketFor(
                 static_cast<int>(maximum_local_routes_per_row),
@@ -2618,11 +2842,15 @@ namespace llaminar2
          * device generation; the graph's first captured node overwrites the
          * complete device tensor capacity from these exact addresses.
          */
-        float *hidden = compact_family
-                            ? static_cast<float *>(
-                                  compact_family->pinned_transfer->mutableData(
-                                      compact_family->pinned_hidden_offset))
-                            : compact_hidden_->mutable_data();
+        const bool materialize_compact_hidden =
+            !params_.device_id.is_cpu() || compact_live_rows == 1u;
+        float *hidden = materialize_compact_hidden
+                            ? compact_family
+                                  ? static_cast<float *>(
+                                        compact_family->pinned_transfer->mutableData(
+                                            compact_family->pinned_hidden_offset))
+                                  : compact_hidden_->mutable_data()
+                            : nullptr;
         float *routing_indices = compact_family
                                      ? static_cast<float *>(
                                            compact_family->pinned_transfer->mutableData(
@@ -2636,26 +2864,29 @@ namespace llaminar2
         /*
          * A retained GPU family publishes into a separate pinned destination,
          * so touching the tensor's stale host allocation here would first
-         * download the preceding layer output. The fixed-capacity grouped
-         * kernel overwrites every active and invalid-padded row. Inline CPU/GPU
-         * execution still uses Tensor coherence and therefore clears its host
-         * output before launch.
+         * download the preceding layer output. The CPU grouped executor owns
+         * exact live-publication zeroing inside MoEExpertComputeStage; asking
+         * for its output here would duplicate a capacity-wide host write.
          */
-        float *compact_output = usesDeferredCompletion()
-                                    ? nullptr
-                                    : compact_output_->mutable_data();
+        float *compact_output =
+            !usesDeferredCompletion() && params_.device_id.is_gpu()
+                ? compact_output_->mutable_data()
+                : nullptr;
         const size_t compact_hidden_elements =
             compact_capacity_ * static_cast<size_t>(params_.d_model);
         const size_t compact_routing_elements =
             compact_capacity_ * static_cast<size_t>(compact_top_k);
+        const size_t materialized_routing_elements =
+            params_.device_id.is_cpu()
+                ? compact_live_rows * static_cast<size_t>(compact_top_k)
+                : compact_routing_elements;
         /*
-         * A retained graph always executes its immutable bucket geometry.
-         * Padding every unused row with an invalid expert and zero weight makes
-         * the full-capacity launch mathematically identical to the live prefix,
-         * Clearing hidden storage prevents stale bytes from obscuring an
-         * invalid-route kernel defect. Inline execution also clears its tensor
-         * output; retained GPU execution proves full overwrite by publishing
-         * the complete fixed-capacity result from inside the captured graph.
+         * A retained GPU graph always executes its immutable bucket geometry,
+         * so every padded route must be invalid. CPU execution receives the
+         * exact live row count and cannot observe bucket-tail storage; clearing
+         * only its live route rectangle avoids touching unused maximum-family
+         * pages. Clearing hidden storage in diagnostic validation makes stale
+         * padding visible without charging Release inference.
          */
         /*
          * Every live hidden row is overwritten below and every padded row has
@@ -2665,59 +2896,61 @@ namespace llaminar2
          * unreachable. The retained H2D node remains fixed-size and address
          * stable in both modes.
          */
-        if (validate_finite_values)
+        if (validate_finite_values && hidden)
             std::fill_n(hidden, compact_hidden_elements, 0.0f);
-        std::fill_n(routing_indices, compact_routing_elements, -1.0f);
-        std::fill_n(routing_weights, compact_routing_elements, 0.0f);
+        std::fill_n(routing_indices, materialized_routing_elements, -1.0f);
+        std::fill_n(routing_weights, materialized_routing_elements, 0.0f);
         if (compact_output)
             std::fill_n(compact_output, compact_hidden_elements, 0.0f);
 
-        std::fill_n(
-            compact_row_route_counts_.begin(), compact_live_rows, size_t{0});
-        for (size_t compact_row = 0; compact_row < compact_live_rows; ++compact_row)
+        /*
+         * Multi-row CPU execution consumes the authenticated transport matrix
+         * through its typed borrowed-row binding. M=1 retains the compact copy
+         * because it uses the dedicated serial decode implementation; copying
+         * one hidden row is cheaper than adding a second input convention to
+         * that latency-specialized kernel.
+         */
+        if (materialize_compact_hidden)
         {
-            const size_t input_row = output_input_rows_[compact_row];
-            const float *const source_hidden =
-                input.hiddenRowForCompactIndex(input_row);
-            if (!source_hidden)
+            for (size_t compact_row = 0;
+                 compact_row < compact_live_rows;
+                 ++compact_row)
             {
-                LOG_ERROR(
-                    "[MoELocalExpertStage] Active sparse row has no address in its selected hidden payload"
-                    << " compact_row=" << input_row
-                    << " row_id=" << input.row_ids_host[input_row]
-                    << " hidden_row_capacity="
-                    << input.hidden_row_capacity
-                    << " layout="
-                    << static_cast<int>(input.hidden_payload_layout));
-                return false;
+                const size_t input_row = output_input_rows_[compact_row];
+                const float *const source_hidden =
+                    input.hiddenRowForCompactIndex(input_row);
+                if (!source_hidden)
+                {
+                    LOG_ERROR(
+                        "[MoELocalExpertStage] Active sparse row has no address in its selected hidden payload"
+                        << " compact_row=" << input_row
+                        << " row_id=" << input.row_ids_host[input_row]
+                        << " hidden_row_capacity="
+                        << input.hidden_row_capacity
+                        << " layout="
+                        << static_cast<int>(input.hidden_payload_layout));
+                    return false;
+                }
+                std::memcpy(
+                    hidden + compact_row *
+                                 static_cast<size_t>(params_.d_model),
+                    source_hidden,
+                    static_cast<size_t>(params_.d_model) * sizeof(float));
             }
-            std::memcpy(
-                hidden + compact_row * static_cast<size_t>(params_.d_model),
-                source_hidden,
-                static_cast<size_t>(params_.d_model) * sizeof(float));
         }
         for (const auto &route : active_routes_)
         {
-            const int compact_row = row_output_slot_[route.input_row];
-            if (compact_row < 0 ||
-                static_cast<size_t>(compact_row) >= compact_live_rows)
+            if (route.compact_row >= compact_live_rows ||
+                route.route_offset >= static_cast<size_t>(compact_top_k))
             {
                 LOG_ERROR(
-                    "[MoELocalExpertStage] Active route lost its compact-row slot");
-                return false;
-            }
-            size_t &route_slot =
-                compact_row_route_counts_[static_cast<size_t>(compact_row)];
-            if (route_slot >= static_cast<size_t>(compact_top_k))
-            {
-                LOG_ERROR(
-                    "[MoELocalExpertStage] Participant-local routes exceed model top_k");
+                    "[MoELocalExpertStage] Admitted route exceeds its selected compact family");
                 return false;
             }
             const size_t flat_slot =
-                static_cast<size_t>(compact_row) *
+                route.compact_row *
                     static_cast<size_t>(compact_top_k) +
-                route_slot++;
+                route.route_offset;
             routing_indices[flat_slot] = static_cast<float>(route.expert_id);
             routing_weights[flat_slot] = route.weight;
         }
@@ -2734,11 +2967,11 @@ namespace llaminar2
                                            ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
         const uint64_t engine_binding_generation = input.residency_epoch;
-        const bool reuse_deferred_engine_binding =
-            usesDeferredCompletion() && !cpu_llep_transaction &&
+        const bool reuse_immutable_engine_binding =
+            !cpu_llep_transaction &&
             invocation_engine_binding_generation_ ==
                 engine_binding_generation;
-        if (!reuse_deferred_engine_binding)
+        if (!reuse_immutable_engine_binding)
         {
             std::fill(
                 invocation_gate_engines_.begin(),
@@ -2880,6 +3113,57 @@ namespace llaminar2
                 engine_binding_generation;
             compute_stage = deferred_replay->compute_stage;
         }
+        else if (params_.device_id.is_cpu())
+        {
+            if (!retained_cpu_compute_stage_ ||
+                !retained_cpu_compute_stage_->bindSparseOverlayInvocation(
+                    MoEExpertComputeStage::SparseOverlayInvocation{
+                        .input = compact_hidden_.get(),
+                        .routing_indices = compact_routing_indices_.get(),
+                        .routing_weights = compact_routing_weights_.get(),
+                        .output = compact_output_.get(),
+                        .live_rows = static_cast<int>(compact_live_rows),
+                        .route_width = compact_top_k,
+                        .binding_kind =
+                            MoEExpertComputeStage::
+                                SparseOverlayBindingKind::
+                                    HostPacketPublication,
+                        .service_phase = servicePhaseHint(
+                            input.key.histogram_source),
+                        .engine_binding_generation =
+                            engine_binding_generation,
+                        .expert_mask = &invocation_expert_mask_,
+                        .gate_engines = invocation_gate_engines_,
+                        .up_engines = invocation_up_engines_,
+                        .down_engines = invocation_down_engines_,
+                        .cpu_transported_hidden = {
+                            .source = input.hidden_rows_fp32,
+                            .source_row_capacity = static_cast<int>(
+                                input.hidden_row_capacity),
+                            .compact_to_source_row =
+                                compact_hidden_source_rows_,
+                        },
+                    }))
+            {
+                LOG_ERROR(
+                    "[MoELocalExpertStage] CPU sparse packet could not bind its retained serial executor");
+                return false;
+            }
+            /*
+             * A durable CPU residency epoch owns one immutable prepared-engine
+             * bank just like a retained GPU family. Remember the accepted
+             * generation so subsequent packets avoid rebuilding three
+             * model-wide pointer tables. Current-batch LLEP deliberately never
+             * takes this reuse branch because its transient arrivals are a
+             * packet-scoped view of the durable parent epoch.
+             */
+            if (!cpu_llep_transaction)
+            {
+                invocation_engine_binding_generation_ =
+                    engine_binding_generation;
+            }
+            compute_stage = retained_cpu_compute_stage_.get();
+        }
         else
         {
             MoEExpertComputeStage::Params compute_params;
@@ -2898,6 +3182,25 @@ namespace llaminar2
             compute_params.routing_indices = compact_routing_indices_.get();
             compute_params.routing_weights = compact_routing_weights_.get();
             compute_params.output = compact_output_.get();
+            if (params_.cpu_canonical_route_return)
+            {
+                /*
+                 * The grouped CPU kernel must preserve one raw expert row per
+                 * compact route.  Applying router weights here would fold
+                 * participant-local routes in a backend-dependent order.  The
+                 * completion boundary below authenticates the mapped packet,
+                 * applies each original weight exactly once, and publishes
+                 * into the source graph's original route slots.
+                 */
+                compute_params.canonical_route_contributions =
+                    compact_canonical_routes_.get();
+                compute_params.canonical_route_arithmetic =
+                    MoECanonicalRouteArithmeticPolicy::
+                        UnweightedExpertRowThenOrderedFMA;
+                compute_params.canonical_route_layout =
+                    MoECanonicalRoutePublicationLayout::
+                        DenseOriginalRouteSlots;
+            }
             compute_params.output_registered_in_arena = false;
             compute_params.cpu_router_q8_input_publication =
                 params_.device_id.is_cpu()
@@ -3115,9 +3418,17 @@ namespace llaminar2
             return false;
         };
 
+        const bool publishes_canonical_routes =
+            params_.cpu_canonical_route_return.has_value();
         const float *compact_result = nullptr;
         if (usesDeferredCompletion())
         {
+            if (publishes_canonical_routes)
+            {
+                LOG_ERROR(
+                    "[MoELocalExpertStage] A mapped CPU canonical return cannot use deferred GPU completion");
+                return fail_completed_packet();
+            }
             if (!pending_deferred_replay_)
             {
                 LOG_ERROR(
@@ -3155,7 +3466,9 @@ namespace llaminar2
         }
         else
         {
-            compact_result = compact_output_->data();
+            compact_result = publishes_canonical_routes
+                                 ? compact_canonical_routes_->data()
+                                 : compact_output_->data();
         }
         if (!compact_result)
         {
@@ -3166,7 +3479,11 @@ namespace llaminar2
         const auto output_materialized_at = endpoint_detail_enabled
                                                 ? std::chrono::steady_clock::now()
                                                 : std::chrono::steady_clock::time_point{};
-        if (validate_finite_values)
+        std::chrono::steady_clock::time_point
+            canonical_publication_started{};
+        std::chrono::steady_clock::time_point
+            canonical_publication_completed{};
+        if (validate_finite_values && !publishes_canonical_routes)
         {
             for (size_t compact_row = 0;
                  compact_row < output_input_rows_.size();
@@ -3194,18 +3511,189 @@ namespace llaminar2
             }
         }
 
-        for (size_t output_row = 0; output_row < output_input_rows_.size(); ++output_row)
+        if (publishes_canonical_routes)
         {
-            const size_t input_row = output_input_rows_[output_row];
-            output.row_ids_host[output_row] = input.row_ids_host[input_row];
-            std::memcpy(
-                output.output_rows_fp32 +
-                    output_row * static_cast<size_t>(params_.d_model),
-                compact_result +
-                    output_row * static_cast<size_t>(params_.d_model),
-                static_cast<size_t>(params_.d_model) * sizeof(float));
+            const auto &binding = *params_.cpu_canonical_route_return;
+            bool exact_packet = binding.valid() &&
+                                active_routes_.size() ==
+                                    input.live_entry_count &&
+                                output_input_rows_.size() ==
+                                    input.live_row_count &&
+                                input.live_entry_count <=
+                                    binding.route_slot_capacity;
+            std::int32_t previous_original_slot = -1;
+            for (size_t compact_row = 0;
+                 exact_packet && compact_row < output_input_rows_.size();
+                 ++compact_row)
+            {
+                const size_t input_row = output_input_rows_[compact_row];
+                if (input_row != compact_row)
+                {
+                    exact_packet = false;
+                    break;
+                }
+                output.row_ids_host[compact_row] =
+                    input.row_ids_host[input_row];
+                const std::int32_t begin =
+                    input.entry_offsets_host[input_row];
+                const std::int32_t end =
+                    input.entry_offsets_host[input_row + 1u];
+                if (begin < 0 || end <= begin ||
+                    end > static_cast<std::int32_t>(
+                              input.live_entry_count) ||
+                    end - begin > compact_execution_top_k_)
+                {
+                    exact_packet = false;
+                    break;
+                }
+                for (std::int32_t entry = begin; entry < end; ++entry)
+                {
+                    const std::int32_t local_route = entry - begin;
+                    const std::int32_t expected_compact_slot =
+                        static_cast<std::int32_t>(compact_row) *
+                            params_.top_k +
+                        local_route;
+                    const std::int32_t compact_slot =
+                        binding.compact_route_slots[entry];
+                    const std::int32_t original_slot =
+                        binding.original_route_slots[entry];
+                    if (compact_slot != expected_compact_slot ||
+                        original_slot <= previous_original_slot ||
+                        original_slot < 0 ||
+                        static_cast<size_t>(original_slot) >=
+                            binding.route_slot_capacity)
+                    {
+                        exact_packet = false;
+                        break;
+                    }
+                    previous_original_slot = original_slot;
+                }
+            }
+            if (!exact_packet)
+            {
+                LOG_ERROR(
+                    "[MoELocalExpertStage] Mapped CPU canonical return does not match the authenticated compact/original route-slot packet"
+                    << " layer=" << params_.layer_idx
+                    << " participant="
+                    << params_.runtime_participant_index
+                    << " live_rows=" << input.live_row_count
+                    << " live_entries=" << input.live_entry_count
+                    << " active_routes=" << active_routes_.size()
+                    << " compact_width=" << compact_execution_top_k_
+                    << " route_capacity="
+                    << binding.route_slot_capacity);
+                return fail_completed_packet();
+            }
+
+            const size_t d_model = static_cast<size_t>(params_.d_model);
+            const auto publish_entry = [&](size_t entry)
+            {
+                const std::int32_t compact_slot =
+                    binding.compact_route_slots[entry];
+                const size_t compact_row =
+                    static_cast<size_t>(compact_slot / params_.top_k);
+                const size_t local_route =
+                    static_cast<size_t>(compact_slot % params_.top_k);
+                const size_t source_slot =
+                    compact_row *
+                        static_cast<size_t>(compact_execution_top_k_) +
+                    local_route;
+                const size_t original_slot = static_cast<size_t>(
+                    binding.original_route_slots[entry]);
+                const float weight = input.route_weights_host[entry];
+                const float *const source =
+                    compact_result + source_slot * d_model;
+                float *const destination =
+                    binding.preweighted_route_contributions +
+                    original_slot * d_model;
+                for (size_t col = 0; col < d_model; ++col)
+                    destination[col] = weight * source[col];
+            };
+
+            /*
+             * Decode packets are too small to repay an OpenMP fork.  Larger
+             * prefill packets publish disjoint route rows in parallel.  If a
+             * caller already owns an outer team, stay on its invoking thread:
+             * entering an orphaned workshare from only one team member would
+             * be invalid and a nested team would oversubscribe the socket.
+             */
+            constexpr size_t kParallelCanonicalPublicationEntries = 8u;
+            if (endpoint_detail_enabled)
+                canonical_publication_started =
+                    std::chrono::steady_clock::now();
+            if (!omp_in_parallel() &&
+                input.live_entry_count >=
+                    kParallelCanonicalPublicationEntries)
+            {
+#pragma omp parallel for schedule(static)
+                for (std::int64_t entry = 0;
+                     entry < static_cast<std::int64_t>(
+                                 input.live_entry_count);
+                     ++entry)
+                {
+                    publish_entry(static_cast<size_t>(entry));
+                }
+            }
+            else
+            {
+                for (size_t entry = 0;
+                     entry < input.live_entry_count;
+                     ++entry)
+                {
+                    publish_entry(entry);
+                }
+            }
+            if (endpoint_detail_enabled)
+                canonical_publication_completed =
+                    std::chrono::steady_clock::now();
+
+            if (validate_finite_values)
+            {
+                for (size_t entry = 0;
+                     entry < input.live_entry_count;
+                     ++entry)
+                {
+                    const size_t original_slot = static_cast<size_t>(
+                        binding.original_route_slots[entry]);
+                    const float *const row =
+                        binding.preweighted_route_contributions +
+                        original_slot * d_model;
+                    for (size_t col = 0; col < d_model; ++col)
+                    {
+                        if (!std::isfinite(row[col]))
+                        {
+                            LOG_ERROR(
+                                "[MoELocalExpertStage] Non-finite mapped canonical route contribution"
+                                << " layer=" << params_.layer_idx
+                                << " participant="
+                                << params_.runtime_participant_index
+                                << " entry=" << entry
+                                << " original_slot=" << original_slot
+                                << " col=" << col);
+                            return fail_completed_packet();
+                        }
+                    }
+                }
+            }
         }
-        if (validate_finite_values)
+        else
+        {
+            for (size_t output_row = 0;
+                 output_row < output_input_rows_.size();
+                 ++output_row)
+            {
+                const size_t input_row = output_input_rows_[output_row];
+                output.row_ids_host[output_row] =
+                    input.row_ids_host[input_row];
+                std::memcpy(
+                    output.output_rows_fp32 +
+                        output_row * static_cast<size_t>(params_.d_model),
+                    compact_result +
+                        output_row * static_cast<size_t>(params_.d_model),
+                    static_cast<size_t>(params_.d_model) * sizeof(float));
+            }
+        }
+        if (validate_finite_values && !publishes_canonical_routes)
         {
             for (size_t output_row = 0;
                  output_row < output_input_rows_.size();
@@ -3319,6 +3807,13 @@ namespace llaminar2
             record("stage_setup_and_transfers", stage_setup_start, t_compute_start);
             record("compute_submission", t_compute_start, t_compute_end);
             record("output_materialization", t_compute_end, output_materialized_at);
+            if (publishes_canonical_routes)
+            {
+                record(
+                    "canonical_route_preweight_and_publication",
+                    canonical_publication_started,
+                    canonical_publication_completed);
+            }
             record("return_validation_and_aggregation", output_materialized_at, completed_at);
         }
 

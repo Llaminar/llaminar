@@ -1309,6 +1309,25 @@ namespace llaminar2
                 config_.max_mtp_draft_depth);
         main_layer_count_ = transaction_graph_family_.main_layer_count;
         mtp_source_layers_ = transaction_graph_family_.mtp_source_layers;
+        routed_layer_capacity_ =
+            transaction_graph_family_.routedLayerCapacity();
+
+        /* The model-frozen placement plan is the topology-wide storage
+         * authority. The independently resolved graph family describes the
+         * exact graphs this follower will construct. Requiring equality here
+         * prevents a raw GGUF sidecar block from silently enlarging only one
+         * rank's runtime table, and catches a missing MTP bank before capture. */
+        const int planned_layer_capacity =
+            config_.placement_plan->placementLayerCapacity();
+        if (routed_layer_capacity_ <= 0 ||
+            planned_layer_capacity != routed_layer_capacity_)
+        {
+            throw std::invalid_argument(
+                "MoE overlay participant graph-family layer capacity " +
+                std::to_string(routed_layer_capacity_) +
+                " disagrees with frozen placement capacity " +
+                std::to_string(planned_layer_capacity));
+        }
 
         const int num_experts = loader.getInt(
             architecture_ + ".expert_count", 0);
@@ -1365,7 +1384,13 @@ namespace llaminar2
         const int num_experts = loader.getInt(architecture + ".expert_count", 0);
         const int routing_top_k =
             loader.getInt(architecture + ".expert_used_count", 0);
-        if (d_model <= 0 || num_experts <= 0 || routing_top_k <= 0)
+        int expert_intermediate =
+            loader.getInt(
+                architecture + ".expert_feed_forward_length", 0);
+        if (expert_intermediate <= 0)
+            expert_intermediate = config_.model_context->feedForwardLength();
+        if (d_model <= 0 || num_experts <= 0 || routing_top_k <= 0 ||
+            expert_intermediate <= 0)
         {
             throw std::runtime_error(
                 "Participant serial compact arena could not resolve model routing geometry");
@@ -1424,6 +1449,17 @@ namespace llaminar2
             }
             arena_config.d_model = d_model;
             arena_config.routing_top_k = routing_top_k;
+            if (participant->device.is_cpu())
+            {
+                arena_config.cpu_canonical_route_storage =
+                    MoELocalExpertSerialBufferArena::
+                        CPUCanonicalRouteStoragePolicy::RetainSerialMaximum;
+                arena_config.cpu_grouped_scratch_storage =
+                    MoELocalExpertSerialBufferArena::
+                        CPUGroupedScratchStoragePolicy::RetainSerialMaximum;
+                arena_config.num_experts = num_experts;
+                arena_config.expert_intermediate = expert_intermediate;
+            }
             arena_config.logical_participant_id = participant->participant_id;
             arena_config.debug_name =
                 "moe_overlay_participant_serial_compact.p" +
@@ -1616,8 +1652,10 @@ namespace llaminar2
     {
         const auto &loader = config_.model_context->concreteLoader();
         const std::string &arch = config_.model_context->architecture();
-        const int runtime_layer_count =
-            config_.model_context->totalBlockCount();
+        /* resolveGraphFamilies() already proved this value against the frozen
+         * placement plan. Never re-derive it from totalBlockCount(): Qwen GGUFs
+         * include an inactive trailing NextN block when MTP is disabled. */
+        const int runtime_layer_count = routed_layer_capacity_;
         const int num_experts = loader.getInt(arch + ".expert_count", 0);
         const int top_k = loader.getInt(arch + ".expert_used_count", 0);
         const auto authority_execution =
@@ -2471,6 +2509,18 @@ namespace llaminar2
                     local_params.device_id = endpoint->device;
                     local_params.input_rows_lifetime = endpoint->input_rows;
                     local_params.output_rows_lifetime = endpoint->output_rows;
+                    local_params.cpu_canonical_route_return =
+                        MoELocalExpertStage::CPUCanonicalRouteReturnBinding{
+                            .original_route_slots =
+                                endpoint->lane.dispatch.original_route_slots,
+                            .compact_route_slots =
+                                endpoint->lane.dispatch.compact_route_slots,
+                            .preweighted_route_contributions =
+                                endpoint->lane.returned
+                                    .canonical_route_contributions_fp32,
+                            .route_slot_capacity =
+                                endpoint->lane.returned.route_slot_capacity,
+                        };
                     local_params.serial_compact_buffer_arena = compact_arena;
                     local_params.graph_row_capacity =
                         static_cast<size_t>(row_capacity);
@@ -4773,8 +4823,9 @@ namespace llaminar2
                 }
 
                 const std::uint64_t return_bytes =
-                    static_cast<std::uint64_t>(
-                        compactMoEOverlayReturnBytes(output));
+                    moeOverlayReturnPayloadBytes(
+                        input.live_entry_count,
+                        static_cast<std::uint32_t>(input.d_model));
                 if (!protocol.publishReturn(
                         lane->identity,
                         layer.stage_ordinal,
@@ -4786,6 +4837,22 @@ namespace llaminar2
                         "Mapped ExpertOverlay CPU follower could not publish layer " +
                         std::to_string(layer.model_layer_index) + ": " +
                         protocol_error);
+                }
+                if (debugEnv().execution.gpu_graph_trace_replay)
+                {
+                    /* This host endpoint is the release authority for the
+                     * mapped return.  Capture-time device stalls otherwise
+                     * expose only the consumer's eventual timeout, so retain
+                     * the exact bank/value witness in the opt-in graph trace. */
+                    LOG_DEBUG(
+                        "[MappedCPUTrace] participant="
+                        << endpoint->participant_id
+                        << " layer=" << layer.model_layer_index
+                        << " stage=" << layer.stage_ordinal
+                        << " bank=" << bank
+                        << " return_timeline="
+                        << protocol.returnTimeline(bank)
+                        << " expected=" << expected_timeline);
                 }
                 ++cpu_layer_dispatches;
             }

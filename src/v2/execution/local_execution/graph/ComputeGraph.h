@@ -61,6 +61,31 @@ namespace llaminar2
     };
 
     /**
+     * @brief State why one heterogeneous captured unit ends at a graph node.
+     *
+     * Authority and follower graphs attach the same identity to different
+     * participant-local terminal nodes. The authority then executes its manual
+     * CPU ticket segment while the follower waits at the next LocalTP capture
+     * rendezvous. The final disposition instead names the last captured unit
+     * without manufacturing an empty successor. This contract deliberately
+     * does not expose the fine-grained mapped GPU packet waves inside a unit:
+     * their multi-stream event DAG must remain in one native executable.
+     */
+    enum class GraphHeterogeneousTicketUnitDisposition : uint8_t
+    {
+        BeforeManualBoundary, ///< Close this unit and start another after participant-local manual work.
+        TransactionTerminal, ///< Name the final unit without creating an empty successor.
+    };
+
+    /** @brief Identity and closure semantics for one heterogeneous captured unit. */
+    struct GraphHeterogeneousTicketUnitContract
+    {
+        std::string identity; ///< Cross-participant identity of the captured unit being closed.
+        GraphHeterogeneousTicketUnitDisposition disposition =
+            GraphHeterogeneousTicketUnitDisposition::BeforeManualBoundary; ///< Whether another captured unit must follow.
+    };
+
+    /**
      * @brief Graph-wide native-capture envelope selected by declarative lowering.
      *
      * Ordinary graphs may use per-node wave contracts to describe explicitly
@@ -70,18 +95,22 @@ namespace llaminar2
      * dispatch between those edges, so all participants must record one native
      * executable and legacy per-wave annotations become documentation only.
      *
-     * A heterogeneous ticket transaction is the deliberately segmented case:
-     * captured device work publishes one fixed immutable ticket, an explicitly
-     * manual participant consumes and completes it, and a following captured
-     * device segment imports the result. This is not permission for generic
-     * eager replay; the capture controller validates the ticket fence and every
-     * manual boundary before accepting the graph.
+     * A heterogeneous ticket lifecycle is the deliberately segmented case.
+     * Its authority graph publishes one fixed immutable ticket, executes the
+     * explicitly manual participant, and imports the result into a following
+     * captured device unit. Every same-domain sibling uses the follower
+     * envelope: it performs no manual work, but closes corresponding captured
+     * units at typed participant-local cutpoints. Keeping those roles distinct
+     * makes a missing ticket boundary, an accidental sibling CPU stage, or an
+     * indivisible sibling graph invalid before capture begins.
+     * Neither role permits generic eager replay.
      */
     enum class GraphNativeCaptureEnvelope : uint8_t
     {
         Ordinary = 0, ///< Per-node capture-wave and segment contracts apply.
         DeviceOwnedTimelineTransaction, ///< One indivisible native executable owns all ordering edges.
-        HeterogeneousTicketTransaction, ///< Captured device units surround one or more declared host-ticket boundaries.
+        HeterogeneousTicketAuthorityTransaction, ///< Captured device units surround one or more authenticated host-ticket boundaries.
+        HeterogeneousTicketFollowerTransaction, ///< A no-manual-work sibling closes matching captured units around authority tickets.
     };
 
     /**
@@ -99,13 +128,43 @@ namespace llaminar2
     /**
      * @brief Return whether an envelope requires an explicit ticketed boundary.
      * @param envelope Declarative graph-wide capture lifecycle.
-     * @return True only for the typed heterogeneous ticket transaction.
+     * @return True for either typed role in a heterogeneous ticket lifecycle.
      */
     [[nodiscard]] constexpr bool requiresHeterogeneousTicketSegmentation(
         GraphNativeCaptureEnvelope envelope) noexcept
     {
         return envelope ==
-               GraphNativeCaptureEnvelope::HeterogeneousTicketTransaction;
+                   GraphNativeCaptureEnvelope::
+                       HeterogeneousTicketAuthorityTransaction ||
+               envelope ==
+                   GraphNativeCaptureEnvelope::
+                       HeterogeneousTicketFollowerTransaction;
+    }
+
+    /**
+     * @brief Return whether this graph owns the manual ticket boundary.
+     * @param envelope Declarative graph-wide capture lifecycle.
+     * @return True only for the heterogeneous ticket authority role.
+     */
+    [[nodiscard]] constexpr bool ownsHeterogeneousTicketBoundary(
+        GraphNativeCaptureEnvelope envelope) noexcept
+    {
+        return envelope ==
+               GraphNativeCaptureEnvelope::
+                   HeterogeneousTicketAuthorityTransaction;
+    }
+
+    /**
+     * @brief Return whether this graph follows a sibling ticket authority.
+     * @param envelope Declarative graph-wide capture lifecycle.
+     * @return True only for the no-manual-work heterogeneous follower role.
+     */
+    [[nodiscard]] constexpr bool followsHeterogeneousTicketBoundary(
+        GraphNativeCaptureEnvelope envelope) noexcept
+    {
+        return envelope ==
+               GraphNativeCaptureEnvelope::
+                   HeterogeneousTicketFollowerTransaction;
     }
 
     /**
@@ -119,6 +178,8 @@ namespace llaminar2
         DeviceId device;                       ///< Target device for execution
         bool completed;                        ///< Execution complete flag
         std::optional<GraphCaptureWaveContract> graph_capture_wave; ///< Optional cross-participant capture schedule contract.
+        std::optional<GraphHeterogeneousTicketUnitContract>
+            heterogeneous_ticket_unit_contract; ///< Optional captured-unit identity aligned across authority and follower.
 
         // =====================================================================
         // Coherence fast-path flags (mutable for use in const execution context)
@@ -192,7 +253,24 @@ namespace llaminar2
             GraphCaptureWaveContract contract);
 
         /**
-         * @brief Require one indivisible native capture for this graph.
+         * @brief Close a heterogeneous captured unit after one graph node.
+         *
+         * The boundary changes capture topology, not graph dependency order.
+         * It is consumed only by the two heterogeneous ticket envelopes and is
+         * rejected for ordinary or indivisible device-owned graphs.
+         *
+         * @param node_name Existing participant-local terminal node.
+         * @param contract Non-empty identity plus boundary or terminal role.
+         * @return Reference to this graph for fluent construction.
+         * @throws std::invalid_argument when the identity is empty.
+         * @throws std::out_of_range when @p node_name does not exist.
+         */
+        ComputeGraph &setHeterogeneousTicketUnitContract(
+            const std::string &node_name,
+            GraphHeterogeneousTicketUnitContract contract);
+
+        /**
+         * @brief Select the typed native-capture lifecycle for this graph.
          *
          * Repeated selection of the same envelope is idempotent. Merging graph
          * fragments propagates the stronger envelope; incompatible future
@@ -406,7 +484,7 @@ namespace llaminar2
         std::vector<FastScheduleEntry> fast_schedule_;   ///< Pre-computed decode schedule
         std::string terminal_node_;                      ///< Explicit terminal node (set by sub-graph builders)
         GraphNativeCaptureEnvelope native_capture_envelope_ =
-            GraphNativeCaptureEnvelope::Ordinary;        ///< Indivisible device timeline ownership, when selected.
+            GraphNativeCaptureEnvelope::Ordinary;        ///< Typed graph-wide capture lifecycle selected by lowering.
         uint64_t topology_generation_ = 1;               ///< Monotonic captured-topology identity; zero is never published.
     };
 

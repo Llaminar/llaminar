@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -81,11 +82,28 @@ namespace llaminar2
      * entry point from accidentally applying the ordinary-continuation M
      * heuristic to grouped verification again.
      */
+    /**
+     * @brief Typed public-to-graph invocation policy.
+     *
+     * This single discriminator replaces the former pair of force-prefill and
+     * force-decode booleans, whose fourth combination was invalid. The restored
+     * prefix bridge is a decode invocation with an additional graph-owned state
+     * transition; keeping it distinct here makes that topology impossible to
+     * request accidentally through ordinary decode.
+     */
+    enum class ForwardInvocationKind : uint8_t
+    {
+        Automatic = 0, ///< Apply the ordinary public MainInference heuristic.
+        ExplicitPrefill, ///< Require prefill mathematical topology.
+        ExplicitDecode, ///< Require decode mathematical topology.
+        RestoredPrefixMTPDecodeBridge, ///< Decode plus restored-prefix shifted-MTP state bridge.
+    };
+
     struct ForwardExecutionPhaseRequest
     {
         ForwardExecutionRole role = ForwardExecutionRole::MainInference;
-        bool force_prefill = false;
-        bool force_decode = false;
+        ForwardInvocationKind invocation =
+            ForwardInvocationKind::Automatic;
         int seq_len = 0;
         int batch_size = 0;
         int decode_max_seq_len = 1;
@@ -116,10 +134,16 @@ namespace llaminar2
         if (request.role != ForwardExecutionRole::MainInference)
             return ForwardExecutionPhase::Decode;
 
-        if (request.force_prefill)
+        switch (request.invocation)
+        {
+        case ForwardInvocationKind::ExplicitPrefill:
             return ForwardExecutionPhase::Prefill;
-        if (request.force_decode)
+        case ForwardInvocationKind::ExplicitDecode:
+        case ForwardInvocationKind::RestoredPrefixMTPDecodeBridge:
             return ForwardExecutionPhase::Decode;
+        case ForwardInvocationKind::Automatic:
+            break;
+        }
 
         const bool scalar_decode =
             request.seq_len == 1 && request.batch_size <= 1;
@@ -146,6 +170,8 @@ namespace llaminar2
         DeviceId device = DeviceId::cpu();
         ForwardExecutionRole execution_role =
             ForwardExecutionRole::MainInference; ///< Mathematical owner embedded by this graph.
+        ForwardStateTransaction state_transaction =
+            ForwardStateTransaction::Ordinary; ///< Persistent-state topology embedded by this graph.
         bool decode = false;
         bool decode_has_history = false; ///< True for decode calls that already have KV/GDN history.
         bool all_position_logits = false;
@@ -159,6 +185,7 @@ namespace llaminar2
         bool uses_device_sequence_lengths = false; ///< True when stages derive request geometry from a stable device row.
         uint64_t device_prefill_chunk_capture_identity = 0; ///< Non-zero when a captured device chunk materializer precedes model roots.
         uint64_t shifted_mtp_prefill_capture_identity = 0; ///< Non-zero only when this capture embeds shifted MTP KV prefill.
+        uint64_t mtp_main_terminal_hidden_capture_identity = 0; ///< Non-zero when main decode publishes its MTP terminal row in-graph.
         bool standard_path = true;
         bool pp_stage_enabled = false;
         int pp_first_layer = -1;
@@ -176,6 +203,7 @@ namespace llaminar2
                    batch_size == other.batch_size &&
                    device == other.device &&
                    execution_role == other.execution_role &&
+                   state_transaction == other.state_transaction &&
                    decode == other.decode &&
                    decode_has_history == other.decode_has_history &&
                    all_position_logits == other.all_position_logits &&
@@ -192,6 +220,8 @@ namespace llaminar2
                        other.device_prefill_chunk_capture_identity &&
                    shifted_mtp_prefill_capture_identity ==
                        other.shifted_mtp_prefill_capture_identity &&
+                   mtp_main_terminal_hidden_capture_identity ==
+                       other.mtp_main_terminal_hidden_capture_identity &&
                    standard_path == other.standard_path &&
                    pp_stage_enabled == other.pp_stage_enabled &&
                    pp_first_layer == other.pp_first_layer &&
@@ -216,6 +246,9 @@ namespace llaminar2
             h ^= (std::hash<uint8_t>{}(
                       static_cast<uint8_t>(sig.execution_role)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint8_t>{}(
+                      static_cast<uint8_t>(sig.state_transaction)) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode_has_history) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.all_position_logits) + 0x9e3779b9 + (h << 6) + (h >> 2));
@@ -235,6 +268,9 @@ namespace llaminar2
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<uint64_t>{}(
                       sig.shifted_mtp_prefill_capture_identity) +
+                  0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(
+                      sig.mtp_main_terminal_hidden_capture_identity) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));
@@ -632,8 +668,15 @@ namespace llaminar2
         /// Explicit stream for prefill warmup/capture/replay.
         CachedGraphStream prefill_capture_stream;
 
+        /** @brief Typed decode launch path used to resolve producer ownership. */
+        enum class DecodeLaunchPath : uint8_t
+        {
+            Direct,          ///< Warmup or ordinary non-replay graph execution.
+            CapturedReplay,  ///< Launch of a retained native graph executable.
+        };
+
         /**
-         * @brief Resolve the exact stream that produced one cached invocation.
+         * @brief Resolve the exact stream that produced one cached decode.
          *
          * A cached graph owns several stream-shaped fields with different
          * meanings. `applied_stream` only says which stream was most recently
@@ -642,23 +685,19 @@ namespace llaminar2
          * invocation actually replayed its captured graph, the segment cache's
          * capture stream is therefore the only valid producer provenance.
          *
-         * Prefill has an independently typed capture stream. Non-replay
-         * warmup/eager executions retain the established applied-stream and
-         * worker-stream ordering because those are their actual launch owners.
+         * Prefill deliberately has no matching resolver here because
+         * heterogeneous segmented and monolithic prefill use different graph
+         * caches. Its state machine returns the concrete launch stream.
          *
-         * @param is_decode True for a decode or grouped-verifier invocation.
-         * @param used_graph_replay True only when this invocation launched the
-         *        cached decode graph executable.
+         * @param launch_path Whether execution was direct or a retained replay.
          * @return Exact producer stream, or nullptr when the required typed
          *         stream was not published.
          */
-        void *outputProducerStream(bool is_decode,
-                                   bool used_graph_replay) const noexcept
+        void *decodeOutputProducerStream(
+            DecodeLaunchPath launch_path) const noexcept
         {
-            if (used_graph_replay)
+            if (launch_path == DecodeLaunchPath::CapturedReplay)
                 return segment_cache.capture_stream;
-            if (!is_decode && prefill_capture_stream.stream)
-                return prefill_capture_stream.stream;
             if (applied_stream)
                 return applied_stream;
             if (segment_cache.capture_stream)

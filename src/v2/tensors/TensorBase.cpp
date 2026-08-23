@@ -32,29 +32,10 @@
 #include <cstring>
 #include <vector>
 #include <chrono>
+#include <cstdint>
+#include <mutex>
 #include <sstream>
 #include <omp.h>
-
-#ifdef HAVE_ROCM
-#include <hip/hip_runtime.h>
-#endif
-
-// Forward declare pinned memory registration functions from HostBackend implementations
-// These are defined in HostBackendROCm.cpp and HostBackendCUDA.cu
-namespace llaminar2
-{
-    namespace host_backend_detail
-    {
-#ifdef HAVE_CUDA
-        bool cudaHostRegisterBuffer(void *ptr, size_t size);
-        void cudaHostUnregisterBuffer(void *ptr);
-#endif
-#ifdef HAVE_ROCM
-        bool hipHostRegisterBuffer(void *ptr, size_t size);
-        void hipHostUnregisterBuffer(void *ptr);
-#endif
-    } // namespace host_backend_detail
-} // namespace llaminar2
 
 namespace llaminar2
 {
@@ -159,22 +140,12 @@ namespace llaminar2
     // Also frees GPU memory and unpins host memory if allocated.
     TensorBase::~TensorBase()
     {
-        try
-        {
-            /*
-             * Async H2D may outlive the submitting host frame, but it may not
-             * outlive the tensor allocation that supplies its bytes.  Wait the
-             * one exact copy event before unpinning or releasing storage; a
-             * stream/device synchronization would also drain unrelated work.
-             */
-            TransferEngine::waitForPendingHostSourceUseLocked(this);
-        }
-        catch (const std::exception &error)
-        {
-            LOG_ERROR("[TensorBase::~TensorBase] Cannot retire in-flight H2D host source: "
-                      << error.what());
-            std::terminate();
-        }
+        /*
+         * Concrete destructors already close this transition before their
+         * storage members disappear. Keep the base call as an idempotent guard
+         * for mapped or storage-free TensorBase implementations.
+         */
+        retireHostTransferLifetimeBeforeStorageDestruction();
 
         // Free mapped memory if allocated (must be done first)
         freeMappedMemory();
@@ -197,14 +168,6 @@ namespace llaminar2
             }
         }
         secondary_device_buffers_.clear();
-
-        // Unpin host memory BEFORE freeing GPU memory.
-        // When a non-blocking stream was used for H2D transfer (e.g., via
-        // GPUDeviceContextPool's default stream in resolveStream()), calling
-        // cudaHostUnregister AFTER cudaFree can corrupt the CUDA driver's
-        // internal pinned-memory bookkeeping, leading to silent data corruption
-        // in subsequent GPU allocations and kernel launches.
-        unpinHostMemory();
 
         // Free GPU memory if allocated
         if (gpu_data_ptr_ && gpu_device_.has_value())
@@ -736,6 +699,28 @@ namespace llaminar2
     // Pinned Memory Registration for Fast GPU Transfers
     // =========================================================================
 
+    void TensorBase::retireHostTransferLifetimeBeforeStorageDestruction() noexcept
+    {
+        try
+        {
+            /*
+             * Async H2D may outlive the submitting host frame, but it may not
+             * outlive the concrete vector that supplies its bytes. Wait only
+             * the exact copy event before removing the runtime registration;
+             * a stream/device synchronization would also drain unrelated work.
+             */
+            TransferEngine::waitForPendingHostSourceUseLocked(this);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_ERROR("[TensorBase] Cannot retire in-flight H2D host source before storage destruction: "
+                      << error.what());
+            std::terminate();
+        }
+
+        unpinHostMemory();
+    }
+
     bool TensorBase::ensureHostPinned()
     {
         // Already pinned?
@@ -758,38 +743,13 @@ namespace llaminar2
             return true; // Nothing to pin
         }
 
-        // Try to register with the appropriate runtime
-        bool success = false;
-
-#ifdef HAVE_ROCM
-        if (!success && gpu_device_.has_value() && gpu_device_->is_rocm())
-        {
-            // Ensure thread-local HIP device is set correctly before registration.
-            // hipHostRegisterDefault (used inside hipHostRegisterBuffer) only registers
-            // for the current device. The device should already be set by the caller
-            // (ensureOnDevice → backend->allocate → hipSetDevice), but we set it
-            // explicitly for safety in case ensureHostPinned is called from another path.
-            (void)hipSetDevice(gpu_device_->gpu_ordinal());
-            success = host_backend_detail::hipHostRegisterBuffer(host_ptr, bytes);
-            if (success)
-            {
-                LOG_TRACE("[TensorBase::ensureHostPinned] Pinned " << bytes
-                                                                   << " bytes of host memory for ROCm DMA transfers");
-            }
-        }
-#endif
-
-#ifdef HAVE_CUDA
-        if (!success && gpu_device_.has_value() && gpu_device_->is_cuda())
-        {
-            success = host_backend_detail::cudaHostRegisterBuffer(host_ptr, bytes);
-            if (success)
-            {
-                LOG_TRACE("[TensorBase::ensureHostPinned] Pinned " << bytes
-                                                                   << " bytes of host memory for CUDA DMA transfers");
-            }
-        }
-#endif
+        if (!gpu_device_.has_value() || !gpu_device_->is_gpu())
+            return false;
+        IBackend *const backend = resolveBackend(*gpu_device_);
+        const bool success = backend && backend->pinHostMemory(
+                                            host_ptr,
+                                            bytes,
+                                            gpu_device_->gpu_ordinal());
 
         if (success)
         {
@@ -824,23 +784,21 @@ namespace llaminar2
             return;
         }
 
-#ifdef HAVE_ROCM
-        if (gpu_device_.has_value() && gpu_device_->is_rocm())
+        if (gpu_device_.has_value() && gpu_device_->is_gpu())
         {
-            host_backend_detail::hipHostUnregisterBuffer(host_ptr);
+            IBackend *const backend = resolveBackend(*gpu_device_);
+            if (!backend || !backend->unpinHostMemory(
+                                host_ptr, gpu_device_->gpu_ordinal()))
+            {
+                LOG_ERROR("[TensorBase::unpinHostMemory] Failed to unregister "
+                          << pinned_bytes_ << " bytes at " << host_ptr
+                          << " from " << gpu_device_->toString());
+                std::terminate();
+            }
             LOG_TRACE("[TensorBase::unpinHostMemory] Unpinned " << pinned_bytes_
-                                                                << " bytes of ROCm host memory");
+                                                                << " bytes at " << host_ptr
+                                                                << " from " << gpu_device_->toString());
         }
-#endif
-
-#ifdef HAVE_CUDA
-        if (gpu_device_.has_value() && gpu_device_->is_cuda())
-        {
-            host_backend_detail::cudaHostUnregisterBuffer(host_ptr);
-            LOG_TRACE("[TensorBase::unpinHostMemory] Unpinned " << pinned_bytes_
-                                                                << " bytes of CUDA host memory");
-        }
-#endif
 
         host_pinned_ = false;
         pinned_bytes_ = 0;

@@ -46,6 +46,23 @@ namespace llaminar2
             EmptyCollectiveParticipant,
         };
 
+        /**
+         * @brief Authority that made a captured ticket host-readable.
+         *
+         * `DirectCapturedProducer` means this stage is the first host observer
+         * and must fence the immediately preceding captured producer.
+         * `MaterializedHostDispatch` means an earlier
+         * @ref MoEExpertDispatchStage already crossed that exact boundary and
+         * published the immutable dispatch output consumed here. Re-fencing a
+         * later, independent GPU segment would serialize CPU expert work behind
+         * continuation compute and is therefore forbidden.
+         */
+        enum class TicketObservationRole : uint8_t
+        {
+            DirectCapturedProducer,
+            MaterializedHostDispatch,
+        };
+
         /** @brief Immutable construction and ownership contract for dispatch. */
         struct Params
         {
@@ -81,6 +98,8 @@ namespace llaminar2
              */
             uint64_t fixed_residency_epoch = 0;
             std::shared_ptr<MoEOverlayDispatchTicketStorage> ticket_storage;
+            TicketObservationRole ticket_observation_role =
+                TicketObservationRole::DirectCapturedProducer;
             int tier_index = -1;
 
             /** Typed authority for payload materialization on this graph. */
@@ -120,10 +139,6 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override { return false; }
         bool isManualGraphBoundary() const override { return true; }
-        bool requiresHostGraphTicketFence() const override
-        {
-            return params_.ticket_storage != nullptr;
-        }
         bool supportsPaddedPrefillGraphCapturePreflight() const override
         {
             return params_.ticket_storage != nullptr;

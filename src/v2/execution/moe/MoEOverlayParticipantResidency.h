@@ -657,7 +657,13 @@ namespace llaminar2
         /** @return Sorted process-local participant ids. */
         [[nodiscard]] std::vector<int> localParticipantIds() const;
 
-        /** @return Whether every process-local initial epoch bank is complete. */
+        /**
+         * @return Whether every process-local initial bank completed its
+         *         one-way publication transition.
+         *
+         * Completion remains true after maintenance retires the initial epoch;
+         * this is setup certification, not a claim that epoch is still live.
+         */
         [[nodiscard]] bool allInitialBanksReady() const noexcept;
 
         /**
@@ -718,11 +724,27 @@ namespace llaminar2
         }
 
     private:
+        /**
+         * @brief One-way bootstrap publication lifecycle for a local endpoint.
+         *
+         * `Completed` records that the canonical initial bank was published at
+         * least once.  It deliberately remains completed after that epoch is
+         * retired: later graph-cache materialization may validate the frozen
+         * engine identities, but must never resurrect the bootstrap epoch.
+         */
+        enum class InitialPublicationState
+        {
+            Assembling,
+            Completed,
+        };
+
         struct EndpointAssembly
         {
             std::shared_ptr<MoEOverlayParticipantResidency> endpoint;
             MoEOverlayParticipantResidencyBank initial_bank;
             std::vector<bool> registered_layers;
+            InitialPublicationState publication_state =
+                InitialPublicationState::Assembling;
         };
 
         Config config_;

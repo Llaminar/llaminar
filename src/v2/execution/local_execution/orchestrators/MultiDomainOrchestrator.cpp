@@ -126,6 +126,29 @@ namespace llaminar2
         return inner_runner_->forward(tokens, seq_len);
     }
 
+    bool MultiDomainOrchestrator::forwardPrefill(
+        const int *tokens,
+        int seq_len)
+    {
+        if (!initialized_ || !inner_runner_)
+        {
+            LOG_ERROR("MultiDomainOrchestrator not initialized");
+            return false;
+        }
+        return inner_runner_->forwardPrefill(tokens, seq_len);
+    }
+
+    bool MultiDomainOrchestrator::forwardRestoredPrefixMTPDecodeBridge(
+        const RestoredPrefixMTPDecodeBridgeRequest &request)
+    {
+        if (!initialized_ || !inner_runner_)
+        {
+            LOG_ERROR("MultiDomainOrchestrator not initialized");
+            return false;
+        }
+        return inner_runner_->forwardRestoredPrefixMTPDecodeBridge(request);
+    }
+
     /**
      * @brief Preserve the root-authoritative sparse protocol identity through this wrapper.
      */

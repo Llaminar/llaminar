@@ -24,6 +24,7 @@ Usage:
 import os
 import sys
 import argparse
+import json
 from pathlib import Path
 from typing import Optional, Set
 
@@ -44,6 +45,10 @@ from python.reference.pipeline_stages import stage_to_string
 from python.reference.snapshot_metadata import (
     build_reference_identity,
     write_metadata_atomically,
+)
+from python.reference.mtp_sidecar_reference import (
+    normalize_mtp_branch_override_batches,
+    promote_mtp_sidecar_metadata,
 )
 
 
@@ -318,8 +323,34 @@ Examples:
         "--mtp-sidecar-snapshots",
         action="store_true",
         help=(
-            "Also save recursive Qwen3.6 MTP0..MTP2 checkpoints from the "
+            "Also save recursive Qwen3.6 MTP checkpoints from the "
             "GGUF's real trailing nextn weights"
+        ),
+    )
+    parser.add_argument(
+        "--mtp-max-draft-depth",
+        type=int,
+        default=3,
+        help=(
+            "Maximum recursive MTP draft depth to materialize when sidecar "
+            "snapshots are enabled (default: 3)"
+        ),
+    )
+    parser.add_argument(
+        "--mtp-branch-overrides",
+        type=Path,
+        default=None,
+        help=(
+            "JSON mapping decode steps to production recursive MTP condition "
+            "tokens; generate additive branch-qualified sidecar snapshots"
+        ),
+    )
+    parser.add_argument(
+        "--mtp-sidecar-only",
+        action="store_true",
+        help=(
+            "Add canonical recursive MTP snapshots to an authenticated dense "
+            "main-model pack using only the bounded sidecar context"
         ),
     )
     parser.add_argument(
@@ -346,7 +377,39 @@ Examples:
     print(f"  Metadata only: {args.metadata_only}")
     print(f"  Decode snapshots only: {args.decode_snapshots_only}")
     print(f"  MTP sidecar snapshots: {args.mtp_sidecar_snapshots}")
+    print(f"  MTP maximum draft depth: {args.mtp_max_draft_depth}")
+    print(f"  MTP branch overrides: {args.mtp_branch_overrides}")
+    print(f"  MTP sidecar only: {args.mtp_sidecar_only}")
     print(f"  Snapshot decode steps: {args.snapshot_decode_steps or '<all>'}")
+
+    if args.mtp_max_draft_depth < 1 or args.mtp_max_draft_depth > 15:
+        raise ValueError("--mtp-max-draft-depth must be in [1, 15]")
+    if args.mtp_sidecar_only and not args.mtp_sidecar_snapshots:
+        raise ValueError("--mtp-sidecar-only requires --mtp-sidecar-snapshots")
+    if args.mtp_sidecar_only and args.metadata_only:
+        raise ValueError("--mtp-sidecar-only is incompatible with --metadata-only")
+    if args.mtp_sidecar_only and args.decode_snapshots_only:
+        raise ValueError(
+            "--mtp-sidecar-only is incompatible with --decode-snapshots-only"
+        )
+    if args.mtp_sidecar_only and args.mtp_branch_overrides is not None:
+        raise ValueError(
+            "--mtp-sidecar-only is canonical generation and cannot be combined "
+            "with branch overrides"
+        )
+
+    branch_override_batches = None
+    if args.mtp_branch_overrides is not None:
+        raw_overrides = json.loads(
+            args.mtp_branch_overrides.read_text(encoding="utf-8")
+        )
+        branch_override_batches = normalize_mtp_branch_override_batches(
+            raw_overrides
+        )
+        if not args.mtp_sidecar_snapshots:
+            raise ValueError(
+                "--mtp-branch-overrides requires --mtp-sidecar-snapshots"
+            )
 
     snapshot_decode_steps: Optional[Set[int]] = None
     if args.snapshot_decode_steps:
@@ -368,48 +431,92 @@ Examples:
                 )
             snapshot_decode_steps.add(step)
 
-    # Create and load model via registry
+    # Additive branches and canonical depth repair need only the graph-external
+    # sidecar allocation plus the authenticated main trajectory already stored
+    # in the output pack.
     print("\nLoading model...")
-    model = create_reference_model("qwen35", args.model)
+    sidecar_context = (
+        args.mtp_sidecar_only or branch_override_batches is not None
+    )
+    reference_kwargs = (
+        {"mtp_sidecar_reference_pack": args.output}
+        if sidecar_context
+        else {}
+    )
+    model = create_reference_model("qwen35", args.model, **reference_kwargs)
     print("Model loaded successfully")
 
     # Run inference and save snapshots
-    total, token_ids, decode_tokens = run_prefill_and_decode(
-        model,
-        args.prompt,
-        args.decode_steps,
-        args.output,
-        verbose=args.verbose,
-        save_snapshots=not args.metadata_only,
-        save_prefill_snapshots=not args.decode_snapshots_only,
-        save_decode_snapshots=True,
-        snapshot_decode_steps=snapshot_decode_steps,
-    )
-
-    if args.mtp_sidecar_snapshots and not args.metadata_only:
-        mtp_total = model.generate_mtp_sidecar_decode_snapshots(
+    if not sidecar_context:
+        total, token_ids, decode_tokens = run_prefill_and_decode(
+            model,
             args.prompt,
             args.decode_steps,
             args.output,
-            max_draft_depth=3,
             verbose=args.verbose,
+            save_snapshots=not args.metadata_only,
+            save_prefill_snapshots=not args.decode_snapshots_only,
+            save_decode_snapshots=True,
+            snapshot_decode_steps=snapshot_decode_steps,
         )
+    else:
+        if not args.output.is_dir() or not (args.output / "metadata.txt").is_file():
+            raise ValueError(
+                "Dense sidecar-context generation requires an existing "
+                "canonical pack"
+            )
+        total = 0
+        token_ids = []
+        decode_tokens = []
+
+    if args.mtp_sidecar_snapshots and not args.metadata_only:
+        mtp_total = 0
+        batches = branch_override_batches or [None]
+        for branch_overrides in batches:
+            mtp_total += model.generate_mtp_sidecar_decode_snapshots(
+                args.prompt,
+                args.decode_steps,
+                args.output,
+                max_draft_depth=args.mtp_max_draft_depth,
+                verbose=args.verbose,
+                draft_token_overrides=branch_overrides,
+                reuse_canonical_main_trajectory=args.mtp_sidecar_only,
+            )
         total += mtp_total
         (args.output / "mtp_sidecar_snapshot_schema.txt").write_text(
             f"{QWEN36_MTP_SIDECAR_SNAPSHOT_SCHEMA}\n", encoding="ascii"
         )
         print(f"  Captured {mtp_total} MTP sidecar snapshots")
+        if branch_override_batches is not None:
+            (args.output / "mtp_sidecar_branch_overrides.json").write_text(
+                json.dumps(branch_override_batches, sort_keys=True, indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
 
     # Write metadata
-    write_metadata(
-        args.output,
-        args.model,
-        model,
-        args.prompt,
-        token_ids,
-        args.decode_steps,
-        decode_tokens,
-    )
+    if not sidecar_context:
+        write_metadata(
+            args.output,
+            args.model,
+            model,
+            args.prompt,
+            token_ids,
+            args.decode_steps,
+            decode_tokens,
+            extra_metadata_lines=(
+                [
+                    "mtp_sidecar_max_draft_depth: "
+                    f"{args.mtp_max_draft_depth}"
+                ]
+                if args.mtp_sidecar_snapshots
+                else []
+            ),
+        )
+    elif args.mtp_sidecar_only:
+        promote_mtp_sidecar_metadata(
+            args.output / "metadata.txt", args.mtp_max_draft_depth
+        )
 
     print(f"\n✓ Done! {total} snapshots saved to: {args.output}")
 

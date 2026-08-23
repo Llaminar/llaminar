@@ -10,6 +10,7 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../transfer/TransferEngine.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 
 #ifdef HAVE_CUDA
@@ -701,6 +702,22 @@ namespace llaminar2
                     LOG_ERROR("[HiddenStateRowsSelectStage] Shifted-prefill transaction is missing its device terminal archive");
                     return false;
                 }
+                if (!DebugEnv::isFalseyEnv(
+                        "LLAMINAR_PREFIX_CACHE_TRACE"))
+                {
+                    LOG_DEBUG(
+                        "[ShiftedMTPArchiveTrace] device="
+                        << params_.device_id.toString()
+                        << " input_tensor=" << input_base
+                        << " input_source=" << input_device
+                        << " archive_tensor="
+                        << params_.terminal_hidden_archive
+                        << " archive_source=" << archive_device
+                        << " packed_tensor=" << output_base
+                        << " packed_destination=" << output_device
+                        << " captured_rows=" << params_.seq_len
+                        << " requests=" << params_.request_count);
+                }
                 const int row_stride = params_.seq_len / params_.request_count;
                 launched = true;
                 for (int request = 0; request < params_.request_count; ++request)
@@ -798,6 +815,22 @@ namespace llaminar2
                 {
                     LOG_ERROR("[HiddenStateRowsSelectStage] Shifted-prefill transaction is missing its device terminal archive");
                     return false;
+                }
+                if (!DebugEnv::isFalseyEnv(
+                        "LLAMINAR_PREFIX_CACHE_TRACE"))
+                {
+                    LOG_DEBUG(
+                        "[ShiftedMTPArchiveTrace] device="
+                        << params_.device_id.toString()
+                        << " input_tensor=" << input_base
+                        << " input_source=" << input_device
+                        << " archive_tensor="
+                        << params_.terminal_hidden_archive
+                        << " archive_source=" << archive_device
+                        << " packed_tensor=" << output_base
+                        << " packed_destination=" << output_device
+                        << " captured_rows=" << params_.seq_len
+                        << " requests=" << params_.request_count);
                 }
                 const int row_stride = params_.seq_len / params_.request_count;
                 launched = true;

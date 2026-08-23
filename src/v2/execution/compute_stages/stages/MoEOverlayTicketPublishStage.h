@@ -4,8 +4,9 @@
  *
  * The stage is the final producer in a native GPU graph segment. It copies the
  * router outputs, normalized hidden rows, and device-owned logical row count to
- * one model-lifetime pinned ticket. The following explicitly declared manual
- * participant boundary consumes that immutable snapshot after an event handoff.
+ * one model-lifetime pinned ticket and then system-release publishes its
+ * isolated mapped timeline word. The following explicitly declared manual
+ * participant boundary acquires only that word, never the graph terminal.
  */
 
 #pragma once
@@ -73,7 +74,7 @@ namespace llaminar2
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
         {
             return supportsGraphCaptureAfterLaunchPreparation()
-                       ? GraphLaunchPreparationPolicy::CaptureOnly
+                       ? GraphLaunchPreparationPolicy::CaptureAndReplay
                        : GraphLaunchPreparationPolicy::None;
         }
         StageBufferRequirements getBufferRequirements() const override;

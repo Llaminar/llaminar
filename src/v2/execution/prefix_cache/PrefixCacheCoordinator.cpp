@@ -1,3 +1,8 @@
+/**
+ * @file PrefixCacheCoordinator.cpp
+ * @brief Implements typed common-prefix reductions and fingerprint policy.
+ */
+
 #include "execution/prefix_cache/PrefixCacheCoordinator.h"
 
 #include <algorithm>
@@ -104,7 +109,8 @@ namespace llaminar2
         DeviceId device,
         const PrefixLookupResult &hit,
         std::string domain_id,
-        uint64_t placement_epoch)
+        uint64_t placement_epoch,
+        PrefixFingerprintCoordinationPolicy fingerprint_policy)
     {
         PrefixParticipantLookup participant;
         participant.domain_id = std::move(domain_id);
@@ -112,6 +118,7 @@ namespace llaminar2
         participant.device = device;
         participant.placement_epoch = placement_epoch != 0 ? placement_epoch : hit.placement_epoch;
         participant.fingerprint_key = hit.fingerprint_key;
+        participant.fingerprint_policy = fingerprint_policy;
         participant.supported = hit.supported;
         participant.cache_enabled = hit.cache_enabled;
         participant.hit = hit.cached_tokens > 0;
@@ -166,7 +173,8 @@ namespace llaminar2
             local_max_tokens = std::max(local_max_tokens, participant_tokens);
             local_placement_epoch = std::max(local_placement_epoch, participant.placement_epoch);
             if (participant_tokens > 0 &&
-                participant.fingerprint_must_match &&
+                participant.fingerprint_policy ==
+                    PrefixFingerprintCoordinationPolicy::RequireIdentical &&
                 participant.fingerprint_key != 0)
             {
                 local_min_fingerprint = std::min(local_min_fingerprint, participant.fingerprint_key);

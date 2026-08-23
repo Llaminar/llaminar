@@ -21,8 +21,13 @@
 #include "../qwen35/Qwen35ParityTestBase.h"
 #include "models/qwen35moe/Qwen35MoESchema.h"
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
+#include <vector>
 
 namespace llaminar2::test::parity::qwen35moe
 {
@@ -63,6 +68,15 @@ namespace llaminar2::test::parity::qwen35moe
          */
         virtual bool requiresMTPSidecarReferenceSnapshots() const
         {
+            if constexpr (requires(const Derived &fixture)
+                          {
+                              fixture.modelParityCase().mtpEnabled();
+                          })
+            {
+                return static_cast<const Derived *>(this)
+                    ->modelParityCase()
+                    .mtpEnabled();
+            }
             return false;
         }
 
@@ -77,6 +91,18 @@ namespace llaminar2::test::parity::qwen35moe
          */
         virtual int requiredMTPSidecarReferenceDraftDepth() const
         {
+            if constexpr (requires(const Derived &fixture)
+                          {
+                              fixture.modelParityCase()
+                                  .model.maximum_mtp_draft_depth;
+                          })
+            {
+                const auto &test_case =
+                    static_cast<const Derived *>(this)->modelParityCase();
+                return test_case.mtpEnabled()
+                           ? test_case.model.maximum_mtp_draft_depth
+                           : 0;
+            }
             return requiresMTPSidecarReferenceSnapshots() ? 3 : 0;
         }
 
@@ -106,8 +132,8 @@ namespace llaminar2::test::parity::qwen35moe
          * pre-softmax projection under an identical filename.
          */
         typename Base::ReferenceSnapshotValidation
-        validateModelSpecificReferenceSnapshotMetadata(
-            const std::filesystem::path &metadata_path) const override
+        validateMoEMainReferenceSnapshotMetadata(
+            const std::filesystem::path &metadata_path) const
         {
             constexpr int kMoERouterSnapshotSchema = 1;
             const auto observed = Base::readSnapshotMetadataValue(
@@ -120,6 +146,26 @@ namespace llaminar2::test::parity::qwen35moe
                     "moe_router_snapshot_schema is missing or does not publish "
                     "the post-softmax production boundary"};
             }
+
+            return {true, {}};
+        }
+
+        /**
+         * @brief Authenticate MoE main checkpoints and optional MTP extension.
+         *
+         * Main-model provenance and router semantics remain independently
+         * usable when a typed MTP cell asks for a deeper recursive sidecar
+         * corpus.  Keeping the two contracts separate lets regeneration repair
+         * only the bounded predictor context without weakening either one.
+         */
+        typename Base::ReferenceSnapshotValidation
+        validateModelSpecificReferenceSnapshotMetadata(
+            const std::filesystem::path &metadata_path) const override
+        {
+            const auto main_validation =
+                validateMoEMainReferenceSnapshotMetadata(metadata_path);
+            if (!main_validation.usable)
+                return main_validation;
 
             if (requiresMTPSidecarReferenceSnapshots())
             {
@@ -207,6 +253,36 @@ namespace llaminar2::test::parity::qwen35moe
         }
 
         /**
+         * @brief Decide whether an existing main trajectory can be extended.
+         *
+         * This method authenticates the complete shared reference identity and
+         * MoE router boundary while intentionally excluding only the separately
+         * repairable MTP sidecar contract.  A stale model, prompt, token stream,
+         * decode depth, or router schema therefore forces full regeneration.
+         */
+        bool canExtendAuthenticatedMainReferenceWithMTPSidecars() const
+        {
+            if (!requiresMTPSidecarReferenceSnapshots())
+                return false;
+
+            const auto metadata_path =
+                std::filesystem::path(Base::config_.snapshot_dir) /
+                "metadata.txt";
+            if (!std::filesystem::is_regular_file(metadata_path))
+                return false;
+
+            const auto common_validation =
+                Base::validateReferenceSnapshotMetadata(
+                    metadata_path,
+                    Base::productionParityCampaignEnabled(),
+                    false);
+            if (!common_validation.usable)
+                return false;
+
+            return validateMoEMainReferenceSnapshotMetadata(metadata_path).usable;
+        }
+
+        /**
          * @brief Regenerate PyTorch snapshots using Qwen3.5 MoE-specific generator.
          *
          * The standard Qwen3.5 snapshot generator only handles dense SwiGLU FFN.
@@ -220,8 +296,13 @@ namespace llaminar2::test::parity::qwen35moe
          */
         bool regeneratePyTorchSnapshots() override
         {
+            const bool extend_mtp_sidecars =
+                canExtendAuthenticatedMainReferenceWithMTPSidecars();
             LOG_INFO("[" << Base::getBackendName()
-                         << " Parity] Regenerating Qwen3.5 MoE PyTorch snapshots from GGUF: "
+                         << " Parity] "
+                         << (extend_mtp_sidecars
+                                 ? "Extending authenticated Qwen3.5 MoE MTP sidecars from GGUF: "
+                                 : "Regenerating Qwen3.5 MoE PyTorch snapshots from GGUF: ")
                          << Base::config_.model_path);
 
             std::ostringstream script;
@@ -244,6 +325,8 @@ namespace llaminar2::test::parity::qwen35moe
                 script << " --mtp-sidecar-snapshots"
                        << " --mtp-max-draft-depth "
                        << requiredMTPSidecarReferenceDraftDepth();
+                if (extend_mtp_sidecars)
+                    script << " --mtp-sidecar-only";
             }
             const std::string command =
                 "bash -c " + Base::parityShellQuote(script.str()) + " 2>&1";
@@ -271,6 +354,121 @@ namespace llaminar2::test::parity::qwen35moe
             }
 
             LOG_INFO("[Parity] Qwen3.5 MoE snapshots regenerated successfully");
+            return true;
+        }
+
+        /**
+         * @brief Generate an exact additive oracle for one observed MTP branch.
+         *
+         * The MoE generator's branch mode constructs only embeddings, LM head,
+         * rotary state, and the single trailing predictor layer. It reuses the
+         * authenticated main-model hidden/token trajectory already present in
+         * the canonical pack, so a quantized proposal divergence costs one
+         * bounded sidecar replay rather than a second complete 35B model load.
+         * The caller owns node-wide serialization and validates every resulting
+         * NPY before comparison.
+         */
+        bool regeneratePyTorchMTPBranchSnapshots(
+            int reference_step,
+            const std::vector<int32_t> &condition_tokens) override
+        {
+            if (reference_step < 0 || condition_tokens.empty() ||
+                condition_tokens.size() >= 15u ||
+                std::any_of(
+                    condition_tokens.begin(),
+                    condition_tokens.end(),
+                    [](int32_t token) { return token < 0; }))
+            {
+                LOG_ERROR(
+                    "[Parity] Invalid Qwen3.5 MoE MTP branch identity");
+                return false;
+            }
+
+            const auto artifact_dir = Base::ensureResultsDir();
+            const auto request_path =
+                artifact_dir / "mtp_hf_branch_request.json";
+            std::ofstream request(request_path, std::ios::trunc);
+            if (!request.is_open())
+            {
+                LOG_ERROR(
+                    "[Parity] Cannot write MTP branch request "
+                    << request_path);
+                return false;
+            }
+            request << "{\"" << reference_step << "\": [";
+            for (size_t index = 0; index < condition_tokens.size(); ++index)
+            {
+                if (index != 0u)
+                    request << ", ";
+                request << condition_tokens[index];
+            }
+            request << "]}\n";
+            request.flush();
+            if (!request.good())
+            {
+                LOG_ERROR(
+                    "[Parity] Failed while writing MTP branch request "
+                    << request_path);
+                return false;
+            }
+            request.close();
+
+            std::ostringstream script;
+            script
+                << "unset OMP_NUM_THREADS MKL_NUM_THREADS "
+                   "OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES "
+                   "KMP_AFFINITY; "
+                << "if [ -f /workspaces/llaminar/.venv/bin/activate ]; then "
+                   "source /workspaces/llaminar/.venv/bin/activate; fi; "
+                << "python3 python/reference/"
+                   "generate_qwen35_moe_pipeline_snapshots.py"
+                << " --model "
+                << Base::parityShellQuote(Base::config_.model_path)
+                << " --prompt "
+                << Base::parityShellQuote(Base::config_.prompt)
+                << " --output "
+                << Base::parityShellQuote(Base::config_.snapshot_dir)
+                << " --decode-steps " << Base::config_.decode_steps
+                << " --mtp-sidecar-snapshots --mtp-max-draft-depth "
+                << condition_tokens.size() + 1u
+                << " --mtp-branch-overrides "
+                << Base::parityShellQuote(request_path.string());
+            const std::string command =
+                "bash -c " + Base::parityShellQuote(script.str()) + " 2>&1";
+
+            LOG_INFO(
+                "[Parity] Generating Qwen3.5 MoE forced-branch MTP oracle "
+                "step="
+                << reference_step << " depth=" << condition_tokens.size());
+            FILE *pipe = popen(command.c_str(), "r");
+            if (!pipe)
+            {
+                LOG_ERROR(
+                    "[Parity] Failed to start Qwen3.5 MoE MTP branch generator");
+                return false;
+            }
+
+            std::string output;
+            std::array<char, 512> buffer{};
+            while (fgets(buffer.data(), buffer.size(), pipe) != nullptr)
+                output += buffer.data();
+            const int exit_code = pclose(pipe);
+
+            const auto log_path =
+                artifact_dir / "mtp_hf_branch_generation.log";
+            std::ofstream log(log_path, std::ios::trunc);
+            if (log.is_open())
+                log << output;
+            if (exit_code != 0)
+            {
+                LOG_ERROR(
+                    "[Parity] Qwen3.5 MoE MTP branch generation failed:\n"
+                    << output);
+                return false;
+            }
+
+            LOG_INFO(
+                "[Parity] Qwen3.5 MoE forced-branch snapshots are durable");
             return true;
         }
     };

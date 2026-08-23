@@ -30,18 +30,20 @@ namespace
         explicit PinTrackingBackend(DeviceType device_type)
             : test::MockBackend(device_type) {}
 
-        bool pinHostMemory(void *ptr, size_t bytes) override
+        bool pinHostMemory(void *ptr, size_t bytes, int device_id) override
         {
             ++pin_count_;
             last_pinned_ptr_ = ptr;
             last_pinned_bytes_ = bytes;
+            last_pinned_device_id_ = device_id;
             return true;
         }
 
-        bool unpinHostMemory(void *ptr) override
+        bool unpinHostMemory(void *ptr, int device_id) override
         {
             ++unpin_count_;
             last_unpinned_ptr_ = ptr;
+            last_unpinned_device_id_ = device_id;
             return true;
         }
 
@@ -50,6 +52,8 @@ namespace
         void *lastPinnedPtr() const { return last_pinned_ptr_; }
         void *lastUnpinnedPtr() const { return last_unpinned_ptr_; }
         size_t lastPinnedBytes() const { return last_pinned_bytes_; }
+        int lastPinnedDeviceId() const { return last_pinned_device_id_; }
+        int lastUnpinnedDeviceId() const { return last_unpinned_device_id_; }
 
     private:
         size_t pin_count_ = 0;
@@ -57,6 +61,8 @@ namespace
         void *last_pinned_ptr_ = nullptr;
         void *last_unpinned_ptr_ = nullptr;
         size_t last_pinned_bytes_ = 0;
+        int last_pinned_device_id_ = -1;
+        int last_unpinned_device_id_ = -1;
     };
 
     PinTrackingBackend *g_cuda_pin_backend = nullptr;
@@ -301,20 +307,23 @@ TEST_F(Test__LogitsGatherer, DestructorUnpinsWithPinnedDeviceBackend)
     {
         auto g = std::make_unique<LogitsGatherer>(VOCAB, MAX_TOKENS, resolvePinTrackingBackend);
 
-        // Pin via ROCm while a CUDA backend is also available; destruction must
-        // unpin through the stored ROCm backend type instead of probing CUDA first.
-        g->pinForDevice(DeviceId::rocm(0));
+        // Pin via a non-zero ROCm ordinal while CUDA is also available;
+        // destruction must retain both backend type and exact registration
+        // device instead of reconstructing ROCm:0 from a type-only flag.
+        g->pinForDevice(DeviceId::rocm(3));
         buffer_ptr = g->mutableData();
 
         ASSERT_NE(buffer_ptr, nullptr);
         EXPECT_EQ(rocm_backend.pinCount(), 1u);
         EXPECT_EQ(rocm_backend.lastPinnedPtr(), buffer_ptr);
         EXPECT_EQ(rocm_backend.lastPinnedBytes(), expected_bytes);
+        EXPECT_EQ(rocm_backend.lastPinnedDeviceId(), 3);
         EXPECT_EQ(cuda_backend.pinCount(), 0u);
     }
 
     EXPECT_EQ(rocm_backend.unpinCount(), 1u);
     EXPECT_EQ(rocm_backend.lastUnpinnedPtr(), buffer_ptr);
+    EXPECT_EQ(rocm_backend.lastUnpinnedDeviceId(), 3);
     EXPECT_EQ(cuda_backend.unpinCount(), 0u);
 }
 

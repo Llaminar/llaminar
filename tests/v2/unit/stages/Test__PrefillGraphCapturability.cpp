@@ -596,6 +596,72 @@ TEST_F(MoERoutingPrefillGraphCapture,
 }
 
 /**
+ * @brief A one-row prefix suffix remains a prefill graph, not decode policy.
+ *
+ * Prefix restore deliberately admits a one-token uncached suffix. The
+ * physical M=1 router uses the same runtime-table kernel as serial decode, but
+ * its device-owned active-row scalar identifies the surrounding transaction as
+ * prefill. Cold serving-family materialization must therefore admit it on both
+ * GPU backends without an eager warmup or a parity-only retry.
+ */
+TEST_F(MoERoutingPrefillGraphCapture,
+       OneRowPrefixSuffixAdvertisesDeviceOwnedPrefillCapture)
+{
+    const auto expect_backend =
+        [&](DeviceId device, bool backend_supported, const char *backend_name)
+    {
+        auto input = TestTensorFactory::createFP32({1, D_MODEL});
+        auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
+        auto output_weights = TestTensorFactory::createFP32({TOP_K, 1});
+        int32_t active_rows = 1;
+
+        MoERuntimeTable runtime_table(
+            DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+        ASSERT_TRUE(runtime_table.prepareInactiveBank(
+            0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
+        ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
+
+        MoERoutingStage::Params params;
+        params.device_id = device;
+        params.seq_len = 1;
+        params.d_model = D_MODEL;
+        params.num_experts = NUM_EXPERTS;
+        params.top_k = TOP_K;
+        params.input = input.get();
+        params.gate_weights = gate_weights_.get();
+        params.output_indices = output_indices.get();
+        params.output_weights = output_weights.get();
+        params.layer_idx = 0;
+        params.moe_runtime_table = &runtime_table;
+        params.active_row_count_device = &active_rows;
+
+        MoERoutingStage stage(params);
+        stage.setMoEKernelForTesting(&stub_kernel_);
+        EXPECT_EQ(
+            stage.supportsLazyPrefillGraphCapturePreflight(),
+            backend_supported)
+            << backend_name;
+        EXPECT_EQ(
+            stage.supportsPaddedPrefillGraphCapturePreflight(),
+            backend_supported)
+            << backend_name;
+        EXPECT_EQ(stage.isGraphCapturable(), backend_supported)
+            << backend_name;
+    };
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true, "CUDA");
+#else
+    expect_backend(DeviceId::cuda(0), false, "CUDA");
+#endif
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true, "ROCm");
+#else
+    expect_backend(DeviceId::rocm(0), false, "ROCm");
+#endif
+}
+
+/**
  * @brief Lock down the heterogeneous overlay verifier publication protocol.
  *
  * The continuation GPU router must retain selected expert IDs in its own
@@ -1110,6 +1176,52 @@ TEST_F(MoEExpertPrefillGraphCapture,
 #endif
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight())
         << "A reusable physical width requires one device-owned logical count.";
+}
+
+/**
+ * @brief Prefix restore may reuse the production one-row runtime-table kernel.
+ *
+ * The stable device row-count binding authenticates the prefill transaction;
+ * the stage must not infer phase from physical M or require a separate eager
+ * arithmetic path for the one uncached suffix token.
+ */
+TEST_F(MoEExpertPrefillGraphCapture,
+       OneRowPrefixSuffixUsesDeviceRoutedGraphPreflight)
+{
+    const auto expect_backend =
+        [&](DeviceId device, bool backend_supported, const char *backend_name)
+    {
+        MoERuntimeTable runtime_table(
+            DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+        auto params = makeValidPrefillParams();
+        params.device_id = device;
+        params.seq_len = 1;
+        params.layer_idx = 0;
+        params.moe_runtime_table = &runtime_table;
+
+        MoEExpertComputeStage stage(params);
+        EXPECT_EQ(
+            stage.supportsPaddedPrefillGraphCapturePreflight(),
+            backend_supported)
+            << backend_name << " must admit the exact one-row prefix suffix";
+
+        params.active_row_count_device = nullptr;
+        MoEExpertComputeStage unauthenticated_stage(params);
+        EXPECT_FALSE(
+            unauthenticated_stage.supportsLazyPrefillGraphCapturePreflight())
+            << backend_name << " one-row prefill requires device-owned geometry";
+    };
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true, "CUDA");
+#else
+    expect_backend(DeviceId::cuda(0), false, "CUDA");
+#endif
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true, "ROCm");
+#else
+    expect_backend(DeviceId::rocm(0), false, "ROCm");
+#endif
 }
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWithoutKernel)
@@ -1989,6 +2101,57 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightUsesBackendGroupedCap
 #endif
 }
 
+/**
+ * @brief One uncached prefix token admits the exact one-row shared FFN graph.
+ *
+ * Physical row count does not define transaction phase. The parent serving
+ * graph owns the prefill identity, while this row-local stage may reuse its
+ * already-proven M=1 production launch contract.
+ */
+TEST_F(SharedExpertFFNPrefillGraphCapture,
+       OneRowPrefixSuffixSupportsExactShapePrefillCapture)
+{
+    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
+
+    const auto expect_backend =
+        [&](DeviceId device, bool backend_supported, const char *backend_name)
+    {
+        SharedExpertFFNStage::Params params;
+        params.device_id = device;
+        params.seq_len = 1;
+        params.d_model = D_MODEL;
+        params.intermediate = INTERMEDIATE;
+        params.input = input_.get();
+        params.gate_w = gate_w.get();
+        params.up_w = up_w.get();
+        params.down_w = down_w.get();
+        params.output = output_.get();
+
+        SharedExpertFFNStage stage(params);
+        EXPECT_EQ(
+            stage.supportsLazyPrefillGraphCapturePreflight(),
+            backend_supported)
+            << backend_name << " must admit a one-row prefix suffix without "
+                               "eager replay";
+        EXPECT_EQ(
+            stage.supportsPaddedPrefillGraphCapturePreflight(),
+            backend_supported);
+    };
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true, "CUDA");
+#else
+    expect_backend(DeviceId::cuda(0), false, "CUDA");
+#endif
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true, "ROCm");
+#else
+    expect_backend(DeviceId::rocm(0), false, "ROCm");
+#endif
+}
+
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillCapturableWhenScratchReady)
 {
     ScopedMoEGraphCaptureFlags flags(true, true);
@@ -2643,6 +2806,44 @@ TEST_F(SharedExpertGatePrefillGraphCapture, DecodePlansWarmupDependentCaptureWit
         << "Decode shared gate should be planned capturable before warmup";
 #else
     EXPECT_FALSE(stage.supportsGraphCaptureAfterLaunchPreparation());
+#endif
+}
+
+/**
+ * @brief One-row prefix suffixes retain the device-owned prefill contract.
+ */
+TEST_F(SharedExpertGatePrefillGraphCapture,
+       OneRowPrefixSuffixSupportsDeviceOwnedPrefillCapture)
+{
+    const auto expect_backend =
+        [&](DeviceId device, bool backend_supported, const char *backend_name)
+    {
+        int32_t active_rows = 1;
+        SharedExpertGateStage::Params params;
+        params.device_id = device;
+        params.seq_len = 1;
+        params.d_model = D_MODEL;
+        params.input = input_.get();
+        params.gate_inp = gate_inp_.get();
+        params.shared_output = shared_output_.get();
+        params.active_row_count_device = &active_rows;
+
+        SharedExpertGateStage stage(params);
+        EXPECT_EQ(
+            stage.supportsPaddedPrefillGraphCapturePreflight(),
+            backend_supported)
+            << backend_name << " must admit a one-row restored-prefix suffix";
+    };
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true, "CUDA");
+#else
+    expect_backend(DeviceId::cuda(0), false, "CUDA");
+#endif
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true, "ROCm");
+#else
+    expect_backend(DeviceId::rocm(0), false, "ROCm");
 #endif
 }
 

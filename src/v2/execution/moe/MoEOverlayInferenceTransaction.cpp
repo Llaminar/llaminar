@@ -14,6 +14,7 @@
 #include "loaders/IModelLoader.h"
 
 #include <algorithm>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -171,11 +172,32 @@ namespace llaminar2
         int previous_layer = main_layer_count - 1;
         for (const int layer : mtp_source_layers)
         {
-            if (layer <= previous_layer)
+            if (layer <= previous_layer ||
+                layer == std::numeric_limits<int>::max())
                 return false;
             previous_layer = layer;
         }
-        return true;
+        return routedLayerCapacity() > 0;
+    }
+
+    int MoEOverlayInferenceGraphFamilyIdentity::routedLayerCapacity()
+        const noexcept
+    {
+        if (main_layer_count <= 0)
+            return 0;
+        if (mtp_source_layers.empty())
+            return main_layer_count;
+
+        /* Source layers remain model-global wire and prepared-bank indices.
+         * A dense NextN source may sit between routed sources, so vector size
+         * is not a valid substitute for the final addressable index. */
+        const int final_source_layer = mtp_source_layers.back();
+        if (final_source_layer < main_layer_count ||
+            final_source_layer == std::numeric_limits<int>::max())
+        {
+            return 0;
+        }
+        return final_source_layer + 1;
     }
 
     MoEOverlayInferenceGraphFamilyIdentity

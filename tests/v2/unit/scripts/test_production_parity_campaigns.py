@@ -324,6 +324,52 @@ class ProductionParityCampaignTest(unittest.TestCase):
             any("missing prefill_stages.csv" in error for error in errors)
         )
 
+    def test_typed_mtp_cell_requires_exact_transaction_evidence(self) -> None:
+        gtest_case = (
+            "MatrixSuite.ProductionParity/"
+            "Qwen36_CUDA0_ActFP32_KVFP16_MTPDepth15"
+        )
+        cell = campaigns.CampaignCell(
+            "V2_Parity_ProductionCampaign_CUDA_ALL_PRECISIONS",
+            campaigns.CampaignGroup("CUDA", "ALL"),
+            gtest_cases=(gtest_case,),
+        )
+        with tempfile.TemporaryDirectory() as raw_directory:
+            root = Path(raw_directory)
+            result_directory = root / campaigns._gtest_artifact_directory_name(
+                gtest_case
+            )
+            self.write_canonical_artifacts(result_directory)
+
+            count, _, errors = campaigns.validate_campaign_artifacts(
+                cell,
+                campaigns.time.time_ns(),
+                revision_results_root=root,
+            )
+            self.assertEqual(count, len(campaigns.REQUIRED_CSV_HEADERS))
+            self.assertTrue(
+                any("missing mtp_transactions.csv" in error for error in errors)
+            )
+
+            columns = next(
+                campaigns.csv.reader([campaigns.MTP_TRANSACTIONS_HEADER])
+            )
+            (result_directory / "mtp_transactions.csv").write_text(
+                campaigns.MTP_TRANSACTIONS_HEADER
+                + "\n"
+                + ",".join("value" for _ in columns)
+                + "\n",
+                encoding="utf-8",
+            )
+            count, _, errors = campaigns.validate_campaign_artifacts(
+                cell,
+                campaigns.time.time_ns(),
+                revision_results_root=root,
+            )
+
+        self.assertEqual(count, len(campaigns.REQUIRED_CSV_HEADERS) + 1)
+        self.assertEqual(errors, ())
+
     @mock.patch.object(
         campaigns,
         "validate_campaign_artifacts",
@@ -715,6 +761,74 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertIn("ProductionParity/NodeTP_2xMPI_CPU", registration)
         self.assertIn("ProductionParity/NodeTP_4xMPI_CPU", registration)
 
+    def test_cmake_discovery_honors_focused_test_mpi_world_suffix(self) -> None:
+        """A focused topology suffix overrides the target's default MPI world."""
+
+        discovery = (
+            REPO_ROOT / "tests" / "v2" / "cmake" /
+            "V2ParityTestDiscovery.cmake"
+        )
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            executable = directory / "fake_gtest"
+            executable.write_text(
+                "#!/bin/sh\n"
+                "cat <<'EOF'\n"
+                "FocusedSuite.\n"
+                "  SingleRankControl\n"
+                "  MixedROCmCPUStaticPlacement_2xMPI\n"
+                "EOF\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            generated = directory / "discovered.cmake"
+
+            completed = subprocess.run(
+                [
+                    "cmake",
+                    f"-DTEST_EXECUTABLE={executable}",
+                    f"-DCTEST_FILE={generated}",
+                    "-DTEST_PREFIX=V2_Integration_Parity_FocusedMPI",
+                    "-DLABELS=V2;Integration;Parity;CPU;ROCm;MPI",
+                    "-DMPI_PROCS=1",
+                    "-DNUM_SOCKETS=2",
+                    "-DCORES_PER_SOCKET=4",
+                    f"-DWORKING_DIR={directory}",
+                    "-DTIMEOUT=90",
+                    "-DNO_MODELS=ON",
+                    "-P",
+                    str(discovery),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                msg=completed.stderr or completed.stdout,
+            )
+            registration = generated.read_text(encoding="utf-8")
+
+        control_name = (
+            "V2_Integration_Parity_FocusedMPI_"
+            "FocusedSuite_SingleRankControl"
+        )
+        mixed_name = (
+            "V2_Integration_Parity_FocusedMPI_"
+            "FocusedSuite_MixedROCmCPUStaticPlacement_2xMPI"
+        )
+        self.assertIn(f'add_test("{control_name}"', registration)
+        self.assertIn(f'add_test("{mixed_name}"', registration)
+        control_command = registration.split(
+            f'add_test("{control_name}"', 1
+        )[1].split("\n", 1)[0]
+        mixed_command = registration.split(
+            f'add_test("{mixed_name}"', 1
+        )[1].split("\n", 1)[0]
+        self.assertIn('"-np" "1"', control_command)
+        self.assertIn('"-np" "2"', mixed_command)
+
     def test_cmake_discovery_isolates_current_batch_llep_policy(self) -> None:
         """Unfinished LLEP can be omitted without bypassing canonical campaigns."""
 
@@ -772,7 +886,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
         )
         llep_name = (
             "V2_Integration_Parity_FakePolicy_LLEP_"
-            "ProductionCampaign_CPU_ALL_PRECISIONS"
+            "FocusedPolicySlice_CPU_ALL_PRECISIONS"
         )
         self.assertIn(f'add_test("{main_name}"', registration)
         self.assertIn(f'add_test("{llep_name}"', registration)
@@ -792,6 +906,15 @@ class ProductionParityCampaignTest(unittest.TestCase):
             "ProductionParity/CPU_CurrentBatchLLEP_Ordinal",
             llep_command,
         )
+        llep_registration = registration.split(
+            f'add_test("{llep_name}"', 1
+        )[1]
+        llep_properties = llep_registration.split(
+            "set_tests_properties", 1
+        )[1].split(")\n\n", 1)[0]
+        self.assertIn("UnfinishedPolicy", llep_properties)
+        self.assertNotIn("WholeMatrixOneHourTarget", llep_properties)
+        self.assertNotRegex(llep_properties, r'LABELS "[^"]*Campaign')
 
     def test_cmake_discovery_isolates_declared_application_lifetimes(self) -> None:
         discovery = (
@@ -878,10 +1001,15 @@ class ProductionParityCampaignTest(unittest.TestCase):
                 "Suite.ProductionParity/CPU_KV_TQ",
                 "Suite.ProductionParity/CPU_KV_FP16",
                 "Suite.ProductionParity/CPU_KV_Q8_1",
+                "Suite.ProductionParity/"
+                "Qwen36_CUDA0_ActFP32_KVFP32_MTPDepth3",
             ),
         )
 
-        self.assertEqual(cell.precision_types, ("FP16", "Q8_1", "TQ"))
+        self.assertEqual(
+            cell.precision_types,
+            ("FP16", "FP32", "Q8_1", "TQ"),
+        )
 
     def test_selected_models_expand_split_gguf_and_deduplicate_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:

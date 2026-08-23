@@ -29,9 +29,15 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
+#include "Qwen35ModelParityDefinitions.h"
 #include "Qwen35ParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
+
+#include <array>
+#include <iterator>
+#include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
@@ -92,95 +98,68 @@ static const std::vector<std::string> kNodeTPAllreduceStages = {
 // Test Configuration Definitions
 // =============================================================================
 
-static const std::vector<TestConfig> kNodeTPTestConfigs = {
-    // =========================================================================
-    // Qwen3.5-0.8B (Q4_0) — 2-way Node-Local TP with CPU (UPI interconnect)
-    // =========================================================================
-    {
-        .name = "NodeTP_2xMPI_CPU_08B",
-        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU},
-        .parallelism = Parallelism::NodeTP,
-        .collective = Collective::MPI,
-        .thresholds = {
-            .cosine_threshold = 0.96f,        // Observed: 0.999 prefill cosine (was 0.90)
-            .decode_cosine_threshold = 0.96f, // Observed: 0.994 avg decode cosine (was 0.90)
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.012f, // Observed: 0.002 prefill KL (was 0.35 = 148x over-relaxed)
-            .excluded_stages = kNodeTPExcludedStages,
-            .allreduce_stages = kNodeTPAllreduceStages,
+/** @return One typed two-rank CPU TP definition. */
+static ModelParityDefinition makeQwen35NodeTPDefinition(
+    ModelParityModelDefinition model,
+    float kl_threshold)
+{
+    return qwen35ParityDefinition(
+        std::move(model),
+        ModelParityTopologyDefinition{
+            .test_id = "NodeTP_2xMPI_CPU",
+            .kind = ModelParityTopologyKind::NodeTensorParallel,
+            .participants = {
+                {GlobalDeviceAddress::cpu(0), 0},
+                {GlobalDeviceAddress::cpu(1), 1},
+            },
+            .collective = Collective::MPI,
+            .mpi_ranks = 2,
         },
-        .mpi_ranks = 2,
-        .model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-
-    // =========================================================================
-    // Qwen3.5-4B (Q8_0) — 2-way Node-Local TP with CPU (UPI interconnect)
-    // =========================================================================
-    {
-        .name = "NodeTP_2xMPI_CPU_4B",
-        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU},
-        .parallelism = Parallelism::NodeTP,
-        .collective = Collective::MPI,
-        .thresholds = {
-            .cosine_threshold = 0.96f,        // Observed: 0.998 prefill cosine (was 0.90)
-            .decode_cosine_threshold = 0.96f, // Observed: 0.997 avg decode cosine (was 0.90)
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.015f, // Observed: 0.004 prefill KL (was 0.35 = 94x over-relaxed)
-            .excluded_stages = kNodeTPExcludedStages,
-            .allreduce_stages = kNodeTPAllreduceStages,
-        },
-        .mpi_ranks = 2,
-        .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_4b_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-
-    // =========================================================================
-    // Qwen3.5-27B (Q8_0) — 2-way Node-Local TP with CPU (UPI interconnect)
-    //
-    // 27B is the critical 27B-sized model where GDN under TP=2 exhibits
-    // non-integer V/K head ratios (n_v_heads_local=24, n_k_heads=16) that
-    // previously triggered expansion-branch bugs. This test is the primary
-    // parity guard for the GDN deinterleave modular-mapping path.
-    // =========================================================================
-    {
-        .name = "NodeTP_2xMPI_CPU_27B",
-        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU},
-        .parallelism = Parallelism::NodeTP,
-        .collective = Collective::MPI,
-        .thresholds = {
+        BackendThresholds{
             .cosine_threshold = 0.96f,
             .decode_cosine_threshold = 0.96f,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
-            .kl_threshold = 0.020f,
+            .kl_threshold = kl_threshold,
             .excluded_stages = kNodeTPExcludedStages,
             .allreduce_stages = kNodeTPAllreduceStages,
-        },
-        .mpi_ranks = 2,
-        .model_path = "models/Qwen3.5-27B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen35_27b_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-};
+        });
+}
+
+/** @return Canonically generated dense Qwen3.5 NodeTP cases. */
+static const std::vector<ModelParityCase> &qwen35NodeTPCases()
+{
+    static const auto cases = []
+    {
+        const std::array definitions = {
+            makeQwen35NodeTPDefinition(
+                qwen35_08B_Q40ParityModel(), 0.012f),
+            makeQwen35NodeTPDefinition(
+                qwen35_4B_Q80ParityModel(), 0.015f),
+            makeQwen35NodeTPDefinition(
+                qwen35_27B_Q80ParityModel(), 0.020f),
+        };
+        std::vector<ModelParityCase> expanded;
+        for (const auto &definition : definitions)
+        {
+            auto definition_cases = expandModelParityDefinition(definition);
+            expanded.insert(
+                expanded.end(),
+                std::make_move_iterator(definition_cases.begin()),
+                std::make_move_iterator(definition_cases.end()));
+        }
+        return expanded;
+    }();
+    return cases;
+}
 
 // =============================================================================
 // Parameterized Test Fixture
 // =============================================================================
 
 class Qwen35NodeTPParityTest : public Qwen35ConfigDrivenParityTest<Qwen35NodeTPParityTest>,
-                                    public ::testing::WithParamInterface<TestConfig>
-{
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
-};
+                                public ModelParityCaseParameter
+{};
 
 // =============================================================================
 // Test Cases
@@ -323,10 +302,10 @@ TEST_P(Qwen35NodeTPParityTest, ProductionParity)
 INSTANTIATE_TEST_SUITE_P(
     Qwen35NodeTP,
     Qwen35NodeTPParityTest,
-    ::testing::ValuesIn(kNodeTPTestConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
+    ::testing::ValuesIn(qwen35NodeTPCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {
-        return info.param.name;
+        return info.param.testName();
     });
 
 // =============================================================================

@@ -120,6 +120,24 @@ REQUIRED_CSV_HEADERS = {
         "pytorch_dynamic_range,pytorch_sparsity,pytorch_zero_frac,"
         "pytorch_nan_count,pytorch_inf_count,pytorch_elements"
     ),
+    "prefix_restore.csv": (
+        "backend,phase,cache_config_enabled,cache_ready,cache_bypassed,"
+        "cache_bypass_reason,request_enabled,request_bypassed,"
+        "request_bypass_reason,hit,partial_hit,requested_tokens,"
+        "matched_tokens,matched_blocks,terminal_logits_restored,"
+        "terminal_hidden_restored,mtp_state_restored,hybrid_state_restored,"
+        "storage_tier,current_position,state_compared,state_equivalent,"
+        "state_detail,observed_terminal_hidden_hash_available,"
+        "observed_terminal_hidden_bytes,observed_terminal_hidden_hash,"
+        "observed_terminal_logits_hash_available,"
+        "observed_terminal_logits_bytes,observed_terminal_logits_hash,"
+        "oracle_terminal_hidden_hash_available,"
+        "oracle_terminal_hidden_bytes,oracle_terminal_hidden_hash,"
+        "oracle_terminal_logits_hash_available,"
+        "oracle_terminal_logits_bytes,oracle_terminal_logits_hash,"
+        "checkpoint_compared,checkpoint_cosine,"
+        "checkpoint_passed,passed"
+    ),
     "production_path.csv": (
         "backend,device,execution_path,homogeneous_gpu,"
         "forward_full_graph_capture,forward_full_graph_replay,"
@@ -133,12 +151,24 @@ REQUIRED_CSV_HEADERS = {
         "budget_seconds,within_budget"
     ),
 }
+MTP_TRANSACTIONS_HEADER = (
+    "backend,requested_draft_depth,response_limited_draft_depth,"
+    "snapshot_execution_draft_depth,last_transaction_draft_depth,"
+    "reference_step,condition_position,emitted_token_count,emitted_tokens,"
+    "serial_oracle_tokens,serial_token_exact,attempted_draft_tokens,"
+    "verifier_transactions,verifier_identity_transaction_count,"
+    "verifier_identity_depth,production_verifier_draft_tokens,"
+    "before_position,after_position,"
+    "before_draft_steps,after_draft_steps,before_verifier_runs,"
+    "after_verifier_runs"
+)
 CSV_ARTIFACTS_REQUIRING_DATA = frozenset(
     {
         "prefill_layers.csv",
         "prefill_summary.csv",
         "prefill_stages.csv",
         "decode_steps.csv",
+        "prefix_restore.csv",
         "production_path.csv",
     }
 )
@@ -197,7 +227,7 @@ class CampaignCell:
             for precision in KV_PRECISIONS
             if any(
                 re.search(
-                    rf"(?:^|_)KV_{re.escape(precision)}(?:_|$)", case
+                    rf"(?:^|_)KV_?{re.escape(precision)}(?:_|$)", case
                 )
                 for case in self.gtest_cases
             )
@@ -1267,6 +1297,18 @@ def _gtest_artifact_directory_name(gtest_case: str) -> str:
     return re.sub(r'[/\\:*?"<>|]', "_", raw_name)
 
 
+def _required_csv_headers_for_case(gtest_case: str) -> dict[str, str]:
+    """Return the exact artifact contract for one typed matrix cell."""
+
+    headers = dict(REQUIRED_CSV_HEADERS)
+    if re.search(
+        r"(?:^|_)MTP(?:Depth(?:1|2|3|15)|DynamicDepth)(?:_|$)",
+        gtest_case,
+    ):
+        headers["mtp_transactions.csv"] = MTP_TRANSACTIONS_HEADER
+    return headers
+
+
 def validate_campaign_artifacts(
     cell: CampaignCell,
     campaign_started_wall_time_ns: int,
@@ -1299,7 +1341,8 @@ def validate_campaign_artifacts(
             continue
         directories.append(str(directory))
 
-        for filename, expected_header in REQUIRED_CSV_HEADERS.items():
+        required_headers = _required_csv_headers_for_case(gtest_case)
+        for filename, expected_header in required_headers.items():
             path = directory / filename
             try:
                 file_stat = path.stat()
@@ -1351,7 +1394,11 @@ def validate_campaign_artifacts(
                     "wrong column count"
                 )
                 continue
-            if filename in CSV_ARTIFACTS_REQUIRING_DATA and len(rows) < 2:
+            requires_data = (
+                filename in CSV_ARTIFACTS_REQUIRING_DATA
+                or filename == "mtp_transactions.csv"
+            )
+            if requires_data and len(rows) < 2:
                 errors.append(f"{gtest_case}: {filename} has no evidence row")
                 continue
             validated += 1

@@ -113,6 +113,26 @@ TEST(Test__WorkspaceMemoryEstimator, GPU_HasMinimumFloor)
     EXPECT_GE(bytes, 800ULL * 1024 * 1024);
 }
 
+/** @brief Exact local head geometry admits a non-divisible rank-local TP plan. */
+TEST(Test__WorkspaceMemoryEstimator, ExactLocalQueryHeadsPermitUnevenTP4)
+{
+    auto profile = qwen35MoEProfile(false);
+    profile.n_heads = 14;
+    profile.n_kv_heads = 2;
+    profile.head_dim = 64;
+
+    auto exact = graphGeometry(
+        DeviceId::rocm(0), /*local_d_ff=*/128, /*total_shards=*/4);
+    exact.local_query_heads = 4;
+    EXPECT_GT(WorkspaceMemoryEstimator::estimate(profile, exact), 0u);
+
+    auto lossy = exact;
+    lossy.local_query_heads = 0;
+    EXPECT_THROW(
+        WorkspaceMemoryEstimator::estimate(profile, lossy),
+        std::runtime_error);
+}
+
 TEST(Test__WorkspaceMemoryEstimator, CUDA_AddsExactMoERequirementFactoryBytes)
 {
     auto moe = qwen35MoEProfile(false);

@@ -9,9 +9,11 @@
  * @ref MoELocalExpertSerialBufferArena: a typed, immutable-address owner for
  * the transient compact tensors shared by graph roles that the orchestrator
  * has proven cannot execute concurrently. Each arena may contain a small
- * decode/MTP family and a maximum prefill family with independent coherence;
- * this avoids capacity-wide decode transfers while retaining an explicit
- * ownership boundary for concurrent graph families. Production overlay
+ * decode/MTP family and a maximum prefill family with independent coherence,
+ * plus one setup-first-touched CPU grouped-MoE workspace when the participant
+ * is host-owned. This avoids capacity-wide decode transfers and per-layer CPU
+ * scratch duplication while retaining an explicit ownership boundary for
+ * concurrent graph families. Production overlay
  * arenas retain a bounded power-of-two ladder through one captured prefill
  * segment, keeping transfer and fixed-launch padding below two times the live
  * route count without sizing transient state from the full KV context.
@@ -48,6 +50,7 @@ namespace llaminar2
     class ExpertWeightPayloadProvider;
     class DeviceWorkspaceManager;
     class MoEExpertComputeStage;
+    class CPUGroupedMoESerialWorkspace;
     class IWorkerGPUContext;
     class PinnedHostTransferBuffer;
 
@@ -65,6 +68,21 @@ namespace llaminar2
     class MoELocalExpertSerialBufferArena final
     {
     public:
+        /** @brief Select whether this serial arena owns CPU canonical-route rows. */
+        enum class CPUCanonicalRouteStoragePolicy : uint8_t
+        {
+            Disabled = 0, ///< Retain only the ordinary aggregated output family.
+            RetainSerialMaximum, ///< Add one maximum-capacity tensor shared by all serial row families.
+        };
+
+        /** @brief Select setup-owned scratch for serial CPU expert execution. */
+        enum class CPUGroupedScratchStoragePolicy : uint8_t
+        {
+            Disabled = 0, ///< Hand-built/test stage retains private CPU scratch.
+            /** Allocate one maximum-capacity workspace shared by every serial role. */
+            RetainSerialMaximum,
+        };
+
         /** @brief Immutable capacity and layout contract for one arena. */
         struct Config
         {
@@ -83,6 +101,24 @@ namespace llaminar2
             std::vector<size_t> row_capacity_buckets;
             int d_model = 0;
             int routing_top_k = 0;
+            /**
+             * @brief Retain one serial CPU tensor of raw per-route expert rows.
+             *
+             * A CPU follower serving a GPU continuation must preserve original
+             * router-slot arithmetic instead of collapsing its local experts
+             * into one row. The tensor is allocated once at maximum capacity
+             * and shared by every row family because the arena already proves
+             * those families cannot execute concurrently.
+             */
+            CPUCanonicalRouteStoragePolicy cpu_canonical_route_storage =
+                CPUCanonicalRouteStoragePolicy::Disabled;
+            /** @brief Setup-time policy for CPU grouped-MoE execution scratch. */
+            CPUGroupedScratchStoragePolicy cpu_grouped_scratch_storage =
+                CPUGroupedScratchStoragePolicy::Disabled;
+            /** @brief Logical expert count required by retained CPU scratch. */
+            int num_experts = 0;
+            /** @brief Per-expert intermediate width required by CPU scratch. */
+            int expert_intermediate = 0;
             /**
              * @brief Optional logical sparse participant that exclusively owns this arena.
              *
@@ -207,7 +243,7 @@ namespace llaminar2
         {
             return logical_participant_id_;
         }
-        /** @brief Return the sum of the four host/device tensor payload sizes. */
+        /** @brief Return all compact, canonical-route, and CPU scratch bytes. */
         size_t allocationBytes() const noexcept { return allocation_bytes_; }
         /** @brief Return setup-owned pinned bytes used by captured GPU transfers. */
         size_t pinnedTransferBytes() const noexcept
@@ -263,6 +299,31 @@ namespace llaminar2
             return families_.back().output;
         }
 
+        /**
+         * @brief Return serial CPU storage for unweighted canonical route rows.
+         *
+         * The pointer is null unless construction explicitly selected
+         * @ref CPUCanonicalRouteStoragePolicy::RetainSerialMaximum. It is
+         * never captured by a GPU graph and remains safe to reuse only under
+         * this arena's serial-family contract.
+         */
+        const std::shared_ptr<FP32Tensor> &cpuCanonicalRoutes() const noexcept
+        {
+            return cpu_canonical_routes_;
+        }
+
+        /**
+         * @brief Return setup-owned scratch for the serial CPU graph family.
+         *
+         * The pointer is null only when construction explicitly selected
+         * @ref CPUGroupedScratchStoragePolicy::Disabled.
+         */
+        const std::shared_ptr<CPUGroupedMoESerialWorkspace> &
+        cpuGroupedWorkspace() const noexcept
+        {
+            return cpu_grouped_workspace_;
+        }
+
     private:
         DeviceId device_id_ = DeviceId::invalid();
         size_t row_capacity_ = 0;
@@ -272,6 +333,9 @@ namespace llaminar2
         size_t allocation_bytes_ = 0;
         size_t pinned_transfer_bytes_ = 0;
         std::vector<TensorFamily> families_;
+        std::shared_ptr<FP32Tensor> cpu_canonical_routes_; ///< Maximum-capacity raw route rows shared by serial CPU families.
+        /** Maximum-capacity CPU grouped execution scratch shared by serial roles. */
+        std::shared_ptr<CPUGroupedMoESerialWorkspace> cpu_grouped_workspace_;
     };
 
     /**
@@ -287,6 +351,31 @@ namespace llaminar2
                                 public ICPUCurrentBatchLLEPExpertConsumer
     {
     public:
+        /**
+         * @brief Exact mapped destination for a CPU follower's route results.
+         *
+         * The dispatch packet stores compact routes in original router order.
+         * CPU expert compute first publishes one unweighted expert row per
+         * compact route, then this binding applies the original route weight
+         * and writes the result into the source GPU's canonical route slot.
+         * Timeline publication remains outside this stage.
+         */
+        struct CPUCanonicalRouteReturnBinding
+        {
+            const int32_t *original_route_slots = nullptr; ///< `[route_slot_capacity]` source-graph slot identities.
+            const int32_t *compact_route_slots = nullptr; ///< `[route_slot_capacity]` authenticated compact-row identities.
+            float *preweighted_route_contributions = nullptr; ///< `[route_slot_capacity, d_model]` mapped return matrix.
+            size_t route_slot_capacity = 0; ///< Maximum compact/original slots addressable by the binding.
+
+            /** @return Whether all setup-owned addresses and capacity exist. */
+            [[nodiscard]] bool valid() const noexcept
+            {
+                return original_route_slots && compact_route_slots &&
+                       preweighted_route_contributions &&
+                       route_slot_capacity > 0u;
+            }
+        };
+
         /**
          * @brief Authority permitted to resolve participant-local expert GEMMs.
          *
@@ -325,6 +414,15 @@ namespace llaminar2
             std::shared_ptr<const MoEOverlaySparseRows> input_rows_lifetime;
             MoEOverlayReturnRows *output_rows = nullptr;
             std::shared_ptr<MoEOverlayReturnRows> output_rows_lifetime;
+            /**
+             * @brief Optional CPU-to-GPU canonical route publication target.
+             *
+             * Absence retains the ordinary aggregated-row sparse collective.
+             * Presence is valid only for a CPU endpoint backed by an arena
+             * that retained canonical route storage.
+             */
+            std::optional<CPUCanonicalRouteReturnBinding>
+                cpu_canonical_route_return;
             std::shared_ptr<MoEOverlayCollectiveWorkspace> workspace_lifetime;
             /**
              * Immutable compact tensors shared by one ordered graph family.
@@ -694,10 +792,18 @@ namespace llaminar2
         bool preparePersistentBuffers();
 
     private:
-        /** One compact `(input row, expert, route weight)` execution record. */
+        /**
+         * @brief One admitted route in stable compact-row order.
+         *
+         * Admission assigns both compact coordinates while it already owns the
+         * source CSR row.  Packet materialization can therefore write the
+         * selected fixed-width family directly without rescanning routes or
+         * rebuilding a source-row-to-compact-row map.
+         */
         struct ActiveRoute
         {
-            size_t input_row = 0;
+            size_t compact_row = 0; ///< Dense row in the selected compact family.
+            size_t route_offset = 0; ///< Original-order local route within that row.
             int expert_id = -1;
             float weight = 0.0f;
         };
@@ -741,6 +847,15 @@ namespace llaminar2
          * graph with immutable pointer and launch identity.
          */
         void createDeferredReplayFamilies();
+        /**
+         * @brief Create the serial packet executor retained by a CPU endpoint.
+         *
+         * Construction primes fixed expert-table capacity and tensor geometry.
+         * Packet publication later changes only live row/route scalars and
+         * setup-owned tensor-family bindings, preserving kernel and scratch
+         * allocations across inference transactions.
+         */
+        void createRetainedCPUExecutor();
         /** @brief Return the retained graph bound to current tensors and route width. */
         struct DeferredGPUReplayFamily;
         DeferredGPUReplayFamily *currentDeferredReplayFamily() noexcept;
@@ -783,11 +898,9 @@ namespace llaminar2
         size_t row_admission_capacity_ = 0;
         /** Allocation-free packet scratch reused after each explicit completion. */
         std::vector<ActiveRoute> active_routes_;
-        std::vector<int> row_output_slot_;
-        std::vector<uint8_t> validated_input_rows_;
         std::vector<size_t> output_input_rows_;
-        /** Number of original-order local routes packed into each compact row. */
-        std::vector<size_t> compact_row_route_counts_;
+        /** Compact CPU row to authenticated transport-matrix row index. */
+        std::vector<int> compact_hidden_source_rows_;
         std::vector<ITensorGemm *> invocation_gate_engines_;
         std::vector<ITensorGemm *> invocation_up_engines_;
         std::vector<ITensorGemm *> invocation_down_engines_;
@@ -810,6 +923,8 @@ namespace llaminar2
          */
         std::vector<std::unique_ptr<DeferredGPUReplayFamily>>
             deferred_replay_families_;
+        /** Persistent CPU kernel/scratch authority for this serial endpoint stage. */
+        std::unique_ptr<MoEExpertComputeStage> retained_cpu_compute_stage_;
         /** Exact retained family whose captured publication is currently in flight. */
         DeferredGPUReplayFamily *pending_deferred_replay_ = nullptr;
         DeferredLifecycle deferred_lifecycle_ = DeferredLifecycle::Idle;
@@ -827,6 +942,8 @@ namespace llaminar2
         mutable std::shared_ptr<FP32Tensor> compact_routing_indices_;
         mutable std::shared_ptr<FP32Tensor> compact_routing_weights_;
         mutable std::shared_ptr<FP32Tensor> compact_output_;
+        /** Raw, unweighted route rows used only by a mapped CPU follower. */
+        mutable std::shared_ptr<FP32Tensor> compact_canonical_routes_;
         /**
          * Full tensor stride owned by the serial arena. This never changes and
          * remains the maximum model top-k allocation contract.

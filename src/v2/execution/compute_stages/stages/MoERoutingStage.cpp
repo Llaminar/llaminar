@@ -1423,10 +1423,22 @@ namespace llaminar2
         if (params_.force_decode_equivalent_verifier_prefill)
             return false;
 
+        /*
+         * Physical row count is not an execution-phase discriminator. A
+         * one-row prefix-cache suffix is still a prefill transaction and owns
+         * the same device-published real-row scalar as every larger bucket.
+         * Treating M=1 as decode-only made the smallest serving bucket
+         * impossible to pre-materialize, even though its runtime-table route
+         * is already graph-safe. The device pointer is the typed prefill
+         * authority; no host scalar or test-only mode is consulted here.
+         */
+        const bool device_owned_prefill_geometry =
+            params_.active_row_count_device != nullptr;
         const bool forced_decode_replay =
             params_.force_grouped_verifier_prefill_for_decode && params_.seq_len == 1;
         return supportsGroupedPrefillExecutionBackend(params_.device_id) &&
-               (params_.seq_len > 1 || forced_decode_replay) &&
+               (params_.seq_len > 1 || forced_decode_replay ||
+                device_owned_prefill_geometry) &&
                params_.d_model > 0 &&
                params_.num_experts > 0 &&
                params_.top_k > 0 &&

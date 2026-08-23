@@ -28,9 +28,7 @@ MoE-specific GGUF tensors:
 """
 
 import copy
-import os
 import re
-import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +37,10 @@ import torch
 import torch.nn.functional as F
 
 from .base import HuggingFaceReferenceModel
+from .mtp_sidecar_reference import (
+    mtp_sidecar_replay_depth,
+    save_mtp_snapshot_atomic,
+)
 from .pipeline_stages import PipelineStage
 from .registry import ModelRegistry
 
@@ -57,57 +59,6 @@ def production_router_distribution(router_output) -> torch.Tensor:
             "Qwen3.5 MoE router did not return probabilities, weights, and indices"
         )
     return router_output[0]
-
-
-def mtp_sidecar_replay_depth(
-    step: int,
-    max_draft_depth: int,
-    draft_token_overrides: dict[int, list[int]],
-) -> int:
-    """Return the minimum predictor depth needed by an additive branch pass.
-
-    A branch-qualified reference still has to replay MTP0 at every preceding
-    committed decode position so its recurrent sidecar cache is authentic.
-    Deeper predictors are speculative and are required only at a requested
-    branch step. Canonical pack generation has no overrides and therefore
-    retains the complete requested depth at every step.
-    """
-
-    if not draft_token_overrides:
-        return max_draft_depth
-    tokens = draft_token_overrides.get(step)
-    return 1 if tokens is None else len(tokens) + 1
-
-
-def save_mtp_snapshot_atomic(path, payload: np.ndarray) -> None:
-    """Atomically publish one additive MTP reference tensor.
-
-    Production campaigns may be interrupted while the expensive CPU oracle is
-    running. A temporary file in the destination directory plus ``replace``
-    ensures a later campaign observes either the complete old tensor or the
-    complete new tensor, never a truncated ``.npy`` file.
-    """
-
-    destination = os.fspath(path)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            prefix=f".{os.path.basename(destination)}.",
-            suffix=".tmp",
-            dir=os.path.dirname(destination),
-            delete=False,
-        ) as output:
-            temporary = output.name
-            np.save(output, payload)
-        os.replace(temporary, destination)
-        temporary = None
-    finally:
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
 
 
 class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
@@ -682,6 +633,7 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
         max_draft_depth: int = 3,
         verbose: bool = False,
         draft_token_overrides: Optional[dict[int, list[int]]] = None,
+        reuse_canonical_main_trajectory: bool = False,
     ) -> int:
         """Generate recursive MTP0..MTPN checkpoints for the Qwen3.6 sidecar.
 
@@ -695,6 +647,14 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
         MTP2, and so on; MTP0 always consumes the main-model condition token.
         Alternate snapshots include the consumed branch in their filename so
         they can coexist with the canonical Hugging Face greedy branch.
+
+        ``reuse_canonical_main_trajectory`` explicitly authorizes canonical
+        MTP0..MTPN generation from an existing authenticated main-model pack.
+        The sidecar-only model context then consumes the immutable FP32 hidden
+        rows and committed token history in that pack.  Keeping this authority
+        explicit prevents an arbitrary directory from silently replacing a
+        complete-model reference run while allowing deeper predictor capacity
+        to be added without loading the complete 35B/122B model again.
         """
         if not getattr(self, "_mtp_sidecar_state", None):
             return 0
@@ -723,10 +683,15 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
         sidecar_layer = self._make_mtp_sidecar_layer()
         sidecar_cache = DynamicCache(config=sidecar_layer._llaminar_mtp_config)
         reference_pack = getattr(self, "_mtp_sidecar_reference_pack", None)
-        if reference_pack is not None and not draft_token_overrides:
+        if (
+            reference_pack is not None
+            and not draft_token_overrides
+            and not reuse_canonical_main_trajectory
+        ):
             raise RuntimeError(
                 "A sidecar-only context may generate additive branch snapshots "
-                "only; canonical pack generation requires the complete model"
+                "only unless reuse_canonical_main_trajectory explicitly "
+                "authorizes an authenticated canonical trajectory"
             )
 
         hnorm = self._mtp_tensor("hnorm.weight")

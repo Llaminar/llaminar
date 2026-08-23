@@ -3732,6 +3732,129 @@ Static depth-1 then depth-2 sequence passed ten consecutive same-process
 iterations (20 strict parity cells), covering the reused-model/setup boundary
 that originally exposed the race.
 
+## MTP transaction and parity-checkpoint lifecycle audit (2026-08-23)
+
+The production MTP lifecycle has three independent quantities. They must not
+be inferred from one another:
+
+1. **Graph capacity** is the largest verifier transaction retained by the
+   model instance. It is immutable capture identity.
+2. **Selected execution depth** is the depth chosen by the fixed or dynamic
+   device policy for one transaction. It identifies which MTP checkpoint banks
+   the transaction actually materializes.
+3. **Response commit budget** is the number of serial-visible tokens still
+   permitted by the request. The device commit controller clips publication to
+   this budget; it does not change the identity of an already selected graph.
+
+The complete captured transaction remains device-owned. A retained parent may
+invoke the same chained child graph repeatedly; the child's graph-stable
+snapshot slot is overwritten on each invocation and therefore holds the
+terminal chained checkpoint when the transaction completes.
+
+```mermaid
+flowchart TD
+    R[Prefix restore or fresh request] --> A[Device admission]
+    A --> P[Select execution depth D within graph capacity C]
+    A --> B[Publish remaining response budget B]
+    P --> X[Externally materialized transaction]
+    X --> M0[Primary sidecar publishes MTP0]
+    M0 --> CH{D greater than 1?}
+    CH -- no --> V[Grouped verifier]
+    CH -- yes --> MC[Replay chained sidecar D minus 1 times]
+    MC --> MT[Terminal chained bank publishes MTP D minus 1]
+    MT --> V
+    B --> V
+    V --> DC[Device commit controller clips serial-visible rows to B]
+    DC --> NEXT{Request complete?}
+    NEXT -- no --> RP[Retained parent or authenticated HIP ticket]
+    RP --> P
+    NEXT -- yes --> T[One terminal result crosses the host boundary]
+```
+
+The parity harness had incorrectly treated a response-limited span as the
+recursive checkpoint identity. At fixed depth three, for example, a two-token
+remaining response still executes the selected depth-three transaction and
+leaves the chained snapshot bank at `MTP2`; comparing that bank with the
+Hugging Face `MTP1` row was a test lifecycle error, not a model error.
+
+The corrected proof derives a bounded typed checkpoint plan solely from the
+actual execution depth:
+
+```mermaid
+stateDiagram-v2
+    [*] --> DeclaredMatrixCell: typed MTP policy
+    DeclaredMatrixCell --> ExecutionDepth: fixed D or device-selected D
+    ExecutionDepth --> PrimaryCheckpoint: reference depth 0
+    ExecutionDepth --> TerminalCheckpoint: reference depth D minus 1 when D is greater than 1
+    PrimaryCheckpoint --> CheckpointsProven
+    TerminalCheckpoint --> CheckpointsProven
+    ExecutionDepth --> SerialOracle: D plus 1 budget-one serial decodes
+    ExecutionDepth --> GroupedTransaction: one production grouped proof at D
+    SerialOracle --> ExactTokensProven
+    GroupedTransaction --> ExactTokensProven
+    CheckpointsProven --> CellComplete
+    ExactTokensProven --> CellComplete
+    CellComplete --> [*]
+```
+
+Each declared matrix cell now performs one grouped transaction at its declared
+depth. Depths 1, 2, 3, and 15 and dynamic depth remain independent production
+cells; the exact serial-token trajectory and the terminal checkpoint cover all
+intermediate recursion inside a deeper cell. This removes the former
+one-through-D grouped replay ladder, which duplicated coverage and made the
+depth-15 cell quadratic in setup/restore work. It does not alter production
+graph ownership, device authority, response clipping, or snapshot storage.
+
+The CSV evidence records all three meanings explicitly:
+`requested_draft_depth`, `response_limited_draft_depth`,
+`snapshot_execution_draft_depth`, and `last_transaction_draft_depth`. A fixed
+depth-15 CUDA LocalTP production cell completed in 54.2 seconds with all 16
+emitted tokens byte-identical to serial decode and its terminal `MTP14`
+checkpoint within the Hugging Face tolerance. The dynamic-depth sibling
+completed in 57.4 seconds; it began with snapshot execution depth 15 and
+reported a last transaction depth of 14 after the controller adapted, while
+retaining exact serial-token equivalence.
+
+### Restored-prefix bridge authority and retained capacity audit
+
+The restored-prefix bridge is one typed transaction with exactly one state
+authority selected by the execution device. It is not two loosely coupled
+prefix and MTP lifecycle flags. CPU keeps token, logical position, KV, and
+shifted-MTP advancement host-owned. CUDA and ROCm admit the token once, compose
+it with the canonical device KV count, and publish the resulting logical row by
+event before replaying the captured bridge. Both branches rejoin only after the
+same serial-decode mathematical transition has completed.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PrefixRestored
+    PrefixRestored --> BridgeAdmitted: RestoredPrefixMTPDecodeBridge request
+    state AuthorityChoice <<choice>>
+    BridgeAdmitted --> AuthorityChoice
+    AuthorityChoice --> CPUDecode: CPU host authority
+    AuthorityChoice --> GPUAdmission: CUDA or ROCm device authority
+    CPUDecode --> CPUShiftedAdvance: one row serial decode
+    CPUShiftedAdvance --> BridgeComplete: advance host shifted MTP cache
+    GPUAdmission --> DeviceLogicalMailbox: token plus canonical device KV position
+    DeviceLogicalMailbox --> CapturedBridge: event-ordered publication
+    CapturedBridge --> BridgeComplete: one complete captured transaction
+    BridgeComplete --> [*]
+```
+
+The backend choice happens once at the typed bridge boundary. In particular,
+CPU must not enter the GPU logical-mailbox transition, and GPU must not create
+a host shadow of its live KV position.
+
+Graph admission has an adjacent but independent invariant. The exact prefill
+bucket is a throughput/snapshot shape; it is not necessarily the largest row
+owner in the retained graph family. Memory planning now publishes one common
+capacity equal to the maximum of the selected prefill bucket and every enabled
+participant's MTP target-query capacity. The same value is priced and installed
+on CUDA, ROCm, and captured routed-expert participants. This prevents a small
+nine-token parity prompt from approving a nine-row hidden arena while the
+depth-15 family subsequently materializes sixteen-row terminal-hidden
+publication graphs.
+
 ## Performance certification baseline (2026-08-13)
 
 The registered Release targets exercise all 21 NativeVNNI source formats, both

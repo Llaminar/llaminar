@@ -119,6 +119,7 @@ namespace llaminar2
 
     IQ4_NLTensor::~IQ4_NLTensor()
     {
+        retireHostTransferLifetimeBeforeStorageDestruction();
         // TODO: Free device_blocks_ if allocated
         if (device_blocks_)
         {

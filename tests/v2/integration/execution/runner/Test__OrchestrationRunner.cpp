@@ -557,6 +557,30 @@ namespace
             << "Should not be an OrchestrationRunner for cross-rank named domain config";
     }
 
+    /**
+     * @brief Cross-rank PP is a property of the stage sequence, not one domain.
+     *
+     * Each stage may legitimately be rank-local. Distinct typed owners still
+     * require the global runner because the activation edge crosses MPI ranks.
+     */
+    TEST_F(Test__OrchestrationRunner, RankLocalStagesWithDistinctOwnersUseGlobalRunner)
+    {
+        OrchestrationConfig cfg;
+        cfg.domain_definitions.push_back(DomainDefinition::parse(
+            "head=0:cpu:0;scope=rank_local;owner=0"));
+        cfg.domain_definitions.push_back(DomainDefinition::parse(
+            "tail=1:cpu:0;scope=rank_local;owner=1"));
+        cfg.pp_stage_definitions.push_back(
+            PPStageDefinition::parse("0=head:0-13"));
+        cfg.pp_stage_definitions.push_back(
+            PPStageDefinition::parse("1=tail:14-27"));
+
+        ASSERT_TRUE(NamedDomainGlobalRunner::shouldUse(cfg));
+        auto runner = factory_->createFromOrchestrationConfig(cfg);
+        ASSERT_NE(runner, nullptr);
+        EXPECT_NE(dynamic_cast<NamedDomainGlobalRunner *>(runner.get()), nullptr);
+    }
+
     TEST_F(Test__OrchestrationRunner, SimpleSingleDeviceConfig_DoesNotCreateNamedDomainRunner)
     {
         // Simple single-device config must still go through OrchestrationRunner

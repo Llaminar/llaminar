@@ -116,6 +116,17 @@ namespace llaminar2
 
         const OverlayRankPlan &currentRankPlan() const { return current_rank; }
         const OverlayRankPlan *rankPlanFor(int world_rank) const;
+        /**
+         * @brief Return the complete ordered set of dense-continuation ranks.
+         *
+         * Prefix/KV state, logits, sampling, and public request admission live
+         * only on ranks that own a continuation graph.  Consumers use this
+         * set to construct domain-scoped control collectives without pulling
+         * expert-only transaction followers into a dense-state protocol.
+         *
+         * @return Unique ascending MPI world ranks owning continuation graphs.
+         */
+        [[nodiscard]] std::vector<int> continuationWorldRanks() const;
         bool ownsContinuationGraph() const
         {
             return current_rank.ownsContinuationGraph();

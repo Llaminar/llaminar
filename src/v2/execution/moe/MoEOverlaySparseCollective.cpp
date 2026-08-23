@@ -8,15 +8,20 @@
 
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
+#include "collective/CollectiveTimeoutPolicy.h"
 #include "interfaces/IMPIContext.h"
+#include "transfer/TransferEngine.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 #include <utility>
 
@@ -122,6 +127,8 @@ namespace llaminar2
         allocation_bytes_ = 0;
         backend_ = nullptr;
         backend_pinned_ = false;
+        publication_timeline_ = nullptr;
+        publication_region_.reset();
         source_device_ = DeviceId::cpu();
         layer_idx_ = -1;
         bucket_rows_ = 0;
@@ -210,6 +217,22 @@ namespace llaminar2
                     source_device.toString());
             }
             backend_pinned_ = true;
+
+            /*
+             * Keep readiness on its own mapped page. Payload DMA retains the
+             * established pinned allocation while a system-scope stream write
+             * gives the host an exact mid-graph observation edge.
+             * TransferEngine is the sole mapping and alias authority.
+             */
+            const std::array<DeviceId, 1> publication_devices{
+                source_device};
+            publication_region_ =
+                TransferEngine::instance().allocateMappedHostRegion(
+                    sizeof(std::uint64_t), publication_devices);
+            publication_timeline_ = static_cast<std::uint64_t *>(
+                publication_region_->mutableHostData());
+            std::atomic_ref<std::uint64_t>(*publication_timeline_).store(
+                0u, std::memory_order_release);
         }
         else
         {
@@ -268,7 +291,149 @@ namespace llaminar2
                header.workspace_generation == workspace_generation_ &&
                header.source_device_kind ==
                    static_cast<int32_t>(source_device_.type) &&
-               header.source_device_ordinal == source_device_.ordinal;
+               header.source_device_ordinal == source_device_.ordinal &&
+               (!source_device_.is_gpu() ||
+                hasCapturedPublicationContract());
+    }
+
+    bool MoEOverlayDispatchTicketStorage::hasCapturedPublicationContract()
+        const noexcept
+    {
+        return source_device_.is_gpu() && publication_region_ &&
+               publication_region_->isBound() && publication_timeline_ &&
+               publication_region_->hasDevice(source_device_) &&
+               publication_region_->contains(0u, sizeof(std::uint64_t)) &&
+               (reinterpret_cast<std::uintptr_t>(publication_timeline_) &
+                (alignof(std::uint64_t) - 1u)) == 0u;
+    }
+
+    bool MoEOverlayDispatchTicketStorage::armCapturedPublication(
+        std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+        if (!source_device_.is_gpu())
+            return true;
+        if (!hasCapturedPublicationContract())
+        {
+            if (error)
+            {
+                *error =
+                    "captured ticket has no complete mapped publication contract";
+            }
+            return false;
+        }
+
+        /*
+         * Each layer owns a distinct ticket and segmented transactions are
+         * serial for that graph identity. Resetting before launch cannot race a
+         * previous replay; the preceding CPU consumer already acquired it.
+         */
+        std::atomic_ref<std::uint64_t>(*publication_timeline_).store(
+            0u, std::memory_order_release);
+        return true;
+    }
+
+    bool MoEOverlayDispatchTicketStorage::enqueueCapturedPublication(
+        void *stream,
+        std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+        if (!source_device_.is_gpu())
+            return true;
+        if (!stream || !hasCapturedPublicationContract())
+        {
+            if (error)
+            {
+                *error =
+                    "captured ticket publication requires its exact non-null stream and mapped contract";
+            }
+            return false;
+        }
+
+        try
+        {
+            constexpr std::uint64_t kPublished = 1u;
+            TransferEngine::instance().enqueueMappedTimelinePublish64(
+                *publication_region_,
+                /*signal_offset=*/0u,
+                kPublished,
+                source_device_,
+                stream);
+            return true;
+        }
+        catch (const std::exception &exception)
+        {
+            if (error)
+                *error = exception.what();
+            return false;
+        }
+        catch (...)
+        {
+            if (error)
+            {
+                *error =
+                    "captured ticket publication threw a non-standard exception";
+            }
+            return false;
+        }
+    }
+
+    bool MoEOverlayDispatchTicketStorage::awaitCapturedPublication(
+        std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+        if (!source_device_.is_gpu())
+            return true;
+        if (!hasCapturedPublicationContract())
+        {
+            if (error)
+            {
+                *error =
+                    "captured ticket wait has no complete mapped publication contract";
+            }
+            return false;
+        }
+
+        constexpr std::uint64_t kPublished = 1u;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(
+                                  collective_timeout_policy::
+                                      kDefaultCollectiveTimeoutMs);
+        std::uint64_t polls = 0u;
+        for (;;)
+        {
+            const std::uint64_t observed =
+                std::atomic_ref<std::uint64_t>(*publication_timeline_).load(
+                    std::memory_order_acquire);
+            if (observed == kPublished)
+                return true;
+            if (observed > kPublished)
+            {
+                if (error)
+                {
+                    *error =
+                        "captured ticket publication timeline exceeded its fixed replay value";
+                }
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                if (error)
+                {
+                    *error =
+                        "captured ticket publication exceeded the canonical 30-second protocol deadline";
+                }
+                return false;
+            }
+
+            /* Keep sub-millisecond handoff latency without monopolizing the
+             * controller core if a peer or device stalls pathologically. */
+            if ((++polls & 1023u) == 0u)
+                std::this_thread::yield();
+        }
     }
 
     namespace

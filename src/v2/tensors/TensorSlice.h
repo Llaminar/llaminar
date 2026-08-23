@@ -191,7 +191,10 @@ namespace llaminar2
             }
         }
 
-        ~TensorSlice() override = default;
+        ~TensorSlice() override
+        {
+            retireHostTransferLifetimeBeforeStorageDestruction();
+        }
 
         // =======================================================================
         // Slice Metadata Access
@@ -627,10 +630,31 @@ namespace llaminar2
         /**
          * @brief Release raw data from inner tensor after GEMM packing
          *
-         * Forwards to inner tensor's release_raw_data() to free the original
-         * quantized weight data after the GEMM kernel has repacked it.
+         * A slice does not own the registration state associated with its
+         * bytes. Route even the legacy raw-release entry point through the
+         * inner tensor's complete host-release transition so no caller can
+         * free registered storage through the wrapper.
          */
-        void release_raw_data() override { inner()->release_raw_data(); }
+        void release_raw_data() override
+        {
+            inner()->release_host_weight_data();
+        }
+
+        /**
+         * @brief Retire and release host storage through its real inner owner.
+         *
+         * TensorSlice delegates transfers to the inner tensor, so the inner
+         * object owns both the runtime registration and the backing vector.
+         * Running TensorBase's default implementation on this wrapper would
+         * unpin an empty wrapper state and then free the still-registered
+         * inner allocation through release_raw_data(). Delegate the complete
+         * typed lifecycle transition instead.
+         */
+        void release_host_weight_data() override
+        {
+            inner()->release_host_weight_data();
+        }
+
         bool is_raw_data_released() const override { return inner()->is_raw_data_released(); }
 
     private:

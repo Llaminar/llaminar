@@ -406,6 +406,11 @@ TEST(Test__MTPSpecStateContract, BuildsAcceptAllPlanWithBonusReadyRow)
     EXPECT_EQ(step.bonus_ready_token_row, 3);
     EXPECT_EQ(step.bonus_ready_token_index, 3);
     EXPECT_EQ(step.bonus_ready_state_slot_index, 3);
+    ASSERT_TRUE(step.verifier_input_identity.has_value());
+    EXPECT_EQ(step.verifier_input_identity->draft_depth, 2);
+    EXPECT_THAT(
+        step.verifier_input_identity->verifier_input_tokens,
+        ElementsAre(7, 9, 8));
 }
 
 TEST(Test__MTPSpecStateContract, CommonAcceptedPrefixLeavesMatchingParticipantsDirect)
@@ -1057,6 +1062,11 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsGreedyCatchupPlan)
     EXPECT_EQ(step.accepted_state_slot_index, 1);
     EXPECT_EQ(step.correction_replay_start_index, 2);
     EXPECT_EQ(step.correction_replay_count, 1);
+    ASSERT_TRUE(step.verifier_input_identity.has_value());
+    EXPECT_EQ(step.verifier_input_identity->draft_depth, 2);
+    EXPECT_THAT(
+        step.verifier_input_identity->verifier_input_tokens,
+        ElementsAre(7, 9, 8));
 }
 
 TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedGreedyCatchupPlan)
@@ -1098,6 +1108,10 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedGreedyCatchupPlan
     EXPECT_EQ(first.accepted_state_slot_index, 2);
     EXPECT_EQ(first.bonus_ready_state_slot_index, 3);
     EXPECT_FALSE(first.requiresCorrectionReplay());
+    ASSERT_TRUE(first.verifier_input_identity.has_value());
+    EXPECT_THAT(
+        first.verifier_input_identity->verifier_input_tokens,
+        ElementsAre(7, 9, 8));
 
     const MTPSpecStepPlan &second = plan.step_plans.steps[1];
     EXPECT_EQ(second.request_id, 11);
@@ -1107,6 +1121,10 @@ TEST(Test__MTPSpecStateContract, TransactionDriverBuildsBatchedGreedyCatchupPlan
     EXPECT_EQ(second.correction_replay_start_index, 1);
     EXPECT_EQ(second.correction_replay_count, 1);
     EXPECT_TRUE(second.requiresCorrectionReplay());
+    ASSERT_TRUE(second.verifier_input_identity.has_value());
+    EXPECT_THAT(
+        second.verifier_input_identity->verifier_input_tokens,
+        ElementsAre(11, 12, 13));
 }
 
 TEST(Test__MTPSpecStateContract, TransactionDriverBuildsGreedyGroupedOutcomePublicationPlan)

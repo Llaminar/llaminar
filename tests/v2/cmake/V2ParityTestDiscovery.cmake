@@ -93,24 +93,9 @@ if(_test_count EQUAL 0)
     return()
 endif()
 
-# --- Build the mpirun command prefix ----------------------------------------
+# --- Establish the default MPI world ----------------------------------------
 if(NOT MPI_PROCS)
     set(MPI_PROCS 1)
-endif()
-
-set(_mpi_cmd
-    "mpirun"
-    "-np" "${MPI_PROCS}"
-    "--bind-to" "socket"
-    "--map-by" "socket"
-    "--mca" "mpi_leave_pinned" "1"
-    "--mca" "btl_vader_single_copy_mechanism" "none"
-    "--mca" "orte_allowed_exit_without_sync" "1"
-)
-
-# Add --oversubscribe if we have fewer sockets than MPI ranks
-if(NUM_SOCKETS AND MPI_PROCS GREATER NUM_SOCKETS)
-    list(APPEND _mpi_cmd "--oversubscribe")
 endif()
 
 # --- Build environment variables list ----------------------------------------
@@ -119,7 +104,13 @@ if(NOT CORES_PER_SOCKET OR CORES_PER_SOCKET EQUAL "" OR CORES_PER_SOCKET EQUAL 0
 endif()
 
 if(NOT PRODUCTION_PERF_STATS_FILTER)
-    set(PRODUCTION_PERF_STATS_FILTER "forward_graph")
+    # The standard campaign owns graph, MTP, prefix, and ExpertOverlay path
+    # evidence even when a particular typed cell disables one of those axes.
+    # Enabling the producers is not policy selection: the generated C++ case
+    # remains the sole runtime authority, while zero counters are meaningful
+    # evidence for Static/no-MTP cells.
+    set(PRODUCTION_PERF_STATS_FILTER
+        "forward_graph,mtp,prefix_cache,moe_rebalance,moe_overlay_residency,moe_placement")
 endif()
 
 # Normalize the binary-owned model manifest once. Production campaigns expose
@@ -306,7 +297,25 @@ foreach(_full_name IN LISTS _all_tests)
     string(REPLACE "/" "_" _sanitized "${_sanitized}")
     set(_ctest_name "${TEST_PREFIX}_${_sanitized}")
 
-    set(_test_mpi_cmd ${_mpi_cmd})
+    # Focused topology tests may require a different MPI world from the
+    # target-level default. Keep that requirement explicit in the GTest name,
+    # using the same `<N>xMPI` taxonomy as process-resident campaigns, so CTest
+    # cannot silently launch a multi-rank topology with one rank.
+    set(_focused_mpi_procs "${MPI_PROCS}")
+    if("${_full_name}" MATCHES "([0-9]+)xMPI")
+        set(_focused_mpi_procs "${CMAKE_MATCH_1}")
+    endif()
+    set(_test_mpi_cmd
+        "mpirun"
+        "-np" "${_focused_mpi_procs}"
+        "--bind-to" "socket"
+        "--map-by" "socket"
+        "--mca" "mpi_leave_pinned" "1"
+        "--mca" "btl_vader_single_copy_mechanism" "none"
+        "--mca" "orte_allowed_exit_without_sync" "1")
+    if(NUM_SOCKETS AND _focused_mpi_procs GREATER NUM_SOCKETS)
+        list(APPEND _test_mpi_cmd "--oversubscribe")
+    endif()
     foreach(_export IN LISTS _graph_native_capture_env)
         # mpirun must explicitly forward graph admission settings to every
         # participant; CTest ENVIRONMENT alone is not reliable for OpenMPI.
@@ -414,7 +423,19 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     if(_campaign_variant)
         string(APPEND _campaign_test_prefix "_${_campaign_variant}")
     endif()
-    if(_campaign_mpi_procs EQUAL MPI_PROCS)
+    if(_campaign_policy_slice STREQUAL "LLEP")
+        # LLEP remains an explicit, process-amortized production-path proof,
+        # but the implementation is unfinished and therefore must not
+        # advertise itself to the aggregate correctness/economy campaign.
+        # Its identity and labels make opt-in execution unambiguous.
+        if(_campaign_mpi_procs EQUAL MPI_PROCS)
+            set(_ctest_name
+                "${_campaign_test_prefix}_FocusedPolicySlice_${_backend_signature}_ALL_PRECISIONS")
+        else()
+            set(_ctest_name
+                "${_campaign_test_prefix}_FocusedPolicySlice_${_backend_signature}_MPI_${_campaign_mpi_procs}_ALL_PRECISIONS")
+        endif()
+    elseif(_campaign_mpi_procs EQUAL MPI_PROCS)
         set(_ctest_name
             "${_campaign_test_prefix}_ProductionCampaign_${_backend_signature}_ALL_PRECISIONS")
     else()
@@ -498,10 +519,17 @@ foreach(_campaign_key IN LISTS _production_campaign_keys)
     list(APPEND _campaign_labels
         "ProductionPath"
         "FullModel"
-        "Campaign"
         "AllPrecisions"
-        "WholeMatrixOneHourTarget"
         "MPI${_campaign_mpi_procs}")
+    if(_campaign_policy_slice STREQUAL "LLEP")
+        list(APPEND _campaign_labels
+            "Focused"
+            "UnfinishedPolicy")
+    else()
+        list(APPEND _campaign_labels
+            "Campaign"
+            "WholeMatrixOneHourTarget")
+    endif()
     if(_campaign_variant)
         list(APPEND _campaign_labels "FreshMPIWorld")
     endif()

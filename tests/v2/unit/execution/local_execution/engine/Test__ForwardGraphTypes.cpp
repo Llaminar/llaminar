@@ -43,7 +43,6 @@ namespace
                          bool segment_boundary_before = false,
                          bool segment_boundary_after = false,
                          const uint64_t *variant_signature = nullptr,
-                         bool host_ticket_fence = false,
                          bool passive_capture_noop = false)
             : IComputeStage(device),
               capturable_(capturable),
@@ -53,7 +52,6 @@ namespace
               segment_boundary_before_(segment_boundary_before),
               segment_boundary_after_(segment_boundary_after),
               variant_signature_(variant_signature),
-              host_ticket_fence_(host_ticket_fence),
               passive_capture_noop_(passive_capture_noop)
         {
         }
@@ -86,10 +84,6 @@ namespace
         bool requiresGraphCaptureSegmentBoundaryBefore() const override { return segment_boundary_before_; }
         bool requiresGraphCaptureSegmentBoundaryAfter() const override { return segment_boundary_after_; }
         bool isManualGraphBoundary() const override { return manual_boundary_; }
-        bool requiresHostGraphTicketFence() const override
-        {
-            return host_ticket_fence_;
-        }
         StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
         int execute_calls_ = 0;
@@ -102,7 +96,6 @@ namespace
         bool segment_boundary_before_ = false;
         bool segment_boundary_after_ = false;
         const uint64_t *variant_signature_ = nullptr;
-        bool host_ticket_fence_ = false;
         bool passive_capture_noop_ = false;
     };
 
@@ -659,7 +652,6 @@ namespace
                              bool segment_boundary_after = false,
                              const uint64_t *variant_signature = nullptr,
                              DeviceId device = DeviceId::cpu(),
-                             bool host_ticket_fence = false,
                              bool passive_capture_noop = false)
     {
         graph.addNode(
@@ -673,7 +665,6 @@ namespace
                 segment_boundary_before,
                 segment_boundary_after,
                 variant_signature,
-                host_ticket_fence,
                 passive_capture_noop),
             device);
     }
@@ -927,6 +918,47 @@ TEST(Test__ForwardGraphSignature,
         ForwardGraphSignatureHash{}(rebound));
 }
 
+TEST(Test__ForwardGraphSignature,
+     RestoredPrefixStateTransactionHasDedicatedGraphIdentity)
+{
+    ForwardGraphSignature ordinary{
+        .seq_len = 1,
+        .batch_size = 1,
+        .device = DeviceId::cuda(0),
+        .execution_role = ForwardExecutionRole::MainInference,
+        .state_transaction = ForwardStateTransaction::Ordinary,
+        .decode = true,
+        .decode_has_history = true};
+    ForwardGraphSignature bridge = ordinary;
+    bridge.state_transaction =
+        ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;
+
+    EXPECT_NE(ordinary, bridge);
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(ordinary),
+        ForwardGraphSignatureHash{}(bridge));
+}
+
+TEST(Test__ForwardGraphSignature,
+     MTPMainTerminalHiddenBindingIdentityPreventsStaleGraphReuse)
+{
+    ForwardGraphSignature first{
+        .seq_len = 1,
+        .batch_size = 1,
+        .device = DeviceId::cuda(0),
+        .execution_role = ForwardExecutionRole::MTPCondition,
+        .decode = true,
+        .uses_device_token_ids = true,
+        .mtp_main_terminal_hidden_capture_identity = UINT64_C(0x1234)};
+    ForwardGraphSignature rebound = first;
+    rebound.mtp_main_terminal_hidden_capture_identity = UINT64_C(0x5678);
+
+    EXPECT_NE(first, rebound);
+    EXPECT_NE(
+        ForwardGraphSignatureHash{}(first),
+        ForwardGraphSignatureHash{}(rebound));
+}
+
 /**
  * @brief Completion provenance distinguishes integrated shifted prefill by type.
  *
@@ -947,6 +979,18 @@ TEST(Test__ForwardGraphTypes,
     EXPECT_EQ(
         forwardCompletionScopeForInput(integrated),
         ForwardCompletionScope::GraphIntegratedShiftedMTPPrefill);
+
+    ForwardInput decode_publication;
+    decode_publication.mtp_main_terminal_hidden.emplace();
+    EXPECT_EQ(
+        forwardCompletionScopeForInput(decode_publication),
+        ForwardCompletionScope::GraphIntegratedMTPTerminalHidden);
+
+    decode_publication.shifted_mtp_prefill.emplace();
+    EXPECT_EQ(
+        forwardCompletionScopeForInput(decode_publication),
+        ForwardCompletionScope::GraphIntegratedShiftedMTPPrefill)
+        << "Shifted prefill is the complete superset transaction.";
 }
 
 /**
@@ -1219,7 +1263,7 @@ TEST(Test__ForwardExecutionPhasePolicy, MainInferenceRetainsExplicitBoundaries)
     EXPECT_EQ(
         resolveForwardExecutionPhase({
             .role = ForwardExecutionRole::MainInference,
-            .force_decode = true,
+            .invocation = ForwardInvocationKind::ExplicitDecode,
             .seq_len = 1024,
             .batch_size = 1,
             .decode_max_seq_len = 4,
@@ -1229,13 +1273,25 @@ TEST(Test__ForwardExecutionPhasePolicy, MainInferenceRetainsExplicitBoundaries)
     EXPECT_EQ(
         resolveForwardExecutionPhase({
             .role = ForwardExecutionRole::MainInference,
-            .force_prefill = true,
+            .invocation = ForwardInvocationKind::ExplicitPrefill,
             .seq_len = 1,
             .batch_size = 1,
             .decode_max_seq_len = 4,
             .logical_position = 128,
         }),
         ForwardExecutionPhase::Prefill);
+    EXPECT_EQ(
+        resolveForwardExecutionPhase({
+            .role = ForwardExecutionRole::MainInference,
+            .invocation =
+                ForwardInvocationKind::RestoredPrefixMTPDecodeBridge,
+            .seq_len = 1,
+            .batch_size = 1,
+            .decode_max_seq_len = 4,
+            .logical_position = 128,
+        }),
+        ForwardExecutionPhase::Decode)
+        << "A restored-prefix MTP bridge must use serial-decode math.";
 }
 
 // =========================================================================
@@ -1370,13 +1426,11 @@ TEST(Test__ForwardGraphCache, DecodeReplayOutputProducerIgnoresGenericAppliedStr
     cache.applied_stream = &applied_stream;
     cache.gpu_stream = &worker_stream;
 
-    EXPECT_EQ(cache.outputProducerStream(
-                  /*is_decode=*/true,
-                  /*used_graph_replay=*/true),
+    EXPECT_EQ(cache.decodeOutputProducerStream(
+                  ForwardGraphCache::DecodeLaunchPath::CapturedReplay),
               &replay_stream);
-    EXPECT_EQ(cache.outputProducerStream(
-                  /*is_decode=*/true,
-                  /*used_graph_replay=*/false),
+    EXPECT_EQ(cache.decodeOutputProducerStream(
+                  ForwardGraphCache::DecodeLaunchPath::Direct),
               &applied_stream);
 
     // The sentinel is not an owned GPU stream; do not present it to the
@@ -2144,6 +2198,12 @@ TEST(Test__GraphSegmentCache,
     DeviceGraphExecutor executor;
     BufferArena arena;
     executor.setArena(&arena);
+    size_t snapshot_callback_calls = 0u;
+    executor.setSnapshotCallback(
+        [&](const std::string &, const StageDumpInfo &)
+        {
+            ++snapshot_callback_calls;
+        });
     DeviceGraphExecutor::GraphSegmentCache cache;
     cache.perf_context = "retained_parent_setup_materialization_unit";
     FakeReplayGPUContext gpu_ctx(
@@ -2210,6 +2270,10 @@ TEST(Test__GraphSegmentCache,
     EXPECT_EQ(parent->instantiate_calls_, 1);
     EXPECT_EQ(parent->launch_calls_, 0)
         << "Setup must not consume a follower transaction.";
+    EXPECT_EQ(snapshot_callback_calls, 0u)
+        << "Setup may seal diagnostic D2D nodes but must not publish values.";
+    EXPECT_EQ(cache.snapshot_manifest.outputless_stages.size(), 3u)
+        << "The setup executable must retain the final snapshot topology.";
     EXPECT_TRUE(cache.initialized);
     EXPECT_FALSE(cache.needs_capture);
     EXPECT_EQ(cache.decode_step, 0u);
@@ -2551,7 +2615,6 @@ TEST(Test__GraphSegmentCache,
         /*segment_boundary_after=*/false,
         /*variant_signature=*/nullptr,
         DeviceId::cuda(0),
-        /*host_ticket_fence=*/false,
         /*passive_capture_noop=*/true);
     graph.setGraphCaptureWaveContract(
         "nonroot_ordered_reduce_noop",
@@ -3761,8 +3824,22 @@ TEST(Test__GraphSegmentCache,
     graph.setGraphCaptureWaveContract(
         "mapped_return",
         GraphCaptureWaveContract{.identity = "mapped_return_wave"});
+    graph.setHeterogeneousTicketUnitContract(
+        "mapped_return",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_unit_before_cpu",
+        });
+    graph.setTerminalNode("ticket_consume");
+    graph.setHeterogeneousTicketUnitContract(
+        "ticket_consume",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
     graph.setNativeCaptureEnvelope(
-        GraphNativeCaptureEnvelope::HeterogeneousTicketTransaction);
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
 
     DeviceGraphExecutor::DecodeCapturePolicy policy;
     policy.allow_cached_graph_replay = true;
@@ -3793,8 +3870,10 @@ TEST(Test__GraphSegmentCache,
         cache.segments[0].stage_names,
         std::vector<std::string>(
             {"ticket_publish", "mapped_dispatch", "mapped_return"}))
-        << "A graph-owned ticket envelope must not reactivate legacy wave "
-           "annotations inside its captured producer transaction.";
+        << "Mapped fork, wait, and join must remain one multi-stream native unit.";
+    EXPECT_EQ(
+        cache.segments[0].capture_wave_identity,
+        "ticket_unit_before_cpu");
     EXPECT_FALSE(cache.segments[1].capturable);
     EXPECT_TRUE(cache.segments[2].capturable);
     EXPECT_DOUBLE_EQ(
@@ -3803,7 +3882,119 @@ TEST(Test__GraphSegmentCache,
             "heterogeneous_ticket_transactions",
             {{"capturable_segments", "2"},
              {"manual_segments", "1"},
-             {"ticket_boundaries", "1"}}),
+             {"ticket_publication_authority",
+              "stage_owned_mapped_timeline"},
+             {"unit_boundaries", "1"},
+             {"terminal_units", "1"},
+             {"role", "authority"}}),
+        1.0);
+}
+
+/**
+ * @brief A LocalTP sibling follows every ticket wave without host work.
+ *
+ * The authority owns mapped packet and CPU-ticket work. Its sibling retains
+ * only common device stages and closes the corresponding captured unit at its
+ * local-expert terminal. Fine-grained packet wave annotations remain dormant
+ * because splitting a multi-stream fork/join across native graphs is invalid.
+ */
+TEST(Test__GraphSegmentCache,
+     HeterogeneousTicketFollowerUsesMatchingCapturedUnits)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    addFakeSegmentStage(
+        graph, "routing", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(1));
+    addFakeSegmentStage(
+        graph, "local_experts", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(1));
+    addFakeSegmentStage(
+        graph, "ordered_reduce", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(1));
+    addFakeSegmentStage(
+        graph, "publication", true, false, ComputeStageType::COPY,
+        false, false, false, nullptr, DeviceId::cuda(1));
+    graph.addDependency("local_experts", "routing");
+    graph.addDependency("ordered_reduce", "local_experts");
+    graph.addDependency("publication", "ordered_reduce");
+    graph.setGraphCaptureWaveContract(
+        "routing",
+        GraphCaptureWaveContract{
+            .identity = "ticket",
+            .passive_following_identities = {"mapped_dispatch"},
+        });
+    graph.setGraphCaptureWaveContract(
+        "local_experts",
+        GraphCaptureWaveContract{.identity = "outbound"});
+    graph.setGraphCaptureWaveContract(
+        "ordered_reduce",
+        GraphCaptureWaveContract{
+            .identity = "ordered_reduce",
+            .passive_following_identities = {"mapped_return"},
+        });
+    graph.setGraphCaptureWaveContract(
+        "publication",
+        GraphCaptureWaveContract{.identity = "inbound"});
+    graph.setHeterogeneousTicketUnitContract(
+        "local_experts",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_unit_before_cpu",
+        });
+    graph.setTerminalNode("publication");
+    graph.setHeterogeneousTicketUnitContract(
+        "publication",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
+    graph.setNativeCaptureEnvelope(
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketFollowerTransaction);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildCapturePlan(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        DeviceGraphExecutor::GraphReplayPlanPolicy::
+            AllowHeterogeneousBoundarySegmentation);
+
+    ASSERT_EQ(cache.segments.size(), 2u);
+    EXPECT_TRUE(std::all_of(
+        cache.segments.begin(),
+        cache.segments.end(),
+        [](const DeviceGraphExecutor::GraphSegment &segment)
+        {
+            return segment.capturable;
+        }));
+    EXPECT_EQ(
+        cache.segments[0].capture_wave_identity,
+        "ticket_unit_before_cpu");
+    EXPECT_TRUE(cache.segments[0].passive_capture_waves_after.empty());
+    EXPECT_TRUE(cache.segments[1].passive_capture_waves_after.empty());
+    EXPECT_EQ(
+        cache.segments[0].stage_names,
+        std::vector<std::string>({"routing", "local_experts"}));
+    EXPECT_EQ(
+        cache.segments[1].stage_names,
+        std::vector<std::string>({"ordered_reduce", "publication"}));
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            PerfStatsCollector::snapshot({"forward_graph"}),
+            "heterogeneous_ticket_transactions",
+            {{"capturable_segments", "2"},
+             {"manual_segments", "0"},
+             {"ticket_publication_authority",
+              "stage_owned_mapped_timeline"},
+             {"unit_boundaries", "1"},
+             {"terminal_units", "1"},
+             {"role", "follower"}}),
         1.0);
 }
 
@@ -3833,8 +4024,22 @@ TEST(Test__GraphSegmentCache,
         false, false, false, nullptr, DeviceId::cuda(0));
     graph.addDependency("cpu_ticket_transaction", "ticket_publish");
     graph.addDependency("ticket_consume", "cpu_ticket_transaction");
+    graph.setHeterogeneousTicketUnitContract(
+        "ticket_publish",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_unit_before_cpu",
+        });
+    graph.setTerminalNode("ticket_consume");
+    graph.setHeterogeneousTicketUnitContract(
+        "ticket_consume",
+        GraphHeterogeneousTicketUnitContract{
+            .identity = "ticket_transaction_terminal",
+            .disposition = GraphHeterogeneousTicketUnitDisposition::
+                TransactionTerminal,
+        });
     graph.setNativeCaptureEnvelope(
-        GraphNativeCaptureEnvelope::HeterogeneousTicketTransaction);
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
 
     DeviceGraphExecutor executor;
     BufferArena arena;
@@ -3917,7 +4122,8 @@ TEST(Test__GraphSegmentCache,
     graph.addDependency("manual", "before");
     graph.addDependency("after", "manual");
     graph.setNativeCaptureEnvelope(
-        GraphNativeCaptureEnvelope::HeterogeneousTicketTransaction);
+        GraphNativeCaptureEnvelope::
+            HeterogeneousTicketAuthorityTransaction);
 
     DeviceGraphExecutor::GraphSegmentCache cache;
     EXPECT_THROW(
@@ -3944,72 +4150,11 @@ TEST(Test__GraphSegmentCache,
     std::string error;
     EXPECT_FALSE(
         DeviceGraphCaptureController::constrainReplayPolicyToNativeEnvelope(
-            GraphNativeCaptureEnvelope::HeterogeneousTicketTransaction,
+            GraphNativeCaptureEnvelope::
+                HeterogeneousTicketAuthorityTransaction,
             policy,
             &error));
     EXPECT_NE(error.find("topology-admitted"), std::string::npos);
-}
-
-TEST(Test__GraphSegmentCache, HostTicketFenceRequiresExplicitManualBoundary)
-{
-    ComputeGraph graph;
-    addFakeSegmentStage(graph, "before", true);
-    addFakeSegmentStage(
-        graph,
-        "invalid_ticket_consumer",
-        false,
-        false,
-        ComputeStageType::COPY,
-        false,
-        false,
-        false,
-        nullptr,
-        DeviceId::cpu(),
-        true);
-    graph.addDependency("invalid_ticket_consumer", "before");
-
-    DeviceGraphExecutor::GraphSegmentCache cache;
-    EXPECT_THROW(
-        DeviceGraphCaptureController::buildCapturePlan(
-            graph,
-            cache,
-            nullptr,
-            /*has_collective_nodes=*/false,
-            /*collectives_graph_capturable=*/false,
-            DeviceGraphExecutor::GraphReplayPlanPolicy::
-                AllowHeterogeneousBoundarySegmentation),
-        std::logic_error);
-}
-
-TEST(Test__GraphSegmentCache, HostTicketFenceRequiresCapturedProducerSegment)
-{
-    ComputeGraph graph;
-    addFakeSegmentStage(
-        graph,
-        "orphan_ticket_consumer",
-        false,
-        true,
-        ComputeStageType::COPY,
-        false,
-        false,
-        false,
-        nullptr,
-        DeviceId::cpu(),
-        true);
-    addFakeSegmentStage(graph, "after", true);
-    graph.addDependency("after", "orphan_ticket_consumer");
-
-    DeviceGraphExecutor::GraphSegmentCache cache;
-    EXPECT_THROW(
-        DeviceGraphCaptureController::buildCapturePlan(
-            graph,
-            cache,
-            nullptr,
-            /*has_collective_nodes=*/false,
-            /*collectives_graph_capturable=*/false,
-            DeviceGraphExecutor::GraphReplayPlanPolicy::
-                AllowHeterogeneousBoundarySegmentation),
-        std::runtime_error);
 }
 
 TEST(Test__GraphSegmentCache, NonCollectiveManualBoundaryIsFatal)

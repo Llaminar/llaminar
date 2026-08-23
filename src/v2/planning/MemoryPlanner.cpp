@@ -313,13 +313,33 @@ MemoryPlan MemoryPlanner::plan(
         if (max_seq > 0)
             activation_seq = std::min(activation_seq, max_seq);
         activation_seq = std::max(1, activation_seq);
-        int local_kv_heads = cfg.local_kv_heads > 0 ? cfg.local_kv_heads : profile.n_kv_heads;
+        if (cfg.tensor_parallel_assignment.has_value())
+        {
+            const auto &assignment = *cfg.tensor_parallel_assignment;
+            if (cfg.total_shards <= 1 ||
+                assignment.local_rank != cfg.shard_index ||
+                assignment.device != cfg.device ||
+                !assignment.isValid() ||
+                assignment.kv_head_count <= 0 ||
+                assignment.d_ff_count <= 0 ||
+                assignment.vocab_count <= 0)
+            {
+                throw std::invalid_argument(
+                    "Device memory plan contains a stale or mismatched tensor-parallel assignment");
+            }
+        }
+        int local_kv_heads = cfg.tensor_parallel_assignment.has_value()
+            ? cfg.tensor_parallel_assignment->kv_head_count
+            : (cfg.local_kv_heads > 0
+                   ? cfg.local_kv_heads
+                   : profile.n_kv_heads);
 
         dev_plan.max_seq_len = max_seq;
         dev_plan.activation_seq_len = activation_seq;
 
         // If TP sharded, divide KV heads
-        if (cfg.total_shards > 1 && cfg.local_kv_heads <= 0)
+        if (cfg.total_shards > 1 && cfg.local_kv_heads <= 0 &&
+            !cfg.tensor_parallel_assignment.has_value())
         {
             local_kv_heads = std::max(1, profile.n_kv_heads / cfg.total_shards);
         }
@@ -493,6 +513,12 @@ MemoryPlan MemoryPlanner::plan(
                     cfg.batch_size,
                     max_seq,
                     local_kv_heads,
+                    cfg.tensor_parallel_assignment.has_value()
+                        ? cfg.tensor_parallel_assignment->head_count
+                        : std::max(
+                              1,
+                              profile.n_heads /
+                                  std::max(1, cfg.total_shards)),
                     cfg.total_shards,
                     cfg.first_layer,
                     last_layer,
@@ -517,13 +543,19 @@ MemoryPlan MemoryPlanner::plan(
         }
 
         // Activation estimation
-        int local_n_heads = profile.n_heads;
-        if (cfg.total_shards > 1)
+        int local_n_heads = cfg.tensor_parallel_assignment.has_value()
+            ? cfg.tensor_parallel_assignment->head_count
+            : profile.n_heads;
+        if (cfg.total_shards > 1 &&
+            !cfg.tensor_parallel_assignment.has_value())
         {
             local_n_heads = std::max(1, profile.n_heads / cfg.total_shards);
         }
-        int local_d_ff = profile.d_ff;
-        if (cfg.total_shards > 1)
+        int local_d_ff = cfg.tensor_parallel_assignment.has_value()
+            ? cfg.tensor_parallel_assignment->d_ff_count
+            : profile.d_ff;
+        if (cfg.total_shards > 1 &&
+            !cfg.tensor_parallel_assignment.has_value())
         {
             local_d_ff = std::max(1, profile.d_ff / cfg.total_shards);
         }
@@ -538,6 +570,9 @@ MemoryPlan MemoryPlanner::plan(
                     .local_d_ff = local_d_ff,
                     .local_n_heads = local_n_heads,
                     .local_n_kv_heads = local_kv_heads,
+                    .local_vocab = cfg.tensor_parallel_assignment.has_value()
+                        ? cfg.tensor_parallel_assignment->vocab_count
+                        : 0,
                     .first_layer = cfg.first_layer,
                     .last_layer = last_layer,
                     .total_shards = cfg.total_shards,
@@ -579,6 +614,7 @@ MemoryPlan MemoryPlanner::plan(
                     .resident_graph_rows = activation_seq,
                     .max_context_rows = max_seq,
                     .local_d_ff = local_d_ff,
+                    .local_query_heads = local_n_heads,
                     .first_layer = cfg.first_layer,
                     .last_layer = last_layer,
                     .total_shards = cfg.total_shards,
@@ -612,6 +648,7 @@ MemoryPlan MemoryPlanner::plan(
                         .resident_graph_rows = participant_graph_rows,
                         .max_context_rows = max_seq,
                         .local_d_ff = local_d_ff,
+                        .local_query_heads = local_n_heads,
                         .first_layer = cfg.first_layer,
                         .last_layer = last_layer,
                         .total_shards = cfg.total_shards,
@@ -703,15 +740,35 @@ ResidentGraphMemoryPlan MemoryPlanner::planLargestFittingResidentGraphRows(
      */
     for (const int candidate : candidates)
     {
+        /*
+         * A configured prefill bucket is only one member of the retained graph
+         * family. MTP verification may own a wider flattened row shape even
+         * when the authenticated prompt deliberately uses a tiny exact bucket.
+         * Publish and price one common capacity that covers both shapes on
+         * every participant; otherwise preflight can approve (for example)
+         * nine hidden rows and setup later tries to materialize the retained
+         * depth-fifteen sixteen-row publication family into that arena.
+         */
+        int retained_graph_rows = candidate;
+        for (const auto& config : device_configs)
+        {
+            if (usesResidentGraphRows(config) && config.mtp_enabled)
+            {
+                retained_graph_rows = std::max(
+                    retained_graph_rows,
+                    std::max(1, config.mtp_target_query_rows));
+            }
+        }
+
         std::vector<DevicePlanConfig> evaluated = device_configs;
         for (auto& config : evaluated)
         {
             if (usesResidentGraphRows(config))
-                config.activation_seq_len = candidate;
+                config.activation_seq_len = retained_graph_rows;
         }
 
         MemoryPlan candidate_plan = plan(profile, evaluated);
-        selection.resident_graph_rows = candidate;
+        selection.resident_graph_rows = retained_graph_rows;
         selection.memory_plan = std::move(candidate_plan);
         if (selection.memory_plan.fits())
             return selection;

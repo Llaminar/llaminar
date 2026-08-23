@@ -160,6 +160,7 @@ namespace llaminar2
             p.coherence = false;
             p.weight_coherence = false;
             p.mark_dirty = false;
+            p.profiling = false;
             p.graph_recording_authority =
                 GraphRecordingAuthority::SetupAddressesOnly;
             return p;
@@ -604,6 +605,31 @@ namespace llaminar2
                                GraphSnapshotManifest *snapshot_manifest = nullptr);
 
         /**
+         * @brief Record a complete setup-owned graph body without executing it.
+         *
+         * This entry point is legal only while the exact backend stream is under
+         * native graph capture. It invokes the same canonical stage runner as
+         * production execution, but with @ref
+         * StageRunPolicy::setupGraphMaterialization: arena addresses and prepared
+         * kernel descriptors may be embedded in graph nodes, while request
+         * coherence, dirty publication, snapshot callbacks, completion flags, and
+         * profiling authority remain untouched. Calling it outside native capture
+         * is a hard error because stage methods would otherwise execute real model
+         * work during setup.
+         *
+         * @param graph Stable participant-local graph being materialized.
+         * @param ctx Exact GPU context that owns the active capture stream.
+         * @param collective_nodes Precomputed collective-stage identities.
+         * @param snapshot_manifest Graph-owned D2D snapshot slots to record.
+         * @return true after every stage node was recorded successfully.
+         */
+        bool recordSetupGraphMaterialization(
+            ComputeGraph &graph,
+            IDeviceContext *ctx,
+            const std::unordered_set<std::string> *collective_nodes = nullptr,
+            GraphSnapshotManifest *snapshot_manifest = nullptr);
+
+        /**
          * @brief Execute an eager graph against its explicit snapshot owner.
          *
          * Cached graph construction uses this boundary so warmup descriptors
@@ -763,13 +789,19 @@ namespace llaminar2
          * @param ctx GPU context owning the graph and stream.
          * @param capture_stream Exact non-null stream passed to beginCapture().
          * @param context Optional diagnostic label.
+         * @param external_input_authority Whether the frontier must own live
+         *        request bytes or setup may bind its already allocated addresses.
          * @return true after all external dependencies and output storage are ready.
          */
         bool prepareGraphStorageForCapture(
             ComputeGraph &graph,
             IDeviceContext *ctx,
             void *capture_stream,
-            const char *context = nullptr);
+            const char *context = nullptr,
+            GraphCaptureDependencyLedger::ExternalInputAuthority
+                external_input_authority =
+                    GraphCaptureDependencyLedger::ExternalInputAuthority::
+                        RequireReadyBytes);
 
         /**
          * @brief Freeze the typed stage dependency sequence for native capture.
@@ -1324,7 +1356,6 @@ namespace llaminar2
             std::vector<ReplayGpuTimingSlot> replay_gpu_timing_slots; ///< Fixed event ring allocated before capture
             std::string replay_gpu_timing_device_name; ///< Stable PerfStats device label for completed slots
             uint64_t replay_gpu_timing_busy_samples = 0; ///< Replays intentionally not sampled while every slot is in flight
-            uint64_t host_ticket_fence_count = 0; ///< Explicit heterogeneous captured-ticket observations
             GraphReplayPlanPolicy graph_replay_plan_policy =
                 GraphReplayPlanPolicy::RequireFullGraph; ///< Exact materialization/replay authority represented by this cache.
             SteadyReplayHostPolicy steady_replay_host_policy =
@@ -1372,7 +1403,6 @@ namespace llaminar2
                   replay_gpu_timing_slots(std::move(other.replay_gpu_timing_slots)),
                   replay_gpu_timing_device_name(std::move(other.replay_gpu_timing_device_name)),
                   replay_gpu_timing_busy_samples(other.replay_gpu_timing_busy_samples),
-                  host_ticket_fence_count(other.host_ticket_fence_count),
                   graph_replay_plan_policy(other.graph_replay_plan_policy),
                   steady_replay_host_policy(other.steady_replay_host_policy),
                   retained_full_graph_replay(
@@ -1405,7 +1435,6 @@ namespace llaminar2
                 other.replay_gpu_timing_slots.clear();
                 other.replay_gpu_timing_device_name.clear();
                 other.replay_gpu_timing_busy_samples = 0;
-                other.host_ticket_fence_count = 0;
                 other.graph_replay_plan_policy =
                     GraphReplayPlanPolicy::RequireFullGraph;
                 other.steady_replay_host_policy =
@@ -1450,7 +1479,6 @@ namespace llaminar2
                     replay_gpu_timing_slots = std::move(other.replay_gpu_timing_slots);
                     replay_gpu_timing_device_name = std::move(other.replay_gpu_timing_device_name);
                     replay_gpu_timing_busy_samples = other.replay_gpu_timing_busy_samples;
-                    host_ticket_fence_count = other.host_ticket_fence_count;
                     graph_replay_plan_policy = other.graph_replay_plan_policy;
                     steady_replay_host_policy =
                         other.steady_replay_host_policy;
@@ -1483,7 +1511,6 @@ namespace llaminar2
                     other.replay_gpu_timing_slots.clear();
                     other.replay_gpu_timing_device_name.clear();
                     other.replay_gpu_timing_busy_samples = 0;
-                    other.host_ticket_fence_count = 0;
                     other.graph_replay_plan_policy =
                         GraphReplayPlanPolicy::RequireFullGraph;
                     other.steady_replay_host_policy =
@@ -1563,7 +1590,6 @@ namespace llaminar2
                     snapshot_manifest.filtered_stages.empty() &&
                     decode_step == 0 && capture_variant_signature == 0 &&
                     replay_gpu_timing_slots.empty() &&
-                    host_ticket_fence_count == 0 &&
                     !retained_parent_capture &&
                     !auxiliary_branch &&
                     auxiliary_branch_authority == nullptr &&
@@ -1680,7 +1706,6 @@ namespace llaminar2
                     ExecutableSubmissionState::Empty;
                 decode_step = 0;
                 capture_variant_signature = 0;
-                host_ticket_fence_count = 0;
                 terminal_fence_published_generation = 0;
                 terminal_fence_observed_generation = 0;
                 graph_replay_plan_policy =
@@ -1799,16 +1824,6 @@ namespace llaminar2
                 HostFenceWaitPolicy wait_policy =
                     HostFenceWaitPolicy::Blocking,
                 std::function<std::string()> active_timeout_diagnostic = {});
-
-            /**
-             * @brief Publish and await one declared captured-device ticket.
-             *
-             * This event wait is legal only at an explicit heterogeneous
-             * device/host boundary whose first manual stage declares
-             * `requiresHostGraphTicketFence()`.  It reuses the cache-owned
-             * event and never allocates during replay.
-             */
-            void waitForManualHostTicketFence();
 
             /// Destroy the capture stream if it exists
             void destroyCaptureStream();
@@ -2092,22 +2107,6 @@ namespace llaminar2
             const char *context);
 
         /**
-         * @brief External-input readiness required while recording a native graph.
-         *
-         * Ordinary capture joins the producer of every external input before
-         * `beginCapture()`. Setup-only materialization has no admitted request,
-         * so it may bind already allocated input addresses without inventing
-         * payload authority. That relaxed state is legal only because no
-         * executable is launched; transaction zero performs the strict frontier
-         * preflight after the request owner publishes its bytes.
-         */
-        enum class GraphCaptureInputFrontierPolicy : uint8_t
-        {
-            RequireReadyBytes = 0, ///< Join and validate every external producer.
-            BindAddressesOnly,     ///< Setup recording; do not publish input bytes.
-        };
-
-        /**
          * @brief Prepare one stage's arena frontier before native capture.
          *
          * StageBufferContract is the sole authority: external reads must own
@@ -2134,7 +2133,8 @@ namespace llaminar2
             void *capture_stream,
             std::unordered_set<ITensor *> &prepared_inputs,
             std::unordered_set<ITensor *> &prepared_outputs,
-            GraphCaptureInputFrontierPolicy input_policy,
+            GraphCaptureDependencyLedger::ExternalInputAuthority
+                external_input_authority,
             const char *context);
 
         void advanceSnapshotConfigurationEpoch() noexcept

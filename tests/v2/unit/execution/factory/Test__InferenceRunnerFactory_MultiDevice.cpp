@@ -18,6 +18,7 @@
 #include "execution/local_execution/orchestrators/IRankOrchestrator.h"
 #include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
+#include "execution/moe/MoEOverlayInferenceTransaction.h"
 #include "execution/moe/MoERebalanceController.h"
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/moe/MoERoutedExpertPlacementPlanner.h"
@@ -962,6 +963,40 @@ namespace
         EXPECT_EQ(serial_plan->placements.back().layer, 2);
         ASSERT_EQ(mtp_plan->placements.size(), 4u);
         EXPECT_EQ(mtp_plan->placements.back().layer, 3);
+
+        const auto serial_family =
+            resolveMoEOverlayInferenceGraphFamilyIdentity(
+                *model_ctx->loader(),
+                model_ctx->architecture(),
+                model_ctx->totalBlockCount(),
+                /*mtp_enabled=*/false,
+                /*graph_family_generation=*/1,
+                /*max_graph_rows=*/16,
+                /*max_decode_rows=*/1,
+                /*max_request_count=*/1,
+                /*max_mtp_draft_depth=*/0);
+        const auto mtp_family =
+            resolveMoEOverlayInferenceGraphFamilyIdentity(
+                *model_ctx->loader(),
+                model_ctx->architecture(),
+                model_ctx->totalBlockCount(),
+                /*mtp_enabled=*/true,
+                /*graph_family_generation=*/1,
+                /*max_graph_rows=*/16,
+                /*max_decode_rows=*/4,
+                /*max_request_count=*/1,
+                /*max_mtp_draft_depth=*/3);
+
+        EXPECT_EQ(serial_family.routedLayerCapacity(), kMoELayers);
+        EXPECT_EQ(
+            serial_family.routedLayerCapacity(),
+            serial_plan->placementLayerCapacity())
+            << "an inactive raw NextN block must not enlarge follower runtime geometry";
+        EXPECT_EQ(mtp_family.routedLayerCapacity(), kMoELayers + 1);
+        EXPECT_EQ(
+            mtp_family.routedLayerCapacity(),
+            mtp_plan->placementLayerCapacity())
+            << "an enabled routed NextN graph must share the placement bank's raw source slot";
     }
 
     /**

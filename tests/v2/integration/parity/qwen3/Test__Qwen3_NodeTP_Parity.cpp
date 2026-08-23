@@ -28,6 +28,7 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <unistd.h>
+#include "Qwen3ModelParityDefinitions.h"
 #include "Qwen3ParityTestBase.h"
 #include "collective/BackendRouter.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -60,40 +61,39 @@ static const std::vector<std::string> kNodeTPExcludedStages = {
 // Test Configuration Definitions
 // =============================================================================
 
-static const std::vector<TestConfig> kNodeTPTestConfigs = {
-    // =========================================================================
-    // Qwen3-0.6B (Q8_0) — 2-way Node-Local TP with CPU (UPI interconnect)
-    // =========================================================================
-    {
-        .name = "NodeTP_2xMPI_CPU",
-        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU},
-        .parallelism = Parallelism::NodeTP,
-        .collective = Collective::MPI,
-        .thresholds = {
-            .cosine_threshold = 0.94f,
-            .decode_cosine_threshold = 0.90f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.012f, // Observed: 0.003 prefill KL (was 0.20 = 80x over-relaxed)
-            .excluded_stages = kNodeTPExcludedStages,
-        },
-        .mpi_ranks = 2,
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::FP16,
-    },
-};
+/** @return Canonically generated two-rank CPU NodeTP case. */
+static const std::vector<ModelParityCase> &qwen3NodeTPCases()
+{
+    static const auto cases = expandModelParityDefinition(
+        qwen3Q80ParityDefinition(
+            ModelParityTopologyDefinition{
+                .test_id = "NodeTP_2xMPI_CPU",
+                .kind = ModelParityTopologyKind::NodeTensorParallel,
+                .participants = {
+                    {GlobalDeviceAddress::cpu(0), 0},
+                    {GlobalDeviceAddress::cpu(1), 1},
+                },
+                .collective = Collective::MPI,
+                .mpi_ranks = 2,
+            },
+            BackendThresholds{
+                .cosine_threshold = 0.94f,
+                .decode_cosine_threshold = 0.90f,
+                .early_layers_count = 6,
+                .min_early_layers_passed = 4,
+                .kl_threshold = 0.012f,
+                .excluded_stages = kNodeTPExcludedStages,
+            }));
+    return cases;
+}
 
 // =============================================================================
 // Parameterized Test Fixture
 // =============================================================================
 
 class Qwen3NodeTPParityTest : public Qwen3ConfigDrivenParityTest<Qwen3NodeTPParityTest>,
-                                   public ::testing::WithParamInterface<TestConfig>
+                               public ModelParityCaseParameter
 {
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
 };
 
 // =============================================================================
@@ -210,10 +210,10 @@ TEST_P(Qwen3NodeTPParityTest, ProductionParity)
 INSTANTIATE_TEST_SUITE_P(
     Qwen3NodeTP,
     Qwen3NodeTPParityTest,
-    ::testing::ValuesIn(kNodeTPTestConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
+    ::testing::ValuesIn(qwen3NodeTPCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {
-        return info.param.name;
+        return info.param.testName();
     });
 
 // =============================================================================

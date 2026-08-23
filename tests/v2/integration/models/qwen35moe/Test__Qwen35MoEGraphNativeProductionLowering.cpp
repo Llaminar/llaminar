@@ -1165,6 +1165,20 @@ namespace llaminar2::test
                 small_stage->params().serial_compact_buffer_arena.get(),
                 large_stage->params().serial_compact_buffer_arena.get())
                 << "participant=" << participant;
+            ASSERT_NE(
+                small_stage->params().serial_compact_buffer_arena
+                    ->cpuGroupedWorkspace(),
+                nullptr)
+                << "A production CPU overlay participant must first-touch its "
+                   "grouped execution workspace during graph setup";
+            EXPECT_EQ(
+                small_stage->params().serial_compact_buffer_arena
+                    ->cpuGroupedWorkspace().get(),
+                large_stage->params().serial_compact_buffer_arena
+                    ->cpuGroupedWorkspace().get())
+                << "Every serial bucket for one participant must share one "
+                   "grouped execution workspace; participant="
+                << participant;
             EXPECT_NE(
                 small_stage->compactHiddenTensorForDiagnostics(),
                 large_stage->compactHiddenTensorForDiagnostics())
@@ -1214,6 +1228,12 @@ namespace llaminar2::test
             first->second->params().serial_compact_buffer_arena.get(),
             second->second->params().serial_compact_buffer_arena.get())
             << "Independent overlay participants must not alias a compact packet arena";
+        EXPECT_NE(
+            first->second->params().serial_compact_buffer_arena
+                ->cpuGroupedWorkspace().get(),
+            second->second->params().serial_compact_buffer_arena
+                ->cpuGroupedWorkspace().get())
+            << "Independent CPU participants must not alias execution scratch";
     }
 
     /**
@@ -1562,6 +1582,17 @@ namespace llaminar2::test
             DeviceId::cuda(0),
             stream.get(),
             prefill_live_rows);
+        const int32_t *const one_row_prefill_live_rows =
+            stream.publishRowCount(1);
+        ComputeGraph one_row_prefill_graph = builder.buildFFNGraph(
+            layer,
+            decode_buffers,
+            /*layer_idx=*/0,
+            /*seq_len=*/1,
+            kBatchSize,
+            DeviceId::cuda(0),
+            stream.get(),
+            one_row_prefill_live_rows);
 
         const std::string local_name =
             "layer0_moe_expert_ffn_overlay_continuation_local";
@@ -1632,6 +1663,20 @@ namespace llaminar2::test
         }
         EXPECT_TRUE(
             runtime_table->overlayRoutePlacementBinding(0).valid());
+
+        const auto *one_row_prefill_local = expertComputeStage(
+            one_row_prefill_graph, local_name);
+        ASSERT_NE(one_row_prefill_local, nullptr);
+        EXPECT_TRUE(
+            one_row_prefill_local
+                ->supportsLazyPrefillGraphCapturePreflight())
+            << "A restored one-row heterogeneous prefill must retain its "
+               "captured explicit-routing continuation graph";
+        EXPECT_TRUE(
+            one_row_prefill_local
+                ->supportsPaddedPrefillGraphCapturePreflight())
+            << "The exact device live-row pointer is the typed distinction "
+               "between this prefill bucket and ordinary one-row decode";
 
         for (const auto *graph : {&decode_graph, &prefill_graph})
         {

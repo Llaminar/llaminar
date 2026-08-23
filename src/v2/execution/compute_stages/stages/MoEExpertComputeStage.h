@@ -30,6 +30,7 @@
 #include "../../moe/IMoEGroupedVerifierHistogramPublisher.h"
 
 #include <memory>
+#include <atomic>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -53,6 +54,115 @@ namespace llaminar2
     class DeviceMoERebalanceTransferState;
     class MoEOverlayNodeLocalRouteExchange;
     class MoEOverlayPersistentGraphStorage;
+
+    /**
+     * @brief Setup-owned CPU grouped-MoE scratch shared by one serial graph family.
+     *
+     * Heterogeneous ExpertOverlay executes model layers, prefill buckets, and
+     * MTP verifier roles in strict transaction order for one CPU participant.
+     * Those mutually exclusive stages borrow this one first-touched workspace
+     * instead of allocating and retaining a worst-case gate/up/down arena per
+     * layer. An RAII lease turns the serial-family proof into a runtime
+     * invariant: concurrent use is a fatal ownership error, never an implicit
+     * allocation or private fallback.
+     */
+    class CPUGroupedMoESerialWorkspace final
+    {
+    public:
+        /** @brief Complete immutable capacity contract. */
+        struct Config
+        {
+            size_t row_capacity = 0; ///< Maximum compact input rows.
+            int d_model = 0; ///< Hidden/output width.
+            int expert_intermediate = 0; ///< Routed-expert SwiGLU width.
+            int num_experts = 0; ///< Logical expert-table width.
+            int routing_top_k = 0; ///< Maximum routes admitted per row.
+            std::string debug_name; ///< Stable diagnostics identity.
+        };
+
+        /** @brief Exclusive invocation lease for one serial participant stage. */
+        class InvocationLease final
+        {
+        public:
+            InvocationLease() = default;
+            ~InvocationLease();
+            InvocationLease(const InvocationLease &) = delete;
+            InvocationLease &operator=(const InvocationLease &) = delete;
+            InvocationLease(InvocationLease &&other) noexcept;
+            InvocationLease &operator=(InvocationLease &&other) noexcept;
+
+        private:
+            friend class CPUGroupedMoESerialWorkspace;
+            explicit InvocationLease(
+                CPUGroupedMoESerialWorkspace *owner) noexcept
+                : owner_(owner)
+            {
+            }
+            void release() noexcept;
+            CPUGroupedMoESerialWorkspace *owner_ = nullptr;
+        };
+
+        /**
+         * @brief Allocate and first-touch the complete serial workspace.
+         * @throws std::invalid_argument for incomplete or overflowing geometry.
+         */
+        explicit CPUGroupedMoESerialWorkspace(Config config);
+        ~CPUGroupedMoESerialWorkspace();
+
+        CPUGroupedMoESerialWorkspace(
+            const CPUGroupedMoESerialWorkspace &) = delete;
+        CPUGroupedMoESerialWorkspace &operator=(
+            const CPUGroupedMoESerialWorkspace &) = delete;
+
+        /** @brief Check whether one runtime invocation fits this setup plan. */
+        [[nodiscard]] bool supports(
+            int rows,
+            int route_width,
+            int d_model,
+            int expert_intermediate,
+            int num_experts) const noexcept;
+
+        /**
+         * @brief Acquire exclusive access for one participant-local packet.
+         * @throws std::invalid_argument when runtime geometry exceeds the plan.
+         * @throws std::logic_error when two allegedly serial stages overlap.
+         */
+        [[nodiscard]] InvocationLease acquire(
+            int rows,
+            int route_width,
+            int d_model,
+            int expert_intermediate,
+            int num_experts,
+            int layer_idx);
+
+        /** @brief Return all setup-owned payload bytes. */
+        [[nodiscard]] size_t allocationBytes() const noexcept
+        {
+            return allocation_bytes_;
+        }
+
+    private:
+        friend class MoEExpertComputeStage;
+
+        size_t row_capacity_ = 0;
+        size_t route_capacity_ = 0;
+        int d_model_ = 0;
+        int expert_intermediate_ = 0;
+        int num_experts_ = 0;
+        int routing_top_k_ = 0;
+        std::string debug_name_;
+        size_t allocation_bytes_ = 0;
+        std::atomic_flag invocation_active_ = ATOMIC_FLAG_INIT;
+
+        std::shared_ptr<FP32Tensor> scratch_batch_;
+        std::shared_ptr<FP32Tensor> scratch_gate_;
+        std::shared_ptr<FP32Tensor> scratch_up_;
+        std::shared_ptr<FP32Tensor> scratch_out_;
+        std::vector<Q8_1Block> router_q8_;
+        std::vector<Q8_1Block> swiglu_q8_;
+        std::vector<float> route_outputs_;
+        std::unique_ptr<IMoEKernel> moe_kernel_;
+    };
 
     /**
      * @brief Select how a grouped LLEP invocation assigns the current batch.
@@ -109,6 +219,37 @@ namespace llaminar2
     };
 
     /**
+     * @brief Select the sole graph-build authority for routed-expert weights.
+     *
+     * Ordinary standalone graphs may prepare engines from their bound raw
+     * three-dimensional parent tensors. ExpertOverlay graphs instead receive
+     * participant-scoped engines from @ref ExpertGemmRegistry; consulting a
+     * generic raw-parent binding there can select another participant's packed
+     * slice when CPU and GPU tiers share a model layer.
+     */
+    enum class MoEExpertWeightResolutionPolicy : uint8_t
+    {
+        RawOrPrepared = 0,
+        PreparedRegistryOnly = 1,
+    };
+
+    /**
+     * @brief Select when a registry-only stage receives its first live engine bank.
+     *
+     * Ordinary graph stages are born with a complete immutable bank. A serial
+     * CPU ExpertOverlay endpoint is different: graph construction creates one
+     * retained executor before the participant residency authority publishes
+     * its initial epoch. That executor is setup-primed with an explicitly empty
+     * mask and cannot execute until a non-zero host-packet publication binds a
+     * complete triplet for every active expert.
+     */
+    enum class MoEPreparedEngineBindingLifecycle : uint8_t
+    {
+        CompleteAtConstruction = 0,
+        SparseOverlayInvocationPublished = 1,
+    };
+
+    /**
      * @brief Unified MoE FFN stage (router + expert execution + combine)
      *
      * Supports CPU, CUDA, and ROCm backends:
@@ -157,11 +298,43 @@ namespace llaminar2
             CPURouterQ8InputPublicationPolicy cpu_router_q8_input_publication =
                 CPURouterQ8InputPublicationPolicy::RequireRouterStage;
 
+            /**
+             * @brief Serial participant workspace for CPU ExpertOverlay packets.
+             *
+             * Production heterogeneous CPU endpoints bind the workspace owned
+             * by their compact-buffer arena. Ordinary CPU graphs leave this
+             * empty and retain their graph-local scratch ownership.
+             */
+            std::shared_ptr<CPUGroupedMoESerialWorkspace>
+                cpu_grouped_serial_workspace;
+
             // Expert weights (3D packed tensors) — used by CPU path
             TensorBase *gate_exps = nullptr; ///< [num_experts, intermediate, d_model]
             TensorBase *up_exps = nullptr;   ///< [num_experts, intermediate, d_model]
             TensorBase *down_exps = nullptr; ///< [num_experts, d_model, intermediate]
             int expert_intermediate = 0;
+
+            /**
+             * @brief Authority used to resolve executable expert matrices.
+             *
+             * PreparedRegistryOnly requires raw parent pointers to be absent
+             * and a complete prepared triplet for every locally executable
+             * expert. This makes an ExpertOverlay graph unable to fall back to
+             * a coincidentally bound slice owned by another tier participant.
+             */
+            MoEExpertWeightResolutionPolicy expert_weight_resolution_policy =
+                MoEExpertWeightResolutionPolicy::RawOrPrepared;
+
+            /**
+             * @brief Typed construction/publication boundary for prepared engines.
+             *
+             * SparseOverlayInvocationPublished is legal only for a serial CPU
+             * transported-row endpoint with setup-owned grouped scratch. The
+             * constructor accepts only an all-disabled mask in that state;
+             * @ref bindSparseOverlayInvocation validates the first live bank.
+             */
+            MoEPreparedEngineBindingLifecycle prepared_engine_binding_lifecycle =
+                MoEPreparedEngineBindingLifecycle::CompleteAtConstruction;
 
             // Whole-expert-ID apportionment across participants.
             // When active, this rank only computes experts in
@@ -217,7 +390,7 @@ namespace llaminar2
             RoutedExpertRowExecutionPolicy routed_row_execution_policy =
                 RoutedExpertRowExecutionPolicy::ParticipantAssigned;
 
-            // Per-expert 2D tensor views — used by GPU path
+            // Per-expert 2D tensor views — used by raw-parent GPU paths
             // Each vector has num_experts entries; each entry is a 2D view
             // into the corresponding 3D packed tensor.
             // Set by graph builder via extractExpertViews().
@@ -478,16 +651,52 @@ namespace llaminar2
          * addresses and fixed-size prepared-engine tables to a persistent nested
          * executor.
          *
-         * The binding may change the live row count, compact tensor family, or
-         * residency epoch between serial transactions. It never changes the
-         * model geometry, device, layer, or vector capacities established at
-         * construction.
+         * A serial CPU packet may select another setup-owned compact tensor
+         * family and change its live row count, live route width, or residency
+         * epoch between transactions. GPU replay families retain one captured
+         * tensor identity. The binding never changes model geometry, device,
+         * layer, or vector capacities established at construction.
          */
         /** @brief Lifecycle authority represented by a sparse engine binding. */
         enum class SparseOverlayBindingKind : uint8_t
         {
             ResidencyPublication = 0, ///< Live non-zero overlay authority epoch.
             SetupPriming,             ///< One pre-capture construction binding.
+            /**
+             * Serial CPU packet publication with mutable live tensor geometry.
+             *
+             * The enclosing local-expert stage remains the sole packet and
+             * residency authority. This binding lets its persistent CPU
+             * executor reuse kernels and grow-only scratch across packets;
+             * GPU captured executors must never select it.
+             */
+            HostPacketPublication,
+        };
+
+        /**
+         * @brief Borrowed CPU hidden-row storage for one synchronous host packet.
+         *
+         * The sparse collective already owns an authenticated FP32 activation
+         * matrix. A CPU endpoint must retain its compact row mapping, but it
+         * need not copy the complete hidden payload into another tensor before
+         * quantization or floating GEMM gather. The enclosing local-expert
+         * stage publishes this binding immediately before synchronous CPU
+         * execution; GPU and retained asynchronous invocations must leave it
+         * empty.
+         */
+        struct CPUTransportedHiddenRows
+        {
+            const float *source = nullptr; ///< Stable FP32 transport allocation.
+            int source_row_capacity = 0;   ///< Addressable rows in @ref source.
+            /** Compact execution row to physical source-row index. */
+            std::span<const int> compact_to_source_row;
+
+            /** @return True when no borrowed transport identity was supplied. */
+            [[nodiscard]] bool empty() const noexcept
+            {
+                return source == nullptr && source_row_capacity == 0 &&
+                       compact_to_source_row.empty();
+            }
         };
 
         struct SparseOverlayInvocation
@@ -497,20 +706,41 @@ namespace llaminar2
             TensorBase *routing_weights = nullptr;  ///< Row-major local top-k weights.
             TensorBase *output = nullptr;           ///< Locally aggregated expert rows.
             int live_rows = 0;                      ///< Positive live compact row count.
+            /**
+             * @brief Live compact route stride for a host packet.
+             *
+             * Zero retains the construction width. A positive value is legal
+             * only for @ref SparseOverlayBindingKind::HostPacketPublication
+             * and cannot exceed the setup-certified route capacity.
+             */
+            int route_width = 0;
             SparseOverlayBindingKind binding_kind =
                 SparseOverlayBindingKind::ResidencyPublication;
             /**
-             * Monotonic immutable residency publication represented by the
-             * mask and three prepared-engine tables below. Reusing a value is
-             * a promise from the overlay authority that those tables are
-             * unchanged; changing any table requires a new non-zero value.
-             * Setup priming is the sole typed exception and requires zero.
+             * Exact semantic phase of a synchronous CPU transport packet.
+             *
+             * HostPacketPublication must select a production phase. Retained
+             * GPU and setup bindings leave this as Auto because their graph
+             * role owns phase identity independently of the mutable binding.
+             */
+            MoEOverlayServicePhaseHint service_phase =
+                MoEOverlayServicePhaseHint::Auto;
+            /**
+             * Parent residency publication represented by the mask and three
+             * prepared-engine tables below. A GPU
+             * @ref SparseOverlayBindingKind::ResidencyPublication is immutable
+             * for one non-zero generation. A serial CPU packet revalidates its
+             * exact tables on every binding because current-batch LLEP may lend
+             * transient engines underneath the same durable parent epoch.
+             * Setup priming is the sole zero-generation binding.
              */
             uint64_t engine_binding_generation = 0;
             const std::vector<bool> *expert_mask = nullptr; ///< Exact immutable bank mask.
             std::span<ITensorGemm *const> gate_engines;     ///< Global-id-indexed gate engines.
             std::span<ITensorGemm *const> up_engines;       ///< Global-id-indexed up engines.
             std::span<ITensorGemm *const> down_engines;     ///< Global-id-indexed down engines.
+            /** Exact CPU-only hidden rows borrowed for this host packet. */
+            CPUTransportedHiddenRows cpu_transported_hidden;
         };
 
         /**
@@ -519,7 +749,9 @@ namespace llaminar2
          * This is a manual heterogeneous-boundary API, not a mutable captured
          * graph API. The method copies into construction-sized tables and
          * invalidates device descriptor tables only when prepared engine
-         * addresses actually changed. It performs no allocation when the
+         * addresses actually changed. A CPU host-packet binding may select a
+         * different preallocated tensor family because it is never captured;
+         * a GPU publication may not. It performs no allocation when the
          * constructor established a valid expert geometry.
          *
          * @param invocation Exact compact tensors, live rows, mask, and engines.
@@ -1191,14 +1423,16 @@ namespace llaminar2
         /**
          * @brief Name the semantic owner of one CPU grouped-row invocation.
          *
-         * Ordinary prefill and MTP verification share the same economical,
-         * serial-row-equivalent expert kernels.  They differ only in replica
-         * assignment and observability.  Carrying that distinction as a
-         * scoped enum prevents the executor from inferring lifecycle policy
-         * from a mutable test flag or from runtime M.
+         * Decode, ordinary prefill, and MTP verification share the same
+         * economical serial-row-equivalent expert kernels for transported CPU
+         * packets. They differ in observability and, outside an already
+         * owner-filtered host packet, replica assignment. Carrying that
+         * distinction as a scoped enum prevents the executor from inferring
+         * lifecycle policy from a mutable test flag or from runtime M.
          */
         enum class CPUGroupedRowsPurpose : uint8_t
         {
+            Decode,
             OrdinaryPrefill,
             MTPVerifier,
         };
@@ -1233,9 +1467,11 @@ namespace llaminar2
          * @brief Reusable host scratch for CPU routed-expert execution.
          *
          * Fixed-M verifier stages bind their complete bounded capacity during
-         * construction so request execution never allocates or changes memory
-         * topology. Ordinary large-prefill stages currently grow these buffers
-         * on first use pending graph-level cross-layer scratch sharing.
+         * construction. Heterogeneous CPU ExpertOverlay stages instead borrow
+         * @ref CPUGroupedMoESerialWorkspace across mutually exclusive layers
+         * and graph roles. Ordinary standalone large-prefill stages retain
+         * these private grow-only buffers because they have no serial overlay
+         * ownership contract to authorize cross-layer aliasing.
          */
         mutable std::shared_ptr<FP32Tensor> scratch_batch_;
         mutable std::shared_ptr<FP32Tensor> scratch_gate_;
@@ -1291,6 +1527,15 @@ namespace llaminar2
         /** @brief Gather indices reused for each complete expert batch. */
         mutable std::vector<int> cpu_grouped_token_indices_;
 
+        /** Borrowed FP32 transport base for the current synchronous CPU packet. */
+        const float *sparse_overlay_cpu_hidden_source_ = nullptr;
+
+        /** Number of addressable rows under @ref sparse_overlay_cpu_hidden_source_. */
+        int sparse_overlay_cpu_hidden_source_row_capacity_ = 0;
+
+        /** Compact CPU execution row to borrowed physical source-row index. */
+        std::vector<int> sparse_overlay_cpu_compact_to_source_row_;
+
         /** @brief Canonical router-Q8 rows gathered in expert-major layer order. */
         mutable std::vector<Q8_1Block> cpu_grouped_router_q8_;
 
@@ -1343,6 +1588,14 @@ namespace llaminar2
          * ordinary homogeneous graphs keep their capture-only preparation.
          */
         bool sparse_overlay_invocation_bound_ = false;
+        /** @brief Typed authority that supplied the currently bound invocation. */
+        SparseOverlayBindingKind sparse_overlay_binding_kind_ =
+            SparseOverlayBindingKind::SetupPriming;
+        /** Semantic phase authenticated by the current CPU host packet. */
+        MoEOverlayServicePhaseHint sparse_overlay_service_phase_ =
+            MoEOverlayServicePhaseHint::Auto;
+        /** Maximum compact route width certified before any host rebind. */
+        int sparse_overlay_route_width_capacity_ = 0;
         /** @brief Residency generation currently certified by the bound tables. */
         uint64_t sparse_overlay_engine_binding_generation_ = 0;
         /**
@@ -1525,6 +1778,16 @@ namespace llaminar2
             DeviceMoERebalanceApplyStatus **apply_status_out,
             DeviceMoERebalanceTransferState *transfer_state_override =
                 nullptr) const;
+        /**
+         * @brief Validate the immutable one-row runtime-table launch contract.
+         *
+         * The same production kernel serves ordinary decode and an exact-shape
+         * one-row prefill left by prefix restore. This predicate checks only
+         * immutable geometry and bindings; graph preparation owns descriptor
+         * publication and runtime-bank readiness.
+         */
+        bool supportsDeviceRoutedOneRowGraphCapturePreflight() const;
+        /** @brief Check prepared launch state for the one-row runtime-table path. */
         bool isDeviceRoutedDecodeGraphCapturable() const;
         bool supportsFixedTopologyPrefillGraphCapturePreflight() const;
         bool isFixedTopologyPrefillGraphCapturable() const;

@@ -381,6 +381,34 @@ TEST_F(StageDumpInfoTest, RMSNormStage_GetDumpInfo)
     EXPECT_FALSE(hasInput(info, "gamma"));
 }
 
+TEST_F(StageDumpInfoTest,
+       RMSNormStage_MTPTerminalHiddenDiagnosticIsTypedAndOptIn)
+{
+    constexpr int seq_len = 1;
+    constexpr int hidden_size = 64;
+
+    auto input = TestTensorFactory::createFP32Random(
+        {seq_len, hidden_size});
+    auto output = TestTensorFactory::createFP32(
+        {seq_len, hidden_size});
+    auto gamma = TestTensorFactory::createFP32Ones({hidden_size});
+
+    RMSNormStage stage({
+        .input = input.get(),
+        .output = output.get(),
+        .gamma = gamma.get(),
+        .seq_len = seq_len,
+        .diagnostic_input_publication =
+            RMSNormStage::DiagnosticInputPublication::MTPTerminalHidden,
+    });
+    const StageDumpInfo info = stage.getDumpInfo();
+
+    EXPECT_TRUE(hasOutput(info, "output"));
+    EXPECT_TRUE(hasOutput(info, "mtp_terminal_hidden_input"));
+    ASSERT_EQ(info.outputs.size(), 2u);
+    EXPECT_EQ(info.outputs[1].tensor, input.get());
+}
+
 TEST_F(StageDumpInfoTest, GatedRMSNormStage_DumpInfoUsesFeatureDim)
 {
     int seq_len = 4;

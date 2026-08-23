@@ -1361,11 +1361,19 @@ namespace llaminar2
             bool valid = false;
             ForwardGraphSignature signature;
             bool cache_hit = false;
+            void *producer_stream = nullptr;
         };
 
+        /**
+         * @brief Retain the exact graph and producer identity of one launch.
+         * @param signature Complete cache identity of the launched graph.
+         * @param cache_hit Whether an existing graph topology was reused.
+         * @param producer_stream Exact output producer stream; null only for CPU.
+         */
         void recordLastExecutedForwardGraph(
             const ForwardGraphSignature &signature,
-            bool cache_hit);
+            bool cache_hit,
+            void *producer_stream);
         std::optional<LastExecutedForwardGraphView> viewForLastExecutedForwardGraphState(
             const LastExecutedForwardGraphState &state);
         std::optional<DeviceLoopGraphTemplateView>
@@ -1409,13 +1417,33 @@ namespace llaminar2
             bool has_unified_pp,
             std::chrono::high_resolution_clock::time_point start);
 
-        // ----- Prefill graph capture/replay (Tier 1 Phase 5) -----
+        /**
+         * @brief Execute one prefill through its production graph lifecycle.
+         *
+         * Monolithic bucket capture and explicitly admitted heterogeneous
+         * segmentation own different caches and streams. The method therefore
+         * returns the concrete launch stream instead of asking callers to
+         * reconstruct provenance from phase booleans. Setup-only
+         * materialization succeeds with a null producer because it launches no
+         * inference transaction.
+         *
+         * @param input Exact prefill invocation and graph identity.
+         * @param forward_cache Stable topology and native executable storage.
+         * @param ctx Device context owning the graph participant.
+         * @param host Model/runtime lifecycle authority.
+         * @param used_graph_replay Receives whether retained graph replay ran.
+         * @param out_producer_stream Receives the exact non-null launch stream
+         *        after GPU inference; remains null for setup materialization.
+         * @param initial_submission Launch or setup-materialization policy.
+         * @return True after successful materialization or graph submission.
+         */
         bool executePrefillWithGraphCache(
             const ForwardInput &input,
             ForwardGraphCache &forward_cache,
             IDeviceContext *ctx,
             IForwardExecutionHost &host,
             bool *used_graph_replay = nullptr,
+            void **out_producer_stream = nullptr,
             DeviceGraphExecutor::GraphInitialSubmissionPolicy
                 initial_submission =
                     DeviceGraphExecutor::GraphInitialSubmissionPolicy::

@@ -53,15 +53,17 @@ namespace llaminar2::sampling_math
     constexpr uint32_t kMTPCommittedVerifierIdentityVersion = 1;
 
     /**
-     * @brief Device-owned identity of the last response-visible MTP transaction.
+     * @brief Authority-owned identity of the last response-visible MTP transaction.
      *
      * The verifier input row is reusable graph scratch: observing it after a
      * transaction does not prove that the row belongs to the transaction whose
      * response and controller counters became visible.  The response/state
-     * commit kernel copies the exact active `[target, drafts...]` prefix into
-     * this record in the same request-owned lane that advances those counters.
-     * It writes @ref valid last, so an event-ordered diagnostic read observes
-     * either no committed identity or one complete, versioned transaction.
+     * commit operation copies the exact active `[target, drafts...]` prefix
+     * into this record in the same request-owned lane that advances those
+     * counters. GPU execution owns the record on device; CPU execution owns it
+     * on the host. It writes @ref valid last, so an ordered diagnostic read
+     * observes either no committed identity or one complete, versioned
+     * transaction.
      *
      * This record is evidence only.  It is never read by sampling, controller,
      * KV, or response-publication code and therefore cannot become a host
@@ -78,6 +80,56 @@ namespace llaminar2::sampling_math
     static_assert(
         sizeof(MTPCommittedVerifierIdentityRecord) % sizeof(int32_t) == 0,
         "The arena stores committed verifier identities as whole INT32 words");
+
+    /**
+     * @brief Materialize a committed verifier identity from explicit authority values.
+     *
+     * CPU publication has no device-generation controller row: its transaction
+     * count and selected depth are host-owned values committed by the typed
+     * speculative-state publisher. GPU publication obtains the same two values
+     * from its device controller and delegates here. Keeping the byte layout and
+     * validation in one host/device helper prevents the two ownership domains
+     * from producing subtly different diagnostic evidence.
+     *
+     * @param verifier_input_tokens Exact request-local `[target, drafts...]` row.
+     * @param verifier_input_token_stride Physical row capacity in INT32 words.
+     * @param transaction_count Monotonic committed transaction ordinal.
+     * @param draft_depth Number of speculative predictor tokens in the row.
+     * @param record Authority-owned persistent identity destination.
+     * @return true when a complete committed identity was published.
+     */
+    LLAMINAR_SAMPLING_HD bool materialize_committed_verifier_identity(
+        const int32_t *verifier_input_tokens,
+        int verifier_input_token_stride,
+        int transaction_count,
+        int draft_depth,
+        MTPCommittedVerifierIdentityRecord *record)
+    {
+        if (!record || !verifier_input_tokens ||
+            draft_depth <= 0 || draft_depth > kSpeculativeBatchMaxRows ||
+            verifier_input_token_stride < draft_depth + 1 ||
+            transaction_count <= 0)
+        {
+            return false;
+        }
+        for (int row = 0; row <= draft_depth; ++row)
+        {
+            if (verifier_input_tokens[row] < 0)
+                return false;
+        }
+
+        record->valid = 0;
+        record->version = kMTPCommittedVerifierIdentityVersion;
+        record->transaction_count = transaction_count;
+        record->draft_depth = draft_depth;
+        for (int row = 0; row < kSpeculativeBatchMaxOutputTokens; ++row)
+        {
+            record->verifier_input_tokens[row] =
+                row <= draft_depth ? verifier_input_tokens[row] : -1;
+        }
+        record->valid = 1;
+        return true;
+    }
 
     /**
      * @brief Ordered MTP-sidecar boundaries retained for transaction zero.
@@ -856,7 +908,7 @@ namespace llaminar2::sampling_math
         const int *control,
         MTPCommittedVerifierIdentityRecord *record)
     {
-        if (!record || !verifier_input_tokens || !control)
+        if (!control)
             return false;
 
         /*
@@ -869,29 +921,12 @@ namespace llaminar2::sampling_math
             control[kDeviceGenerationControlLastTransactionDraftDepth];
         const int transaction_count =
             control[kDeviceGenerationControlTransactionCount];
-        if (draft_depth <= 0 || draft_depth > kSpeculativeBatchMaxRows ||
-            verifier_input_token_stride < draft_depth + 1 ||
-            transaction_count <= 0)
-        {
-            return false;
-        }
-        for (int row = 0; row <= draft_depth; ++row)
-        {
-            if (verifier_input_tokens[row] < 0)
-                return false;
-        }
-
-        record->valid = 0;
-        record->version = kMTPCommittedVerifierIdentityVersion;
-        record->transaction_count = transaction_count;
-        record->draft_depth = draft_depth;
-        for (int row = 0; row < kSpeculativeBatchMaxOutputTokens; ++row)
-        {
-            record->verifier_input_tokens[row] =
-                row <= draft_depth ? verifier_input_tokens[row] : -1;
-        }
-        record->valid = 1;
-        return true;
+        return materialize_committed_verifier_identity(
+            verifier_input_tokens,
+            verifier_input_token_stride,
+            transaction_count,
+            draft_depth,
+            record);
     }
 
     /**

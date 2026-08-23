@@ -8,6 +8,7 @@
 #include "../../utils/MTPParitySnapshotContext.h"
 
 #include <array>
+#include <cstdint>
 #include <string>
 
 namespace llaminar2::test::parity
@@ -53,6 +54,77 @@ namespace llaminar2::test::parity
         ASSERT_TRUE(primary.has_value());
         ASSERT_TRUE(chain.has_value());
         EXPECT_NE(*primary, *chain);
+    }
+
+    TEST(Test__MTPParitySnapshotContext, CheckpointPlanUsesExecutedDepthNotResponseLimit)
+    {
+        constexpr auto plan = makeMTPParityCheckpointPlan(
+            /*cpu_owned=*/false,
+            /*execution_draft_depth=*/3);
+        static_assert(plan.valid());
+        static_assert(plan.count == 2);
+
+        EXPECT_EQ(
+            plan.checkpoints[0].role,
+            MTPParityCheckpointRole::Primary);
+        EXPECT_EQ(
+            plan.checkpoints[0].context,
+            MTPParityCheckpointContext::DeviceTargetTokenLivePosition);
+        EXPECT_EQ(plan.checkpoints[0].reference_depth, 0);
+        EXPECT_EQ(
+            plan.checkpoints[1].role,
+            MTPParityCheckpointRole::TerminalChained);
+        EXPECT_EQ(
+            plan.checkpoints[1].context,
+            MTPParityCheckpointContext::DeviceChainedTokenLivePosition);
+        EXPECT_EQ(plan.checkpoints[1].reference_depth, 2)
+            << "A depth-three retained transaction leaves MTP2 in its chained "
+               "snapshot bank even when the response ledger exposes fewer rows";
+    }
+
+    TEST(Test__MTPParitySnapshotContext, DepthOneHasOnlyItsPrimaryCheckpoint)
+    {
+        constexpr auto host_plan = makeMTPParityCheckpointPlan(
+            /*cpu_owned=*/true,
+            /*execution_draft_depth=*/1);
+        static_assert(host_plan.valid());
+        EXPECT_EQ(host_plan.count, 1u);
+        EXPECT_EQ(
+            host_plan.checkpoints[0].context,
+            MTPParityCheckpointContext::HostConditionTokenLivePosition);
+        EXPECT_EQ(host_plan.checkpoints[0].reference_depth, 0);
+
+        constexpr auto invalid = makeMTPParityCheckpointPlan(
+            /*cpu_owned=*/false,
+            /*execution_draft_depth=*/0);
+        static_assert(!invalid.valid());
+        EXPECT_EQ(invalid.count, 0u);
+    }
+
+    TEST(Test__MTPParitySnapshotContext, BranchPrefixOwnsOnlyConsumedTokens)
+    {
+        constexpr std::array<int32_t, 3> consumed = {198, 760, 3841};
+        EXPECT_EQ(
+            mtpParityBranchReferencePrefix(0, 3, consumed),
+            "decode_step0_BRANCH_198_760_3841_MTP3_")
+            << "The output sampled by MTP3 is not one of its input condition "
+               "tokens and must not enter the reference identity";
+    }
+
+    TEST(Test__MTPParitySnapshotContext, InvalidBranchIdentityFailsClosed)
+    {
+        constexpr std::array<int32_t, 2> too_short = {13, 17};
+        EXPECT_THROW(
+            (void)mtpParityBranchReferencePrefix(0, 3, too_short),
+            std::invalid_argument);
+
+        constexpr std::array<int32_t, 2> negative = {13, -1};
+        EXPECT_THROW(
+            (void)mtpParityBranchReferencePrefix(0, 2, negative),
+            std::invalid_argument);
+        EXPECT_THROW(
+            (void)mtpParityBranchReferencePrefix(-1, 2, too_short),
+            std::invalid_argument);
     }
 
     TEST(Test__MTPParitySnapshotContext, OperationalAndMalformedKeysFailClosed)
@@ -112,6 +184,42 @@ namespace llaminar2::test::parity
         EXPECT_EQ(
             classifyMTPParityTransactionActivity({2, 4}, {1, 4}),
             MTPParityTransactionActivity::Inconsistent);
+    }
+
+    TEST(Test__MTPParitySnapshotContext, GroupedTokensUseSerialNotHuggingFaceOracle)
+    {
+        constexpr std::array<int32_t, 3> serial = {13, 271, 760};
+        constexpr std::array<int32_t, 3> grouped = {13, 271, 760};
+        constexpr std::array<int32_t, 3> hugging_face = {13, 271, 71093};
+
+        static_assert(serial != hugging_face);
+        const auto comparison =
+            compareMTPGroupedTokensToSerialOracle(serial, grouped);
+        EXPECT_TRUE(comparison.exact)
+            << "A quantized Hugging Face near-tie must not replace the exact "
+               "serial Llaminar oracle";
+        EXPECT_EQ(comparison.compared_tokens, grouped.size());
+    }
+
+    TEST(Test__MTPParitySnapshotContext, GroupedTokenMismatchReportsFirstEdge)
+    {
+        constexpr std::array<int32_t, 4> serial = {13, 271, 760, 42};
+        constexpr std::array<int32_t, 4> grouped = {13, 271, 71093, 42};
+        const auto mismatch =
+            compareMTPGroupedTokensToSerialOracle(serial, grouped);
+        EXPECT_FALSE(mismatch.exact);
+        EXPECT_EQ(mismatch.compared_tokens, 3u);
+        EXPECT_EQ(mismatch.mismatch_index, 2u);
+        EXPECT_EQ(mismatch.serial_token, 760);
+        EXPECT_EQ(mismatch.grouped_token, 71093);
+
+        constexpr std::array<int32_t, 2> short_oracle = {13, 271};
+        const auto missing =
+            compareMTPGroupedTokensToSerialOracle(short_oracle, grouped);
+        EXPECT_FALSE(missing.exact);
+        EXPECT_EQ(missing.mismatch_index, short_oracle.size());
+        EXPECT_EQ(missing.serial_token, -1);
+        EXPECT_EQ(missing.grouped_token, 71093);
     }
 
     TEST(Test__MTPParitySnapshotContext, ReferenceStepUsesLiveConditionPosition)

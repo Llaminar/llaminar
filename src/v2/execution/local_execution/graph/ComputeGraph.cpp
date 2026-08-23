@@ -46,6 +46,7 @@ namespace llaminar2
             // retaining metadata from the previous stage could align the wrong
             // native capture transaction across LocalTP participants.
             nodes_[idx]->graph_capture_wave.reset();
+            nodes_[idx]->heterogeneous_ticket_unit_contract.reset();
             cached_execution_stages_.clear();
             execution_stages_dirty_ = true;
             fast_schedule_.clear();
@@ -115,6 +116,30 @@ namespace llaminar2
         }
 
         nodes_[it->second]->graph_capture_wave = std::move(contract);
+        noteTopologyMutation();
+        return *this;
+    }
+
+    ComputeGraph &ComputeGraph::setHeterogeneousTicketUnitContract(
+        const std::string &node_name,
+        GraphHeterogeneousTicketUnitContract contract)
+    {
+        auto it = node_index_.find(node_name);
+        if (it == node_index_.end())
+        {
+            throw std::out_of_range(
+                "Cannot attach heterogeneous ticket-unit boundary to missing graph node '" +
+                node_name + "'");
+        }
+        if (contract.identity.empty())
+        {
+            throw std::invalid_argument(
+                "Heterogeneous ticket-unit boundary for node '" +
+                node_name + "' requires a non-empty identity");
+        }
+
+        nodes_[it->second]->heterogeneous_ticket_unit_contract =
+            std::move(contract);
         noteTopologyMutation();
         return *this;
     }

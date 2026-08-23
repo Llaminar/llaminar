@@ -320,6 +320,32 @@ namespace
     {
         (void)ctx;
 
+        if (params_.ticket_storage)
+        {
+            PerfStatsCollector::ScopedTimer publication_wait(
+                "moe_overlay_endpoint",
+                "captured_ticket_publication_wait",
+                params_.seq_len == 1 ? "decode" : "prefill",
+                params_.ticket_storage->sourceDevice().toString(),
+                {{"consumer", "expert_dispatch"},
+                 {"layer",
+                  params_.placement.has_value()
+                      ? std::to_string(params_.placement->layer)
+                      : std::string("invalid")},
+                 {"ordering", "mapped_system_release_acquire"},
+                 {"stream_synchronize", "false"}});
+            std::string publication_error;
+            if (!params_.ticket_storage->awaitCapturedPublication(
+                    &publication_error))
+            {
+                LOG_ERROR(
+                    "[MoEExpertDispatchStage] Captured ticket publication "
+                    "was not observable: "
+                    << publication_error);
+                return false;
+            }
+        }
+
         if (params_.seq_len <= 0 || params_.top_k <= 0 || params_.d_model <= 0)
         {
             LOG_ERROR("[MoEExpertDispatchStage] Invalid dimensions seq_len=" << params_.seq_len

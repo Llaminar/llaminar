@@ -2,11 +2,9 @@
  * @file Test__Qwen36_SingleDevice_Parity.cpp
  * @brief Classic single-device Qwen3.6 dense math parity tests.
  *
- * These tests mirror the Qwen3.5 and Qwen3.6 MoE layer-by-layer parity
- * harnesses.  The prefix/MTP parity suite proves request-level behavior; this
- * suite proves the underlying dense graph math by comparing PyTorch snapshots
- * against one live Llaminar production session for prefill, decode, and
- * snapshot availability on CPU, CUDA, and ROCm.
+ * The standard typed matrix proves main-graph and recursive-MTP checkpoints,
+ * exact grouped-versus-serial tokens, and the mandatory fresh/full/partial
+ * prefix lifecycle against one production runner on CPU, CUDA, and ROCm.
  */
 
 #include <gtest/gtest.h>
@@ -14,96 +12,69 @@
 #include <unistd.h>
 
 #include "../qwen35/Qwen35ParityTestBase.h"
+#include "Qwen36ModelParityDefinitions.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
 
 #include <algorithm>
+#include <array>
+#include <iterator>
 #include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
 using namespace llaminar2::test::parity::qwen35;
+using namespace llaminar2::test::parity::qwen36;
 
 namespace
 {
-    /**
-     * @brief Tight first-pass thresholds for the 27B Q4_K_S dense fixture.
-     *
-     * The PyTorch generator dequantizes the same GGUF weights, so large drift
-     * is a real implementation signal.  The tolerances still leave a modest
-     * buffer for backend reduction order and quantized-kernel accumulation
-     * differences, especially through recurrent GDN decode state.
-     */
-    static const auto kQwen36Dense27BStrictSingleDeviceThresholds = BackendThresholds{
-        .cosine_threshold = 0.96f,
-        .decode_cosine_threshold = 0.93f,
-        .early_layers_count = 8,
-        .min_early_layers_passed = 8,
-        .kl_threshold = 0.08f,
-        .min_top1_accuracy = 80.0f,
-        .min_top5_accuracy = 80.0f,
-        .pytorch_top1_in_topk = 3,
-    };
-
-    /**
-     * @brief Symmetric backend matrix for dense Qwen3.6 classic parity.
-     *
-     * Keep CPU, CUDA, and ROCm entries structurally identical unless a measured
-     * backend difference has a documented reason.  This suite is intended to
-     * prevent hidden backend drift while MTP depth policies are tuned.
-     */
-    static const std::vector<TestConfig> kQwen36DenseSingleDeviceConfigs = {
+    /** @return Canonically expanded dense CPU, CUDA, and ROCm cases. */
+    const std::vector<ModelParityCase> &qwen36DenseSingleDeviceCases()
+    {
+        static const auto cases = []
         {
-            .name = "Qwen36Dense_27B_CPU_KV_FP16",
-            .devices = {ParityDeviceType::CPU},
-            .parallelism = Parallelism::None,
-            .collective = Collective::None,
-            .thresholds = kQwen36Dense27BStrictSingleDeviceThresholds,
-            .model_path = "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf",
-            .snapshot_dir = "pytorch_qwen36_dense_singledevice_snapshots",
-            .activation_precision = ActivationPrecision::FP32,
-            .kv_cache_precision = KVCachePrecision::FP16,
-        },
-        {
-            .name = "Qwen36Dense_27B_CUDA_KV_FP16",
-            .devices = {ParityDeviceType::CUDA},
-            .parallelism = Parallelism::None,
-            .collective = Collective::None,
-            .thresholds = kQwen36Dense27BStrictSingleDeviceThresholds,
-            .model_path = "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf",
-            .snapshot_dir = "pytorch_qwen36_dense_singledevice_snapshots",
-            .activation_precision = ActivationPrecision::FP32,
-            .kv_cache_precision = KVCachePrecision::FP16,
-        },
-        {
-            .name = "Qwen36Dense_27B_ROCm_KV_FP16",
-            .devices = {ParityDeviceType::ROCm},
-            .parallelism = Parallelism::None,
-            .collective = Collective::None,
-            .thresholds = kQwen36Dense27BStrictSingleDeviceThresholds,
-            .model_path = "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf",
-            .snapshot_dir = "pytorch_qwen36_dense_singledevice_snapshots",
-            .activation_precision = ActivationPrecision::FP32,
-            .kv_cache_precision = KVCachePrecision::FP16,
-        },
-    };
+            const std::array definitions = {
+                qwen36DenseParityDefinition(
+                    qwen36SingleDeviceTopology(
+                        "CPU0", GlobalDeviceAddress::cpu()),
+                    "pytorch_qwen36_dense_singledevice_cpu_snapshots"),
+                qwen36DenseParityDefinition(
+                    qwen36SingleDeviceTopology(
+                        "CUDA0", GlobalDeviceAddress::cuda(0)),
+                    "pytorch_qwen36_dense_singledevice_cuda_snapshots"),
+                qwen36DenseParityDefinition(
+                    qwen36SingleDeviceTopology(
+                        "ROCm0", GlobalDeviceAddress::rocm(0)),
+                    "pytorch_qwen36_dense_singledevice_rocm_snapshots"),
+            };
+            std::vector<ModelParityCase> expanded;
+            for (const auto &definition : definitions)
+            {
+                auto definition_cases =
+                    expandModelParityDefinition(definition);
+                expanded.insert(
+                    expanded.end(),
+                    std::make_move_iterator(definition_cases.begin()),
+                    std::make_move_iterator(definition_cases.end()));
+            }
+            return expanded;
+        }();
+        return cases;
+    }
 } // namespace
 
 /**
  * @brief Parameterized wrapper around the Qwen3.5 hybrid-GDN parity base.
  *
  * Qwen3.6 dense GGUFs use the same hybrid GDN/full-attention graph family as
- * Qwen3.5, with trailing MTP sidecar tensors.  The classic math suite disables
- * MTP and validates the main graph through the existing Qwen3.5 reference
- * generator and CSV-export machinery.
+ * Qwen3.5, with trailing MTP sidecar tensors. The shared production campaign
+ * expands MTP off, fixed depths 1/2/3/15, and device-owned dynamic depth from
+ * the typed Qwen3.6 declaration.
  */
 class Qwen36DenseSingleDeviceParityTest
     : public Qwen35ConfigDrivenParityTest<Qwen36DenseSingleDeviceParityTest>,
-      public ::testing::WithParamInterface<TestConfig>
-{
-public:
-    const TestConfig &getTestConfig() const { return GetParam(); }
-};
+      public ModelParityCaseParameter
+{};
 
 TEST_P(Qwen36DenseSingleDeviceParityTest, ProductionParity)
 {
@@ -113,10 +84,10 @@ TEST_P(Qwen36DenseSingleDeviceParityTest, ProductionParity)
 INSTANTIATE_TEST_SUITE_P(
     Qwen36Dense,
     Qwen36DenseSingleDeviceParityTest,
-    ::testing::ValuesIn(kQwen36DenseSingleDeviceConfigs),
-    [](const ::testing::TestParamInfo<TestConfig> &info)
+    ::testing::ValuesIn(qwen36DenseSingleDeviceCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase> &info)
     {
-        return info.param.name;
+        return info.param.testName();
     });
 
 int main(int argc, char **argv)

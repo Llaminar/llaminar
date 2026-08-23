@@ -14,8 +14,11 @@
 #include "planning/ModelMemoryProfile.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "backends/DeviceId.h"
+#include "config/TensorParallelConfig.h"
 #include "execution/config/RuntimeConfig.h"
 
+#include <optional>
+#include <stdexcept>
 #include <vector>
 #include <string>
 
@@ -137,6 +140,38 @@ struct DevicePlanConfig
     int shard_index = 0;
     int total_shards = 1;
 
+    /**
+     * Exact tensor-parallel slice installed by the production assignment authority.
+     *
+     * Rank-local TP may use uneven query/FFN/vocabulary ranges and may
+     * replicate GQA KV heads. `shard_index / total_shards` therefore cannot
+     * reconstruct the participant geometry. Cross-rank uniform TP may leave
+     * this empty because its validator proves exact divisibility.
+     */
+    std::optional<DeviceShardingAssignment> tensor_parallel_assignment;
+
+    /**
+     * @brief Bind the exact production tensor-parallel assignment.
+     * @param assignment Assignment produced by @ref TensorParallelConfig.
+     * @throws std::invalid_argument when it names another device/rank or an
+     *         invalid local slice.
+     */
+    void bindTensorParallelAssignment(
+        const DeviceShardingAssignment &assignment)
+    {
+        if (total_shards <= 1 || assignment.local_rank != shard_index ||
+            assignment.device != device || !assignment.isValid() ||
+            assignment.kv_head_count <= 0 ||
+            assignment.d_ff_count <= 0 ||
+            assignment.vocab_count <= 0)
+        {
+            throw std::invalid_argument(
+                "Device memory plan tensor-parallel assignment does not match its physical shard identity");
+        }
+        tensor_parallel_assignment = assignment;
+        local_kv_heads = assignment.kv_head_count;
+    }
+
     // PP configuration: layer range
     int first_layer = 0;
     int last_layer = -1;  // -1 = all
@@ -236,9 +271,13 @@ public:
      *
      * Every GPU config is evaluated with the same candidate so LocalTP and
      * other symmetric graph domains cannot silently construct incompatible
-     * resident shapes. CPU configs retain their requested activation length.
-     * When no candidate fits, the returned plan contains the smallest
-     * candidate's diagnostics and `fits()` is false.
+     * resident shapes. A retained MTP verifier family can raise that common
+     * capacity above the selected prefill bucket; the returned row count and
+     * byte plan always describe the complete prefill-plus-MTP graph family.
+     * Ordinary CPU configs retain their requested activation length, while CPU
+     * routed-expert participants share the captured ticket geometry. When no
+     * candidate fits, the returned plan contains the smallest candidate's
+     * diagnostics and `fits()` is false.
      */
     static ResidentGraphMemoryPlan planLargestFittingResidentGraphRows(
         const ModelMemoryProfile& profile,

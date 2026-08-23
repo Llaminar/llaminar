@@ -7183,7 +7183,22 @@ namespace
             config.mtp.verify_mode = verify_mode;
             config.mtp.depth_policy = depth_policy;
 
+            /*
+             * This fixture isolates prefill/decode and MTP transaction state.
+             * Prefix-cache coordination has its own adversarial unit suites;
+             * request-batched execution currently has a distinct, explicitly
+             * disabled prefix-cache contract until common-prefix coordination
+             * is implemented.  Override both configuration authorities so the
+             * production default cannot silently change this test topology.
+             */
+            config.prefix_cache.enabled = false;
+            config.prefix_cache.storage_mode =
+                PrefixCacheStorageMode::Disabled;
+
             RankExecutionPlan runner_plan = plan_;
+            runner_plan.runtime.prefix_cache.enabled = false;
+            runner_plan.runtime.prefix_cache.storage_mode =
+                PrefixCacheStorageMode::Disabled;
             if (local_pp_topology)
             {
                 /*
@@ -7330,8 +7345,14 @@ namespace
             config.mtp.max_request_batch = max_request_batch;
             config.mtp.verify_mode = verify_mode;
             config.mtp.depth_policy = depth_policy;
+            config.prefix_cache.enabled = false;
+            config.prefix_cache.storage_mode =
+                PrefixCacheStorageMode::Disabled;
 
             RankExecutionPlan runner_plan = plan_;
+            runner_plan.runtime.prefix_cache.enabled = false;
+            runner_plan.runtime.prefix_cache.storage_mode =
+                PrefixCacheStorageMode::Disabled;
             runner_plan.primary_device = devices.front();
             runner_plan.local_tp_devices = devices;
             runner_plan.local_tp_backend = devices.front().isCUDA()

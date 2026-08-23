@@ -1279,20 +1279,26 @@ add_v2_test(V2_Unit_Sha256
 )
 
 # Test: heavyweight parity-reference generation has one node-local writer.
-add_executable(v2_test_reference_generation_lease
-    unit/utils/Test__ReferenceGenerationLease.cpp
-)
-target_link_libraries(v2_test_reference_generation_lease
-    GTest::gtest
-    GTest::gtest_main
-)
-add_test(NAME V2_Unit_ReferenceGenerationLease
-    COMMAND $<TARGET_FILE:v2_test_reference_generation_lease>
-)
-set_tests_properties(V2_Unit_ReferenceGenerationLease PROPERTIES
-    LABELS "V2;Unit;Utils;Parity;ReferenceGeneration;Lifecycle;Regression"
-    TIMEOUT 10
-)
+# Release configurations deliberately suppress every non-performance test
+# executable above. Keep the direct CTest registration under the same policy;
+# otherwise its TARGET_FILE expression names an executable that the Release
+# add_executable shim intentionally did not create.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_executable(v2_test_reference_generation_lease
+        unit/utils/Test__ReferenceGenerationLease.cpp
+    )
+    target_link_libraries(v2_test_reference_generation_lease
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_test(NAME V2_Unit_ReferenceGenerationLease
+        COMMAND $<TARGET_FILE:v2_test_reference_generation_lease>
+    )
+    set_tests_properties(V2_Unit_ReferenceGenerationLease PROPERTIES
+        LABELS "V2;Unit;Utils;Parity;ReferenceGeneration;Lifecycle;Regression"
+        TIMEOUT 10
+    )
+endif()
 
 # Test: StageDumpConfig - Environment variable parsing and filtering for stage dumps
 add_executable(v2_test_stage_dump_config unit/execution/debug/Test__StageDumpConfig.cpp)
@@ -2463,6 +2469,25 @@ add_test(NAME V2_Unit_ProductionParityCampaigns
 set_tests_properties(V2_Unit_ProductionParityCampaigns PROPERTIES
     LABELS "V2;Unit;Parity;ProductionPath;CampaignFramework;Regression"
     TIMEOUT 30
+)
+
+# Typed, device-free expansion contract shared by every canonical parity suite.
+add_executable(v2_test_model_parity_definition
+    unit/parity/Test__ModelParityDefinition.cpp
+)
+target_link_libraries(v2_test_model_parity_definition
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_test_model_parity_definition PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/cnpy
+)
+add_v2_test(V2_Unit_ModelParityDefinition
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+    LABELS "V2;Unit;Parity;ProductionPath;CampaignFramework;Regression"
+    MPI_PROCS 1
 )
 
 add_test(NAME V2_Unit_ParityResultSummary
@@ -5964,6 +5989,19 @@ add_v2_test(V2_Integration_HostReleaseAfterGpuUpload
     MPI_PROCS 1  # Tests GPU pinned memory locally, no MPI needed
 )
 
+if(HAVE_ROCM)
+    # Backend-symmetric exact-device registration retirement. The complete
+    # codebook matrix runs while a foreign HIP device remains current.
+    add_executable(v2_integration_host_release_after_rocm_upload
+        integration/execution/coherence/Test__HostReleaseAfterROCmUpload.cpp)
+    target_link_libraries(v2_integration_host_release_after_rocm_upload
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_HostReleaseAfterROCmUpload
+        COMMAND $<TARGET_FILE:v2_integration_host_release_after_rocm_upload>
+        LABELS "V2;Integration;ROCm;PinnedMemory;HostRelease;Regression;Coherence;GPUMemory;DeviceManagement;AllCodebooks"
+        MPI_PROCS 1)
+endif()
+
 # Test: Mapped Memory Coherence (Phase 3: verifies zero-copy snapshot mode)
 # Tests FP32Tensor::createMapped() behavior for GPU↔CPU shared memory
 # Verifies: gpu_data_ptr valid after creation, ensureOnHost is no-op, 
@@ -8068,10 +8106,10 @@ if(ZLIB_FOUND)
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36moe_expert_overlay_math
         TEST_PREFIX V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math
-        LABELS "V2;Integration;Parity;Qwen36MoE;MixtureOfExperts;GatedDeltaNet;CPU;CUDA;ROCm;LocalTP;ExpertOverlay;PrefillTensorParallelDecodeReplicated;Dynamic;LLEP;PyTorch;GoldenReference;FullModel"
+        LABELS "V2;Integration;Parity;Qwen36MoE;MixtureOfExperts;GatedDeltaNet;CUDA;ROCm;LocalTP;ExpertOverlay;Static;Dynamic;MTP;PrefixCache;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
         TIMEOUT 3600
-        PRODUCTION_PERF_STATS_FILTER "forward_graph,moe_rebalance,moe_placement,moe_overlay_controller"
+        PRODUCTION_PERF_STATS_FILTER "forward_graph,mtp,prefix_cache,weight_loading,moe_rebalance,moe_overlay_residency,moe_placement,moe_overlay_controller"
         MODEL_FILES ${V2_PARITY_MODEL_QWEN36_MOE}
     )
 
@@ -14396,23 +14434,6 @@ add_v2_test(V2_Integration_DomainCommunicatorRegistry_MPI
 
 message(STATUS "V2 Tests: Added DomainCommunicatorRegistry MPI integration tests")
 
-# Test: GlobalOrchestratorRunner
-# Unit tests for IOrchestrationRunner adapter wrapping GlobalOrchestrator (Phase 4).
-# Verifies lifecycle (init/shutdown), inference delegation (prefill/decodeStep/generate),
-# sampling state, stop tokens, GPU sampling delegation, PP topologies.
-add_executable(v2_test_global_orchestrator_runner unit/execution/global/Test__GlobalOrchestratorRunner.cpp)
-target_include_directories(v2_test_global_orchestrator_runner PRIVATE 
-    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
-)
-target_link_libraries(v2_test_global_orchestrator_runner llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_GlobalOrchestratorRunner
-    COMMAND $<TARGET_FILE:v2_test_global_orchestrator_runner>
-    LABELS "V2;Unit;GlobalOrchestratorRunner;GlobalOrchestrator;GlobalPP;IOrchestrationRunner"
-    MPI_PROCS 1
-)
-
-message(STATUS "V2 Tests: Added GlobalOrchestratorRunner unit tests")
-
 # Test: ParallelismTree
 # Unit tests for recursive parallelism tree data structure:
 # - Fluent builder construction (PP, TP, Device)
@@ -15496,8 +15517,8 @@ target_link_libraries(v2_test_hybrid_allreduce_precision
     GTest::gtest_main
 )
 target_compile_definitions(v2_test_hybrid_allreduce_precision PRIVATE
-    LLAMINAR_QWEN36_MOE_EXPERT_OVERLAY_MATH_PARITY_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_MathParity.cpp"
-    LLAMINAR_QWEN36_MOE_PARITY_BASE_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/integration/parity/qwen36/Qwen36MoEParityTestBase.h"
+    LLAMINAR_MODEL_PARITY_DEFINITION_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/integration/parity/ModelParityDefinition.h"
+    LLAMINAR_QWEN36_MODEL_PARITY_DEFINITIONS_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/integration/parity/qwen36/Qwen36ModelParityDefinitions.h"
 )
 add_v2_test(V2_Unit_HybridAllreducePrecision
     COMMAND $<TARGET_FILE:v2_test_hybrid_allreduce_precision>

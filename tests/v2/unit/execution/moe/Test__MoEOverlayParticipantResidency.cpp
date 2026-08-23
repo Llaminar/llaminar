@@ -1095,6 +1095,59 @@ TEST(Test__MoEOverlayParticipantResidencyRegistry,
 }
 
 TEST(Test__MoEOverlayParticipantResidencyRegistry,
+     LateGraphRegistrationCannotResurrectRetiredInitialEpoch)
+{
+    MoEOverlayParticipantResidencyRegistry registry({
+        .owner_map = twoParticipantOwnerMap(),
+        .local_participant_ids = {0},
+        .num_layers = 1,
+        .num_experts = 2,
+        .initial_epoch = 1,
+        .retained_epoch_capacity = 2,
+    });
+    std::vector<MoEOverlayPreparedExpertTriplet> engines(2);
+    engines[0] = triplet(1450);
+    std::string error;
+    ASSERT_TRUE(registry.registerInitialLayer(
+        0,
+        0,
+        {true, false},
+        engines,
+        &error))
+        << error;
+
+    const auto endpoint = registry.endpoint(0);
+    ASSERT_NE(endpoint, nullptr);
+    auto epoch_two = endpoint->cloneCandidate(1, 2);
+    ASSERT_EQ(
+        prepareAndInstall(*endpoint, epoch_two, &error),
+        MoEOverlayParticipantBankInstallStatus::Installed)
+        << error;
+    ASSERT_TRUE(endpoint->retire(1));
+    ASSERT_EQ(endpoint->acquire(1), nullptr);
+    ASSERT_NE(endpoint->acquire(2), nullptr);
+    ASSERT_TRUE(endpoint->hasCandidateCapacity());
+
+    /*
+     * A graph variant may validate the canonical bootstrap identities after
+     * maintenance advances.  It must not republish epoch one or consume the
+     * only inactive bank needed by epoch three.
+     */
+    EXPECT_TRUE(registry.registerInitialLayer(
+        0,
+        0,
+        {true, false},
+        engines,
+        &error))
+        << error;
+    EXPECT_TRUE(registry.allInitialBanksReady());
+    EXPECT_EQ(endpoint->acquire(1), nullptr);
+    EXPECT_NE(endpoint->acquire(2), nullptr);
+    EXPECT_EQ(endpoint->retainedEpochCount(), 1u);
+    EXPECT_TRUE(endpoint->hasCandidateCapacity());
+}
+
+TEST(Test__MoEOverlayParticipantResidencyRegistry,
      RelayOnlyRankOwnsAValidVacuouslyReadyRegistry)
 {
     MoEOverlayParticipantResidencyRegistry registry({

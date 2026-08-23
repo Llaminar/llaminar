@@ -1,6 +1,12 @@
 /**
  * @file Qwen35Graph.cpp
- * @brief Qwen 3.5 compute graph builder implementation
+ * @brief Declarative Qwen 3.5-family forward and recursive MTP graph wiring.
+ *
+ * This builder binds model-owned buffers and weights into participant-local
+ * compute graphs.  It declares dependencies, sharding-aware collectives, MTP
+ * input ownership, and transaction terminal nodes; orchestration remains in
+ * the runner/executor layers.  Diagnostic metadata identifies existing graph
+ * values only and must not introduce alternate arithmetic or lifecycle paths.
  */
 
 #include "Qwen35Graph.h"
@@ -611,6 +617,9 @@ namespace llaminar2
                           .seq_len = total_tokens,
                           .input_buffer_id = input.terminal_hidden_buffer_id,
                           .output_buffer_id = BufferId::MTP_NORM_HIDDEN,
+                          .diagnostic_input_publication =
+                              RMSNormStage::DiagnosticInputPublication::
+                                  MTPTerminalHidden,
                       }),
                       device);
 
@@ -738,7 +747,7 @@ namespace llaminar2
 
             const std::string kv_terminal = kv_append.terminalNode();
             graph.merge(std::move(kv_append), prefix + "fc");
-            graph.setTerminalNode(kv_terminal);
+            sealInferenceTransactionGraph(graph, kv_terminal);
             return graph;
         }
 
@@ -869,7 +878,7 @@ namespace llaminar2
                 device);
             graph.addDependency(terminal_node, prefix + "lm_head");
         }
-        graph.setTerminalNode(terminal_node);
+        sealInferenceTransactionGraph(graph, terminal_node);
 
         return graph;
     }

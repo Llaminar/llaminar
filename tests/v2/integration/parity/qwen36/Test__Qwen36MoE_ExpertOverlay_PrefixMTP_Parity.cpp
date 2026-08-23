@@ -142,10 +142,20 @@ namespace
      * a separate lock domain. Running the unfiltered suite retains a global lock
      * because it traverses both domains in one process.
      */
-    class ScopedParityProcessLock
+    class ScopedParityWorldLock
     {
     public:
-        explicit ScopedParityProcessLock(const char *path)
+        /**
+         * @brief Acquire the backend lock on behalf of one complete MPI world.
+         *
+         * Only MPI rank zero may construct this guard. Its peers wait at the
+         * subsequent status broadcast, so a competing world can wait in
+         * `flock()` without preventing its own ranks from assembling.
+         *
+         * @param path Stable backend-specific lock-file path.
+         * @throws std::runtime_error when the file cannot be opened or locked.
+         */
+        explicit ScopedParityWorldLock(const char *path)
         {
             fd_ = ::open(path, O_CREAT | O_RDWR, 0666);
             if (fd_ < 0)
@@ -165,7 +175,8 @@ namespace
             }
         }
 
-        ~ScopedParityProcessLock()
+        /** @brief Release the inter-world lock after every local rank finalized. */
+        ~ScopedParityWorldLock()
         {
             if (fd_ >= 0)
             {
@@ -174,12 +185,15 @@ namespace
             }
         }
 
-        ScopedParityProcessLock(const ScopedParityProcessLock &) = delete;
-        ScopedParityProcessLock &operator=(const ScopedParityProcessLock &) = delete;
+        ScopedParityWorldLock(const ScopedParityWorldLock &) = delete;
+        ScopedParityWorldLock &operator=(const ScopedParityWorldLock &) = delete;
 
     private:
         int fd_ = -1;
     };
+
+    /** True only in the MPI process that owns this world's filesystem lock. */
+    bool g_parity_world_lock_owner = false;
 
     /**
      * @brief Select the narrowest safe interprocess lock for this test command.
@@ -553,9 +567,22 @@ namespace
      */
     MoEPrefixRestoreParityCase expertOverlayCase()
     {
-        return qwen36MoEPrefixParityCase(
+        auto test_case = qwen36MoEPrefixParityCase(
             "Qwen3.6 MoE ExpertOverlay ROCm2TP hot + CPU2LocalTP cold parity",
             MoEPrefixParityTopology::ExpertOverlayRocm2TPHotCpu2LocalTPCold);
+
+        /*
+         * This short MTP lifecycle probe is the mixed-tier static control.  A
+         * disengaged override is not static: OrchestrationConfig deliberately
+         * defaults durable residency maintenance to Dynamic.  Select Off
+         * explicitly so the zero-movement PerfStats assertion and the runner
+         * consume the same typed policy.  Dedicated long-window fixtures own
+         * the positive Dynamic migration proof.
+         */
+        MoERebalanceRuntimeConfig static_placement;
+        static_placement.mode = MoERebalanceRuntimeMode::Off;
+        test_case.moe_rebalance = static_placement;
+        return test_case;
     }
 
     /**
@@ -1218,69 +1245,6 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMat
         true);
 }
 
-/*
- * ProductionParity is a registration contract consumed by the campaign
- * discovery layer. These cells execute the ordinary sparse-collective
- * two-device ExpertOverlay runner while retaining the complete PyTorch
- * sidecar checkpoint oracle and canonical CSV artifact contract. Fixed depth
- * two, fixed depth three, and adaptive depth are distinct capture identities;
- * fresh and full-prefix-restored requests are distinct lifecycle identities.
- */
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointFixedDepth2_CUDA2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        cudaOnlyStochasticBenchmarkCase(),
-        4,
-        2);
-}
-
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointFixedDepth3_CUDA2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        cudaOnlyStochasticBenchmarkCase(),
-        4,
-        3);
-}
-
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointDynamicDepth_CUDA2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        cudaOnlyStochasticBenchmarkCase(),
-        4,
-        3,
-        qwen36MoEStochasticDynamicDepthPolicy(3));
-}
-
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreFixedDepth2_CUDA2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        cudaOnlyStochasticBenchmarkCase(),
-        4,
-        2,
-        {},
-        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
-}
-
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreFixedDepth3_CUDA2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        cudaOnlyStochasticBenchmarkCase(),
-        4,
-        3,
-        {},
-        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
-}
-
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreDynamicDepth_CUDA2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        cudaOnlyStochasticBenchmarkCase(),
-        4,
-        3,
-        qwen36MoEStochasticDynamicDepthPolicy(3),
-        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
-}
-
 /**
  * @brief Proves CUDA stochastic grouped MTP at long absolute positions without
  *        runtime expert movement.
@@ -1854,61 +1818,6 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, StochasticMTPDynamicDepthVerifierMat
         true);
 }
 
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointFixedDepth2_ROCm2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        rocmOnlyStochasticBenchmarkCase(),
-        4,
-        2);
-}
-
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointFixedDepth3_ROCm2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        rocmOnlyStochasticBenchmarkCase(),
-        4,
-        3);
-}
-
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointDynamicDepth_ROCm2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        rocmOnlyStochasticBenchmarkCase(),
-        4,
-        3,
-        qwen36MoEStochasticDynamicDepthPolicy(3));
-}
-
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreFixedDepth2_ROCm2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        rocmOnlyStochasticBenchmarkCase(),
-        4,
-        2,
-        {},
-        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
-}
-
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreFixedDepth3_ROCm2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        rocmOnlyStochasticBenchmarkCase(),
-        4,
-        3,
-        {},
-        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
-}
-
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProductionParity_MTPCheckpointPrefixRestoreDynamicDepth_ROCm2TPHotOnly)
-{
-    runMoEMTPSidecarStageBreakdownDiagnostic(
-        rocmOnlyStochasticBenchmarkCase(),
-        4,
-        3,
-        qwen36MoEStochasticDynamicDepthPolicy(3),
-        MoEMTPCheckpointRequestLifecycle::FullPrefixRestore);
-}
-
 /**
  * @brief Mirrors the static-placement long-context stochastic control on ROCm.
  *
@@ -2241,12 +2150,12 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefillRequestBoundaryStress_ROCm2TP
     runExpertOverlayRequestBoundaryStress(rocmOnlyCurrentBatchLLEPCase());
 }
 
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPHot_CPU2LocalTPCold)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPHot_CPU2LocalTPCold_StaticPlacement_2xMPI)
 {
     runMoEMTPParity(expertOverlayCase(), false);
 }
 
-TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPHot_CPU2LocalTPCold)
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPHot_CPU2LocalTPCold_StaticPlacement_2xMPI)
 {
     runMoEMTPParity(expertOverlayCase(), true);
 }
@@ -2446,6 +2355,22 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MixedHotColdMTPUsesPhaseSplitDenseDe
     EXPECT_TRUE(spec.dense_decode_replicated);
     EXPECT_EQ(test_case.moe_routed_expert_plan->continuation_domain,
               "qwen36_moe_rocm_hot");
+    ASSERT_TRUE(test_case.moe_rebalance.has_value());
+    EXPECT_EQ(test_case.moe_rebalance->mode, MoERebalanceRuntimeMode::Off);
+
+    const auto &domains = test_case.moe_routed_expert_plan->domains;
+    const auto cpu_domain = std::find_if(
+        domains.begin(),
+        domains.end(),
+        [](const RoutedExpertDomain &domain)
+        { return domain.name == "qwen36_moe_cpu_cold"; });
+    ASSERT_NE(cpu_domain, domains.end());
+    EXPECT_EQ(cpu_domain->scope, ExecutionDomainScope::NODE_LOCAL);
+    EXPECT_EQ(cpu_domain->backend, CollectiveBackendType::UPI);
+    EXPECT_EQ(cpu_domain->participants.size(), 2u);
+    EXPECT_TRUE(cpu_domain->world_ranks.empty());
+    EXPECT_EQ(cpu_domain->owner_rank, -1);
+    EXPECT_EQ(test_case.mpi_ranks, 2);
 }
 
 /**
@@ -2477,23 +2402,98 @@ TEST(Qwen36MoEExpertOverlayPrefixMTPParity, ProcessLockSeparatesGpuBackends)
         "/tmp/llaminar_qwen36_moe_expert_overlay_parity.lock");
 }
 
+/**
+ * @brief Proves one, and only one, rank owns the inter-world process lock.
+ *
+ * Acquiring the filesystem lock independently on every rank deadlocks before
+ * the first model collective: one process owns the lock and waits for a peer
+ * that is itself blocked in `flock()`. This two-rank lifecycle regression
+ * reaches an MPI collective and authenticates the rank-zero authority without
+ * loading model weights.
+ */
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MPIWorldUsesSingleProcessLockAuthority_2xMPI)
+{
+    int initialized = 0;
+    ASSERT_EQ(MPI_Initialized(&initialized), MPI_SUCCESS);
+    ASSERT_NE(initialized, 0);
+
+    int world_rank = -1;
+    int world_size = 0;
+    ASSERT_EQ(MPI_Comm_rank(MPI_COMM_WORLD, &world_rank), MPI_SUCCESS);
+    ASSERT_EQ(MPI_Comm_size(MPI_COMM_WORLD, &world_size), MPI_SUCCESS);
+    ASSERT_EQ(world_size, 2);
+
+    const int local_owner = g_parity_world_lock_owner ? 1 : 0;
+    int world_owner_count = 0;
+    ASSERT_EQ(
+        MPI_Allreduce(
+            &local_owner,
+            &world_owner_count,
+            1,
+            MPI_INT,
+            MPI_SUM,
+            MPI_COMM_WORLD),
+        MPI_SUCCESS);
+    EXPECT_EQ(world_owner_count, 1);
+    EXPECT_EQ(local_owner, world_rank == 0 ? 1 : 0);
+}
+
 int main(int argc, char **argv)
 {
-    std::unique_ptr<ScopedParityProcessLock> parity_lock;
-    try
+    const std::string parity_lock_path = parityProcessLockPath(argc, argv);
+    int provided = MPI_THREAD_SINGLE;
+    if (MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided) !=
+        MPI_SUCCESS)
     {
-        parity_lock = std::make_unique<ScopedParityProcessLock>(
-            parityProcessLockPath(argc, argv));
-    }
-    catch (const std::exception &e)
-    {
-        std::cerr << "Failed to acquire Qwen36 MoE ExpertOverlay parity lock: "
-                  << e.what() << std::endl;
+        std::cerr << "Failed to initialize MPI for Qwen36 MoE ExpertOverlay parity"
+                  << std::endl;
         return 1;
     }
 
-    int provided;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    int world_rank = -1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+
+    std::unique_ptr<ScopedParityWorldLock> parity_lock;
+    std::string parity_lock_error;
+    int parity_lock_acquired = 1;
+    if (world_rank == 0)
+    {
+        try
+        {
+            parity_lock = std::make_unique<ScopedParityWorldLock>(
+                parity_lock_path.c_str());
+        }
+        catch (const std::exception &error)
+        {
+            parity_lock_acquired = 0;
+            parity_lock_error = error.what();
+        }
+    }
+
+    /*
+     * Peers wait here while rank zero contends with another CTest process.
+     * Once rank zero owns the lock, the complete world starts together; no
+     * rank can enter an MPI collective while another rank is stuck in flock.
+     */
+    MPI_Bcast(
+        &parity_lock_acquired,
+        1,
+        MPI_INT,
+        0,
+        MPI_COMM_WORLD);
+    if (parity_lock_acquired == 0)
+    {
+        if (world_rank == 0)
+        {
+            std::cerr
+                << "Failed to acquire Qwen36 MoE ExpertOverlay parity lock: "
+                << parity_lock_error << std::endl;
+        }
+        MPI_Finalize();
+        return 1;
+    }
+    g_parity_world_lock_owner = parity_lock != nullptr;
+
     initializeLogging();
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
@@ -2501,7 +2501,10 @@ int main(int argc, char **argv)
     GlobalBackendRouter::shutdown();
     GPUDeviceContextPool::instance().shutdown();
 
+    /* MPI_Finalize is collective, so rank zero cannot release the world lock
+     * while a peer still owns backend resources from this test command. */
     MPI_Finalize();
+    parity_lock.reset();
     std::cout.flush();
     std::cerr.flush();
     _exit(result);

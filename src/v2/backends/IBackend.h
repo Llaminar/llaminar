@@ -597,12 +597,34 @@ namespace llaminar2
          *
          * @param ptr Host pointer to pin
          * @param bytes Size of the region in bytes
+         * @param device_id Exact backend-local device whose runtime context
+         *                  owns the registration lifecycle
          * @return true on success, false on error
          *
-         * Call unpinHostMemory() when done. No-op on CPU backend.
+         * Call unpinHostMemory() with the same device when done. No-op on CPU
+         * backend. Implementations must bind the named device explicitly;
+         * ambient thread-local device state is not an ownership contract.
          */
-        virtual bool pinHostMemory(void *ptr, size_t bytes) { return true; }
-        virtual bool unpinHostMemory(void *ptr) { return true; }
+        virtual bool pinHostMemory(void *ptr, size_t bytes, int device_id)
+        {
+            (void)ptr;
+            (void)bytes;
+            (void)device_id;
+            return true;
+        }
+
+        /**
+         * @brief Retire a host-memory registration in its owning device context.
+         * @param ptr Exact address passed to @ref pinHostMemory.
+         * @param device_id Exact backend-local registration owner.
+         * @return true only when the registration is no longer live.
+         */
+        virtual bool unpinHostMemory(void *ptr, int device_id)
+        {
+            (void)ptr;
+            (void)device_id;
+            return true;
+        }
 
         /**
          * @brief Register caller-owned pages for direct access by every local device.

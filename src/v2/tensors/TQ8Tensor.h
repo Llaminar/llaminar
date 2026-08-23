@@ -65,7 +65,10 @@ namespace llaminar2
          */
         TQ8Tensor(const std::vector<size_t> &shape, int head_dim, DeviceId device = DeviceId::cpu());
 
-        ~TQ8Tensor() override = default;
+        ~TQ8Tensor() override
+        {
+            retireHostTransferLifetimeBeforeStorageDestruction();
+        }
 
         // =====================================================================
         // TensorBase interface
